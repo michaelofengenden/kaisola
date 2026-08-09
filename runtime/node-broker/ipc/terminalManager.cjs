@@ -10,11 +10,104 @@ const crypto = require('node:crypto')
 const { execFile, execFileSync } = require('node:child_process')
 const { agentEnv } = require('./shellEnv.cjs')
 const { TerminalSpool, DEFAULT_HOT_CAP, DEFAULT_SNAPSHOT_CAP } = require('./terminalSpool.cjs')
-const { TerminalObservers } = require('./terminalObservers.cjs')
+const { DEFAULT_OBSERVER_QUEUE_BYTES, TerminalObservers } = require('./terminalObservers.cjs')
 const { TerminalCursor, isUtf8Boundary } = require('../companion/terminalCursor.cjs')
+const { validatedTerminalGeometry } = require('./terminalCreateRoute.cjs')
 
 let pty = null
 let ptyLoadAttempted = false
+
+const HELPER_MODE = 0o700
+const HELPER_TEMP_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+
+/** lstat, never stat: a symlink has to be visible AS a symlink here. Whoever
+ * controls a component of the helper path controls the executable node-pty
+ * hands to posix_spawn, so a link, a non-directory or another account's inode
+ * on that path is refused rather than followed. */
+function assertRealDirectory(dir, { mustOwn = true } = {}) {
+  const stat = fs.lstatSync(dir)
+  if (stat.isSymbolicLink()) throw new Error(`helper path component is a symlink: ${dir}`)
+  if (!stat.isDirectory()) throw new Error(`helper path component is not a directory: ${dir}`)
+  const ours = stat.uid === process.getuid()
+  if (!ours && (mustOwn || stat.uid !== 0)) throw new Error(`helper path component is foreign-owned: ${dir}`)
+  return stat
+}
+
+/** Writable by group or other is tolerable only with the sticky bit (/tmp,
+ * /var/folders): there just the owner may replace an entry, and the component
+ * below it still has to pass the ownership check. */
+function assertNotOtherWritable(dir, stat) {
+  if ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0) {
+    throw new Error(`helper path component is writable by other users: ${dir}`)
+  }
+}
+
+/** Create one level of the private helper path. Plain mkdir (unlike the
+ * recursive form) fails with EEXIST on a pre-existing symlink instead of
+ * following it, so create-then-verify leaves an attacker no entry to redirect.
+ * A directory an earlier, looser build left behind is ours to tighten back to
+ * 0700; the repair is then re-checked instead of assumed. */
+function createPrivateDir(dir) {
+  try {
+    fs.mkdirSync(dir, { mode: HELPER_MODE })
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err
+  }
+  if ((assertRealDirectory(dir).mode & 0o077) !== 0) fs.chmodSync(dir, HELPER_MODE)
+  if ((assertRealDirectory(dir).mode & 0o077) !== 0) throw new Error(`helper path component stayed group- or world-accessible: ${dir}`)
+  return dir
+}
+
+/** Resolve and validate the private directory the signed helper is copied into.
+ * Everything above `root` is canonicalized first — macOS reaches real storage
+ * through the /var and /tmp symlinks, so a blanket link rejection would refuse
+ * every default path — and each canonical component is then checked for owner
+ * and mode, which is what a hostile ancestor link would fail anyway once it
+ * lands in the attacker's own directory. `root` and the arch directory below it
+ * are ours to create, so there a link is rejected outright. */
+function prepareHelperDir(root, arch) {
+  const resolved = path.resolve(root)
+  const parent = path.dirname(resolved)
+  fs.mkdirSync(parent, { recursive: true, mode: HELPER_MODE })
+  const canonicalParent = fs.realpathSync(parent)
+  let walked = path.sep
+  for (const part of canonicalParent.split(path.sep).filter(Boolean)) {
+    walked = path.join(walked, part)
+    assertNotOtherWritable(walked, assertRealDirectory(walked, { mustOwn: false }))
+  }
+  const base = createPrivateDir(path.join(canonicalParent, path.basename(resolved)))
+  return createPrivateDir(path.join(base, `darwin-${arch}`))
+}
+
+/** Write the helper through an unpredictable, exclusively created temp file and
+ * rename it into place. O_EXCL refuses an existing entry, so a pre-planted
+ * symlink at the temp path cannot be written through the way copyFileSync would
+ * have, and the rename replaces a tampered helper atomically instead of
+ * following it. */
+function installSpawnHelper(source, helperDir) {
+  const helper = path.join(helperDir, 'spawn-helper')
+  const tmp = path.join(helperDir, `spawn-helper.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`)
+  const fd = fs.openSync(tmp, HELPER_TEMP_FLAGS, HELPER_MODE)
+  try {
+    try {
+      fs.writeFileSync(fd, fs.readFileSync(source))
+      fs.fchmodSync(fd, HELPER_MODE)
+    } finally {
+      fs.closeSync(fd)
+    }
+    fs.renameSync(tmp, helper)
+  } catch (err) {
+    try { fs.unlinkSync(tmp) } catch { /* nothing left to clean up */ }
+    throw err
+  }
+  return helper
+}
+
+/** The packaged helper must be a plain file: the packager already refuses to
+ * ship a symlink, so one here means the bundle was rewritten after signing. */
+function isRegularFile(file) {
+  try { return fs.lstatSync(file).isFile() } catch { return false }
+}
 
 /** Hardened macOS apps may load node-pty's native module from Resources, but
  * posix_spawn refuses its nested spawn-helper at that location. Copy only the
@@ -31,17 +124,10 @@ function loadPty(helperRoot) {
         path.join(packageRoot, 'build', 'Release', 'spawn-helper'),
         path.join(packageRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper'),
       ]
-      const source = candidates.find((file) => fs.existsSync(file))
+      const source = candidates.find(isRegularFile)
       if (!source) throw new Error('node-pty spawn-helper is missing')
-      const helperDir = path.join(helperRoot, `darwin-${process.arch}`)
-      fs.mkdirSync(helperDir, { recursive: true, mode: 0o700 })
-      try { fs.chmodSync(helperDir, 0o700) } catch { /* best effort */ }
-      const helper = path.join(helperDir, 'spawn-helper')
-      const tmp = `${helper}.${process.pid}.${Date.now()}.tmp`
-      fs.copyFileSync(source, tmp)
-      fs.chmodSync(tmp, 0o700)
-      fs.renameSync(tmp, helper)
-      fs.chmodSync(helper, 0o700)
+      const helperDir = prepareHelperDir(helperRoot, process.arch)
+      installSpawnHelper(source, helperDir)
 
       // unixTerminal captures `native.dir` at module evaluation. Override the
       // loader for that one require, then restore the package unchanged.
@@ -78,6 +164,17 @@ const FLUSH_CAP = 65_536 // a burst bigger than this flushes immediately
 const OBSERVER_CHUNK_BYTES = 64 * 1024
 const AGENT_QUIET_MS = 4500
 const CWD_REFRESH_COALESCE_MS = 250
+// An exit wait lives as long as the pty it watches, which for a dev server is
+// hours. Every waiter therefore carries the owner key that asked for it, so a
+// dropped socket can drop its closures, and one terminal holds at most this
+// many: a reconnect-looping or abusive client must not be able to pin an
+// unbounded list of resolvers to a long-running terminal.
+const MAX_EXIT_WAITERS = 32
+// A caller may bound its own wait; this clamps that bound, because setTimeout
+// fires IMMEDIATELY past 2^31-1 ms and a wild timeoutMs would then read as an
+// instant timeout. Unbounded stays the default: a wait is how the agent learns
+// a command finished, and cutting it short would report a false non-exit.
+const MAX_EXIT_WAIT_MS = 6 * 60 * 60 * 1_000
 
 /** main.cjs calls this on app focus/blur — the stream profile follows. */
 function setAppFocused(focused) {
@@ -118,10 +215,42 @@ function reportActivity(kind, id = null) {
   try { activitySink?.(String(kind || 'terminal'), id == null ? null : String(id)) } catch { /* safety telemetry only */ }
 }
 
+/** Retained history is quota-bounded, and a dropped page is real user-visible
+ * history loss — worth a broker log line both while a quota is being approached
+ * and once something has actually been evicted. The eviction itself is also
+ * stamped into the spool meta, so `snapshot` and `history` keep reporting it
+ * long after the log line has scrolled away. */
+function reportQuota(event) {
+  const surface = event.scope === 'directory' ? 'terminal history directory' : 'terminal history'
+  const id = event.id || 'unknown terminal'
+  if (event.phase === 'warning') {
+    console.warn(`[kaisola] ${surface} quota nearly reached for ${id}: ${event.retainedBytes} of ${event.quotaBytes} bytes retained`)
+    return
+  }
+  console.warn(`[kaisola] ${surface} quota evicted ${event.evictedBytes} bytes of scrollback for ${id}`)
+}
+
 /** terminal:run children (plain child_process, not node-pty) — tracked here so
  *  a non-terminating run command dies on app quit instead of reparenting to
  *  launchd. terminalHandler registers/unregisters each spawned child. */
 const runChildren = new Set()
+
+// OSC 133 "D" is the shell's own end-of-command mark, emitted by the private
+// startup files Kaisola installs (see AppModel's semantic prompt integration).
+// It is a real lifecycle event from the process, not an inference from
+// quietness, so it is allowed to close an agent turn: the foreground command
+// the turn was opened for has returned to the prompt.
+const COMMAND_END_MARK = '\u001b]133;D'
+const MARK_CARRY = COMMAND_END_MARK.length - 1
+
+/** True when this chunk (joined to the carried tail of the previous one, so a
+ *  mark split across two pty writes still matches) reports a finished command.
+ *  The carry is only maintained while a turn is open — see p.onData. */
+function consumeCommandEndMark(record, data) {
+  const window = record.agentMarkCarry ? record.agentMarkCarry + data : data
+  record.agentMarkCarry = window.slice(-MARK_CARRY)
+  return window.includes(COMMAND_END_MARK)
+}
 
 function terminalEnv(extra) {
   const env = agentEnv({
@@ -204,6 +333,30 @@ function send(sender, channel, payload, options) {
     sender.send(channel, payload)
     return true
   }
+  return false
+}
+
+/** Keep the primary renderer socket bounded just like observer sockets. Once a
+ * delta cannot be queued, the spool remains authoritative and no more deltas
+ * are offered until terminal.attach rebinds the sender and returns a snapshot. */
+function deliverPrimaryOutput(record, id, payload) {
+  if (record.primaryOutputPaused) return false
+  const delivered = send(
+    record.sender,
+    `terminal:data:${id}`,
+    payload,
+    { maxQueueBytes: DEFAULT_OBSERVER_QUEUE_BYTES },
+  )
+  if (delivered) return true
+  record.primaryOutputPaused = true
+  // One forced, small reset marker is the only permitted overflow. Future
+  // deltas are discarded until an explicit attach obtains a fresh snapshot.
+  send(record.sender, 'terminal:snapshot-required', {
+    id,
+    reason: 'slow_consumer',
+    streamEpoch: record.cursor.streamEpoch,
+    endOffset: record.cursor.nextOffset,
+  }, { force: true, maxQueueBytes: DEFAULT_OBSERVER_QUEUE_BYTES })
   return false
 }
 
@@ -336,6 +489,8 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
   // never decreases. No caller combines these today — refuse loudly so a
   // future one cannot silently corrupt history offsets.
   if (restore && Number.isFinite(outputByteLimit)) return null
+  const geometry = validatedTerminalGeometry({ cols, rows }, { defaults: true })
+  if (!geometry.ok) return null
   cancelRelease(id)
   const restoring = restore === true
   const prior = terms.get(id)
@@ -348,12 +503,13 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     terms.delete(id)
   }
   const retainedOutputBytes = Number.isFinite(outputByteLimit) ? Math.max(0, Math.floor(outputByteLimit)) : null
-  const initialCols = cols || 80
-  const initialRows = rows || 24
+  const initialCols = geometry.value.cols
+  const initialRows = geometry.value.rows
   const spoolOptions = {
     dir: spoolDir,
     id,
     fresh: !restoring,
+    onQuota: reportQuota,
     ...(retainedOutputBytes == null ? {} : {
       diskCap: Math.max(1, retainedOutputBytes),
       hotCap: Math.max(1, Math.min(DEFAULT_HOT_CAP, retainedOutputBytes)),
@@ -390,13 +546,18 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       detachedBytes: 0,
       exitedWhileDetached: false,
       agentBusy: false,
+      agentTurnOpen: false,
       agentCompletedAt: null,
+      agentCompletionSignal: null,
+      agentQuietSince: null,
       agentRespondedAt: null,
       agentQuietTimer: null,
+      agentMarkCarry: '',
     }
     rec.observers = new TerminalObservers({
       terminalId: id,
       deliver: (subscriber, channel, payload, options) => send(subscriber, channel, payload, options),
+      onDrop: () => syncSpoolVisibility(rec),
     })
     terms.set(id, rec)
     return rec
@@ -447,20 +608,33 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     exitedWhileDetached: false,
     // Agent activity is deliberately broker-owned: hidden Eco tabs retain no
     // xterm/React renderer, but their turn still settles and notifies the app.
+    // `agentBusy` is the indicator the UI spins on; `agentTurnOpen` is the
+    // process truth an update gate reads, and only an explicit completion
+    // signal ever clears it — see settleAgentTurn/markAgentQuiet below.
     agentBusy: false,
+    agentTurnOpen: false,
     agentCompletedAt: null,
+    agentCompletionSignal: null,
+    agentQuietSince: null,
     agentRespondedAt: null,
     agentQuietTimer: null,
+    agentMarkCarry: '', // straddle buffer for OSC 133 marks split across chunks
   }
   rec.observers = new TerminalObservers({
     terminalId: id,
     deliver: (subscriber, channel, payload, options) => send(subscriber, channel, payload, options),
+    // A retired subscription changes the observer count, and the spool's RAM
+    // read cache is derived from it.
+    onDrop: () => syncSpoolVisibility(rec),
   })
   const broadcastAgentActivity = () => {
     send(rec.sender || rec.lastSender, 'terminal:agent-activity', {
       id,
       busy: rec.agentBusy,
       completedAt: rec.agentCompletedAt,
+      turnOpen: rec.agentTurnOpen,
+      completionSignal: rec.agentCompletionSignal,
+      quietSince: rec.agentQuietSince,
     })
     rec.observers.broadcast('terminal:observer-activity', {
       id,
@@ -468,32 +642,63 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       offset: rec.cursor.nextOffset,
       busy: rec.agentBusy,
       completedAt: rec.agentCompletedAt,
+      turnOpen: rec.agentTurnOpen,
+      completionSignal: rec.agentCompletionSignal,
+      quietSince: rec.agentQuietSince,
     }, { streamEpoch: rec.cursor.streamEpoch, endOffset: rec.cursor.nextOffset })
   }
-  const settleAgentTurn = () => {
+  /** The authoritative end of a turn. Only an explicit lifecycle signal gets
+   *  here: the controller's terminal.agentTurn(busy:false), the pty exiting, or
+   *  the shell's own OSC 133 command-end mark. Quietness never does. */
+  const settleAgentTurn = (signal) => {
     if (rec.agentQuietTimer) clearTimeout(rec.agentQuietTimer)
+    rec.agentQuietTimer = null
+    if (!rec.agentBusy && !rec.agentTurnOpen) return
+    rec.agentBusy = false
+    rec.agentTurnOpen = false
+    rec.agentQuietSince = null
+    rec.agentMarkCarry = ''
+    rec.agentCompletionSignal = signal
+    // A turn demoted by silence first already carries the moment output
+    // stopped; confirming it later must not move the timestamp the UI shows.
+    rec.agentCompletedAt = rec.agentCompletedAt ?? Date.now()
+    reportActivity('agent-settled', id)
+    broadcastAgentActivity()
+  }
+  /** Degraded fallback for agents that never signal an end of turn: after
+   *  AGENT_QUIET_MS the busy indicator relaxes so the UI stops claiming live
+   *  work, but the turn stays OPEN and unconfirmed. A quiet model or a slow
+   *  tool call is still work in progress, so this state keeps blocking every
+   *  update/retirement gate until a real completion signal arrives. */
+  const markAgentQuiet = () => {
     rec.agentQuietTimer = null
     if (!rec.agentBusy) return
     rec.agentBusy = false
-    rec.agentCompletedAt = Date.now()
-    reportActivity('agent-settled', id)
+    rec.agentQuietSince = Date.now()
+    rec.agentCompletedAt = rec.agentQuietSince
+    rec.agentCompletionSignal = null
+    reportActivity('agent-quiet', id)
     broadcastAgentActivity()
   }
   const armAgentQuiet = () => {
     if (!rec.agentBusy) return
     if (rec.agentQuietTimer) clearTimeout(rec.agentQuietTimer)
-    rec.agentQuietTimer = setTimeout(settleAgentTurn, AGENT_QUIET_MS)
+    rec.agentQuietTimer = setTimeout(markAgentQuiet, AGENT_QUIET_MS)
     rec.agentQuietTimer.unref?.()
   }
   rec.setAgentTurn = (busy) => {
     if (busy) {
       if (rec.agentQuietTimer) clearTimeout(rec.agentQuietTimer)
       rec.agentBusy = true
+      rec.agentTurnOpen = true
       rec.agentCompletedAt = null
+      rec.agentCompletionSignal = null
+      rec.agentQuietSince = null
+      rec.agentMarkCarry = ''
       reportActivity('agent-busy', id)
       broadcastAgentActivity()
       armAgentQuiet()
-    } else settleAgentTurn()
+    } else settleAgentTurn('agent-turn')
     return true
   }
   const flushPending = () => {
@@ -504,7 +709,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     if (!rec.pending) return
     const chunk = rec.pending
     rec.pending = ''
-    if (rec.rendererVisible) send(rec.sender, `terminal:data:${id}`, chunk)
+    if (rec.rendererVisible) deliverPrimaryOutput(rec, id, chunk)
   }
   rec.flushPending = flushPending
   p.onData((data) => {
@@ -516,6 +721,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
         rec.agentRespondedAt = responseAt
       }
     }
+    if (rec.agentTurnOpen && consumeCommandEndMark(rec, data)) settleAgentTurn('shell-command-end')
     for (const piece of splitUtf8(data)) {
       const chunk = rec.cursor.append(piece)
       rec.observers.broadcast('terminal:observer-output', { id, ...chunk }, {
@@ -538,16 +744,19 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     rec.exitedWhileDetached = !rec.rendererVisible
     rec.exitStatus = { exitCode: exitCode ?? 0, signal: signal ?? null }
     if (!shuttingDown) rec.spool.markExited(rec.exitStatus)
-    settleAgentTurn()
-    send(rec.sender, `terminal:exit:${id}`, rec.exitStatus.exitCode)
+    settleAgentTurn('terminal-exit')
+    // The whole status, not just the code: a signal-killed session exits 0 and
+    // would otherwise be indistinguishable from a clean one. Clients that never
+    // negotiated terminal-exit-status-v1 are downgraded back to the bare code
+    // by the broker's event sink — the manager does not track features.
+    send(rec.sender, `terminal:exit:${id}`, rec.exitStatus)
     rec.observers.broadcast('terminal:observer-exit', {
       id,
       streamEpoch: rec.cursor.streamEpoch,
       offset: rec.cursor.nextOffset,
       exitStatus: rec.exitStatus,
     }, { streamEpoch: rec.cursor.streamEpoch, endOffset: rec.cursor.nextOffset })
-    rec.waiters.forEach((w) => w(rec.exitStatus))
-    rec.waiters = []
+    resolveExitWaiters(rec, rec.exitStatus)
   })
   terms.set(id, rec)
   if (missingCwd) {
@@ -577,18 +786,18 @@ function agentTurn(id, busy) {
 }
 
 function resizeRecord(record, cols, rows) {
-  if (!record || !Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) {
-    return false
-  }
+  if (!record) return false
+  const geometry = validatedTerminalGeometry({ cols, rows })
+  if (!geometry.ok) return false
   try {
-    record.pty.resize(cols, rows)
+    record.pty.resize(geometry.value.cols, geometry.value.rows)
   } catch {
     // The controller must not cache a geometry the PTY never accepted. A later
     // level-triggered desktop synchronization can safely retry the same size.
     return false
   }
-  record.cols = cols
-  record.rows = rows
+  record.cols = geometry.value.cols
+  record.rows = geometry.value.rows
   return true
 }
 
@@ -622,6 +831,7 @@ function setSender(id, sender) {
   }
   r.pending = ''
   r.sender = sender
+  r.primaryOutputPaused = false
   r.lastSender = sender
   r.rendererVisible = true
   r.spool.setVisible(true)
@@ -652,21 +862,18 @@ function detachRenderer(id, sender, viewState) {
   return true
 }
 
-/** Main-process fallback for a renderer crash/window close where React cleanup
- * never got a chance to send terminal:detachRenderer. PTYs keep running; only
- * renderer ownership and hot scrollback move to the disk spool. */
-function detachSender(sender) {
-  let detached = 0
-  for (const [id, r] of terms) {
-    if (!r.sender || !sender || !sameSender(r.sender, sender)) continue
-    const prior = r.sender
-    if (detachRenderer(id, prior)) {
-      r.lastSender = prior
-      r.sender = null
-      detached++
-    }
-  }
-  return detached
+/** Drop ownership only for the exact authenticated terminal. A missing id
+ * fails closed; broad socket-loss cleanup has the explicitly named
+ * detachSenderPrefix path below. PTYs keep running and move to the disk spool. */
+function detachSender(sender, terminalId) {
+  if (typeof terminalId !== 'string' || !terminalId) return 0
+  const r = terms.get(terminalId)
+  if (!r?.sender || !sender || !sameSender(r.sender, sender)) return 0
+  const prior = r.sender
+  if (!detachRenderer(terminalId, prior)) return 0
+  r.lastSender = prior
+  r.sender = null
+  return 1
 }
 
 /** Broker socket loss means every renderer owner from that app instance is
@@ -706,6 +913,8 @@ function snapshot(id) {
     exited: r.exited,
     exitStatus: r.exitStatus,
     agentBusy: r.agentBusy,
+    agentTurnOpen: r.agentTurnOpen,
+    agentCompletionSignal: r.agentCompletionSignal,
     agentCompletedAt: r.agentCompletedAt,
     agentRespondedAt: r.agentRespondedAt,
   }
@@ -732,6 +941,9 @@ function history(id, { streamEpoch, beforeOffset, maxBytes } = {}) {
     endOffset,
     hasMore: page.hasMore,
     truncated: page.truncated,
+    // Only present once a quota evicted something — the page that stops short
+    // of byte zero carries the reason it does.
+    ...(page.truncation ? { truncation: page.truncation } : {}),
   }
 }
 
@@ -802,23 +1014,141 @@ function unsubscribeSubscriberPrefix(prefix) {
   return removed
 }
 
-function waitForExit(id) {
+function disarmExitWaiter(entry) {
+  if (entry.timer) clearTimeout(entry.timer)
+  entry.timer = null
+  return entry
+}
+
+/** Take the whole waiter list off a record so a settle can never run twice. */
+function takeExitWaiters(record) {
+  const entries = record.waiters
+  record.waiters = []
+  return entries.map(disarmExitWaiter)
+}
+
+function resolveExitWaiters(record, exitStatus) {
+  for (const entry of takeExitWaiters(record)) entry.resolve(exitStatus)
+}
+
+/** A wait that can no longer be answered is rejected, never left pending: the
+ * caller's request must fail loudly instead of hanging on a dead terminal. */
+function rejectExitWaiters(entries, message) {
+  for (const entry of entries) entry.reject(new Error(message))
+  return entries.length
+}
+
+function dropExitWaiter(record, entry) {
+  const index = record.waiters.indexOf(entry)
+  if (index >= 0) record.waiters.splice(index, 1)
+  disarmExitWaiter(entry)
+}
+
+/** Reject and forget every waiter a predicate matches. The terminal itself is
+ * untouched: a client leaving says nothing about the command it was watching. */
+function cancelMatchingExitWaiters(record, matches) {
+  const kept = []
+  const cancelled = []
+  for (const entry of record.waiters) {
+    if (matches(entry)) cancelled.push(disarmExitWaiter(entry))
+    else kept.push(entry)
+  }
+  record.waiters = kept
+  return rejectExitWaiters(cancelled, 'terminal exit wait cancelled')
+}
+
+/**
+ * Await a terminal's exit status. `owner` is the requesting client's capability
+ * key: one client asking twice for the same terminal shares a single resolver
+ * (and the first ask's bound), and cancelExitWaiters[Prefix]() can drop that
+ * closure when the client goes away. `timeoutMs` bounds one wait; without it the
+ * wait lasts as long as the pty, which is the right answer for a command that
+ * legitimately runs for hours.
+ */
+function waitForExit(id, { owner = null, timeoutMs = null } = {}) {
   const r = terms.get(id)
   if (!r) return Promise.reject(new Error('Terminal is no longer available.'))
   if (r.exited) return Promise.resolve(r.exitStatus)
-  return new Promise((resolve) => r.waiters.push(resolve))
+  const key = senderId(owner)
+  const existing = key ? r.waiters.find((entry) => entry.owner === key) : null
+  if (existing) return existing.promise
+  if (r.waiters.length >= MAX_EXIT_WAITERS) {
+    return Promise.reject(new Error('too many terminal exit waiters'))
+  }
+  const entry = { owner: key, resolve: null, reject: null, timer: null, promise: null }
+  entry.promise = new Promise((resolve, reject) => {
+    entry.resolve = resolve
+    entry.reject = reject
+  })
+  const bound = Number(timeoutMs)
+  if (Number.isFinite(bound) && bound > 0) {
+    entry.timer = setTimeout(() => {
+      dropExitWaiter(r, entry)
+      entry.reject(new Error('terminal exit wait timed out'))
+    }, Math.min(bound, MAX_EXIT_WAIT_MS))
+    entry.timer.unref?.()
+  }
+  r.waiters.push(entry)
+  return entry.promise
+}
+
+function exitWaiterCount(id) {
+  return terms.get(id)?.waiters.length ?? 0
+}
+
+/** Cancel one owner's pending waits on one terminal. */
+function cancelExitWaiters(id, owner) {
+  const r = terms.get(id)
+  const key = senderId(owner)
+  if (!r || !key) return 0
+  return cancelMatchingExitWaiters(r, (entry) => entry.owner === key)
+}
+
+/** Broker socket loss: every wait owned by that app instance is unanswerable,
+ * so the closures go with the connection instead of outliving it on a pty that
+ * may keep running for hours. */
+function cancelExitWaitersPrefix(prefix) {
+  if (!prefix) return 0
+  let cancelled = 0
+  for (const r of terms.values()) {
+    cancelled += cancelMatchingExitWaiters(r, (entry) => entry.owner.startsWith(prefix))
+  }
+  return cancelled
+}
+
+function killRecord(record) {
+  if (!record) {
+    return {
+      ok: false,
+      code: 'terminal_not_found',
+      message: 'terminal is no longer available',
+    }
+  }
+  // Killing is idempotent once node-pty has already delivered its exit event.
+  // Cold history records also have no pty, but always carry exited=true.
+  if (record.exited) return { ok: true, alreadyExited: true }
+  if (!record.pty) {
+    return {
+      ok: false,
+      code: 'terminal_kill_unavailable',
+      message: 'terminal signal unavailable',
+    }
+  }
+  try {
+    if (record.pty.kill() === false) {
+      return { ok: false, code: 'terminal_kill_failed', message: 'terminal signal failed' }
+    }
+  } catch {
+    // Never reflect a native/backend diagnostic across the authenticated wire:
+    // it can contain process or filesystem details. The fixed code remains
+    // actionable while the unchanged record proves the terminal is still live.
+    return { ok: false, code: 'terminal_kill_failed', message: 'terminal signal failed' }
+  }
+  return { ok: true }
 }
 
 function kill(id) {
-  const r = terms.get(id)
-  if (r) {
-    try {
-      if (r.pty) r.pty.kill()
-    } catch {
-      /* noop */
-    }
-  }
-  return !!r
+  return { id, ...killRecord(terms.get(id)) }
 }
 
 function release(id) {
@@ -829,6 +1159,8 @@ function release(id) {
   kill(id)
   r?.spool.close({ remove: true })
   terms.delete(id)
+  // The record is gone, so its pty exit can no longer reach these resolvers.
+  if (r) rejectExitWaiters(takeExitWaiters(r), 'Terminal is no longer available.')
 }
 
 /** Broker-owned close grace survives renderer crashes, appearance swaps, and
@@ -874,18 +1206,23 @@ function untrackChild(child) {
 /**
  * Broker-authoritative update gate. UI visibility, cached inventory, and a
  * quiet timer are never treated as permission to replace the process: every
- * live PTY, every explicit agent turn, and every tracked non-PTY child must be
- * absent in this single event-loop snapshot.
+ * live PTY, every open agent turn, and every tracked non-PTY child must be
+ * absent in this single event-loop snapshot. A turn the silence fallback
+ * demoted still counts — it is reported separately as unconfirmed so a pending
+ * response names the terminals that never signalled an end of turn.
  */
 function summarizeUpgradeReadiness(records, childCount) {
   const liveTerminalIds = []
   const busyTerminalIds = []
+  const unconfirmedTurnIds = []
   for (const record of records) {
     if (!record.exited) liveTerminalIds.push(String(record.id))
-    if (record.agentBusy) busyTerminalIds.push(String(record.id))
+    if (record.agentBusy || record.agentTurnOpen) busyTerminalIds.push(String(record.id))
+    if (!record.agentBusy && record.agentTurnOpen) unconfirmedTurnIds.push(String(record.id))
   }
   liveTerminalIds.sort()
   busyTerminalIds.sort()
+  unconfirmedTurnIds.sort()
   const runningChildCount = Math.max(0, Number(childCount) || 0)
   return {
     safe: liveTerminalIds.length === 0 && busyTerminalIds.length === 0 && runningChildCount === 0,
@@ -893,6 +1230,8 @@ function summarizeUpgradeReadiness(records, childCount) {
     liveTerminalIds,
     busyAgentCount: busyTerminalIds.length,
     busyTerminalIds,
+    unconfirmedTurnCount: unconfirmedTurnIds.length,
+    unconfirmedTurnIds,
     childTaskCount: runningChildCount,
   }
 }
@@ -902,8 +1241,10 @@ function upgradeReadiness() {
 }
 
 /** Rolling cutover preserves live PTYs and tracked child processes in this
- * process. Only an explicitly working CLI agent blocks the stability window;
- * socket-request and lease races are fenced by the broker's activity epoch. */
+ * process. Only an open CLI agent turn blocks the stability window — including
+ * one that merely went quiet, because no completion signal arrived to prove the
+ * work finished; socket-request and lease races are fenced by the broker's
+ * activity epoch. */
 function rollingUpdateReadiness() {
   const summary = summarizeUpgradeReadiness(terms.values(), runChildren.size)
   return { ...summary, safe: summary.busyAgentCount === 0 }
@@ -927,6 +1268,7 @@ function killAll() {
     // App quit is not a user close: retain the spool so persisted terminal
     // records can restore their previous scrollback on next launch.
     r.spool.close()
+    rejectExitWaiters(takeExitWaiters(r), 'Terminal is no longer available.')
   }
   terms.clear()
   // terminal:run children are plain child_process, not ptys — reap them too, or
@@ -956,7 +1298,7 @@ function list() {
     try {
       proc = r.pty.process || ''
     } catch { /* pty backend may refuse mid-teardown */ }
-    out.push({ id: r.id, pid: r.pty.pid, process: proc, cwd: r.cwd, cols: r.cols, rows: r.rows, owner: senderId(r.sender), lastOwner: senderId(r.lastSender), agentBusy: r.agentBusy, agentCompletedAt: r.agentCompletedAt, agentRespondedAt: r.agentRespondedAt })
+    out.push({ id: r.id, pid: r.pty.pid, process: proc, cwd: r.cwd, cols: r.cols, rows: r.rows, owner: senderId(r.sender), lastOwner: senderId(r.lastSender), agentBusy: r.agentBusy, agentTurnOpen: r.agentTurnOpen, agentCompletionSignal: r.agentCompletionSignal, agentCompletedAt: r.agentCompletedAt, agentRespondedAt: r.agentRespondedAt })
   }
   return out
 }
@@ -972,13 +1314,20 @@ function diagnostics() {
     exited: r.exited,
     owner: senderId(r.sender),
     lastOwner: senderId(r.lastSender),
+    // Surfaced in broker.status so an unconfirmed (silence-demoted) turn is
+    // legible to whoever is deciding whether this helper may be replaced.
+    agentBusy: r.agentBusy,
+    agentTurnOpen: r.agentTurnOpen,
+    agentCompletionSignal: r.agentCompletionSignal,
+    agentQuietSince: r.agentQuietSince,
     detachedAt: r.detachedAt,
     detachedBytes: r.detachedBytes,
     streamEpoch: r.cursor.streamEpoch,
     endOffset: r.cursor.nextOffset,
     observerCount: r.observers.stats().subscribers,
     pausedObserverCount: r.observers.stats().paused,
+    exitWaiterCount: r.waiters.length,
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, parseLsofCwd, refreshTerminalCwds } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, MAX_EXIT_WAITERS } }

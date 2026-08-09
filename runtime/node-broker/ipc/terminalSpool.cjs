@@ -12,9 +12,10 @@ const intEnv = (name, fallback, min, max) => {
 }
 
 // Explicit ACP terminal/output requests may set a retention cap. Interactive
-// user terminals do not: their append-only log is the durable first-message
-// truth surface, while snapshots and renderer scrollback stay independently
-// bounded. The legacy env cap remains the default only for bounded rotation.
+// user terminals do not: their log is the durable first-message truth surface
+// and stays append-only for as long as it fits the history quota below, while
+// snapshots and renderer scrollback stay independently bounded. The legacy env
+// cap remains the default only for retentionCap-driven rotation.
 const DEFAULT_DISK_CAP = intEnv('KAISOLA_TERMINAL_DISK_MB', 64, 2, 512) * 1024 * 1024
 const DEFAULT_HOT_CAP = intEnv('KAISOLA_TERMINAL_HOT_KB', 1024, 128, 4096) * 1024
 // How much retained output one reattach/resubscribe returns.
@@ -30,6 +31,25 @@ const DEFAULT_SNAPSHOT_CAP = intEnv('KAISOLA_TERMINAL_SNAPSHOT_KB', 4096, 256, 1
 const DEFAULT_QUEUE_CAP = intEnv('KAISOLA_TERMINAL_SPOOL_BATCH_KB', 256, 32, 1024) * 1024
 const DEFAULT_COLD_TAIL_CAP = 512 * 1024
 const SPOOL_APPEND_DEBOUNCE_MS = 750
+// Retained-history quotas. Interactive terminals used to be append-only with no
+// ceiling at all, so one long-lived noisy shell could fill the user's volume.
+// Two bounds now apply: how much history a single terminal may keep, and how
+// much every spool sharing a directory may keep between them (which is also
+// what reclaims the segments a closed-but-restorable terminal left behind).
+//
+// The per-terminal default is the largest history budget Settings offers, so
+// the app's soft "terminal history uses N on disk" warning still fires first at
+// every budget a user can pick. These quotas are the backstop underneath it,
+// not the number anyone is meant to hit.
+const DEFAULT_HISTORY_QUOTA = intEnv('KAISOLA_TERMINAL_HISTORY_MB', 4096, 64, 32_768) * 1024 * 1024
+const DEFAULT_TOTAL_HISTORY_QUOTA = intEnv('KAISOLA_TERMINAL_HISTORY_TOTAL_MB', 16_384, 128, 131_072) * 1024 * 1024
+// Warn at this share of a quota — before anything is evicted, while the user
+// can still copy or close something.
+const QUOTA_WARN_RATIO = 0.8
+// A directory sweep stats every retained segment, so it is amortized against
+// fresh output rather than run per append. A small quota sweeps sooner so the
+// ceiling it names is the one actually enforced.
+const MAX_SWEEP_INTERVAL = 4 * 1024 * 1024
 
 function safeBase(id) {
   return crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, 32)
@@ -109,6 +129,69 @@ const { atomicJson } = require('./brokerWire.cjs')
 // silently misreading a restructured viewState/decModes shape.
 const META_VERSION = 1
 
+/** `null` means unbounded. That stays reachable on purpose: a caller (or a test
+ * pinning the historic append-only contract) can opt one spool out without
+ * disabling the quota for every other terminal. */
+function normalizeQuota(value) {
+  const n = Number(value)
+  return value == null || !Number.isFinite(n) ? null : Math.max(1, Math.floor(n))
+}
+
+/** Truncation provenance: how much history was dropped, how often, and why.
+ * Persisted with the meta so a restored terminal can still explain a scrollback
+ * that no longer reaches byte zero. */
+function normalizeTruncation(value) {
+  const source = value && typeof value === 'object' ? value : {}
+  const count = (input) => (Number.isSafeInteger(input) && input >= 0 ? input : 0)
+  const stamp = (input) => (Number.isSafeInteger(input) && input >= 0 ? input : null)
+  return {
+    evictedBytes: count(source.evictedBytes),
+    evictions: count(source.evictions),
+    reason: typeof source.reason === 'string' ? source.reason : null,
+    firstAt: stamp(source.firstAt),
+    lastAt: stamp(source.lastAt),
+  }
+}
+
+// Open spools, so a directory sweep can tell a segment that still backs a live
+// terminal from an orphan left behind by a closed one. Every spool is removed
+// again by close(), which terminalManager pairs with every record it drops.
+const liveSpools = new Set()
+
+function ownerOf(file) {
+  for (const spool of liveSpools) {
+    if (spool.file === file || spool.prevFile === file) return spool
+  }
+  return null
+}
+
+/** Stamp the meta of an evicted-but-restorable terminal so the loss survives
+ * into the session that reopens it. Returns the terminal id when known. */
+function recordOrphanTruncation(dir, segmentName, bytes) {
+  const metaFile = path.join(dir, `${segmentName.replace(/(?:\.prev)?\.log$/, '')}.json`)
+  let fd
+  try {
+    fd = openSegment(metaFile, O_RDONLY)
+    const meta = JSON.parse(fs.readFileSync(fd, 'utf8'))
+    if (!meta || (meta.v != null && meta.v !== META_VERSION)) return null
+    const at = Date.now()
+    const prior = normalizeTruncation(meta.truncation)
+    meta.truncation = {
+      evictedBytes: prior.evictedBytes + Math.max(0, Math.floor(Number(bytes) || 0)),
+      evictions: prior.evictions + 1,
+      reason: 'directory-quota',
+      firstAt: prior.firstAt ?? at,
+      lastAt: at,
+    }
+    atomicJson(metaFile, meta)
+    return typeof meta.id === 'string' ? meta.id : null
+  } catch {
+    return null
+  } finally {
+    if (fd != null) try { fs.closeSync(fd) } catch { /* noop */ }
+  }
+}
+
 /** Return at most `bytes` from the end without starting inside a multi-byte
  * UTF-8 code point. ACP explicitly requires character-boundary truncation. */
 function utf8Tail(value, bytes) {
@@ -119,6 +202,29 @@ function utf8Tail(value, bytes) {
   let start = buffer.length - cap
   while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start++
   return buffer.subarray(start).toString('utf8')
+}
+
+/** Evict whole chunks from the front of `chunks` until the retained tail fits
+ * `cap`, then trim what is left when a single chunk is still oversized, and
+ * return the new byte length. Dropping only while more than one chunk remained
+ * left one write larger than the cap retained whole, so a terminal that emitted
+ * a megabyte in a single burst kept all of it and the RAM ceiling did not hold.
+ * The surviving trim is a UTF-8 tail: the tail can only start on a character
+ * boundary. Mutates `chunks` in place. */
+function trimChunksToCap(chunks, byteLength, cap) {
+  const limit = Number.isFinite(Number(cap)) ? Math.max(0, Math.floor(Number(cap))) : 0
+  let length = byteLength
+  while (chunks.length > 1 && length > limit) {
+    length -= Buffer.byteLength(chunks.shift())
+  }
+  if (chunks.length === 1 && length > limit) {
+    const tail = utf8Tail(chunks[0], limit)
+    length = Buffer.byteLength(tail)
+    // A cap smaller than the trailing scalar leaves nothing retainable.
+    if (length) chunks[0] = tail
+    else chunks.length = 0
+  }
+  return length
 }
 
 function readTail(file, bytes) {
@@ -204,12 +310,34 @@ class TerminalSpool {
     }
   }
 
-  constructor({ dir, id, diskCap = DEFAULT_DISK_CAP, hotCap = DEFAULT_HOT_CAP, queueCap = DEFAULT_QUEUE_CAP, retentionCap = null, fresh = false }) {
+  constructor({
+    dir,
+    id,
+    diskCap = DEFAULT_DISK_CAP,
+    hotCap = DEFAULT_HOT_CAP,
+    queueCap = DEFAULT_QUEUE_CAP,
+    retentionCap = null,
+    fresh = false,
+    historyQuota = DEFAULT_HISTORY_QUOTA,
+    totalHistoryQuota = DEFAULT_TOTAL_HISTORY_QUOTA,
+    onQuota = null,
+  }) {
     this.id = String(id)
+    this.dir = dir
     this.diskCap = diskCap
     this.hotCap = hotCap
     this.queueCap = queueCap
     this.retentionCap = Number.isFinite(retentionCap) ? Math.max(0, Math.floor(retentionCap)) : null
+    this.historyQuota = normalizeQuota(historyQuota)
+    this.totalHistoryQuota = normalizeQuota(totalHistoryQuota)
+    this.onQuota = typeof onQuota === 'function' ? onQuota : null
+    this.truncation = normalizeTruncation(null)
+    this.quotaWarned = false
+    this.directoryQuotaWarned = false
+    // Sweep on the first append rather than in the constructor: a directory
+    // already over quota when the app launches must not wait for 4 MiB of
+    // fresh output, but a spawn should not pay for a readdir it may not need.
+    this.bytesSinceSweep = Number.POSITIVE_INFINITY
     this.visible = true
     this.chunks = []
     this.chunksLen = 0
@@ -254,7 +382,12 @@ class TerminalSpool {
           if (TRACKED_DEC_MODES.has(n)) this.decModes.set(n, !!set)
         }
       }
+      // History dropped by a previous session stays dropped: carry the
+      // provenance forward so the reopened terminal keeps saying so.
+      this.truncation = normalizeTruncation(meta.truncation)
+      if (this.truncation.evictions > 0) this.truncated = true
     }
+    liveSpools.add(this)
   }
 
   _trackModes(data) {
@@ -318,20 +451,22 @@ class TerminalSpool {
       this.fallbackChunks = []
       this.fallbackLen = 0
       this.diskError = null
-      // Interactive terminals are append-only until the user explicitly closes
-      // the session. That is what makes terminal.history able to reach the
-      // literal first byte. ACP-created capture terminals can request an
-      // explicit retentionCap; only those use the bounded two-segment rotation.
-      if (this.retentionCap != null && size > Math.max(1, Math.floor(this.diskCap / 2))) {
-        // unlink and rename act on the link itself, never its target, so
-        // rotation cannot clobber a file a planted prevFile link points at.
-        // The rotated-in current segment already passed openSegment above.
-        const discardedBytes = segmentSize(this.prevFile)
-        try { fs.unlinkSync(this.prevFile) } catch { /* first segment */ }
-        if (discardedBytes) this.epochStartOffset = Math.max(0, this.epochStartOffset - discardedBytes)
-        fs.renameSync(this.file, this.prevFile)
-        if (discardedBytes != null) this.truncated = true
+      this.bytesSinceSweep += Buffer.byteLength(payload)
+      // Interactive terminals stay append-only for as long as they fit their
+      // quota — that is what lets terminal.history reach the literal first
+      // byte of an ordinary session. Past it they rotate through the same
+      // bounded two-segment scheme as an ACP capture terminal, which sizes its
+      // rotation from the explicit retentionCap's disk cap instead.
+      const budget = this.retentionCap != null ? this.diskCap : this.historyQuota
+      if (budget != null) {
+        // A capture terminal rotating inside its own retentionCap is the
+        // contract its caller asked for, not history the user is losing: it
+        // keeps the provenance but stays quiet and off the extra meta write.
+        const quotaDriven = this.retentionCap == null
+        if (quotaDriven) this._noteQuotaPressure(size, budget)
+        if (size > Math.max(1, Math.floor(budget / 2))) this._rotateSegments(quotaDriven)
       }
+      this._sweepDirectoryQuota()
     } catch (err) {
       this.diskError = String((err && err.code) || (err && err.message) || err || 'disk-write-failed')
       this.truncated = true
@@ -360,14 +495,143 @@ class TerminalSpool {
     }
   }
 
+  _emitQuota(event) {
+    const payload = { id: this.id, at: Date.now(), ...event }
+    this.lastQuotaEvent = payload
+    try { this.onQuota?.(payload) } catch { /* diagnostics must never break a write */ }
+    return payload
+  }
+
+  /** Warn once per approach, before anything is evicted. The warning re-arms
+   * after an eviction so a terminal that keeps filling keeps saying so. */
+  _noteQuotaPressure(currentSize, budget) {
+    const retained = currentSize + (segmentSize(this.prevFile) || 0)
+    if (retained < Math.floor(budget * QUOTA_WARN_RATIO)) {
+      this.quotaWarned = false
+      return
+    }
+    if (this.quotaWarned) return
+    this.quotaWarned = true
+    this._emitQuota({ phase: 'warning', scope: 'terminal', retainedBytes: retained, quotaBytes: budget })
+  }
+
+  /** In-memory provenance only. Persisting and announcing are the caller's
+   * call, because the directory sweep speaks for its own evictions and a
+   * capture terminal's rotation is not worth either. */
+  _recordEviction(bytes, reason) {
+    const at = Date.now()
+    this.truncated = true
+    this.truncation.evictedBytes += Math.max(0, Math.floor(Number(bytes) || 0))
+    this.truncation.evictions += 1
+    this.truncation.reason = reason
+    if (this.truncation.firstAt == null) this.truncation.firstAt = at
+    this.truncation.lastAt = at
+    this.quotaWarned = false
+  }
+
+  /** Retire the current segment. The previous one, if any, is the history the
+   * quota costs us — epochStartOffset indexes the retained spool, so it moves
+   * back by exactly the bytes that stopped being retained. */
+  _rotateSegments(quotaDriven) {
+    // A planted symlink is unlinked but never credited as retained history.
+    // Only a verified owned regular file counts as an eviction.
+    const priorSize = segmentSize(this.prevFile)
+    const discarded = priorSize != null
+    const discardedBytes = priorSize || 0
+    try { fs.unlinkSync(this.prevFile) } catch { /* first segment */ }
+    if (discardedBytes) this.epochStartOffset = Math.max(0, this.epochStartOffset - discardedBytes)
+    fs.renameSync(this.file, this.prevFile)
+    if (!discarded) return
+    this._recordEviction(discardedBytes, quotaDriven ? 'terminal-quota' : 'retention-cap')
+    if (!quotaDriven) return
+    this.persistMeta()
+    this._emitQuota({
+      phase: 'evicted',
+      scope: 'terminal',
+      reason: 'terminal-quota',
+      evictedBytes: discardedBytes,
+      retainedBytes: this._retainedDiskBytes(),
+    })
+  }
+
+  /** A directory sweep removed this spool's cold segment out from under it. */
+  _noteSegmentEvicted(bytes) {
+    if (bytes) this.epochStartOffset = Math.max(0, this.epochStartOffset - bytes)
+    this._recordEviction(bytes, 'directory-quota')
+    this.persistMeta()
+  }
+
+  /** Bound what every spool sharing this directory retains between them. This
+   * is the half of the quota that reclaims segments a closed-but-restorable
+   * terminal left behind — nothing else ever deletes those. */
+  _sweepDirectoryQuota() {
+    const quota = this.totalHistoryQuota
+    if (quota == null) return
+    // A small quota has to be checked often enough to actually hold.
+    if (this.bytesSinceSweep < Math.min(MAX_SWEEP_INTERVAL, Math.max(1, Math.floor(quota / 8)))) return
+    this.bytesSinceSweep = 0
+    const segments = []
+    try {
+      for (const name of fs.readdirSync(this.dir)) {
+        if (!name.endsWith('.log')) continue
+        const file = path.join(this.dir, name)
+        try {
+          const stat = fs.lstatSync(file)
+          if (stat.isFile()
+              && (typeof process.getuid !== 'function' || stat.uid === process.getuid())) {
+            segments.push({ file, name, size: stat.size, mtimeMs: stat.mtimeMs })
+          }
+        } catch { /* vanished mid-sweep */ }
+      }
+    } catch { return }
+
+    let total = segments.reduce((sum, segment) => sum + segment.size, 0)
+    if (total < Math.floor(quota * QUOTA_WARN_RATIO)) this.directoryQuotaWarned = false
+    else if (!this.directoryQuotaWarned) {
+      this.directoryQuotaWarned = true
+      this._emitQuota({ phase: 'warning', scope: 'directory', retainedBytes: total, quotaBytes: quota })
+    }
+    if (total <= quota) return
+
+    // Oldest segment first. A rotated `.prev.log` is always older than the
+    // `.log` it was renamed from, so mtime order already spends a terminal's
+    // cold half before anything a live session is still writing.
+    segments.sort((a, b) => a.mtimeMs - b.mtimeMs)
+    for (const segment of segments) {
+      if (total <= quota) break
+      const owner = ownerOf(segment.file)
+      if (owner && segment.file === owner.file) continue // never wipe a live tail
+      try { fs.unlinkSync(segment.file) } catch { continue }
+      total -= segment.size
+      let terminalId = null
+      if (owner) {
+        owner._noteSegmentEvicted(segment.size)
+        terminalId = owner.id
+      } else {
+        terminalId = recordOrphanTruncation(this.dir, segment.name, segment.size)
+      }
+      this._emitQuota({
+        id: terminalId,
+        phase: 'evicted',
+        scope: 'directory',
+        reason: 'directory-quota',
+        evictedBytes: segment.size,
+        retainedBytes: total,
+        quotaBytes: quota,
+        segment: segment.name,
+      })
+    }
+  }
+
+  _retainedDiskBytes() {
+    return (segmentSize(this.prevFile) || 0) + (segmentSize(this.file) || 0)
+  }
+
   _retainFallback(text) {
     if (!text) return
     this.fallbackChunks.push(text)
     this.fallbackLen += Buffer.byteLength(text)
-    while (this.fallbackChunks.length > 1 && this.fallbackLen > this.hotCap) {
-      const old = this.fallbackChunks.shift()
-      this.fallbackLen -= Buffer.byteLength(old)
-    }
+    this.fallbackLen = trimChunksToCap(this.fallbackChunks, this.fallbackLen, this.hotCap)
   }
 
   _diskSegments(startOffset = 0) {
@@ -429,10 +693,7 @@ class TerminalSpool {
     if (!this.visible) return
     this.chunks.push(data)
     this.chunksLen += Buffer.byteLength(data)
-    while (this.chunks.length > 1 && this.chunksLen > this.hotCap) {
-      const old = this.chunks.shift()
-      this.chunksLen -= Buffer.byteLength(old)
-    }
+    this.chunksLen = trimChunksToCap(this.chunks, this.chunksLen, this.hotCap)
   }
 
   setVisible(visible, viewState) {
@@ -448,6 +709,7 @@ class TerminalSpool {
 
   persistMeta() {
     const exitEvidence = this.exitEvidence()
+    const truncation = this.truncationEvidence()
     try {
       atomicJson(this.metaFile, {
         v: META_VERSION,
@@ -456,6 +718,7 @@ class TerminalSpool {
         decModes: Object.fromEntries(this.decModes),
         epochStartOffset: this.epochStartOffset,
         ...(exitEvidence || {}),
+        ...(truncation ? { truncation } : {}),
         touchedAt: Date.now(),
       })
     } catch { /* cache failure is non-fatal */ }
@@ -475,17 +738,14 @@ class TerminalSpool {
     return { exitedAt: this.exitedAt, exitStatus: this.exitStatus }
   }
 
-  /** Bytes held by the segments we are willing to read. A refused path counts
-   * as zero, exactly as an absent one does. */
-  _diskByteCount() {
-    let diskBytes = 0
-    for (const file of [this.prevFile, this.file]) diskBytes += segmentSize(file) || 0
-    return diskBytes
+  /** Non-null only once a quota has actually dropped history. */
+  truncationEvidence() {
+    return this.truncation.evictions > 0 ? { ...this.truncation } : null
   }
 
   retainedByteCount() {
     this.flush()
-    return this._diskByteCount() + this.fallbackLen
+    return this._retainedDiskBytes() + this.fallbackLen
   }
 
   startEpoch(offset = this.retainedByteCount()) {
@@ -507,8 +767,17 @@ class TerminalSpool {
     const output = !fallbackBytes && !this.diskError && hotBytes >= cap
       ? utf8Tail(hot, cap)
       : utf8Tail(this._diskTail(cap, this.epochStartOffset) + fallback, cap)
-    const liveDiskBytes = Math.max(0, this._diskByteCount() - this.epochStartOffset)
-    return { output, truncated: this.truncated || liveDiskBytes + fallbackBytes > cap, viewState: this.viewState, modePrefix: this._modePrefix() }
+    const liveDiskBytes = Math.max(0, this._retainedDiskBytes() - this.epochStartOffset)
+    const truncation = this.truncationEvidence()
+    return {
+      output,
+      truncated: this.truncated || liveDiskBytes + fallbackBytes > cap,
+      // Present only once a quota has actually dropped something, so an
+      // ordinary snapshot stays exactly the shape every client already reads.
+      ...(truncation ? { truncation } : {}),
+      viewState: this.viewState,
+      modePrefix: this._modePrefix(),
+    }
   }
 
   /** Return one bounded page ending `distanceFromEnd` bytes before the live
@@ -555,6 +824,7 @@ class TerminalSpool {
       output = output.subarray(skipped)
       startByte += skipped
     }
+    const truncation = this.truncationEvidence()
     return {
       output: output.toString('utf8'),
       startByte,
@@ -562,12 +832,22 @@ class TerminalSpool {
       totalBytes,
       hasMore: startByte > 0,
       truncated: this.truncated,
+      ...(truncation ? { truncation } : {}),
     }
   }
 
   stats() {
-    const diskBytes = this._diskByteCount()
-    return { id: this.id, visible: this.visible, ramBytes: this.chunksLen + this.queuedLen + this.fallbackLen, diskBytes, diskError: this.diskError, viewState: this.viewState }
+    return {
+      id: this.id,
+      visible: this.visible,
+      ramBytes: this.chunksLen + this.queuedLen + this.fallbackLen,
+      diskBytes: this._retainedDiskBytes(),
+      diskError: this.diskError,
+      viewState: this.viewState,
+      historyQuota: this.historyQuota,
+      totalHistoryQuota: this.totalHistoryQuota,
+      truncation: this.truncationEvidence(),
+    }
   }
 
   close({ remove = false } = {}) {
@@ -579,6 +859,9 @@ class TerminalSpool {
     // and a debounced append 750ms later would silently recreate the file
     // the user just asked to be wiped.
     this.closed = true
+    // Deregister before any unlink: from here on these segments are an orphan
+    // the directory sweep may reclaim, not a live terminal's tail.
+    liveSpools.delete(this)
     if (this.appendTimer) {
       clearTimeout(this.appendTimer)
       this.appendTimer = null
@@ -599,6 +882,9 @@ module.exports = {
   DEFAULT_SNAPSHOT_CAP,
   DEFAULT_QUEUE_CAP,
   DEFAULT_COLD_TAIL_CAP,
+  DEFAULT_HISTORY_QUOTA,
+  DEFAULT_TOTAL_HISTORY_QUOTA,
+  QUOTA_WARN_RATIO,
   SPOOL_APPEND_DEBOUNCE_MS,
   readTail,
   utf8Tail,

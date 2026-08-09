@@ -62,6 +62,79 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    func testActivityFromAnotherOwnerOrProjectChangesNoLocalState() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+
+        let target = ReconnectBrokerClient.secondTerminalID
+        let subscribedOwnerID = await fixture.client.subscribedOwnerID(
+            for: ReconnectBrokerClient.firstTerminalID
+        )
+        let observerOwnerID = try XCTUnwrap(subscribedOwnerID)
+        XCTAssertEqual(fixture.model.sessions.first(where: { $0.id == target })?.agentActivity, .idle)
+
+        // Right terminal, another owner: the row must not start working.
+        await fixture.client.emitActivity(
+            for: target,
+            ownerID: "kaisola-native-someone-else",
+            busy: true
+        )
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(fixture.model.sessions.first(where: { $0.id == target })?.agentActivity, .idle)
+
+        // Right owner, another project: the terminal is filed under
+        // project.one, so a frame routed through a different project is just
+        // as untrustworthy.
+        await fixture.client.emitActivity(
+            for: target,
+            ownerID: observerOwnerID,
+            projectID: "project.two",
+            busy: true
+        )
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(fixture.model.sessions.first(where: { $0.id == target })?.agentActivity, .idle)
+        XCTAssertTrue(fixture.attentionCenter.entries.isEmpty)
+
+        // An authentic frame still lands, so the rejections above are the
+        // identity check and not a dead event path.
+        await fixture.client.emitActivity(for: target, ownerID: observerOwnerID, busy: true)
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(
+            fixture.model.sessions.first(where: { $0.id == target })?.agentActivity,
+            .working
+        )
+
+        // A forged completion is the expensive one: it would end the turn and
+        // raise a durable needs-you badge for work that never finished.
+        await fixture.client.emitActivity(
+            for: target,
+            ownerID: "kaisola-native-someone-else",
+            busy: false,
+            completedAt: 1_785_000_400_000
+        )
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(
+            fixture.model.sessions.first(where: { $0.id == target })?.agentActivity,
+            .working
+        )
+        XCTAssertTrue(fixture.attentionCenter.entries.isEmpty)
+
+        await fixture.client.emitActivity(
+            for: target,
+            ownerID: observerOwnerID,
+            busy: false,
+            completedAt: 1_785_000_500_000
+        )
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(
+            fixture.model.sessions.first(where: { $0.id == target })?.agentActivity,
+            .responded(at: 1_785_000_500_000)
+        )
+        XCTAssertEqual(fixture.attentionCenter.entries.map(\.targetID), [target])
+        await fixture.model.disconnect()
+    }
+
     func testDisconnectRetriesAndResubscribesFromTheVisibleCursor() async throws {
         let fixture = try Fixture(failingConnectAttempts: [2])
         defer { fixture.cleanUp() }
@@ -1255,6 +1328,27 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
             )
         ))
     }
+
+    /// Activity frames are emitted with an explicit routing identity so a test
+    /// can forge one that claims another owner or another project.
+    func emitActivity(
+        for id: String,
+        ownerID: String,
+        projectID: String = "project.one",
+        busy: Bool,
+        completedAt: Int64? = nil
+    ) {
+        eventHandler?(BrokerEvent(
+            ownerID: ownerID,
+            projectID: projectID,
+            terminalID: id,
+            kind: .activity(busy: busy, completedAt: completedAt)
+        ))
+    }
+
+    /// The owner identity the app actually subscribed with, which is the only
+    /// one an authentic observer frame can carry.
+    func subscribedOwnerID(for id: String) -> String? { ownerIDsByTerminal[id] }
 
     func connectionAttempts() -> Int { connectCount }
     func failNextInventoryRequests(_ count: Int) {

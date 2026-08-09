@@ -6383,13 +6383,32 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Observer frames carry the broker's routing identity, and only a frame
+    /// that matches this observer *and* the project the terminal is actually
+    /// filed under may act on local state. Project identity comes from the
+    /// authoritative inventory, plus the selected row so a frame that lands
+    /// between a local create and the next poll is still accepted. A frame for
+    /// a terminal this app does not know has no legitimate local target.
+    private func isAuthenticObserverEvent(_ event: BrokerEvent) -> Bool {
+        guard event.ownerID == observerOwnerID else { return false }
+        guard let knownProjectID = sessions.first(where: { $0.id == event.terminalID })?.projectID
+            ?? (selectedSession?.id == event.terminalID ? selectedSession?.projectID : nil)
+        else { return false }
+        return knownProjectID == event.projectID
+    }
+
     private func consume(_ event: BrokerEvent) {
+        // Authenticate before anything else: activity used to be applied ahead
+        // of the owner check, so a misrouted or forged frame could move another
+        // owner's busy/completed state and its needs-you badge. Owner and
+        // project identity are now settled before the first side effect.
+        guard isAuthenticObserverEvent(event) else { return }
+
         // Agent activity updates the session's row even if it is the selected
         // one; it is scoped to the subscribed terminal like every other event.
         if case let .activity(busy, completedAt) = event.kind {
             applyActivity(busy: busy, completedAt: completedAt, to: event.terminalID)
         }
-        guard event.ownerID == observerOwnerID else { return }
 
         if case let .output(epoch, startOffset, endOffset, data) = event.kind {
             if pendingTerminalDraftRestores[event.terminalID] != nil {

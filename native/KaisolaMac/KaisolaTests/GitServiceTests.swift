@@ -443,7 +443,7 @@ final class GitServiceTests: XCTestCase {
 
         let service = GitService(repoRoot: repo)
         let firstPath = FileManager.default.temporaryDirectory
-            .appendingPathComponent("kaisola-wt-\(UUID().uuidString.prefix(6))").path
+            .appendingPathComponent("kaisola-wt-\(UUID().uuidString.prefix(6))-line\nbreak\t雪").path
         let secondPath = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-wt-\(UUID().uuidString.prefix(6))").path
         let firstBranch = "\(GitService.meshBranchPrefix)first"
@@ -466,6 +466,43 @@ final class GitServiceTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: firstPath))
         XCTAssertTrue(try service.branchExists(firstBranch))
         XCTAssertTrue(try service.isRegisteredWorktree(path: firstPath, branch: firstBranch))
+    }
+
+    func testRegisteredWorktreePorcelainParserPreservesNULFramedRecords() {
+        let firstPath = "/tmp/ordinary"
+        let unusualPath = "/tmp/line\nbreak\t雪"
+        let detachedPath = "/tmp/detached"
+        let prunablePath = "/tmp/prunable"
+        let output = [
+            "worktree \(firstPath)",
+            "HEAD 1111111111111111111111111111111111111111",
+            "branch refs/heads/main",
+            "",
+            "worktree \(unusualPath)",
+            "HEAD 2222222222222222222222222222222222222222",
+            "branch refs/heads/kaisola-mesh-unicode",
+            "locked maintenance\nwindow",
+            "",
+            "worktree \(detachedPath)",
+            "HEAD 3333333333333333333333333333333333333333",
+            "detached",
+            "",
+            "worktree \(prunablePath)",
+            "HEAD 4444444444444444444444444444444444444444",
+            "branch refs/heads/kaisola-mesh-prunable",
+            "prunable gitdir file points to non-existent location",
+            "",
+        ].joined(separator: "\0") + "\0"
+
+        XCTAssertEqual(
+            GitService.parseRegisteredWorktrees(output),
+            [
+                GitService.RegisteredWorktree(path: firstPath, branch: "main"),
+                GitService.RegisteredWorktree(path: unusualPath, branch: "kaisola-mesh-unicode"),
+                GitService.RegisteredWorktree(path: detachedPath, branch: nil),
+                GitService.RegisteredWorktree(path: prunablePath, branch: "kaisola-mesh-prunable"),
+            ]
+        )
     }
 
     func testMeshDiscardInventoryDetectsDirtyFiles() throws {

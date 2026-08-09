@@ -879,7 +879,15 @@ struct GitService: Sendable {
     /// Registered worktree truth from Git itself. Persisted Mesh paths are
     /// adopted or removed only after their exact path/branch pair appears here.
     func registeredWorktrees() throws -> [RegisteredWorktree] {
-        let output = try run(["worktree", "list", "--porcelain"])
+        Self.parseRegisteredWorktrees(try run(["worktree", "list", "--porcelain", "-z"]))
+    }
+
+    /// Parse `git worktree list --porcelain -z`. Every attribute is its own
+    /// NUL-delimited record and an empty record ends one worktree, so legal
+    /// newlines and tabs in a path can never become structure. Unknown fields
+    /// such as `locked` and `prunable` remain attached to the current record
+    /// but do not affect the exact path/branch inventory Mesh consumes.
+    static func parseRegisteredWorktrees(_ output: String) -> [RegisteredWorktree] {
         var result: [RegisteredWorktree] = []
         var path: String?
         var branch: String?
@@ -890,15 +898,16 @@ struct GitService: Sendable {
             path = nil
             branch = nil
         }
-        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = String(rawLine)
-            if line.isEmpty {
+        for record in output.split(separator: "\0", omittingEmptySubsequences: false) {
+            if record.isEmpty {
                 flush()
-            } else if line.hasPrefix("worktree ") {
+            } else if record.hasPrefix("worktree ") {
                 flush()
-                path = String(line.dropFirst("worktree ".count))
-            } else if line.hasPrefix("branch refs/heads/") {
-                branch = String(line.dropFirst("branch refs/heads/".count))
+                let value = record.dropFirst("worktree ".count)
+                path = value.isEmpty ? nil : String(value)
+            } else if path != nil, record.hasPrefix("branch refs/heads/") {
+                let value = record.dropFirst("branch refs/heads/".count)
+                branch = value.isEmpty ? nil : String(value)
             }
         }
         flush()

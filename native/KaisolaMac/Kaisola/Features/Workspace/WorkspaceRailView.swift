@@ -38,6 +38,8 @@ struct WorkspaceRailView: View {
     /// Live FSEvents watcher — agent writes refresh the tree automatically.
     @StateObject private var watcher: WorkspaceWatcher
     @StateObject private var tree: WorkspaceTreeModel
+    /// Keeps one click and two clicks from both opening the same file.
+    @StateObject private var clicks = WorkspaceRowClickArbiter()
 
     init(
         root: URL,
@@ -596,7 +598,7 @@ struct WorkspaceRailView: View {
                     tree.load(node.url)
                 }
             } else {
-                openFile(node.url, false)
+                clicks.click(rowID: node.id) { pinned in openFile(node.url, pinned) }
             }
         } label: {
             HStack(spacing: 5) {
@@ -622,7 +624,7 @@ struct WorkspaceRailView: View {
             // its 6pt inset, plus a little air.
             .padding(.trailing, Self.optionsClearance)
             .background(
-                !node.isDirectory && selectedFile?.standardizedFileURL.path == node.url.standardizedFileURL.path
+                rowIsHighlighted(node)
                     ? Color.accentColor.opacity(0.15)
                     : .clear,
                 in: RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -635,7 +637,7 @@ struct WorkspaceRailView: View {
         .simultaneousGesture(
             TapGesture(count: 2).onEnded {
                 guard !node.isDirectory else { return }
-                openFile(node.url, true)
+                clicks.doubleClick(rowID: node.id) { pinned in openFile(node.url, pinned) }
             }
         )
         .contextMenu {
@@ -649,6 +651,15 @@ struct WorkspaceRailView: View {
 
     /// Room kept clear at the trailing edge for the floating options button.
     private static let optionsClearance: CGFloat = 30
+
+    /// The selected file, or — while a click waits out the double-click window
+    /// — the row that click will open. Without the second case a single click
+    /// would leave the rail looking untouched until the document arrived.
+    private func rowIsHighlighted(_ node: FileNode) -> Bool {
+        guard !node.isDirectory else { return false }
+        if let armedRowID = clicks.armedRowID { return armedRowID == node.id }
+        return selectedFile?.standardizedFileURL.path == node.url.standardizedFileURL.path
+    }
 
     private func fileName(_ name: String) -> some View {
         FadingFileName(text: name)
@@ -715,6 +726,103 @@ struct WorkspaceRailView: View {
             }
             ToastCenter.shared.show("Copied \(url.lastPathComponent)", style: .success)
         }
+    }
+}
+
+/// Decides what a click on a file row means, so a single click and a double
+/// click stay mutually exclusive.
+///
+/// SwiftUI fires a row `Button` on every mouse-up and the two-tap gesture fires
+/// on top of it, so one double click used to run the transient open twice and
+/// then the pinned open: three navigations, a tab flickering between preview
+/// and kept-open, and two preview loads for a document the user asked to keep.
+/// Clicks land here instead. The transient open waits out one double-click
+/// interval, and a second click inside that window cancels it and opens the
+/// file pinned, so exactly one open leaves the rail per gesture.
+///
+/// The wait is only observable if the row looks dead while it runs, hence
+/// `armedRowID`: the rail highlights the armed row immediately and the document
+/// arrives a beat later.
+@MainActor
+final class WorkspaceRowClickArbiter: ObservableObject {
+    /// The row whose transient open is waiting for a possible second click.
+    @Published private(set) var armedRowID: String?
+
+    /// The user's own double-click speed — never a longer wait than the window
+    /// AppKit itself uses to call two clicks a double click.
+    private let interval: @MainActor () -> TimeInterval
+    private let schedule: @MainActor (TimeInterval, @escaping @MainActor () -> Void) -> Void
+    /// Monotonic ticket. Every armed open and every settled burst carries one so
+    /// a timer that fires late can tell it was superseded.
+    private var sequence = 0
+    private var armedTicket = 0
+    /// The row a double click already answered. Trailing clicks of the same
+    /// burst — the button's second fire, a third click — are swallowed until
+    /// the window closes.
+    private var settledRowID: String?
+    private var settledTicket = 0
+
+    init(
+        interval: @escaping @MainActor () -> TimeInterval = { NSEvent.doubleClickInterval },
+        schedule: @escaping @MainActor (TimeInterval, @escaping @MainActor () -> Void) -> Void = { delay, work in
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(delay))
+                work()
+            }
+        }
+    ) {
+        self.interval = interval
+        self.schedule = schedule
+    }
+
+    /// One mouse-up on a file row. `open(true)` keeps the document open,
+    /// `open(false)` opens it as the replaceable preview.
+    func click(rowID: String, open: @escaping (Bool) -> Void) {
+        if settledRowID == rowID { return }
+        if armedRowID == rowID {
+            settle(rowID: rowID, open: open)
+        } else {
+            arm(rowID: rowID, open: open)
+        }
+    }
+
+    /// The two-tap gesture. Whether it arrives before or after the button's
+    /// second fire is not guaranteed, so either one may settle the burst and
+    /// the other is swallowed.
+    func doubleClick(rowID: String, open: @escaping (Bool) -> Void) {
+        guard settledRowID != rowID else { return }
+        settle(rowID: rowID, open: open)
+    }
+
+    /// Clicking a second row before the window closes replaces the pending open
+    /// rather than stacking two preview loads: the rail follows the last click.
+    private func arm(rowID: String, open: @escaping (Bool) -> Void) {
+        sequence += 1
+        let ticket = sequence
+        armedTicket = ticket
+        armedRowID = rowID
+        schedule(interval()) { [weak self] in
+            guard let self, self.armedTicket == ticket else { return }
+            self.armedRowID = nil
+            open(false)
+        }
+    }
+
+    private func settle(rowID: String, open: (Bool) -> Void) {
+        sequence += 1
+        let ticket = sequence
+        if armedRowID == rowID {
+            // Bumping the ticket is what cancels the armed transient open.
+            armedTicket = ticket
+            armedRowID = nil
+        }
+        settledTicket = ticket
+        settledRowID = rowID
+        schedule(interval()) { [weak self] in
+            guard let self, self.settledTicket == ticket else { return }
+            self.settledRowID = nil
+        }
+        open(true)
     }
 }
 

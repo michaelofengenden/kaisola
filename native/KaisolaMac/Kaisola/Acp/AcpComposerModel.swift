@@ -556,6 +556,9 @@ struct AcpComposerMenuOption: Equatable, Sendable, Identifiable {
 struct AcpComposerSubmenu: Equatable, Sendable {
     let title: String
     let options: [AcpComposerMenuOption]
+    /// A short consequence statement shown above the choices when changing
+    /// this setting has timing semantics the user needs before committing.
+    var note: String? = nil
 
     /// Search is a cost, not a feature. It appears only once a panel is long
     /// enough that reading it top to bottom stops working.
@@ -649,7 +652,10 @@ enum AcpComposerMenu {
                     caption: nil,
                     isSelected: choice.value == selected
                 )
-            }
+            },
+            note: AcpComposerMetrics.effortOption([option]) == nil
+                ? nil
+                : "Applies to the next message in this chat."
         )
     }
 

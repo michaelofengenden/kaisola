@@ -125,6 +125,66 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertNil(McpSettingsPolicy.duplicateName("other", servers: servers))
     }
 
+    func testSettingsAddPolicyUsesOneCaseInsensitiveTrimmedNameForValidationAndPersistence() {
+        let servers = [
+            McpServerConfig(name: "Project Files", kind: .stdio, command: "server"),
+        ]
+
+        XCTAssertEqual(
+            McpSettingsPolicy.normalizedName("  PROJECT FILES \n"),
+            "PROJECT FILES"
+        )
+        XCTAssertEqual(
+            McpSettingsPolicy.duplicateName("  PROJECT FILES \n", servers: servers),
+            "PROJECT FILES"
+        )
+        XCTAssertFalse(McpSettingsPolicy.canAddServer(
+            rawName: "  PROJECT FILES \n",
+            servers: servers,
+            hasRequiredFields: true,
+            remainingCapacity: 1
+        ))
+        XCTAssertTrue(McpSettingsPolicy.canAddServer(
+            rawName: "  Other Server \n",
+            servers: servers,
+            hasRequiredFields: true,
+            remainingCapacity: 1
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAddServer(
+            rawName: "Other Server",
+            servers: servers,
+            hasRequiredFields: true,
+            remainingCapacity: 0
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAddServer(
+            rawName: " \n ",
+            servers: servers,
+            hasRequiredFields: true,
+            remainingCapacity: 1
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAddServer(
+            rawName: "Other Server",
+            servers: servers,
+            hasRequiredFields: false,
+            remainingCapacity: 1
+        ))
+
+        let persisted = McpServerConfig(
+            name: McpSettingsPolicy.normalizedName("  Other Server \n"),
+            kind: .stdio,
+            command: "server"
+        )
+        store(workspace).save(servers + [persisted])
+        XCTAssertEqual(store(workspace).servers().map(\.name), ["Project Files", "Other Server"])
+    }
+
+    func testSettingsDuplicateMessageIsContentSpecificAndSafeForFieldAndButtonHints() {
+        XCTAssertEqual(
+            McpSettingsPolicy.duplicateMessage("Project Files"),
+            "A server named \"Project Files\" already exists in this project."
+        )
+    }
+
     // MARK: - Session wire shapes
 
     func testStdioJsonValueMatchesNodeShape() {

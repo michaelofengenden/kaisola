@@ -435,7 +435,12 @@ struct BrokerEvent: Equatable, Sendable {
             guard let epoch = payload["streamEpoch"]?.stringValue,
                   let start = payload["startOffset"]?.intValue,
                   let end = payload["endOffset"]?.intValue,
-                  let data = payload["data"]?.stringValue else { return nil }
+                  let data = payload["data"]?.stringValue,
+                  Self.hasValidOutputRange(
+                      startOffset: start,
+                      endOffset: end,
+                      data: data
+                  ) else { return nil }
             kind = .output(epoch: epoch, startOffset: start, endOffset: end, data: data)
         case "terminal:observer-snapshot-required": kind = .snapshotRequired
         case "terminal:observer-exit": kind = .exit
@@ -451,6 +456,18 @@ struct BrokerEvent: Equatable, Sendable {
         self.projectID = projectID
         self.terminalID = terminalID
         self.kind = kind
+    }
+
+    private static func hasValidOutputRange(
+        startOffset: Int64,
+        endOffset: Int64,
+        data: String
+    ) -> Bool {
+        guard startOffset >= 0,
+              endOffset >= startOffset,
+              let byteCount = Int64(exactly: data.utf8.count) else { return false }
+        let (rangeByteCount, overflow) = endOffset.subtractingReportingOverflow(startOffset)
+        return !overflow && rangeByteCount == byteCount
     }
 }
 

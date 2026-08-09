@@ -128,6 +128,92 @@ final class BrokerModelsTests: XCTestCase {
         ))
     }
 
+    func testBrokerEventAcceptsByteExactMultibyteOutputAtValidBoundaries() throws {
+        let data = "é🙂"
+        let byteCount = Int64(data.utf8.count)
+
+        let event = try XCTUnwrap(BrokerEvent(frame: outputEvent(
+            startOffset: 7,
+            endOffset: 7 + byteCount,
+            data: data
+        )))
+        XCTAssertEqual(
+            event.kind,
+            .output(epoch: "epoch", startOffset: 7, endOffset: 7 + byteCount, data: data)
+        )
+
+        XCTAssertNotNil(BrokerEvent(frame: outputEvent(
+            startOffset: 0,
+            endOffset: 0,
+            data: ""
+        )))
+        XCTAssertNotNil(BrokerEvent(frame: outputEvent(
+            startOffset: Int64.max,
+            endOffset: Int64.max,
+            data: ""
+        )))
+    }
+
+    func testBrokerEventRejectsInvalidOutputRanges() {
+        XCTAssertNil(BrokerEvent(frame: outputEvent(
+            startOffset: -1,
+            endOffset: 0,
+            data: "x"
+        )))
+        XCTAssertNil(BrokerEvent(frame: outputEvent(
+            startOffset: 9,
+            endOffset: 8,
+            data: ""
+        )))
+        XCTAssertNil(BrokerEvent(frame: outputEvent(
+            startOffset: 7,
+            endOffset: 8,
+            data: "é"
+        )))
+        XCTAssertNil(BrokerEvent(frame: outputEvent(
+            startOffset: Int64.min,
+            endOffset: Int64.max,
+            data: ""
+        )))
+    }
+
+    func testBrokerEventRejectsOffsetOutsideInt64WireRange() throws {
+        let frame = try JSONDecoder().decode(JSONValue.self, from: Data(#"""
+        {
+            "type":"event",
+            "ownerId":"owner",
+            "projectId":"project",
+            "channel":"terminal:observer-output",
+            "payload":{
+                "id":"terminal",
+                "streamEpoch":"epoch",
+                "startOffset":0,
+                "endOffset":9223372036854775808,
+                "data":""
+            }
+        }
+        """#.utf8))
+
+        XCTAssertNil(BrokerEvent(frame: frame))
+    }
+
+    func testBrokerEventKeepsNonOutputEventShapesIndependentOfOutputRanges() {
+        for channel in [
+            "terminal:observer-snapshot-required",
+            "terminal:observer-exit",
+            "terminal:observer-activity",
+        ] {
+            let frame: JSONValue = .object([
+                "type": .string("event"),
+                "ownerId": .string("owner"),
+                "projectId": .string("project"),
+                "channel": .string(channel),
+                "payload": .object(["id": .string("terminal")]),
+            ])
+            XCTAssertNotNil(BrokerEvent(frame: frame), channel)
+        }
+    }
+
     func testStatusRejectsAProtocolDriftBeforeUsingInventory() {
         let drifted: JSONValue = .object([
             "ok": .bool(true),
@@ -182,6 +268,26 @@ final class BrokerModelsTests: XCTestCase {
             "ok": .bool(true),
             "protocol": .integer(2),
             "securityEpoch": .integer(1),
+        ])
+    }
+
+    private func outputEvent(
+        startOffset: Int64,
+        endOffset: Int64,
+        data: String
+    ) -> JSONValue {
+        .object([
+            "type": .string("event"),
+            "ownerId": .string("owner"),
+            "projectId": .string("project"),
+            "channel": .string("terminal:observer-output"),
+            "payload": .object([
+                "id": .string("terminal"),
+                "streamEpoch": .string("epoch"),
+                "startOffset": .integer(startOffset),
+                "endOffset": .integer(endOffset),
+                "data": .string(data),
+            ]),
         ])
     }
 

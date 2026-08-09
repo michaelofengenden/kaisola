@@ -172,4 +172,88 @@ final class AcpTerminalHostTests: XCTestCase {
         }
         XCTAssertTrue(snapshot?.output.contains("overlay-works") == true)
     }
+
+    @MainActor
+    func testTerminalContentMissingOnFirstPollBecomesUnavailable() async {
+        let model = AcpTerminalContentModel(pollIntervalNanoseconds: 0)
+
+        await model.poll(terminalID: "missing-terminal") { _ in nil }
+
+        XCTAssertEqual(model.status, .unavailable)
+        XCTAssertEqual(model.output, "")
+        XCTAssertFalse(model.outputIsTruncated)
+    }
+
+    @MainActor
+    func testTerminalContentDisappearingAfterOutputPreservesOutputAndBecomesUnavailable() async {
+        let snapshots = TerminalSnapshotSequence([
+            AcpTerminalHost.Snapshot(output: "work in progress", truncated: true, exitStatus: nil),
+            nil,
+        ])
+        let model = AcpTerminalContentModel(pollIntervalNanoseconds: 0)
+
+        await model.poll(terminalID: "evicted-terminal") { _ in
+            await snapshots.next()
+        }
+
+        XCTAssertEqual(model.status, .unavailable)
+        XCTAssertEqual(model.output, "work in progress")
+        XCTAssertTrue(model.outputIsTruncated)
+    }
+
+    @MainActor
+    func testTerminalContentRetryFencesLateSnapshotFromOlderPoll() async {
+        let olderPoll = SuspendedTerminalSnapshot()
+        let model = AcpTerminalContentModel(pollIntervalNanoseconds: 0)
+        let staleSnapshot = AcpTerminalHost.Snapshot(
+            output: "stale output",
+            truncated: false,
+            exitStatus: .init(exitCode: 0, signal: nil)
+        )
+
+        let staleTask = Task { @MainActor in
+            await model.poll(terminalID: "racing-terminal") { _ in
+                await olderPoll.next()
+            }
+        }
+        await olderPoll.waitUntilRequested()
+
+        await model.poll(terminalID: "racing-terminal") { _ in nil }
+        await olderPoll.resolve(with: staleSnapshot)
+        await staleTask.value
+
+        XCTAssertEqual(model.status, .unavailable)
+        XCTAssertEqual(model.output, "")
+    }
+}
+
+private actor TerminalSnapshotSequence {
+    private var snapshots: [AcpTerminalHost.Snapshot?]
+
+    init(_ snapshots: [AcpTerminalHost.Snapshot?]) {
+        self.snapshots = snapshots
+    }
+
+    func next() -> AcpTerminalHost.Snapshot? {
+        snapshots.isEmpty ? nil : snapshots.removeFirst()
+    }
+}
+
+private actor SuspendedTerminalSnapshot {
+    private var continuation: CheckedContinuation<AcpTerminalHost.Snapshot?, Never>?
+    private var requested = false
+
+    func next() async -> AcpTerminalHost.Snapshot? {
+        requested = true
+        return await withCheckedContinuation { continuation = $0 }
+    }
+
+    func waitUntilRequested() async {
+        while !requested { await Task.yield() }
+    }
+
+    func resolve(with snapshot: AcpTerminalHost.Snapshot?) {
+        continuation?.resume(returning: snapshot)
+        continuation = nil
+    }
 }

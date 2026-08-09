@@ -16,6 +16,18 @@ actor AcpTerminalHost {
         let truncated: Bool
         let exitStatus: ExitStatus?
         let outputBufferStats: OutputBufferStats
+
+        init(
+            output: String,
+            truncated: Bool,
+            exitStatus: ExitStatus?,
+            outputBufferStats: OutputBufferStats = .empty
+        ) {
+            self.output = output
+            self.truncated = truncated
+            self.exitStatus = exitStatus
+            self.outputBufferStats = outputBufferStats
+        }
     }
 
     /// Diagnostics for the pipe-to-actor backlog. Each queued element is no
@@ -28,6 +40,15 @@ actor AcpTerminalHost {
         let peakBufferedChunks: Int
         let droppedChunks: UInt64
         let droppedBytes: UInt64
+
+        static let empty = OutputBufferStats(
+            chunkByteLimit: AcpTerminalHost.outputStreamChunkByteLimit,
+            bufferedChunkLimit: AcpTerminalHost.outputStreamBufferedChunkLimit,
+            bufferedByteCeiling: AcpTerminalHost.outputStreamBufferedByteCeiling,
+            peakBufferedChunks: 0,
+            droppedChunks: 0,
+            droppedBytes: 0
+        )
     }
 
     static let defaultOutputByteLimit = 1_048_576

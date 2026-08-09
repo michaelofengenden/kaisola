@@ -35,6 +35,7 @@ struct WorkspaceRailView: View {
     @State private var creationDraft = ""
     @State private var trashTarget: FileNode?
     @State private var isMutating = false
+    @State private var agentsCreationFailure: WorkspaceAgentsFileCreation.Failure?
     /// Live FSEvents watcher — agent writes refresh the tree automatically.
     @StateObject private var watcher: WorkspaceWatcher
     @StateObject private var tree: WorkspaceTreeModel
@@ -241,15 +242,8 @@ struct WorkspaceRailView: View {
                 .disabled(isMutating)
             Divider()
             Button("Refresh") { refresh() }
-            Button("New AGENTS.md") {
-                let target = root.appendingPathComponent("AGENTS.md")
-                if !FileManager.default.fileExists(atPath: target.path) {
-                    try? Self.agentsTemplate.write(to: target, atomically: true, encoding: .utf8)
-                    ProjectFileIndex.shared.invalidate(root: root)
-                    tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
-                }
-                openFile(target, true)
-            }
+            Button("New AGENTS.md") { createAgentsFile() }
+                .disabled(isMutating)
         }
         .alert(
             "Rename \(renameTarget?.isDirectory == true ? "Folder" : "File")",
@@ -289,6 +283,17 @@ struct WorkspaceRailView: View {
         } message: {
             Text("This is recoverable from the macOS Trash.")
         }
+        .alert("Could not create AGENTS.md", isPresented: agentsCreationFailurePresented) {
+            Button("Cancel", role: .cancel) { agentsCreationFailure = nil }
+            Button("Retry") {
+                agentsCreationFailure = nil
+                createAgentsFile()
+            }
+            .keyboardShortcut(.defaultAction)
+            .accessibilityIdentifier("workspace-agents-create-retry")
+        } message: {
+            Text(agentsCreationFailure?.message ?? WorkspaceAgentsFileCreation.Failure.other.message)
+        }
         .accessibilityLabel("Project files")
     }
 
@@ -310,6 +315,13 @@ struct WorkspaceRailView: View {
         Binding(
             get: { creationRequest != nil },
             set: { if !$0 { creationRequest = nil } }
+        )
+    }
+
+    private var agentsCreationFailurePresented: Binding<Bool> {
+        Binding(
+            get: { agentsCreationFailure != nil },
+            set: { if !$0 { agentsCreationFailure = nil } }
         )
     }
 
@@ -542,9 +554,33 @@ struct WorkspaceRailView: View {
         }
     }
 
+    private func createAgentsFile() {
+        guard !isMutating else { return }
+        let root = self.root
+        let template = Self.agentsTemplate
+        isMutating = true
+        Task {
+            let result = await Task.detached(priority: .userInitiated) {
+                WorkspaceAgentsFileCreation.attempt(in: root, template: template)
+            }.value
+            isMutating = false
+            switch result {
+            case let .success(target):
+                agentsCreationFailure = nil
+                ProjectFileIndex.shared.invalidate(root: root)
+                tree.refresh(expandedDirectories: expanded.map {
+                    URL(fileURLWithPath: $0, isDirectory: true)
+                })
+                openFile(target, true)
+            case let .failure(failure):
+                agentsCreationFailure = failure
+            }
+        }
+    }
+
     /// Starter AGENTS.md dropped at the project root — the emerging convention
-    /// agent CLIs read for repo-specific guidance. Opens the existing file
-    /// instead when one is already there.
+    /// agent CLIs read for repo-specific guidance. Creation is exclusive, so a
+    /// file that appears concurrently is never replaced.
     static let agentsTemplate = """
     # AGENTS.md
 
@@ -715,6 +751,83 @@ struct WorkspaceRailView: View {
             }
             ToastCenter.shared.show("Copied \(url.lastPathComponent)", style: .success)
         }
+    }
+}
+
+enum WorkspaceAgentsFileCreation {
+    typealias Writer = (_ data: Data, _ target: URL) throws -> Void
+
+    enum Failure: Error, Equatable, Sendable {
+        case destinationExists
+        case permissionDenied
+        case diskFull
+        case other
+
+        var message: String {
+            switch self {
+            case .destinationExists:
+                "AGENTS.md already exists. Rename or remove it, then try again."
+            case .permissionDenied:
+                "Kaisola doesn't have permission to create AGENTS.md in this project."
+            case .diskFull:
+                "There isn't enough disk space to create AGENTS.md."
+            case .other:
+                "Kaisola couldn't create AGENTS.md. Check the project and try again."
+            }
+        }
+    }
+
+    static func attempt(in root: URL, template: String) -> Result<URL, Failure> {
+        attempt(in: root, template: template) { data, target in
+            // Foundation rejects combining `.atomic` with
+            // `.withoutOverwriting`. Exclusive creation is the required
+            // boundary here: a racing AGENTS.md must never be replaced.
+            try data.write(to: target, options: .withoutOverwriting)
+        }
+    }
+
+    static func attempt(
+        in root: URL,
+        template: String,
+        writer: Writer
+    ) -> Result<URL, Failure> {
+        let target = root.standardizedFileURL.appendingPathComponent("AGENTS.md")
+        do {
+            try writer(Data(template.utf8), target)
+            return .success(target)
+        } catch {
+            return .failure(classify(error))
+        }
+    }
+
+    private static func classify(_ error: any Error) -> Failure {
+        if let cocoaError = error as? CocoaError {
+            switch cocoaError.code {
+            case .fileWriteFileExists:
+                return .destinationExists
+            case .fileReadNoPermission, .fileWriteNoPermission, .fileWriteVolumeReadOnly:
+                return .permissionDenied
+            case .fileWriteOutOfSpace:
+                return .diskFull
+            default:
+                break
+            }
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain {
+            switch nsError.code {
+            case Int(EEXIST):
+                return .destinationExists
+            case Int(EACCES), Int(EPERM), Int(EROFS):
+                return .permissionDenied
+            case Int(ENOSPC):
+                return .diskFull
+            default:
+                break
+            }
+        }
+        return .other
     }
 }
 

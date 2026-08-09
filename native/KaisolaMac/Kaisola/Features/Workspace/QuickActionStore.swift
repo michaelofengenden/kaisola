@@ -2,10 +2,68 @@ import Foundation
 
 /// A per-project one-click command: a labelled shell command (build/test/dev…)
 /// the user runs in a fresh owned terminal from the Quick Actions bar.
-struct QuickAction: Codable, Equatable, Identifiable {
+struct QuickAction: Codable, Equatable, Identifiable, Sendable {
+    static let maximumTitleBytes = 128
+    static let maximumCommandBytes = 4_096
+
+    enum ValidationIssue: Equatable, Sendable, LocalizedError {
+        case titleRequired
+        case titleTooLong(maximumBytes: Int)
+        case titleContainsControlCharacters
+        case commandRequired
+        case commandTooLong(maximumBytes: Int)
+        case commandContainsControlCharacters
+
+        var errorDescription: String? {
+            switch self {
+            case .titleRequired:
+                return "Enter a title."
+            case .titleTooLong(let maximumBytes):
+                return "Title must be \(maximumBytes) UTF-8 bytes or fewer."
+            case .titleContainsControlCharacters:
+                return "Title must stay on one line and cannot contain control characters."
+            case .commandRequired:
+                return "Enter a command."
+            case .commandTooLong(let maximumBytes):
+                return "Command must be \(maximumBytes) UTF-8 bytes or fewer."
+            case .commandContainsControlCharacters:
+                return "Command must stay on one line and cannot contain control characters."
+            }
+        }
+    }
+
     var id: String
     var title: String
     var command: String
+
+    var validationIssues: [ValidationIssue] {
+        var issues: [ValidationIssue] = []
+        let forbiddenCharacters = CharacterSet.controlCharacters.union(.newlines)
+
+        if title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append(.titleRequired)
+        } else {
+            if title.utf8.count > Self.maximumTitleBytes {
+                issues.append(.titleTooLong(maximumBytes: Self.maximumTitleBytes))
+            }
+            if title.unicodeScalars.contains(where: forbiddenCharacters.contains) {
+                issues.append(.titleContainsControlCharacters)
+            }
+        }
+
+        if command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            issues.append(.commandRequired)
+        } else {
+            if command.utf8.count > Self.maximumCommandBytes {
+                issues.append(.commandTooLong(maximumBytes: Self.maximumCommandBytes))
+            }
+            if command.unicodeScalars.contains(where: forbiddenCharacters.contains) {
+                issues.append(.commandContainsControlCharacters)
+            }
+        }
+
+        return issues
+    }
 }
 
 /// Persists each project's Quick Actions in the native application-support
@@ -15,6 +73,35 @@ struct QuickAction: Codable, Equatable, Identifiable {
 /// cap drops the oldest (front of the array) so a full row still accepts a new
 /// button.
 struct QuickActionStore: Sendable {
+    struct RowValidation: Equatable, Sendable {
+        let index: Int
+        let actionID: String
+        let issues: [QuickAction.ValidationIssue]
+    }
+
+    enum StoreError: Error, Equatable {
+        case invalidActions([RowValidation])
+    }
+
+    struct LoadedRow: Equatable, Sendable {
+        let action: QuickAction
+        let issues: [QuickAction.ValidationIssue]
+
+        var isQuarantined: Bool { !issues.isEmpty }
+    }
+
+    struct LoadResult: Equatable, Sendable {
+        let rows: [LoadedRow]
+
+        var runnableActions: [QuickAction] {
+            rows.compactMap { $0.isQuarantined ? nil : $0.action }
+        }
+
+        var quarantinedRows: [LoadedRow] {
+            rows.filter(\.isQuarantined)
+        }
+    }
+
     private struct Payload: Codable {
         /// projectID → its ordered Quick Actions (display order = array order).
         var actionsByProject: [String: [QuickAction]]
@@ -30,23 +117,46 @@ struct QuickActionStore: Sendable {
         self.fileURL = fileURL
     }
 
-    /// This project's actions in display order, or an empty array when the
-    /// project has none (or the file is missing/corrupt).
+    /// This project's validated actions in display order, or an empty array
+    /// when the project has none (or the file is missing/corrupt). Invalid
+    /// legacy rows stay available through `load(forProject:)` for repair, but
+    /// never reach command execution surfaces.
     func actions(forProject projectID: String) -> [QuickAction] {
-        read()?.actionsByProject[projectID] ?? []
+        load(forProject: projectID).runnableActions
+    }
+
+    /// Loads every persisted row for editing while marking invalid legacy rows
+    /// as quarantined. Callers that can execute commands must use
+    /// `actions(forProject:)` or `runnableActions`.
+    func load(forProject projectID: String) -> LoadResult {
+        let actions = read()?.actionsByProject[projectID] ?? []
+        return LoadResult(rows: actions.map {
+            LoadedRow(action: $0, issues: $0.validationIssues)
+        })
     }
 
     /// Replace a project's actions wholesale. The cap is enforced here by
     /// dropping the oldest entries first, so an editor that appended past the
     /// cap still persists the most recent `capPerProject` buttons. Passing an
     /// empty array clears the project's row (and prunes the key).
-    func save(_ actions: [QuickAction], forProject projectID: String) {
-        var payload = read() ?? Payload(actionsByProject: [:])
+    func save(_ actions: [QuickAction], forProject projectID: String) throws(StoreError) {
         var trimmed = actions
         if trimmed.count > capPerProject {
             trimmed.removeFirst(trimmed.count - capPerProject)
         }
         trimmed = Self.normalizingIdentifiers(in: trimmed)
+        let invalidRows = trimmed.enumerated().compactMap { index, action -> RowValidation? in
+            let issues = action.validationIssues
+            guard !issues.isEmpty else { return nil }
+            return RowValidation(index: index, actionID: action.id, issues: issues)
+        }
+        guard invalidRows.isEmpty else {
+            throw StoreError.invalidActions(invalidRows)
+        }
+
+        // Validation happens before reading or writing the registry so a
+        // rejected edit cannot replace the last valid persisted state.
+        var payload = read() ?? Payload(actionsByProject: [:])
         if trimmed.isEmpty {
             payload.actionsByProject.removeValue(forKey: projectID)
         } else {

@@ -72,6 +72,10 @@ struct QuickActionsEditor: View {
     /// ceiling instead of silently dropping the oldest on save.
     private let cap = 8
 
+    private var hasValidationErrors: Bool {
+        actions.contains { !$0.validationIssues.isEmpty }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
@@ -86,21 +90,22 @@ struct QuickActionsEditor: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
             ForEach($actions) { $action in
-                HStack(spacing: 6) {
-                    TextField("Title", text: $action.title)
-                        .frame(width: 96)
-                    TextField("command", text: $action.command)
-                        .frame(minWidth: 180)
-                    Button {
-                        delete(action.id)
-                    } label: {
-                        Image(systemName: "trash")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Delete this action")
+                QuickActionEditorRow(
+                    action: $action,
+                    rowNumber: rowNumber(for: action.id)
+                ) {
+                    delete(action.id)
                 }
-                .textFieldStyle(.roundedBorder)
-                .font(.callout)
+            }
+            if hasValidationErrors {
+                Label(
+                    "Fix highlighted rows to save changes. Previously saved actions remain active.",
+                    systemImage: "exclamationmark.triangle.fill"
+                )
+                .font(.caption)
+                .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("quick-actions.validation-summary")
             }
             HStack {
                 Button {
@@ -115,7 +120,9 @@ struct QuickActionsEditor: View {
         }
         .padding(14)
         .frame(width: 360)
-        .onAppear { actions = QuickActionStore().actions(forProject: projectID) }
+        .onAppear {
+            actions = QuickActionStore().load(forProject: projectID).rows.map(\.action)
+        }
         .onChange(of: actions) { _, updated in persist(updated) }
     }
 
@@ -128,8 +135,69 @@ struct QuickActionsEditor: View {
         actions.removeAll { $0.id == id }
     }
 
+    private func rowNumber(for id: String) -> Int {
+        (actions.firstIndex { $0.id == id } ?? 0) + 1
+    }
+
     private func persist(_ updated: [QuickAction]) {
-        QuickActionStore().save(updated, forProject: projectID)
-        onSave()
+        do {
+            try QuickActionStore().save(updated, forProject: projectID)
+            onSave()
+        } catch let error {
+            switch error {
+            case .invalidActions:
+                // Field-level feedback is derived from `actions`, while the
+                // store leaves the last valid registry untouched until every
+                // row is valid again.
+                break
+            }
+        }
+    }
+}
+
+private struct QuickActionEditorRow: View {
+    @Binding var action: QuickAction
+    let rowNumber: Int
+    let delete: () -> Void
+
+    private var errorMessage: String {
+        action.validationIssues.compactMap(\.errorDescription).joined(separator: " ")
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 6) {
+                TextField("Title", text: $action.title)
+                    .frame(width: 96)
+                    .accessibilityLabel("Quick Action row \(rowNumber) title")
+                    .accessibilityHint(
+                        "Required, one line, and at most \(QuickAction.maximumTitleBytes) UTF-8 bytes"
+                    )
+                TextField("command", text: $action.command)
+                    .frame(minWidth: 180)
+                    .accessibilityLabel("Quick Action row \(rowNumber) command")
+                    .accessibilityHint(
+                        "Required, one line, and at most \(QuickAction.maximumCommandBytes) UTF-8 bytes"
+                    )
+                Button(action: delete) {
+                    Image(systemName: "trash")
+                }
+                .buttonStyle(.borderless)
+                .help("Delete this action")
+                .accessibilityLabel("Delete Quick Action row \(rowNumber)")
+            }
+            .textFieldStyle(.roundedBorder)
+            .font(.callout)
+
+            if !errorMessage.isEmpty {
+                Label(errorMessage, systemImage: "exclamationmark.circle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityLabel("Quick Action row \(rowNumber) error. \(errorMessage)")
+                    .accessibilityHint("Fix this row before Quick Actions can be saved")
+                    .accessibilityIdentifier("quick-actions.validation-row-\(rowNumber)")
+            }
+        }
     }
 }

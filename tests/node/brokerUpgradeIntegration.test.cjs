@@ -108,6 +108,59 @@ async function connectClient(config, access = 'controller') {
   return { socket, hello, request }
 }
 
+test('broker mutation ids replay one terminal.write outcome without duplicate input', async (t) => {
+  const fixture = startBroker()
+  t.after(() => {
+    try { fixture.child.kill('SIGKILL') } catch {}
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  })
+  await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
+  const controller = await connectClient(fixture.config)
+  const projectId = 'mutation-idempotency'
+  const terminalId = 'idempotent-write-terminal'
+  const created = await controller.request('terminal.create', {
+    mutationId: crypto.randomUUID(),
+    ownerId: '0',
+    projectId,
+    id: terminalId,
+    command: '/bin/sh',
+    args: ['-c', 'stty -echo; while IFS= read -r line; do printf "SEEN:%s\\n" "$line"; done'],
+    cwd: fixture.root,
+  })
+  assert.equal(created.result.ok, true)
+
+  const mutationId = crypto.randomUUID()
+  const params = {
+    mutationId,
+    ownerId: '0',
+    projectId,
+    id: terminalId,
+    data: 'apply-once\n',
+  }
+  const first = await controller.request('terminal.write', params)
+  const replay = await controller.request('terminal.write', params)
+  assert.deepEqual(replay.result, first.result)
+  assert.equal(first.result.ok, true)
+
+  const output = await waitFor(async () => {
+    const response = await controller.request('terminal.snapshot', {
+      ownerId: '0', projectId, id: terminalId,
+    })
+    return response.result.output.includes('SEEN:apply-once') ? response.result.output : null
+  }, 'one applied write')
+  assert.equal(output.match(/SEEN:apply-once/g)?.length, 1)
+
+  const reused = await controller.request('terminal.write', { ...params, data: 'different-input\n' })
+  assert.equal(reused.ok, false)
+  assert.equal(reused.code, 'mutation_id_reused')
+
+  await controller.request('terminal.release', {
+    mutationId: crypto.randomUUID(), ownerId: '0', projectId, id: terminalId,
+  })
+  controller.socket.destroy()
+})
+
 test('unhandled rejection policy preserves observation while fencing mutations', async (t) => {
   const fixture = startBroker({ rejectionProbe: true })
   t.after(() => {

@@ -15,6 +15,7 @@ final class BrokerWireTests: XCTestCase {
         XCTAssertEqual(BrokerWire.observerRoleFeature, "observer-role-v1")
         XCTAssertEqual(BrokerWire.brokerUpdateFeature, "broker-update-v1")
         XCTAssertEqual(BrokerWire.brokerRollingUpdateFeature, "broker-rolling-update-v1")
+        XCTAssertEqual(BrokerWire.brokerMutationIdempotencyFeature, "broker-mutation-idempotency-v1")
         XCTAssertEqual(BrokerWire.observerMethods, [
             "broker.status",
             "terminal.list",

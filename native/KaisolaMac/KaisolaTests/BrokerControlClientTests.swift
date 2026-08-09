@@ -82,6 +82,156 @@ private func controlHello(
 /// mutations the native app needs, every request carries the owner identity,
 /// and the connection refuses brokers that predate role enforcement.
 final class BrokerControlClientTests: XCTestCase {
+    func testEveryMutationReconcilesAfterAResponseDelayedBeyondTimeout() async throws {
+        let transport = TimeoutReconcilingControlBrokerTransport()
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 50_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        let operations: [(ControlBrokerMethod, (BrokerControlClient) async throws -> Void)] = [
+            (.create, { client in
+                _ = try await client.createTerminal(
+                    projectID: "project.one",
+                    terminalID: "terminal-one",
+                    command: "/bin/sh",
+                    arguments: [],
+                    cwd: "/tmp",
+                    columns: 80,
+                    rows: 24
+                )
+            }),
+            (.attach, { client in
+                try await client.attach(projectID: "project.one", terminalID: "terminal-one")
+            }),
+            (.write, { client in
+                try await client.write(projectID: "project.one", terminalID: "terminal-one", data: "date\n")
+            }),
+            (.resize, { client in
+                try await client.resize(
+                    projectID: "project.one",
+                    terminalID: "terminal-one",
+                    columns: 100,
+                    rows: 30
+                )
+            }),
+            (.kill, { client in
+                try await client.kill(projectID: "project.one", terminalID: "terminal-one")
+            }),
+            (.release, { client in
+                try await client.release(projectID: "project.one", terminalID: "terminal-one")
+            }),
+            (.detachOwner, { client in
+                try await client.detachOwner(projectID: "project.one", terminalID: "terminal-one")
+            }),
+            (.agentTurn, { client in
+                try await client.setAgentTurn(
+                    projectID: "project.one",
+                    terminalID: "terminal-one",
+                    busy: true
+                )
+            }),
+            (.controlLease, { client in
+                try await client.setControlLease(
+                    projectID: "project.one",
+                    terminalID: "terminal-one",
+                    active: true
+                )
+            }),
+        ]
+
+        for operation in operations {
+            try await operation.1(client)
+        }
+
+        let attempts = await transport.attemptsByMethod
+        let applications = await transport.applicationsByMethod
+        let mutationIDs = await transport.mutationIDsByMethod
+        XCTAssertEqual(Set(operations.map(\.0)), Set(ControlBrokerMethod.allCases))
+        for method in ControlBrokerMethod.allCases {
+            XCTAssertEqual(attempts[method.rawValue], 2, method.rawValue)
+            XCTAssertEqual(applications[method.rawValue], 1, method.rawValue)
+            let ids = try XCTUnwrap(mutationIDs[method.rawValue], method.rawValue)
+            XCTAssertEqual(ids.count, 2, method.rawValue)
+            XCTAssertEqual(Set(ids).count, 1, "\(method.rawValue) must reuse its idempotency key")
+            XCTAssertNotNil(UUID(uuidString: ids[0]), method.rawValue)
+        }
+        await client.disconnect()
+    }
+
+    func testAdministrativeMutationsReconcileAfterAResponseDelayedBeyondTimeout() async throws {
+        let targetDigest = String(repeating: "d", count: 64)
+        let operations: [(method: String, call: (BrokerControlClient) async throws -> Void)] = [
+            ("broker.prepareRollingUpdate", { client in
+                let decision = try await client.requestUpgrade(
+                    from: primaryControlBrokerInfo,
+                    targetContentDigest: targetDigest
+                )
+                XCTAssertEqual(decision, .accepted)
+            }),
+            ("broker.cancelRollingUpdate", { client in
+                try await client.cancelRollingUpdate(
+                    from: primaryControlBrokerInfo,
+                    targetContentDigest: targetDigest
+                )
+            }),
+            ("broker.retireDraining", { client in
+                let decision = try await client.requestRetirement(
+                    of: primaryControlBrokerInfo,
+                    targetContentDigest: targetDigest
+                )
+                XCTAssertEqual(decision, .accepted)
+            }),
+        ]
+
+        for operation in operations {
+            let transport = TimeoutReconcilingControlBrokerTransport()
+            let client = BrokerControlClient(
+                transport: transport,
+                operationTimeoutNanoseconds: 50_000_000
+            )
+            try await operation.call(client)
+            let attemptsByMethod = await transport.attemptsByMethod
+            let applicationsByMethod = await transport.applicationsByMethod
+            let mutationIDsByMethod = await transport.mutationIDsByMethod
+            let attempts = attemptsByMethod[operation.method]
+            let applications = applicationsByMethod[operation.method]
+            let ids = try XCTUnwrap(
+                mutationIDsByMethod[operation.method],
+                operation.method
+            )
+            XCTAssertEqual(attempts, 2, operation.method)
+            XCTAssertEqual(applications, 1, operation.method)
+            XCTAssertEqual(ids.count, 2, operation.method)
+            XCTAssertEqual(Set(ids).count, 1, "\(operation.method) must reuse its idempotency key")
+        }
+    }
+
+    func testTimeoutDoesNotBlindlyRetryAnOlderBrokerWithoutIdempotencyReceipts() async throws {
+        let transport = TimeoutReconcilingControlBrokerTransport(supportsIdempotency: false)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 50_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        do {
+            try await client.write(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                data: "must-not-duplicate\n"
+            )
+            XCTFail("An older broker cannot authoritatively reconcile a timed-out mutation.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .requestTimedOut)
+        }
+        let attempts = await transport.attemptsByMethod
+        let applications = await transport.applicationsByMethod
+        XCTAssertEqual(attempts[ControlBrokerMethod.write.rawValue], 1)
+        XCTAssertEqual(applications[ControlBrokerMethod.write.rawValue], 1)
+        await client.disconnect()
+    }
+
     func testHandshakeRejectsEveryImmutableBrokerIdentityMismatch() async throws {
         let mismatches: [(field: String, value: JSONValue, error: BrokerClientError)] = [
             ("protocol", .integer(Int64(BrokerWire.protocolVersion + 1)), .protocolMismatch),
@@ -1335,6 +1485,132 @@ private actor IdentityControlBrokerTransport: BrokerByteTransport {
 
     func close() async {
         deliver(nil)
+    }
+
+    private func deliver(_ data: Data?) {
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            incoming.append(data)
+        }
+    }
+}
+
+/// Applies the first request but withholds its response past the client's
+/// timeout. The retry receives the retained result only when it carries the
+/// same mutation id, modeling the broker's bounded idempotency ledger without
+/// relying on timing sleeps in the test itself.
+private actor TimeoutReconcilingControlBrokerTransport: BrokerByteTransport {
+    private let supportsIdempotency: Bool
+    private var incoming: [Data?] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+    private var retainedResults: [String: JSONValue] = [:]
+    private(set) var attemptsByMethod: [String: Int] = [:]
+    private(set) var applicationsByMethod: [String: Int] = [:]
+    private(set) var mutationIDsByMethod: [String: [String]] = [:]
+
+    init(supportsIdempotency: Bool = true) {
+        self.supportsIdempotency = supportsIdempotency
+    }
+
+    func connect(path: String) async throws {}
+
+    func send(_ data: Data) async throws {
+        guard let newline = data.firstIndex(of: 0x0A) else {
+            throw BrokerClientError.malformedResponse
+        }
+        let frame = try JSONDecoder().decode(JSONValue.self, from: data[..<newline])
+        guard let object = frame.objectValue,
+              let type = object["type"]?.stringValue else { return }
+        if type == "hello" {
+            var hello = controlHello(for: primaryControlBrokerInfo).objectValue ?? [:]
+            hello["features"] = .array([
+                .string(BrokerWire.terminalObserveFeature),
+                .string(BrokerWire.brokerUpdateFeature),
+                .string(BrokerWire.brokerRollingUpdateFeature),
+            ] + (supportsIdempotency ? [.string(BrokerWire.brokerMutationIdempotencyFeature)] : []))
+            deliver(try encoded(.object(hello)))
+            return
+        }
+        guard type == "request",
+              let requestID = object["id"]?.stringValue,
+              let method = object["method"]?.stringValue,
+              let params = object["params"]?.objectValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        if method == "broker.status" {
+            deliver(try encoded(.object([
+                "type": .string("response"),
+                "id": .string(requestID),
+                "ok": .bool(true),
+                "result": brokerStatus(),
+            ])))
+            return
+        }
+        guard let mutationID = params["mutationId"]?.stringValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        attemptsByMethod[method, default: 0] += 1
+        mutationIDsByMethod[method, default: []].append(mutationID)
+        if retainedResults[mutationID] == nil {
+            applicationsByMethod[method, default: 0] += 1
+            retainedResults[mutationID] = result(for: method, params: params)
+            return
+        }
+        deliver(try encoded(.object([
+            "type": .string("response"),
+            "id": .string(requestID),
+            "ok": .bool(true),
+            "result": retainedResults[mutationID] ?? .null,
+        ])))
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !incoming.isEmpty { return incoming.removeFirst() }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func close() async {
+        deliver(nil)
+    }
+
+    private func result(for method: String, params: [String: JSONValue]) -> JSONValue {
+        switch method {
+        case ControlBrokerMethod.create.rawValue:
+            .object(["ok": .bool(true), "pid": .integer(42_424)])
+        case ControlBrokerMethod.attach.rawValue, ControlBrokerMethod.kill.rawValue:
+            .object(["ok": .bool(true), "id": params["id"] ?? .null])
+        case ControlBrokerMethod.controlLease.rawValue:
+            .object(["ok": .bool(true), "active": params["active"] ?? .bool(false)])
+        case "broker.prepareRollingUpdate":
+            .object(["ok": .bool(true), "state": .string("rolling")])
+        case "broker.cancelRollingUpdate":
+            .object(["ok": .bool(true), "state": .string("current")])
+        case "broker.retireDraining":
+            .object(["ok": .bool(true), "state": .string("retiring")])
+        default:
+            .object(["ok": .bool(true)])
+        }
+    }
+
+    private func brokerStatus() -> JSONValue {
+        .object([
+            "ok": .bool(true),
+            "pid": .integer(Int64(primaryControlBrokerInfo.pid)),
+            "startedAt": .integer(primaryControlBrokerInfo.startedAt),
+            "contentDigest": .string(primaryControlBrokerInfo.contentDigest ?? ""),
+            "implementationVersion": .integer(Int64(primaryControlBrokerInfo.implementationVersion ?? 1)),
+            "packageSchema": .integer(Int64(primaryControlBrokerInfo.packageSchema ?? 1)),
+            "packageVersion": .string(primaryControlBrokerInfo.packageVersion ?? ""),
+            "features": .array([.string(BrokerWire.brokerUpdateFeature)]),
+        ])
+    }
+
+    private func encoded(_ frame: JSONValue) throws -> Data {
+        var data = try JSONEncoder().encode(frame)
+        data.append(0x0A)
+        return data
     }
 
     private func deliver(_ data: Data?) {

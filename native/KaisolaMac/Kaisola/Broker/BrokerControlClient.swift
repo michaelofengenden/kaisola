@@ -439,7 +439,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                !connectedFeatures.contains(BrokerWire.brokerRollingUpdateFeature) {
                 throw BrokerClientError.requestFailed("broker rolling update capability")
             }
-            let result = try await request(
+            let result = try await requestMutation(
                 rolling ? "broker.prepareRollingUpdate" : "broker.shutdownForUpdate",
                 params: .object([
                     "ownerId": .string("0"),
@@ -468,7 +468,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         }
         do {
             try await connect(to: info, ownerID: "0")
-            let result = try await request(
+            let result = try await requestMutation(
                 "broker.cancelRollingUpdate",
                 params: .object([
                     "ownerId": .string("0"),
@@ -503,7 +503,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                 params: .object(["ownerId": .string("0")])
             )
             try Self.validateUpgradeStatus(status, expected: info)
-            let result = try await request(
+            let result = try await requestMutation(
                 "broker.retireDraining",
                 params: .object([
                     "ownerId": .string("0"),
@@ -545,7 +545,26 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     private func request(_ method: ControlBrokerMethod, params: JSONValue) async throws -> JSONValue {
-        try await request(method.rawValue, params: params)
+        try await requestMutation(method.rawValue, params: params)
+    }
+
+    private func requestMutation(_ method: String, params: JSONValue) async throws -> JSONValue {
+        guard var mutationParams = params.objectValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        // A timeout only proves the response was not observed. Retrying once
+        // with the same idempotency key lets the broker join/replay the exact
+        // mutation instead of duplicating input, processes, or lifecycle work.
+        mutationParams["mutationId"] = .string(UUID().uuidString.lowercased())
+        let reconciledParams = JSONValue.object(mutationParams)
+        do {
+            return try await request(method, params: reconciledParams)
+        } catch BrokerClientError.requestTimedOut {
+            guard connectedFeatures.contains(BrokerWire.brokerMutationIdempotencyFeature) else {
+                throw BrokerClientError.requestTimedOut
+            }
+            return try await request(method, params: reconciledParams)
+        }
     }
 
     private func request(_ method: String, params: JSONValue) async throws -> JSONValue {

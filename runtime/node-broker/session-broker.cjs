@@ -18,7 +18,7 @@ const {
 } = require('./ipc/brokerRejectionPolicy.cjs')
 const { terminalAttachRoute, terminalCreateRoute, terminalKillRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalDetachOwnerRoute } = require('./ipc/terminalDetachOwnerRoute.cjs')
-const { BrokerRequestGate, dispatchBrokerRequest } = require('./ipc/brokerRequestGate.cjs')
+const { BrokerMutationLedger, BrokerRequestGate, dispatchBrokerRequest } = require('./ipc/brokerRequestGate.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
@@ -118,6 +118,7 @@ let companionLeaseEpoch = 1
 const companionLeases = new Set()
 let inFlightMutations = 0
 const requestGate = new BrokerRequestGate()
+const mutationLedger = new BrokerMutationLedger()
 let everConnected = false
 
 const MUTATING_METHODS = new Set([
@@ -136,6 +137,41 @@ const MUTATING_METHODS = new Set([
   'terminal.setFocused',
   'terminal.controlLease',
 ])
+const IDEMPOTENT_METHODS = new Set([
+  ...MUTATING_METHODS,
+  'broker.shutdownForUpdate',
+  'broker.prepareRollingUpdate',
+  'broker.cancelRollingUpdate',
+  'broker.retireDraining',
+])
+
+const MUTATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function canonicalMutationValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalMutationValue)
+  if (!value || typeof value !== 'object') return value
+  const result = {}
+  for (const key of Object.keys(value).sort()) {
+    if (key !== 'mutationId') result[key] = canonicalMutationValue(value[key])
+  }
+  return result
+}
+
+function mutationIdempotency(client, method, params) {
+  if (params?.mutationId == null) return null
+  const mutationId = String(params.mutationId)
+  if (!MUTATION_ID_PATTERN.test(mutationId)) return { invalid: true }
+  const key = JSON.stringify([
+    client.instanceId,
+    String(params.ownerId ?? '0'),
+    String(params.projectId ?? LEGACY_PROJECT_SCOPE),
+    mutationId,
+  ])
+  const fingerprint = crypto.createHash('sha256')
+    .update(JSON.stringify([method, canonicalMutationValue(params)]))
+    .digest('hex')
+  return { ledger: mutationLedger, key, fingerprint }
+}
 
 function noteActivity() {
   activityEpoch = activityEpoch >= Number.MAX_SAFE_INTEGER ? 1 : activityEpoch + 1
@@ -645,6 +681,16 @@ function handleLine(client, line) {
   }
   if (frame?.type !== 'request' || typeof frame.id !== 'string' || typeof frame.method !== 'string') return
   const mutating = MUTATING_METHODS.has(frame.method)
+  const idempotency = IDEMPOTENT_METHODS.has(frame.method)
+    ? mutationIdempotency(client, frame.method, frame.params)
+    : null
+  if (idempotency?.invalid) {
+    send(client.socket, {
+      type: 'response', id: frame.id, ok: false,
+      code: 'invalid_mutation_id', message: 'broker mutation id is invalid',
+    }, { method: frame.method })
+    return
+  }
   dispatchBrokerRequest({
     gate: requestGate,
     client,
@@ -657,6 +703,7 @@ function handleLine(client, line) {
     // the originating method to enforce its response-specific encoded cap.
     respond: (response) => send(client.socket, response, { method: frame.method }),
     onSuccess: scheduleNoClientExit,
+    idempotency,
   })
 }
 

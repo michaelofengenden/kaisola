@@ -161,9 +161,11 @@ final class NotificationBridgeTests: XCTestCase {
         XCTAssertTrue(restored.entries.isEmpty)
     }
 
-    func testAttentionRestoreRejectsCorruptStorage() {
+    func testAttentionRestoreRetainsCorruptStorageForRecovery() {
         let defaults = makeDefaults()
-        defaults.set(Data("not-json".utf8), forKey: "attention.entries.v1")
+        let key = "attention.entries.v1"
+        let raw = Data("not-json".utf8)
+        defaults.set(raw, forKey: key)
 
         let center = AttentionCenter(
             defaults: defaults,
@@ -171,7 +173,79 @@ final class NotificationBridgeTests: XCTestCase {
             updatesDockBadge: false
         )
         XCTAssertTrue(center.entries.isEmpty)
-        XCTAssertNil(defaults.data(forKey: "attention.entries.v1"))
+        XCTAssertEqual(defaults.data(forKey: key), raw)
+        XCTAssertEqual(center.persistenceNotice, .corruptStatePreserved)
+        XCTAssertTrue(center.persistenceNotice?.offersReset == true)
+    }
+
+    func testAttentionRestoreSalvagesValidLegacyEntryAndRetainsMalformedSource() throws {
+        let defaults = makeDefaults()
+        let key = "attention.entries.v1"
+        let valid = AttentionCenter.Entry(
+            id: "terminal-valid-permission-1000",
+            kind: .permission,
+            targetID: "terminal-valid",
+            title: "Approval needed",
+            detail: "Review the command",
+            at: Date(timeIntervalSince1970: 1)
+        )
+        let validObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(valid))
+        let raw = try JSONSerialization.data(withJSONObject: [
+            validObject,
+            ["id": 42, "kind": "permission", "targetID": "broken"],
+        ])
+        defaults.set(raw, forKey: key)
+
+        let center = AttentionCenter(
+            defaults: defaults,
+            postsNotifications: false,
+            updatesDockBadge: false
+        )
+
+        XCTAssertEqual(center.entries, [valid])
+        XCTAssertEqual(defaults.data(forKey: key), raw, "malformed source must remain recoverable")
+        XCTAssertEqual(
+            center.persistenceNotice,
+            .recovered(discardedEntries: 1, discardedAcknowledgements: 0)
+        )
+    }
+
+    func testAttentionRestoreDropsSessionTimestampThatCannotBeAcknowledged() throws {
+        let defaults = makeDefaults()
+        let key = "attention.entries.v1"
+        let valid = AttentionCenter.Entry(
+            id: "terminal-valid-permission-1000",
+            kind: .permission,
+            targetID: "terminal-valid",
+            title: "Approval needed",
+            detail: "Review the command",
+            at: Date(timeIntervalSince1970: 1)
+        )
+        let outOfRange = AttentionCenter.Entry(
+            id: "terminal-extreme-session-responded",
+            kind: .sessionResponded,
+            targetID: "terminal-extreme",
+            title: "Agent responded",
+            detail: "Corrupt timestamp",
+            at: Date(timeIntervalSince1970: 1e20)
+        )
+        let raw = try JSONEncoder().encode([valid, outOfRange])
+        defaults.set(raw, forKey: key)
+
+        let center = AttentionCenter(
+            defaults: defaults,
+            postsNotifications: false,
+            updatesDockBadge: false
+        )
+
+        XCTAssertEqual(center.entries, [valid])
+        XCTAssertEqual(defaults.data(forKey: key), raw)
+        XCTAssertEqual(
+            center.persistenceNotice,
+            .recovered(discardedEntries: 1, discardedAcknowledgements: 0)
+        )
+        center.clearAll()
+        XCTAssertTrue(center.entries.isEmpty)
     }
 
     func testSessionResponseAcknowledgementSurvivesRelaunchAndAllowsNewerCompletion() {
@@ -250,10 +324,11 @@ final class NotificationBridgeTests: XCTestCase {
         ))
     }
 
-    func testAttentionRestoreRejectsCorruptAcknowledgementStorage() {
+    func testAttentionRestoreRetainsCorruptAcknowledgementStorageForRecovery() {
         let defaults = makeDefaults()
         let key = "attention.acknowledged-session-completions.v1"
-        defaults.set(Data("not-json".utf8), forKey: key)
+        let raw = Data("not-json".utf8)
+        defaults.set(raw, forKey: key)
 
         let center = AttentionCenter(
             defaults: defaults,
@@ -261,7 +336,232 @@ final class NotificationBridgeTests: XCTestCase {
             updatesDockBadge: false
         )
         XCTAssertFalse(center.hasAcknowledgedSessionResponse(targetID: "terminal", completedAt: 1))
-        XCTAssertNil(defaults.data(forKey: key))
+        XCTAssertEqual(defaults.data(forKey: key), raw)
+        XCTAssertEqual(center.persistenceNotice, .corruptStatePreserved)
+        XCTAssertTrue(center.persistenceNotice?.offersReset == true)
+    }
+
+    func testAttentionRestoreSalvagesValidLegacyAcknowledgementAndRetainsMalformedSource() throws {
+        let defaults = makeDefaults()
+        let key = "attention.acknowledged-session-completions.v1"
+        let raw = try JSONSerialization.data(withJSONObject: [
+            "terminal-valid": 1_785_000_100_000,
+            "terminal-broken": "not-an-integer",
+        ])
+        defaults.set(raw, forKey: key)
+
+        let center = AttentionCenter(
+            defaults: defaults,
+            postsNotifications: false,
+            updatesDockBadge: false
+        )
+
+        XCTAssertTrue(center.hasAcknowledgedSessionResponse(
+            targetID: "terminal-valid",
+            completedAt: 1_785_000_100_000
+        ))
+        XCTAssertEqual(defaults.data(forKey: key), raw, "malformed source must remain recoverable")
+        XCTAssertEqual(
+            center.persistenceNotice,
+            .recovered(discardedEntries: 0, discardedAcknowledgements: 1)
+        )
+    }
+
+    func testAttentionWritesOneAtomicIndependentlyVersionedStateEnvelope() throws {
+        let defaults = makeDefaults()
+        let center = AttentionCenter(
+            defaults: defaults,
+            postsNotifications: false,
+            updatesDockBadge: false
+        )
+        center.notify(
+            kind: .permission,
+            targetID: "terminal-atomic",
+            title: "Approval needed",
+            detail: "Review the command"
+        )
+
+        let data = try XCTUnwrap(defaults.data(forKey: "attention.state.v2"))
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let entries = try XCTUnwrap(root["entries"] as? [String: Any])
+        let acknowledgements = try XCTUnwrap(root["acknowledgements"] as? [String: Any])
+
+        XCTAssertEqual(root["schemaVersion"] as? Int, 1)
+        XCTAssertEqual(entries["schemaVersion"] as? Int, 1)
+        XCTAssertEqual(acknowledgements["schemaVersion"] as? Int, 1)
+        XCTAssertEqual((entries["values"] as? [[String: Any]])?.count, 1)
+        XCTAssertEqual((acknowledgements["values"] as? [String: Int64])?.count, 0)
+    }
+
+    func testLossyVersionedRepairCopiesOriginalBeforeClearingRecoveredState() throws {
+        let defaults = makeDefaults()
+        let stateKey = "attention.state.v2"
+        let recoveryKey = "attention.state.recovery.v2"
+        let valid = AttentionCenter.Entry(
+            id: "terminal-valid-permission-1000",
+            kind: .permission,
+            targetID: "terminal-valid",
+            title: "Approval needed",
+            detail: "Review the command",
+            at: Date(timeIntervalSince1970: 1)
+        )
+        let validObject = try JSONSerialization.jsonObject(with: JSONEncoder().encode(valid))
+        let raw = try JSONSerialization.data(withJSONObject: [
+            "schemaVersion": 1,
+            "entries": [
+                "schemaVersion": 1,
+                "values": [
+                    validObject,
+                    ["id": 42, "kind": "permission", "targetID": "broken"],
+                ],
+            ],
+            "acknowledgements": [
+                "schemaVersion": 1,
+                "values": [
+                    "terminal-acknowledged": 1_785_000_100_000,
+                    "terminal-broken": "not-an-integer",
+                ],
+            ],
+        ])
+        defaults.set(raw, forKey: stateKey)
+        var rejectRecoveryWrite = true
+        let center = AttentionCenter(
+            defaults: defaults,
+            postsNotifications: false,
+            updatesDockBadge: false,
+            persistenceWriter: { defaults, key, data in
+                guard !(rejectRecoveryWrite && key == recoveryKey) else { return false }
+                defaults.set(data, forKey: key)
+                return defaults.data(forKey: key) == data
+            }
+        )
+
+        XCTAssertEqual(center.entries, [valid])
+        XCTAssertTrue(center.hasAcknowledgedSessionResponse(
+            targetID: "terminal-acknowledged",
+            completedAt: 1_785_000_100_000
+        ))
+        XCTAssertEqual(
+            center.persistenceNotice,
+            .recovered(discardedEntries: 1, discardedAcknowledgements: 1)
+        )
+
+        center.clearAll()
+        XCTAssertEqual(center.entries, [valid], "a failed recovery copy must fence the clear")
+        XCTAssertEqual(defaults.data(forKey: stateKey), raw)
+        XCTAssertNil(defaults.data(forKey: recoveryKey))
+        XCTAssertEqual(center.persistenceNotice, .writeFailed)
+
+        rejectRecoveryWrite = false
+        center.clearAll()
+        XCTAssertTrue(center.entries.isEmpty)
+        XCTAssertEqual(defaults.data(forKey: recoveryKey), raw)
+        XCTAssertNotEqual(defaults.data(forKey: stateKey), raw)
+    }
+
+    func testAttentionClearWaitsForAConfirmedAtomicWrite() {
+        let defaults = makeDefaults()
+        var rejectStateWrites = false
+        let center = AttentionCenter(
+            defaults: defaults,
+            postsNotifications: false,
+            updatesDockBadge: false,
+            persistenceWriter: { defaults, key, data in
+                guard !(rejectStateWrites && key == "attention.state.v2") else { return false }
+                defaults.set(data, forKey: key)
+                return defaults.data(forKey: key) == data
+            }
+        )
+        let completedAt: Int64 = 1_785_000_200_000
+        XCTAssertTrue(center.notifySessionResponded(
+            targetID: "terminal-write-failure",
+            title: "Agent responded",
+            detail: "Review the result",
+            completedAt: completedAt
+        ))
+        XCTAssertEqual(center.entries.count, 1)
+
+        rejectStateWrites = true
+        center.clear(targetID: "terminal-write-failure")
+
+        XCTAssertEqual(center.entries.count, 1, "failed persistence must not clear visible state")
+        XCTAssertFalse(center.hasAcknowledgedSessionResponse(
+            targetID: "terminal-write-failure",
+            completedAt: completedAt
+        ))
+        XCTAssertEqual(center.persistenceNotice, .writeFailed)
+
+        let restored = AttentionCenter(
+            defaults: defaults,
+            postsNotifications: false,
+            updatesDockBadge: false
+        )
+        XCTAssertEqual(restored.entries.map(\.targetID), ["terminal-write-failure"])
+        XCTAssertFalse(restored.hasAcknowledgedSessionResponse(
+            targetID: "terminal-write-failure",
+            completedAt: completedAt
+        ))
+    }
+
+    func testCorruptVersionedStateRequiresExplicitResetAndKeepsRecoveryCopy() throws {
+        let defaults = makeDefaults()
+        let stateKey = "attention.state.v2"
+        let recoveryKey = "attention.state.recovery.v2"
+        let raw = Data("not-json-v2".utf8)
+        defaults.set(raw, forKey: stateKey)
+        let center = AttentionCenter(
+            defaults: defaults,
+            postsNotifications: false,
+            updatesDockBadge: false
+        )
+
+        XCTAssertEqual(center.persistenceNotice, .corruptStatePreserved)
+        center.notify(
+            kind: .permission,
+            targetID: "terminal-after-corruption",
+            title: "Approval needed",
+            detail: "Review the command"
+        )
+        XCTAssertEqual(defaults.data(forKey: stateKey), raw, "ordinary writes must not replace corrupt state")
+
+        XCTAssertTrue(center.resetCorruptPersistence())
+        XCTAssertEqual(defaults.data(forKey: recoveryKey), raw)
+        XCTAssertNotEqual(defaults.data(forKey: stateKey), raw)
+        XCTAssertNil(center.persistenceNotice)
+
+        let restored = AttentionCenter(
+            defaults: defaults,
+            postsNotifications: false,
+            updatesDockBadge: false
+        )
+        XCTAssertEqual(restored.entries.map(\.targetID), ["terminal-after-corruption"])
+    }
+
+    func testWrongTypedVersionedStateIsCorruptRatherThanAbsent() {
+        let defaults = makeDefaults()
+        let stateKey = "attention.state.v2"
+        let recoveryKey = "attention.state.recovery.v2"
+        defaults.set("not-a-data-payload", forKey: stateKey)
+
+        let center = AttentionCenter(
+            defaults: defaults,
+            postsNotifications: false,
+            updatesDockBadge: false
+        )
+
+        XCTAssertEqual(center.persistenceNotice, .corruptStatePreserved)
+        center.notify(
+            kind: .permission,
+            targetID: "terminal-after-wrong-type",
+            title: "Approval needed",
+            detail: "Review the command"
+        )
+        XCTAssertEqual(defaults.string(forKey: stateKey), "not-a-data-payload")
+
+        XCTAssertTrue(center.resetCorruptPersistence())
+        XCTAssertEqual(defaults.string(forKey: recoveryKey), "not-a-data-payload")
+        XCTAssertNotNil(defaults.data(forKey: stateKey))
+        XCTAssertNil(center.persistenceNotice)
     }
 }
 

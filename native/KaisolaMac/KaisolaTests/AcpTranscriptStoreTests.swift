@@ -1,3 +1,4 @@
+import SQLite3
 import XCTest
 @testable import Kaisola
 
@@ -10,6 +11,14 @@ final class AcpTranscriptStoreTests: XCTestCase {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-transcript-\(UUID().uuidString)", isDirectory: true)
         return (AcpTranscriptStore(fileURL: directory.appendingPathComponent("transcripts.json")), directory)
+    }
+
+    /// A second connection to the same file, used to hold locks and to damage
+    /// the schema the way another process or a rolled-back build would.
+    private func openSideConnection(to url: URL) throws -> OpaquePointer {
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        return try XCTUnwrap(handle)
     }
 
     func testLiveStoreUsesAnXCTestIsolatedRoot() {
@@ -277,6 +286,117 @@ final class AcpTranscriptStoreTests: XCTestCase {
         XCTAssertTrue(cleared.attachments.isEmpty)
         XCTAssertNil(cleared.sessionID)
         XCTAssertEqual(cleared.usage, usage)
+    }
+
+    func testTombstoneLookupSeparatesDeletedChatsFromNeverDeletedOnes() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await store.scheduleSave([.message(id: "1", text: "live")], for: "chat-live", now: 1)
+        await store.flush()
+        let beforeDelete = await store.tombstoneState(chatID: "chat-live")
+        XCTAssertEqual(beforeDelete, .absent)
+
+        try await store.tombstone(chatID: "chat-live")
+        let afterDelete = await store.tombstoneState(chatID: "chat-live")
+        XCTAssertEqual(afterDelete, .present)
+        let neverSeen = await store.tombstoneState(chatID: "chat-never-seen")
+        XCTAssertEqual(neverSeen, .absent)
+
+        // A buffered chunk landing after the delete still cannot re-materialize.
+        await store.scheduleSave([.message(id: "2", text: "late chunk")], for: "chat-live", now: 3)
+        await store.flush()
+        let rows = await store.rows(for: "chat-live")
+        XCTAssertEqual(rows, [.message(id: "1", text: "live")])
+    }
+
+    func testTombstoneLookupIsUnknownWhenTheDatabaseIsCorrupt() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-corrupt-db-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        try Data(repeating: 0x7f, count: 8_192).write(to: databaseURL, options: .atomic)
+
+        let store = AcpTranscriptStore(databaseURL: databaseURL)
+        let state = await store.tombstoneState(chatID: "chat-corrupt")
+        XCTAssertEqual(state, .unknown)
+    }
+
+    func testTombstoneLookupIsUnknownWhenTheDatabaseCannotBeRead() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try await store.tombstone(chatID: "chat-denied")
+        let readable = await store.tombstoneState(chatID: "chat-denied")
+        XCTAssertEqual(readable, .present)
+
+        // A relaunch that cannot open the file at all must not conclude the
+        // chat survived: the deletion record is right there, unreadable.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000],
+            ofItemAtPath: store.databaseURL.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: store.databaseURL.path
+            )
+        }
+        let reopened = AcpTranscriptStore(databaseURL: store.databaseURL)
+        let state = await reopened.tombstoneState(chatID: "chat-denied")
+        XCTAssertEqual(state, .unknown)
+    }
+
+    func testTombstoneLookupIsUnknownWhileAnotherWriterHoldsTheDatabase() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try await store.tombstone(chatID: "chat-busy")
+
+        let blocker = try openSideConnection(to: store.databaseURL)
+        defer { sqlite3_close_v2(blocker) }
+        XCTAssertEqual(sqlite3_exec(blocker, "BEGIN EXCLUSIVE", nil, nil, nil), SQLITE_OK)
+
+        // The store's connection is already open, so this exercises a busy
+        // lookup rather than a busy open.
+        let state = await store.tombstoneState(chatID: "chat-busy")
+        XCTAssertEqual(state, .unknown)
+    }
+
+    func testBufferedWritesAreWithheldWhileTheTombstoneProbeCannotComplete() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await store.scheduleSessionID("provider-session", for: "chat-probe", now: 1)
+        await store.flush()
+
+        // A rolled-back build or a hand-edited database can leave a
+        // deleted_chats table this schema cannot query. The lookup then fails
+        // to prepare, which must not be read as "never deleted".
+        let side = try openSideConnection(to: store.databaseURL)
+        XCTAssertEqual(
+            sqlite3_exec(
+                side,
+                "CREATE TABLE deleted_chats (id TEXT PRIMARY KEY NOT NULL)",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+
+        let rows: [AcpTranscriptRow] = [.message(id: "1", text: "must not land unverified")]
+        await store.scheduleSave(rows, for: "chat-probe", now: 2)
+        await store.flush()
+        let probe = await store.tombstoneState(chatID: "chat-probe")
+        XCTAssertEqual(probe, .unknown)
+        let withheld = await store.rows(for: "chat-probe")
+        XCTAssertTrue(withheld.isEmpty)
+
+        // Withheld, not lost: the coalesced snapshot lands once the probe can
+        // answer again.
+        XCTAssertEqual(sqlite3_exec(side, "DROP TABLE deleted_chats", nil, nil, nil), SQLITE_OK)
+        sqlite3_close_v2(side)
+        await store.flush()
+        let restored = await store.rows(for: "chat-probe")
+        XCTAssertEqual(restored, rows)
     }
 
     func testLegacyJSONMigrationIsAtomicBoundedAndLeavesTheSourceUntouched() async throws {

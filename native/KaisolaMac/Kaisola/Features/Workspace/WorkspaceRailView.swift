@@ -27,7 +27,13 @@ struct WorkspaceRailView: View {
     let close: () -> Void
 
     @State private var expanded: Set<String> = []
-    @State private var searchText = ""
+    @State private var searchText = {
+        let environment = ProcessInfo.processInfo.environment
+        return environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+            && environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "workspace-search-partial"
+            ? "indexed-fixture"
+            : ""
+    }()
     @State private var renameTarget: FileNode?
     @State private var renameDraft = ""
     @State private var moveTarget: FileNode?
@@ -123,6 +129,11 @@ struct WorkspaceRailView: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 6)
 
+            if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !tree.isSearching {
+                partialSearchNotice
+            }
+
             if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 0) {
@@ -201,6 +212,7 @@ struct WorkspaceRailView: View {
         .padding(4)
         .task {
             tree.load(root)
+            tree.search(searchText)
             revealSelection()
             // Deterministic broker-free visual QA: present a real file-action
             // sheet over the real lazy tree without mutating any fixture file.
@@ -290,6 +302,33 @@ struct WorkspaceRailView: View {
             Text("This is recoverable from the macOS Trash.")
         }
         .accessibilityLabel("Project files")
+    }
+
+    /// The index is deliberately bounded; when one of those bounds wins, do
+    /// not let a partial match list masquerade as proof that another file does
+    /// not exist. Folder browsing is the uncached scope escape hatch.
+    @ViewBuilder
+    private var partialSearchNotice: some View {
+        if let notice = ProjectFileSearchPresentation.notice(for: tree.searchCompletion) {
+            VStack(alignment: .leading, spacing: 5) {
+                Label(notice.title, systemImage: "exclamationmark.magnifyingglass")
+                    .font(.caption.weight(.semibold))
+                Text(notice.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(notice.actionTitle) { searchText = "" }
+                    .buttonStyle(.link)
+                    .font(.caption)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(Color.orange.opacity(0.09))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("\(notice.title). \(notice.detail)")
+            .accessibilityIdentifier("files.search-partial")
+        }
     }
 
     private var renamePresented: Binding<Bool> {

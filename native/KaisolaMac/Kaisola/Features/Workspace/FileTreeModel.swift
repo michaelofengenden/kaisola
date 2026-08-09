@@ -416,6 +416,86 @@ enum ProjectFiles {
     static let defaultDirectoryLimit = 2_000
     static let defaultVisitLimit = 20_000
 
+    /// One traversal budget that stopped an otherwise valid project index.
+    /// Keeping the concrete maximum beside the kind lets the UI say what was
+    /// searched without duplicating the crawler's constants.
+    struct TraversalLimit: Equatable, Hashable, Sendable {
+        enum Kind: Int, CaseIterable, Sendable {
+            case files
+            case directories
+            case visitedEntries
+        }
+
+        let kind: Kind
+        let maximum: Int
+    }
+
+    /// Whether an enumeration covered its whole reachable tree. Cancellation
+    /// is separate from deterministic caps because a superseded query should
+    /// be retried, while a capped query should tell the user its exact scope.
+    struct EnumerationCompletion: Equatable, Sendable {
+        let limits: [TraversalLimit]
+        let wasCancelled: Bool
+
+        init(limits: [TraversalLimit] = [], wasCancelled: Bool = false) {
+            var limitsByKind: [TraversalLimit.Kind: TraversalLimit] = [:]
+            for limit in limits {
+                let normalized = TraversalLimit(
+                    kind: limit.kind,
+                    maximum: max(0, limit.maximum)
+                )
+                if let existing = limitsByKind[normalized.kind] {
+                    limitsByKind[limit.kind] = TraversalLimit(
+                        kind: normalized.kind,
+                        maximum: min(existing.maximum, normalized.maximum)
+                    )
+                } else {
+                    limitsByKind[normalized.kind] = normalized
+                }
+            }
+            self.limits = TraversalLimit.Kind.allCases.compactMap { limitsByKind[$0] }
+            self.wasCancelled = wasCancelled
+        }
+
+        static let complete = EnumerationCompletion()
+        var isComplete: Bool { limits.isEmpty && !wasCancelled }
+
+        func merging(_ other: EnumerationCompletion) -> EnumerationCompletion {
+            EnumerationCompletion(
+                limits: limits + other.limits,
+                wasCancelled: wasCancelled || other.wasCancelled
+            )
+        }
+    }
+
+    /// Project-relative paths plus the evidence needed to interpret omissions.
+    /// Collection conformance keeps existing path-only consumers lightweight;
+    /// new callers can inspect `completion` instead of guessing from count.
+    struct Enumeration: Equatable, Sendable, RandomAccessCollection {
+        typealias Element = String
+        typealias Index = Int
+
+        let paths: [String]
+        let completion: EnumerationCompletion
+
+        init(paths: [String], completion: EnumerationCompletion = .complete) {
+            self.paths = paths
+            self.completion = completion
+        }
+
+        var startIndex: Int { paths.startIndex }
+        var endIndex: Int { paths.endIndex }
+        subscript(position: Int) -> String { paths[position] }
+        func index(after index: Int) -> Int { paths.index(after: index) }
+        func index(before index: Int) -> Int { paths.index(before: index) }
+        func index(_ index: Int, offsetBy distance: Int) -> Int {
+            paths.index(index, offsetBy: distance)
+        }
+        func distance(from start: Int, to end: Int) -> Int {
+            paths.distance(from: start, to: end)
+        }
+    }
+
     /// Directories that never belong in a tree or fuzzy index.
     static let ignoredNames: Set<String> = [
         ".git", "node_modules", ".build", "dist", "DerivedData", ".swiftpm",
@@ -515,9 +595,9 @@ enum ProjectFiles {
         of directory: URL,
         limit: Int,
         isCancelled: () -> Bool
-    ) -> (nodes: [FileNode], failure: DirectoryLoadFailure?, visited: Int) {
-        guard limit > 0 else { return ([], nil, 0) }
-        guard !isCancelled() else { return ([], .cancelled, 0) }
+    ) -> (nodes: [FileNode], failure: DirectoryLoadFailure?, visited: Int, reachedLimit: Bool) {
+        guard limit > 0 else { return ([], nil, 0, false) }
+        guard !isCancelled() else { return ([], .cancelled, 0, false) }
         // The error-handling enumerator is the only way to learn *why* a
         // directory refused to list. The plain one hands back an empty
         // sequence for permission denied, a deleted folder, and an I/O fault
@@ -535,10 +615,11 @@ enum ProjectFiles {
                 failure = loadFailure(for: error as NSError)
                 return false
             }
-        ) else { return ([], probedFailure(for: directory) ?? .ioFailure(code: 0), 0) }
+        ) else { return ([], probedFailure(for: directory) ?? .ioFailure(code: 0), 0, false) }
         var nodes: [FileNode] = []
         if limit != .max { nodes.reserveCapacity(min(limit, 256)) }
         var visited = 0
+        var reachedLimit = false
         while let url = contents.nextObject() as? URL {
             // Hitting the caller's limit is deliberate bounding, not a failure;
             // being cancelled mid-walk leaves a truncated list that is.
@@ -546,7 +627,10 @@ enum ProjectFiles {
                 failure = .cancelled
                 break
             }
-            guard visited < limit else { break }
+            guard visited < limit else {
+                reachedLimit = true
+                break
+            }
             visited += 1
             let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             let isDirectory = values?.isDirectory ?? false
@@ -560,7 +644,7 @@ enum ProjectFiles {
             if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
             return $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
-        return (sorted, failure, visited)
+        return (sorted, failure, visited, reachedLimit)
     }
 
     /// Map what `FileManager` reported onto the five outcomes the rail knows
@@ -618,54 +702,107 @@ enum ProjectFiles {
     }
 
     /// Recursively enumerate project files for fuzzy search, bounded so a huge
-    /// tree cannot stall the palette. Returns project-relative paths.
+    /// tree cannot stall the palette. Returns project-relative paths together
+    /// with the exact traversal budget or cancellation that made them partial.
     static func enumerate(
         root: URL,
         limit: Int = defaultFileLimit,
         directoryLimit: Int = defaultDirectoryLimit,
         visitLimit: Int = defaultVisitLimit,
         isCancelled: () -> Bool = { Task.isCancelled }
-    ) -> [String] {
-        guard limit > 0, directoryLimit > 0, visitLimit > 0, !isCancelled() else {
-            return []
+    ) -> Enumeration {
+        let initiallyCancelled = isCancelled()
+        var invalidLimits: [TraversalLimit] = []
+        if limit <= 0 { invalidLimits.append(.init(kind: .files, maximum: 0)) }
+        if directoryLimit <= 0 { invalidLimits.append(.init(kind: .directories, maximum: 0)) }
+        if visitLimit <= 0 { invalidLimits.append(.init(kind: .visitedEntries, maximum: 0)) }
+        guard invalidLimits.isEmpty, !initiallyCancelled else {
+            return Enumeration(
+                paths: [],
+                completion: EnumerationCompletion(
+                    limits: invalidLimits,
+                    wasCancelled: initiallyCancelled
+                )
+            )
         }
         var results: [String] = []
         var queue: [URL] = [root]
         var queueIndex = 0
         var visitedEntries = 0
+        var reachedLimits: [TraversalLimit] = []
+        var wasCancelled = false
         let rootPath = root.standardizedFileURL.path
-        while queueIndex < queue.count,
-              queueIndex < directoryLimit,
-              results.count < limit,
-              visitedEntries < visitLimit,
-              !isCancelled() {
+        while queueIndex < queue.count {
+            if isCancelled() {
+                wasCancelled = true
+                break
+            }
+            if visitedEntries >= visitLimit {
+                reachedLimits.append(.init(kind: .visitedEntries, maximum: visitLimit))
+                break
+            }
             let directory = queue[queueIndex]
             queueIndex += 1
-            for node in children(
+            let scan = scanChildren(
                 of: directory,
                 limit: visitLimit - visitedEntries,
                 isCancelled: isCancelled
-            ) {
-                guard !isCancelled(), visitedEntries < visitLimit else {
-                    return results
+            )
+            visitedEntries += scan.visited
+            if scan.failure == .cancelled {
+                return Enumeration(
+                    paths: results,
+                    completion: EnumerationCompletion(
+                        limits: reachedLimits,
+                        wasCancelled: true
+                    )
+                )
+            }
+            if scan.reachedLimit {
+                reachedLimits.append(.init(kind: .visitedEntries, maximum: visitLimit))
+            }
+            for node in scan.nodes {
+                guard !isCancelled() else {
+                    return Enumeration(
+                        paths: results,
+                        completion: EnumerationCompletion(
+                            limits: reachedLimits,
+                            wasCancelled: true
+                        )
+                    )
                 }
-                visitedEntries += 1
                 if node.isDirectory {
                     // Never enqueue more work than this traversal is allowed
                     // to visit. This also caps memory used by the BFS queue.
                     if queue.count < directoryLimit {
                         queue.append(node.url)
+                    } else {
+                        reachedLimits.append(.init(kind: .directories, maximum: directoryLimit))
                     }
                 } else {
                     let path = node.url.path
                     if path.hasPrefix(rootPath + "/") {
+                        guard results.count < limit else {
+                            return Enumeration(
+                                paths: results,
+                                completion: EnumerationCompletion(
+                                    limits: reachedLimits + [.init(kind: .files, maximum: limit)]
+                                )
+                            )
+                        }
                         results.append(String(path.dropFirst(rootPath.count + 1)))
-                        if results.count >= limit { break }
                     }
                 }
             }
+            if scan.reachedLimit { break }
         }
-        return results
+        return Enumeration(
+            paths: results,
+            completion: EnumerationCompletion(
+                limits: reachedLimits,
+                wasCancelled: wasCancelled
+            )
+        )
     }
 
     /// Bounded, symlink-free project folders suitable for an in-app move
@@ -734,12 +871,65 @@ enum ProjectFiles {
         visitLimit: Int = defaultVisitLimit,
         isCancelled: () -> Bool = { Task.isCancelled }
     ) -> [String]? {
-        guard limit > 0, !isCancelled() else { return [] }
+        updatingEnumeration(
+            Enumeration(paths: existing),
+            root: root,
+            changedPaths: changedPaths,
+            limit: limit,
+            directoryLimit: directoryLimit,
+            visitLimit: visitLimit,
+            isCancelled: isCancelled
+        )?.paths
+    }
+
+    /// Metadata-preserving counterpart used by the cached search index. A
+    /// partial prior walk stays partial after a targeted patch: adding one
+    /// known file cannot prove that previously omitted subtrees are complete.
+    static func updatingIndex(
+        _ existing: Enumeration,
+        root: URL,
+        changedPaths: [URL],
+        limit: Int = defaultFileLimit,
+        directoryLimit: Int = defaultDirectoryLimit,
+        visitLimit: Int = defaultVisitLimit,
+        isCancelled: () -> Bool = { Task.isCancelled }
+    ) -> Enumeration? {
+        updatingEnumeration(
+            existing,
+            root: root,
+            changedPaths: changedPaths,
+            limit: limit,
+            directoryLimit: directoryLimit,
+            visitLimit: visitLimit,
+            isCancelled: isCancelled
+        )
+    }
+
+    static func updatingEnumeration(
+        _ existing: Enumeration,
+        root: URL,
+        changedPaths: [URL],
+        limit: Int = defaultFileLimit,
+        directoryLimit: Int = defaultDirectoryLimit,
+        visitLimit: Int = defaultVisitLimit,
+        isCancelled: () -> Bool = { Task.isCancelled }
+    ) -> Enumeration? {
+        guard limit > 0 else {
+            return Enumeration(
+                paths: [],
+                completion: .init(limits: [.init(kind: .files, maximum: 0)])
+            )
+        }
+        guard !isCancelled() else {
+            return Enumeration(paths: [], completion: .init(wasCancelled: true))
+        }
         let normalizedRoot = root.standardizedFileURL
         let rootPath = normalizedRoot.path
         var relativeChanges: Set<String> = []
         for changedPath in changedPaths {
-            guard !isCancelled() else { return [] }
+            guard !isCancelled() else {
+                return Enumeration(paths: [], completion: .init(wasCancelled: true))
+            }
             let path = changedPath.standardizedFileURL.path
             if path == rootPath { return nil }
             guard path.hasPrefix(rootPath + "/") else { continue }
@@ -749,7 +939,7 @@ enum ProjectFiles {
         }
         guard !relativeChanges.isEmpty else { return existing }
 
-        var files = Set(existing)
+        var files = Set(existing.paths)
         let orderedChanges = relativeChanges.sorted {
             $0.localizedStandardCompare($1) == .orderedAscending
         }
@@ -759,30 +949,47 @@ enum ProjectFiles {
         }
 
         var additions: [String] = []
+        var completion = existing.completion
         additions.reserveCapacity(min(limit, 256))
         for relative in orderedChanges where additions.count < limit {
-            guard !isCancelled() else { return [] }
+            guard !isCancelled() else {
+                return Enumeration(
+                    paths: [],
+                    completion: completion.merging(.init(wasCancelled: true))
+                )
+            }
             let candidate = normalizedRoot.appendingPathComponent(relative).standardizedFileURL
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: candidate.path, isDirectory: &isDirectory),
                   isSafeIndexCandidate(candidate, root: normalizedRoot) else { continue }
             if isDirectory.boolValue {
                 let remaining = limit - additions.count
-                additions.append(contentsOf: enumerate(
+                let enumeration = enumerate(
                     root: candidate,
                     limit: remaining,
                     directoryLimit: directoryLimit,
                     visitLimit: visitLimit,
                     isCancelled: isCancelled
-                ).map { relative + "/" + $0 })
+                )
+                additions.append(contentsOf: enumeration.paths.map { relative + "/" + $0 })
+                completion = completion.merging(enumeration.completion)
             } else {
                 additions.append(relative)
             }
         }
         files.formUnion(additions)
-        return Array(files).sorted {
+        let ordered = Array(files).sorted {
             $0.localizedStandardCompare($1) == .orderedAscending
-        }.prefix(limit).map { $0 }
+        }
+        if ordered.count > limit {
+            completion = completion.merging(.init(
+                limits: [.init(kind: .files, maximum: limit)]
+            ))
+        }
+        return Enumeration(
+            paths: Array(ordered.prefix(limit)),
+            completion: completion
+        )
     }
 
     private static func isIndexableRelativePath(_ path: String) -> Bool {
@@ -811,6 +1018,69 @@ enum ProjectFiles {
     }
 }
 
+/// Copy shared by the file rail's partial-result states. The crawler supplies
+/// the numbers; this formatter only turns them into a concise, inspectable
+/// explanation and a route back to folder-by-folder browsing.
+enum ProjectFileSearchPresentation {
+    struct Notice: Equatable, Sendable {
+        let title: String
+        let detail: String
+        let actionTitle: String
+    }
+
+    static func notice(for completion: ProjectFiles.EnumerationCompletion) -> Notice? {
+        guard !completion.isComplete else { return nil }
+        let scopes = completion.limits.map { limit -> String in
+            let amount = grouped(limit.maximum)
+            switch limit.kind {
+            case .files:
+                return "\(amount) files"
+            case .directories:
+                return "\(amount) folders"
+            case .visitedEntries:
+                return "\(amount) items"
+            }
+        }
+        let detail: String
+        if scopes.isEmpty {
+            detail = "Indexing was interrupted before it finished."
+        } else {
+            let scope = list(scopes)
+            detail = completion.wasCancelled
+                ? "Search stopped at \(scope) and was interrupted."
+                : "Search stopped at \(scope)."
+        }
+        return Notice(
+            title: "Partial results",
+            detail: detail,
+            actionTitle: "Browse folders"
+        )
+    }
+
+    private static func list(_ values: [String]) -> String {
+        switch values.count {
+        case 0:
+            return ""
+        case 1:
+            return values[0]
+        case 2:
+            return values.joined(separator: " and ")
+        default:
+            return values.dropLast().joined(separator: ", ") + ", and " + values.last!
+        }
+    }
+
+    private static func grouped(_ value: Int) -> String {
+        let digits = String(value)
+        var result = ""
+        for (offset, character) in digits.reversed().enumerated() {
+            if offset > 0, offset.isMultiple(of: 3) { result.append(",") }
+            result.append(character)
+        }
+        return String(result.reversed())
+    }
+}
+
 /// A small TTL cache of project file lists so the palette doesn't re-walk the
 /// tree on every keystroke.
 @MainActor
@@ -819,7 +1089,7 @@ final class ProjectFileIndex {
 
     private struct InFlightWalk {
         let id: UUID
-        let task: Task<[String], Never>
+        let task: Task<ProjectFiles.Enumeration, Never>
     }
 
     private struct PendingInvalidation {
@@ -827,7 +1097,7 @@ final class ProjectFileIndex {
         var requiresFullRefresh = false
     }
 
-    private var cache: [String: (at: Date, files: [String])] = [:]
+    private var cache: [String: (at: Date, result: ProjectFiles.Enumeration)] = [:]
 
     /// Memory-pressure hook and closed-project eviction (spec §2g/§2i): the
     /// palette re-walks on demand, so residency is purely discretionary.
@@ -842,61 +1112,83 @@ final class ProjectFileIndex {
     /// A replacement walk waits for its canceled predecessor to finish. The
     /// production enumerator cooperates promptly, and the ordering guarantee
     /// ensures invalidation can never create overlapping crawls of one root.
-    private var retiring: [String: Task<[String], Never>] = [:]
+    private var retiring: [String: Task<ProjectFiles.Enumeration, Never>] = [:]
     private var generationByRoot: [String: Int] = [:]
     private var pendingInvalidations: [String: PendingInvalidation] = [:]
-    private let enumerateFiles: @Sendable (URL) -> [String]
+    private let enumerateResult: @Sendable (URL) -> ProjectFiles.Enumeration
 
     init(
-        enumerateFiles: @escaping @Sendable (URL) -> [String] = {
+        enumerateResult: @escaping @Sendable (URL) -> ProjectFiles.Enumeration = {
             ProjectFiles.enumerate(root: $0)
         }
     ) {
-        self.enumerateFiles = enumerateFiles
+        self.enumerateResult = enumerateResult
+    }
+
+    /// Compatibility for path-only consumers such as link completion. Search
+    /// surfaces call `snapshot` so they cannot lose the traversal receipt.
+    convenience init(enumerateFiles: @escaping @Sendable (URL) -> [String]) {
+        self.init(enumerateResult: { root in
+            ProjectFiles.Enumeration(paths: enumerateFiles(root))
+        })
     }
 
     func files(for root: URL, now: Date = Date()) async -> [String] {
+        await snapshot(for: root, now: now).paths
+    }
+
+    func snapshot(for root: URL, now: Date = Date()) async -> ProjectFiles.Enumeration {
         let key = root.standardizedFileURL.path
         if pendingInvalidations[key] == nil,
            let cached = cache[key], now.timeIntervalSince(cached.at) < 30 {
-            return cached.files
+            return cached.result
         }
         if let existing = inFlight[key] {
             let joinedGeneration = generationByRoot[key, default: 0]
-            let files = await existing.task.value
+            let result = await existing.task.value
             if joinedGeneration == generationByRoot[key, default: 0], !existing.task.isCancelled {
-                return files
+                return result
             }
-            guard !Task.isCancelled else { return [] }
-            return await self.files(for: root)
+            guard !Task.isCancelled else {
+                return ProjectFiles.Enumeration(
+                    paths: [],
+                    completion: .init(wasCancelled: true)
+                )
+            }
+            return await self.snapshot(for: root)
         }
         let currentGeneration = generationByRoot[key, default: 0]
         let predecessor = retiring.removeValue(forKey: key)
         let invalidation = pendingInvalidations.removeValue(forKey: key)
-        let cachedFiles = cache[key]?.files
+        let cachedResult = cache[key]?.result
         let walkID = UUID()
-        let enumerateFiles = self.enumerateFiles
-        let task: Task<[String], Never> = Task.detached(priority: .utility) {
+        let enumerateResult = self.enumerateResult
+        let task: Task<ProjectFiles.Enumeration, Never> = Task.detached(priority: .utility) {
             if let predecessor {
                 _ = await predecessor.value
             }
-            guard !Task.isCancelled else { return [] }
+            guard !Task.isCancelled else {
+                return ProjectFiles.Enumeration(
+                    paths: [],
+                    completion: .init(wasCancelled: true)
+                )
+            }
             if let invalidation,
                !invalidation.requiresFullRefresh,
-               let cachedFiles {
+               let cachedResult {
                 let paths = invalidation.paths.map { URL(fileURLWithPath: $0) }
-                if let files = ProjectFiles.updatingIndex(
-                    cachedFiles,
+                if let result = ProjectFiles.updatingEnumeration(
+                    cachedResult,
                     root: root,
                     changedPaths: paths
                 ) {
-                    return files
+                    return result
                 }
             }
-            return enumerateFiles(root)
+            return enumerateResult(root)
         }
         inFlight[key] = InFlightWalk(id: walkID, task: task)
-        let files = await task.value
+        let result = await task.value
         // An invalidated caller may finish after a replacement has started.
         // Only the walk that still owns this slot may clear or populate it.
         let stillOwnsSlot = inFlight[key]?.id == walkID
@@ -906,13 +1198,18 @@ final class ProjectFileIndex {
         if stillOwnsSlot,
            generationByRoot[key, default: 0] == currentGeneration,
            !task.isCancelled {
-            cache[key] = (now, files)
-            return files
+            cache[key] = (now, result)
+            return result
         }
         // An invalidated walk may contain a partial traversal. Join the current
         // generation instead of leaking that stale list to the palette.
-        guard !Task.isCancelled else { return [] }
-        return await self.files(for: root)
+        guard !Task.isCancelled else {
+            return ProjectFiles.Enumeration(
+                paths: [],
+                completion: .init(wasCancelled: true)
+            )
+        }
+        return await self.snapshot(for: root)
     }
 
     func invalidate() {
@@ -972,6 +1269,7 @@ final class WorkspaceTreeModel: ObservableObject {
     @Published private(set) var listingsByDirectory: [String: ProjectFiles.DirectoryListing] = [:]
     @Published private(set) var loadingDirectories: Set<String> = []
     @Published private(set) var searchResults: [String] = []
+    @Published private(set) var searchCompletion: ProjectFiles.EnumerationCompletion = .complete
     @Published private(set) var isSearching = false
 
     private var directoryTasks: [String: Task<Void, Never>] = [:]
@@ -1080,6 +1378,7 @@ final class WorkspaceTreeModel: ObservableObject {
         let query = rawQuery.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else {
             searchResults = []
+            searchCompletion = .complete
             isSearching = false
             return
         }
@@ -1088,13 +1387,16 @@ final class WorkspaceTreeModel: ObservableObject {
         searchTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: 140_000_000)
             guard !Task.isCancelled else { return }
-            let files = await ProjectFileIndex.shared.files(for: root)
+            let enumeration = await ProjectFileIndex.shared.snapshot(for: root)
             guard !Task.isCancelled else { return }
             let matches = await Task.detached(priority: .userInitiated) {
-                Array(files.lazy.filter { $0.localizedCaseInsensitiveContains(query) }.prefix(200))
+                Array(enumeration.paths.lazy.filter {
+                    $0.localizedCaseInsensitiveContains(query)
+                }.prefix(200))
             }.value
             guard !Task.isCancelled, let self else { return }
             self.searchResults = matches
+            self.searchCompletion = enumeration.completion
             self.isSearching = false
         }
     }

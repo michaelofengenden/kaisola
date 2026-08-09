@@ -725,13 +725,127 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(ProjectFiles.enumerate(root: root, limit: 5).count, 5)
     }
 
+    func testEnumerateReportsFileLimitWithoutFalsePositiveAtExactBoundary() throws {
+        let zero = ProjectFiles.enumerate(root: root, limit: 0)
+        XCTAssertEqual(zero.paths, [])
+        XCTAssertEqual(zero.completion.limits, [.init(kind: .files, maximum: 0)])
+
+        let exact = ProjectFiles.enumerate(root: root, limit: 2)
+        XCTAssertEqual(Set(exact.paths), ["README.md", "src/main.swift"])
+        XCTAssertTrue(exact.completion.isComplete)
+        XCTAssertEqual(exact.completion.limits, [])
+
+        try "third".write(
+            to: root.appendingPathComponent("third.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let limited = ProjectFiles.enumerate(root: root, limit: 2)
+        XCTAssertEqual(limited.paths.count, 2)
+        XCTAssertFalse(limited.completion.isComplete)
+        XCTAssertEqual(
+            limited.completion.limits,
+            [.init(kind: .files, maximum: 2)]
+        )
+    }
+
+    func testEnumerateReportsDirectoryVisitAndCancellationStops() {
+        let exactDirectoryBoundary = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 2,
+            visitLimit: 100
+        )
+        XCTAssertTrue(exactDirectoryBoundary.completion.isComplete)
+
+        let directoryLimited = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 1,
+            visitLimit: 100
+        )
+        XCTAssertEqual(
+            directoryLimited.completion.limits,
+            [.init(kind: .directories, maximum: 1)]
+        )
+        XCTAssertFalse(directoryLimited.completion.wasCancelled)
+
+        let visitLimited = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 100,
+            visitLimit: 1
+        )
+        XCTAssertEqual(
+            visitLimited.completion.limits,
+            [.init(kind: .visitedEntries, maximum: 1)]
+        )
+
+        let exactVisitBoundary = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 100,
+            visitLimit: 4
+        )
+        XCTAssertTrue(exactVisitBoundary.completion.isComplete)
+
+        var checks = 0
+        let cancelled = ProjectFiles.enumerate(root: root, isCancelled: {
+            checks += 1
+            return checks >= 2
+        })
+        XCTAssertTrue(cancelled.completion.wasCancelled)
+        XCTAssertFalse(cancelled.completion.isComplete)
+    }
+
+    @MainActor
+    func testProjectFileIndexPreservesTraversalMetadataAndPartialPresentationIsActionable() async {
+        let enumeration = ProjectFiles.Enumeration(
+            paths: ["README.md"],
+            completion: .init(
+                limits: [
+                    .init(kind: .directories, maximum: 2_000),
+                    .init(kind: .visitedEntries, maximum: 20_000),
+                ],
+                wasCancelled: false
+            )
+        )
+        let index = ProjectFileIndex(enumerateResult: { _ in enumeration })
+
+        let snapshot = await index.snapshot(for: root)
+        let files = await index.files(for: root)
+        XCTAssertEqual(snapshot, enumeration)
+        XCTAssertEqual(files, enumeration.paths)
+
+        let notice = try? XCTUnwrap(
+            ProjectFileSearchPresentation.notice(for: enumeration.completion)
+        )
+        XCTAssertEqual(notice?.title, "Partial results")
+        XCTAssertEqual(notice?.actionTitle, "Browse folders")
+        XCTAssertTrue(notice?.detail.contains("2,000 folders") == true)
+        XCTAssertTrue(notice?.detail.contains("20,000 items") == true)
+    }
+
+    func testDetailedIndexUpdatePreservesPriorPartialReceipt() throws {
+        let partial = ProjectFiles.Enumeration(
+            paths: ProjectFiles.enumerate(root: root).paths,
+            completion: .init(limits: [.init(kind: .directories, maximum: 2_000)])
+        )
+        let added = root.appendingPathComponent("src/added.swift")
+        try "added".write(to: added, atomically: true, encoding: .utf8)
+
+        let updated = try XCTUnwrap(ProjectFiles.updatingEnumeration(
+            partial,
+            root: root,
+            changedPaths: [added]
+        ))
+        XCTAssertTrue(updated.paths.contains("src/added.swift"))
+        XCTAssertEqual(updated.completion, partial.completion)
+    }
+
     func testEnumerateHonorsDirectoryAndVisitBounds() {
         let rootOnly = ProjectFiles.enumerate(
             root: root,
             directoryLimit: 1,
             visitLimit: 100
         )
-        XCTAssertEqual(rootOnly, ["README.md"])
+        XCTAssertEqual(rootOnly.paths, ["README.md"])
 
         let oneVisit = ProjectFiles.enumerate(
             root: root,
@@ -790,7 +904,7 @@ final class WorkspaceFilesTests: XCTestCase {
 
     @MainActor
     func testDetailedIndexInvalidationAvoidsASecondRepositoryWalk() async throws {
-        let probe = ProjectFileIndexStaticProbe(files: ProjectFiles.enumerate(root: root))
+        let probe = ProjectFileIndexStaticProbe(files: ProjectFiles.enumerate(root: root).paths)
         let index = ProjectFileIndex(enumerateFiles: probe.enumerate)
         _ = await index.files(for: root)
         XCTAssertEqual(probe.startedCount, 1)

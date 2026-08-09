@@ -968,7 +968,7 @@ struct CommandKeymapSettingsView: View {
                             }
                         }
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 12)
@@ -980,7 +980,7 @@ struct CommandKeymapSettingsView: View {
                             .textSelection(.enabled)
                         Text("Use version 1 and a bindings object, for example: \"view.toggle-files\": \"command+option+b\".")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)

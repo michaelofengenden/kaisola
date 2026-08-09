@@ -363,15 +363,17 @@ struct MeshView: View {
 
     @ObservedObject var mesh: MeshSession
     private let presentation: Presentation
-    @State private var diffColumnID: String?
-    @State private var diffText = ""
+    @State private var diffSheet = MeshDiffSheetState()
     @State private var integrateColumnID: String?
-    @State private var integrationStatus: String?
     /// The column the reader chose to focus. Held here, above the deck, so a
     /// width change never moves it.
     @State private var requestedColumnID: String?
     @State private var transcriptStates = MeshTranscriptViewStates()
     @Environment(\.dynamicTypeSize) private var dynamicTypeSize
+    @State private var integrationOutcome: MeshIntegrationOutcome?
+    /// The column the reported outcome belongs to, so "Try Again" and "Review
+    /// Diff" act on it rather than guessing from the message.
+    @State private var integratedColumnID: String?
     @FocusState private var composerFocused: Bool
     private let focusRequestGeneration: UInt64?
     private let onKeyboardFocus: (() -> Void)?
@@ -394,18 +396,8 @@ struct MeshView: View {
                 header
                 Divider()
             }
-            if let status = integrationStatus {
-                Text(status)
-                    .font(.caption)
-                    .foregroundStyle(
-                        isConflictStatus(status)
-                            ? KaisolaStatusTone.needsYou.foregroundColor
-                            : Color.secondary
-                    )
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 5)
+            if let outcome = integrationOutcome {
+                integrationStatusBar(outcome)
                 Divider()
             }
             if mesh.columns.isEmpty {
@@ -459,25 +451,12 @@ struct MeshView: View {
             Text("Grafts this column's edits onto \(mesh.baseDirectory.lastPathComponent) with a 3-way merge. Conflicts leave git markers you'll need to resolve.")
         }
         .sheet(item: Binding(
-            get: { diffColumnID.map(DiffSheetID.init) },
-            set: { diffColumnID = $0?.id }
+            get: { diffSheet.columnID.map(DiffSheetID.init) },
+            // SwiftUI only ever writes nil here (a dismissal); opening runs
+            // through the column's Diff button so the token is stamped once.
+            set: { if $0 == nil { diffSheet.close() } }
         )) { sheet in
-            VStack(spacing: 0) {
-                HStack {
-                    Text("Worktree diff — \(mesh.columns.first { $0.id == sheet.id }?.agent.name ?? "")")
-                        .font(.headline)
-                    Spacer()
-                    Button("Done") { diffColumnID = nil }.keyboardShortcut(.defaultAction)
-                }
-                .padding(12)
-                Divider()
-                ScrollView {
-                    UnifiedPatchView(patch: diffText.isEmpty ? "No changes yet." : diffText)
-                        .padding(12)
-                }
-            }
-            .frame(width: 640, height: 480)
-            .task { diffText = await mesh.diff(for: sheet.id) }
+            diffSheetBody(for: sheet.id)
         }
         .onAppear { applyFocusRequest(focusRequestGeneration) }
         .onChange(of: focusRequestGeneration) { _, request in
@@ -487,6 +466,49 @@ struct MeshView: View {
 
     private struct DiffSheetID: Identifiable {
         let id: String
+    }
+
+    /// The diff sheet for one column. Until that column's own request comes
+    /// back the body says so out loud rather than rendering whatever the last
+    /// column left in the shared string.
+    @ViewBuilder
+    private func diffSheetBody(for columnID: String) -> some View {
+        let name = mesh.columns.first { $0.id == columnID }?.agent.name ?? ""
+        VStack(spacing: 0) {
+            HStack {
+                Text("Worktree diff — \(name)")
+                    .font(.headline)
+                Spacer()
+                Button("Done") { diffSheet.close() }.keyboardShortcut(.defaultAction)
+            }
+            .padding(12)
+            Divider()
+            ScrollView {
+                if let patch = diffSheet.patch {
+                    UnifiedPatchView(patch: patch.isEmpty ? "No changes yet." : patch)
+                        .padding(12)
+                } else {
+                    ProgressView("Loading diff…")
+                        .controlSize(.small)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(24)
+                        .accessibilityLabel(
+                            name.isEmpty ? "Loading worktree diff" : "Loading \(name)'s worktree diff"
+                        )
+                }
+            }
+        }
+        .frame(width: 640, height: 480)
+        .task(id: columnID) { await loadDiff(for: columnID) }
+    }
+
+    /// Read the column's worktree diff and hand it back through the sheet's
+    /// fence, so a slow result that lands after a switch or a dismissal is
+    /// dropped instead of painted over the wrong column.
+    private func loadDiff(for columnID: String) async {
+        let token = diffSheet.token
+        let patch = await mesh.diff(for: columnID)
+        diffSheet.apply(patch: patch, from: columnID, token: token)
     }
 
     private var header: some View {
@@ -642,7 +664,7 @@ struct MeshView: View {
                             viewState: transcriptStates.state(for: column.id),
                             enablesPermissionShortcuts: column.id == shortcutColumnID,
                             stop: { Task { await mesh.stopTurn(columnID: column.id) } },
-                            showDiff: { diffColumnID = column.id },
+                            showDiff: { diffSheet.open(columnID: column.id) },
                             integrate: { integrateColumnID = column.id }
                         )
                     }
@@ -651,32 +673,71 @@ struct MeshView: View {
         }
     }
 
-    /// Fetch the column's worktree diff and graft it onto the base workspace.
-    /// Success and conflict/error alike surface in the status line under the
-    /// header. Runs on the main actor so the @State write is safe.
-    private func integrate(_ columnID: String) {
-        let name = mesh.columns.first { $0.id == columnID }?.agent.name ?? "column"
-        let base = mesh.baseDirectory
-        Task { @MainActor in
-            let patch = await mesh.diff(for: columnID)
-            guard !patch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                integrationStatus = "\(name): no changes to apply."
-                return
+    /// The integration status line. Tint, symbol, what VoiceOver says, and which
+    /// buttons appear all come from the typed outcome, so a permission,
+    /// repository, patch, or I/O failure stays as loud as a conflict no matter
+    /// how git worded it.
+    private func integrationStatusBar(_ outcome: MeshIntegrationOutcome) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Label(outcome.message, systemImage: outcome.symbol)
+                .font(.caption)
+                .foregroundStyle(outcome.severity.foregroundColor)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel(outcome.accessibilityAnnouncement)
+            ForEach(outcome.recoveryActions) { action in
+                Button(action.title) { perform(action) }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .help(action.help)
+                    .accessibilityLabel("\(action.title): \(action.help)")
             }
-            do {
-                try await Task.detached(priority: .userInitiated) {
-                    try GitService(repoRoot: base).applyPatch(patch)
-                }.value
-                integrationStatus = "Applied \(name)'s diff to \(base.lastPathComponent)."
-            } catch {
-                integrationStatus = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 5)
+        .accessibilityElement(children: .contain)
+    }
+
+    /// Run one of the outcome's offered recoveries against the column it came
+    /// from.
+    private func perform(_ action: MeshIntegrationOutcome.Recovery) {
+        switch action {
+        case .reviewDiff:
+            if let columnID = integratedColumnID {
+                diffSheet.open(columnID: columnID)
             }
+        case .retry:
+            if let columnID = integratedColumnID { integrate(columnID) }
+        case .revealDestination:
+            NSWorkspace.shared.activateFileViewerSelecting([mesh.baseDirectory])
+        case .dismiss:
+            integrationOutcome = nil
+            integratedColumnID = nil
         }
     }
 
-    private func isConflictStatus(_ status: String) -> Bool {
-        status.range(of: "conflict", options: .caseInsensitive) != nil
-            || status.range(of: "marker", options: .caseInsensitive) != nil
+    /// Graft the column's worktree diff onto the base workspace and keep the
+    /// typed outcome it reports. Runs on the main actor so the @State writes are
+    /// safe.
+    private func integrate(_ columnID: String) {
+        integratedColumnID = columnID
+        Task { @MainActor in
+            integrationOutcome = await mesh.integrate(columnID: columnID)
+        }
+    }
+}
+
+private extension MeshIntegrationOutcome.Severity {
+    /// The only place a severity becomes a colour. Each state also carries its
+    /// own symbol, so tint is reinforcement rather than the whole signal.
+    var foregroundColor: Color {
+        switch self {
+        case .success: KaisolaStatusTone.done.foregroundColor
+        case .informational: Color.kaisolaSecondary
+        case .warning: KaisolaStatusTone.needsYou.foregroundColor
+        case .failure: KaisolaStatusTone.failed.foregroundColor
+        }
     }
 }
 
@@ -716,7 +777,7 @@ struct MeshStagedPromptQueueButton: View {
                         .font(.headline)
                     Text("Waiting in dispatch order")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
                 Spacer()
                 Button {
@@ -738,7 +799,7 @@ struct MeshStagedPromptQueueButton: View {
                             HStack {
                                 Text("Prompt \(index + 1)")
                                     .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                                 Spacer()
                                 Button(role: .destructive) {
                                     if mesh.removeStagedPrompt(prompt, at: index), mesh.stagedPrompts.isEmpty {
@@ -808,7 +869,7 @@ struct MeshConfigurationMenu: View {
                 Text("\(mesh.configuredAgentNames.count) ACP · \(mesh.configuredMCPServerNames.count) MCP")
             }
             .font(.caption.weight(.medium))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .kaisolaControlSurface(active: true, tint: .purple)
@@ -980,7 +1041,7 @@ private struct MeshColumnView: View {
                                     if viewState.isLoadingEarlier { ProgressView().controlSize(.mini) }
                                     Text(viewState.isLoadingEarlier ? "Loading earlier messages…" : "Earlier messages")
                                         .font(.caption2)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(.kaisolaSecondary)
                                 }
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 5)
@@ -1000,13 +1061,13 @@ private struct MeshColumnView: View {
                             } else if viewState.isReady, !conversation.rows.isEmpty {
                                 Text("Beginning of session")
                                     .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                                     .frame(maxWidth: .infinity)
                                     .padding(.vertical, 5)
                             }
                             if let status = conversation.statusMessage {
                                 Label(status, systemImage: "exclamationmark.triangle")
-                                    .font(.caption).foregroundStyle(.secondary)
+                                    .font(.caption).foregroundStyle(.kaisolaSecondary)
                             }
                             ForEach(conversation.visibleRows) { row in
                                 TranscriptRowView(
@@ -1121,7 +1182,7 @@ struct UnifiedPatchView: View {
             if rendered.isTruncated {
                 Label("Large diff truncated in this view", systemImage: "ellipsis.rectangle")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.top, 6)
             }
         }

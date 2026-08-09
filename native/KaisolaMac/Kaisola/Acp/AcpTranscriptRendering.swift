@@ -290,7 +290,7 @@ struct AssistantMarkdownText: View {
                         ProgressView().controlSize(.mini)
                         Text("Rendering response…")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                     }
                     .accessibilityLabel("Rendering response")
                 } else {
@@ -310,7 +310,7 @@ struct AssistantMarkdownText: View {
                     systemImage: "ellipsis.rectangle"
                 )
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             }
             HStack(spacing: 10) {
                 if rendered.isTruncated {
@@ -367,13 +367,13 @@ private struct AcpTranscriptBlockView: View, Equatable {
         case let .image(source, alt, _, _, _):
             Label(alt ?? source, systemImage: "photo")
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityLabel("Image reference: \(alt ?? source)")
         case let .listItem(indent, marker, text):
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 Text(marker)
                     .font(.system(.body, design: .monospaced))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .frame(minWidth: 17, alignment: .trailing)
                 Text(AcpTranscriptInlineRendering.attributed(text, workspaceURL: workspaceURL))
             }
@@ -385,7 +385,7 @@ private struct AcpTranscriptBlockView: View, Equatable {
                     .frame(width: 3)
                 Text(AcpTranscriptInlineRendering.attributed(text, workspaceURL: workspaceURL))
                     .italic()
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             .padding(.vertical, 2)
         case let .code(language, text):
@@ -434,7 +434,7 @@ private struct AcpTranscriptCodeBlock: View {
             HStack(spacing: 8) {
                 Text(languageName?.uppercased() ?? "CODE")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Spacer()
                 Button {
                     NSPasteboard.general.clearContents()
@@ -492,7 +492,7 @@ private struct AcpTranscriptTable: View {
             if omittedRows > 0 {
                 Label(MarkdownTableTruncation.message(omittedRows: omittedRows), systemImage: "ellipsis.rectangle")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
         }
         .accessibilityElement(children: .contain)

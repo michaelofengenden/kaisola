@@ -111,6 +111,114 @@ function readRange(file, start, length) {
   }
 }
 
+// A spool root is private broker storage: transcripts, view state and exit
+// evidence all land under it, and the default root is a predictable
+// `kaisola-terminal-cache-<pid>` inside the shared temp directory. mkdir with
+// `recursive` treats an existing symlink-to-directory as "already there", so a
+// local process that pre-creates that path silently redirects every terminal
+// write outside broker storage. Validate the whole chain with lstat first and
+// refuse to run rather than write through a path we do not trust.
+const SPOOL_DIR_MODE = 0o700
+const OTHER_WRITE_BITS = 0o022
+const STICKY_BIT = 0o1000
+const MAX_LINK_HOPS = 8
+
+function unsafeSpoolDir(file, reason) {
+  const error = new Error(`refusing terminal spool directory: ${reason} (${file})`)
+  error.code = 'ERR_KAISOLA_UNSAFE_SPOOL_DIR'
+  return error
+}
+
+/** Root-owned ancestors are trusted, because a compromised root already owns
+ * the machine, but anything belonging to another account is not. */
+function ownedSafely(stat, uid) {
+  return stat.uid === uid || stat.uid === 0
+}
+
+/** Check every existing ancestor of `target`. Returns once a component is
+ * absent: mkdir creates that one and everything under it with our own mode. */
+function assertTrustedAncestors(target, uid) {
+  let remaining = target.split(path.sep).filter(Boolean)
+  remaining.pop() // the leaf is checked separately, after it exists
+  let current = path.sep
+  let hops = 0
+  while (remaining.length) {
+    const next = path.join(current, remaining.shift())
+    let stat
+    try {
+      stat = fs.lstatSync(next)
+    } catch (error) {
+      if (error?.code === 'ENOENT') return
+      throw unsafeSpoolDir(next, `unreadable (${error?.code || 'lstat failed'})`)
+    }
+    if (stat.isSymbolicLink()) {
+      // macOS ships /var and /tmp as root-owned links into /private, so an
+      // ancestor link is ordinary. Follow one only when the link itself is
+      // ours or root's: every directory above it has already been proven not
+      // writable by anyone else, so nobody could have planted it. Its target
+      // is re-walked from the root, giving each hop the same checks.
+      if (!ownedSafely(stat, uid)) throw unsafeSpoolDir(next, 'symlink owned by another user')
+      if (++hops > MAX_LINK_HOPS) throw unsafeSpoolDir(next, 'symlink chain too deep')
+      const resolved = path.resolve(path.dirname(next), fs.readlinkSync(next))
+      remaining = resolved.split(path.sep).filter(Boolean).concat(remaining)
+      current = path.sep
+      continue
+    }
+    if (!stat.isDirectory()) throw unsafeSpoolDir(next, 'not a directory')
+    if (!ownedSafely(stat, uid)) throw unsafeSpoolDir(next, 'owned by another user')
+    // A group- or world-writable ancestor lets another account swap our path
+    // out from under us. The sticky bit is the one exception the platform
+    // itself relies on: /tmp is 1777, where only an entry's owner may rename
+    // or delete it, and the leaf check below still catches a planted entry.
+    if ((stat.mode & OTHER_WRITE_BITS) && !(stat.mode & STICKY_BIT)) {
+      throw unsafeSpoolDir(next, 'writable by group or others')
+    }
+    current = next
+  }
+}
+
+/** True when `dir` exists and is a private directory of ours. Unlike an
+ * ancestor, the leaf is a path we create ourselves, so a symlink there means
+ * someone got to it first. There is no legitimate version of that. */
+function isPrivateSpoolDir(dir, uid) {
+  let stat
+  try {
+    stat = fs.lstatSync(dir)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false
+    throw unsafeSpoolDir(dir, `unreadable (${error?.code || 'lstat failed'})`)
+  }
+  if (stat.isSymbolicLink()) throw unsafeSpoolDir(dir, 'symlink')
+  if (!stat.isDirectory()) throw unsafeSpoolDir(dir, 'not a directory')
+  if (stat.uid !== uid) throw unsafeSpoolDir(dir, 'owned by another user')
+  if (stat.mode & OTHER_WRITE_BITS) throw unsafeSpoolDir(dir, 'writable by group or others')
+  return true
+}
+
+/** Create the spool root only through a chain we have verified, and hand back
+ * the resolved path. Throws with code ERR_KAISOLA_UNSAFE_SPOOL_DIR otherwise;
+ * a terminal that cannot get private storage must not start. */
+function ensurePrivateSpoolDir(dir) {
+  const target = path.resolve(String(dir ?? ''))
+  // Windows carries neither uid nor POSIX mode, so there is nothing to verify.
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null
+  if (uid == null) {
+    fs.mkdirSync(target, { recursive: true, mode: SPOOL_DIR_MODE })
+    return target
+  }
+  assertTrustedAncestors(target, uid)
+  isPrivateSpoolDir(target, uid)
+  fs.mkdirSync(target, { recursive: true, mode: SPOOL_DIR_MODE })
+  // mkdir accepts an existing symlink-to-directory, so the leaf is checked
+  // again here: this pass is what a path planted between the check above and
+  // the mkdir itself runs into.
+  if (!isPrivateSpoolDir(target, uid)) throw unsafeSpoolDir(target, 'vanished while being created')
+  // Spool roots from before this check may carry group/other read bits; they
+  // are ours and not writable by anyone else, so tighten instead of refusing.
+  try { fs.chmodSync(target, SPOOL_DIR_MODE) } catch { /* ownership already verified */ }
+  return target
+}
+
 class TerminalSpool {
   static readMeta(id, dir) {
     const terminalId = String(id)
@@ -168,11 +276,11 @@ class TerminalSpool {
     this.epochStartOffset = 0
     this.exitedAt = null
     this.exitStatus = null
-    fs.mkdirSync(dir, { recursive: true, mode: 0o700 })
+    const root = ensurePrivateSpoolDir(dir)
     const base = safeBase(this.id)
-    this.file = path.join(dir, `${base}.log`)
-    this.prevFile = path.join(dir, `${base}.prev.log`)
-    this.metaFile = path.join(dir, `${base}.json`)
+    this.file = path.join(root, `${base}.log`)
+    this.prevFile = path.join(root, `${base}.prev.log`)
+    this.metaFile = path.join(root, `${base}.json`)
     if (fresh) {
       for (const file of [this.file, this.prevFile, this.metaFile]) {
         try { fs.unlinkSync(file) } catch { /* absent or already unavailable */ }
@@ -183,7 +291,7 @@ class TerminalSpool {
     this.diskError = null
     this.decModes = new Map()
     this.decCarry = ''
-    const meta = TerminalSpool.readMeta(this.id, dir)
+    const meta = TerminalSpool.readMeta(this.id, root)
     if (meta) {
       this.viewState = meta.viewState || null
       if (Number.isSafeInteger(meta.epochStartOffset) && meta.epochStartOffset >= 0) {
@@ -525,6 +633,7 @@ module.exports = {
   DEFAULT_QUEUE_CAP,
   DEFAULT_COLD_TAIL_CAP,
   SPOOL_APPEND_DEBOUNCE_MS,
+  ensurePrivateSpoolDir,
   readTail,
   utf8Tail,
   readRange,

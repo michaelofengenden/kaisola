@@ -773,8 +773,8 @@ final class NativeTerminalInteractionTests: XCTestCase {
 
     func testOwnedTerminalPasteUsesCodexBracketedPasteProtocol() {
         let coordinator = NativeTerminalSurface.Coordinator()
-        var captured = ""
-        coordinator.onInput = { captured += $0 }
+        var captured: [String] = []
+        coordinator.onInput = { captured.append($0) }
         let view = OwnedTerminalView(
             frame: NSRect(x: 0, y: 0, width: 640, height: 320),
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
@@ -803,7 +803,11 @@ final class NativeTerminalInteractionTests: XCTestCase {
 
         view.paste(NSNull())
 
-        XCTAssertEqual(captured, "\u{1B}[200~first line\nsecond line 张\u{1B}[201~")
+        XCTAssertEqual(
+            captured,
+            ["\u{1B}[200~first line\nsecond line 张\u{1B}[201~"],
+            "A bracketed paste must cross the ownership-epoch boundary as one packet."
+        )
     }
 
     func testCommandPasteForwardsImageOnlyClipboardToCodexControlV() throws {

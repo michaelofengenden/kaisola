@@ -148,6 +148,8 @@ jobs:
               || receipt.linkStable !== true
               || receipt.liveFollowStable !== true
               || receipt.revokedPresentationObserved !== true
+              || receipt.discardNoticeVisible !== true
+              || receipt.discardNoticeRedacted !== true
               || receipt.additionalReplayStarts !== 0) {
             throw new Error(`invalid terminal ownership-flap receipt: ${JSON.stringify(receipt)}`)
           }

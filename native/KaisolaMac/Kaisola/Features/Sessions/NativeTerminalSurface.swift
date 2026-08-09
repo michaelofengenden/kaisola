@@ -3134,6 +3134,12 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
             insert(plan)
             return
         }
+        let terminal = getTerminal()
+        if terminal.bracketedPasteMode,
+           let text = NSPasteboard.general.string(forType: .string) {
+            sendBracketedPaste(text, to: terminal)
+            return
+        }
         super.paste(sender)
     }
 
@@ -3309,15 +3315,24 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
         guard isInputAuthorized else { return }
         let terminal = getTerminal()
         if terminal.bracketedPasteMode {
-            send(source: terminal, data: ArraySlice(Array("\u{1B}[200~".utf8)))
-        }
-        send(source: terminal, data: ArraySlice(Array(plan.text.utf8)))
-        if terminal.bracketedPasteMode {
-            send(source: terminal, data: ArraySlice(Array("\u{1B}[201~".utf8)))
+            sendBracketedPaste(plan.text, to: terminal)
+        } else {
+            send(source: terminal, data: ArraySlice(Array(plan.text.utf8)))
         }
         if let warning = plan.warningMessage {
             ToastCenter.shared.show(warning, style: .error, duration: 5)
         }
+    }
+
+    /// Treat DECSET 2004's wrapper and body as one ownership-epoch packet.
+    /// Three delegate callbacks let a controller flap strand the CLI after the
+    /// opening marker or deliver only a suffix; one callback is all-or-nothing
+    /// at AppModel's queue boundary.
+    private func sendBracketedPaste(_ text: String, to terminal: Terminal) {
+        var payload = Array("\u{1B}[200~".utf8)
+        payload.append(contentsOf: text.utf8)
+        payload.append(contentsOf: "\u{1B}[201~".utf8)
+        send(source: terminal, data: ArraySlice(payload))
     }
 
     /// Shift+Enter types a newline instead of submitting — ESC CR, the mapping

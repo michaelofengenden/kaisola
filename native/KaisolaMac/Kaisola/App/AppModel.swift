@@ -310,6 +310,10 @@ final class AppModel: ObservableObject {
     /// generation must never drain after that capability disappears and a
     /// later controller reattaches to the same PTY.
     private var terminalInputGenerations: [String: UInt64] = [:]
+    static let terminalInputDiscardNoticeSuffix =
+        ": unsent input was discarded. Try again after input reconnects."
+    static let terminalInputDiscardAggregateNotice =
+        "Unsent input was discarded after terminal control changed. Try again after input reconnects."
     private var terminalInputFailureNoticeAt: [String: Date] = [:]
     /// Broker PTYs can emit hundreds of small packets in one display interval.
     /// Merge contiguous packets for 16 ms so a 64 MiB retained document is
@@ -4218,10 +4222,19 @@ final class AppModel: ObservableObject {
         if owned {
             ownedTerminalIDs.insert(terminalID)
         } else {
-            invalidateTerminalInput(for: terminalID)
+            if invalidateTerminalInput(for: terminalID) {
+                reportDiscardedTerminalInput(for: [terminalID])
+            }
             ownedTerminalIDs.remove(terminalID)
         }
         return true
+    }
+
+    /// Read-only proof seam for the ownership-epoch tests. Draft state is
+    /// intentionally observable only as parsed composer text, never as queued
+    /// packet contents.
+    func terminalDraftTextForTesting(_ terminalID: String) -> String? {
+        terminalDraftTrackers[terminalID]?.text
     }
 
     /// Feed the broker-free streaming fixture through the same 16 ms output
@@ -5247,7 +5260,6 @@ final class AppModel: ObservableObject {
             return
         }
         let projectID = record.projectID
-        trackTerminalDraftInput(data, terminalID: terminalID)
         let opensAgentTurn = (
             agentProfile(for: terminalID) != nil
                 || detectedAgentNamesByTerminalID[terminalID] != nil
@@ -5299,9 +5311,15 @@ final class AppModel: ObservableObject {
                     terminalID: terminalID,
                     data: packet.data
                 )
-                if packet.opensAgentTurn,
-                   terminalInputGenerations[terminalID, default: 0] == generation,
-                   isOwned(terminalID) {
+                // Composer persistence is an acknowledgement receipt, not an
+                // optimistic key log. A packet discarded while queued, or an
+                // ambiguous late success from a revoked generation, must never
+                // become a future automatic draft retype.
+                guard terminalInputGenerations[terminalID, default: 0] == generation,
+                      controlAvailable,
+                      isOwned(terminalID) else { return }
+                trackTerminalDraftInput(packet.data, terminalID: terminalID)
+                if packet.opensAgentTurn {
                     try? await controlClient.setAgentTurn(
                         projectID: packet.projectID,
                         terminalID: terminalID,
@@ -5333,19 +5351,73 @@ final class AppModel: ObservableObject {
     /// Cancel and forget bytes accepted under the terminal's previous owner
     /// capability. Generation fencing also keeps an old task's `defer` or
     /// transport error from clearing a new drain installed after reattachment.
-    private func invalidateTerminalInput(for terminalID: String) {
+    @discardableResult
+    private func invalidateTerminalInput(for terminalID: String) -> Bool {
+        let discardedQueuedInput = terminalInputQueues[terminalID]?.isEmpty == false
         terminalInputGenerations[terminalID, default: 0] &+= 1
         terminalInputDrainTasks.removeValue(forKey: terminalID)?.cancel()
         terminalInputQueues.removeValue(forKey: terminalID)
+        return discardedQueuedInput
     }
 
-    private func invalidateAllTerminalInput() {
+    private func invalidateAllTerminalInput(notifyIfDiscarded: Bool = false) {
         let terminalIDs = Set(terminalInputQueues.keys)
             .union(terminalInputDrainTasks.keys)
             .union(ownedTerminalIDs)
+        var terminalsWithDiscardedInput: Set<String> = []
         for terminalID in terminalIDs {
-            invalidateTerminalInput(for: terminalID)
+            if invalidateTerminalInput(for: terminalID) {
+                terminalsWithDiscardedInput.insert(terminalID)
+            }
         }
+        if notifyIfDiscarded, !terminalsWithDiscardedInput.isEmpty {
+            reportDiscardedTerminalInput(for: terminalsWithDiscardedInput)
+        }
+    }
+
+    private func reportDiscardedTerminalInput(for terminalIDs: Set<String>) {
+        let message: String
+        if terminalIDs.count == 1, let terminalID = terminalIDs.first {
+            let safeTitle = SessionTitleTracker.sanitize(
+                terminalInputNoticeTitle(for: terminalID)
+            )
+                ?? "This terminal"
+            message = safeTitle + Self.terminalInputDiscardNoticeSuffix
+        } else {
+            message = Self.terminalInputDiscardAggregateNotice
+        }
+        let now = Date()
+        for terminalID in terminalIDs {
+            // A stale surface callback often follows the ownership callback in
+            // the same run-loop turn. The discard notice already explains its
+            // fate, so suppress the generic recovery toast for that echo only.
+            terminalInputFailureNoticeAt[terminalID] = now
+        }
+        ToastCenter.shared.show(
+            message,
+            style: .error,
+            duration: 6
+        )
+    }
+
+    /// Match the terminal identity shown in the project rail. A plain shell's
+    /// stored title is normally just its project folder, which is ambiguous as
+    /// soon as that project has two terminals; the rail resolves that collision
+    /// with a project-local ordinal (and process name when available).
+    private func terminalInputNoticeTitle(for terminalID: String) -> String {
+        guard let project = projects.first(where: { project in
+            project.sessions.contains(where: { $0.id == terminalID })
+        }),
+              let ordinal = project.sessions.firstIndex(where: { $0.id == terminalID }),
+              let record = project.sessions.first(where: { $0.id == terminalID }) else {
+            return sessionTitle(for: terminalID)
+        }
+        return QuietRailTitle.displayTitle(
+            rawTitle: sessionTitle(for: record),
+            projectName: project.name,
+            processName: meta(for: terminalID)?.processName,
+            ordinal: ordinal + 1
+        )
     }
 
     private func reportTerminalInputFailure(_ terminalID: String) {
@@ -5958,13 +6030,13 @@ final class AppModel: ObservableObject {
         topology: BrokerGenerationTopology,
         generation: Int
     ) async {
-        invalidateAllTerminalInput()
+        invalidateAllTerminalInput(notifyIfDiscarded: true)
         controlAvailable = false
         ownedTerminalIDs = []
         await controlClient.setDisconnectHandler { [weak self] error in
             Task { @MainActor in
                 guard let self, self.controlAvailable else { return }
-                self.invalidateAllTerminalInput()
+                self.invalidateAllTerminalInput(notifyIfDiscarded: true)
                 self.controlAvailable = false
                 self.ownedTerminalIDs = []
                 for task in self.terminalResizeTasks.values { task.cancel() }
@@ -6230,13 +6302,15 @@ final class AppModel: ObservableObject {
     /// App-quit path: detach so owned shells keep running on the broker, then
     /// drop the controller connection.
     func releaseOwnedSessionsForQuit() async {
+        // Seal and forget interactive intent before the first suspension. A
+        // direct quit call must not leave a drain alive while owners detach.
+        invalidateAllTerminalInput()
         guard controlAvailable else { return }
         for stored in persistedOwnedSessions where ownedTerminalIDs.contains(stored.id) {
             try? await controlClient.detachOwner(projectID: stored.projectID, terminalID: stored.id)
         }
         await controlClient.setDisconnectHandler(nil)
         await controlClient.disconnect()
-        invalidateAllTerminalInput()
         controlAvailable = false
     }
 

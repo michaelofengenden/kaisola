@@ -2222,6 +2222,28 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 liveFollowStayedExact = liveFollowStayedExact
                     && state.followsLiveOutput == initialState.followsLiveOutput
             }
+
+            for toast in ToastCenter.shared.toasts
+                where toast.message.hasSuffix(AppModel.terminalInputDiscardNoticeSuffix)
+                    || toast.message == AppModel.terminalInputDiscardAggregateNotice {
+                ToastCenter.shared.dismiss(toast.id)
+            }
+            let queuedInputSecrets = [
+                "visual-stale-text-secret",
+                "private visual paste",
+            ]
+            let queuedInputs = [
+                queuedInputSecrets[0],
+                "\u{1B}[A",
+                "\u{1B}[200~\(queuedInputSecrets[1])\r\u{1B}[201~",
+                "\r",
+            ]
+            for data in queuedInputs {
+                model.sendInput(data, to: "visual-terminal")
+            }
+
+            var discardNoticeVisible = false
+            var discardNoticeRedacted = false
             for _ in 0..<7 {
                 let started = ProcessInfo.processInfo.systemUptime
                 guard model.setVisualFixtureTerminalOwnership(false),
@@ -2235,6 +2257,15 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                     self.requestVisualFixtureTermination()
                     return
                 }
+                let discardNotices = ToastCenter.shared.toasts.filter {
+                    $0.message.hasSuffix(AppModel.terminalInputDiscardNoticeSuffix)
+                        || $0.message == AppModel.terminalInputDiscardAggregateNotice
+                }
+                discardNoticeVisible = discardNoticeVisible || discardNotices.count == 1
+                discardNoticeRedacted = discardNoticeRedacted
+                    || (discardNotices.count == 1 && queuedInputSecrets.allSatisfy {
+                        !discardNotices[0].message.contains($0)
+                    })
                 revokedPresentationObserved = revokedPresentationObserved
                     && !view.allowMouseReporting
                     && view.accessibilityLabel() == "Read-only terminal output"
@@ -2282,6 +2313,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 && stateStayedExact
                 && selectionStable
                 && revokedPresentationObserved
+                && discardNoticeVisible
+                && discardNoticeRedacted
                 && view.isInputAuthorized
                 && coordinator.replayMetrics == initialMetrics
 
@@ -2302,6 +2335,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                     "linkStable": linkPresent && linkStayedExact,
                     "liveFollowStable": liveFollowStayedExact,
                     "revokedPresentationObserved": revokedPresentationObserved,
+                    "discardNoticeVisible": discardNoticeVisible,
+                    "discardNoticeRedacted": discardNoticeRedacted,
                     "additionalReplayStarts": coordinator.replayMetrics.fullReplayStarts
                         - initialMetrics.fullReplayStarts,
                 ]

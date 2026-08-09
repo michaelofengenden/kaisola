@@ -256,10 +256,26 @@ struct AdapterInstallManager: Sendable {
         return record
     }
 
-    /// Remove an install and its record — disabling is reversible and total.
-    func uninstall(agentID: String) {
+    /// Remove an install and its record, naming a failure instead of hiding
+    /// it. The files go first on purpose: if the directory refuses to go, the
+    /// record survives, so the install still has an owner in Settings and a
+    /// retry route instead of becoming an unclaimed tree under
+    /// `acp-adapters/`. Removal is idempotent: an already-missing install is
+    /// success, not an error.
+    func purge(agentID: String) throws {
+        do {
+            try FileManager.default.removeItem(at: installRoot(agentID: agentID))
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            // Nothing on disk to remove; the record still has to go.
+        }
         store.remove(agentID: agentID)
-        try? FileManager.default.removeItem(at: installRoot(agentID: agentID))
+    }
+
+    /// Remove an install and its record — disabling is reversible and total.
+    /// Best-effort: for callers with nowhere to report a failure.
+    func uninstall(agentID: String) {
+        try? purge(agentID: agentID)
     }
 
     /// The package name without its version suffix (scope-aware).

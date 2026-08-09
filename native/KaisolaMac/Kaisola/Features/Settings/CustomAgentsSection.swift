@@ -28,6 +28,8 @@ struct CustomAgentsSection: View {
     @State private var pendingEnableIndex: Int?
     /// The agent whose pinned install is currently running.
     @State private var installingAgentID: String?
+    /// Which row's delete confirmation is open.
+    @State private var pendingDeleteID: String?
     private let installs = AdapterInstallManager()
 
     var body: some View {
@@ -54,12 +56,13 @@ struct CustomAgentsSection: View {
                         .labelsHidden()
                         .pickerStyle(.menu)
                         .frame(width: 64)
-                        Button(role: .destructive) { delete(index) } label: {
+                        Button(role: .destructive) { pendingDeleteID = spec.id } label: {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
                     }
                     acpControls(index: index, spec: spec)
+                    deleteConfirmation(spec: spec)
                 }
             }
             HStack {
@@ -117,10 +120,47 @@ struct CustomAgentsSection: View {
         NotificationCenter.default.post(name: .kaisolaAgentsChanged, object: nil)
     }
 
-    private func delete(_ index: Int) {
-        guard specs.indices.contains(index) else { return }
-        specs.remove(at: index)
-        persist()
+    private var deletion: CustomAgentDeletion {
+        CustomAgentDeletion(store: store, installs: installs)
+    }
+
+    /// The delete confirmation for one row: it names the agent and, when the
+    /// agent has a pinned adapter, the exact version that leaves disk with it.
+    /// Deleting used to drop the roster entry on the first click and leave the
+    /// install behind with no owner and no cleanup route. The plan is read on
+    /// each body pass, so enabling chat while this is open cannot leave the
+    /// sentence claiming there is nothing to remove.
+    @ViewBuilder
+    private func deleteConfirmation(spec: CustomAgentSpec) -> some View {
+        if pendingDeleteID == spec.id {
+            let plan = deletion.plan(for: spec)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(plan.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack {
+                    Button("Delete", role: .destructive) { confirmDelete(plan) }
+                        .font(.caption)
+                    Button("Cancel") { pendingDeleteID = nil }
+                        .font(.caption)
+                }
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
+    /// Remove the pinned install and the roster entry as one step. A failure
+    /// leaves both in place and says so, so the agent stays deletable.
+    private func confirmDelete(_ plan: CustomAgentDeletion.Plan) {
+        pendingDeleteID = nil
+        do {
+            specs = try deletion.delete(agentID: plan.agentID, from: specs)
+            NotificationCenter.default.post(name: .kaisolaAgentsChanged, object: nil)
+        } catch {
+            ToastCenter.shared.show(error.localizedDescription, style: .error, duration: 6)
+        }
     }
 
     /// Save the current list and announce the change so menus rebuild.
@@ -254,5 +294,78 @@ struct CustomAgentsSection: View {
         installs.uninstall(agentID: agentID)
         specs[index].chatEnabled = false
         persist()
+    }
+}
+
+/// Deleting a custom agent, as a value the settings row can confirm against
+/// and a test can drive without a settings window.
+///
+/// A chat-enabled agent owns two things: its roster entry and a pinned adapter
+/// install under `acp-adapters/<agentID>/`. Deleting only the entry stranded
+/// the install — executable code on disk that nothing in the UI named or could
+/// clean up. So the plan states both before the click, and the removal takes
+/// them together.
+struct CustomAgentDeletion {
+    /// One agent's removal, described before it happens.
+    struct Plan: Equatable {
+        let agentID: String
+        let agentName: String
+        /// The pinned adapter as the confirmation says it, e.g.
+        /// "probe-acp v1.2.3", or nil when the agent has no install.
+        let pinnedInstall: String?
+
+        /// The confirmation sentence. It always names the agent, and names the
+        /// pinned adapter version whenever deleting would remove one.
+        var message: String {
+            guard let pinnedInstall else {
+                return "Delete “\(agentName)”? It leaves the New menu; there is no pinned adapter install to remove."
+            }
+            return "Delete “\(agentName)”? Its pinned adapter install \(pinnedInstall) is removed from disk with it."
+        }
+    }
+
+    /// A deletion that could not finish. It names the agent, the reason, and
+    /// the fact that nothing was removed, so the user can retry.
+    enum Failure: LocalizedError, Equatable {
+        case installNotRemoved(agent: String, reason: String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .installNotRemoved(agent, reason):
+                "“\(agent)” was not deleted: its pinned adapter install could not be removed (\(reason)). Nothing changed — try again once the install directory is writable."
+            }
+        }
+    }
+
+    let store: CustomAgentStore
+    let installs: AdapterInstallManager
+
+    /// What deleting `spec` would remove, read from the recorded install.
+    func plan(for spec: CustomAgentSpec) -> Plan {
+        let record = installs.store.record(agentID: spec.id)
+        return Plan(
+            agentID: spec.id,
+            agentName: spec.name,
+            pinnedInstall: record.map { "\($0.package) v\($0.resolvedVersion)" }
+        )
+    }
+
+    /// Remove the agent's pinned install and its roster entry together, and
+    /// return the roster that remains.
+    ///
+    /// The install goes first: a failure there throws before the roster
+    /// changes, so the artifacts keep a named owner and a retry route. The
+    /// reverse order is what left executable files with no way back to them.
+    @discardableResult
+    func delete(agentID: String, from specs: [CustomAgentSpec]) throws -> [CustomAgentSpec] {
+        let name = specs.first { $0.id == agentID }?.name ?? agentID
+        do {
+            try installs.purge(agentID: agentID)
+        } catch {
+            throw Failure.installNotRemoved(agent: name, reason: error.localizedDescription)
+        }
+        let remaining = specs.filter { $0.id != agentID }
+        store.save(remaining)
+        return remaining
     }
 }

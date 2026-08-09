@@ -242,6 +242,100 @@ final class AdapterInstallTests: XCTestCase {
         ))
     }
 
+    // MARK: - Deleting a custom agent
+
+    /// Deleting a chat-enabled agent takes its pinned adapter with it. The
+    /// roster entry used to go alone, leaving executable install artifacts on
+    /// disk with no owner in Settings and no route to remove them.
+    func testDeletingAnAgentRemovesItsPinnedInstall() async throws {
+        let manager = manager()
+        let store = CustomAgentStore(fileURL: directory.appending(path: "agents.json"))
+        let spec = CustomAgentSpec(
+            id: "custom-probe", name: "Probe", launchCommand: "probe", symbol: "cpu",
+            acpPackage: "probe-acp", credentials: "none", chatEnabled: true
+        )
+        store.save([spec])
+        _ = try await manager.install(
+            agentID: "custom-probe", package: "probe-acp", runner: fakeInstaller()
+        )
+        let root = manager.installRoot(agentID: "custom-probe")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.path))
+
+        let deletion = CustomAgentDeletion(store: store, installs: manager)
+        let remaining = try deletion.delete(agentID: "custom-probe", from: [spec])
+
+        XCTAssertTrue(remaining.isEmpty)
+        XCTAssertTrue(store.all().isEmpty)
+        XCTAssertEqual(manager.verify(agentID: "custom-probe"), .notInstalled)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: root.path),
+            "a deleted agent must not leave adapter artifacts behind"
+        )
+    }
+
+    /// The confirmation names the agent and the exact pinned version that the
+    /// deletion destroys, and claims no version when there is no install.
+    func testDeletionPlanNamesTheAgentAndPinnedVersion() async throws {
+        let manager = manager()
+        let store = CustomAgentStore(fileURL: directory.appending(path: "agents.json"))
+        let spec = CustomAgentSpec(
+            id: "custom-probe", name: "Probe", launchCommand: "probe", symbol: "cpu",
+            acpPackage: "probe-acp", credentials: "none", chatEnabled: nil
+        )
+        let deletion = CustomAgentDeletion(store: store, installs: manager)
+
+        let uninstalled = deletion.plan(for: spec)
+        XCTAssertNil(uninstalled.pinnedInstall)
+        XCTAssertTrue(uninstalled.message.contains("Probe"), uninstalled.message)
+        XCTAssertFalse(uninstalled.message.contains("v1.2.3"), uninstalled.message)
+
+        _ = try await manager.install(
+            agentID: "custom-probe", package: "probe-acp", runner: fakeInstaller(version: "1.2.3")
+        )
+        let pinned = deletion.plan(for: spec)
+        XCTAssertEqual(pinned.pinnedInstall, "probe-acp v1.2.3")
+        XCTAssertTrue(pinned.message.contains("Probe"), pinned.message)
+        XCTAssertTrue(pinned.message.contains("probe-acp v1.2.3"), pinned.message)
+    }
+
+    /// An install that cannot be removed aborts the deletion and says why: the
+    /// roster entry and the install record both survive, so the artifacts keep
+    /// an owner and the delete can be retried.
+    func testAFailedPurgeKeepsTheAgentAndReportsWhy() async throws {
+        let manager = manager()
+        let store = CustomAgentStore(fileURL: directory.appending(path: "agents.json"))
+        let spec = CustomAgentSpec(
+            id: "custom-probe", name: "Probe", launchCommand: "probe", symbol: "cpu",
+            acpPackage: "probe-acp", credentials: "none", chatEnabled: true
+        )
+        store.save([spec])
+        _ = try await manager.install(
+            agentID: "custom-probe", package: "probe-acp", runner: fakeInstaller()
+        )
+        // A read-only installs root refuses to give up its child directory.
+        let installsRoot = manager.installRoot(agentID: "custom-probe").deletingLastPathComponent()
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500], ofItemAtPath: installsRoot.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700], ofItemAtPath: installsRoot.path
+            )
+        }
+
+        let deletion = CustomAgentDeletion(store: store, installs: manager)
+        XCTAssertThrowsError(try deletion.delete(agentID: "custom-probe", from: [spec])) { error in
+            let message = (error as? LocalizedError)?.errorDescription ?? "\(error)"
+            XCTAssertTrue(message.contains("Probe"), message)
+            XCTAssertTrue(message.lowercased().contains("not deleted"), message)
+        }
+        XCTAssertEqual(store.all(), [spec], "an aborted deletion keeps the roster entry")
+        XCTAssertNotNil(
+            manager.store.record(agentID: "custom-probe"),
+            "an aborted deletion keeps the install record, so the files stay owned"
+        )
+    }
+
     func testPackageNamesAreRegistryOnly() {
         XCTAssertNil(CustomAgentSpec.packageNameError("@scope/name"))
         XCTAssertNil(CustomAgentSpec.packageNameError("plain-name@1.2.3"))

@@ -26,6 +26,87 @@ enum LocalhostDetector {
     }
 }
 
+/// What the card's web view is doing right now. A dev server that is still
+/// starting, or has just died, otherwise shows as a blank page with nothing in
+/// the accessibility tree to explain it, so the header mirrors this state.
+enum BrowserCardLoadState: Equatable {
+    case loading
+    case loaded
+    case failed(String)
+
+    /// A navigation error as a card state, or `nil` when the error is not a
+    /// real failure. WebKit reports a cancelled provisional navigation whenever
+    /// a reload or a retarget supersedes the load in flight; announcing that as
+    /// "failed to load" would be a lie the user hears on every reload.
+    static func failure(for error: Error) -> Self? {
+        let error = error as NSError
+        if error.domain == NSURLErrorDomain, error.code == NSURLErrorCancelled {
+            return nil
+        }
+        return .failed(error.localizedDescription)
+    }
+}
+
+/// Spoken names for the card's header. The reload and close controls are
+/// image-only, so without explicit labels VoiceOver falls back to the SF Symbol
+/// name ("arrow.clockwise") and never says which page is being acted on — the
+/// card sits beside the file preview and other cards can be open. Kept pure and
+/// separate from the view so every announced string is directly testable.
+struct BrowserCardAccessibility {
+    let url: URL
+    let state: BrowserCardLoadState
+
+    /// The address as spoken in an action name: host and port
+    /// ("localhost:3000") rather than the whole URL, so a button does not
+    /// announce as "h t t p colon slash slash…" before naming its action.
+    /// Falls back to the full string for anything without a host.
+    var address: String {
+        guard let host = url.host(percentEncoded: false), !host.isEmpty else {
+            return url.absoluteString
+        }
+        guard let port = url.port else { return host }
+        // An IPv6 literal keeps its brackets, otherwise host and port run
+        // together into one unreadable run of colons.
+        return host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
+    }
+
+    /// Load state as spoken.
+    var statusName: String {
+        switch state {
+        case .loading: "Loading"
+        case .loaded: "Loaded"
+        case .failed(let reason): "Failed to load: \(reason)"
+        }
+    }
+
+    /// Value of the address element. The view labels that element "Address",
+    /// which replaces its visible text for VoiceOver, so the full URL has to
+    /// come back through the value — along with the state, which keeps it
+    /// reachable even when no status indicator is showing.
+    var addressValue: String {
+        "\(url.absoluteString), \(statusName)"
+    }
+
+    /// The header's inline status element, or `nil` once the page is up: a
+    /// loaded page needs no badge, and an empty one would just be noise to
+    /// swipe past.
+    var statusIndicatorLabel: String? {
+        switch state {
+        case .loading: "Loading \(address)"
+        case .loaded: nil
+        case .failed(let reason): "\(address) failed to load: \(reason)"
+        }
+    }
+
+    /// Action names stay constant across load states: a control that renames
+    /// itself mid-load is unusable by Voice Control.
+    var reloadLabel: String { "Reload \(address)" }
+
+    var openExternallyLabel: String { "Open in Browser, \(address)" }
+
+    var closeLabel: String { "Close browser card for \(address)" }
+}
+
 /// An in-app browser card for local dev servers (Electron parity): clicking a
 /// localhost URL in a terminal shows the page here instead of launching Safari.
 /// Header mirrors `FilePreviewView` — an icon, the address, and trailing
@@ -37,12 +118,17 @@ struct BrowserCardView: View {
     /// Bumping this drives a reload through the representable's `updateNSView`
     /// without holding a reference to the WKWebView from the header.
     @State private var reloadToken = 0
+    @State private var loadState: BrowserCardLoadState = .loading
+
+    private var accessibility: BrowserCardAccessibility {
+        BrowserCardAccessibility(url: url, state: loadState)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            ConfinedWebView(url: url, reloadToken: reloadToken)
+            ConfinedWebView(url: url, reloadToken: reloadToken, loadState: $loadState)
         }
         .background(Color(nsColor: .windowBackgroundColor))
     }
@@ -51,12 +137,15 @@ struct BrowserCardView: View {
         HStack(spacing: 10) {
             Image(systemName: "globe")
                 .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
             Text(url.absoluteString)
                 .font(.subheadline.weight(.medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .textSelection(.enabled)
                 .accessibilityLabel("Address")
+                .accessibilityValue(accessibility.addressValue)
+            statusIndicator
             Spacer(minLength: 12)
             Button {
                 reloadToken &+= 1
@@ -65,10 +154,12 @@ struct BrowserCardView: View {
             }
             .buttonStyle(.borderless)
             .help("Reload this page")
+            .accessibilityLabel(accessibility.reloadLabel)
             Button("Open in Browser") {
                 NSWorkspace.shared.open(url)
             }
             .help("Open this URL in your default browser")
+            .accessibilityLabel(accessibility.openExternallyLabel)
             Button {
                 close()
             } label: {
@@ -76,9 +167,29 @@ struct BrowserCardView: View {
             }
             .buttonStyle(.borderless)
             .help("Close the browser card")
+            .accessibilityLabel(accessibility.closeLabel)
         }
         .padding(.horizontal, 14)
         .frame(height: 42)
+    }
+
+    @ViewBuilder
+    private var statusIndicator: some View {
+        if let label = accessibility.statusIndicatorLabel {
+            switch loadState {
+            case .loading:
+                ProgressView()
+                    .controlSize(.mini)
+                    .accessibilityLabel(label)
+            case .failed:
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .help(label)
+                    .accessibilityLabel(label)
+            case .loaded:
+                EmptyView()
+            }
+        }
     }
 }
 
@@ -91,6 +202,7 @@ struct BrowserCardView: View {
 private struct ConfinedWebView: NSViewRepresentable {
     let url: URL
     let reloadToken: Int
+    @Binding var loadState: BrowserCardLoadState
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -109,12 +221,23 @@ private struct ConfinedWebView: NSViewRepresentable {
         coordinator.loadedURL = url
         coordinator.originHost = url.host(percentEncoded: false)?.lowercased()
         coordinator.reloadToken = reloadToken
+        coordinator.report = report
         webView.load(URLRequest(url: url))
         return webView
     }
 
+    /// Load state is only ever published from a navigation callback, never from
+    /// `makeNSView`/`updateNSView` — writing SwiftUI state inside a view update
+    /// is what the "Modifying state during view update" warning is about, and
+    /// `didStartProvisionalNavigation` already reports the reload as loading.
+    private func report(_ state: BrowserCardLoadState) {
+        guard loadState != state else { return }
+        loadState = state
+    }
+
     func updateNSView(_ webView: WKWebView, context: Context) {
         let coordinator = context.coordinator
+        coordinator.report = report
         // The card was retargeted at a different URL (user clicked another
         // localhost link while this card was already up).
         if coordinator.loadedURL != url {
@@ -133,6 +256,27 @@ private struct ConfinedWebView: NSViewRepresentable {
         var loadedURL: URL?
         var originHost: String?
         var reloadToken = 0
+        var report: (BrowserCardLoadState) -> Void = { _ in }
+
+        func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+            report(.loading)
+        }
+
+        func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            report(.loaded)
+        }
+
+        func webView(
+            _ webView: WKWebView,
+            didFailProvisionalNavigation navigation: WKNavigation!,
+            withError error: Error
+        ) {
+            if let state = BrowserCardLoadState.failure(for: error) { report(state) }
+        }
+
+        func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            if let state = BrowserCardLoadState.failure(for: error) { report(state) }
+        }
 
         // The closure attributes must match the optional requirement exactly
         // (`@MainActor @Sendable`); otherwise Swift treats this as an unrelated

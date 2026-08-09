@@ -367,19 +367,22 @@ actor AcpClient {
         }
     }
 
-    /// Set an adapter config option (e.g. reasoning effort). The response echoes
-    /// the full option set, which is re-emitted so the UI reflects adapter-side
-    /// normalization.
-    func setConfigOption(id: String, value: String) async {
-        guard let sessionID else { return }
-        let result = try? await request("session/set_config_option", params: .object([
+    /// Set an adapter config option (e.g. reasoning effort) and return only the
+    /// option set the adapter confirmed. Callers must not present the requested
+    /// value before this succeeds: adapters can reject a level for one model or
+    /// normalize it to another supported value.
+    func setConfigOption(id: String, value: String) async throws -> [AcpConfigOption] {
+        guard let sessionID else { throw AcpClientError.notRunning }
+        let result = try await request("session/set_config_option", params: .object([
             "sessionId": .string(sessionID),
             "configId": .string(id),
             "value": .string(value),
         ]))
-        if let options = result?.objectValue?["configOptions"] {
-            eventHandler?(.configOptions(Self.parseConfigOptions(options)))
+        let options = Self.parseConfigOptions(result.objectValue?["configOptions"])
+        guard options.contains(where: { $0.id == id && $0.currentValue != nil }) else {
+            throw AcpClientError.malformedResponse
         }
+        return options
     }
 
     /// Resolve a pending permission request with the user's chosen option.

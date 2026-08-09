@@ -85,7 +85,188 @@ final class MeshStagedTests: XCTestCase {
     func testApplyPatchRejectsEmptyDiff() throws {
         let repo = try makeTempRepo()
         defer { try? FileManager.default.removeItem(at: repo) }
-        XCTAssertThrowsError(try GitService(repoRoot: repo).applyPatch("   \n"))
+        XCTAssertThrowsError(try GitService(repoRoot: repo).applyPatch("   \n")) { error in
+            XCTAssertEqual(error as? GitService.PatchApplyFailure, .emptyPatch)
+        }
+    }
+
+    // MARK: - Typed integration outcomes (issue #200)
+
+    /// A real 3-way graft that lands with markers must be reported as a conflict
+    /// because the index holds unmerged entries, not because git's wording
+    /// happened to contain a particular English word.
+    func testApplyPatchReportsConflictFromUnmergedIndexEntries() throws {
+        let repo = try makeTempRepo()
+        defer { try? FileManager.default.removeItem(at: repo) }
+        let file = repo.appendingPathComponent("file.txt")
+        try "line1\nline2\nline3\n".write(to: file, atomically: true, encoding: .utf8)
+        try git(["add", "file.txt"], in: repo)
+        try git(["commit", "-q", "-m", "base"], in: repo)
+
+        // A patch produced by git itself, so its blob hashes exist in this repo
+        // and `--3way` can actually do the merge instead of falling back.
+        try "line1\nFROM-COLUMN\nline3\n".write(to: file, atomically: true, encoding: .utf8)
+        try git(["add", "-A"], in: repo)
+        let patch = try git(["diff", "--cached"], in: repo)
+        try git(["reset", "-q", "--hard", "HEAD"], in: repo)
+
+        // The base moves under the patch, so the graft conflicts.
+        try "line1\nLOCAL-EDIT\nline3\n".write(to: file, atomically: true, encoding: .utf8)
+        try git(["add", "-A"], in: repo)
+        try git(["commit", "-q", "-m", "local"], in: repo)
+
+        XCTAssertThrowsError(try GitService(repoRoot: repo).applyPatch(patch)) { error in
+            guard let failure = error as? GitService.PatchApplyFailure,
+                  case let .conflicted(paths, _) = failure else {
+                return XCTFail("expected a typed conflict, got \(error)")
+            }
+            XCTAssertEqual(paths, ["file.txt"])
+        }
+        let merged = try String(contentsOf: file, encoding: .utf8)
+        XCTAssertTrue(merged.contains("<<<<<<<"), "the graft should have left git markers")
+    }
+
+    func testApplyPatchOutsideARepositoryIsTypedNotARepository() throws {
+        let folder = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-mesh-nonrepo-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        let patch = """
+        diff --git a/file.txt b/file.txt
+        --- a/file.txt
+        +++ b/file.txt
+        @@ -1 +1 @@
+        -old
+        +new
+        """
+        XCTAssertThrowsError(try GitService(repoRoot: folder).applyPatch(patch)) { error in
+            XCTAssertEqual(error as? GitService.PatchApplyFailure, .notARepository)
+        }
+    }
+
+    /// The classifier reads structure only. Unmerged paths with bland stderr is
+    /// still a conflict; chatty stderr with a clean index is still a rejected
+    /// patch. Both directions would flip under the old substring test.
+    func testApplyFailureClassificationReadsStructureNotGitWording() {
+        let conflicted = GitService.classifyApplyFailure(
+            status: 1,
+            unmergedPaths: ["src/app.swift"],
+            isRepository: true,
+            destinationIsWritable: true,
+            detail: "Applied patch to 'src/app.swift'."
+        )
+        XCTAssertEqual(conflicted, .conflicted(paths: ["src/app.swift"], detail: "Applied patch to 'src/app.swift'."))
+
+        let rejected = GitService.classifyApplyFailure(
+            status: 1,
+            unmergedPaths: [],
+            isRepository: true,
+            destinationIsWritable: true,
+            detail: "error: patch failed: conflict-resolution-markers.txt:1"
+        )
+        XCTAssertEqual(rejected, .patchRejected(detail: "error: patch failed: conflict-resolution-markers.txt:1"))
+
+        XCTAssertEqual(
+            GitService.classifyApplyFailure(
+                status: 128, unmergedPaths: [], isRepository: true, destinationIsWritable: false, detail: ""
+            ),
+            .permissionDenied(detail: "")
+        )
+        XCTAssertEqual(
+            GitService.classifyApplyFailure(
+                status: 128, unmergedPaths: [], isRepository: false, destinationIsWritable: false, detail: ""
+            ),
+            .notARepository,
+            "a missing repository outranks the write check"
+        )
+        XCTAssertEqual(
+            GitService.classifyApplyFailure(
+                status: 128, unmergedPaths: [], isRepository: true, destinationIsWritable: true, detail: "fatal: bad object"
+            ),
+            .gitFailed(status: 128, detail: "fatal: bad object")
+        )
+    }
+
+    /// Severity, symbol, announcement, and recovery come off the case. A
+    /// permission failure worded without "conflict" stays loud; an I/O failure
+    /// worded WITH "conflict" is not promoted to a conflict.
+    func testIntegrationOutcomeSeveritySymbolAndRecoveryComeFromTheCase() {
+        let applied = MeshIntegrationOutcome.applied(agent: "Claude", destination: "Kaisola")
+        XCTAssertEqual(applied.severity, .success)
+        XCTAssertEqual(applied.recoveryActions, [.dismiss])
+        XCTAssertTrue(applied.accessibilityAnnouncement.hasPrefix("Integration succeeded"))
+
+        let nothing = MeshIntegrationOutcome.noChanges(agent: "Claude")
+        XCTAssertEqual(nothing.severity, .informational)
+
+        let conflicted = MeshIntegrationOutcome.conflicted(agent: "Claude", paths: ["file.txt"])
+        XCTAssertEqual(conflicted.severity, .warning)
+        XCTAssertEqual(conflicted.symbol, "exclamationmark.triangle.fill")
+        XCTAssertTrue(conflicted.recoveryActions.contains(.revealDestination))
+        XCTAssertTrue(conflicted.accessibilityAnnouncement.hasPrefix("Integration needs you"))
+
+        // Wording that the old substring test would have read as ordinary
+        // secondary text.
+        let permission = MeshIntegrationOutcome.failed(
+            agent: "Codex",
+            reason: .permissionDenied(detail: "error: unable to write file 'app.swift' mode 100644: Permission denied")
+        )
+        XCTAssertEqual(permission.severity, .failure)
+        XCTAssertNil(permission.message.range(of: "conflict", options: .caseInsensitive))
+        XCTAssertNil(permission.message.range(of: "marker", options: .caseInsensitive))
+        XCTAssertEqual(permission.symbol, "lock.fill")
+        XCTAssertTrue(permission.recoveryActions.contains(.retry))
+        XCTAssertTrue(permission.accessibilityAnnouncement.hasPrefix("Integration failed"))
+
+        // And the mirror image: the word in a message never makes a conflict.
+        let io = MeshIntegrationOutcome.failed(
+            agent: "Codex",
+            reason: .io(detail: "conflict while writing the patch to the volume")
+        )
+        XCTAssertEqual(io.severity, .failure)
+        XCTAssertEqual(io.symbol, "externaldrive.badge.exclamationmark")
+        XCTAssertEqual(io.recoveryActions, [.retry, .dismiss])
+
+        let repository = MeshIntegrationOutcome.failed(agent: "Gemini", reason: .notARepository)
+        XCTAssertEqual(repository.severity, .failure)
+        XCTAssertFalse(repository.message.isEmpty, "a reason with no git detail still reads")
+        XCTAssertTrue(repository.recoveryActions.contains(.revealDestination))
+
+        let rejected = MeshIntegrationOutcome.failed(agent: "Gemini", reason: .patchRejected(detail: ""))
+        XCTAssertEqual(rejected.severity, .failure)
+        XCTAssertTrue(rejected.recoveryActions.contains(.reviewDiff))
+    }
+
+    func testIntegrationOutcomeFromTypedApplyErrorPreservesKind() {
+        XCTAssertEqual(
+            MeshIntegrationOutcome.from(applyError: GitService.PatchApplyFailure.emptyPatch, agent: "Claude"),
+            .noChanges(agent: "Claude")
+        )
+        XCTAssertEqual(
+            MeshIntegrationOutcome.from(
+                applyError: GitService.PatchApplyFailure.conflicted(paths: ["a.txt", "b.txt"], detail: ""),
+                agent: "Claude"
+            ),
+            .conflicted(agent: "Claude", paths: ["a.txt", "b.txt"])
+        )
+        XCTAssertEqual(
+            MeshIntegrationOutcome.from(applyError: GitService.PatchApplyFailure.notARepository, agent: "Claude"),
+            .failed(agent: "Claude", reason: .notARepository)
+        )
+        XCTAssertEqual(
+            MeshIntegrationOutcome.from(
+                applyError: GitService.PatchApplyFailure.permissionDenied(detail: "denied"),
+                agent: "Claude"
+            ).severity,
+            .failure
+        )
+        // An error from outside GitService is a genuine unknown, not a downgrade.
+        struct Unexpected: Error {}
+        XCTAssertEqual(
+            MeshIntegrationOutcome.from(applyError: Unexpected(), agent: "Claude").severity,
+            .failure
+        )
     }
 
     // MARK: - Mode / purpose defaults and role split

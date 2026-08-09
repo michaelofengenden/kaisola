@@ -21,7 +21,7 @@ feature or acceptance completion, and PR 8 was untouched.
 | PR | Completion in the iteration | Remaining state |
 | --- | --- | --- |
 | PR 5 | Simulator/build blockers removed | Final real-device and production acceptance remains open |
-| PR 6 | Core registry and custom-agent process slices shipped | Consolidated settings UI remains; stronger process sandboxing is optional future work |
+| PR 6 | Core registry and custom-agent process slices shipped | Consolidated settings UI remains; custom ACP adapters now use the issue #26 allowlist + Seatbelt boundary |
 | PR 7 | 2 of 4 major slices shipped | Cross-project groups need a design decision; workflow automation is deferred |
 | PR 8 | No new completion | Pixel-smooth viewport implementation and physical-trackpad acceptance remain open |
 | PR 11 | 2 of 4 explicit acceptance gates completed | Bounded-PDF and installed-app momentum gates remain |
@@ -92,7 +92,8 @@ review). Shipped 2026-08-04:
   runs first.
 - MCP packages were already the reference registry; unchanged.
 
-The process slice shipped 2026-08-04 against all four review findings:
+The process slice shipped 2026-08-04 against all four review findings, and its
+runtime boundary was tightened for issue #26:
 custom agents reach chat only through `AdapterInstallManager` — enable
 resolves the npm package into an app-owned install with scripts disabled,
 pins the full dependency graph by lockfile hash, and spawns the resolved
@@ -100,10 +101,13 @@ executable itself (never `npx`); any drift refuses chat by name until
 re-approved. Credential contexts are declared roster data
 (claude/codex/none — `.none` chats open bindingless), built-in ids and
 adapters are untouched, legacy specs decode chat-disabled, and the enable
-sheet states plainly that the adapter runs with the user's ordinary
-access. Remaining niceties: a consolidated Extensions settings tab
-(grammar/mapping rosters still have stores but no UI), and sandboxing the
-adapter process if the stronger promise is ever wanted.
+sheet originally stated plainly that the adapter ran with the user's ordinary
+access. Custom adapters now launch through a deny-by-default macOS Seatbelt,
+provider-scoped environment allowlist, private home/cache tree, and a closed
+reviewed workspace/network/process grant bound to the install record. ACP fs,
+terminal, and MCP bridges enforce the same grant; see
+`notes/custom-acp-adapter-containment.md`. Remaining nicety: a consolidated
+Extensions settings tab (grammar/mapping rosters still have stores but no UI).
 
 ## PR 7 — Project and session ergonomics
 
@@ -154,7 +158,7 @@ Acceptance:
 
 ## PR 11 — Native preview installed-build performance gates
 
-Status: implementation shipped; 2 of 4 explicit acceptance gates are complete.
+Status: implementation shipped; 3 of 4 explicit acceptance gates are complete.
 
 TextKit 2 read mode, off-main structured-data preparation, PDFKit, bounded
 Markdown images, truthful external-edit handling, safe navigation, and explicit
@@ -173,9 +177,11 @@ Acceptance remaining:
   same budget, and image sizing — called per image per layout pass — is held to
   200,000 calls in under a second, which is what keeps it arithmetic rather
   than something that touches the file.
-- Bounded PDFs still need an equivalent budget. PDFKit does its own paging and
-  decoding, so a meaningful gate has to measure the *surface*, not a parser,
-  and that needs the installed app.
+- ~~Bounded PDFs.~~ Done: `native:pdf-preview-budget` launches copied optimized
+  app bytes once per deterministic fixture (96-page, six-page image-heavy,
+  malformed, and 14,400-point large-page), then gates first draw, exact paging,
+  malformed rejection, sustained real-PDFView scrolling, and peak process-tree
+  physical footprint with fixture-named failure diagnostics.
 - Confirm those surfaces retain native momentum on the **installed optimized
   app**. The in-process budgets above are what can be measured without one;
   momentum under gesture needs the signed build and a physical trackpad, which

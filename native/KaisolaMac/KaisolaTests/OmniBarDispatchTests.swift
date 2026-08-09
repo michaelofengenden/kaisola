@@ -63,4 +63,47 @@ final class OmniBarDispatchTests: XCTestCase {
         XCTAssertTrue(model.chats.isEmpty, "send with no target must not create a chat")
         XCTAssertNil(model.selectedChatID)
     }
+
+    /// Regression: the no-op has to be *reported*, not swallowed. The bar reads
+    /// this outcome to decide whether the draft may be cleared and dismissed, so
+    /// a silent no-op is the bug where a typed message vanishes undelivered.
+    @MainActor
+    func testSubmitWithNoTargetReportsNoTarget() {
+        let (model, _) = makeModel()
+        XCTAssertEqual(
+            OmniBarDispatch.submit("hello there", model: model),
+            .noTarget,
+            "submit with nowhere to send must report .noTarget so the draft survives"
+        )
+        XCTAssertFalse(
+            OmniBarDispatch.send("hello there", model: model),
+            "send must report failure when nothing accepted the message"
+        )
+        XCTAssertTrue(model.chats.isEmpty, "a rejected submit must not create a chat")
+    }
+
+    /// An empty draft is not a delivery failure — it is nothing to send, and the
+    /// bar must not raise a recovery prompt for it.
+    @MainActor
+    func testSubmitWithBlankDraftIsIgnored() {
+        let (model, _) = makeModel()
+        XCTAssertEqual(OmniBarDispatch.submit("   \n ", model: model), .ignored)
+    }
+
+    /// `hasTarget` gates the bar's recovery affordances, so it must answer
+    /// without opening a chat of its own.
+    @MainActor
+    func testHasTargetTracksProjectContextWithoutSideEffects() {
+        let (model, _) = makeModel()
+        XCTAssertFalse(
+            OmniBarDispatch.hasTarget(model: model),
+            "no selection, no project, and no chats is nowhere to send"
+        )
+        model.openProject(directory: URL(fileURLWithPath: "/tmp/omnibar-target", isDirectory: true))
+        XCTAssertTrue(
+            OmniBarDispatch.hasTarget(model: model),
+            "an active project is a target: a fresh chat lands there"
+        )
+        XCTAssertTrue(model.chats.isEmpty, "hasTarget must not create a chat to answer")
+    }
 }

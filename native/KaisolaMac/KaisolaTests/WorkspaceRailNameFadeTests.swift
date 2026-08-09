@@ -56,4 +56,109 @@ final class WorkspaceRailNameFadeTests: XCTestCase {
             .clipped()
         XCTAssertGreaterThan(reportedRowWidth(name: old), 200)
     }
+
+    @MainActor
+    func testAgentsFileCreationWritesTheExactTemplateWithoutReplacingACollision() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-agents-create-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let first = WorkspaceAgentsFileCreation.attempt(
+            in: root,
+            template: WorkspaceRailView.agentsTemplate
+        )
+        let target = try XCTUnwrap(first.successValue)
+        XCTAssertEqual(target, root.appendingPathComponent("AGENTS.md"))
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), WorkspaceRailView.agentsTemplate)
+
+        try "user-owned instructions".write(to: target, atomically: true, encoding: .utf8)
+        XCTAssertEqual(
+            WorkspaceAgentsFileCreation.attempt(
+                in: root,
+                template: WorkspaceRailView.agentsTemplate
+            ).failureValue,
+            .destinationExists
+        )
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "user-owned instructions")
+    }
+
+    func testAgentsFileCreationClassifiesActionableFilesystemFailures() {
+        let root = URL(fileURLWithPath: "/benign/project", isDirectory: true)
+
+        XCTAssertEqual(
+            WorkspaceAgentsFileCreation.attempt(
+                in: root,
+                template: "template",
+                writer: { _, _ in throw CocoaError(.fileWriteNoPermission) }
+            ).failureValue,
+            .permissionDenied
+        )
+        XCTAssertEqual(
+            WorkspaceAgentsFileCreation.attempt(
+                in: root,
+                template: "template",
+                writer: { _, _ in throw CocoaError(.fileWriteOutOfSpace) }
+            ).failureValue,
+            .diskFull
+        )
+        XCTAssertEqual(
+            WorkspaceAgentsFileCreation.attempt(
+                in: root,
+                template: "template",
+                writer: { _, _ in throw CocoaError(.fileWriteUnknown) }
+            ).failureValue,
+            .other
+        )
+        XCTAssertEqual(
+            WorkspaceAgentsFileCreation.Failure.destinationExists.message,
+            "AGENTS.md already exists. Rename or remove it, then try again."
+        )
+        XCTAssertEqual(
+            WorkspaceAgentsFileCreation.Failure.permissionDenied.message,
+            "Kaisola doesn't have permission to create AGENTS.md in this project."
+        )
+        XCTAssertEqual(
+            WorkspaceAgentsFileCreation.Failure.diskFull.message,
+            "There isn't enough disk space to create AGENTS.md."
+        )
+    }
+
+    func testAgentsFileCreationCanRetryAndOnlyReturnsATargetAfterSuccess() {
+        let root = URL(fileURLWithPath: "/benign/project", isDirectory: true)
+        var attempts = 0
+        let writer: WorkspaceAgentsFileCreation.Writer = { _, _ in
+            attempts += 1
+            if attempts == 1 { throw CocoaError(.fileWriteNoPermission) }
+        }
+
+        let failed = WorkspaceAgentsFileCreation.attempt(
+            in: root,
+            template: "template",
+            writer: writer
+        )
+        XCTAssertNil(failed.successValue)
+        XCTAssertEqual(failed.failureValue, .permissionDenied)
+
+        let retried = WorkspaceAgentsFileCreation.attempt(
+            in: root,
+            template: "template",
+            writer: writer
+        )
+        XCTAssertEqual(retried.successValue, root.appendingPathComponent("AGENTS.md"))
+        XCTAssertNil(retried.failureValue)
+        XCTAssertEqual(attempts, 2)
+    }
+}
+
+private extension Result {
+    var successValue: Success? {
+        guard case let .success(value) = self else { return nil }
+        return value
+    }
+
+    var failureValue: Failure? {
+        guard case let .failure(error) = self else { return nil }
+        return error
+    }
 }

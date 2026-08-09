@@ -316,3 +316,42 @@ test('spool hot cache lives only while observed', async (t) => {
   manager.unsubscribeSubscriberPrefix('window-b|')
   assert.equal(record.spool.visible, false)
 })
+
+test('a failed spool read reaches the wire as readError, not an empty snapshot', async (t) => {
+  const id = 'spool-read-failure-on-the-wire'
+  t.after(() => manager.release(id))
+  const record = manager.spawn({
+    id,
+    command: '/bin/sh',
+    args: ['-c', 'printf retained-history'],
+    cwd: managerSpoolDir,
+  })
+  await manager.waitForExit(id)
+  record.spool.flush()
+  // No renderer is attached, so the disk spool is the only source of history.
+  record.spool.setVisible(false)
+  const healthy = manager.snapshot(id)
+  assert.equal(healthy.output, 'retained-history')
+  assert.equal(healthy.readError, undefined)
+
+  // Stat still reports a segment with bytes; every read of it refuses.
+  fs.rmSync(record.spool.file, { force: true })
+  fs.mkdirSync(record.spool.file)
+
+  const failed = manager.snapshot(id)
+  assert.equal(failed.readError, 'EISDIR')
+  assert.equal(failed.output, '')
+  assert.equal(failed.truncated, true)
+  // Without the flag this payload is indistinguishable from a terminal that
+  // never produced a byte, which is what makes an observer reset and wipe.
+  assert.equal(failed.startOffset, failed.endOffset)
+
+  const page = manager.history(id, {
+    streamEpoch: failed.streamEpoch,
+    beforeOffset: failed.endOffset,
+    maxBytes: 1024 * 1024,
+  })
+  assert.equal(page.ok, true)
+  assert.equal(page.readError, 'EISDIR')
+  assert.equal(page.truncated, true)
+})

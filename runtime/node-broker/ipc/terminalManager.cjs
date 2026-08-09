@@ -732,6 +732,9 @@ function history(id, { streamEpoch, beforeOffset, maxBytes } = {}) {
     endOffset,
     hasMore: page.hasMore,
     truncated: page.truncated,
+    // Present only when the spool could not read a retained segment. Absent
+    // means the page is complete, not merely non-empty.
+    ...(page.readError ? { readError: page.readError } : {}),
   }
 }
 

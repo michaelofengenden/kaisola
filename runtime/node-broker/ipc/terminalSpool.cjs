@@ -73,39 +73,73 @@ function utf8Tail(value, bytes) {
   return buffer.subarray(start).toString('utf8')
 }
 
+// A segment read ends one of four ways, and only three of them are history:
+// the segment is ABSENT (never written, or already rotated away), it is EMPTY
+// (a real file holding no bytes), it is OK, or the read itself FAILED (stat,
+// open or read refused). Every read used to answer the first three and the
+// fourth with the same empty string, so one transient EACCES/EIO read exactly
+// like an authoritative empty transcript — and an authoritative empty
+// transcript is what makes a client reset the terminal and drop the user's
+// scrollback. Callers must be able to tell "there is nothing" from "I could
+// not look".
+const READ_ABSENT = 'absent'
+const READ_EMPTY = 'empty'
+const READ_OK = 'ok'
+const READ_FAILED = 'failed'
+const EMPTY_BUFFER = Buffer.alloc(0)
+
+// A segment that vanished between the stat and the read is absent, not
+// broken: close({ remove }) unlinks segments while readers are still running.
+function isMissing(err) {
+  const code = err && err.code
+  return code === 'ENOENT' || code === 'ENOTDIR'
+}
+
+function readErrorCode(err) {
+  return String((err && err.code) || (err && err.message) || err || 'spool-read-failed')
+}
+
+/** Read at most `bytes` from the end of `file` without starting inside a
+ * multi-byte scalar. `text` is history only when `status` is `ok` or `empty`;
+ * a `failed` result carries the error code and no bytes. */
 function readTail(file, bytes) {
-  if (!bytes || !fs.existsSync(file)) return ''
   let fd
   try {
     const size = fs.statSync(file).size
+    if (!size) return { status: READ_EMPTY, text: '', error: null }
     const cap = Math.max(0, Math.floor(Number(bytes) || 0))
+    if (!cap) return { status: READ_OK, text: '', error: null }
     const take = Math.min(size, cap + 3)
-    if (!take) return ''
     const b = Buffer.allocUnsafe(take)
     fd = fs.openSync(file, 'r')
     fs.readSync(fd, b, 0, take, size - take)
-    return utf8Tail(b, cap)
-  } catch {
-    return ''
+    return { status: READ_OK, text: utf8Tail(b, cap), error: null }
+  } catch (err) {
+    if (isMissing(err)) return { status: READ_ABSENT, text: '', error: null }
+    return { status: READ_FAILED, text: '', error: readErrorCode(err) }
   } finally {
     if (fd != null) try { fs.closeSync(fd) } catch { /* noop */ }
   }
 }
 
+/** Read `length` bytes at `start` as the same typed result. `buffer` is empty
+ * for every status except `ok`, so a caller that concatenates blindly still
+ * has to consult `status` before treating the bytes as the whole range. */
 function readRange(file, start, length) {
-  if (!length || !fs.existsSync(file)) return Buffer.alloc(0)
   let fd
   try {
     const size = fs.statSync(file).size
+    if (!size) return { status: READ_EMPTY, buffer: EMPTY_BUFFER, error: null }
     const offset = Math.max(0, Math.min(size, Math.floor(Number(start) || 0)))
     const take = Math.max(0, Math.min(size - offset, Math.floor(Number(length) || 0)))
-    if (!take) return Buffer.alloc(0)
+    if (!take) return { status: READ_OK, buffer: EMPTY_BUFFER, error: null }
     const buffer = Buffer.allocUnsafe(take)
     fd = fs.openSync(file, 'r')
     const read = fs.readSync(fd, buffer, 0, take, offset)
-    return read === take ? buffer : buffer.subarray(0, read)
-  } catch {
-    return Buffer.alloc(0)
+    return { status: READ_OK, buffer: read === take ? buffer : buffer.subarray(0, read), error: null }
+  } catch (err) {
+    if (isMissing(err)) return { status: READ_ABSENT, buffer: EMPTY_BUFFER, error: null }
+    return { status: READ_FAILED, buffer: EMPTY_BUFFER, error: readErrorCode(err) }
   } finally {
     if (fd != null) try { fs.closeSync(fd) } catch { /* noop */ }
   }
@@ -129,13 +163,18 @@ class TerminalSpool {
     const currentFile = path.join(dir, `${base}.log`)
     const prevFile = path.join(dir, `${base}.prev.log`)
     const segments = []
+    let readError = null
     for (const file of [prevFile, currentFile]) {
       try {
         const size = fs.statSync(file).size
         segments.push({ file, size })
-      } catch { /* no retained segment */ }
+      } catch (err) {
+        if (!isMissing(err)) readError = readError || readErrorCode(err)
+      }
     }
-    if (!segments.length) return null
+    // `null` is the answer for "this terminal retained nothing", which callers
+    // treat as authoritative. A refused stat is not that answer.
+    if (!segments.length && !readError) return null
 
     const capValue = Number(maxBytes)
     const cap = Number.isFinite(capValue)
@@ -143,11 +182,16 @@ class TerminalSpool {
       : DEFAULT_COLD_TAIL_CAP
     const totalBytes = segments.reduce((sum, segment) => sum + segment.size, 0)
     const current = readTail(currentFile, cap)
-    const remaining = Math.max(0, cap - Buffer.byteLength(current))
-    const previous = remaining ? readTail(prevFile, remaining) : ''
+    if (current.status === READ_FAILED) readError = readError || current.error
+    const remaining = Math.max(0, cap - Buffer.byteLength(current.text))
+    const previous = remaining ? readTail(prevFile, remaining) : { text: '', status: READ_OK }
+    if (previous.status === READ_FAILED) readError = readError || previous.error
     return {
-      text: previous + current,
-      truncated: totalBytes > cap,
+      text: previous.text + current.text,
+      // A failed read cannot prove it returned the whole retained tail, so the
+      // cold tail is truncated by definition once anything below it refused.
+      truncated: totalBytes > cap || !!readError,
+      ...(readError ? { readError } : {}),
     }
   }
 
@@ -293,24 +337,33 @@ class TerminalSpool {
     }
   }
 
+  /** Retained segments plus the first read failure that hid one of them.
+   * A segment that stats ENOENT is genuinely gone; any other stat error means
+   * the segment list below is short by an unknown number of bytes. */
   _diskSegments(startOffset = 0) {
     const segments = []
+    let readError = null
     let skip = Math.max(0, Math.floor(Number(startOffset) || 0))
     for (const file of [this.prevFile, this.file]) {
+      let size
       try {
-        const size = fs.statSync(file).size
-        const fileStart = Math.min(size, skip)
-        skip -= fileStart
-        if (size > fileStart) segments.push({ file, fileStart, length: size - fileStart })
-      } catch { /* absent */ }
+        size = fs.statSync(file).size
+      } catch (err) {
+        if (!isMissing(err)) readError = readError || readErrorCode(err)
+        continue
+      }
+      const fileStart = Math.min(size, skip)
+      skip -= fileStart
+      if (size > fileStart) segments.push({ file, fileStart, length: size - fileStart })
     }
-    return segments
+    return { segments, readError }
   }
 
   _diskTail(bytes, startOffset = 0) {
     const cap = Math.max(0, Math.floor(Number(bytes) || 0))
-    if (!cap) return ''
-    const segments = this._diskSegments(startOffset)
+    if (!cap) return { text: '', readError: null }
+    const { segments, readError: segmentError } = this._diskSegments(startOffset)
+    let readError = segmentError
     const totalBytes = segments.reduce((sum, segment) => sum + segment.length, 0)
     // Read a few extra bytes so utf8Tail can move a boundary that lands in the
     // middle of a multi-byte scalar without returning less history than needed.
@@ -322,11 +375,13 @@ class TerminalSpool {
       const sliceStart = Math.max(startByte, segmentStart)
       if (segmentEnd > sliceStart) {
         const localStart = sliceStart - segmentStart
-        slices.push(readRange(segment.file, segment.fileStart + localStart, segmentEnd - sliceStart))
+        const read = readRange(segment.file, segment.fileStart + localStart, segmentEnd - sliceStart)
+        if (read.status === READ_FAILED) readError = readError || read.error
+        slices.push(read.buffer)
       }
       segmentStart = segmentEnd
     }
-    return utf8Tail(Buffer.concat(slices), cap)
+    return { text: utf8Tail(Buffer.concat(slices), cap), readError }
   }
 
   flush() {
@@ -424,15 +479,33 @@ class TerminalSpool {
     // Eager append means the hot tail overlaps the end of the disk log. Use it
     // directly only when it can satisfy the whole read; otherwise read the
     // authoritative disk tail and append only disk-write fallback bytes.
-    const output = !fallbackBytes && !this.diskError && hotBytes >= cap
-      ? utf8Tail(hot, cap)
-      : utf8Tail(this._diskTail(cap, this.epochStartOffset) + fallback, cap)
+    let readError = null
+    let output
+    if (!fallbackBytes && !this.diskError && hotBytes >= cap) {
+      output = utf8Tail(hot, cap)
+    } else {
+      const tail = this._diskTail(cap, this.epochStartOffset)
+      readError = tail.readError
+      // A failed disk read is not an empty transcript. Answer with the exact
+      // stream suffix still held in RAM — both caches end at the live cursor,
+      // so the longer one is the most history we can honestly prove — and let
+      // `readError` tell the caller this snapshot is not authoritative.
+      output = readError
+        ? utf8Tail(hotBytes >= fallbackBytes ? hot : fallback, cap)
+        : utf8Tail(tail.text + fallback, cap)
+    }
     let diskBytes = 0
     for (const file of [this.prevFile, this.file]) {
       try { diskBytes += fs.statSync(file).size } catch { /* absent */ }
     }
     const liveDiskBytes = Math.max(0, diskBytes - this.epochStartOffset)
-    return { output, truncated: this.truncated || liveDiskBytes + fallbackBytes > cap, viewState: this.viewState, modePrefix: this._modePrefix() }
+    return {
+      output,
+      truncated: this.truncated || !!readError || liveDiskBytes + fallbackBytes > cap,
+      viewState: this.viewState,
+      modePrefix: this._modePrefix(),
+      ...(readError ? { readError } : {}),
+    }
   }
 
   /** Return one bounded page ending `distanceFromEnd` bytes before the live
@@ -441,7 +514,8 @@ class TerminalSpool {
    * translated to absolute stream offsets by terminalManager. */
   historyPage(distanceFromEnd = 0, outputCap = DEFAULT_SNAPSHOT_CAP) {
     this.flush()
-    const segments = this._diskSegments()
+    const { segments, readError: segmentError } = this._diskSegments()
+    let readError = segmentError
     // `chunks` is a cache of the already-appended disk suffix. Only fallback
     // bytes represent output not present in the disk segments.
     for (const value of [this.fallbackChunks.join('')]) {
@@ -463,9 +537,13 @@ class TerminalSpool {
       if (sliceEnd > sliceStart) {
         const localStart = sliceStart - segmentStart
         const length = sliceEnd - sliceStart
-        slices.push(segment.buffer
-          ? segment.buffer.subarray(localStart, localStart + length)
-          : readRange(segment.file, segment.fileStart + localStart, length))
+        if (segment.buffer) {
+          slices.push(segment.buffer.subarray(localStart, localStart + length))
+        } else {
+          const read = readRange(segment.file, segment.fileStart + localStart, length)
+          if (read.status === READ_FAILED) readError = readError || read.error
+          slices.push(read.buffer)
+        }
       }
       segmentStart = segmentEnd
     }
@@ -485,7 +563,10 @@ class TerminalSpool {
       endByte,
       totalBytes,
       hasMore: startByte > 0,
-      truncated: this.truncated,
+      // A page assembled over a segment we could not read is short by an
+      // unknown amount, which is exactly what `truncated` already means.
+      truncated: this.truncated || !!readError,
+      ...(readError ? { readError } : {}),
     }
   }
 
@@ -525,6 +606,10 @@ module.exports = {
   DEFAULT_QUEUE_CAP,
   DEFAULT_COLD_TAIL_CAP,
   SPOOL_APPEND_DEBOUNCE_MS,
+  READ_ABSENT,
+  READ_EMPTY,
+  READ_OK,
+  READ_FAILED,
   readTail,
   utf8Tail,
   readRange,

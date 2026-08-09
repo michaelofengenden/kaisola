@@ -311,6 +311,11 @@ struct TerminalSnapshot: Equatable, Sendable {
     let endOffset: Int64
     let truncated: Bool
     let exited: Bool
+    /// The broker's code for a spool segment it could not read, when the
+    /// snapshot it answered with is therefore not the whole retained tail.
+    /// `nil` means the output is authoritative — including when it is empty,
+    /// which a terminal that has produced nothing legitimately is.
+    let readError: String?
 
     init(
         streamEpoch: String,
@@ -318,7 +323,8 @@ struct TerminalSnapshot: Equatable, Sendable {
         startOffset: Int64,
         endOffset: Int64,
         truncated: Bool,
-        exited: Bool
+        exited: Bool,
+        readError: String? = nil
     ) {
         self.streamEpoch = streamEpoch
         self.output = output
@@ -326,6 +332,7 @@ struct TerminalSnapshot: Equatable, Sendable {
         self.endOffset = endOffset
         self.truncated = truncated
         self.exited = exited
+        self.readError = readError
     }
 
     init(value: JSONValue) throws {
@@ -345,6 +352,9 @@ struct TerminalSnapshot: Equatable, Sendable {
         self.endOffset = endOffset
         self.truncated = object["truncated"]?.boolValue ?? false
         self.exited = object["exited"]?.boolValue ?? false
+        // Older brokers never send the field; their snapshots stay
+        // authoritative, exactly as they are today.
+        self.readError = object["readError"]?.stringValue
     }
 }
 
@@ -358,6 +368,9 @@ struct TerminalHistoryPage: Equatable, Sendable, Identifiable {
     let endOffset: Int64
     let hasMore: Bool
     let truncated: Bool
+    /// Same contract as `TerminalSnapshot.readError`: set when the page is
+    /// short because a retained segment refused to be read.
+    let readError: String?
 
     var id: Int64 { startOffset }
 
@@ -367,7 +380,8 @@ struct TerminalHistoryPage: Equatable, Sendable, Identifiable {
         startOffset: Int64,
         endOffset: Int64,
         hasMore: Bool,
-        truncated: Bool
+        truncated: Bool,
+        readError: String? = nil
     ) {
         self.streamEpoch = streamEpoch
         self.output = output
@@ -375,6 +389,7 @@ struct TerminalHistoryPage: Equatable, Sendable, Identifiable {
         self.endOffset = endOffset
         self.hasMore = hasMore
         self.truncated = truncated
+        self.readError = readError
     }
 
     init(value: JSONValue, expectedEpoch: String, beforeOffset: Int64) throws {
@@ -397,6 +412,7 @@ struct TerminalHistoryPage: Equatable, Sendable, Identifiable {
         self.endOffset = endOffset
         self.hasMore = object["hasMore"]?.boolValue ?? false
         self.truncated = object["truncated"]?.boolValue ?? false
+        self.readError = object["readError"]?.stringValue
     }
 }
 

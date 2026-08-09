@@ -2413,19 +2413,37 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func enqueueTranscriptRemoval(chatID: String) {
+    /// Queue the durable transcript deletion behind the writes already in
+    /// flight. The returned task carries the committed outcome, so a caller
+    /// standing in front of a permanent-delete confirmation can wait for it
+    /// rather than announce a deletion the store never finished.
+    @discardableResult
+    func enqueueTranscriptRemoval(chatID: String) -> Task<AcpTranscriptStore.Removal, Never> {
         explicitlyClosedChatIDs.insert(chatID)
         let previous = transcriptPersistenceTask
         let transcriptStore = transcriptStore
         let usageCenter = usageCenter
-        transcriptPersistenceTask = Task {
+        let removal = Task { () -> AcpTranscriptStore.Removal in
             await previous?.value
             // Usage and transcript writes use separate coalescing queues during
             // normal streaming. On explicit close, drain usage first and make
             // the full transcript deletion the final actor operation.
             await usageCenter.flushPersistence()
-            await transcriptStore.remove(chatID: chatID)
+            return await transcriptStore.remove(chatID: chatID)
         }
+        transcriptPersistenceTask = Task { _ = await removal.value }
+        return removal
+    }
+
+    /// Wait for queued transcript deletions and report the first that did not
+    /// commit, so a caller can replace its success message with the truth.
+    private func firstTranscriptRemovalFailure(
+        _ removals: [Task<AcpTranscriptStore.Removal, Never>]
+    ) async -> String? {
+        for removal in removals {
+            if let message = await removal.value.failureMessage { return message }
+        }
+        return nil
     }
 
     func flushTranscriptPersistence() async {
@@ -3375,12 +3393,21 @@ final class AppModel: ObservableObject {
         // goes — the old forgetDurableChat gate could leave tombstoned
         // content on disk forever when usage bookkeeping said "shared".
         _ = forgetDurableChat
-        enqueueTranscriptRemoval(chatID: chatID)
+        let removal = enqueueTranscriptRemoval(chatID: chatID)
         enqueueDraftRemoval(chatID: chatID)
         // The workspace archive must reflect the deletion durably NOW, not
         // after a 220 ms debounce a crash can beat (§4e).
         if let projectID = closingChat?.projectID {
             Task { await persistWorkspaceStateImmediately(projectID: projectID) }
+        }
+        // The tombstone already keeps the chat closed, but a DELETE that never
+        // committed left its bytes on disk. Say that instead of letting the
+        // silent close read as a finished permanent delete.
+        if let failure = await removal.value.failureMessage {
+            ToastCenter.shared.show(
+                "The chat is closed, but its transcript could not be erased from disk: \(failure)",
+                style: .error
+            )
         }
     }
 
@@ -3669,9 +3696,14 @@ final class AppModel: ObservableObject {
             var layout = paneLayouts[projectID] ?? SessionPaneLayout()
             layout.remove(meshID)
             paneLayouts[projectID] = layout
-            for columnID in columnIDs { enqueueTranscriptRemoval(chatID: columnID) }
+            let removals = columnIDs.map { enqueueTranscriptRemoval(chatID: $0) }
             enqueueDraftRemoval(stableKey: "mesh|\(meshID)")
             await persistWorkspaceStateImmediately(projectID: projectID)
+            if let failure = await firstTranscriptRemovalFailure(removals) {
+                return .blocked(
+                    "Mesh work was cleaned up, but a column transcript could not be erased: \(failure)"
+                )
+            }
             return .closed
         case let .recoverableWork(columns):
             return .needsConfirmation(columns: columns)
@@ -3829,9 +3861,15 @@ final class AppModel: ObservableObject {
             _ = removeRecentlyClosedPane(id: surfaceID)
             explicitlyClosedChatIDs.insert(surfaceID)
             usageCenter.remove(chatID: surfaceID)
-            enqueueTranscriptRemoval(chatID: surfaceID)
+            let removal = enqueueTranscriptRemoval(chatID: surfaceID)
             enqueueDraftRemoval(chatID: surfaceID)
             await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
+            // "Permanently deleted" is only true once the DELETE commits.
+            if let failure = await removal.value.failureMessage {
+                return .blocked(
+                    "The chat left Recently Closed, but its transcript could not be erased: \(failure)"
+                )
+            }
             ToastCenter.shared.show("Permanently deleted chat", style: .success)
             return .completed
         }
@@ -3850,7 +3888,7 @@ final class AppModel: ObservableObject {
         case .safe:
             // The user crossed the permanent-delete boundary. Remove column
             // data even if writing the final archive tombstone needs a retry.
-            for columnID in columnIDs { enqueueTranscriptRemoval(chatID: columnID) }
+            let removals = columnIDs.map { enqueueTranscriptRemoval(chatID: $0) }
             enqueueDraftRemoval(stableKey: "mesh|\(surfaceID)")
             do {
                 try await workspaceStateStore.removeMeshState(
@@ -3862,6 +3900,11 @@ final class AppModel: ObservableObject {
             }
             _ = removeRecentlyClosedPane(id: surfaceID)
             await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
+            if let failure = await firstTranscriptRemovalFailure(removals) {
+                return .blocked(
+                    "Mesh work was cleaned up, but a column transcript could not be erased: \(failure)"
+                )
+            }
             ToastCenter.shared.show("Permanently deleted Mesh", style: .success)
             return .completed
         case let .recoverableWork(columns):

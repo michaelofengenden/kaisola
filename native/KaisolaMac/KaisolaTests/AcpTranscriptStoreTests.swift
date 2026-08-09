@@ -56,9 +56,50 @@ final class AcpTranscriptStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         await store.scheduleSave([.message(id: "1", text: "saved")], for: "chat-remove", now: 1)
         await store.flush()
-        await store.remove(chatID: "chat-remove")
+        let outcome = await store.remove(chatID: "chat-remove")
+        XCTAssertEqual(outcome, .removed)
         let restoredRows = await store.rows(for: "chat-remove")
         XCTAssertTrue(restoredRows.isEmpty)
+    }
+
+    /// A committed delete consumes the coalesced write too: the queued rows
+    /// must not come back when the next flush runs.
+    func testCommittedRemoveDropsTheQueuedWrite() async {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await store.scheduleSave([.message(id: "1", text: "queued")], for: "chat-committed", now: 1)
+        let outcome = await store.remove(chatID: "chat-committed")
+        XCTAssertEqual(outcome, .removed)
+        await store.flush()
+        let restoredRows = await store.rows(for: "chat-committed")
+        XCTAssertTrue(restoredRows.isEmpty)
+    }
+
+    /// Deletion is one transaction with the pending queue: when the DELETE
+    /// cannot commit, the caller hears about it and the newest in-memory copy
+    /// is still there for the retry.
+    func testFailedRemoveReportsFailureAndKeepsTheQueuedWrite() async {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        // A directory standing where the database file belongs fails every
+        // open — the deletion path's I/O failure without a fake SQLite layer.
+        try? FileManager.default.createDirectory(
+            at: store.databaseURL,
+            withIntermediateDirectories: true
+        )
+        let rows: [AcpTranscriptRow] = [.message(id: "1", text: "newest tail")]
+        await store.scheduleSave(rows, for: "chat-blocked", now: 1)
+
+        let outcome = await store.remove(chatID: "chat-blocked")
+        XCTAssertFalse(outcome.isRemoved, "a delete that never committed must not report success")
+        XCTAssertNotNil(outcome.failureMessage)
+
+        // Clearing the obstruction lets the retained write reach disk. A
+        // failed delete that had eaten it would leave nothing to flush.
+        try? FileManager.default.removeItem(at: store.databaseURL)
+        await store.flush()
+        let restoredRows = await store.rows(for: "chat-blocked")
+        XCTAssertEqual(restoredRows, rows)
     }
 
     func testUsagePersistsBesideRowsAndSurvivesLaterTranscriptSave() async throws {
@@ -134,7 +175,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
             peakUsed: 100, turns: 1, costAmount: nil, costCurrency: nil
         )
 
-        await store.remove(chatID: "closed")
+        _ = await store.remove(chatID: "closed")
         await store.scheduleUsage(usage, for: "closed", now: 2)
         await store.removeUsage(chatID: "closed")
         await store.flush()

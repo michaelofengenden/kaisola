@@ -77,11 +77,42 @@ actor AcpTranscriptStore {
         var sessionID: String?
     }
 
-    enum StoreError: Error, Equatable {
+    enum StoreError: Error, Equatable, Sendable {
         case database(String)
         case corruptLegacyArchive
         case legacyArchiveTooLarge(maxBytes: Int)
         case invalidSnapshot
+
+        /// Plain detail for the callers that surface a failed delete. The
+        /// errors are not `LocalizedError`, so a raw `localizedDescription`
+        /// would show the caller's generic fallback instead of the cause.
+        var message: String {
+            switch self {
+            case let .database(detail): return detail
+            case .corruptLegacyArchive: return "the saved transcript archive could not be read"
+            case let .legacyArchiveTooLarge(maxBytes):
+                return "the saved transcript archive is larger than \(maxBytes) bytes"
+            case .invalidSnapshot: return "the transcript snapshot did not match the stored rows"
+            }
+        }
+    }
+
+    /// The outcome of an explicit transcript deletion. A caller only ever
+    /// reports a permanent delete after `removed`; `failed` means the durable
+    /// bytes may still be on disk and the removal is worth retrying.
+    enum Removal: Equatable, Sendable {
+        case removed
+        case failed(StoreError)
+
+        var isRemoved: Bool {
+            if case .removed = self { return true }
+            return false
+        }
+
+        var failureMessage: String? {
+            if case let .failed(error) = self { return error.message }
+            return nil
+        }
     }
 
     /// Disk is deliberately cheap to spend (2026-08-06 spec): retention is
@@ -359,11 +390,17 @@ actor AcpTranscriptStore {
         }
     }
 
-    func remove(chatID: String) {
-        guard Self.validChatID(chatID) else { return }
-        pending.removeValue(forKey: chatID)
-        guard let database = try? openDatabase() else { return }
+    /// Erase every durable byte for one chat. The coalesced pending write is
+    /// held aside rather than dropped: when nothing commits it goes back
+    /// exactly as it was, so a failed delete is a retryable no-op instead of a
+    /// half-finished deletion that also lost the newest in-memory tail.
+    func remove(chatID: String) -> Removal {
+        // No write path ever accepted an out-of-contract identifier, so there
+        // is nothing durable behind one.
+        guard Self.validChatID(chatID) else { return .removed }
+        let heldPending = pending.removeValue(forKey: chatID)
         do {
+            let database = try openDatabase()
             try transaction(database) {
                 try withStatement("DELETE FROM chats WHERE chat_id = ?", database: database) {
                     try bind(chatID, at: 1, statement: $0, database: database)
@@ -371,8 +408,10 @@ actor AcpTranscriptStore {
                 }
                 try setMetadataValue("1", for: "v2_has_written", database: database)
             }
+            return .removed
         } catch {
-            // Explicit removal remains retryable by the caller's durable model.
+            if let heldPending, pending[chatID] == nil { pending[chatID] = heldPending }
+            return .failed(error as? StoreError ?? .database(error.localizedDescription))
         }
     }
 

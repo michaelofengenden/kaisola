@@ -108,6 +108,45 @@ protocol BrokerRollingUpdateRequesting: BrokerUpgradeRequesting {
 protocol BrokerUpgradeMonitoring: Sendable {
     func upgradeState() async -> BrokerUpgradeState
     func attemptUpgradeIfNeeded() async -> BrokerUpgradeState
+    func retirementDiagnostics() async -> [BrokerRetirementDiagnostic]
+}
+
+enum BrokerRetirementFailureReason: Equatable, Sendable {
+    case shutdownTimedOut
+    case requestUnavailable
+    case identityChanged
+
+    fileprivate var detail: String {
+        switch self {
+        case .shutdownTimedOut:
+            "safe handoff timed out"
+        case .requestUnavailable:
+            "safe handoff request was unavailable"
+        case .identityChanged:
+            "broker identity changed during the safety check"
+        }
+    }
+}
+
+struct BrokerRetirementDiagnostic: Equatable, Sendable {
+    let generationID: String
+    let pid: Int32
+    let failureCount: Int
+    let reason: BrokerRetirementFailureReason
+    let nextAttemptInSweeps: Int
+
+    var detail: String {
+        let retry = nextAttemptInSweeps == 0
+            ? "retry ready"
+            : "retry in \(nextAttemptInSweeps) heartbeat\(nextAttemptInSweeps == 1 ? "" : "s")"
+        return [
+            "Retirement skipped for content \(generationID.prefix(12))",
+            "PID \(pid)",
+            reason.detail,
+            "failure count \(failureCount)",
+            retry,
+        ].joined(separator: " · ")
+    }
 }
 
 struct BrokerRollbackCandidate: Identifiable, Equatable, Sendable {
@@ -175,6 +214,7 @@ actor BrokerStartupCoordinator:
 {
     private static let maximumSocketPathBytes = 100
     private static let startupTimeoutNanoseconds: UInt64 = 8_000_000_000
+    private static let maximumRetirementBackoffSweeps: UInt64 = 16
 
     private let locator: BrokerInfoLocator
     private let launcher: any BrokerHelperLaunching
@@ -183,13 +223,24 @@ actor BrokerStartupCoordinator:
     private let sleep: @Sendable (UInt64) async throws -> Void
     private let upgradeRequester: any BrokerUpgradeRequesting
     private let rollingUpdatesEnabled: Bool
+    private let retirementWaiter: (@Sendable (BrokerGenerationRecord, URL) async throws -> Void)?
     private var currentUpgradeState: BrokerUpgradeState = .unknown
     private var pendingUpgrade: PendingUpgrade?
     private var currentTopology: BrokerGenerationTopology?
+    private var retirementSweepInFlight = false
+    private var retirementSweepNumber: UInt64 = 0
+    private var retirementQuarantines: [String: RetirementQuarantine] = [:]
 
     private struct PendingUpgrade: Sendable {
         let info: BrokerInfo
         let package: BrokerHelperManifest
+    }
+
+    private struct RetirementQuarantine: Sendable {
+        let info: BrokerInfo
+        let failureCount: Int
+        let reason: BrokerRetirementFailureReason
+        let nextEligibleSweep: UInt64
     }
 
     init(
@@ -199,7 +250,8 @@ actor BrokerStartupCoordinator:
         appVersion: String = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native",
         upgradeRequester: any BrokerUpgradeRequesting = BrokerControlClient(),
         rollingUpdatesEnabled: Bool = BrokerRollingUpdatePolicy.clientRoutingEnabled,
-        sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) }
+        sleep: @escaping @Sendable (UInt64) async throws -> Void = { try await Task.sleep(nanoseconds: $0) },
+        retirementWaiter: (@Sendable (BrokerGenerationRecord, URL) async throws -> Void)? = nil
     ) {
         self.locator = locator
         self.launcher = launcher
@@ -208,6 +260,7 @@ actor BrokerStartupCoordinator:
         self.upgradeRequester = upgradeRequester
         self.rollingUpdatesEnabled = rollingUpdatesEnabled
         self.sleep = sleep
+        self.retirementWaiter = retirementWaiter
     }
 
     static func live() -> BrokerStartupCoordinator {
@@ -263,6 +316,23 @@ actor BrokerStartupCoordinator:
 
     func upgradeState() -> BrokerUpgradeState {
         currentUpgradeState
+    }
+
+    func retirementDiagnostics() async -> [BrokerRetirementDiagnostic] {
+        retirementQuarantines.map { generationID, quarantine in
+            BrokerRetirementDiagnostic(
+                generationID: generationID,
+                pid: quarantine.info.pid,
+                failureCount: quarantine.failureCount,
+                reason: quarantine.reason,
+                nextAttemptInSweeps: Int(
+                    quarantine.nextEligibleSweep > retirementSweepNumber
+                        ? quarantine.nextEligibleSweep - retirementSweepNumber
+                        : 0
+                )
+            )
+        }
+        .sorted { $0.generationID < $1.generationID }
     }
 
     func generationTopology() async -> BrokerGenerationTopology? {
@@ -475,12 +545,25 @@ actor BrokerStartupCoordinator:
     }
 
     private func retireEmptyDrainingGenerationIfPossible() async {
+        guard !retirementSweepInFlight else { return }
+        retirementSweepInFlight = true
+        defer { retirementSweepInFlight = false }
+
         guard rollingUpdatesEnabled,
               let rolling = upgradeRequester as? any BrokerRollingUpdateRequesting,
               let topology = currentTopology ?? (try? locator.locateTopology()) else { return }
         let store = BrokerGenerationRegistryStore(profileRoot: locator.preferredUserDataRoot)
-        guard let registry = try? store.load(), registry.topology == topology else { return }
+        guard let registry = exactRetirementRegistry(matching: topology, store: store) else {
+            return
+        }
         let retainedRollbackID = registry.selection?.selectingAppContentDigest
+        advanceRetirementSweep()
+        let eligibleGenerations = Dictionary(uniqueKeysWithValues: topology.draining
+            .filter { $0.id != retainedRollbackID }
+            .map { ($0.id, $0.info) })
+        retirementQuarantines = retirementQuarantines.filter { generationID, quarantine in
+            eligibleGenerations[generationID] == quarantine.info
+        }
         // Every non-rollback drain is a candidate, not only the first: the
         // broker itself is the emptiness authority (a populated or still-
         // connected drain answers `pending`), and a populated drain that
@@ -489,6 +572,11 @@ actor BrokerStartupCoordinator:
         // incident kept two empty drains pinned in the registry exactly this
         // way. At most one retirement is committed per heartbeat.
         for draining in topology.draining where draining.id != retainedRollbackID {
+            if let quarantine = retirementQuarantines[draining.id],
+               quarantine.info == draining.info,
+               retirementSweepNumber < quarantine.nextEligibleSweep {
+                continue
+            }
             let decision: BrokerRetirementDecision
             do {
                 decision = try await rolling.requestRetirement(
@@ -496,32 +584,139 @@ actor BrokerStartupCoordinator:
                     targetContentDigest: topology.current.id
                 )
             } catch {
+                if error is CancellationError { return }
+                guard exactRetirementRegistry(matching: topology, store: store) != nil else {
+                    return
+                }
+                let reason: BrokerRetirementFailureReason
+                if let clientError = error as? BrokerClientError,
+                   clientError == .identityChanged {
+                    reason = .identityChanged
+                } else {
+                    reason = .requestUnavailable
+                }
+                quarantine(draining, reason: reason)
                 continue
             }
-            guard decision == .accepted else { continue }
-            do {
-                try await waitForRetirement(of: draining, profileRoot: locator.preferredUserDataRoot)
-                let registry = try store.load()
-                guard registry.topology == topology,
-                      registry.currentGenerationID == topology.current.id else {
-                    throw BrokerGenerationRegistryError.revisionChanged
-                }
-                let retained = registry.generations.filter { $0.id != draining.id }
-                let next = try store.save(
-                    currentGenerationID: topology.current.id,
-                    generations: retained,
-                    expectedRevision: registry.revision,
-                    selection: registry.selection
-                )
-                currentTopology = next.topology
-                try garbageCollectRetiredMetadata(draining, store: store)
-            } catch {
-                // The registry intentionally retains the generation if
-                // retirement or its identity recheck is ambiguous. A later
-                // heartbeat retries.
+            // The request is an actor suspension point. Do not use a decision
+            // from an earlier ownership epoch after any registry mutation.
+            guard exactRetirementRegistry(matching: topology, store: store) != nil else {
+                return
             }
+            switch decision {
+            case .accepted:
+                break
+            case .deferred:
+                retirementQuarantines.removeValue(forKey: draining.id)
+                continue
+            case .identityChanged:
+                quarantine(draining, reason: .identityChanged)
+                continue
+            }
+            do {
+                if let retirementWaiter {
+                    try await retirementWaiter(draining, locator.preferredUserDataRoot)
+                } else {
+                    try await waitForRetirement(
+                        of: draining,
+                        profileRoot: locator.preferredUserDataRoot
+                    )
+                }
+            } catch {
+                if error is CancellationError { return }
+                guard exactRetirementRegistry(matching: topology, store: store) != nil else {
+                    return
+                }
+                let reason: BrokerRetirementFailureReason
+                if let startupError = error as? BrokerStartupError,
+                   case .timedOut = startupError {
+                    reason = .shutdownTimedOut
+                } else {
+                    reason = .requestUnavailable
+                }
+                quarantine(
+                    draining,
+                    reason: reason
+                )
+                continue
+            }
+
+            // Waiting crosses an actor suspension point. Re-read the complete
+            // validated registry and require the exact topology, current
+            // generation, and candidate identity observed before the request.
+            // Any concurrent registry change fails closed for this sweep.
+            guard let latestRegistry = exactRetirementRegistry(
+                matching: topology,
+                store: store
+            ), latestRegistry.generations.contains(draining) else {
+                return
+            }
+            let retained = latestRegistry.generations.filter { $0.id != draining.id }
+            guard let next = try? store.save(
+                currentGenerationID: topology.current.id,
+                generations: retained,
+                expectedRevision: latestRegistry.revision,
+                selection: latestRegistry.selection
+            ) else {
+                currentTopology = (try? store.load())?.topology
+                return
+            }
+            retirementQuarantines.removeValue(forKey: draining.id)
+            currentTopology = next.topology
+            // Registry removal is the authority boundary. Log cleanup is
+            // best-effort afterward and must never turn a committed retirement
+            // into a misleading quarantine/retry of the removed generation.
+            try? garbageCollectRetiredMetadata(draining, store: store)
             return
         }
+    }
+
+    private func exactRetirementRegistry(
+        matching topology: BrokerGenerationTopology,
+        store: BrokerGenerationRegistryStore
+    ) -> BrokerGenerationRegistry? {
+        guard let registry = try? store.load() else {
+            currentTopology = nil
+            return nil
+        }
+        guard registry.topology == topology,
+              registry.currentGenerationID == topology.current.id else {
+            currentTopology = registry.topology
+            return nil
+        }
+        return registry
+    }
+
+    private func advanceRetirementSweep() {
+        if retirementSweepNumber == UInt64.max {
+            retirementSweepNumber = 1
+            retirementQuarantines.removeAll()
+        } else {
+            retirementSweepNumber += 1
+        }
+    }
+
+    private func quarantine(
+        _ generation: BrokerGenerationRecord,
+        reason: BrokerRetirementFailureReason
+    ) {
+        let priorFailures = retirementQuarantines[generation.id]
+            .flatMap { $0.info == generation.info ? $0.failureCount : nil } ?? 0
+        let failureCount = min(priorFailures + 1, 32)
+        let exponent = min(failureCount - 1, 3)
+        let backoff = min(
+            UInt64(2) << UInt64(exponent),
+            Self.maximumRetirementBackoffSweeps
+        )
+        let nextEligibleSweep = retirementSweepNumber > UInt64.max - backoff
+            ? UInt64.max
+            : retirementSweepNumber + backoff
+        retirementQuarantines[generation.id] = RetirementQuarantine(
+            info: generation.info,
+            failureCount: failureCount,
+            reason: reason,
+            nextEligibleSweep: nextEligibleSweep
+        )
     }
 
     private func waitForRetirement(

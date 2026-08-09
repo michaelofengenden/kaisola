@@ -3,14 +3,23 @@ import Foundation
 enum BrokerGenerationDiagnostics {
     static func detail(
         appVersion: String,
-        topology: BrokerGenerationTopology
+        topology: BrokerGenerationTopology,
+        retirementDiagnostics: [BrokerRetirementDiagnostic] = []
     ) -> String {
         let current = generationDetail(topology.current)
         let drains = topology.draining.map(generationDetail).joined(separator: "; ")
+        let drainingIDs = Set(topology.draining.map(\.id))
+        let retirement = retirementDiagnostics
+            .filter { drainingIDs.contains($0.generationID) }
+            .map(\.detail)
+            .joined(separator: "; ")
+        let base: String
         if drains.isEmpty {
-            return "App \(appVersion) · Current broker \(current) · No draining brokers"
+            base = "App \(appVersion) · Current broker \(current) · No draining brokers"
+        } else {
+            base = "App \(appVersion) · Current broker \(current) · Draining brokers: \(drains)"
         }
-        return "App \(appVersion) · Current broker \(current) · Draining brokers: \(drains)"
+        return retirement.isEmpty ? base : "\(base) · \(retirement)"
     }
 
     private static func generationDetail(_ generation: BrokerGenerationRecord) -> String {

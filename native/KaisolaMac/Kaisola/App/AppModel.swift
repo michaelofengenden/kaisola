@@ -5721,8 +5721,12 @@ final class AppModel: ObservableObject {
                 await controlClient.detachGenerations(emptyDrains)
                 brokerRollbackCandidates.removeAll { emptyDrains.contains($0.id) }
             }
+            var retirementDiagnostics: [BrokerRetirementDiagnostic] = []
             if let activeBrokerUpgradeMonitor {
+                let monitorGeneration = connectionGeneration
                 let next = await activeBrokerUpgradeMonitor.attemptUpgradeIfNeeded()
+                guard monitorGeneration == connectionGeneration,
+                      connectionState.isConnected else { return }
                 if next != brokerUpgradeState { brokerUpgradeState = next }
                 if case let .current(contentDigest) = next,
                    activeBrokerTopology?.current.id != contentDigest {
@@ -5732,12 +5736,35 @@ final class AppModel: ObservableObject {
                     connectionLost(BrokerClientError.identityChanged, generation: connectionGeneration)
                     return
                 }
+                retirementDiagnostics = await activeBrokerUpgradeMonitor
+                    .retirementDiagnostics()
+                guard monitorGeneration == connectionGeneration,
+                      connectionState.isConnected else { return }
             }
-            if let provider = activeBrokerTopologyProvider,
-               let latest = await provider.generationTopology(),
-               latest != activeBrokerTopology {
-                connectionLost(BrokerClientError.identityChanged, generation: connectionGeneration)
-                return
+            let topologyGeneration = connectionGeneration
+            if let provider = activeBrokerTopologyProvider {
+                let latest = await provider.generationTopology()
+                guard topologyGeneration == connectionGeneration,
+                      connectionState.isConnected else { return }
+                if let latest, latest != activeBrokerTopology {
+                    connectionLost(
+                        BrokerClientError.identityChanged,
+                        generation: connectionGeneration
+                    )
+                    return
+                }
+            }
+            if let activeBrokerTopology {
+                let nextDetail = BrokerGenerationDiagnostics.detail(
+                    appVersion: Bundle.main.object(
+                        forInfoDictionaryKey: "CFBundleShortVersionString"
+                    ) as? String ?? "Dev",
+                    topology: activeBrokerTopology,
+                    retirementDiagnostics: retirementDiagnostics
+                )
+                if nextDetail != brokerGenerationDetail {
+                    brokerGenerationDetail = nextDetail
+                }
             }
         } catch {
             consecutiveInventoryFailures += 1
@@ -6276,12 +6303,18 @@ final class AppModel: ObservableObject {
             notifyInventoryCompletions(previous: sessions, next: visibleTerminals)
             sessions = visibleTerminals
             connectedBrokerFeatures = hello.features
-            brokerUpgradeState = await activeBrokerUpgradeMonitor?.upgradeState() ?? .unknown
+            let connectedUpgradeState = await activeBrokerUpgradeMonitor?.upgradeState() ?? .unknown
+            guard generation == connectionGeneration, shouldReconnect else { return false }
+            let retirementDiagnostics = await activeBrokerUpgradeMonitor?
+                .retirementDiagnostics() ?? []
+            guard generation == connectionGeneration, shouldReconnect else { return false }
+            brokerUpgradeState = connectedUpgradeState
             brokerGenerationDetail = BrokerGenerationDiagnostics.detail(
                 appVersion: Bundle.main.object(
                     forInfoDictionaryKey: "CFBundleShortVersionString"
                 ) as? String ?? "Dev",
-                topology: topology
+                topology: topology,
+                retirementDiagnostics: retirementDiagnostics
             )
             brokerRollbackCandidates = await activeBrokerRollbackController?
                 .rollbackCandidates() ?? []

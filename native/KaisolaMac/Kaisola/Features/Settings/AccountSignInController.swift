@@ -150,9 +150,11 @@ final class AccountSignInController: ObservableObject {
     /// Carries only the output emitted since the latest code submission so an
     /// old prompt in the full transcript cannot move the UI backwards.
     struct OutputPhaseTracker {
+        private var provider: UsageAccountProfile.Provider?
         private var postSubmissionOutput = ""
 
-        mutating func reset() {
+        mutating func reset(for provider: UsageAccountProfile.Provider) {
+            self.provider = provider
             postSubmissionOutput = ""
         }
 
@@ -166,7 +168,9 @@ final class AccountSignInController: ObservableObject {
             newOutput: String
         ) -> Phase {
             guard !current.isFinished else { return current }
-            let url = AccountSignInController.signInURL(in: transcript) ?? current.url
+            let url = provider.flatMap {
+                AccountSignInController.signInURL(in: transcript, for: $0)
+            } ?? current.url
             if case .submitting = current {
                 postSubmissionOutput += newOutput
                 return AccountSignInController.promptsForCode(postSubmissionOutput)
@@ -209,20 +213,47 @@ final class AccountSignInController: ObservableObject {
     /// back rather than keeping it.
     nonisolated static let executableProbeTimeout: TimeInterval = 12
 
-    /// The first `https://` URL in a chunk of CLI output.
+    /// The first `https://` URL for the selected provider in CLI output.
     ///
-    /// Pure and static so the parsing rule is testable without spawning
-    /// anything. Trailing punctuation is trimmed because the CLI prints the URL
-    /// inside a sentence.
-    nonisolated static func signInURL(in output: String) -> URL? {
-        guard let range = output.range(of: "https://") else { return nil }
-        let tail = output[range.lowerBound...]
-        let token = tail.prefix { !$0.isWhitespace }
-        let trimmed = token.drop(while: { _ in false })
-            .reversed()
-            .drop { ".,;:)\"'".contains($0) }
-            .reversed()
-        return URL(string: String(trimmed))
+    /// Claude currently authorizes through `claude.com` or
+    /// `platform.claude.com`; Codex uses `auth.openai.com`. These are exact host
+    /// matches by design: accepting arbitrary HTTPS, wildcard subdomains, or a
+    /// URL for the other provider would let compromised CLI output turn the
+    /// browser button into a phishing link. Trailing punctuation is trimmed
+    /// because the CLI prints the URL inside a sentence.
+    nonisolated static func signInURL(
+        in output: String,
+        for provider: UsageAccountProfile.Provider
+    ) -> URL? {
+        let allowedHosts: Set<String> = switch provider {
+        case .claude: ["claude.com", "platform.claude.com"]
+        case .codex: ["auth.openai.com"]
+        }
+
+        var searchStart = output.startIndex
+        while searchStart < output.endIndex,
+              let range = output.range(
+                  of: "https://",
+                  range: searchStart ..< output.endIndex
+              ) {
+            let tail = output[range.lowerBound...]
+            let token = tail.prefix { !$0.isWhitespace }
+            let trimmed = token.reversed()
+                .drop { ".,;:)\"'".contains($0) }
+                .reversed()
+
+            if let url = URL(string: String(trimmed)),
+               url.scheme?.lowercased() == "https",
+               let host = url.host?.lowercased(),
+               allowedHosts.contains(host),
+               url.user == nil,
+               url.password == nil,
+               url.port == nil || url.port == 443 {
+                return url
+            }
+            searchStart = range.upperBound
+        }
+        return nil
     }
 
     /// Whether the CLI is now blocked on a pasted code.
@@ -488,7 +519,7 @@ final class AccountSignInController: ObservableObject {
     func start(profile: UsageAccountProfile) {
         let tool = Self.toolName(for: profile.provider)
         phase = .launching
-        outputPhaseTracker.reset()
+        outputPhaseTracker.reset(for: profile.provider)
         transcript += "Looking for the \(tool) command…\n"
         discovery?.cancel()
         discovery = Task { [weak self] in

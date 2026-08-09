@@ -105,7 +105,9 @@ final class AccountSignInControllerTests: XCTestCase {
         code_challenge_method=S256&state=GFNgPs8Yr5UxmyrO7A1VIlprWr0AY8y2F
         Paste code here if prompted >
         """
-        let url = try XCTUnwrap(AccountSignInController.signInURL(in: output))
+        let url = try XCTUnwrap(
+            AccountSignInController.signInURL(in: output, for: .claude)
+        )
         XCTAssertEqual(url.scheme, "https")
         XCTAssertEqual(url.host, "claude.com")
         let query = try XCTUnwrap(url.query)
@@ -115,19 +117,95 @@ final class AccountSignInControllerTests: XCTestCase {
 
     func testTrailingSentencePunctuationIsNotPartOfTheURL() throws {
         let url = try XCTUnwrap(
-            AccountSignInController.signInURL(in: "Visit https://example.com/auth?a=1.")
+            AccountSignInController.signInURL(
+                in: "Visit https://claude.com/auth?a=1.",
+                for: .claude
+            )
         )
-        XCTAssertEqual(url.absoluteString, "https://example.com/auth?a=1")
+        XCTAssertEqual(url.absoluteString, "https://claude.com/auth?a=1")
     }
 
     func testOutputWithNoURLYieldsNone() {
-        XCTAssertNil(AccountSignInController.signInURL(in: "Opening browser to sign in…"))
+        XCTAssertNil(
+            AccountSignInController.signInURL(
+                in: "Opening browser to sign in…",
+                for: .claude
+            )
+        )
+    }
+
+    func testProviderSignInURLSkipsMisleadingURLsBeforeAndAfterTheRealURL() throws {
+        let real = try XCTUnwrap(
+            URL(string: "https://claude.com/cai/oauth/authorize?state=real")
+        )
+        let misleading = "https://claude.com.evil.example/cai/oauth/authorize?state=phish"
+
+        XCTAssertEqual(
+            AccountSignInController.signInURL(
+                in: "Debug \(misleading)\nOpen \(real.absoluteString)",
+                for: .claude
+            ),
+            real
+        )
+        XCTAssertEqual(
+            AccountSignInController.signInURL(
+                in: "Open \(real.absoluteString)\nDebug https://evil.example/after",
+                for: .claude
+            ),
+            real
+        )
+    }
+
+    func testProviderSignInURLRejectsLookalikeAndOtherProviderHosts() throws {
+        let codexURL = try XCTUnwrap(
+            URL(string: "https://auth.openai.com/oauth/authorize?state=codex")
+        )
+        let output = """
+        https://claude.com.evil.example/cai/oauth/authorize
+        https://auth.openai.com/oauth/authorize?state=codex
+        """
+
+        XCTAssertNil(AccountSignInController.signInURL(in: output, for: .claude))
+        XCTAssertEqual(AccountSignInController.signInURL(in: output, for: .codex), codexURL)
+        XCTAssertNil(
+            AccountSignInController.signInURL(
+                in: "https://claude.com/cai/oauth/authorize",
+                for: .codex
+            )
+        )
+        XCTAssertNil(
+            AccountSignInController.signInURL(
+                in: "https://attacker@claude.com/cai/oauth/authorize",
+                for: .claude
+            )
+        )
+        XCTAssertNil(
+            AccountSignInController.signInURL(
+                in: "https://claude.com:8443/cai/oauth/authorize",
+                for: .claude
+            )
+        )
+    }
+
+    func testProviderSignInURLAcceptsCurrentClaudeAuthorizeHosts() {
+        XCTAssertNotNil(
+            AccountSignInController.signInURL(
+                in: "https://claude.com/cai/oauth/authorize",
+                for: .claude
+            )
+        )
+        XCTAssertNotNil(
+            AccountSignInController.signInURL(
+                in: "https://platform.claude.com/oauth/authorize",
+                for: .claude
+            )
+        )
     }
 
     func testIncrementalUTF8DecoderPreservesEveryScalarAcrossEveryByteBoundary() throws {
         let expected = """
         Opening browser to sign in… café 研究 🙂
-        Visit https://example.com/oauth?state=été&emoji=✅
+        Visit https://claude.com/oauth?state=été&emoji=✅
         Paste code here if prompted >
         OAuth error: accès refusé
         """
@@ -141,8 +219,10 @@ final class AccountSignInControllerTests: XCTestCase {
 
             XCTAssertEqual(decoded, expected, "UTF-8 split at byte \(split)")
             XCTAssertEqual(
-                try XCTUnwrap(AccountSignInController.signInURL(in: decoded)).absoluteString,
-                "https://example.com/oauth?state=%C3%A9t%C3%A9&emoji=%E2%9C%85"
+                try XCTUnwrap(
+                    AccountSignInController.signInURL(in: decoded, for: .claude)
+                ).absoluteString,
+                "https://claude.com/oauth?state=%C3%A9t%C3%A9&emoji=%E2%9C%85"
             )
             XCTAssertTrue(AccountSignInController.promptsForCode(decoded))
         }
@@ -168,11 +248,12 @@ final class AccountSignInControllerTests: XCTestCase {
     }
 
     func testOutputAfterSubmitDoesNotReopenTheOldCodePrompt() throws {
-        let url = try XCTUnwrap(URL(string: "https://example.com/oauth"))
+        let url = try XCTUnwrap(URL(string: "https://claude.com/oauth"))
         var tracker = AccountSignInController.OutputPhaseTracker()
+        tracker.reset(for: .claude)
         tracker.beginSubmission()
         let transcript = """
-        Visit https://example.com/oauth
+        Visit https://claude.com/oauth
         Paste code here if prompted >
         Verifying your code…
         """
@@ -185,15 +266,40 @@ final class AccountSignInControllerTests: XCTestCase {
             ),
             .submitting
         )
-        XCTAssertEqual(AccountSignInController.signInURL(in: transcript), url)
+        XCTAssertEqual(
+            AccountSignInController.signInURL(in: transcript, for: .claude),
+            url
+        )
+    }
+
+    func testOutputPhaseTrackerUsesTheSelectedProviderHost() throws {
+        let codexURL = try XCTUnwrap(
+            URL(string: "https://auth.openai.com/oauth/authorize?state=codex")
+        )
+        let transcript = """
+        Debug https://claude.com/cai/oauth/authorize?state=wrong-provider
+        Open https://auth.openai.com/oauth/authorize?state=codex
+        """
+        var tracker = AccountSignInController.OutputPhaseTracker()
+        tracker.reset(for: .codex)
+
+        XCTAssertEqual(
+            tracker.phaseAfterOutput(
+                current: .launching,
+                transcript: transcript,
+                newOutput: transcript
+            ),
+            .awaitingBrowser(codexURL)
+        )
     }
 
     func testAnExplicitNewCodePromptCanReopenSubmissionAcrossOutputChunks() throws {
-        let url = try XCTUnwrap(URL(string: "https://example.com/oauth"))
+        let url = try XCTUnwrap(URL(string: "https://claude.com/oauth"))
         var tracker = AccountSignInController.OutputPhaseTracker()
+        tracker.reset(for: .claude)
         tracker.beginSubmission()
         let oldTranscript = """
-        Visit https://example.com/oauth
+        Visit https://claude.com/oauth
         Paste code here if prompted >
         """
         let firstChunk = "That code expired. Paste "

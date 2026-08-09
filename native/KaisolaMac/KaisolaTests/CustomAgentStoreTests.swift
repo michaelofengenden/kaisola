@@ -47,6 +47,149 @@ final class CustomAgentStoreTests: XCTestCase {
         XCTAssertEqual(Set(CustomAgentSymbolAccessibility.choices.map(\.name)).count, 6)
     }
 
+    func testAgentBasicsDraftUsesTheSameValidationForCreationAndEditing() throws {
+        let roster = [
+            makeSpec("custom-aider", "Aider"),
+            makeSpec("custom-reviewer", "Reviewer"),
+        ]
+
+        XCTAssertEqual(
+            CustomAgentBasicsDraft(name: "   ", launchCommand: "aider").validationError(
+                in: roster,
+                editingAgentID: nil
+            ),
+            .emptyName
+        )
+        XCTAssertEqual(
+            CustomAgentBasicsDraft(name: "Aider Pro", launchCommand: "\n\t").validationError(
+                in: roster,
+                editingAgentID: nil
+            ),
+            .emptyCommand
+        )
+
+        let duplicate = CustomAgentBasicsDraft(name: "  AIDER  ", launchCommand: "aider --alt")
+        let creationError = try XCTUnwrap(duplicate.validationError(in: roster, editingAgentID: nil))
+        guard case let .duplicateName(reason) = creationError else {
+            return XCTFail("Expected creation to reject a duplicate display name")
+        }
+        XCTAssertTrue(reason.contains("\"Aider\""), reason)
+
+        XCTAssertNil(
+            duplicate.validationError(in: roster, editingAgentID: "custom-aider"),
+            "Editing a row must ignore only that row's current display name"
+        )
+        XCTAssertNotNil(
+            CustomAgentBasicsDraft(
+                name: " reviewer ",
+                launchCommand: "aider --alt"
+            ).validationError(in: roster, editingAgentID: "custom-aider")
+        )
+    }
+
+    func testApplyingAgentBasicsPreservesStableIdentityAndAdapterSettings() throws {
+        let original = CustomAgentSpec(
+            id: "custom-aider",
+            name: "Aider",
+            launchCommand: "aider",
+            symbol: "bolt",
+            acpPackage: "aider-acp@1.2.3",
+            credentials: "claude",
+            chatEnabled: true,
+            acpPrivileges: ["network", "workspaceRead"]
+        )
+        let roster = [original, makeSpec("custom-reviewer", "Reviewer")]
+        var draft = CustomAgentBasicsDraft(spec: original)
+        draft.name = "  Aider Pro  "
+        draft.launchCommand = "  aider --model sonnet  "
+
+        XCTAssertEqual(original.name, "Aider", "Editing a draft must not mutate the live row")
+        XCTAssertEqual(original.launchCommand, "aider")
+        let edited = try draft.applying(to: original, in: roster).get()
+
+        var expected = original
+        expected.name = "Aider Pro"
+        expected.launchCommand = "aider --model sonnet"
+        XCTAssertEqual(edited, expected)
+        XCTAssertEqual(edited.id, original.id)
+        XCTAssertEqual(edited.symbol, original.symbol)
+        XCTAssertEqual(edited.acpPackage, original.acpPackage)
+        XCTAssertEqual(edited.credentials, original.credentials)
+        XCTAssertEqual(edited.chatEnabled, original.chatEnabled)
+        XCTAssertEqual(edited.acpPrivileges, original.acpPrivileges)
+
+        _ = try store.save(roster).get()
+        _ = try store.save([edited, roster[1]], affectedAgentID: original.id).get()
+        XCTAssertEqual(try store.load().get(), [expected, roster[1]])
+    }
+
+    func testInvalidAgentBasicsCannotProduceAMutatedSpec() {
+        let original = makeSpec("custom-aider", "Aider")
+        let roster = [original, makeSpec("custom-reviewer", "Reviewer")]
+
+        for draft in [
+            CustomAgentBasicsDraft(name: "", launchCommand: "aider --alt"),
+            CustomAgentBasicsDraft(name: "Aider Pro", launchCommand: "  "),
+            CustomAgentBasicsDraft(name: "Reviewer", launchCommand: "aider --alt"),
+        ] {
+            guard case .failure = draft.applying(to: original, in: roster) else {
+                return XCTFail("Invalid edits must not yield a replacement spec: \(draft)")
+            }
+        }
+        XCTAssertEqual(original, roster[0])
+    }
+
+    func testAgentBasicsEditControlsNameTheExactRowAndPurpose() {
+        XCTAssertEqual(
+            CustomAgentBasicsEditAccessibility.editLabel(agentName: "Aider"),
+            "Edit name and launch command for Aider"
+        )
+        XCTAssertEqual(
+            CustomAgentBasicsEditAccessibility.identifier(
+                agentID: "custom-aider",
+                control: "command"
+            ),
+            "extensions.agent.custom-aider.edit.command"
+        )
+        XCTAssertNotEqual(
+            CustomAgentBasicsEditAccessibility.identifier(
+                agentID: "custom-aider",
+                control: "save"
+            ),
+            CustomAgentBasicsEditAccessibility.identifier(
+                agentID: "custom-reviewer",
+                control: "save"
+            )
+        )
+    }
+
+    func testExistingAgentRowsWireAnExplicitSaveOrCancelEditFlow() throws {
+        let view = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Kaisola/Features/Settings/CustomAgentsSection.swift")
+        let source = try String(contentsOf: view, encoding: .utf8)
+        let start = try XCTUnwrap(source.range(of: "struct CustomAgentsSection: View {"))
+        let end = try XCTUnwrap(
+            source.range(
+                of: "\n/// Deleting a custom agent",
+                range: start.upperBound..<source.endIndex
+            )
+        )
+        let section = String(source[start.lowerBound..<end.lowerBound])
+
+        XCTAssertTrue(section.contains("Button { beginEdit(spec) }"))
+        XCTAssertTrue(section.contains("TextField(\"Agent name\", text: $editName)"))
+        XCTAssertTrue(section.contains("TextField(\"Launch command\", text: $editCommand)"))
+        XCTAssertTrue(section.contains("Button(\"Save\") { saveEdit(spec) }"))
+        XCTAssertTrue(section.contains("Button(\"Cancel\") { cancelEdit() }"))
+        XCTAssertTrue(section.contains("case let .success(edited) = editDraft.applying("))
+        XCTAssertFalse(
+            section.contains("TextField(\"Name\", text: nameBinding(index))"),
+            "Existing rows must not save every name keystroke outside the explicit edit flow"
+        )
+    }
+
     func testFailedAdapterInstallFeedbackStaysOnTheExactRowUntilDismissedOrRetried() throws {
         let attempt = CustomAdapterInstallAttempt(
             agentID: "custom-aider",

@@ -39,6 +39,88 @@ enum CustomAgentSymbolAccessibility {
     }
 }
 
+/// The shared name/command contract for creation and explicit row editing.
+/// Applying a valid draft replaces only these two user-facing fields; stable
+/// identity and every adapter, credential, and containment choice stay on the
+/// same custom-agent record.
+struct CustomAgentBasicsDraft: Equatable, Sendable {
+    enum ValidationError: LocalizedError, Equatable, Sendable {
+        case emptyName
+        case emptyCommand
+        case duplicateName(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .emptyName:
+                "Enter an agent name."
+            case .emptyCommand:
+                "Enter a launch command."
+            case let .duplicateName(reason):
+                reason
+            }
+        }
+    }
+
+    var name: String
+    var launchCommand: String
+
+    init(name: String, launchCommand: String) {
+        self.name = name
+        self.launchCommand = launchCommand
+    }
+
+    init(spec: CustomAgentSpec) {
+        self.init(name: spec.name, launchCommand: spec.launchCommand)
+    }
+
+    var trimmedName: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var trimmedCommand: String {
+        launchCommand.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func validationError(
+        in specs: [CustomAgentSpec],
+        editingAgentID: String?
+    ) -> ValidationError? {
+        guard !trimmedName.isEmpty else { return .emptyName }
+        guard !trimmedCommand.isEmpty else { return .emptyCommand }
+        if let reason = CustomAgentStore.duplicateNameError(
+            trimmedName,
+            in: specs,
+            ignoring: editingAgentID
+        ) {
+            return .duplicateName(reason)
+        }
+        return nil
+    }
+
+    func applying(
+        to spec: CustomAgentSpec,
+        in specs: [CustomAgentSpec]
+    ) -> Result<CustomAgentSpec, ValidationError> {
+        if let error = validationError(in: specs, editingAgentID: spec.id) {
+            return .failure(error)
+        }
+        var edited = spec
+        edited.name = trimmedName
+        edited.launchCommand = trimmedCommand
+        return .success(edited)
+    }
+}
+
+enum CustomAgentBasicsEditAccessibility {
+    static func editLabel(agentName: String) -> String {
+        "Edit name and launch command for \(agentName)"
+    }
+
+    static func identifier(agentID: String, control: String) -> String {
+        "extensions.agent.\(agentID).edit.\(control)"
+    }
+}
+
 /// The exact adapter contract behind one install click. A retry reuses this
 /// value instead of reconstructing package or containment choices from mutable
 /// row state after the failure.
@@ -290,6 +372,11 @@ struct CustomAgentsSection: View {
     @State private var specs: [CustomAgentSpec] = []
     @State private var newName = ""
     @State private var newCommand = ""
+    /// One explicit editor at a time. Draft fields are separate from `specs`,
+    /// so Cancel and invalid input never mutate the live or persisted roster.
+    @State private var editingAgentID: String?
+    @State private var editName = ""
+    @State private var editCommand = ""
     /// Which row's honest-grant confirmation is open.
     @State private var pendingEnableIndex: Int?
     /// The agent whose pinned install is currently running.
@@ -326,61 +413,156 @@ struct CustomAgentsSection: View {
             }
             ForEach(Array(specs.enumerated()), id: \.offset) { index, spec in
                 VStack(alignment: .leading, spacing: 5) {
-                    HStack(spacing: 10) {
-                        VStack(alignment: .leading, spacing: 1) {
-                            TextField("Name", text: nameBinding(index))
-                                .font(.callout)
-                                .textFieldStyle(.plain)
-                                .disabled(
-                                    loadBlocked
-                                        || installingAgentID == spec.id
-                                        || installFeedback.failure(for: spec.id) != nil
-                                        || disablingAgentID != nil
-                                )
-                            Text(spec.launchCommand)
-                                .font(.caption.monospaced()).foregroundStyle(.kaisolaSecondary)
-                                .lineLimit(1).truncationMode(.middle)
-                        }
-                        Spacer()
-                        Picker(
-                            CustomAgentSymbolAccessibility.pickerLabel(agentName: spec.name),
-                            selection: symbolBinding(index)
-                        ) {
-                            ForEach(symbolChoices) { choice in
-                                Image(systemName: choice.symbolName)
-                                    .accessibilityLabel(choice.name)
-                                    .tag(choice.symbolName)
+                    if editingAgentID == spec.id {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("Edit \(spec.name)")
+                                .font(.caption.weight(.semibold))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Name")
+                                    .font(.caption2)
+                                    .foregroundStyle(.kaisolaSecondary)
+                                TextField("Agent name", text: $editName)
+                                    .font(.callout)
+                                    .textFieldStyle(.roundedBorder)
+                                    .accessibilityIdentifier(
+                                        CustomAgentBasicsEditAccessibility.identifier(
+                                            agentID: spec.id,
+                                            control: "name"
+                                        )
+                                    )
                             }
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("Launch command")
+                                    .font(.caption2)
+                                    .foregroundStyle(.kaisolaSecondary)
+                                TextField("Launch command", text: $editCommand)
+                                    .font(.caption.monospaced())
+                                    .textFieldStyle(.roundedBorder)
+                                    .onSubmit { saveEdit(spec) }
+                                    .accessibilityIdentifier(
+                                        CustomAgentBasicsEditAccessibility.identifier(
+                                            agentID: spec.id,
+                                            control: "command"
+                                        )
+                                    )
+                            }
+                            HStack(spacing: 8) {
+                                Spacer()
+                                Button("Cancel") { cancelEdit() }
+                                    .accessibilityLabel("Cancel changes to \(spec.name)")
+                                    .accessibilityIdentifier(
+                                        CustomAgentBasicsEditAccessibility.identifier(
+                                            agentID: spec.id,
+                                            control: "cancel"
+                                        )
+                                    )
+                                Button("Save") { saveEdit(spec) }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(!canSaveEdit)
+                                    .accessibilityLabel("Save changes to \(spec.name)")
+                                    .accessibilityIdentifier(
+                                        CustomAgentBasicsEditAccessibility.identifier(
+                                            agentID: spec.id,
+                                            control: "save"
+                                        )
+                                    )
+                            }
+                            .controlSize(.small)
                         }
-                        .labelsHidden()
-                        .pickerStyle(.menu)
-                        .frame(width: 64)
-                        .accessibilityLabel(
-                            CustomAgentSymbolAccessibility.pickerLabel(agentName: spec.name)
-                        )
-                        .accessibilityValue(
-                            CustomAgentSymbolAccessibility.currentValue(symbolName: spec.symbol)
-                        )
-                        .accessibilityIdentifier("extensions.agent.\(spec.id).icon")
-                        .help(
-                            "\(CustomAgentSymbolAccessibility.pickerLabel(agentName: spec.name)): "
-                                + CustomAgentSymbolAccessibility.currentValue(symbolName: spec.symbol)
-                        )
-                        .disabled(disablingAgentID != nil)
-                        Button(role: .destructive) { pendingDeleteID = spec.id } label: {
-                            Image(systemName: "trash")
+                        .padding(8)
+                        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+                    } else {
+                        HStack(spacing: 10) {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(spec.name).font(.callout)
+                                Text(spec.launchCommand)
+                                    .font(.caption.monospaced())
+                                    .foregroundStyle(.kaisolaSecondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                            Spacer()
+                            Button { beginEdit(spec) } label: {
+                                Image(systemName: "pencil")
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel(
+                                CustomAgentBasicsEditAccessibility.editLabel(
+                                    agentName: spec.name
+                                )
+                            )
+                            .accessibilityIdentifier(
+                                CustomAgentBasicsEditAccessibility.identifier(
+                                    agentID: spec.id,
+                                    control: "begin"
+                                )
+                            )
+                            .help("Edit \(spec.name)'s name and launch command")
+                            .disabled(
+                                loadBlocked
+                                    || editingAgentID != nil
+                                    || installingAgentID == spec.id
+                                    || installFeedback.failure(for: spec.id) != nil
+                                    || disablingAgentID != nil
+                                    || pendingEnableIndex != nil
+                                    || pendingDisableID != nil
+                                    || pendingDeleteID != nil
+                            )
+                            Picker(
+                                CustomAgentSymbolAccessibility.pickerLabel(agentName: spec.name),
+                                selection: symbolBinding(index)
+                            ) {
+                                ForEach(symbolChoices) { choice in
+                                    Image(systemName: choice.symbolName)
+                                        .accessibilityLabel(choice.name)
+                                        .tag(choice.symbolName)
+                                }
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .frame(width: 64)
+                            .accessibilityLabel(
+                                CustomAgentSymbolAccessibility.pickerLabel(agentName: spec.name)
+                            )
+                            .accessibilityValue(
+                                CustomAgentSymbolAccessibility.currentValue(symbolName: spec.symbol)
+                            )
+                            .accessibilityIdentifier("extensions.agent.\(spec.id).icon")
+                            .help(
+                                "\(CustomAgentSymbolAccessibility.pickerLabel(agentName: spec.name)): "
+                                    + CustomAgentSymbolAccessibility.currentValue(symbolName: spec.symbol)
+                            )
+                            .disabled(disablingAgentID != nil || editingAgentID != nil)
+                            Button(role: .destructive) { pendingDeleteID = spec.id } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                            .accessibilityLabel("Remove custom agent \(spec.name)")
+                            .disabled(
+                                loadBlocked
+                                    || editingAgentID != nil
+                                    || installingAgentID == spec.id
+                                    || disablingAgentID != nil
+                            )
                         }
-                        .buttonStyle(.borderless)
-                        .accessibilityLabel("Remove custom agent \(spec.name)")
-                        .disabled(
-                            loadBlocked
-                                || installingAgentID == spec.id
-                                || disablingAgentID != nil
-                        )
                     }
                     // A roster written before names were checked can still hold
                     // twins; each one says so until it is renamed apart.
-                    if let reason = CustomAgentStore.duplicateNameError(
+                    if editingAgentID == spec.id, let error = editValidationError {
+                        Text(error.localizedDescription)
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityLabel(
+                                "Cannot save changes: \(error.localizedDescription)"
+                            )
+                            .accessibilityIdentifier(
+                                CustomAgentBasicsEditAccessibility.identifier(
+                                    agentID: spec.id,
+                                    control: "validation"
+                                )
+                            )
+                    } else if let reason = CustomAgentStore.duplicateNameError(
                         spec.name, in: specs, ignoring: spec.id) {
                         Text(reason).font(.caption).foregroundStyle(.orange)
                     }
@@ -413,7 +595,7 @@ struct CustomAgentsSection: View {
                 Button("Add", action: add)
                     .disabled(!canAdd)
             }
-            .disabled(disablingAgentID != nil)
+            .disabled(disablingAgentID != nil || editingAgentID != nil)
             if let reason = newNameDuplicateError {
                 Text(reason).font(.caption).foregroundStyle(.orange)
             } else if specs.count >= cap {
@@ -430,10 +612,13 @@ struct CustomAgentsSection: View {
     private var canAdd: Bool {
         !loadBlocked
             && disablingAgentID == nil
+            && editingAgentID == nil
             && specs.count < cap
-            && !newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && !newCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            && newNameDuplicateError == nil
+            && newBasicsDraft.validationError(in: specs, editingAgentID: nil) == nil
+    }
+
+    private var newBasicsDraft: CustomAgentBasicsDraft {
+        CustomAgentBasicsDraft(name: newName, launchCommand: newCommand)
     }
 
     /// Which existing entry the typed name would be indistinguishable from.
@@ -441,26 +626,16 @@ struct CustomAgentsSection: View {
         CustomAgentStore.duplicateNameError(newName, in: specs)
     }
 
-    /// A binding that renames a row in place, keeping its id — and with it the
-    /// agent's pinned adapter install and credential context. The typed text
-    /// always lands in the row so the field never fights the caret; only a free
-    /// name is persisted, which is how an existing duplicate gets repaired.
-    private func nameBinding(_ index: Int) -> Binding<String> {
-        Binding(
-            get: { specs.indices.contains(index) ? specs[index].name : "" },
-            set: { newValue in
-                guard specs.indices.contains(index) else { return }
-                let previous = specs
-                specs[index].name = newValue
-                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty,
-                      CustomAgentStore.duplicateNameError(
-                        trimmed, in: specs, ignoring: specs[index].id) == nil
-                else { return }
-                specs[index].name = trimmed
-                persist(affectedAgentID: specs[index].id, restoring: previous)
-            }
-        )
+    private var editDraft: CustomAgentBasicsDraft {
+        CustomAgentBasicsDraft(name: editName, launchCommand: editCommand)
+    }
+
+    private var editValidationError: CustomAgentBasicsDraft.ValidationError? {
+        editDraft.validationError(in: specs, editingAgentID: editingAgentID)
+    }
+
+    private var canSaveEdit: Bool {
+        editingAgentID != nil && editValidationError == nil
     }
 
     /// A binding that persists an icon change and rebuilds menus on set.
@@ -490,14 +665,17 @@ struct CustomAgentsSection: View {
     }
 
     private func add() {
-        let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        let command = newCommand.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !loadBlocked, !name.isEmpty, !command.isEmpty, specs.count < cap else { return }
+        let draft = newBasicsDraft
+        guard !loadBlocked,
+              disablingAgentID == nil,
+              editingAgentID == nil,
+              specs.count < cap,
+              draft.validationError(in: specs, editingAgentID: nil) == nil else { return }
         let previous = specs
         let added = CustomAgentSpec(
-            id: CustomAgentStore.slugify(name, existing: Set(specs.map(\.id))),
-            name: name,
-            launchCommand: command,
+            id: CustomAgentStore.slugify(draft.trimmedName, existing: Set(specs.map(\.id))),
+            name: draft.trimmedName,
+            launchCommand: draft.trimmedCommand,
             symbol: symbolChoices.first?.symbolName ?? "terminal",
             acpPrivileges: []
         )
@@ -508,6 +686,41 @@ struct CustomAgentsSection: View {
         if persist(affectedAgentID: added.id, restoring: previous) {
             newName = ""
             newCommand = ""
+        }
+    }
+
+    private func beginEdit(_ spec: CustomAgentSpec) {
+        guard !loadBlocked,
+              editingAgentID == nil,
+              installingAgentID != spec.id,
+              installFeedback.failure(for: spec.id) == nil,
+              disablingAgentID == nil,
+              pendingEnableIndex == nil,
+              pendingDisableID == nil,
+              pendingDeleteID == nil else { return }
+        editingAgentID = spec.id
+        editName = spec.name
+        editCommand = spec.launchCommand
+        registryError = nil
+    }
+
+    private func cancelEdit() {
+        editingAgentID = nil
+        editName = ""
+        editCommand = ""
+    }
+
+    private func saveEdit(_ displayed: CustomAgentSpec) {
+        guard editingAgentID == displayed.id,
+              let index = specs.firstIndex(where: { $0.id == displayed.id }),
+              case let .success(edited) = editDraft.applying(
+                to: specs[index],
+                in: specs
+              ) else { return }
+        let previous = specs
+        specs[index] = edited
+        if persist(affectedAgentID: displayed.id, restoring: previous) {
+            cancelEdit()
         }
     }
 
@@ -561,6 +774,7 @@ struct CustomAgentsSection: View {
                       pendingEnableIndex > removedIndex {
                 self.pendingEnableIndex = pendingEnableIndex - 1
             }
+            if editingAgentID == plan.agentID { cancelEdit() }
             NotificationCenter.default.post(name: .kaisolaAgentsChanged, object: nil)
             NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
         } catch {
@@ -606,6 +820,7 @@ struct CustomAgentsSection: View {
         let locksFailedAttempt = failure != nil
             || installingAgentID == spec.id
             || disablingAgentID != nil
+            || editingAgentID != nil
         HStack(spacing: 8) {
             TextField("ACP adapter (npm package, optional)", text: packageBinding(index))
                 .font(.caption.monospaced())
@@ -625,7 +840,11 @@ struct CustomAgentsSection: View {
                     pendingDisableID = spec.id
                 }
                 .font(.caption)
-                .disabled(installingAgentID != nil || disablingAgentID != nil)
+                .disabled(
+                    installingAgentID != nil
+                        || disablingAgentID != nil
+                        || editingAgentID != nil
+                )
             } else if failure == nil,
                       spec.acpPackage?.isEmpty == false,
                       spec.acpPackageValidationError == nil {
@@ -635,7 +854,11 @@ struct CustomAgentsSection: View {
                     beginEnable(index)
                 }
                 .font(.caption)
-                .disabled(installingAgentID != nil || disablingAgentID != nil)
+                .disabled(
+                    installingAgentID != nil
+                        || disablingAgentID != nil
+                        || editingAgentID != nil
+                )
             }
         }
         if spec.acpPackage?.isEmpty == false {
@@ -704,7 +927,11 @@ struct CustomAgentsSection: View {
                 HStack {
                     Button("Install and Enable") { enableChat(index) }
                         .font(.caption)
-                        .disabled(installingAgentID != nil || disablingAgentID != nil)
+                        .disabled(
+                            installingAgentID != nil
+                                || disablingAgentID != nil
+                                || editingAgentID != nil
+                        )
                     Button("Cancel") { pendingEnableIndex = nil }
                         .font(.caption)
                 }
@@ -728,7 +955,11 @@ struct CustomAgentsSection: View {
             HStack(spacing: 10) {
                 Button("Disable Chat", role: .destructive) { confirmDisableChat(plan) }
                     .font(.caption)
-                    .disabled(installingAgentID != nil || disablingAgentID != nil)
+                    .disabled(
+                        installingAgentID != nil
+                            || disablingAgentID != nil
+                            || editingAgentID != nil
+                    )
                 Button("Cancel") { pendingDisableID = nil }
                     .font(.caption)
             }
@@ -771,7 +1002,11 @@ struct CustomAgentsSection: View {
                 Button("Retry") { retryInstall(failure) }
                     .font(.caption)
                     .accessibilityLabel(failure.retryLabel)
-                    .disabled(installingAgentID != nil || disablingAgentID != nil)
+                    .disabled(
+                        installingAgentID != nil
+                            || disablingAgentID != nil
+                            || editingAgentID != nil
+                    )
                 Button("Copy Details") {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(failure.copyDetails, forType: .string)

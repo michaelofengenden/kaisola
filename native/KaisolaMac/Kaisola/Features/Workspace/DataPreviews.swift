@@ -57,6 +57,47 @@ actor PreviewParseCache<Value: Sendable> {
 
 // MARK: - CSV
 
+/// What the render caps actually dropped, per dimension. Rows and columns are
+/// tracked separately so the preview's notice can name the dimension that was
+/// cut and cite real counts, instead of implying rows are missing whenever a
+/// wide file lost only its trailing columns.
+///
+/// `total*` is the document's own count; `displayed*` is what survived the cap.
+/// Columns are measured over the rows that survived the row cap: a wide record
+/// past `maxRows` is never rendered, so counting it would claim columns were
+/// dropped from a table that in fact shows every column it displays.
+struct CsvTruncation: Equatable, Sendable {
+    var totalRows = 0
+    var displayedRows = 0
+    var totalColumns = 0
+    var displayedColumns = 0
+
+    /// Nothing parsed, nothing dropped.
+    static let none = CsvTruncation()
+
+    var rowsTruncated: Bool { totalRows > displayedRows }
+    var columnsTruncated: Bool { totalColumns > displayedColumns }
+    var isTruncated: Bool { rowsTruncated || columnsTruncated }
+
+    /// The preview banner's text, or `nil` when the whole document is shown.
+    /// Pure so the per-dimension wording is testable without SwiftUI.
+    var noticeText: String? {
+        let rows = "the first \(displayedRows) of \(totalRows) rows"
+        let columns = "the first \(displayedColumns) of \(totalColumns) columns"
+        switch (rowsTruncated, columnsTruncated) {
+        case (false, false):
+            return nil
+        case (true, false):
+            return "Showing \(rows) (preview caps at \(CsvTable.maxRows) rows)."
+        case (false, true):
+            return "Showing \(columns) (preview caps at \(CsvTable.maxCols) columns)."
+        case (true, true):
+            return "Showing \(rows) and \(columns) "
+                + "(preview caps at \(CsvTable.maxRows) rows × \(CsvTable.maxCols) columns)."
+        }
+    }
+}
+
 /// RFC-4180-ish CSV/TSV parsing. Pure so tests can drive it directly.
 enum CsvTable {
     /// Rendering caps: excess rows/columns are dropped and flagged so a
@@ -66,37 +107,44 @@ enum CsvTable {
 
     /// Parse `text` into rows of fields. Handles quoted fields, `""`-escaped
     /// quotes, embedded newlines inside quotes, and CRLF/CR/LF record endings.
-    /// Returns the (capped) rows plus a `truncated` flag set when any row or
-    /// column past the cap was dropped.
+    /// Returns the (capped) rows plus the per-dimension counts describing what
+    /// each cap dropped.
     ///
     /// Pure — `nonisolated` keeps CI's strict-concurrency inference from pinning
     /// it to the main actor just because the file also defines SwiftUI views.
-    nonisolated static func parse(_ text: String, delimiter: Character = ",") -> (rows: [[String]], truncated: Bool) {
+    nonisolated static func parse(
+        _ text: String,
+        delimiter: Character = ","
+    ) -> (rows: [[String]], truncation: CsvTruncation) {
         let chars = Array(text)
         let count = chars.count
         var rows: [[String]] = []
         var record: [String] = []
         var field = ""
         var inQuotes = false
-        var truncated = false
+        var truncation = CsvTruncation()
+        // The record's real width, counted past `maxCols` so the notice can
+        // report how many columns the file actually has.
+        var fieldsInRecord = 0
         var index = 0
 
         func endField() {
+            fieldsInRecord += 1
             if record.count < maxCols {
                 record.append(field)
-            } else {
-                truncated = true
             }
             field = ""
         }
         func endRecord() {
             endField()
+            truncation.totalRows += 1
             if rows.count < maxRows {
                 rows.append(record)
-            } else {
-                truncated = true
+                truncation.totalColumns = max(truncation.totalColumns, fieldsInRecord)
+                truncation.displayedColumns = max(truncation.displayedColumns, record.count)
             }
             record = []
+            fieldsInRecord = 0
         }
 
         while index < count {
@@ -147,7 +195,8 @@ enum CsvTable {
         if !field.isEmpty || !record.isEmpty {
             endRecord()
         }
-        return (rows, truncated)
+        truncation.displayedRows = rows.count
+        return (rows, truncation)
     }
 
     /// Guess the delimiter from the first non-empty line by counting comma,
@@ -181,10 +230,10 @@ enum CsvTable {
 }
 
 /// The render-ready projection of a CSV/TSV document: capped rows, the
-/// truncation flag, and the fixed per-column widths that keep cells aligned
-/// across a vertically lazy list. Built once per content identity — this used to
-/// run in `CsvPreview.init`, so every SwiftUI body evaluation re-parsed the
-/// whole file.
+/// per-dimension truncation counts, and the fixed per-column widths that keep
+/// cells aligned across a vertically lazy list. Built once per content identity
+/// — this used to run in `CsvPreview.init`, so every SwiftUI body evaluation
+/// re-parsed the whole file.
 struct CsvPreviewModel: Equatable, Sendable {
     static let minimumColumnWidth: CGFloat = 46
     static let maximumColumnWidth: CGFloat = 340
@@ -193,10 +242,10 @@ struct CsvPreviewModel: Equatable, Sendable {
     static let cellPadding: CGFloat = 10
 
     let rows: [[String]]
-    let truncated: Bool
+    let truncation: CsvTruncation
     let columnWidths: [CGFloat]
 
-    static let empty = CsvPreviewModel(rows: [], truncated: false, columnWidths: [])
+    static let empty = CsvPreviewModel(rows: [], truncation: .none, columnWidths: [])
 
     nonisolated static func make(_ text: String) -> CsvPreviewModel {
         let parsed = CsvTable.parse(text, delimiter: CsvTable.detectDelimiter(text))
@@ -211,7 +260,7 @@ struct CsvPreviewModel: Equatable, Sendable {
                 if fitted > widths[column] { widths[column] = fitted }
             }
         }
-        return CsvPreviewModel(rows: parsed.rows, truncated: parsed.truncated, columnWidths: widths)
+        return CsvPreviewModel(rows: parsed.rows, truncation: parsed.truncation, columnWidths: widths)
     }
 }
 
@@ -249,7 +298,7 @@ struct CsvPreview: View {
 
     private func table(_ model: CsvPreviewModel) -> some View {
         VStack(alignment: .leading, spacing: 0) {
-            if model.truncated { truncationNotice(rowCount: model.rows.count) }
+            if let notice = model.truncation.noticeText { truncationNotice(notice) }
             if model.rows.isEmpty {
                 ContentUnavailableView(
                     "Empty file",
@@ -298,11 +347,8 @@ struct CsvPreview: View {
             }
     }
 
-    private func truncationNotice(rowCount: Int) -> some View {
-        Label(
-            "Showing the first \(rowCount) rows (preview caps at \(CsvTable.maxRows) rows × \(CsvTable.maxCols) columns).",
-            systemImage: "exclamationmark.triangle.fill"
-        )
+    private func truncationNotice(_ text: String) -> some View {
+        Label(text, systemImage: "exclamationmark.triangle.fill")
         .font(.caption)
         .foregroundStyle(.secondary)
         .padding(.horizontal, 12)

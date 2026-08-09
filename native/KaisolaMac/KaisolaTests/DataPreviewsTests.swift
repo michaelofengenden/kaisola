@@ -10,9 +10,9 @@ final class DataPreviewsTests: XCTestCase {
     // MARK: - CSV parsing
 
     func testParsesSimpleRows() {
-        let (rows, truncated) = CsvTable.parse("a,b,c\n1,2,3")
+        let (rows, truncation) = CsvTable.parse("a,b,c\n1,2,3")
         XCTAssertEqual(rows, [["a", "b", "c"], ["1", "2", "3"]])
-        XCTAssertFalse(truncated)
+        XCTAssertFalse(truncation.isTruncated)
     }
 
     func testQuotedFieldWithEmbeddedCommaAndNewline() {
@@ -49,9 +49,10 @@ final class DataPreviewsTests: XCTestCase {
     }
 
     func testEmptyInputYieldsNoRows() {
-        let (rows, truncated) = CsvTable.parse("")
+        let (rows, truncation) = CsvTable.parse("")
         XCTAssertTrue(rows.isEmpty)
-        XCTAssertFalse(truncated)
+        XCTAssertFalse(truncation.isTruncated)
+        XCTAssertNil(truncation.noticeText)
     }
 
     func testSemicolonDelimiterParsing() {
@@ -61,25 +62,108 @@ final class DataPreviewsTests: XCTestCase {
 
     // MARK: - CSV caps
 
-    func testRowCapAndTruncatedFlag() {
-        let text = (0..<(CsvTable.maxRows + 500)).map(String.init).joined(separator: "\n")
-        let (rows, truncated) = CsvTable.parse(text)
-        XCTAssertEqual(rows.count, CsvTable.maxRows)
-        XCTAssertTrue(truncated)
+    /// A `rows` × `columns` document with distinct cells, so a cap that fires
+    /// shows up in the parsed shape instead of hiding behind repeated values.
+    private func grid(rows: Int, columns: Int) -> String {
+        (0..<rows)
+            .map { row in (0..<columns).map { "r\(row)c\($0)" }.joined(separator: ",") }
+            .joined(separator: "\n")
     }
 
-    func testColumnCapAndTruncatedFlag() {
-        let wideRow = (0..<(CsvTable.maxCols + 30)).map { "c\($0)" }.joined(separator: ",")
-        let (rows, truncated) = CsvTable.parse(wideRow)
+    func testRowCapReportsRowCountsAndSaysNothingAboutColumns() {
+        let (rows, truncation) = CsvTable.parse(grid(rows: CsvTable.maxRows + 500, columns: 3))
+        XCTAssertEqual(rows.count, CsvTable.maxRows)
+        XCTAssertTrue(truncation.rowsTruncated)
+        XCTAssertFalse(truncation.columnsTruncated)
+        XCTAssertEqual(truncation.totalRows, CsvTable.maxRows + 500)
+        XCTAssertEqual(truncation.displayedRows, CsvTable.maxRows)
+        XCTAssertEqual(truncation.totalColumns, 3)
+        XCTAssertEqual(truncation.displayedColumns, 3)
+        XCTAssertEqual(
+            truncation.noticeText,
+            "Showing the first \(CsvTable.maxRows) of \(CsvTable.maxRows + 500) rows "
+                + "(preview caps at \(CsvTable.maxRows) rows)."
+        )
+    }
+
+    func testColumnCapReportsColumnCountsAndNeverImpliesMissingRows() {
+        let (rows, truncation) = CsvTable.parse(grid(rows: 4, columns: CsvTable.maxCols + 30))
+        XCTAssertEqual(rows.count, 4)
         XCTAssertEqual(rows.first?.count, CsvTable.maxCols)
-        XCTAssertTrue(truncated)
+        XCTAssertFalse(truncation.rowsTruncated)
+        XCTAssertTrue(truncation.columnsTruncated)
+        XCTAssertEqual(truncation.totalRows, 4)
+        XCTAssertEqual(truncation.displayedRows, 4)
+        XCTAssertEqual(truncation.totalColumns, CsvTable.maxCols + 30)
+        XCTAssertEqual(truncation.displayedColumns, CsvTable.maxCols)
+        // Every row is on screen: the notice must not mention rows or the row
+        // cap at all, which is what the old single-flag wording always did.
+        XCTAssertEqual(
+            truncation.noticeText,
+            "Showing the first \(CsvTable.maxCols) of \(CsvTable.maxCols + 30) columns "
+                + "(preview caps at \(CsvTable.maxCols) columns)."
+        )
+        XCTAssertFalse(truncation.noticeText?.contains("rows") ?? true)
+    }
+
+    func testBothCapsReportEachDimensionSeparately() {
+        let (rows, truncation) = CsvTable.parse(
+            grid(rows: CsvTable.maxRows + 7, columns: CsvTable.maxCols + 5)
+        )
+        XCTAssertEqual(rows.count, CsvTable.maxRows)
+        XCTAssertEqual(rows.first?.count, CsvTable.maxCols)
+        XCTAssertTrue(truncation.rowsTruncated)
+        XCTAssertTrue(truncation.columnsTruncated)
+        XCTAssertEqual(truncation.totalRows, CsvTable.maxRows + 7)
+        XCTAssertEqual(truncation.totalColumns, CsvTable.maxCols + 5)
+        XCTAssertEqual(
+            truncation.noticeText,
+            "Showing the first \(CsvTable.maxRows) of \(CsvTable.maxRows + 7) rows "
+                + "and the first \(CsvTable.maxCols) of \(CsvTable.maxCols + 5) columns "
+                + "(preview caps at \(CsvTable.maxRows) rows × \(CsvTable.maxCols) columns)."
+        )
+    }
+
+    func testExactCapBoundaryIsNotTruncated() {
+        let (rows, truncation) = CsvTable.parse(
+            grid(rows: CsvTable.maxRows, columns: CsvTable.maxCols)
+        )
+        XCTAssertEqual(rows.count, CsvTable.maxRows)
+        XCTAssertEqual(rows.first?.count, CsvTable.maxCols)
+        XCTAssertFalse(truncation.isTruncated)
+        XCTAssertEqual(truncation.totalRows, CsvTable.maxRows)
+        XCTAssertEqual(truncation.totalColumns, CsvTable.maxCols)
+        XCTAssertNil(truncation.noticeText)
+    }
+
+    func testWideRowPastTheRowCapDoesNotClaimMissingColumns() {
+        // The wide record is dropped whole by the row cap, so the table really
+        // does show every column it has; only the row count was cut.
+        let wideTail = (0..<(CsvTable.maxCols + 10)).map { "w\($0)" }.joined(separator: ",")
+        let (_, truncation) = CsvTable.parse(
+            grid(rows: CsvTable.maxRows, columns: 3) + "\n" + wideTail
+        )
+        XCTAssertTrue(truncation.rowsTruncated)
+        XCTAssertFalse(truncation.columnsTruncated)
+        XCTAssertEqual(truncation.totalRows, CsvTable.maxRows + 1)
+        XCTAssertEqual(truncation.totalColumns, 3)
+        XCTAssertEqual(truncation.displayedColumns, 3)
     }
 
     func testWithinCapsIsNotTruncated() {
         let text = (0..<10).map { "\($0),x,y" }.joined(separator: "\n")
-        let (rows, truncated) = CsvTable.parse(text)
+        let (rows, truncation) = CsvTable.parse(text)
         XCTAssertEqual(rows.count, 10)
-        XCTAssertFalse(truncated)
+        XCTAssertFalse(truncation.isTruncated)
+        XCTAssertNil(truncation.noticeText)
+    }
+
+    func testRaggedRowsReportTheWidestRowAsTheColumnCount() {
+        let (_, truncation) = CsvTable.parse("a\nb,c,d\ne,f")
+        XCTAssertEqual(truncation.totalRows, 3)
+        XCTAssertEqual(truncation.totalColumns, 3)
+        XCTAssertEqual(truncation.displayedColumns, 3)
+        XCTAssertFalse(truncation.isTruncated)
     }
 
     // MARK: - Delimiter detection
@@ -256,7 +340,7 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertEqual(parseCount, 1)
         XCTAssertEqual(first, second)
         XCTAssertEqual(first.rows.count, 300)
-        XCTAssertFalse(first.truncated)
+        XCTAssertFalse(first.truncation.isTruncated)
     }
 
     func testCsvPreviewModelColumnWidthsFitTheLongestCellWithinBounds() {
@@ -269,9 +353,18 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertEqual(model.columnWidths[1], CsvPreviewModel.maximumColumnWidth)
     }
 
-    func testCsvPreviewModelCarriesTheTruncationFlag() {
-        let text = (0..<(CsvTable.maxRows + 10)).map(String.init).joined(separator: "\n")
-        XCTAssertTrue(CsvPreviewModel.make(text).truncated)
+    func testCsvPreviewModelCarriesPerDimensionTruncation() {
+        let rowCapped = CsvPreviewModel.make(grid(rows: CsvTable.maxRows + 10, columns: 2))
+        XCTAssertTrue(rowCapped.truncation.rowsTruncated)
+        XCTAssertFalse(rowCapped.truncation.columnsTruncated)
+        XCTAssertEqual(rowCapped.truncation.totalRows, CsvTable.maxRows + 10)
+
+        let columnCapped = CsvPreviewModel.make(grid(rows: 3, columns: CsvTable.maxCols + 8))
+        XCTAssertFalse(columnCapped.truncation.rowsTruncated)
+        XCTAssertTrue(columnCapped.truncation.columnsTruncated)
+        XCTAssertEqual(columnCapped.truncation.totalColumns, CsvTable.maxCols + 8)
+        // The rendered grid is exactly as wide as the notice claims.
+        XCTAssertEqual(columnCapped.columnWidths.count, columnCapped.truncation.displayedColumns)
     }
 
     func testJsonPreviewOutcomeIsBuiltOncePerContentIdentity() async {
@@ -335,7 +428,7 @@ final class DataPreviewsTests: XCTestCase {
         let csvElapsed = csvStart.duration(to: .now)
         _ = await csvCache.value(for: csv, parse: CsvPreviewModel.make)
         let csvParseCount = await csvCache.parseCount
-        XCTAssertTrue(csvModel.truncated)
+        XCTAssertTrue(csvModel.truncation.rowsTruncated)
         XCTAssertEqual(csvParseCount, 1)
         XCTAssertLessThan(csvElapsed, .seconds(3.5))
 

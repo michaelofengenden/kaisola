@@ -850,12 +850,12 @@ private struct PreviewMappingsExtensionEditor: View {
                         if let message = item.validationMessage {
                             Text(message)
                                 .font(.callout)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                         }
                         if let recoveryURL = snapshot.state.preservedCopyURL {
                             Text(recoveryURL.path)
                                 .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .textSelection(.enabled)
                                 .lineLimit(2)
                                 .accessibilityLabel("Preview mapping recovery copy \(recoveryURL.lastPathComponent)")

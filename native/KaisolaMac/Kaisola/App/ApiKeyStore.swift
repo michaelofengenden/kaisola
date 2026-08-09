@@ -86,7 +86,7 @@ struct ApiKeyStore {
             return
         }
         guard let data = trimmed.data(using: .utf8) else {
-            throw error(errSecParam, "Could not encode the \(key.title) key.")
+            throw Self.keychainError(errSecParam, message: "Could not encode the \(key.title) key.")
         }
 
         let attributes: [String: Any] = [
@@ -101,7 +101,10 @@ struct ApiKeyStore {
             status = SecItemAdd(addQuery as CFDictionary, nil)
         }
         guard status == errSecSuccess else {
-            throw error(status, "Could not save the \(key.title) key to the Keychain.")
+            throw Self.keychainError(
+                status,
+                message: "Could not save the \(key.title) key to the Keychain."
+            )
         }
     }
 
@@ -124,7 +127,10 @@ struct ApiKeyStore {
         ]
     }
 
-    private func error(_ status: OSStatus, _ message: String) -> NSError {
+    /// Convert an OSStatus into the stable, secret-free error contract used by
+    /// Settings and by the required signed Keychain boundary lane. The caller
+    /// supplies only an operation/provider description, never the key value.
+    static func keychainError(_ status: OSStatus, message: String) -> NSError {
         let detail = SecCopyErrorMessageString(status, nil).map { $0 as String } ?? "OSStatus \(status)"
         return NSError(
             domain: ApiKeyStore.defaultService,

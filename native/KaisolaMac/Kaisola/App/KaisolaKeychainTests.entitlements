@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Test-host only. The dedicated workflow applies this to an ad-hoc copy
+         in private DerivedData; production signing remains unchanged. -->
+    <key>com.apple.application-identifier</key>
+    <string>com.kaisola.mac</string>
+    <key>keychain-access-groups</key>
+    <array>
+        <string>com.kaisola.mac</string>
+    </array>
+</dict>
+</plist>

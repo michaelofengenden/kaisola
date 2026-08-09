@@ -1,0 +1,135 @@
+name: native-keychain-boundaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-keychain-boundaries.yml'
+      - 'native/KaisolaMac/Kaisola/App/ApiKeyStore.swift'
+      - 'native/KaisolaMac/Kaisola/App/KaisolaKeychainTests.entitlements'
+      - 'native/KaisolaMac/Kaisola/Companion/CompanionIdentityStore.swift'
+      - 'native/KaisolaMac/KaisolaTests/ApiKeyStoreTests.swift'
+      - 'scripts/native-keychain-boundary-receipt.cjs'
+      - 'tests/node/nativeKeychainBoundaryReceipt.test.cjs'
+  pull_request:
+    paths:
+      - '.github/workflows/native-keychain-boundaries.yml'
+      - 'native/KaisolaMac/Kaisola/App/ApiKeyStore.swift'
+      - 'native/KaisolaMac/Kaisola/App/KaisolaKeychainTests.entitlements'
+      - 'native/KaisolaMac/Kaisola/Companion/CompanionIdentityStore.swift'
+      - 'native/KaisolaMac/KaisolaTests/ApiKeyStoreTests.swift'
+      - 'scripts/native-keychain-boundary-receipt.cjs'
+      - 'tests/node/nativeKeychainBoundaryReceipt.test.cjs'
+
+permissions:
+  contents: read
+
+jobs:
+  keychain-boundaries:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install exact Node dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+        env:
+          KAISOLA_SKIP_NATIVE_REBUILD: '1'
+      - name: Test the fail-closed Keychain receipt
+        run: node --test tests/node/nativeKeychainBoundaryReceipt.test.cjs
+      - name: Prepare private boundary paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Data-protection Keychain items are per user and are not redirected
+          # by `security default-keychain`. Require GitHub's one-job fresh VM
+          # instead of pretending a throwaway legacy file Keychain isolates it.
+          test "${RUNNER_ENVIRONMENT:-}" = github-hosted
+          test "${RUNNER_OS:-}" = macOS
+          test "${RUNNER_ARCH:-}" = ARM64
+          BOUNDARY_ROOT="$RUNNER_TEMP/kaisola-keychain-boundary"
+          mkdir -m 700 -p "$BOUNDARY_ROOT"
+          printf 'KAISOLA_KEYCHAIN_BOUNDARY_ROOT=%s\n' "$BOUNDARY_ROOT" >> "$GITHUB_ENV"
+          printf 'KAISOLA_KEYCHAIN_DERIVED_DATA=%s/DerivedData\n' "$BOUNDARY_ROOT" >> "$GITHUB_ENV"
+          printf 'KAISOLA_KEYCHAIN_RESULT=%s/KaisolaKeychain.xcresult\n' "$BOUNDARY_ROOT" >> "$GITHUB_ENV"
+      - name: Compile an arm64 signed test host
+        run: >-
+          xcodebuild
+          -project native/KaisolaMac/KaisolaMac.xcodeproj
+          -scheme Kaisola
+          -configuration Debug
+          -destination 'platform=macOS,arch=arm64'
+          -derivedDataPath "$KAISOLA_KEYCHAIN_DERIVED_DATA"
+          ARCHS=arm64
+          ONLY_ACTIVE_ARCH=YES
+          CODE_SIGNING_ALLOWED=YES
+          CODE_SIGN_STYLE=Manual
+          CODE_SIGN_IDENTITY=-
+          build-for-testing
+      - name: Run and seal isolated entitled Keychain boundaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          APP="$KAISOLA_KEYCHAIN_DERIVED_DATA/Build/Products/Debug/Kaisola.app"
+          RECEIPT="$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/keychain-boundary-receipt.json"
+
+          # build-for-testing leaves nested SwiftPM/XCTest code linker-signed.
+          # Re-seal that graph before applying the test-only host entitlement;
+          # otherwise the outer signature is invalid as soon as it is replaced.
+          codesign --force --deep --sign - --entitlements \
+            native/KaisolaMac/Kaisola/App/KaisolaKeychainTests.entitlements \
+            "$APP"
+          codesign --verify --deep --strict "$APP"
+          codesign -dv --verbose=4 "$APP" \
+            2> "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/signature.txt"
+          codesign -d --entitlements :- "$APP" \
+            > "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/entitlements.plist" 2>/dev/null
+          plutil -convert json -o "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/entitlements.json" \
+            "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/entitlements.plist"
+
+          xcodebuild \
+            -project native/KaisolaMac/KaisolaMac.xcodeproj \
+            -scheme Kaisola \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$KAISOLA_KEYCHAIN_DERIVED_DATA" \
+            -resultBundlePath "$KAISOLA_KEYCHAIN_RESULT" \
+            -only-testing:KaisolaTests/KeychainBoundaryTests \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY=- \
+            TEST_RUNNER_KAISOLA_REQUIRE_KEYCHAIN_BOUNDARIES=1 \
+            TEST_RUNNER_KAISOLA_KEYCHAIN_BOUNDARY_ISOLATION=github-hosted-ephemeral-vm \
+            test-without-building
+
+          xcrun xcresulttool get test-results summary \
+            --path "$KAISOLA_KEYCHAIN_RESULT" --compact \
+            > "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/summary.json"
+          xcrun xcresulttool get test-results tests \
+            --path "$KAISOLA_KEYCHAIN_RESULT" --compact \
+            > "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/tests.json"
+          node scripts/native-keychain-boundary-receipt.cjs seal \
+            --summary "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/summary.json" \
+            --tests "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/tests.json" \
+            --signature "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/signature.txt" \
+            --entitlements "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/entitlements.json" \
+            --keychain-isolation github-hosted-ephemeral-vm \
+            --cleanup-verified true \
+            --output "$RECEIPT"
+      - name: Upload redacted Keychain receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-keychain-boundary-receipt
+          path: ${{ runner.temp }}/kaisola-keychain-boundary/keychain-boundary-receipt.json
+          if-no-files-found: error
+          retention-days: 14

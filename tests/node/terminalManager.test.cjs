@@ -316,3 +316,85 @@ test('spool hot cache lives only while observed', async (t) => {
   manager.unsubscribeSubscriberPrefix('window-b|')
   assert.equal(record.spool.visible, false)
 })
+
+// Each of these awaits a promise that a broken cancel/cap/bound path would
+// leave pending forever, so they carry an explicit timeout: the failure mode
+// under test is a wait that never ends.
+test('an exit wait is owned by its client and leaves when that client does', { timeout: 10_000 }, async (t) => {
+  const id = 'exit-wait-follows-its-client'
+  assert.ok(manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+  t.after(() => manager.release(id))
+
+  const gone = manager.waitForExit(id, { owner: 'window-a|3|kaisola' })
+  const repeat = manager.waitForExit(id, { owner: 'window-a|3|kaisola' })
+  const survivor = manager.waitForExit(id, { owner: 'window-b|3|kaisola' })
+  assert.equal(repeat, gone, 'one client asking twice shares a single resolver')
+  assert.equal(__test.exitWaiterCount(id), 2)
+
+  assert.equal(manager.cancelExitWaitersPrefix('window-a|'), 1)
+  assert.equal(__test.exitWaiterCount(id), 1, 'a departed client keeps no closure')
+  await assert.rejects(gone, /terminal exit wait cancelled/)
+
+  // Cancelling one client must not disturb the terminal or anyone else's wait.
+  manager.kill(id)
+  const status = await survivor
+  assert.equal(Number.isInteger(status.exitCode), true)
+  assert.equal(__test.exitWaiterCount(id), 0)
+  assert.equal(manager.cancelExitWaiters(id, 'window-b|3|kaisola'), 0)
+})
+
+test('a terminal caps its exit waiters and answers every retained one on release', { timeout: 10_000 }, async (t) => {
+  const id = 'exit-wait-cap'
+  assert.ok(manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+  t.after(() => manager.release(id))
+
+  const waits = []
+  for (let index = 0; index < __test.MAX_EXIT_WAITERS; index += 1) {
+    waits.push(manager.waitForExit(id, { owner: `window-flood|${index}|kaisola` }))
+  }
+  assert.equal(__test.exitWaiterCount(id), __test.MAX_EXIT_WAITERS)
+
+  await assert.rejects(
+    manager.waitForExit(id, { owner: 'window-flood|overflow|kaisola' }),
+    /too many terminal exit waiters/,
+  )
+  assert.equal(__test.exitWaiterCount(id), __test.MAX_EXIT_WAITERS, 'a refused wait adds nothing')
+
+  // Release deletes the record, so its pty exit can never answer these: they
+  // must fail now instead of staying pending for the broker's lifetime.
+  manager.release(id)
+  const settled = await Promise.allSettled(waits)
+  assert.deepEqual(
+    [...new Set(settled.map((result) => `${result.status}:${result.reason?.message ?? ''}`))],
+    ['rejected:Terminal is no longer available.'],
+  )
+  assert.equal(__test.exitWaiterCount(id), 0)
+})
+
+test('an exit wait accepts a bound and drops itself when the bound expires', { timeout: 10_000 }, async (t) => {
+  const id = 'exit-wait-bound'
+  assert.ok(manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+  t.after(() => manager.release(id))
+
+  await assert.rejects(
+    manager.waitForExit(id, { owner: 'window-c|3|kaisola', timeoutMs: 25 }),
+    /terminal exit wait timed out/,
+  )
+  assert.equal(__test.exitWaiterCount(id), 0, 'an expired wait leaves nothing behind')
+  assert.equal(manager.diagnostics().find((row) => row.id === id)?.exitWaiterCount, 0)
+})

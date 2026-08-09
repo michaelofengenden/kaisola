@@ -78,6 +78,17 @@ const FLUSH_CAP = 65_536 // a burst bigger than this flushes immediately
 const OBSERVER_CHUNK_BYTES = 64 * 1024
 const AGENT_QUIET_MS = 4500
 const CWD_REFRESH_COALESCE_MS = 250
+// An exit wait lives as long as the pty it watches, which for a dev server is
+// hours. Every waiter therefore carries the owner key that asked for it, so a
+// dropped socket can drop its closures, and one terminal holds at most this
+// many: a reconnect-looping or abusive client must not be able to pin an
+// unbounded list of resolvers to a long-running terminal.
+const MAX_EXIT_WAITERS = 32
+// A caller may bound its own wait; this clamps that bound, because setTimeout
+// fires IMMEDIATELY past 2^31-1 ms and a wild timeoutMs would then read as an
+// instant timeout. Unbounded stays the default: a wait is how the agent learns
+// a command finished, and cutting it short would report a false non-exit.
+const MAX_EXIT_WAIT_MS = 6 * 60 * 60 * 1_000
 
 /** main.cjs calls this on app focus/blur — the stream profile follows. */
 function setAppFocused(focused) {
@@ -546,8 +557,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       offset: rec.cursor.nextOffset,
       exitStatus: rec.exitStatus,
     }, { streamEpoch: rec.cursor.streamEpoch, endOffset: rec.cursor.nextOffset })
-    rec.waiters.forEach((w) => w(rec.exitStatus))
-    rec.waiters = []
+    resolveExitWaiters(rec, rec.exitStatus)
   })
   terms.set(id, rec)
   if (missingCwd) {
@@ -802,11 +812,106 @@ function unsubscribeSubscriberPrefix(prefix) {
   return removed
 }
 
-function waitForExit(id) {
+function disarmExitWaiter(entry) {
+  if (entry.timer) clearTimeout(entry.timer)
+  entry.timer = null
+  return entry
+}
+
+/** Take the whole waiter list off a record so a settle can never run twice. */
+function takeExitWaiters(record) {
+  const entries = record.waiters
+  record.waiters = []
+  return entries.map(disarmExitWaiter)
+}
+
+function resolveExitWaiters(record, exitStatus) {
+  for (const entry of takeExitWaiters(record)) entry.resolve(exitStatus)
+}
+
+/** A wait that can no longer be answered is rejected, never left pending: the
+ * caller's request must fail loudly instead of hanging on a dead terminal. */
+function rejectExitWaiters(entries, message) {
+  for (const entry of entries) entry.reject(new Error(message))
+  return entries.length
+}
+
+function dropExitWaiter(record, entry) {
+  const index = record.waiters.indexOf(entry)
+  if (index >= 0) record.waiters.splice(index, 1)
+  disarmExitWaiter(entry)
+}
+
+/** Reject and forget every waiter a predicate matches. The terminal itself is
+ * untouched: a client leaving says nothing about the command it was watching. */
+function cancelMatchingExitWaiters(record, matches) {
+  const kept = []
+  const cancelled = []
+  for (const entry of record.waiters) {
+    if (matches(entry)) cancelled.push(disarmExitWaiter(entry))
+    else kept.push(entry)
+  }
+  record.waiters = kept
+  return rejectExitWaiters(cancelled, 'terminal exit wait cancelled')
+}
+
+/**
+ * Await a terminal's exit status. `owner` is the requesting client's capability
+ * key: one client asking twice for the same terminal shares a single resolver
+ * (and the first ask's bound), and cancelExitWaiters[Prefix]() can drop that
+ * closure when the client goes away. `timeoutMs` bounds one wait; without it the
+ * wait lasts as long as the pty, which is the right answer for a command that
+ * legitimately runs for hours.
+ */
+function waitForExit(id, { owner = null, timeoutMs = null } = {}) {
   const r = terms.get(id)
   if (!r) return Promise.reject(new Error('Terminal is no longer available.'))
   if (r.exited) return Promise.resolve(r.exitStatus)
-  return new Promise((resolve) => r.waiters.push(resolve))
+  const key = senderId(owner)
+  const existing = key ? r.waiters.find((entry) => entry.owner === key) : null
+  if (existing) return existing.promise
+  if (r.waiters.length >= MAX_EXIT_WAITERS) {
+    return Promise.reject(new Error('too many terminal exit waiters'))
+  }
+  const entry = { owner: key, resolve: null, reject: null, timer: null, promise: null }
+  entry.promise = new Promise((resolve, reject) => {
+    entry.resolve = resolve
+    entry.reject = reject
+  })
+  const bound = Number(timeoutMs)
+  if (Number.isFinite(bound) && bound > 0) {
+    entry.timer = setTimeout(() => {
+      dropExitWaiter(r, entry)
+      entry.reject(new Error('terminal exit wait timed out'))
+    }, Math.min(bound, MAX_EXIT_WAIT_MS))
+    entry.timer.unref?.()
+  }
+  r.waiters.push(entry)
+  return entry.promise
+}
+
+function exitWaiterCount(id) {
+  return terms.get(id)?.waiters.length ?? 0
+}
+
+/** Cancel one owner's pending waits on one terminal. */
+function cancelExitWaiters(id, owner) {
+  const r = terms.get(id)
+  const key = senderId(owner)
+  if (!r || !key) return 0
+  return cancelMatchingExitWaiters(r, (entry) => entry.owner === key)
+}
+
+/** Broker socket loss: every wait owned by that app instance is unanswerable,
+ * so the closures go with the connection instead of outliving it on a pty that
+ * may keep running for hours. */
+function cancelExitWaitersPrefix(prefix) {
+  if (!prefix) return 0
+  let cancelled = 0
+  for (const r of terms.values()) {
+    cancelled += cancelMatchingExitWaiters(r, (entry) => entry.owner.startsWith(prefix))
+  }
+  return cancelled
 }
 
 function kill(id) {
@@ -829,6 +934,8 @@ function release(id) {
   kill(id)
   r?.spool.close({ remove: true })
   terms.delete(id)
+  // The record is gone, so its pty exit can no longer reach these resolvers.
+  if (r) rejectExitWaiters(takeExitWaiters(r), 'Terminal is no longer available.')
 }
 
 /** Broker-owned close grace survives renderer crashes, appearance swaps, and
@@ -927,6 +1034,7 @@ function killAll() {
     // App quit is not a user close: retain the spool so persisted terminal
     // records can restore their previous scrollback on next launch.
     r.spool.close()
+    rejectExitWaiters(takeExitWaiters(r), 'Terminal is no longer available.')
   }
   terms.clear()
   // terminal:run children are plain child_process, not ptys — reap them too, or
@@ -978,7 +1086,8 @@ function diagnostics() {
     endOffset: r.cursor.nextOffset,
     observerCount: r.observers.stats().subscribers,
     pausedObserverCount: r.observers.stats().paused,
+    exitWaiterCount: r.waiters.length,
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, parseLsofCwd, refreshTerminalCwds } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, parseLsofCwd, refreshTerminalCwds, exitWaiterCount, MAX_EXIT_WAITERS } }

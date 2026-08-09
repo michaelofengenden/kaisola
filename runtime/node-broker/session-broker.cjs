@@ -200,6 +200,9 @@ function detachInstance(instanceId) {
   if (!instanceId) return
   mgr.detachSenderPrefix(`${instanceId}|`)
   mgr.unsubscribeSubscriberPrefix(`${instanceId}|`)
+  // A pending exit wait can never be answered once the socket is gone, and the
+  // pty it watches may run for hours: drop those closures with the connection.
+  mgr.cancelExitWaitersPrefix(`${instanceId}|`)
   scheduleNoClientExit()
 }
 
@@ -495,7 +498,9 @@ async function dispatch(client, method, params = {}) {
     case 'terminal.waitForExit': {
       const id = terminalId()
       requireAllowed(id)
-      return await mgr.waitForExit(id)
+      // The owner key is the wait's identity: it collapses a client's repeat
+      // asks onto one resolver and is what a socket close cancels by prefix.
+      return await mgr.waitForExit(id, { owner, timeoutMs: params.timeoutMs })
     }
     case 'terminal.signal': {
       const id = terminalId()

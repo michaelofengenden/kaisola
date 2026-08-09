@@ -58,8 +58,6 @@ jobs:
         with:
           node-version: 22
           cache: npm
-      - name: Lint security-sensitive workflow checkouts
-        run: node --test tests/node/workflowSecurity.test.cjs
       - name: Record Apple toolchain
         run: |
           swift --version
@@ -68,6 +66,8 @@ jobs:
         run: npm ci --prefer-offline --no-audit --no-fund
         env:
           KAISOLA_SKIP_NATIVE_REBUILD: '1'
+      - name: Lint security-sensitive workflow checkouts
+        run: node --test tests/node/workflowSecurity.test.cjs
       - name: Download checksum-pinned Node runtime
         run: node scripts/download-native-node-runtime.cjs arm64
       - name: Test native packaging, compatibility, and resource policies

@@ -765,7 +765,7 @@ struct ToolCallCard: View {
 
     private var statusColor: Color {
         switch call.status {
-        case .pending, .inProgress: .secondary
+        case .pending, .inProgress: .kaisolaSecondary
         case .completed: .green
         case .failed: .red
         }
@@ -838,29 +838,117 @@ private struct ToolTextArtifact: View {
 
 /// Live output of an agent-spawned terminal inside a tool card: polls the
 /// AcpTerminalHost snapshot until the process exits.
+@MainActor
+final class AcpTerminalContentModel: ObservableObject {
+    enum Status: Equatable {
+        case running
+        case exited(String)
+        case unavailable
+
+        var label: String {
+            switch self {
+            case .running: "Running…"
+            case let .exited(label): label
+            case .unavailable: "Terminal output unavailable"
+            }
+        }
+    }
+
+    @Published private(set) var output = ""
+    @Published private(set) var outputIsTruncated = false
+    @Published private(set) var status: Status = .running
+
+    private let pollIntervalNanoseconds: UInt64
+    private var activeTerminalID: String?
+    private var pollGeneration: UInt64 = 0
+
+    init(pollIntervalNanoseconds: UInt64 = 700_000_000) {
+        self.pollIntervalNanoseconds = pollIntervalNanoseconds
+    }
+
+    func poll(
+        terminalID: String,
+        snapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
+    ) async {
+        pollGeneration &+= 1
+        let generation = pollGeneration
+        if activeTerminalID != terminalID {
+            activeTerminalID = terminalID
+            output = ""
+            outputIsTruncated = false
+        }
+        status = .running
+
+        while !Task.isCancelled {
+            let next = await snapshot?(terminalID)
+            guard !Task.isCancelled, pollGeneration == generation else { return }
+            guard let next else {
+                status = .unavailable
+                return
+            }
+
+            let bounded = AcpChatRendering.bounded(
+                next.output,
+                characterLimit: AcpChatRendering.toolCharacterLimit,
+                lineLimit: AcpChatRendering.toolLineLimit
+            )
+            output = bounded.text
+            outputIsTruncated = next.truncated || bounded.isTruncated
+            if let exitStatus = next.exitStatus {
+                status = .exited(
+                    exitStatus.exitCode.map { "Exited (\($0))" }
+                        ?? exitStatus.signal.map { "Killed (\($0))" }
+                        ?? "Exited"
+                )
+                return
+            }
+
+            if pollIntervalNanoseconds == 0 {
+                await Task.yield()
+            } else {
+                do {
+                    try await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    /// Invalidates an in-flight provider call that may ignore task cancellation.
+    func invalidate() {
+        pollGeneration &+= 1
+    }
+}
+
 struct TerminalContentView: View {
     let terminalID: String
     var snapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
-    @State private var output = ""
-    @State private var outputIsTruncated = false
-    @State private var exitText: String?
+    @StateObject private var model = AcpTerminalContentModel()
+    @State private var retryGeneration: UInt64 = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Image(systemName: "terminal").font(.caption2)
-                Text(exitText ?? "Running…").font(.caption2)
+                Text(model.status.label).font(.caption2)
                 Spacer()
+                if model.status == .unavailable {
+                    Button {
+                        retryGeneration &+= 1
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2.weight(.semibold))
+                    .help("Try to load this terminal's output again")
+                }
             }
-            .foregroundStyle(
-                exitText == nil
-                    ? KaisolaStatusTone.working.foregroundColor
-                    : Color.kaisolaSecondary
-            )
+            .foregroundStyle(statusColor)
             .padding(.horizontal, 8).padding(.vertical, 5)
             .background(.quaternary.opacity(0.6))
             ScrollView {
-                Text(output.isEmpty ? " " : output)
+                Text(model.output.isEmpty ? " " : model.output)
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -868,7 +956,15 @@ struct TerminalContentView: View {
             }
             .frame(maxHeight: 180)
             .background(.black.opacity(0.18))
-            if outputIsTruncated {
+            if model.status == .unavailable {
+                Text("No snapshot was returned for \(terminalID). The terminal may have been released or its output evicted.")
+                    .font(.caption2)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+            }
+            if model.outputIsTruncated {
                 Text("Earlier terminal output truncated in this view")
                     .font(.caption2)
                     .foregroundStyle(.kaisolaSecondary)
@@ -878,25 +974,25 @@ struct TerminalContentView: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
-        .task(id: terminalID) {
-            while !Task.isCancelled {
-                guard let snap = await snapshot?(terminalID) else { break }
-                let bounded = AcpChatRendering.bounded(
-                    snap.output,
-                    characterLimit: AcpChatRendering.toolCharacterLimit,
-                    lineLimit: AcpChatRendering.toolLineLimit
-                )
-                output = bounded.text
-                outputIsTruncated = bounded.isTruncated
-                if let status = snap.exitStatus {
-                    exitText = status.exitCode.map { "Exited (\($0))" }
-                        ?? status.signal.map { "Killed (\($0))" }
-                        ?? "Exited"
-                    break
-                }
-                try? await Task.sleep(nanoseconds: 700_000_000)
-            }
+        .task(id: PollIdentity(terminalID: terminalID, retryGeneration: retryGeneration)) {
+            await model.poll(terminalID: terminalID, snapshot: snapshot)
         }
+        .onDisappear {
+            model.invalidate()
+        }
+    }
+
+    private var statusColor: Color {
+        switch model.status {
+        case .running: KaisolaStatusTone.working.foregroundColor
+        case .unavailable: KaisolaStatusTone.needsYou.foregroundColor
+        case .exited: .kaisolaSecondary
+        }
+    }
+
+    private struct PollIdentity: Hashable {
+        let terminalID: String
+        let retryGeneration: UInt64
     }
 }
 

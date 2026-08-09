@@ -307,15 +307,22 @@ struct ProjectAccountsSection: View {
             return
         }
         let expanded = (resolved as NSString).expandingTildeInPath
-        if usageProfiles.contains(where: {
-            $0.provider == newProvider && $0.expandedDirectory == expanded
-        }) {
-            accountError = "A \(newProvider.displayName) account already uses \(resolved)."
-            return
-        }
         guard expanded.hasPrefix("/"),
               !resolved.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains) else {
             accountError = "Enter an absolute directory or a path beginning with ~/."
+            return
+        }
+        // An alias is not a second subscription. Name the account the directory
+        // already belongs to, so a symlink or a `..` path reads as the collision
+        // it is rather than as an unexplained refusal.
+        if let existing = UsageAccountStore.existingProfile(
+            in: usageProfiles,
+            provider: newProvider,
+            directory: resolved
+        ) {
+            accountError = existing.directory == resolved
+                ? "A \(newProvider.displayName) account already uses \(resolved)."
+                : "\(resolved) is the same directory as “\(existing.label)” (\(existing.directory)). Kaisola keeps one account per credential directory."
             return
         }
         guard usageAccountStore.add(

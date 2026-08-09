@@ -176,6 +176,124 @@ final class AcpTranscriptStoreTests: XCTestCase {
         XCTAssertNil(restored)
     }
 
+    func testTombstoneVacuumWaitsForBufferedWriterAcknowledgement() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-writer-fence-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        let writerA = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "writer-a",
+            schedulesAutomaticFlush: false
+        )
+        let writerB = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "writer-b",
+            schedulesAutomaticFlush: false
+        )
+        let chatID = "buffered-writer-delete"
+        let staleMarker = "KAISOLA_BUFFERED_WRITER_SECRET_497_9B18C4"
+
+        await writerA.scheduleSave([.message(id: "1", text: "persisted")], for: chatID, now: 1)
+        await writerA.flush()
+        await writerB.scheduleSave(
+            [
+                .message(id: "1", text: "persisted"),
+                .message(id: "2", text: staleMarker),
+            ],
+            for: chatID,
+            now: 2
+        )
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM transcript_writers", databaseURL: databaseURL),
+            1,
+            "Only the store holding a buffered snapshot should retain a writer lease"
+        )
+
+        try await writerA.tombstone(chatID: chatID)
+        await writerA.remove(chatID: chatID)
+        await writerA.vacuumTombstones()
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM chats", databaseURL: databaseURL),
+            0
+        )
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM deleted_chats", databaseURL: databaseURL),
+            1,
+            "Vacuum must retain the marker while writer B can still flush its old generation"
+        )
+
+        await writerB.flush()
+        let restored = await writerB.entry(for: chatID)
+        XCTAssertNil(restored, "Writer B's delayed flush must not recreate the deleted chat")
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM transcript_rows", databaseURL: databaseURL),
+            0
+        )
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM deleted_chats", databaseURL: databaseURL),
+            0,
+            "The acknowledged writer generation makes the tombstone reclaimable"
+        )
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM transcript_writers", databaseURL: databaseURL),
+            0,
+            "A writer with no buffered snapshots must retire its durable lease"
+        )
+    }
+
+    func testExpiredWriterLeaseBoundsTombstonesWithoutAllowingStaleRecreation() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-expired-writer-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        let writerA = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "writer-a",
+            schedulesAutomaticFlush: false
+        )
+        let writerB = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "writer-b",
+            schedulesAutomaticFlush: false
+        )
+        let chatID = "expired-buffered-writer"
+
+        await writerA.scheduleSave([.message(id: "1", text: "persisted")], for: chatID, now: 1)
+        await writerA.flush()
+        await writerB.scheduleSave(
+            [.message(id: "2", text: "KAISOLA_EXPIRED_WRITER_SECRET_497_4D22A9")],
+            for: chatID,
+            now: 2
+        )
+        try await writerA.tombstone(chatID: chatID)
+        await writerA.remove(chatID: chatID)
+
+        // Deterministic crash/suspension simulation: advance reclamation past
+        // every bounded lease without sleeping in the test process.
+        await writerA.vacuumTombstones(now: Int64.max)
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM transcript_writers", databaseURL: databaseURL),
+            0
+        )
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM deleted_chats", databaseURL: databaseURL),
+            0,
+            "An expired writer cannot make tombstones grow indefinitely"
+        )
+
+        await writerB.flush()
+        let restored = await writerB.entry(for: chatID)
+        XCTAssertNil(
+            restored,
+            "A writer resuming after lease expiry must reject its stale captured generation"
+        )
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM transcript_rows", databaseURL: databaseURL),
+            0
+        )
+    }
+
     func testUsagePersistsBesideRowsAndSurvivesLaterTranscriptSave() async throws {
         let (store, directory) = temporaryStore()
         defer { try? FileManager.default.removeItem(at: directory) }

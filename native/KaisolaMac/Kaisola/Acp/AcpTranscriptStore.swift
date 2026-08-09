@@ -105,6 +105,10 @@ actor AcpTranscriptStore {
     static let maximumAttachmentCount = 8
     static let maximumAttachmentBytes = 20 * 1_048_576
     static let maximumLegacyArchiveBytes = 512 * 1_048_576
+    /// A crashed or suspended writer can delay reclamation only for this
+    /// bounded interval. Resuming after expiry is still safe: buffered writes
+    /// retain their captured deletion generation and fail closed if it moved.
+    static let writerLeaseDurationMilliseconds: Int64 = 5 * 60 * 1_000
     static let live: AcpTranscriptStore = {
         let environment = ProcessInfo.processInfo.environment
         let isXCTest = environment["XCTestConfigurationFilePath"] != nil
@@ -152,9 +156,13 @@ actor AcpTranscriptStore {
         var attachments: FieldChange<[AcpAttachment]> = .unchanged
         var sessionID: FieldChange<String> = .unchanged
         var updatedAt: Int64
+        var writerGeneration: Int64
+        var heldContinuousFence: Bool
 
-        init(updatedAt: Int64) {
+        init(updatedAt: Int64, writerGeneration: Int64, heldContinuousFence: Bool) {
             self.updatedAt = updatedAt
+            self.writerGeneration = writerGeneration
+            self.heldContinuousFence = heldContinuousFence
         }
     }
 
@@ -188,6 +196,10 @@ actor AcpTranscriptStore {
     private var flushTask: Task<Void, Never>?
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
+    private let writerID: String
+    private let schedulesAutomaticFlush: Bool
+    private var writerGeneration: Int64?
+    private var writerLeaseExpiresAt: Int64 = 0
 
     /// Compatibility initializer: callers hand us the v1 JSON path and the v2
     /// database is created beside it. The JSON remains untouched after a
@@ -196,11 +208,20 @@ actor AcpTranscriptStore {
         let legacy = fileURL.standardizedFileURL
         self.databaseURL = legacy.deletingPathExtension().appendingPathExtension("sqlite3")
         self.legacyJSONURL = legacy
+        self.writerID = UUID().uuidString
+        self.schedulesAutomaticFlush = true
     }
 
-    init(databaseURL: URL, legacyJSONURL: URL? = nil) {
+    init(
+        databaseURL: URL,
+        legacyJSONURL: URL? = nil,
+        writerID: String = UUID().uuidString,
+        schedulesAutomaticFlush: Bool = true
+    ) {
         self.databaseURL = databaseURL.standardizedFileURL
         self.legacyJSONURL = legacyJSONURL?.standardizedFileURL
+        self.writerID = writerID
+        self.schedulesAutomaticFlush = schedulesAutomaticFlush
     }
 
     /// Explicit full-history compatibility read. Product restoration uses
@@ -273,9 +294,16 @@ actor AcpTranscriptStore {
         guard Self.validChatID(chatID), startOrdinal >= 0,
               startOrdinal <= Int64.max - Int64(rows.count) else { return }
         let timestamp = Self.timestamp(now)
-        var write = pending[chatID] ?? PendingWrite(updatedAt: timestamp)
+        let fence = captureWriterFence()
+        var write = pending[chatID] ?? PendingWrite(
+            updatedAt: timestamp,
+            writerGeneration: fence.generation,
+            heldContinuousFence: fence.continuous
+        )
         write.rows = RowWrite(rows: rows, startOrdinal: startOrdinal)
         write.updatedAt = max(write.updatedAt, timestamp)
+        write.writerGeneration = min(write.writerGeneration, fence.generation)
+        write.heldContinuousFence = write.heldContinuousFence && fence.continuous
         pending[chatID] = write
         scheduleFlush()
     }
@@ -283,9 +311,16 @@ actor AcpTranscriptStore {
     func scheduleUsage(_ usage: AcpPersistedUsage, for chatID: String, now: Int64? = nil) {
         guard Self.validChatID(chatID) else { return }
         let timestamp = Self.timestamp(now)
-        var write = pending[chatID] ?? PendingWrite(updatedAt: timestamp)
+        let fence = captureWriterFence()
+        var write = pending[chatID] ?? PendingWrite(
+            updatedAt: timestamp,
+            writerGeneration: fence.generation,
+            heldContinuousFence: fence.continuous
+        )
         write.usage = .set(usage)
         write.updatedAt = max(write.updatedAt, timestamp)
+        write.writerGeneration = min(write.writerGeneration, fence.generation)
+        write.heldContinuousFence = write.heldContinuousFence && fence.continuous
         pending[chatID] = write
         scheduleFlush()
     }
@@ -294,9 +329,16 @@ actor AcpTranscriptStore {
         guard Self.validChatID(chatID),
               draft.lengthOfBytes(using: .utf8) <= Self.maximumDraftBytes else { return }
         let timestamp = Self.timestamp(now)
-        var write = pending[chatID] ?? PendingWrite(updatedAt: timestamp)
+        let fence = captureWriterFence()
+        var write = pending[chatID] ?? PendingWrite(
+            updatedAt: timestamp,
+            writerGeneration: fence.generation,
+            heldContinuousFence: fence.continuous
+        )
         write.draft = .set(draft.isEmpty ? nil : draft)
         write.updatedAt = max(write.updatedAt, timestamp)
+        write.writerGeneration = min(write.writerGeneration, fence.generation)
+        write.heldContinuousFence = write.heldContinuousFence && fence.continuous
         pending[chatID] = write
         scheduleFlush()
     }
@@ -308,9 +350,16 @@ actor AcpTranscriptStore {
     ) {
         guard Self.validChatID(chatID), Self.attachmentsAreBounded(attachments) else { return }
         let timestamp = Self.timestamp(now)
-        var write = pending[chatID] ?? PendingWrite(updatedAt: timestamp)
+        let fence = captureWriterFence()
+        var write = pending[chatID] ?? PendingWrite(
+            updatedAt: timestamp,
+            writerGeneration: fence.generation,
+            heldContinuousFence: fence.continuous
+        )
         write.attachments = .set(attachments.isEmpty ? nil : attachments)
         write.updatedAt = max(write.updatedAt, timestamp)
+        write.writerGeneration = min(write.writerGeneration, fence.generation)
+        write.heldContinuousFence = write.heldContinuousFence && fence.continuous
         pending[chatID] = write
         scheduleFlush()
     }
@@ -320,9 +369,16 @@ actor AcpTranscriptStore {
         let normalized = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard normalized?.lengthOfBytes(using: .utf8) ?? 0 <= 4_096 else { return }
         let timestamp = Self.timestamp(now)
-        var write = pending[chatID] ?? PendingWrite(updatedAt: timestamp)
+        let fence = captureWriterFence()
+        var write = pending[chatID] ?? PendingWrite(
+            updatedAt: timestamp,
+            writerGeneration: fence.generation,
+            heldContinuousFence: fence.continuous
+        )
         write.sessionID = .set(normalized?.isEmpty == false ? normalized : nil)
         write.updatedAt = max(write.updatedAt, timestamp)
+        write.writerGeneration = min(write.writerGeneration, fence.generation)
+        write.heldContinuousFence = write.heldContinuousFence && fence.continuous
         pending[chatID] = write
         scheduleFlush()
     }
@@ -364,11 +420,49 @@ actor AcpTranscriptStore {
     }
 
     private func scheduleFlush() {
+        guard schedulesAutomaticFlush else { return }
         flushTask?.cancel()
         flushTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
             await self?.flush()
+        }
+    }
+
+    /// Capture the generation under a durable lease before any snapshot enters
+    /// the in-memory coalescing queue. If the database cannot establish that
+    /// fence, generation -1 makes the eventual flush fail closed.
+    private func captureWriterFence() -> (generation: Int64, continuous: Bool) {
+        let now = Self.timestamp(nil)
+        if let writerGeneration, writerLeaseExpiresAt > now {
+            return (writerGeneration, true)
+        }
+        do {
+            let database = try openDatabase()
+            let generation: Int64
+            if let writerGeneration {
+                generation = writerGeneration
+            } else {
+                generation = try currentDeletionGeneration(database)
+            }
+            var wasLive = false
+            try transaction(database) {
+                let current = try currentDeletionGeneration(database)
+                wasLive = try writerLeaseIsLive(now: now, database: database)
+                try upsertWriterLease(
+                    acknowledgedGeneration: generation,
+                    now: now,
+                    database: database
+                )
+                writerLeaseExpiresAt = Self.writerLeaseDeadline(after: now)
+                // A newly registered writer starts a continuous fence only
+                // when no deletion generation elapsed while it was absent.
+                if generation == current { wasLive = true }
+            }
+            writerGeneration = generation
+            return (generation, wasLive)
+        } catch {
+            return (-1, false)
         }
     }
 
@@ -382,8 +476,14 @@ actor AcpTranscriptStore {
                     try bind(chatID, at: 1, statement: $0, database: database)
                     try stepDone($0, database: database)
                 }
+                if pending.isEmpty {
+                    try retireWriter(database)
+                }
+                try expireWriterLeases(now: Self.timestamp(nil), database: database)
+                try reclaimEligibleTombstones(database)
                 try setMetadataValue("1", for: "v2_has_written", database: database)
             }
+            if pending.isEmpty { writerLeaseExpiresAt = 0 }
         } catch {
             // Explicit removal remains retryable by the caller's durable model.
         }
@@ -399,24 +499,38 @@ actor AcpTranscriptStore {
         guard Self.validChatID(chatID) else { return }
         pending.removeValue(forKey: chatID)
         let database = try openDatabase()
+        let now = Self.timestamp(nil)
+        var deletionGeneration: Int64 = 0
         try transaction(database) {
-            try execute(
-                """
-                CREATE TABLE IF NOT EXISTS deleted_chats (
-                    chat_id TEXT PRIMARY KEY NOT NULL,
-                    deleted_at INTEGER NOT NULL
-                ) WITHOUT ROWID
-                """,
-                database: database
-            )
+            try ensureDeletedChatsTable(database)
+            deletionGeneration = try nextDeletionGeneration(database)
             try withStatement(
-                "INSERT OR REPLACE INTO deleted_chats(chat_id, deleted_at) VALUES (?, ?)",
+                """
+                INSERT OR REPLACE INTO deleted_chats(chat_id, deleted_at, generation)
+                VALUES (?, ?, ?)
+                """,
                 database: database
             ) {
                 try bind(chatID, at: 1, statement: $0, database: database)
-                try bind(Int64(Date().timeIntervalSince1970 * 1_000), at: 2, statement: $0, database: database)
+                try bind(now, at: 2, statement: $0, database: database)
+                try bind(deletionGeneration, at: 3, statement: $0, database: database)
                 try stepDone($0, database: database)
             }
+            if pending.isEmpty {
+                try retireWriter(database)
+            } else {
+                try upsertWriterLease(
+                    acknowledgedGeneration: deletionGeneration,
+                    now: now,
+                    database: database
+                )
+            }
+        }
+        writerGeneration = deletionGeneration
+        writerLeaseExpiresAt = pending.isEmpty ? 0 : Self.writerLeaseDeadline(after: now)
+        for chatID in pending.keys {
+            pending[chatID]?.writerGeneration = deletionGeneration
+            pending[chatID]?.heldContinuousFence = true
         }
     }
 
@@ -455,10 +569,11 @@ actor AcpTranscriptStore {
     /// then drain tombstones whose chat rows are fully gone. Both statements
     /// share one transaction so a failed launch cleanup retains the fence for
     /// the next retry instead of stranding transcript bytes without intent.
-    func vacuumTombstones() {
+    func vacuumTombstones(now: Int64? = nil) {
         guard let database = try? openDatabase(),
               (try? tableExists("deleted_chats", database: database)) == true else { return }
         try? transaction(database) {
+            try expireWriterLeases(now: Self.timestamp(now), database: database)
             // `transcript_rows` follows through its ON DELETE CASCADE. This is
             // the idempotent restart path for a crash before remove(chatID:).
             try execute(
@@ -468,13 +583,7 @@ actor AcpTranscriptStore {
                 """,
                 database: database
             )
-            try execute(
-                """
-                DELETE FROM deleted_chats
-                WHERE chat_id NOT IN (SELECT chat_id FROM chats)
-                """,
-                database: database
-            )
+            try reclaimEligibleTombstones(database)
         }
     }
 
@@ -495,9 +604,26 @@ actor AcpTranscriptStore {
         pending.removeAll()
         do {
             let database = try openDatabase()
+            let now = Self.timestamp(nil)
+            var completedGeneration: Int64 = 0
             try transaction(database) {
+                completedGeneration = try currentDeletionGeneration(database)
+                let writerFenceIsContinuous = try writerLeaseIsLive(now: now, database: database)
+                try upsertWriterLease(
+                    acknowledgedGeneration: writerGeneration ?? completedGeneration,
+                    now: now,
+                    database: database
+                )
                 for chatID in writes.keys.sorted() {
                     guard let write = writes[chatID] else { continue }
+                    // If this writer's durable lease expired and the global
+                    // deletion generation advanced, the relevant tombstone may
+                    // already have been reclaimed. Drop that stale snapshot
+                    // rather than guessing that the chat survived.
+                    guard write.writerGeneration == completedGeneration
+                            || (write.heldContinuousFence && writerFenceIsContinuous) else {
+                        continue
+                    }
                     // A buffered write racing a deletion (a final stream chunk
                     // landing as the user hits delete) must not re-materialize
                     // tombstoned content 350ms later (§4e). A probe that cannot
@@ -509,8 +635,13 @@ actor AcpTranscriptStore {
                 }
                 try pruneEmptyChats(database)
                 try pruneOldChats(database)
+                try retireWriter(database)
+                try expireWriterLeases(now: now, database: database)
+                try reclaimEligibleTombstones(database)
                 try setMetadataValue("1", for: "v2_has_written", database: database)
             }
+            writerGeneration = completedGeneration
+            writerLeaseExpiresAt = 0
             try secureDatabaseFile()
         } catch {
             // Retain the exact coalesced snapshots. A later stream update or an
@@ -606,7 +737,71 @@ actor AcpTranscriptStore {
             "CREATE INDEX IF NOT EXISTS chats_by_recency ON chats(updated_at DESC, chat_id ASC)",
             database: database
         )
-        try execute("PRAGMA user_version = 2", database: database)
+        try execute(
+            """
+            CREATE TABLE IF NOT EXISTS transcript_writers (
+                writer_id TEXT PRIMARY KEY NOT NULL,
+                acknowledged_generation INTEGER NOT NULL CHECK (acknowledged_generation >= 0),
+                lease_expires_at INTEGER NOT NULL CHECK (lease_expires_at >= 0)
+            ) WITHOUT ROWID
+            """,
+            database: database
+        )
+        if try metadataValue(for: "deletion_generation", database: database) == nil {
+            try setMetadataValue("0", for: "deletion_generation", database: database)
+        }
+        try migrateDeletedChatsGenerationIfNeeded(database)
+        try execute("PRAGMA user_version = 3", database: database)
+    }
+
+    private func ensureDeletedChatsTable(_ database: SQLiteHandle) throws {
+        try execute(
+            """
+            CREATE TABLE IF NOT EXISTS deleted_chats (
+                chat_id TEXT PRIMARY KEY NOT NULL,
+                deleted_at INTEGER NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 0)
+            ) WITHOUT ROWID
+            """,
+            database: database
+        )
+    }
+
+    /// Existing v2 databases may already contain the two-column tombstone
+    /// table. Assign every such durable delete one freshly advanced generation
+    /// so new writer leases cannot mistake it for an already-acknowledged era.
+    private func migrateDeletedChatsGenerationIfNeeded(_ database: SQLiteHandle) throws {
+        guard try tableExists("deleted_chats", database: database) else { return }
+        guard try !deletedChatsHaveGenerationColumn(database) else { return }
+        try execute(
+            "ALTER TABLE deleted_chats ADD COLUMN generation INTEGER NOT NULL DEFAULT 0",
+            database: database
+        )
+        let retainedCount = try withStatement(
+            "SELECT COUNT(*) FROM deleted_chats",
+            database: database
+        ) { statement in
+            guard try stepRow(statement, database: database) else { return Int64(0) }
+            return sqlite3_column_int64(statement, 0)
+        }
+        guard retainedCount > 0 else { return }
+        let generation = try nextDeletionGeneration(database)
+        try withStatement(
+            "UPDATE deleted_chats SET generation = ?",
+            database: database
+        ) { statement in
+            try bind(generation, at: 1, statement: statement, database: database)
+            try stepDone(statement, database: database)
+        }
+    }
+
+    private func deletedChatsHaveGenerationColumn(_ database: SQLiteHandle) throws -> Bool {
+        try withStatement("PRAGMA table_info(deleted_chats)", database: database) { statement in
+            while try stepRow(statement, database: database) {
+                if Self.columnString(statement, column: 1) == "generation" { return true }
+            }
+            return false
+        }
     }
 
     /// Import the v1 monolithic JSON inside the same immediate transaction that
@@ -1008,6 +1203,95 @@ actor AcpTranscriptStore {
 
     // MARK: - SQLite helpers
 
+    private func currentDeletionGeneration(_ database: SQLiteHandle) throws -> Int64 {
+        guard let stored = try metadataValue(for: "deletion_generation", database: database),
+              let generation = Int64(stored), generation >= 0 else {
+            throw StoreError.database("transcript deletion generation is missing or invalid")
+        }
+        return generation
+    }
+
+    private func nextDeletionGeneration(_ database: SQLiteHandle) throws -> Int64 {
+        let current = try currentDeletionGeneration(database)
+        guard current < Int64.max else {
+            throw StoreError.database("transcript deletion generation is exhausted")
+        }
+        let next = current + 1
+        try setMetadataValue(String(next), for: "deletion_generation", database: database)
+        return next
+    }
+
+    private func writerLeaseIsLive(now: Int64, database: SQLiteHandle) throws -> Bool {
+        try withStatement(
+            "SELECT lease_expires_at FROM transcript_writers WHERE writer_id = ?",
+            database: database
+        ) { statement in
+            try bind(writerID, at: 1, statement: statement, database: database)
+            guard try stepRow(statement, database: database) else { return false }
+            return sqlite3_column_int64(statement, 0) > now
+        }
+    }
+
+    private func upsertWriterLease(
+        acknowledgedGeneration: Int64,
+        now: Int64,
+        database: SQLiteHandle
+    ) throws {
+        guard acknowledgedGeneration >= 0 else {
+            throw StoreError.database("transcript writer generation is invalid")
+        }
+        try withStatement(
+            """
+            INSERT INTO transcript_writers(writer_id, acknowledged_generation, lease_expires_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(writer_id) DO UPDATE SET
+                acknowledged_generation = excluded.acknowledged_generation,
+                lease_expires_at = excluded.lease_expires_at
+            """,
+            database: database
+        ) { statement in
+            try bind(writerID, at: 1, statement: statement, database: database)
+            try bind(acknowledgedGeneration, at: 2, statement: statement, database: database)
+            try bind(Self.writerLeaseDeadline(after: now), at: 3, statement: statement, database: database)
+            try stepDone(statement, database: database)
+        }
+    }
+
+    private func retireWriter(_ database: SQLiteHandle) throws {
+        try withStatement(
+            "DELETE FROM transcript_writers WHERE writer_id = ?",
+            database: database
+        ) { statement in
+            try bind(writerID, at: 1, statement: statement, database: database)
+            try stepDone(statement, database: database)
+        }
+    }
+
+    private func expireWriterLeases(now: Int64, database: SQLiteHandle) throws {
+        try withStatement(
+            "DELETE FROM transcript_writers WHERE lease_expires_at <= ?",
+            database: database
+        ) { statement in
+            try bind(now, at: 1, statement: statement, database: database)
+            try stepDone(statement, database: database)
+        }
+    }
+
+    private func reclaimEligibleTombstones(_ database: SQLiteHandle) throws {
+        guard try tableExists("deleted_chats", database: database) else { return }
+        try execute(
+            """
+            DELETE FROM deleted_chats
+            WHERE chat_id NOT IN (SELECT chat_id FROM chats)
+              AND NOT EXISTS (
+                  SELECT 1 FROM transcript_writers
+                  WHERE acknowledged_generation < deleted_chats.generation
+              )
+            """,
+            database: database
+        )
+    }
+
     private func transaction(_ database: SQLiteHandle, body: () throws -> Void) throws {
         try execute("BEGIN IMMEDIATE", database: database)
         do {
@@ -1167,6 +1451,11 @@ actor AcpTranscriptStore {
 
     private static func timestamp(_ supplied: Int64?) -> Int64 {
         max(0, supplied ?? Int64(Date().timeIntervalSince1970 * 1_000))
+    }
+
+    private static func writerLeaseDeadline(after now: Int64) -> Int64 {
+        if now > Int64.max - writerLeaseDurationMilliseconds { return Int64.max }
+        return now + writerLeaseDurationMilliseconds
     }
 
     private static func attachmentsAreBounded(_ attachments: [AcpAttachment]) -> Bool {

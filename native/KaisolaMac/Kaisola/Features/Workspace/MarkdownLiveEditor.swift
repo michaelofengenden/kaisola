@@ -404,9 +404,13 @@ final class MarkdownInlineImageLayoutManager: NSLayoutManager {
         NSColor.quaternaryLabelColor.setFill()
         path.fill()
         let label = placement.alt.isEmpty ? "Image unavailable" : placement.alt
+        // Placeholder copy, so it takes the secondary ink rather than a lighter
+        // rung — and the *glass* weight of it, because the plate under this
+        // label is the quaternary fill above rather than the document's white.
+        // On that ground α 0.55 measures 4.50:1 and α 0.60 measures 5.36:1.
         let attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.systemFont(ofSize: 11),
-            .foregroundColor: NSColor.secondaryLabelColor,
+            .foregroundColor: KaisolaInk.nsColor(.secondary),
         ]
         let size = (label as NSString).size(withAttributes: attributes)
         (label as NSString).draw(

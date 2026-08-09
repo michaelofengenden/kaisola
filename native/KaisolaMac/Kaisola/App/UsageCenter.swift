@@ -391,10 +391,21 @@ struct UsageAccountStore: Sendable {
 
     static let schemaVersion = 1
     let fileURL: URL
+    private let installTemporary: @Sendable (URL, URL) throws -> Void
 
-    init(fileURL: URL = NativePreviewPaths.applicationSupportDirectory
-        .appendingPathComponent("usage-accounts.json", isDirectory: false)) {
+    init(
+        fileURL: URL = NativePreviewPaths.applicationSupportDirectory
+            .appendingPathComponent("usage-accounts.json", isDirectory: false),
+        installTemporary: @escaping @Sendable (URL, URL) throws -> Void = { temporary, destination in
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+        }
+    ) {
         self.fileURL = fileURL
+        self.installTemporary = installTemporary
     }
 
     func profiles() -> [UsageAccountProfile] {
@@ -505,6 +516,12 @@ struct UsageAccountStore: Sendable {
 
     private func write(_ profiles: [UsageAccountProfile]) -> Bool {
         let directory = fileURL.deletingLastPathComponent()
+        var temporary: URL?
+        defer {
+            if let temporary {
+                try? FileManager.default.removeItem(at: temporary)
+            }
+        }
         do {
             try FileManager.default.createDirectory(
                 at: directory,
@@ -513,17 +530,14 @@ struct UsageAccountStore: Sendable {
             )
             let payload = Payload(schemaVersion: Self.schemaVersion, profiles: profiles)
             let data = try JSONEncoder().encode(payload)
-            let temporary = directory.appendingPathComponent(
+            let candidate = directory.appendingPathComponent(
                 ".\(fileURL.lastPathComponent).\(UUID().uuidString)",
                 isDirectory: false
             )
-            try data.write(to: temporary, options: [.atomic])
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
-            } else {
-                try FileManager.default.moveItem(at: temporary, to: fileURL)
-            }
+            temporary = candidate
+            try data.write(to: candidate, options: [.atomic])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: candidate.path)
+            try installTemporary(candidate, fileURL)
             return true
         } catch {
             return false

@@ -529,6 +529,39 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertFalse(store.remove(id: "missing"))
     }
 
+    func testUsageAccountStoreRemovesTemporaryFileWhenInstallationFails() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("usage-accounts.json")
+        let store = UsageAccountStore(
+            fileURL: fileURL,
+            installTemporary: { temporary, destination in
+                XCTAssertEqual(destination, fileURL)
+                XCTAssertTrue(
+                    FileManager.default.fileExists(atPath: temporary.path),
+                    "fault injection must happen after the exact temporary file exists"
+                )
+                throw UsageAccountInstallFailure.injected
+            }
+        )
+
+        XCTAssertNil(store.add(
+            provider: .codex,
+            label: "Failure fixture",
+            directory: "~/.codex-failure-fixture"
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+
+        let prefix = ".\(fileURL.lastPathComponent)."
+        let entries = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        let orphanedTemporaryFiles = entries.filter { name in
+            guard name.hasPrefix(prefix) else { return false }
+            return UUID(uuidString: String(name.dropFirst(prefix.count))) != nil
+        }
+        XCTAssertEqual(orphanedTemporaryFiles, [])
+    }
+
     func testUsageAccountStoreKeepsEveryAccountWhenIndependentInstancesWriteAtOnce() {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
@@ -832,6 +865,10 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertEqual(reading?.accessibilityLabel, "Claude plan usage, 91 percent of 5-hour used")
         XCTAssertEqual(reading?.help, "Claude · 5-hour 91% used — open Usage settings")
     }
+}
+
+private enum UsageAccountInstallFailure: Error {
+    case injected
 }
 
 /// Collects what background writers did to the account registry, so the

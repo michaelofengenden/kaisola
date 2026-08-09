@@ -156,6 +156,372 @@ final class TerminalScrollPinTests: XCTestCase {
         XCTAssertFalse(TerminalScrollGestureMonitor.isActive(for: terminalView()))
     }
 
+    func testContinuousScrollPhysicsPreservesEverySubRowSampleAt120Hertz() {
+        let rowHeight: CGFloat = 20
+        var state = TerminalContinuousScrollState(
+            anchorRow: 100,
+            fractionalOffset: 0,
+            rowHeight: rowHeight,
+            maximumRow: 100,
+            viewportExtent: 320
+        )
+        var previous = state.projection.presentedPosition
+
+        // A deterministic one-second 120 Hz gesture whose individual samples
+        // are all smaller than one terminal cell. The old SwiftTerm path would
+        // leave the viewport frozen for many samples, then jump a whole row.
+        for sample in 0..<120 {
+            state.apply(scrollingDeltaY: 0.375)
+            let projection = state.projection
+            XCTAssertEqual(
+                previous - projection.presentedPosition,
+                0.375,
+                accuracy: 0.000_001,
+                "Sample \(sample) was quantized or dropped."
+            )
+            XCTAssertEqual(
+                CGFloat(projection.anchorRow) * rowHeight + projection.offsetWithinAnchor,
+                projection.presentedPosition,
+                accuracy: 0.000_001,
+                "Crossing an integer row must not create a visual discontinuity."
+            )
+            previous = projection.presentedPosition
+        }
+
+        XCTAssertEqual(state.projection.anchorRow, 97)
+        XCTAssertEqual(state.projection.offsetWithinAnchor, 15, accuracy: 0.000_001)
+        XCTAssertEqual(state.projection.scrollbarPosition, 0.9775, accuracy: 0.000_001)
+    }
+
+    func testContinuousScrollPhysicsRubberBandsAndSettlesAtBothEdges() {
+        var oldest = TerminalContinuousScrollState(
+            anchorRow: 0,
+            fractionalOffset: 0,
+            rowHeight: 20,
+            maximumRow: 100,
+            viewportExtent: 320
+        )
+        oldest.apply(scrollingDeltaY: 120)
+        XCTAssertTrue(oldest.projection.isRubberBanding)
+        XCTAssertLessThan(oldest.projection.presentedPosition, 0)
+        XCTAssertGreaterThan(oldest.projection.presentedPosition, -120)
+        oldest.settle()
+        XCTAssertEqual(oldest.projection.presentedPosition, 0, accuracy: 0.000_001)
+        XCTAssertFalse(oldest.projection.isRubberBanding)
+
+        var newest = TerminalContinuousScrollState(
+            anchorRow: 100,
+            fractionalOffset: 0,
+            rowHeight: 20,
+            maximumRow: 100,
+            viewportExtent: 320
+        )
+        newest.apply(scrollingDeltaY: -120)
+        XCTAssertTrue(newest.projection.isRubberBanding)
+        XCTAssertGreaterThan(newest.projection.presentedPosition, 2_000)
+        XCTAssertLessThan(newest.projection.presentedPosition, 2_120)
+        newest.settle()
+        XCTAssertEqual(newest.projection.presentedPosition, 2_000, accuracy: 0.000_001)
+        XCTAssertFalse(newest.projection.isRubberBanding)
+    }
+
+    func testRubberBandWaitsForZeroDeltaGestureEndBeforeSettling() {
+        let fixture = scrollFixture()
+        fixture.view.scroll(toPosition: 0)
+        XCTAssertTrue(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: 32,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: [],
+            routesToNativeScrollback: true
+        ))
+        XCTAssertTrue(fixture.view.continuousScrollSnapshot?.isRubberBanding == true)
+        let heldOrigin = fixture.view.bounds.origin.y
+
+        RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+        XCTAssertEqual(fixture.view.bounds.origin.y, heldOrigin, accuracy: 0.000_001)
+
+        XCTAssertTrue(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: 0,
+            hasPreciseScrollingDeltas: true,
+            phase: .ended,
+            momentumPhase: [],
+            routesToNativeScrollback: true
+        ))
+        RunLoop.main.run(until: Date().addingTimeInterval(0.3))
+        XCTAssertFalse(fixture.view.continuousScrollSnapshot?.isRubberBanding == true)
+        XCTAssertEqual(fixture.view.bounds.origin.y, 0, accuracy: 0.000_001)
+    }
+
+    func testPreciseTrackpadSamplesMoveRealViewportContinuouslyAndUpdateScroller() throws {
+        freshMonitor()
+        let fixture = scrollFixture()
+        fixture.view.selectAll(nil)
+        let selection = fixture.view.selectedRange()
+        let liveBottomRow = fixture.view.getTerminal().getTopVisibleRow()
+
+        XCTAssertTrue(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: 2.5,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: [],
+            routesToNativeScrollback: true
+        ))
+
+        let first = try XCTUnwrap(fixture.view.continuousScrollSnapshot)
+        XCTAssertEqual(first.anchorRow, liveBottomRow - 1)
+        XCTAssertGreaterThan(first.offsetWithinAnchor, 0)
+        XCTAssertLessThan(first.offsetWithinAnchor, first.rowHeight)
+        XCTAssertEqual(fixture.view.bounds.origin.y, -first.offsetWithinAnchor, accuracy: 0.000_001)
+        XCTAssertEqual(fixture.view.nativeScrollerValue, first.scrollbarPosition, accuracy: 0.000_001)
+        XCTAssertFalse(fixture.view.isViewportAtLiveBottom)
+        XCTAssertEqual(fixture.view.selectedRange(), selection)
+
+        var origins = [fixture.view.bounds.origin.y]
+        for _ in 0..<12 {
+            XCTAssertTrue(fixture.view.handleContinuousScroll(
+                scrollingDeltaY: 0.25,
+                hasPreciseScrollingDeltas: true,
+                phase: .changed,
+                momentumPhase: .changed,
+                routesToNativeScrollback: true
+            ))
+            origins.append(fixture.view.bounds.origin.y)
+        }
+        XCTAssertEqual(Set(origins.map { ($0 * 1_000).rounded() }).count, origins.count)
+        XCTAssertEqual(fixture.view.selectedRange(), selection)
+    }
+
+    func testMountedNativeScrollerRemainsFixedWhileTerminalContentMovesFractionally() throws {
+        freshMonitor()
+        let fixture = scrollFixture()
+        let host = NSView(frame: fixture.view.frame)
+        host.addSubview(fixture.view)
+        let window = NSWindow(
+            contentRect: host.bounds,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = host
+        fixture.view.layoutSubtreeIfNeeded()
+
+        let scroller = try XCTUnwrap(
+            fixture.view.subviews.compactMap { $0 as? NSScroller }.first
+        )
+        let before = try XCTUnwrap(fixture.view.nativeScrollerWindowFrame)
+
+        XCTAssertTrue(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: 2.5,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: [],
+            routesToNativeScrollback: true
+        ))
+        fixture.view.layoutSubtreeIfNeeded()
+
+        let after = try XCTUnwrap(fixture.view.nativeScrollerWindowFrame)
+        XCTAssertEqual(after.origin.x, before.origin.x, accuracy: 0.000_001)
+        XCTAssertEqual(after.origin.y, before.origin.y, accuracy: 0.000_001)
+        XCTAssertEqual(after.size.width, before.size.width, accuracy: 0.000_001)
+        XCTAssertEqual(after.size.height, before.size.height, accuracy: 0.000_001)
+    }
+
+    func testFractionalHitTestingPreservesExplicitLinkAcrossAgentRepaint() throws {
+        freshMonitor()
+        let coordinator = NativeTerminalSurface.Coordinator()
+        let view = terminalView()
+        view.changeScrollback(500)
+        view.terminalDelegate = coordinator
+        let href = "https://kaisola.app/continuous-scroll-contract"
+        var output = "Open \u{1B}]8;;\(href)\u{7}linked-anchor\u{1B}]8;;\u{7}\r\n"
+            + (0..<240).map { "history-\($0)\r\n" }.joined()
+        coordinator.apply(
+            output: output,
+            epoch: "continuous-link-epoch",
+            endOffset: Int64(output.utf8.count),
+            to: view
+        )
+        view.scroll(toPosition: 0)
+        TerminalScrollGestureMonitor.noteGestureForTesting(
+            view: view,
+            scrollingUpward: false
+        )
+        XCTAssertTrue(view.handleContinuousScroll(
+            scrollingDeltaY: -3.25,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: [],
+            routesToNativeScrollback: true
+        ))
+
+        output += "\u{1B}[?2026h\r\u{1B}[2KClaude repaint\u{1B}[?2026l"
+        coordinator.apply(
+            output: output,
+            epoch: "continuous-link-epoch",
+            endOffset: Int64(output.utf8.count),
+            to: view
+        )
+
+        let projection = try XCTUnwrap(view.continuousScrollSnapshot)
+        let dimensions = view.getTerminal().getDims()
+        let optimal = view.getOptimalFrameSize().size
+        let scrollerWidth = NSScroller.scrollerWidth(
+            for: .regular,
+            scrollerStyle: view.scrollerStyle
+        )
+        let cellWidth = (optimal.width - scrollerWidth) / CGFloat(dimensions.cols)
+        let point = NSPoint(
+            x: cellWidth * 8,
+            y: view.frame.height - projection.rowHeight / 2
+        )
+        XCTAssertEqual(view.terminalCell(at: point)?.row, 0)
+        XCTAssertEqual(view.terminalLink(at: point), href)
+    }
+
+    func testFractionalViewportSurvivesAgentRepaintResizeHitTestingAndSurfaceCache() throws {
+        freshMonitor()
+        var fixture = deepScrollFixture()
+        fixture.view.configureJumpToLiveBottomAffordance()
+        // Production's local event monitor attributes the sample before the
+        // renderer moves. Mirror that ordering so the following PTY repaint is
+        // testing continuous-scroll retention, not an impossible unowned feed.
+        TerminalScrollGestureMonitor.noteGestureForTesting(view: fixture.view)
+        XCTAssertTrue(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: 2.5,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: .changed,
+            routesToNativeScrollback: true
+        ))
+        let beforeRepaint = try XCTUnwrap(fixture.view.continuousScrollSnapshot)
+        let topBeforeRepaint = fixture.view.getTerminal().getTopVisibleRow()
+
+        appendClaudeRepaint(0, to: &fixture)
+
+        let afterRepaint = try XCTUnwrap(fixture.view.continuousScrollSnapshot)
+        XCTAssertEqual(afterRepaint.presentedPosition, beforeRepaint.presentedPosition, accuracy: 0.001)
+        XCTAssertEqual(fixture.view.getTerminal().getTopVisibleRow(), topBeforeRepaint)
+        XCTAssertTrue(fixture.view.jumpToLiveBottomIsVisible)
+
+        // The fractional origin participates in the same mouse-cell transform
+        // as SwiftTerm selection and links: the clipped tail of anchor row zero
+        // ends before the next full row begins.
+        let remainingAnchorHeight = afterRepaint.rowHeight - afterRepaint.offsetWithinAnchor
+        let anchorPoint = NSPoint(
+            x: 4,
+            y: fixture.view.bounds.maxY - remainingAnchorHeight / 2
+        )
+        let nextPoint = NSPoint(
+            x: 4,
+            y: fixture.view.bounds.maxY - remainingAnchorHeight - 1
+        )
+        XCTAssertEqual(fixture.view.terminalCell(at: anchorPoint)?.row, 0)
+        XCTAssertEqual(fixture.view.terminalCell(at: nextPoint)?.row, 1)
+
+        fixture.view.setFrameSize(NSSize(width: 700, height: 360))
+        let afterResize = try XCTUnwrap(fixture.view.continuousScrollSnapshot)
+        XCTAssertEqual(
+            afterResize.offsetWithinAnchor / afterResize.rowHeight,
+            beforeRepaint.offsetWithinAnchor / beforeRepaint.rowHeight,
+            accuracy: 0.001
+        )
+
+        let cache = TerminalSurfaceCache.shared
+        cache.removeAll()
+        defer { cache.removeAll() }
+        let identity = ObjectIdentifier(fixture.view)
+        cache.store(
+            sessionID: "continuous-scroll-cache",
+            view: fixture.view,
+            coordinator: fixture.coordinator
+        )
+        let claimed = try XCTUnwrap(cache.claim(
+            sessionID: "continuous-scroll-cache",
+            isOwned: false
+        ))
+        XCTAssertEqual(ObjectIdentifier(claimed.view), identity)
+        XCTAssertEqual(claimed.view.continuousScrollSnapshot, afterResize)
+        XCTAssertEqual(claimed.view.getTerminal().options.scrollback, 20_000)
+    }
+
+    func testJumpToLiveBottomClearsFractionAndRestoresExactFollow() {
+        freshMonitor()
+        let fixture = scrollFixture()
+        fixture.view.configureJumpToLiveBottomAffordance()
+        XCTAssertTrue(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: 1,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: [],
+            routesToNativeScrollback: true
+        ))
+        XCTAssertFalse(fixture.view.isViewportAtLiveBottom)
+        XCTAssertTrue(fixture.view.jumpToLiveBottomIsVisible)
+
+        XCTAssertTrue(fixture.view.performJumpToLiveBottom())
+
+        XCTAssertTrue(fixture.view.isViewportAtLiveBottom)
+        XCTAssertEqual(fixture.view.scrollPosition, 1, accuracy: 0.000_001)
+        XCTAssertNil(fixture.view.continuousScrollSnapshot)
+        XCTAssertEqual(fixture.view.bounds.origin.y, 0, accuracy: 0.000_001)
+        XCTAssertFalse(fixture.view.jumpToLiveBottomIsVisible)
+        XCTAssertTrue(fixture.coordinator.isFollowingLiveOutput)
+    }
+
+    func testDiscreteKeyboardAndAccessibilityPagingReconcileFractionalViewport() throws {
+        freshMonitor()
+        let fixture = scrollFixture()
+        XCTAssertTrue(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: 3,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: [],
+            routesToNativeScrollback: true
+        ))
+        XCTAssertNotEqual(fixture.view.bounds.origin.y, 0)
+
+        fixture.view.prepareForDiscreteScrollInput()
+        XCTAssertNil(fixture.view.continuousScrollSnapshot)
+        XCTAssertEqual(fixture.view.bounds.origin.y, 0, accuracy: 0.000_001)
+
+        let accessibilityActionNames = fixture.view.accessibilityCustomActions()?.map(\.name) ?? []
+        XCTAssertTrue(accessibilityActionNames.contains("Scroll one page up"))
+        XCTAssertTrue(accessibilityActionNames.contains("Scroll one page down"))
+        let beforeAX = fixture.view.getTerminal().getTopVisibleRow()
+        XCTAssertTrue(fixture.view.accessibilityPerformDecrement())
+        XCTAssertLessThan(fixture.view.getTerminal().getTopVisibleRow(), beforeAX)
+        XCTAssertNil(fixture.view.continuousScrollSnapshot)
+        XCTAssertEqual(fixture.view.bounds.origin.y, 0, accuracy: 0.000_001)
+        XCTAssertTrue(fixture.view.accessibilityPerformIncrement())
+    }
+
+    func testContinuousScrollNeverConsumesAlternateScreenOrAppOwnedMouseRouting() {
+        freshMonitor()
+        let fixture = scrollFixture()
+
+        XCTAssertFalse(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: 4,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: [],
+            routesToNativeScrollback: false
+        ))
+        XCTAssertNil(fixture.view.continuousScrollSnapshot)
+
+        fixture.view.feed(text: "\u{1B}[?1049h")
+        XCTAssertTrue(fixture.view.getTerminal().isCurrentBufferAlternate)
+        XCTAssertFalse(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: 4,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: [],
+            routesToNativeScrollback: true
+        ))
+        XCTAssertNil(fixture.view.continuousScrollSnapshot)
+        XCTAssertEqual(fixture.view.bounds.origin.y, 0, accuracy: 0.000_001)
+    }
+
     func testVisibleUpwardGestureLatchesBeforeRapidOutputCanSnapToBottom() {
         freshMonitor()
         var fixture = scrollFixture()

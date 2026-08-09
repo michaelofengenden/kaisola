@@ -409,6 +409,12 @@ final class AppModel: ObservableObject {
         sessionAdoptions = adoptionStore.adoptions()
     }
 
+    /// Installed visual receipts assert this concrete no-launch route rather
+    /// than trusting the fixture environment flag that selected it.
+    var usesBrokerFreeFixturePreparer: Bool {
+        brokerPreparer is BrokerFreeFixturePreparer
+    }
+
     /// Keeps each chat's usage observers alive only while that chat exists.
     /// Keying by id avoids retaining closed conversations and stale Usage rows.
     private var usageObservers: [String: Set<AnyCancellable>] = [:]
@@ -4102,6 +4108,7 @@ final class AppModel: ObservableObject {
         let resourceScrollback: TerminalScrollback? = if visualSurface != "terminal-transcript",
                                                          visualSurface != "terminal-semantic",
                                                          visualSurface != "terminal-scroll-output",
+                                                         visualSurface != "terminal-continuous-scroll",
                                                          let requestedResourceBytes,
                                                          requestedResourceBytes > 0 {
             VisualTerminalResourceFixture.scrollback(
@@ -4128,6 +4135,8 @@ final class AppModel: ObservableObject {
                 + "michael@kaisola Kaisola % " + mark("B")
         } else if visualSurface == "terminal-scroll-output" {
             output = VisualTerminalStreamingFixture.initialOutput
+        } else if visualSurface == "terminal-continuous-scroll" {
+            output = VisualTerminalContinuousScrollFixture.initialOutput
         } else if resourceScrollback != nil {
             output = ""
         } else {
@@ -4195,7 +4204,8 @@ final class AppModel: ObservableObject {
     func enqueueVisualTerminalStreamingPacket(_ index: Int) -> Bool {
         let environment = ProcessInfo.processInfo.environment
         guard environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
-              environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "terminal-scroll-output",
+              let visualSurface = environment["KAISOLA_NATIVE_VISUAL_SURFACE"],
+              ["terminal-scroll-output", "terminal-continuous-scroll"].contains(visualSurface),
               VisualTerminalStreamingFixture.packetIndices.contains(index),
               let terminal = sessions.first,
               terminal.id == terminalDocument.sessionID,
@@ -4216,9 +4226,12 @@ final class AppModel: ObservableObject {
     /// Finish a hosted burst synchronously before its evidence gate reads the
     /// document cursor. Ordinary live output still drains on the frame timer.
     func finishVisualTerminalStreamingBurst() {
-        guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
-              ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"]
-                == "terminal-scroll-output" else { return }
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+              let visualSurface = environment["KAISOLA_NATIVE_VISUAL_SURFACE"],
+              ["terminal-scroll-output", "terminal-continuous-scroll"].contains(visualSurface) else {
+            return
+        }
         flushPendingTerminalOutputs()
     }
 
@@ -7075,6 +7088,24 @@ enum VisualTerminalStreamingFixture {
     static var finalMarker: String {
         String(format: "streaming-frame-%04d", packetIndices.upperBound)
     }
+}
+
+/// Broker-free retained history for the optimized continuous-scroll fixture.
+/// It carries real OSC 133 prompt marks and an OSC 8 link so the installed-app
+/// receipt can prove those parser-owned features survive the fractional host
+/// viewport while Claude-style repaints and Codex-style linefeeds interleave.
+enum VisualTerminalContinuousScrollFixture {
+    private static func mark(_ value: String) -> String { "\u{1B}]133;\(value)\u{7}" }
+
+    static let initialOutput = mark("A")
+        + "michael@kaisola Kaisola % " + mark("B")
+        + "codex --continue" + mark("C") + "\r\n"
+        + "Open \u{1B}]8;;https://kaisola.app\u{7}https://kaisola.app\u{1B}]8;;\u{7}\r\n"
+        + (0 ..< 640).map { index in
+            String(format: "continuous-anchor-%04d  retained output remains readable", index)
+        }.joined(separator: "\r\n")
+        + "\r\n" + mark("D;0") + mark("A")
+        + "michael@kaisola Kaisola % " + mark("B")
 }
 
 /// Resolves terminal launch state independently of the app/broker lifetime.

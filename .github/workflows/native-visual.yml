@@ -18,9 +18,18 @@ concurrency:
 jobs:
   capture:
     runs-on: macos-15
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install exact helper dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+        env:
+          KAISOLA_SKIP_NATIVE_REBUILD: '1'
 
       - name: Resolve native app version
         run: >-
@@ -41,6 +50,25 @@ jobs:
           CODE_SIGNING_ALLOWED=NO
           build
 
+      - name: Prepare pinned runtime for optimized visual fixture
+        run: node scripts/download-native-node-runtime.cjs arm64
+
+      - name: Build optimized continuous-scroll fixture
+        run: >-
+          xcodebuild
+          -project native/KaisolaMac/KaisolaMac.xcodeproj
+          -scheme Kaisola
+          -configuration LocalRelease
+          -destination 'platform=macOS,arch=arm64'
+          -derivedDataPath "$RUNNER_TEMP/kaisola-native-visual"
+          MARKETING_VERSION="$KAISOLA_VISUAL_VERSION"
+          CURRENT_PROJECT_VERSION=900000001
+          PRODUCT_BUNDLE_IDENTIFIER=com.kaisola.mac.visual.continuous-scroll
+          ARCHS=arm64
+          ONLY_ACTIVE_ARCH=YES
+          CODE_SIGNING_ALLOWED=NO
+          build
+
       - name: Capture workspace, document, Mesh, Settings, and Usage states
         shell: bash
         run: |
@@ -48,7 +76,16 @@ jobs:
           app="$RUNNER_TEMP/kaisola-native-visual/Build/Products/Debug/Kaisola.app"
           binary="$app/Contents/MacOS/Kaisola"
           output="$RUNNER_TEMP/kaisola-native-screenshots"
+          fixture_profiles="$RUNNER_TEMP/kaisola-native-visual-profiles"
           mkdir -p "$output"
+          mkdir -p "$fixture_profiles"
+          debug_binary_hash_before="$(shasum -a 256 "$binary" | awk '{print $1}')"
+          debug_info_hash_before="$(shasum -a 256 "$app/Contents/Info.plist" | awk '{print $1}')"
+          broker_processes_before="$(
+            ps -axo pid=,command= \
+              | grep -E '[s]ession-broker\.cjs|[k]aisola-broker' \
+              || true
+          )"
 
           verify_capture() {
             local capture="$1"
@@ -110,7 +147,10 @@ jobs:
           run_fixture() {
             local surface="$1"
             local capture="$2"
+            local profile
             shift 2
+            profile="$(mktemp -d "$fixture_profiles/$surface.XXXXXX")"
+            mkdir -p "$profile/home" "$profile/tmp" "$profile/workspace"
             echo "KAISOLA_NATIVE_VISUAL_SURFACE_BEGIN=$surface"
             # Each fixture normally captures and exits in under eight seconds.
             # Keep a broken AppKit sheet or framework callback from hiding the
@@ -121,9 +161,12 @@ jobs:
               alarm $seconds;
               exec @ARGV or die "exec failed: $!\n";
             ' 20 /usr/bin/env \
+              HOME="$profile/home" \
+              CFFIXED_USER_HOME="$profile/home" \
+              TMPDIR="$profile/tmp" \
               KAISOLA_NATIVE_VISUAL_FIXTURE=1 \
               KAISOLA_NATIVE_VISUAL_SURFACE="$surface" \
-              KAISOLA_NATIVE_VISUAL_WORKSPACE="$GITHUB_WORKSPACE" \
+              KAISOLA_NATIVE_VISUAL_WORKSPACE="$profile/workspace" \
               KAISOLA_NATIVE_VISUAL_CAPTURE_PATH="$capture" \
               "$@"; then
               echo "KAISOLA_NATIVE_VISUAL_SURFACE_END=$surface"
@@ -133,6 +176,88 @@ jobs:
               return "$status"
             fi
           }
+
+          optimized_source="$RUNNER_TEMP/kaisola-native-visual/Build/Products/LocalRelease/Kaisola.app"
+          optimized_app="$RUNNER_TEMP/Kaisola Continuous Scroll QA.app"
+          /usr/bin/ditto "$optimized_source" "$optimized_app"
+          optimized_binary="$optimized_app/Contents/MacOS/Kaisola"
+          optimized_info="$optimized_app/Contents/Info.plist"
+          optimized_binary_hash_before="$(shasum -a 256 "$optimized_binary" | awk '{print $1}')"
+          optimized_info_hash_before="$(shasum -a 256 "$optimized_info" | awk '{print $1}')"
+
+          assert_optimized_bundle_unchanged() {
+            test "$(shasum -a 256 "$optimized_binary" | awk '{print $1}')" \
+              = "$optimized_binary_hash_before"
+            test "$(shasum -a 256 "$optimized_info" | awk '{print $1}')" \
+              = "$optimized_info_hash_before"
+          }
+
+          run_optimized_continuous_fixture() {
+            local appearance="$1"
+            local capture="$2"
+            local log="$3"
+            local profile receipt
+            profile="$(mktemp -d "$fixture_profiles/optimized-$appearance.XXXXXX")"
+            mkdir -p "$profile/home" "$profile/tmp" "$profile/workspace"
+            echo "KAISOLA_NATIVE_VISUAL_SURFACE_BEGIN=optimized-$appearance-terminal-continuous-scroll"
+            /usr/bin/perl -e '
+              $seconds = shift @ARGV;
+              alarm $seconds;
+              exec @ARGV or die "exec failed: $!\n";
+            ' 25 /usr/bin/env \
+              HOME="$profile/home" \
+              CFFIXED_USER_HOME="$profile/home" \
+              TMPDIR="$profile/tmp" \
+              KAISOLA_NATIVE_VISUAL_FIXTURE=1 \
+              KAISOLA_NATIVE_VISUAL_SURFACE=terminal-continuous-scroll \
+              KAISOLA_NATIVE_VISUAL_APPEARANCE="$appearance" \
+              KAISOLA_NATIVE_VISUAL_WORKSPACE="$profile/workspace" \
+              KAISOLA_NATIVE_VISUAL_CAPTURE_PATH="$capture" \
+              KAISOLA_NATIVE_VISUAL_FEED_BUILD_FLOOR=900000000 \
+              "$optimized_binary" 2>&1 | tee "$log"
+            ! grep -F 'KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=FAIL' "$log"
+            receipt="$(sed -n 's/^KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=PASS //p' "$log" | tail -n 1)"
+            test -n "$receipt"
+            node -e '
+              const receipt = JSON.parse(process.argv[1]);
+              if (!receipt.optimizedBuild
+                  || receipt.scheduledHertz !== 120
+                  || receipt.sampleCount !== 120
+                  || receipt.sampleIntervalCount !== 119
+                  || !Array.isArray(receipt.sampleTimestampsMilliseconds)
+                  || receipt.sampleTimestampsMilliseconds.length !== 120
+                  || Math.abs(receipt.sampleTimestampsMilliseconds[0]) > 0.001
+                  || receipt.sampleTimestampsMilliseconds.some((timestamp, index, values) =>
+                    !Number.isFinite(timestamp) || (index > 0 && timestamp <= values[index - 1]))
+                  || Math.abs(receipt.sampleTimestampsMilliseconds.at(-1)
+                    - receipt.sampleDurationMilliseconds) > 0.001
+                  || receipt.measuredHertz < 80
+                  || receipt.measuredHertz > 145
+                  || receipt.sampleDurationMilliseconds < 800
+                  || receipt.sampleDurationMilliseconds > 1600
+                  || receipt.cadenceP95Milliseconds > 25
+                  || !receipt.viewIdentityPreserved
+                  || !receipt.coordinatorIdentityPreserved
+                  || !receipt.terminalEngineIdentityPreserved
+                  || !receipt.fixtureUpdaterDisabled
+                  || !receipt.fixtureBrokerIsolated
+                  || receipt.fixtureBuildNumber <= receipt.feedBuildFloor) {
+                throw new Error(`invalid optimized receipt: ${process.argv[1]}`);
+              }
+            ' "$receipt"
+            verify_capture "$capture" terminal-continuous-scroll
+            assert_optimized_bundle_unchanged
+            echo "KAISOLA_NATIVE_VISUAL_SURFACE_END=optimized-$appearance-terminal-continuous-scroll"
+          }
+
+          run_optimized_continuous_fixture \
+            light \
+            "$output/terminal-continuous-scroll.png" \
+            "$output/terminal-continuous-scroll.log"
+          run_optimized_continuous_fixture \
+            dark \
+            "$output/dark-terminal-continuous-scroll.png" \
+            "$output/dark-terminal-continuous-scroll.log"
 
           for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-transcript account-picker attention-completed companion-control mixed permission palette preview preview-narrow preview-code-editor preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file workspace-move topbar topbar-attention mesh onboarding settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-models settings-shortcuts settings-account-recovery usage; do
             capture="$output/$surface.png"
@@ -147,6 +272,21 @@ jobs:
               /usr/bin/env KAISOLA_NATIVE_VISUAL_APPEARANCE=dark "$binary"
             verify_capture "$capture" "$surface"
           done
+
+          test "$(shasum -a 256 "$binary" | awk '{print $1}')" = "$debug_binary_hash_before"
+          test "$(shasum -a 256 "$app/Contents/Info.plist" | awk '{print $1}')" = "$debug_info_hash_before"
+          assert_optimized_bundle_unchanged
+          broker_processes_after="$(
+            ps -axo pid=,command= \
+              | grep -E '[s]ession-broker\.cjs|[k]aisola-broker' \
+              || true
+          )"
+          test "$broker_processes_after" = "$broker_processes_before"
+          if find "$fixture_profiles" -type f -name broker.json -print -quit | grep -q .; then
+            echo "KAISOLA_NATIVE_VISUAL_ISOLATION=FAIL broker-metadata-created" >&2
+            exit 1
+          fi
+          echo "KAISOLA_NATIVE_VISUAL_ISOLATION=PASS bundle-hashes=true broker-free=true"
 
           # Dimension and file-size checks cannot distinguish a real capture
           # from an all-transparent material-backed sheet. Sample visible

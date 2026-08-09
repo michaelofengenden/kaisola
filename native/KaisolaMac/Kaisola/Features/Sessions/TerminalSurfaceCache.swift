@@ -87,7 +87,11 @@ final class TerminalSurfaceCache {
     /// pinned view is by definition not being read into history. A view the
     /// user left scrolled INTO history keeps its buffer and its position.
     func store(sessionID: String, view: ReadOnlyTerminalView, coordinator: NativeTerminalSurface.Coordinator) {
-        let pinnedToBottom = !view.canScroll || view.scrollPosition >= 0.99
+        // Integer `scrollPosition` can round a tiny-but-real fractional
+        // trackpad move to 0.99+ in deep history. The view owns the exact
+        // sub-row truth; trimming that parked surface would destroy the rows
+        // the user is visibly reading and invalidate its retained viewport.
+        let pinnedToBottom = view.isViewportAtLiveBottom
         if pinnedToBottom,
            view.getTerminal().options.scrollback > Self.parkedScrollbackLines {
             view.changeScrollback(Self.parkedScrollbackLines)

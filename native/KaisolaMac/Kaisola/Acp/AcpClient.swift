@@ -524,21 +524,69 @@ actor AcpClient {
                 if data.isEmpty { continue }
                 var active = decoder
                 try active.consume(data) { frame in
-                    if let value = try? JSONDecoder().decode(JSONValue.self, from: frame) {
-                        handle(value)
+                    // ACP's stdout carries nothing but JSON-RPC, so a frame the
+                    // decoder rejects means the stream can no longer be trusted:
+                    // those bytes may have been the response or the permission
+                    // request this turn is waiting on. Skipping them (the old
+                    // `try?`) left the turn hanging until an unrelated timeout.
+                    guard let value = try? JSONDecoder().decode(JSONValue.self, from: frame) else {
+                        throw AcpClientError.malformedFrame(Self.framePreview(frame))
                     }
+                    handle(value)
                 }
                 decoder = active
             }
         } catch {
             guard !Task.isCancelled else { return }
-            connectionGeneration &+= 1
-            cancelPermissionRequests()
-            sessionID = nil
-            workspaceRoot = nil
-            for continuation in pending.values { continuation.resume(throwing: error) }
-            pending.removeAll()
-            eventHandler?(.error(error.localizedDescription))
+            await failConnection(Self.protocolFailure(error))
+        }
+    }
+
+    /// End a connection that broke below the JSON-RPC layer. The adapter is
+    /// terminated rather than left half-read, every awaiting request and
+    /// permission is failed instead of waiting out a timeout, and the reason is
+    /// reported once: `.exited` marks the connection gone (so the chat offers a
+    /// restart) and `.error` carries the diagnostic the user actually needs.
+    private func failConnection(_ error: AcpClientError) async {
+        connectionGeneration &+= 1
+        cancelPermissionRequests()
+        sessionID = nil
+        workspaceRoot = nil
+        await transport.terminate()
+        for continuation in pending.values { continuation.resume(throwing: error) }
+        pending.removeAll()
+        let code = await transport.exitCode() ?? -1
+        eventHandler?(.exited(code: code))
+        eventHandler?(.error(errorText(error)))
+    }
+
+    /// Bytes of a rejected frame kept for its diagnostic. Adapter output can be
+    /// megabytes wide; a status line and a log entry cannot.
+    static let framePreviewByteLimit = 160
+
+    /// A short single-line excerpt of a frame the client refused, safe for a
+    /// status line: control bytes are flattened and everything past the limit
+    /// becomes the frame's real size.
+    static func framePreview(_ frame: Data, limit: Int = framePreviewByteLimit) -> String {
+        let head = String(decoding: frame.prefix(limit), as: UTF8.self)
+        let flattened = String(String.UnicodeScalarView(head.unicodeScalars.map {
+            CharacterSet.controlCharacters.contains($0) ? " " : $0
+        })).trimmingCharacters(in: .whitespaces)
+        guard !flattened.isEmpty else { return "\(frame.count) unreadable bytes" }
+        return frame.count > limit ? "\(flattened)… (\(frame.count) bytes)" : flattened
+    }
+
+    /// Map a framing failure onto the client's own error vocabulary, so the chat
+    /// shows a sentence instead of `BrokerWireError error 1`.
+    private static func protocolFailure(_ error: any Error) -> AcpClientError {
+        if let error = error as? AcpClientError { return error }
+        switch error as? BrokerWireError {
+        case .invalidUTF8: return .malformedFrame("the bytes are not valid UTF-8")
+        case .incompleteFrame: return .malformedFrame("the message ended mid-frame")
+        case .frameTooLarge: return .frameTooLarge
+        case nil: return .requestFailed(
+            (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        )
         }
     }
 

@@ -774,6 +774,176 @@ final class AcpClientTests: XCTestCase {
         conversation.removeQueued(id)
         XCTAssertTrue(conversation.queued.isEmpty)
     }
+
+    // MARK: - Malformed frames
+
+    func testMalformedJsonBetweenValidFramesFailsTheConnection() async throws {
+        let transport = ScriptedAcpTransport(answersPrompt: false)
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        // The prompt is never answered, so it stands in for the response the
+        // corrupted bytes could have been: it must fail, not wait out a timeout.
+        let outcome = PromptOutcomeBox()
+        let prompt = Task {
+            do { try await client.prompt("what happened to my answer?"); outcome.record(.success(())) }
+            catch { outcome.record(.failure(error)) }
+        }
+        try await Self.untilAsync("the prompt to reach the adapter") {
+            await transport.receivedPromptTexts().count == 1
+        }
+
+        // One stdout chunk: a good frame, an unparsable one, then another good
+        // frame that must never be acted on.
+        var corrupted = Data(#"{"jsonrpc":"2.0","method":"session/update","params":{"#.utf8)
+        corrupted.append(Data(repeating: UInt8(ascii: "x"), count: 20_000))
+        var chunk = Self.agentMessageFrame(text: "before the corruption")
+        chunk.append(corrupted)
+        chunk.append(0x0A)
+        chunk.append(Self.agentMessageFrame(text: "after the corruption"))
+        await transport.emit(chunk)
+
+        try await Self.untilAsync("the malformed frame to fail the connection") {
+            collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        try await Self.untilAsync("the awaiting prompt to fail") { outcome.failure != nil }
+
+        let texts = collector.events.compactMap { event -> String? in
+            if case let .turnItem(.message(_, text)) = event { return text } else { return nil }
+        }
+        XCTAssertEqual(texts, ["before the corruption"], "frames after the break must not be acted on")
+        let diagnostic = try XCTUnwrap(collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message } else { return nil }
+        }.first)
+        XCTAssertTrue(diagnostic.contains("malformed"), diagnostic)
+        XCTAssertTrue(diagnostic.contains("session/update"), "the excerpt should show the offending head")
+        XCTAssertTrue(diagnostic.contains("(\(corrupted.count) bytes)"), diagnostic)
+        XCTAssertLessThan(diagnostic.count, 400, "a 20 KB frame must not become a 20 KB diagnostic")
+        XCTAssertTrue(
+            collector.events.contains { if case .exited = $0 { return true } else { return false } },
+            "a broken stream must mark the connection gone so the chat can restart it"
+        )
+        let terminations = await transport.terminationCount()
+        XCTAssertEqual(terminations, 1, "the adapter must not be left running behind a dead read loop")
+        switch outcome.failure as? AcpClientError {
+        case .malformedFrame: break
+        default: XCTFail(
+            "the awaiting prompt should fail with the protocol error, got \(String(describing: outcome.failure))"
+        )
+        }
+        // Release the prompt task last: awaiting it earlier would hang forever
+        // against a client that still swallows the malformed frame.
+        await client.stop()
+        _ = await prompt.value
+    }
+
+    func testInvalidUtf8FramingFailsTheConnectionWithAReadableReason() async throws {
+        let transport = ScriptedAcpTransport(answersPrompt: false)
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        let outcome = PromptOutcomeBox()
+        let prompt = Task {
+            do { try await client.prompt("garbled adapter output"); outcome.record(.success(())) }
+            catch { outcome.record(.failure(error)) }
+        }
+        try await Self.untilAsync("the prompt to reach the adapter") {
+            await transport.receivedPromptTexts().count == 1
+        }
+
+        // 0xFF is not legal in any UTF-8 sequence, so this never reaches JSON.
+        var chunk = Data(#"{"jsonrpc":"2.0","method":"session/update","params":""#.utf8)
+        chunk.append(0xFF)
+        chunk.append(contentsOf: Data(#""}"#.utf8))
+        chunk.append(0x0A)
+        chunk.append(Self.agentMessageFrame(text: "after the corruption"))
+        await transport.emit(chunk)
+
+        try await Self.untilAsync("the invalid framing to fail the connection") {
+            collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        try await Self.untilAsync("the awaiting prompt to fail") { outcome.failure != nil }
+
+        let diagnostic = try XCTUnwrap(collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message } else { return nil }
+        }.first)
+        XCTAssertTrue(diagnostic.contains("UTF-8"), "expected a readable reason, got: \(diagnostic)")
+        XCTAssertFalse(
+            diagnostic.contains("BrokerWireError"),
+            "the framing error must be translated, not leaked as an opaque code: \(diagnostic)"
+        )
+        XCTAssertLessThan(diagnostic.count, 400, diagnostic)
+        XCTAssertFalse(
+            collector.events.contains { if case .turnItem = $0 { return true } else { return false } },
+            "frames after the break must not be acted on"
+        )
+        XCTAssertTrue(
+            collector.events.contains { if case .exited = $0 { return true } else { return false } },
+            "a broken stream must mark the connection gone so the chat can restart it"
+        )
+        let terminations = await transport.terminationCount()
+        XCTAssertEqual(terminations, 1, "the adapter must not be left running behind a dead read loop")
+        XCTAssertEqual(
+            outcome.failure as? AcpClientError,
+            .malformedFrame("the bytes are not valid UTF-8")
+        )
+        await client.stop()
+        _ = await prompt.value
+    }
+
+    /// One newline-delimited `session/update` frame carrying an agent message.
+    private static func agentMessageFrame(text: String) -> Data {
+        var data = (try? JSONEncoder().encode(JSONValue.object([
+            "jsonrpc": .string("2.0"),
+            "method": .string("session/update"),
+            "params": .object([
+                "sessionId": .string("sess-1"),
+                "update": .object([
+                    "sessionUpdate": .string("agent_message_chunk"),
+                    "content": .object(["type": .string("text"), "text": .string(text)]),
+                ]),
+            ]),
+        ]))) ?? Data()
+        data.append(0x0A)
+        return data
+    }
+
+    /// Poll an async condition until it holds, failing on timeout. The
+    /// `@MainActor` sibling above cannot await inside its predicate.
+    private static func untilAsync(
+        _ description: String,
+        timeout: TimeInterval = 5,
+        _ condition: () async -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            if await condition() { return }
+            if Date() > deadline { return XCTFail("timed out waiting for \(description)") }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+}
+
+/// How a deliberately unanswered prompt finished, recorded off the actor.
+private final class PromptOutcomeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Result<Void, any Error>?
+    func record(_ outcome: Result<Void, any Error>) {
+        lock.lock(); storage = outcome; lock.unlock()
+    }
+    var failure: (any Error)? {
+        lock.lock(); defer { lock.unlock() }
+        if case let .failure(error) = storage { return error }
+        return nil
+    }
 }
 
 private final class EventCollector: @unchecked Sendable {
@@ -796,6 +966,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private let resumeCapability: Bool
     private let rejectRestoration: Bool
     private let crashOnFirstPrompt: Bool
+    /// When false the prompt is recorded but never answered, so a test can
+    /// prove what happens to a request that is still awaiting a response.
+    private let answersPrompt: Bool
     private let steeringSupported: Bool
     private let steerOutcome: String?
     private let steerErrorMessage: String?
@@ -817,6 +990,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         resumeCapability: Bool = false,
         rejectRestoration: Bool = false,
         crashOnFirstPrompt: Bool = false,
+        answersPrompt: Bool = true,
         steeringSupported: Bool = true,
         steerOutcome: String? = "injected",
         steerErrorMessage: String? = nil,
@@ -829,6 +1003,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         self.resumeCapability = resumeCapability
         self.rejectRestoration = rejectRestoration
         self.crashOnFirstPrompt = crashOnFirstPrompt
+        self.answersPrompt = answersPrompt
         self.steeringSupported = steeringSupported
         self.steerOutcome = steerOutcome
         self.steerErrorMessage = steerErrorMessage
@@ -966,6 +1141,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                 waiter = nil
                 return
             }
+            guard answersPrompt else { return }
             streamTurn()
             reply(id: id, result: .object(["stopReason": .string("end_turn")]))
         default:
@@ -1027,6 +1203,14 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private func enqueue(_ value: JSONValue) {
         guard var data = try? JSONEncoder().encode(value) else { return }
         data.append(0x0A)
+        deliver(data)
+    }
+
+    /// Hand the client a chunk of stdout verbatim, so a test can send bytes no
+    /// encoder would produce (unparsable JSON, invalid UTF-8).
+    func emit(_ raw: Data) { deliver(raw) }
+
+    private func deliver(_ data: Data) {
         if let waiter {
             self.waiter = nil
             waiter.resume(returning: data)

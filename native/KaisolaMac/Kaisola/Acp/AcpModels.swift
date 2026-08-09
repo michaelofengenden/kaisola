@@ -184,6 +184,90 @@ struct AcpSessionInfo: Equatable, Sendable {
     }
 }
 
+/// Immutable provider/account identity captured before an adapter starts.
+/// Failure and fallback UI must describe this launch context rather than
+/// inferring credentials from whatever error text an adapter happens to emit.
+struct AcpProviderLaunchContext: Equatable, Sendable {
+    let providerName: String
+    let accountLabel: String
+    let defaultSettingsSectionID: String
+
+    init(
+        providerName: String,
+        accountLabel: String,
+        defaultSettingsSectionID: String
+    ) {
+        self.providerName = providerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.accountLabel = accountLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.defaultSettingsSectionID = defaultSettingsSectionID
+    }
+}
+
+/// A provider launch error with a deterministic recovery destination. The raw
+/// detail remains visible, but it never supplies provider/account identity.
+struct AcpProviderStartupFailure: Equatable, Sendable {
+    let providerName: String
+    let accountLabel: String
+    let detail: String
+    let settingsSectionID: String
+    let settingsTitle: String
+
+    init(context: AcpProviderLaunchContext, detail: String) {
+        let normalizedDetail = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        let searchable = normalizedDetail.lowercased()
+        let modelOrKeyFailure = [
+            "api key", "api_key", "apikey", "base url", "base_url", "model",
+        ].contains { searchable.contains($0) }
+        let accountFailure = [
+            "account", "authentication", "authenticate", "credentials", "login",
+            "sign in", "signed out", "401", "403",
+        ].contains { searchable.contains($0) }
+
+        providerName = context.providerName.isEmpty ? "Configured provider" : context.providerName
+        accountLabel = context.accountLabel.isEmpty ? "Default account" : context.accountLabel
+        self.detail = normalizedDetail.isEmpty ? "The adapter did not provide an error detail." : normalizedDetail
+        if modelOrKeyFailure {
+            settingsSectionID = "models"
+            settingsTitle = "Models & Keys"
+        } else if accountFailure {
+            settingsSectionID = "accounts"
+            settingsTitle = "Accounts"
+        } else {
+            settingsSectionID = context.defaultSettingsSectionID
+            switch context.defaultSettingsSectionID {
+            case "agents": settingsTitle = "Agents"
+            case "models": settingsTitle = "Models & Keys"
+            default: settingsTitle = "Accounts"
+            }
+        }
+    }
+
+    var summary: String {
+        "\(providerName) account “\(accountLabel)” could not start. \(detail)"
+    }
+}
+
+/// A requested model was not honored by the adapter. This is a pre-inference
+/// gate: callers must explicitly accept the adapter's actual model or cancel.
+struct AcpModelFallback: Equatable, Sendable {
+    let requestedID: String
+    let requestedLabel: String
+    let actualID: String
+    let actualLabel: String
+    let providerName: String
+    let accountLabel: String
+}
+
+extension Notification.Name {
+    /// Window-scoped through `object: AppModel`; another window must not open
+    /// Settings when this conversation requests provider recovery.
+    static let kaisolaOpenProviderSettings = Notification.Name("kaisola.openProviderSettings")
+}
+
+enum AcpProviderSettingsNotificationKey {
+    static let sectionID = "sectionID"
+}
+
 /// A slash command the agent advertises via `available_commands_update`.
 struct AcpCommand: Equatable, Sendable, Identifiable {
     let name: String

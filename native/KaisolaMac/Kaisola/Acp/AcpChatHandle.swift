@@ -255,4 +255,18 @@ struct AcpChatHandle: Identifiable {
     var projectID: String {
         NativeSessionStore.projectID(forDirectory: workspaceDirectory.path)
     }
+
+    /// Persist an adapter-confirmed fallback without rebuilding the live
+    /// conversation or changing the immutable provider-account identity.
+    func replacingModelOverride(with modelOverride: String?) -> AcpChatHandle {
+        AcpChatHandle(
+            id: id,
+            agentID: agentID,
+            workspaceDirectory: workspaceDirectory,
+            accountBinding: accountBinding,
+            modelOverride: modelOverride,
+            accountAccess: accountAccess,
+            conversation: conversation
+        )
+    }
 }

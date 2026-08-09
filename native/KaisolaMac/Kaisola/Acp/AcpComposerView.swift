@@ -65,7 +65,7 @@ struct AcpComposerCard: View {
     private var sendEnabled: Bool {
         AcpComposerSendPolicy.isEnabled(
             draft: draft,
-            isConnected: conversation.isConnected,
+            isConnected: conversation.allowsInference,
             isRunning: conversation.isRunning,
             hasAttachments: !conversation.pendingAttachments.isEmpty
         )
@@ -80,6 +80,8 @@ struct AcpComposerCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            providerLaunchNotice
+
             TextField(placeholder, text: $draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(.callout)
@@ -109,6 +111,65 @@ struct AcpComposerCard: View {
         .accessibilityIdentifier("acp.composer")
         .task(id: agentName) {
             favorites = favoritesStore.favorites(agentKey: agentName)
+        }
+    }
+
+    @ViewBuilder
+    private var providerLaunchNotice: some View {
+        if let fallback = conversation.pendingModelFallback {
+            VStack(alignment: .leading, spacing: 7) {
+                Label("Confirm model fallback", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Text("Requested \(fallback.requestedLabel); \(fallback.providerName) account “\(fallback.accountLabel)” selected \(fallback.actualLabel). No prompt will run until you choose.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button("Use \(fallback.actualLabel)") {
+                        conversation.acceptModelFallback()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("acp.model-fallback.accept")
+                    Button("Cancel") {
+                        Task { await conversation.cancelModelFallback() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("acp.model-fallback.cancel")
+                }
+            }
+            .padding(12)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("acp.model-fallback")
+            Divider()
+        } else if let failure = conversation.providerStartupFailure {
+            VStack(alignment: .leading, spacing: 7) {
+                Label("\(failure.providerName) could not start", systemImage: "exclamationmark.octagon.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.red)
+                Text("Account: \(failure.accountLabel)")
+                    .font(.caption.weight(.medium))
+                Text(failure.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Open \(failure.settingsTitle)") {
+                    NotificationCenter.default.post(
+                        name: .kaisolaOpenProviderSettings,
+                        object: model,
+                        userInfo: [AcpProviderSettingsNotificationKey.sectionID: failure.settingsSectionID]
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("acp.provider-failure.settings")
+            }
+            .padding(12)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("acp.provider-failure")
+            Divider()
         }
     }
 
@@ -190,7 +251,7 @@ struct AcpComposerCard: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-        .disabled(!conversation.isConnected)
+        .disabled(!conversation.allowsInference)
         .help("Attach files or photos, or insert a slash command")
         .accessibilityLabel("Add attachments")
         .accessibilityIdentifier("acp.composer.attach")
@@ -247,7 +308,7 @@ struct AcpComposerCard: View {
             }
         }
         .buttonStyle(AcpComposerChipButtonStyle(shape: AnyShape(Capsule()), restingOpacity: 0.32))
-        .disabled(conversation.pendingConfigOptionID != nil)
+        .disabled(conversation.pendingConfigOptionID != nil || conversation.pendingModelFallback != nil)
         .help(conversation.pendingConfigOptionID == nil
             ? "Agent, model, and the settings this chat runs on"
             : "Waiting for the agent to confirm this setting")

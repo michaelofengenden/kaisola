@@ -267,6 +267,12 @@ final class AcpConversation: ObservableObject {
     /// the prior value visible until this clears prevents a rejected effort
     /// level from masquerading as the value the next prompt will use.
     @Published private(set) var pendingConfigOptionID: String?
+    /// Present before any prompt can be dispatched when a restored/requested
+    /// model was silently substituted by the adapter.
+    @Published private(set) var pendingModelFallback: AcpModelFallback?
+    /// Context-rich adapter launch failure with a direct Settings recovery
+    /// destination. Cleared on every new start attempt.
+    @Published private(set) var providerStartupFailure: AcpProviderStartupFailure?
     @Published private(set) var commands: [AcpCommand] = []
     /// Whether this adapter advertised `_session/steering` at `initialize`.
     /// Reset on every connect so a swapped agent can never inherit the previous
@@ -376,6 +382,9 @@ final class AcpConversation: ObservableObject {
     /// ephemeral view state. AppModel uses this hook to archive their exact
     /// FIFO order whenever the queue changes.
     var onQueueChanged: (([String]) -> Void)?
+    /// AppModel persists the accepted actual model while retaining this chat's
+    /// immutable account binding and live conversation identity.
+    var onConfirmedModelFallback: ((String) -> Void)?
     /// Stable per-chat key for persisting the composer draft across relaunches.
     /// Set by the owner (AppModel passes the chat id) or the `draftKey` init
     /// parameter. Nil disables persistence: `loadDraft` returns "" and
@@ -421,6 +430,7 @@ final class AcpConversation: ObservableObject {
     private let transcriptAgentID: String
     private let transcriptAgentName: String?
     private let transcriptModelID: String?
+    private let providerContext: AcpProviderLaunchContext
     private let mcpServers: [JSONValue]
     private let ruleStore: PermissionRuleStore
     private let sensitiveGlobs: [String]
@@ -521,6 +531,7 @@ final class AcpConversation: ObservableObject {
         transcriptAgentID: String = "unknown-agent",
         transcriptAgentName: String? = nil,
         transcriptModelID: String? = nil,
+        providerContext: AcpProviderLaunchContext? = nil,
         mcpServers: [JSONValue] = [],
         client: AcpClient? = nil,
         clientFactory: (@MainActor () -> AcpClient)? = nil,
@@ -550,6 +561,11 @@ final class AcpConversation: ObservableObject {
         self.transcriptAgentID = transcriptAgentID
         self.transcriptAgentName = transcriptAgentName
         self.transcriptModelID = transcriptModelID
+        self.providerContext = providerContext ?? AcpProviderLaunchContext(
+            providerName: transcriptAgentName ?? transcriptAgentID,
+            accountLabel: "Default account",
+            defaultSettingsSectionID: "agents"
+        )
         self.mcpServers = mcpServers
         let factory = clientFactory ?? { AcpClient() }
         self.clientFactory = factory
@@ -601,6 +617,8 @@ final class AcpConversation: ObservableObject {
     func start(resumeQueuedPrompts: Bool = false) async {
         guard !hasStarted else { return }
         hasStarted = true
+        providerStartupFailure = nil
+        pendingModelFallback = nil
         invalidateConfigOptionRequest()
         // One ordered pipe from the client's (off-main) event handler to the
         // MainActor consumer: yields preserve order, and a single draining task
@@ -639,6 +657,20 @@ final class AcpConversation: ObservableObject {
             onProviderSessionID?(info.sessionID)
             models = info.models
             currentModelID = info.currentModelID
+            if let requestedID = transcriptModelID?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !requestedID.isEmpty,
+               let actualID = info.currentModelID?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !actualID.isEmpty,
+               requestedID != actualID {
+                pendingModelFallback = AcpModelFallback(
+                    requestedID: requestedID,
+                    requestedLabel: info.models.first(where: { $0.id == requestedID })?.name ?? requestedID,
+                    actualID: actualID,
+                    actualLabel: info.models.first(where: { $0.id == actualID })?.name ?? actualID,
+                    providerName: providerContext.providerName,
+                    accountLabel: providerContext.accountLabel
+                )
+            }
             modes = info.modes
             currentModeID = info.currentModeID
             var confirmedOptions = info.configOptions
@@ -660,7 +692,9 @@ final class AcpConversation: ObservableObject {
             applyConfirmedConfigOptions(confirmedOptions)
             supportsSteering = info.supportsSteering
             isConnected = true
-            statusMessage = restorationFailure
+            statusMessage = pendingModelFallback.map {
+                "\($0.providerName) substituted \($0.actualLabel) for requested \($0.requestedLabel). Accept the actual model or cancel before inference."
+            } ?? restorationFailure
             lastConfigOptionFailureMessage = restorationFailure
             // Only entries still in `queued` are known never to have been
             // dispatched. An explicit adapter restart resumes them; ordinary
@@ -673,10 +707,33 @@ final class AcpConversation: ObservableObject {
             eventContinuation = nil
             eventConsumerTask?.cancel()
             eventConsumerTask = nil
-            statusMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            let failure = AcpProviderStartupFailure(context: providerContext, detail: detail)
+            providerStartupFailure = failure
+            statusMessage = failure.summary
             isConnected = false
             supportsSteering = false
         }
+    }
+
+    /// A connected adapter is not inference-ready while it is waiting for an
+    /// explicit model-substitution decision.
+    var allowsInference: Bool {
+        isConnected && pendingModelFallback == nil
+    }
+
+    func acceptModelFallback() {
+        guard let fallback = pendingModelFallback else { return }
+        pendingModelFallback = nil
+        statusMessage = "Using \(fallback.actualLabel) instead of requested \(fallback.requestedLabel)."
+        onConfirmedModelFallback?(fallback.actualID)
+        flushQueue()
+    }
+
+    func cancelModelFallback() async {
+        guard let fallback = pendingModelFallback else { return }
+        _ = await stop()
+        statusMessage = "Model fallback from \(fallback.requestedLabel) to \(fallback.actualLabel) was cancelled before inference."
     }
 
     var canRestart: Bool {
@@ -713,7 +770,7 @@ final class AcpConversation: ObservableObject {
     func send(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = pendingAttachments.map(\.attachment)
-        guard isConnected, !trimmed.isEmpty || !attachments.isEmpty else { return false }
+        guard allowsInference, !trimmed.isEmpty || !attachments.isEmpty else { return false }
         if isRunning {
             // A running turn queues this as a TEXT-ONLY follow-up. Queued
             // follow-ups deliberately never carry attachments (the flush path
@@ -1521,6 +1578,7 @@ final class AcpConversation: ObservableObject {
         flushPendingChunk()
         isConnected = false
         isRunning = false
+        pendingModelFallback = nil
         supportsSteering = false
         injectingQueuedIDs.removeAll()
         statusMessage = queued.isEmpty
@@ -1961,7 +2019,7 @@ final class AcpConversation: ObservableObject {
     /// `applySteerOutcome` flushes again once the answer is in, so a refused
     /// injection is sent as its own turn immediately afterwards.
     private func flushQueue() {
-        guard !isRunning, isConnected, injectingQueuedIDs.isEmpty, !queued.isEmpty else { return }
+        guard !isRunning, allowsInference, injectingQueuedIDs.isEmpty, !queued.isEmpty else { return }
         let next = queued.removeFirst()
         dispatch(next.text)
     }

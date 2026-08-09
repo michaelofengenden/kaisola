@@ -235,6 +235,15 @@ struct RootShellView: View {
                 }
                 performLocalCommand(AppCommandID(rawValue: rawID))
             }
+            .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenProviderSettings)) { note in
+                guard let target = note.object as? AppModel,
+                      target === model,
+                      let sectionID = note.userInfo?[AcpProviderSettingsNotificationKey.sectionID] as? String else {
+                    return
+                }
+                settingsSectionID = sectionID
+                showSettings = true
+            }
             .onChange(of: model.latestAgentFileActivity) { _, activity in
                 guard let activity,
                       WorkspaceAgentFileFollowPolicy.shouldOpen(

@@ -3124,6 +3124,196 @@ final class AcpClientTests: XCTestCase {
     }
 
     @MainActor
+    func testRestoredModelFallbackBlocksInferenceUntilExplicitAcceptance() async throws {
+        let transport = ScriptedAcpTransport(currentModelID: "sonnet")
+        let conversation = AcpConversation(
+            title: "Fallback",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            transcriptModelID: "retired-opus",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "Claude",
+                accountLabel: "Work",
+                defaultSettingsSectionID: "accounts"
+            ),
+            client: AcpClient(transport: transport)
+        )
+        var persistedModelID: String?
+        conversation.onConfirmedModelFallback = { persistedModelID = $0 }
+
+        await conversation.start()
+
+        let fallback = try XCTUnwrap(conversation.pendingModelFallback)
+        XCTAssertEqual(fallback.requestedID, "retired-opus")
+        XCTAssertEqual(fallback.requestedLabel, "retired-opus")
+        XCTAssertEqual(fallback.actualID, "sonnet")
+        XCTAssertEqual(fallback.actualLabel, "Sonnet")
+        XCTAssertEqual(fallback.providerName, "Claude")
+        XCTAssertEqual(fallback.accountLabel, "Work")
+        XCTAssertFalse(conversation.allowsInference)
+        XCTAssertFalse(conversation.send("must stay local"))
+        let promptsBeforeAcceptance = await transport.receivedPromptTexts()
+        XCTAssertEqual(promptsBeforeAcceptance, [])
+
+        conversation.acceptModelFallback()
+
+        XCTAssertNil(conversation.pendingModelFallback)
+        XCTAssertTrue(conversation.allowsInference)
+        XCTAssertEqual(persistedModelID, "sonnet")
+        XCTAssertTrue(conversation.send("accepted"))
+        try await Self.until("the accepted fallback prompt completed") {
+            await transport.receivedPromptTexts() == ["accepted"] && !conversation.isRunning
+        }
+    }
+
+    @MainActor
+    func testCancellingModelFallbackStopsBeforeAnyInference() async throws {
+        let transport = ScriptedAcpTransport(currentModelID: "sonnet")
+        let conversation = AcpConversation(
+            title: "Fallback",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            transcriptModelID: "retired-opus",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "Claude",
+                accountLabel: "Work",
+                defaultSettingsSectionID: "accounts"
+            ),
+            client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+
+        await conversation.cancelModelFallback()
+
+        XCTAssertNil(conversation.pendingModelFallback)
+        XCTAssertFalse(conversation.isConnected)
+        XCTAssertFalse(conversation.allowsInference)
+        XCTAssertTrue(conversation.statusMessage?.contains("cancelled before inference") == true)
+        let promptsAfterCancellation = await transport.receivedPromptTexts()
+        XCTAssertEqual(promptsAfterCancellation, [])
+    }
+
+    @MainActor
+    func testRestoredQueueCannotResumeAcrossModelFallbackWithoutAcceptance() async throws {
+        let transport = ScriptedAcpTransport(currentModelID: "sonnet")
+        let conversation = AcpConversation(
+            title: "Restored queue",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            transcriptModelID: "retired-opus",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "Claude",
+                accountLabel: "Work",
+                defaultSettingsSectionID: "accounts"
+            ),
+            client: AcpClient(transport: transport),
+            initialQueuedPrompts: ["preserved follow-up"]
+        )
+
+        await conversation.start(resumeQueuedPrompts: true)
+
+        XCTAssertEqual(conversation.queued.map(\.text), ["preserved follow-up"])
+        let blockedPrompts = await transport.receivedPromptTexts()
+        XCTAssertEqual(blockedPrompts, [])
+
+        conversation.acceptModelFallback()
+        try await Self.until("the accepted restored queue resumed") {
+            await transport.receivedPromptTexts() == ["preserved follow-up"]
+        }
+    }
+
+    @MainActor
+    func testProviderStartupFailureNamesProviderAccountAndRelevantSettings() async {
+        let conversation = AcpConversation(
+            title: "Provider failure",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "OpenAI",
+                accountLabel: "Project/default",
+                defaultSettingsSectionID: "accounts"
+            ),
+            client: AcpClient(transport: ProviderFailureAcpTransport(
+                message: "Missing OPENAI_API_KEY"
+            ))
+        )
+
+        await conversation.start()
+
+        let failure = try? XCTUnwrap(conversation.providerStartupFailure)
+        XCTAssertEqual(failure?.providerName, "OpenAI")
+        XCTAssertEqual(failure?.accountLabel, "Project/default")
+        XCTAssertEqual(failure?.settingsSectionID, "models")
+        XCTAssertEqual(failure?.settingsTitle, "Models & Keys")
+        XCTAssertTrue(failure?.detail.contains("Missing OPENAI_API_KEY") == true)
+        XCTAssertTrue(conversation.statusMessage?.contains("OpenAI") == true)
+    }
+
+    @MainActor
+    func testAdapterWithoutRequestedModelHidesFallbackControl() async {
+        let transport = ScriptedAcpTransport(currentModelID: "sonnet")
+        let conversation = AcpConversation(
+            title: "Default model",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "Claude",
+                accountLabel: "Work",
+                defaultSettingsSectionID: "accounts"
+            ),
+            client: AcpClient(transport: transport)
+        )
+
+        await conversation.start()
+
+        XCTAssertNil(conversation.pendingModelFallback)
+        XCTAssertTrue(conversation.allowsInference)
+    }
+
+    @MainActor
+    func testPersistingAcceptedFallbackKeepsImmutableAccountBinding() {
+        let binding = SessionAccountBinding(
+            accountID: "work",
+            provider: .claude,
+            label: "Work",
+            configDirectory: "/tmp/claude-work"
+        )
+        let conversation = AcpConversation(
+            title: "Fallback",
+            command: "mock",
+            arguments: [],
+            cwd: "/tmp"
+        )
+        let access = ChatAccountAccess(binding: binding, requiresResolution: false)
+        let handle = AcpChatHandle(
+            id: "chat-fallback",
+            agentID: "claude-code",
+            workspaceDirectory: URL(fileURLWithPath: "/tmp"),
+            accountBinding: binding,
+            modelOverride: "retired-opus",
+            accountAccess: access,
+            conversation: conversation
+        )
+
+        let persisted = handle.replacingModelOverride(with: "sonnet")
+
+        XCTAssertEqual(persisted.modelOverride, "sonnet")
+        XCTAssertEqual(persisted.accountBinding, binding.normalized)
+        XCTAssertTrue(persisted.accountAccess === access)
+        XCTAssertTrue(persisted.conversation === conversation)
+    }
+
+    @MainActor
     func testFollowUpQueuedWhileRunningDispatchesAfterTurn() async throws {
         let transport = ScriptedAcpTransport()
         let client = AcpClient(transport: transport)
@@ -4122,6 +4312,30 @@ private final class PromptOutcomeBox: @unchecked Sendable {
     }
 }
 
+private struct ProviderFailureError: LocalizedError, Sendable {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// Fails at the real transport-start boundary, before any ACP request can be
+/// emitted, so the conversation must add provider/account recovery context.
+private actor ProviderFailureAcpTransport: AcpByteTransport {
+    let message: String
+
+    init(message: String) {
+        self.message = message
+    }
+
+    func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
+        throw ProviderFailureError(message: message)
+    }
+
+    func send(_ data: Data) async throws {}
+    func receive(maximumBytes: Int) async throws -> Data? { nil }
+    func terminate() async {}
+    func exitCode() async -> Int32? { nil }
+}
+
 
 /// Returns one syntactically decodable but ambiguous response so the client's
 /// pending-request failure path is exercised without modifying the healthy
@@ -4322,6 +4536,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private let steeringSupported: Bool
     private let steerOutcome: String?
     private let steerErrorMessage: String?
+    private let currentModelID: String?
     private let newSessionIDs: [String]
     private var newSessionIndex = 0
     private var currentSessionID = "sess-1"
@@ -4359,6 +4574,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         steeringSupported: Bool = true,
         steerOutcome: String? = "injected",
         steerErrorMessage: String? = nil,
+        currentModelID: String? = nil,
         newSessionIDs: [String] = ["sess-1"],
         restartRaceStaleSessionID: String? = nil,
         loadRaceStaleSessionID: String? = nil,
@@ -4377,6 +4593,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         self.steeringSupported = steeringSupported
         self.steerOutcome = steerOutcome
         self.steerErrorMessage = steerErrorMessage
+        self.currentModelID = currentModelID
         self.newSessionIDs = newSessionIDs.isEmpty ? ["sess-1"] : newSessionIDs
         self.restartRaceStaleSessionID = restartRaceStaleSessionID
         self.loadRaceStaleSessionID = loadRaceStaleSessionID
@@ -4582,7 +4799,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
             }
             newSessionIndex += 1
             currentSessionID = newSessionID
-            reply(id: id, result: .object([
+            var result: [String: JSONValue] = [
                 "sessionId": .string(newSessionID),
                 // Flat models shape (exercises the fallback parse path).
                 "models": .array([
@@ -4609,7 +4826,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                         ]),
                     ]),
                 ]),
-            ]))
+            ]
+            if let currentModelID { result["currentModelId"] = .string(currentModelID) }
+            reply(id: id, result: .object(result))
         case "session/load", "session/resume":
             let method = object["method"]?.stringValue ?? ""
             sessionMethods.append(method)

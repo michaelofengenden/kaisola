@@ -3261,6 +3261,11 @@ final class AppModel: ObservableObject {
         // provider thread preserves the visible transcript without risking a
         // resume under credentials that differ from the original continuation.
         let safeResumeSessionID = accountBinding?.normalized == nil ? nil : resumeSessionID
+        let providerContext = AcpProviderLaunchContext(
+            providerName: declaredProvider?.displayName ?? agent.name,
+            accountLabel: accountBinding?.label ?? "Default account",
+            defaultSettingsSectionID: declaredProvider == nil ? "agents" : "accounts"
+        )
         let conversation = AcpConversation(
             title: title,
             command: adapter.command,
@@ -3271,6 +3276,7 @@ final class AppModel: ObservableObject {
             transcriptAgentID: agent.id,
             transcriptAgentName: agent.name,
             transcriptModelID: modelOverride,
+            providerContext: providerContext,
             mcpServers: McpConfigStore.jsonValues(mcp),
             sensitiveGlobs: NativePreviewSettings.shared.sensitiveGlobs,
             draftKey: chatID,
@@ -3391,6 +3397,14 @@ final class AppModel: ObservableObject {
         }
         conversation.onQueueChanged = { [weak self] _ in
             self?.scheduleWorkspaceStateSave(projectID: projectID)
+        }
+        conversation.onConfirmedModelFallback = { [weak self, weak conversation] actualModelID in
+            guard let self, let conversation,
+                  let index = self.chats.firstIndex(where: { $0.id == chatID }),
+                  self.chats[index].conversation === conversation else { return }
+            let existing = self.chats[index]
+            self.chats[index] = existing.replacingModelOverride(with: actualModelID)
+            self.scheduleWorkspaceStateSave(projectID: projectID)
         }
         let accountAccess = accountAccess ?? ChatAccountAccess(
             binding: accountBinding,

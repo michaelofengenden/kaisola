@@ -915,12 +915,22 @@ actor AcpClient {
     private var decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
     private var eventHandler: EventHandler?
     private var pending: [Int: CheckedContinuation<JSONValue, any Error>] = [:]
+    /// One retained sleeper per in-flight request, cancelled the moment that
+    /// request settles. An unretained timer outlives the answer it was guarding
+    /// and keeps waking the actor for the rest of its window, so a busy session
+    /// accumulates tasks that can only report on requests already finished.
+    private var requestTimeouts: [Int: Task<Void, Never>] = [:]
     private var nextRequestID = 0
     private var readerTask: Task<Void, Never>?
     /// Invalidates callbacks that were awaiting a user decision when an adapter
     /// exits or a client is stopped/restarted. Without this guard, a resumed
     /// permission task could write its JSON-RPC response into the next adapter.
     private var connectionGeneration: UInt64 = 0
+    /// The reader and callback writers can discover the same broken connection
+    /// concurrently. Claim the generation before terminating it so exactly one
+    /// path owns the health transition and a stale send failure cannot close a
+    /// replacement adapter.
+    private var failingConnectionGeneration: UInt64?
     private var sessionID: String?
     private struct ScopedSessionIdentity: Sendable {
         let sessionID: String
@@ -1047,6 +1057,7 @@ actor AcpClient {
     ) async throws -> AcpSessionInfo {
         connectionGeneration &+= 1
         let startGeneration = connectionGeneration
+        failingConnectionGeneration = nil
         decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
         sessionID = nil
         activeSessionIdentity = nil
@@ -1368,6 +1379,7 @@ actor AcpClient {
 
     func stop() async {
         connectionGeneration &+= 1
+        failingConnectionGeneration = nil
         let reader = readerTask
         readerTask = nil
         reader?.cancel()
@@ -1375,8 +1387,7 @@ actor AcpClient {
         await transport.terminate()
         await reader?.value
         await terminalHost.releaseAll()
-        for continuation in pending.values { continuation.resume(throwing: AcpClientError.notRunning) }
-        pending.removeAll()
+        failAllPending(with: AcpClientError.notRunning)
         sessionID = nil
         activeSessionIdentity = nil
         restoringSessionIdentity = nil
@@ -1432,38 +1443,118 @@ actor AcpClient {
             "method": .string(method),
             "params": params,
         ]), purpose: .request(method: method))
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[id] = continuation
-            if timeoutNanoseconds > 0 {
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                // Cancellation is sticky, and the handler below can fire before
+                // this body runs, so this one check covers both orderings.
+                guard !Task.isCancelled else {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                pending[id] = continuation
+                if timeoutNanoseconds > 0 {
+                    requestTimeouts[id] = Task {
+                        try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                        guard !Task.isCancelled else { return }
+                        failRequest(id, error: AcpClientError.requestFailed("\(method) timed out"))
+                    }
+                }
                 Task {
-                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
-                    failRequest(id, error: AcpClientError.requestFailed("\(method) timed out"))
+                    do { try await transport.send(frame) }
+                    catch { failRequest(id, error: error) }
                 }
             }
-            Task {
-                do { try await transport.send(frame) }
-                catch { failRequest(id, error: error) }
+        } onCancel: {
+            // A cancelled caller settles its request now instead of leaving the
+            // continuation (and its sleeper) waiting out the whole window.
+            Task { await self.failRequest(id, error: CancellationError()) }
+        }
+    }
+
+    private enum OutboundCallbackKind {
+        case notification
+        case response
+
+        var failure: AcpClientError {
+            switch self {
+            case .notification:
+                .requestFailed(
+                    "Kaisola could not send an ACP notification. The agent connection was closed."
+                )
+            case .response:
+                .requestFailed(
+                    "Kaisola could not send an ACP callback response. The agent connection was closed."
+                )
             }
         }
     }
 
+    /// Callback delivery is part of connection health, not best-effort
+    /// telemetry. A failed notification can leave cancellation unapplied and a
+    /// failed response leaves the adapter waiting forever, so either failure
+    /// retires only the generation that attempted the write.
+    private func sendCallbackFrame(
+        _ frame: Data,
+        kind: OutboundCallbackKind,
+        sourceConnectionGeneration: UInt64
+    ) {
+        Task {
+            do {
+                try await transport.send(frame)
+            } catch {
+                await failConnection(
+                    kind.failure,
+                    sourceConnectionGeneration: sourceConnectionGeneration
+                )
+            }
+        }
+    }
+
+    private func failCallbackEncoding(
+        kind: OutboundCallbackKind,
+        sourceConnectionGeneration: UInt64
+    ) {
+        Task {
+            await failConnection(
+                kind.failure,
+                sourceConnectionGeneration: sourceConnectionGeneration
+            )
+        }
+    }
+
     private func notify(_ method: String, params: JSONValue) {
-        guard let frame = try? encode(.object([
-            "jsonrpc": .string("2.0"),
-            "method": .string(method),
-            "params": params,
-        ]), purpose: .notification(method: method)) else { return }
-        Task { try? await transport.send(frame) }
+        let generation = connectionGeneration
+        let frame: Data
+        do {
+            frame = try encode(.object([
+                "jsonrpc": .string("2.0"),
+                "method": .string(method),
+                "params": params,
+            ]), purpose: .notification(method: method))
+        } catch {
+            failCallbackEncoding(kind: .notification, sourceConnectionGeneration: generation)
+            return
+        }
+        sendCallbackFrame(
+            frame,
+            kind: .notification,
+            sourceConnectionGeneration: generation
+        )
     }
 
     private func respond(id: JSONValue, method: String, result: JSONValue) {
+        let generation = connectionGeneration
         do {
             let frame = try encode(.object([
                 "jsonrpc": .string("2.0"),
                 "id": id,
                 "result": result,
             ]), purpose: .response(method: method))
-            Task { try? await transport.send(frame) }
+            sendCallbackFrame(
+                frame,
+                kind: .response,
+                sourceConnectionGeneration: generation
+            )
         } catch {
             respondError(
                 id: id,
@@ -1482,6 +1573,7 @@ actor AcpClient {
         message: String,
         data: JSONValue? = nil
     ) {
+        let generation = connectionGeneration
         var error: [String: JSONValue] = [
             "code": .integer(Int64(code)),
             "message": .string(message),
@@ -1509,10 +1601,20 @@ actor AcpClient {
                     "data": outboundFrameRejectionData(error),
                 ]),
             ])
-            guard let bounded = try? encode(fallback, purpose: purpose) else { return }
+            guard let bounded = try? encode(fallback, purpose: purpose) else {
+                failCallbackEncoding(
+                    kind: .response,
+                    sourceConnectionGeneration: generation
+                )
+                return
+            }
             frame = bounded
         }
-        Task { try? await transport.send(frame) }
+        sendCallbackFrame(
+            frame,
+            kind: .response,
+            sourceConnectionGeneration: generation
+        )
     }
 
     private func encode(
@@ -1536,7 +1638,41 @@ actor AcpClient {
     }
 
     private func failRequest(_ id: Int, error: any Error) {
-        pending.removeValue(forKey: id)?.resume(throwing: error)
+        takePending(id)?.resume(throwing: error)
+    }
+
+    /// Take one request off the in-flight table and stop its timeout task.
+    /// Every single-request settlement — a response, a send failure, a fired
+    /// timeout, a cancelled caller — goes through here.
+    private func takePending(_ id: Int) -> CheckedContinuation<JSONValue, any Error>? {
+        requestTimeouts.removeValue(forKey: id)?.cancel()
+        return pending.removeValue(forKey: id)
+    }
+
+    /// Settle every in-flight request at once (stop, adapter exit, read
+    /// failure), cancelling the timers along with the continuations.
+    private func failAllPending(with error: any Error) {
+        for timeout in requestTimeouts.values { timeout.cancel() }
+        requestTimeouts.removeAll()
+        let waiters = pending
+        pending.removeAll()
+        for continuation in waiters.values { continuation.resume(throwing: error) }
+    }
+
+    // MARK: - Request testing hooks
+
+    /// In-flight request timers, so tests can prove a settled request leaves
+    /// none behind.
+    func outstandingRequestTimeoutCountForTesting() -> Int { requestTimeouts.count }
+
+    /// Drive one raw JSON-RPC request with a caller-chosen timeout. Tests need
+    /// a window far shorter than the 30s default to exercise the timeout path.
+    func requestForTesting(
+        _ method: String,
+        params: JSONValue = .object([:]),
+        timeoutNanoseconds: UInt64
+    ) async throws -> JSONValue {
+        try await request(method, params: params, timeoutNanoseconds: timeoutNanoseconds)
     }
 
     // MARK: - Read loop
@@ -1548,6 +1684,10 @@ actor AcpClient {
                 guard let data = try await transport.receive(maximumBytes: 256 * 1_024) else {
                     guard sourceConnectionGeneration == connectionGeneration else { return }
                     guard !Task.isCancelled else { return }
+                    // A callback writer already owns this generation's health
+                    // transition. Its terminate() wakes receive with EOF; the
+                    // reader must not emit a second exit or terminate twice.
+                    guard failingConnectionGeneration != sourceConnectionGeneration else { return }
                     // EOF is the transport connection closing. Reap the whole
                     // adapter-owned process group before publishing the exit;
                     // the adapter may have closed stdout while remaining alive.
@@ -1562,20 +1702,20 @@ actor AcpClient {
                     restoringSessionIdentity = nil
                     workspaceRoot = nil
                     eventHandler?(.exited(code: code))
-                    for continuation in pending.values { continuation.resume(throwing: AcpClientError.adapterExited(code: code)) }
-                    pending.removeAll()
+                    failAllPending(with: AcpClientError.adapterExited(code: code))
                     return
                 }
                 guard sourceConnectionGeneration == connectionGeneration else { return }
                 if data.isEmpty { continue }
                 var active = decoder
                 try active.consume(data) { frame in
+                    // ACP's stdout carries nothing but JSON-RPC, so a frame the
+                    // decoder rejects means the stream can no longer be trusted:
+                    // those bytes may have been the response or the permission
+                    // request this turn is waiting on. Skipping them (the old
+                    // `try?`) left the turn hanging until an unrelated timeout.
                     guard let value = try? JSONDecoder().decode(JSONValue.self, from: frame) else {
-                        respondError(id: .null, code: -32700, message: "Parse error")
-                        if recordInboundProtocolViolation(.parseError) {
-                            throw AcpJSONRPCReadLoopError.violationLimitReached
-                        }
-                        return
+                        throw AcpClientError.malformedFrame(Self.framePreview(frame))
                     }
                     if handle(value, sourceConnectionGeneration: sourceConnectionGeneration) {
                         throw AcpJSONRPCReadLoopError.violationLimitReached
@@ -1586,18 +1726,81 @@ actor AcpClient {
         } catch {
             guard !Task.isCancelled,
                   sourceConnectionGeneration == connectionGeneration else { return }
-            await transport.terminate()
-            guard !Task.isCancelled,
-                  sourceConnectionGeneration == connectionGeneration else { return }
-            connectionGeneration &+= 1
-            cancelPermissionRequests()
-            sessionID = nil
-            activeSessionIdentity = nil
-            restoringSessionIdentity = nil
-            workspaceRoot = nil
-            for continuation in pending.values { continuation.resume(throwing: error) }
-            pending.removeAll()
-            eventHandler?(.error(error.localizedDescription))
+            await failConnection(
+                Self.protocolFailure(error),
+                sourceConnectionGeneration: sourceConnectionGeneration
+            )
+        }
+    }
+
+    /// End a connection that broke below the JSON-RPC layer. The adapter is
+    /// terminated rather than left half-read, every awaiting request and
+    /// permission is failed instead of waiting out a timeout, and the reason is
+    /// reported once: `.exited` marks the connection gone (so the chat offers a
+    /// restart) and `.error` carries the diagnostic the user actually needs.
+    private func failConnection(
+        _ error: AcpClientError,
+        sourceConnectionGeneration: UInt64
+    ) async {
+        guard !Task.isCancelled,
+              sourceConnectionGeneration == connectionGeneration,
+              failingConnectionGeneration == nil else { return }
+        failingConnectionGeneration = sourceConnectionGeneration
+        await transport.terminate()
+        guard !Task.isCancelled,
+              sourceConnectionGeneration == connectionGeneration else {
+            if failingConnectionGeneration == sourceConnectionGeneration {
+                failingConnectionGeneration = nil
+            }
+            return
+        }
+        let code = await transport.exitCode() ?? -1
+        guard !Task.isCancelled,
+              sourceConnectionGeneration == connectionGeneration else {
+            if failingConnectionGeneration == sourceConnectionGeneration {
+                failingConnectionGeneration = nil
+            }
+            return
+        }
+        connectionGeneration &+= 1
+        failingConnectionGeneration = nil
+        cancelPermissionRequests()
+        sessionID = nil
+        activeSessionIdentity = nil
+        restoringSessionIdentity = nil
+        workspaceRoot = nil
+        failAllPending(with: error)
+        eventHandler?(.exited(code: code))
+        eventHandler?(.error(errorText(error)))
+    }
+
+    /// Bytes of a rejected frame kept for its diagnostic. Adapter output can be
+    /// megabytes wide; a status line and a log entry cannot.
+    static let framePreviewByteLimit = 160
+
+    /// A short single-line excerpt of a frame the client refused, safe for a
+    /// status line: control bytes are flattened and everything past the limit
+    /// becomes the frame's real size.
+    static func framePreview(_ frame: Data, limit: Int = framePreviewByteLimit) -> String {
+        let head = String(decoding: frame.prefix(limit), as: UTF8.self)
+        let flattened = String(String.UnicodeScalarView(head.unicodeScalars.map {
+            CharacterSet.controlCharacters.contains($0) ? " " : $0
+        })).trimmingCharacters(in: .whitespaces)
+        guard !flattened.isEmpty else { return "\(frame.count) unreadable bytes" }
+        return frame.count > limit ? "\(flattened)… (\(frame.count) bytes)" : flattened
+    }
+
+    /// Map a framing failure onto the client's own error vocabulary, so the chat
+    /// shows a sentence instead of `BrokerWireError error 1`.
+    private static func protocolFailure(_ error: any Error) -> AcpClientError {
+        if let error = error as? AcpClientError { return error }
+        switch error as? BrokerWireError {
+        case .invalidUTF8: return .malformedFrame("the bytes are not valid UTF-8")
+        case .incompleteFrame: return .malformedFrame("the message ended mid-frame")
+        case .frameTooLarge: return .frameTooLarge
+        case nil: return .requestFailed(
+            (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        )
         }
     }
 
@@ -1622,7 +1825,7 @@ actor AcpClient {
 
         case let .valid(.response(idValue, payload)):
             guard let id = idValue.intValue.flatMap(Int.init(exactly:)) else { return false }
-            let continuation = pending.removeValue(forKey: id)
+            let continuation = takePending(id)
             switch payload {
             case let .result(result):
                 continuation?.resume(returning: result)

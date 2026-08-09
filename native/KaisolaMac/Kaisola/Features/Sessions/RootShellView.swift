@@ -1745,6 +1745,79 @@ struct RootShellView: View {
         }
     }
 
+    /// Choose only the provider account for an already-restored chat. Its
+    /// execution location is fixed by the existing session, so presenting the
+    /// Run on picker here would incorrectly imply that switching credentials
+    /// can also move the continuation to another project or worktree.
+    @MainActor
+    private static func chooseSessionAccount(
+        for agent: AgentProfile,
+        then handle: @escaping @MainActor (UsageAccountProfile?) -> Void
+    ) {
+        guard let provider = SessionAccountBinding.provider(forAgentID: agent.id) else {
+            handle(nil)
+            return
+        }
+        var profiles = UsageAccountStore().profiles()
+            .filter { $0.provider == provider }
+        if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+           ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "account-picker" {
+            profiles = [
+                UsageAccountProfile(
+                    id: "visual-work",
+                    provider: provider,
+                    label: "Work",
+                    directory: "/Users/example/.\(provider.rawValue)-work"
+                ),
+                UsageAccountProfile(
+                    id: "visual-research",
+                    provider: provider,
+                    label: "Research",
+                    directory: "/Users/example/.\(provider.rawValue)-research"
+                ),
+            ]
+        }
+        profiles.sort {
+            $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending
+        }
+        guard !profiles.isEmpty else {
+            handle(nil)
+            return
+        }
+
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 340, height: 26))
+        picker.addItem(withTitle: "Project/default")
+        picker.item(at: 0)?.toolTip = "Use this project's effective \(provider.environmentKey)"
+        for profile in profiles {
+            picker.addItem(withTitle: profile.label)
+            picker.item(at: picker.numberOfItems - 1)?.toolTip = profile.expandedDirectory
+        }
+        picker.setAccessibilityLabel("Account")
+
+        let alert = NSAlert()
+        alert.messageText = "Choose \(agent.name) account"
+        alert.informativeText = "This account stays locked to the restored session and its continuations. Credentials remain in the provider's own config directory."
+        alert.alertStyle = .informational
+        alert.accessoryView = picker
+        alert.addButton(withTitle: "Switch")
+        alert.addButton(withTitle: "Cancel")
+
+        let finish: @MainActor (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .alertFirstButtonReturn else { return }
+            let selected = picker.indexOfSelectedItem
+            handle(selected > 0 ? profiles[selected - 1] : nil)
+        }
+        if let window = NSApp.keyWindow
+            ?? NSApp.mainWindow
+            ?? NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) }) {
+            alert.beginSheetModal(for: window) { response in
+                Task { @MainActor in finish(response) }
+            }
+        } else {
+            finish(alert.runModal())
+        }
+    }
+
     /// New Mesh belongs to the active project. The project-scoped plus menu is
     /// the place to create one; a global folder picker would make its ACP/MCP
     /// account and configuration context ambiguous.

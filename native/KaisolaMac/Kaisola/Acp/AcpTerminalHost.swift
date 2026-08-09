@@ -23,11 +23,41 @@ actor AcpTerminalHost {
         case descendantTimeout = "descendant_timeout"
     }
 
+    struct KillStatus: Equatable, Sendable {
+        enum State: String, Equatable, Sendable {
+            case sigtermRequested = "sigterm_requested"
+            case sigkillRetrying = "sigkill_retrying"
+            case sigkillSent = "sigkill_sent"
+            case reconcilingExit = "reconciling_exit"
+            case failed
+        }
+
+        let state: State
+        let attempts: Int
+        let errorNumber: Int32?
+        let message: String
+        let retryable: Bool
+        let processMayBeRunning: Bool
+    }
+
+    enum WaitOutcome: Equatable, Sendable {
+        case exited(ExitStatus)
+        case terminationFailed(KillStatus)
+    }
+
+    enum SignalDeliveryResult: Equatable, Sendable {
+        case sent
+        case failed(errorNumber: Int32)
+    }
+
+    typealias SignalSender = @Sendable (_ pid: Int32, _ signal: Int32) -> SignalDeliveryResult
+
     struct Snapshot: Equatable, Sendable {
         let output: String
         let truncated: Bool
         let exitStatus: ExitStatus?
         let outputState: OutputState
+        let killStatus: KillStatus?
         let outputBufferStats: OutputBufferStats
 
         init(
@@ -35,12 +65,14 @@ actor AcpTerminalHost {
             truncated: Bool,
             exitStatus: ExitStatus?,
             outputState: OutputState? = nil,
+            killStatus: KillStatus? = nil,
             outputBufferStats: OutputBufferStats = .empty
         ) {
             self.output = output
             self.truncated = truncated
             self.exitStatus = exitStatus
             self.outputState = outputState ?? (exitStatus == nil ? .running : .complete)
+            self.killStatus = killStatus
             self.outputBufferStats = outputBufferStats
         }
     }
@@ -80,6 +112,10 @@ actor AcpTerminalHost {
     /// terminal forever. At the deadline the read end is closed for real;
     /// waiters resolve only after the bounded stream drains and reaches EOF.
     static let defaultDescendantPipeDrainTimeoutNanoseconds: UInt64 = 10_000_000_000
+    static let defaultSIGKILLEscalationDelayNanoseconds: UInt64 = 3_000_000_000
+    static let sigkillRetryDelayNanoseconds: UInt64 = 50_000_000
+    static let maximumSIGKILLAttempts = 3
+    static let maximumSIGKILLRetryWindowNanoseconds: UInt64 = 250_000_000
     private static let signalNames: [Int32: String] = [
         SIGHUP: "SIGHUP", SIGINT: "SIGINT", SIGQUIT: "SIGQUIT", SIGKILL: "SIGKILL",
         SIGTERM: "SIGTERM", SIGPIPE: "SIGPIPE", SIGSEGV: "SIGSEGV", SIGABRT: "SIGABRT",
@@ -353,8 +389,11 @@ actor AcpTerminalHost {
         var outputState: OutputState = .running
         var pipeEOFReached = false
         var pipeDrainTimeoutTask: Task<Void, Never>?
+        var killEscalationTask: Task<Void, Never>?
+        var killStatus: KillStatus?
         var released = false
         var waiters: [CheckedContinuation<ExitStatus, Never>] = []
+        var outcomeWaiters: [CheckedContinuation<WaitOutcome, Never>] = []
         let outputStreamBuffer: OutputStreamBuffer
         /// Chunks at or below this sequence precede a stream overflow and can
         /// no longer be part of the contiguous retained suffix.
@@ -376,12 +415,22 @@ actor AcpTerminalHost {
     private var entries: [String: Entry] = [:]
     private var counter = 0
     private let descendantPipeDrainTimeoutNanoseconds: UInt64
+    private let sigkillEscalationDelayNanoseconds: UInt64
+    private let sigkillRetryDelayNanoseconds: UInt64
+    private let signalSender: SignalSender
 
     init(
         descendantPipeDrainTimeoutNanoseconds: UInt64 =
-            AcpTerminalHost.defaultDescendantPipeDrainTimeoutNanoseconds
+            AcpTerminalHost.defaultDescendantPipeDrainTimeoutNanoseconds,
+        sigkillEscalationDelayNanoseconds: UInt64 =
+            AcpTerminalHost.defaultSIGKILLEscalationDelayNanoseconds,
+        sigkillRetryDelayNanoseconds: UInt64 = AcpTerminalHost.sigkillRetryDelayNanoseconds,
+        signalSender: @escaping SignalSender = AcpTerminalHost.systemSignalSender
     ) {
         self.descendantPipeDrainTimeoutNanoseconds = descendantPipeDrainTimeoutNanoseconds
+        self.sigkillEscalationDelayNanoseconds = sigkillEscalationDelayNanoseconds
+        self.sigkillRetryDelayNanoseconds = sigkillRetryDelayNanoseconds
+        self.signalSender = signalSender
     }
 
     /// Spawn a command. `env` pairs overlay the app environment; a relative or
@@ -470,6 +519,7 @@ actor AcpTerminalHost {
             truncated: entry.buffer.truncated || entry.outputState == .descendantTimeout,
             exitStatus: entry.exitStatus,
             outputState: entry.outputState,
+            killStatus: entry.killStatus,
             outputBufferStats: bufferState.stats
         )
     }
@@ -482,14 +532,48 @@ actor AcpTerminalHost {
         }
     }
 
+    /// ACP waiters need an actionable answer when a requested kill cannot be
+    /// delivered, but that failure is not an exit. The ordinary exit waiter
+    /// remains available for UI/tests that must await actual process death.
+    func waitForExitOutcome(_ id: String) async -> WaitOutcome? {
+        guard let entry = entries[id] else { return nil }
+        if let status = entry.exitStatus { return .exited(status) }
+        if let killStatus = entry.killStatus, killStatus.state == .failed {
+            return .terminationFailed(killStatus)
+        }
+        return await withCheckedContinuation { continuation in
+            entry.outcomeWaiters.append(continuation)
+        }
+    }
+
     /// SIGTERM now, SIGKILL if the process lingers.
-    func kill(_ id: String) {
-        guard let entry = entries[id], entry.exitStatus == nil, entry.process.isRunning else { return }
+    @discardableResult
+    func kill(_ id: String) -> KillStatus? {
+        guard let entry = entries[id] else { return nil }
+        guard entry.exitStatus == nil, entry.directChildExit == nil,
+              entry.process.isRunning else { return entry.killStatus }
         let pid = entry.process.processIdentifier
         entry.process.terminate()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [weak self] in
-            Task { await self?.forceKillIfRunning(id: id, pid: pid) }
+        let requested = KillStatus(
+            state: .sigtermRequested,
+            attempts: 0,
+            errorNumber: nil,
+            message: "SIGTERM requested; SIGKILL will follow if the process is still running.",
+            retryable: true,
+            processMayBeRunning: true
+        )
+        entry.killStatus = requested
+        entry.killEscalationTask?.cancel()
+        let delay = sigkillEscalationDelayNanoseconds
+        entry.killEscalationTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
+                return
+            }
+            await self?.forceKillIfRunning(id: id, pid: pid)
         }
+        return requested
     }
 
     /// Invalidate the id; a still-running process is killed first.
@@ -502,6 +586,7 @@ actor AcpTerminalHost {
             closeLingeringDescendantPipe(id: id, timedOut: false)
         } else {
             entry.pipeDrainTimeoutTask?.cancel()
+            entry.killEscalationTask?.cancel()
             entry.outputReadHandle.readabilityHandler = nil
             try? entry.outputReadHandle.close()
             entry.outputStreamBuffer.finish()
@@ -541,6 +626,8 @@ actor AcpTerminalHost {
     /// status once the independently-owned output pipe reaches real EOF.
     private func recordExit(id: String, status: ExitStatus) {
         guard let entry = entries[id] else { return }
+        entry.killEscalationTask?.cancel()
+        entry.killEscalationTask = nil
         entry.directChildExit = status
         if entry.pipeEOFReached {
             entry.outputState = .complete
@@ -597,12 +684,141 @@ actor AcpTerminalHost {
         entry.exitStatus = status
         for waiter in entry.waiters { waiter.resume(returning: status) }
         entry.waiters.removeAll()
+        for waiter in entry.outcomeWaiters { waiter.resume(returning: .exited(status)) }
+        entry.outcomeWaiters.removeAll()
         if entry.released { entries[id] = nil }
     }
 
-    private func forceKillIfRunning(id: String, pid: Int32) {
-        guard let entry = entries[id], entry.exitStatus == nil else { return }
-        _ = Darwin.kill(pid, SIGKILL)
+    private func forceKillIfRunning(id: String, pid: Int32) async {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let (sum, overflow) = startedAt.addingReportingOverflow(
+            Self.maximumSIGKILLRetryWindowNanoseconds
+        )
+        let retryDeadline = overflow ? UInt64.max : sum
+        for attempt in 1...Self.maximumSIGKILLAttempts {
+            guard let entry = entries[id], entry.exitStatus == nil,
+                  entry.directChildExit == nil, entry.process.isRunning,
+                  entry.process.processIdentifier == pid else { return }
+            if attempt > 1, DispatchTime.now().uptimeNanoseconds >= retryDeadline {
+                recordKillFailure(
+                    entry,
+                    errorNumber: EINTR,
+                    attempts: attempt - 1,
+                    message: "SIGKILL retry window expired after \(attempt - 1) attempts (EINTR); the process may still be running. Retry terminal/kill."
+                )
+                return
+            }
+
+            switch signalSender(pid, SIGKILL) {
+            case .sent:
+                entry.killStatus = KillStatus(
+                    state: .sigkillSent,
+                    attempts: attempt,
+                    errorNumber: nil,
+                    message: "SIGKILL was delivered; waiting for the process exit notification.",
+                    retryable: false,
+                    processMayBeRunning: true
+                )
+                return
+            case .failed(errorNumber: ESRCH):
+                // ESRCH commonly means exit won the race. Never synthesize an
+                // exit: retain the entry until Process confirms termination.
+                entry.killStatus = KillStatus(
+                    state: .reconcilingExit,
+                    attempts: attempt,
+                    errorNumber: ESRCH,
+                    message: "SIGKILL found no process (ESRCH); waiting for the process exit notification.",
+                    retryable: false,
+                    processMayBeRunning: false
+                )
+                return
+            case .failed(errorNumber: EINTR) where attempt < Self.maximumSIGKILLAttempts:
+                entry.killStatus = KillStatus(
+                    state: .sigkillRetrying,
+                    attempts: attempt,
+                    errorNumber: EINTR,
+                    message: "SIGKILL was interrupted (EINTR); retrying within the bounded escalation window.",
+                    retryable: true,
+                    processMayBeRunning: true
+                )
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard now < retryDeadline else {
+                    recordKillFailure(
+                        entry,
+                        errorNumber: EINTR,
+                        attempts: attempt,
+                        message: "SIGKILL retry window expired after \(attempt) attempts (EINTR); the process may still be running. Retry terminal/kill."
+                    )
+                    return
+                }
+                let delay = min(sigkillRetryDelayNanoseconds, retryDeadline - now)
+                do {
+                    try await Task.sleep(nanoseconds: delay)
+                } catch {
+                    return
+                }
+            case let .failed(errorNumber):
+                let exhausted = errorNumber == EINTR
+                let message = exhausted
+                    ? "SIGKILL remained interrupted after \(attempt) attempts (EINTR); the process may still be running. Retry terminal/kill."
+                    : "SIGKILL failed with \(Self.errnoName(errorNumber)) (errno \(errorNumber)); the process may still be running. Check permissions, then retry terminal/kill."
+                recordKillFailure(
+                    entry,
+                    errorNumber: errorNumber,
+                    attempts: attempt,
+                    message: message
+                )
+                return
+            }
+        }
+    }
+
+    private func recordKillFailure(
+        _ entry: Entry,
+        errorNumber: Int32,
+        attempts: Int,
+        message: String
+    ) {
+        let failure = KillStatus(
+            state: .failed,
+            attempts: attempts,
+            errorNumber: errorNumber,
+            message: message,
+            retryable: false,
+            processMayBeRunning: true
+        )
+        entry.killStatus = failure
+        for waiter in entry.outcomeWaiters {
+            waiter.resume(returning: .terminationFailed(failure))
+        }
+        entry.outcomeWaiters.removeAll()
+    }
+
+    func processIdentifierForTesting(_ id: String) -> Int32? {
+        entries[id]?.process.processIdentifier
+    }
+
+    func forceKillForTesting(_ id: String) async {
+        guard let pid = entries[id]?.process.processIdentifier else { return }
+        await forceKillIfRunning(id: id, pid: pid)
+    }
+
+    nonisolated static func systemSignalSender(
+        pid: Int32,
+        signal: Int32
+    ) -> SignalDeliveryResult {
+        if Darwin.kill(pid, signal) == 0 { return .sent }
+        return .failed(errorNumber: errno)
+    }
+
+    nonisolated private static func errnoName(_ errorNumber: Int32) -> String {
+        switch errorNumber {
+        case EINTR: "EINTR"
+        case ESRCH: "ESRCH"
+        case EPERM: "EPERM"
+        case EINVAL: "EINVAL"
+        default: "POSIX error"
+        }
     }
 
     private static func shellQuote(_ value: String) -> String {

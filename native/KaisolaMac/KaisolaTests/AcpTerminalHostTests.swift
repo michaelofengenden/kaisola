@@ -360,8 +360,8 @@ final class AcpTerminalHostTests: XCTestCase {
     func testKillTerminatesALongRunningProcess() async throws {
         let host = AcpTerminalHost()
         let id = try await host.create(
-            command: "/bin/sleep",
-            args: ["30"],
+            command: "exec",
+            args: ["/bin/sleep", "30"],
             env: [:],
             cwd: FileManager.default.temporaryDirectory.path,
             outputByteLimit: nil
@@ -372,6 +372,191 @@ final class AcpTerminalHostTests: XCTestCase {
         // (128+SIGTERM) or propagate the signal itself — either proves death.
         XCTAssertNotNil(status)
         XCTAssertTrue(status?.signal != nil || (status?.exitCode ?? 0) != 0)
+    }
+
+    func testSIGKILLEscalationSuccessIsRecordedUntilActualExit() async throws {
+        let sender = ScriptedSignalSender([
+            .deliverAndReport(.sent),
+        ])
+        let host = AcpTerminalHost(
+            sigkillEscalationDelayNanoseconds: 0,
+            signalSender: { sender.send(pid: $0, signal: $1) }
+        )
+        let id = try await host.create(
+            command: "exec",
+            args: ["/bin/sleep", "30"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        let createdPID = await host.processIdentifierForTesting(id)
+        let pid = try XCTUnwrap(createdPID)
+        defer { _ = Darwin.kill(pid, SIGKILL) }
+
+        await host.forceKillForTesting(id)
+        let statusAfterSend = await host.output(id)?.killStatus
+        XCTAssertEqual(statusAfterSend?.state, .sigkillSent)
+        XCTAssertEqual(statusAfterSend?.attempts, 1)
+        XCTAssertNil(statusAfterSend?.errorNumber)
+        XCTAssertEqual(sender.callCount, 1)
+
+        let exit = await host.waitForExit(id)
+        XCTAssertNotNil(exit)
+        let completed = await host.output(id)
+        XCTAssertEqual(completed?.killStatus, statusAfterSend)
+        await host.release(id)
+    }
+
+    func testSIGKILLESRCHReconcilesWithoutSynthesizingExitOrRemovingEntry() async throws {
+        let sender = ScriptedSignalSender([
+            .report(.failed(errorNumber: ESRCH)),
+        ])
+        let host = AcpTerminalHost(
+            sigkillEscalationDelayNanoseconds: 0,
+            sigkillRetryDelayNanoseconds: 0,
+            signalSender: { sender.send(pid: $0, signal: $1) }
+        )
+        let id = try await host.create(
+            command: "exec",
+            args: ["/bin/sleep", "30"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        let createdPID = await host.processIdentifierForTesting(id)
+        let pid = try XCTUnwrap(createdPID)
+        defer { _ = Darwin.kill(pid, SIGKILL) }
+
+        await host.forceKillForTesting(id)
+        let reconciling = await host.output(id)
+        XCTAssertNotNil(reconciling, "ESRCH is not proof of a delivered Process exit callback")
+        XCTAssertNil(reconciling?.exitStatus)
+        XCTAssertEqual(reconciling?.killStatus?.state, .reconcilingExit)
+        XCTAssertEqual(reconciling?.killStatus?.errorNumber, ESRCH)
+        XCTAssertFalse(reconciling?.killStatus?.processMayBeRunning ?? true)
+        XCTAssertEqual(sender.callCount, 1)
+
+        XCTAssertEqual(Darwin.kill(pid, SIGKILL), 0)
+        let exit = await host.waitForExit(id)
+        XCTAssertNotNil(exit)
+        let completed = await host.output(id)
+        XCTAssertEqual(completed?.killStatus?.state, .reconcilingExit)
+        await host.release(id)
+    }
+
+    func testSIGKILLEINTRRetriesOnceThenRecordsSuccessfulDelivery() async throws {
+        let sender = ScriptedSignalSender([
+            .report(.failed(errorNumber: EINTR)),
+            .deliverAndReport(.sent),
+        ])
+        let host = AcpTerminalHost(
+            sigkillEscalationDelayNanoseconds: 0,
+            sigkillRetryDelayNanoseconds: 0,
+            signalSender: { sender.send(pid: $0, signal: $1) }
+        )
+        let id = try await host.create(
+            command: "exec",
+            args: ["/bin/sleep", "30"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        let createdPID = await host.processIdentifierForTesting(id)
+        let pid = try XCTUnwrap(createdPID)
+        defer { _ = Darwin.kill(pid, SIGKILL) }
+
+        await host.forceKillForTesting(id)
+        let delivered = await host.output(id)?.killStatus
+        XCTAssertEqual(sender.callCount, 2)
+        XCTAssertEqual(delivered?.state, .sigkillSent)
+        XCTAssertEqual(delivered?.attempts, 2)
+        XCTAssertFalse(delivered?.retryable ?? true)
+        let exit = await host.waitForExit(id)
+        XCTAssertNotNil(exit)
+        await host.release(id)
+    }
+
+    func testSIGKILLPersistentEINTRStopsAtTheStrictAttemptBound() async throws {
+        let sender = ScriptedSignalSender(Array(
+            repeating: .report(.failed(errorNumber: EINTR)),
+            count: AcpTerminalHost.maximumSIGKILLAttempts
+        ))
+        let host = AcpTerminalHost(
+            sigkillEscalationDelayNanoseconds: 0,
+            signalSender: { sender.send(pid: $0, signal: $1) }
+        )
+        let id = try await host.create(
+            command: "exec",
+            args: ["/bin/sleep", "30"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        let createdPID = await host.processIdentifierForTesting(id)
+        let pid = try XCTUnwrap(createdPID)
+        defer { _ = Darwin.kill(pid, SIGKILL) }
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        await host.forceKillForTesting(id)
+        let elapsed = started.duration(to: clock.now)
+        let failure = await host.output(id)?.killStatus
+        XCTAssertEqual(sender.callCount, AcpTerminalHost.maximumSIGKILLAttempts)
+        XCTAssertLessThan(elapsed, .seconds(1), "EINTR retries must stay inside the strict retry window")
+        XCTAssertEqual(failure?.state, .failed)
+        XCTAssertEqual(failure?.attempts, AcpTerminalHost.maximumSIGKILLAttempts)
+        XCTAssertEqual(failure?.errorNumber, EINTR)
+        XCTAssertTrue(failure?.message.contains("Retry terminal/kill") == true)
+        let retained = await host.output(id)
+        XCTAssertNotNil(retained, "a failed escalation must retain the live entry")
+
+        XCTAssertEqual(Darwin.kill(pid, SIGKILL), 0)
+        let exit = await host.waitForExit(id)
+        XCTAssertNotNil(exit)
+        await host.release(id)
+    }
+
+    func testSIGKILLEPERMReturnsActionableWaitFailureButRetainsEntryUntilEventualExit() async throws {
+        let sender = ScriptedSignalSender([
+            .report(.failed(errorNumber: EPERM)),
+        ])
+        let host = AcpTerminalHost(
+            sigkillEscalationDelayNanoseconds: 0,
+            sigkillRetryDelayNanoseconds: 0,
+            signalSender: { sender.send(pid: $0, signal: $1) }
+        )
+        let id = try await host.create(
+            command: "exec",
+            args: ["/bin/sleep", "30"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        let createdPID = await host.processIdentifierForTesting(id)
+        let pid = try XCTUnwrap(createdPID)
+        defer { _ = Darwin.kill(pid, SIGKILL) }
+
+        await host.forceKillForTesting(id)
+        let failedSnapshot = await host.output(id)
+        let failure = try XCTUnwrap(failedSnapshot?.killStatus)
+        XCTAssertEqual(failure.state, .failed)
+        XCTAssertEqual(failure.errorNumber, EPERM)
+        XCTAssertFalse(failure.retryable)
+        XCTAssertTrue(failure.processMayBeRunning)
+        XCTAssertTrue(failure.message.contains("Check permissions"))
+        XCTAssertNil(failedSnapshot?.exitStatus)
+        XCTAssertNotNil(failedSnapshot, "permanent failure must not discard a live terminal")
+        let waitOutcome = await host.waitForExitOutcome(id)
+        XCTAssertEqual(waitOutcome, .terminationFailed(failure))
+
+        XCTAssertEqual(Darwin.kill(pid, SIGKILL), 0)
+        let exit = await host.waitForExit(id)
+        XCTAssertNotNil(exit)
+        let exitedSnapshot = await host.output(id)
+        XCTAssertNotNil(exitedSnapshot, "actual exit remains inspectable until release")
+        await host.release(id)
+        let released = await host.output(id)
+        XCTAssertNil(released)
     }
 
     func testReleaseInvalidatesTheTerminalID() async throws {
@@ -418,5 +603,38 @@ private actor TerminalExitReceipt {
 
     func value() -> AcpTerminalHost.ExitStatus? {
         recorded
+    }
+}
+
+private final class ScriptedSignalSender: @unchecked Sendable {
+    enum Step {
+        case report(AcpTerminalHost.SignalDeliveryResult)
+        case deliverAndReport(AcpTerminalHost.SignalDeliveryResult)
+    }
+
+    private let lock = NSLock()
+    private var steps: [Step]
+    private var calls = 0
+
+    init(_ steps: [Step]) {
+        self.steps = steps
+    }
+
+    var callCount: Int {
+        lock.withLock { calls }
+    }
+
+    func send(pid: Int32, signal: Int32) -> AcpTerminalHost.SignalDeliveryResult {
+        lock.withLock {
+            calls += 1
+            guard !steps.isEmpty else { return .failed(errorNumber: EIO) }
+            switch steps.removeFirst() {
+            case let .report(result):
+                return result
+            case let .deliverAndReport(result):
+                _ = Darwin.kill(pid, signal)
+                return result
+            }
+        }
     }
 }

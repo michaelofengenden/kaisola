@@ -614,23 +614,36 @@ actor AcpClient {
                         "outputState": .string(snapshot.outputState.rawValue),
                     ]
                     if let status = snapshot.exitStatus { result["exitStatus"] = Self.encode(status) }
+                    if let killStatus = snapshot.killStatus {
+                        result["killStatus"] = Self.encode(killStatus)
+                    }
                     respond(id: id, result: .object(result))
                 case "terminal/wait_for_exit":
                     guard let terminalID = object["terminalId"]?.stringValue,
-                          let status = await terminalHost.waitForExit(terminalID) else {
+                          let outcome = await terminalHost.waitForExitOutcome(terminalID) else {
                         throw AcpClientError.requestFailed("unknown terminal")
                     }
-                    var result: [String: JSONValue] = ["exitStatus": Self.encode(status)]
-                    if let snapshot = await terminalHost.output(terminalID) {
-                        result["outputState"] = .string(snapshot.outputState.rawValue)
+                    switch outcome {
+                    case let .exited(status):
+                        var result: [String: JSONValue] = ["exitStatus": Self.encode(status)]
+                        if let snapshot = await terminalHost.output(terminalID) {
+                            result["outputState"] = .string(snapshot.outputState.rawValue)
+                            if let killStatus = snapshot.killStatus {
+                                result["killStatus"] = Self.encode(killStatus)
+                            }
+                        }
+                        respond(id: id, result: .object(result))
+                    case let .terminationFailed(killStatus):
+                        throw AcpClientError.requestFailed(killStatus.message)
                     }
-                    respond(id: id, result: .object(result))
                 case "terminal/kill":
                     guard let terminalID = object["terminalId"]?.stringValue else {
                         throw AcpClientError.requestFailed("terminal/kill requires terminalId")
                     }
-                    await terminalHost.kill(terminalID)
-                    respond(id: id, result: .object([:]))
+                    let killStatus = await terminalHost.kill(terminalID)
+                    var result: [String: JSONValue] = [:]
+                    if let killStatus { result["killStatus"] = Self.encode(killStatus) }
+                    respond(id: id, result: .object(result))
                 case "terminal/release":
                     guard let terminalID = object["terminalId"]?.stringValue else {
                         throw AcpClientError.requestFailed("terminal/release requires terminalId")
@@ -650,6 +663,20 @@ actor AcpClient {
         var fields: [String: JSONValue] = [:]
         if let code = status.exitCode { fields["exitCode"] = .integer(Int64(code)) }
         if let signal = status.signal { fields["signal"] = .string(signal) }
+        return .object(fields)
+    }
+
+    private static func encode(_ status: AcpTerminalHost.KillStatus) -> JSONValue {
+        var fields: [String: JSONValue] = [
+            "state": .string(status.state.rawValue),
+            "attempts": .integer(Int64(status.attempts)),
+            "message": .string(status.message),
+            "retryable": .bool(status.retryable),
+            "processMayBeRunning": .bool(status.processMayBeRunning),
+        ]
+        if let errorNumber = status.errorNumber {
+            fields["errno"] = .integer(Int64(errorNumber))
+        }
         return .object(fields)
     }
 

@@ -711,6 +711,197 @@ private enum AcpJSONRPCReadLoopError: LocalizedError {
     }
 }
 
+/// Outbound ACP frames are measured before `JSONEncoder` is allowed to build
+/// its `Data`. The global ceiling mirrors the inbound decoder. Prompts use a
+/// smaller ceiling that still carries the conversation's existing 20 MiB
+/// staged-attachment budget after base64 expansion, while file and terminal
+/// responses get bounded headroom above their existing 8 MiB source caps.
+struct AcpOutboundFrameLimits: Equatable, Sendable {
+    let globalMaximumBytes: Int
+    let promptMaximumBytes: Int
+    let toolResponseMaximumBytes: Int
+
+    static let production = AcpOutboundFrameLimits(
+        globalMaximumBytes: 64 * 1_024 * 1_024,
+        promptMaximumBytes: 32 * 1_024 * 1_024,
+        toolResponseMaximumBytes: 12 * 1_024 * 1_024
+    )
+
+    init(
+        globalMaximumBytes: Int,
+        promptMaximumBytes: Int,
+        toolResponseMaximumBytes: Int
+    ) {
+        precondition(globalMaximumBytes > 0)
+        precondition((1...globalMaximumBytes).contains(promptMaximumBytes))
+        precondition((1...globalMaximumBytes).contains(toolResponseMaximumBytes))
+        self.globalMaximumBytes = globalMaximumBytes
+        self.promptMaximumBytes = promptMaximumBytes
+        self.toolResponseMaximumBytes = toolResponseMaximumBytes
+    }
+
+    func maximumBytes(for purpose: AcpOutboundFramePurpose) -> Int {
+        switch purpose {
+        case let .request(method) where method == "session/prompt":
+            promptMaximumBytes
+        case let .response(method)
+            where method == "fs/read_text_file" || method == "terminal/output":
+            toolResponseMaximumBytes
+        default:
+            globalMaximumBytes
+        }
+    }
+}
+
+enum AcpOutboundFramePurpose: Equatable, Sendable {
+    case request(method: String)
+    case notification(method: String)
+    case response(method: String)
+}
+
+struct AcpOutboundFrameMeasurement: Equatable, Sendable {
+    let encodedBytes: Int
+    let maximumBytes: Int
+    let inspectedNodes: Int
+}
+
+struct AcpOutboundEncodedFrame: Equatable, Sendable {
+    let data: Data
+    let measurement: AcpOutboundFrameMeasurement
+}
+
+enum AcpOutboundFrameError: Error, Equatable, LocalizedError {
+    case tooLarge(maximumBytes: Int)
+    case invalidNumber
+    case measurementMismatch
+
+    var reason: String {
+        switch self {
+        case .tooLarge: "frame_too_large"
+        case .invalidNumber: "invalid_number"
+        case .measurementMismatch: "encoding_mismatch"
+        }
+    }
+
+    var errorDescription: String? {
+        switch self {
+        case let .tooLarge(maximumBytes):
+            "The outbound ACP message exceeds its \(maximumBytes)-byte frame limit."
+        case .invalidNumber:
+            "The outbound ACP message contains a non-finite number."
+        case .measurementMismatch:
+            "The outbound ACP message could not be measured safely."
+        }
+    }
+}
+
+/// Exact byte preflight for the JSON formatting used below. Oversized values
+/// stop at the first byte beyond the selected limit, before a frame-sized
+/// buffer exists. Node counting is diagnostic only: this change does not add a
+/// new structural schema restriction to otherwise valid ACP JSON.
+struct AcpOutboundFrameEncoder: Sendable {
+    let limits: AcpOutboundFrameLimits
+
+    init(limits: AcpOutboundFrameLimits = .production) {
+        self.limits = limits
+    }
+
+    func measure(
+        _ value: JSONValue,
+        purpose: AcpOutboundFramePurpose
+    ) throws -> AcpOutboundFrameMeasurement {
+        let maximumBytes = limits.maximumBytes(for: purpose)
+        var scanner = Scanner(maximumBytes: maximumBytes)
+        try scanner.scan(value)
+        return AcpOutboundFrameMeasurement(
+            encodedBytes: scanner.bytes,
+            maximumBytes: maximumBytes,
+            inspectedNodes: scanner.nodes
+        )
+    }
+
+    func encode(
+        _ value: JSONValue,
+        purpose: AcpOutboundFramePurpose
+    ) throws -> AcpOutboundEncodedFrame {
+        let measurement = try measure(value, purpose: purpose)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        var data = try encoder.encode(value)
+        data.append(0x0A)
+        guard data.count == measurement.encodedBytes else {
+            throw AcpOutboundFrameError.measurementMismatch
+        }
+        return AcpOutboundEncodedFrame(data: data, measurement: measurement)
+    }
+
+    private struct Scanner {
+        let maximumBytes: Int
+        /// Every outbound frame ends in one newline delimiter.
+        private(set) var bytes = 1
+        private(set) var nodes = 0
+
+        mutating func scan(_ value: JSONValue) throws {
+            nodes += 1
+            switch value {
+            case .null:
+                try add(4)
+            case let .bool(value):
+                try add(value ? 4 : 5)
+            case let .integer(value):
+                try add(String(value).utf8.count)
+            case let .number(value):
+                guard value.isFinite else { throw AcpOutboundFrameError.invalidNumber }
+                // A number encoding is at most a few dozen bytes. Measuring
+                // that scalar independently keeps the full-frame allocation
+                // behind the preflight while matching Foundation exactly.
+                try add(try JSONEncoder().encode(value).count)
+            case let .string(value):
+                try scanString(value)
+            case let .array(values):
+                try add(2 + max(0, values.count - 1))
+                for value in values { try scan(value) }
+            case let .object(values):
+                try add(2 + max(0, values.count - 1))
+                for (key, value) in values {
+                    try scanString(key)
+                    try add(1)
+                    try scan(value)
+                }
+            }
+        }
+
+        private mutating func scanString(_ value: String) throws {
+            try add(2) // quotes
+            for scalar in value.unicodeScalars {
+                let count: Int
+                switch scalar.value {
+                case 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x22, 0x5C:
+                    count = 2
+                case 0x00 ... 0x1F:
+                    count = 6
+                case 0x00 ... 0x7F:
+                    count = 1
+                case 0x80 ... 0x7FF:
+                    count = 2
+                case 0x800 ... 0xFFFF:
+                    count = 3
+                default:
+                    count = 4
+                }
+                try add(count)
+            }
+        }
+
+        private mutating func add(_ count: Int) throws {
+            guard count >= 0, count <= maximumBytes - bytes else {
+                throw AcpOutboundFrameError.tooLarge(maximumBytes: maximumBytes)
+            }
+            bytes += count
+        }
+    }
+}
+
 /// A native ACP client: spawns the adapter, runs the JSON-RPC handshake
 /// (initialize → session/new), sends prompts, and streams the agent's
 /// `session/update` notifications plus permission callbacks. Newline-delimited
@@ -719,6 +910,7 @@ actor AcpClient {
     typealias EventHandler = @Sendable (AcpEvent) -> Void
 
     private let transport: any AcpByteTransport
+    private let outboundFrameEncoder: AcpOutboundFrameEncoder
     private var decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
     private var eventHandler: EventHandler?
     private var pending: [Int: CheckedContinuation<JSONValue, any Error>] = [:]
@@ -782,9 +974,11 @@ actor AcpClient {
 
     init(
         transport: any AcpByteTransport = AcpProcessTransport(),
-        toolCallReviewContextLimits: AcpToolCallReviewContextLimits = .production
+        toolCallReviewContextLimits: AcpToolCallReviewContextLimits = .production,
+        outboundFrameLimits: AcpOutboundFrameLimits = .production
     ) {
         self.transport = transport
+        outboundFrameEncoder = AcpOutboundFrameEncoder(limits: outboundFrameLimits)
         toolCallReviewContextStore = AcpToolCallReviewContextStore(
             limits: toolCallReviewContextLimits
         )
@@ -1186,7 +1380,7 @@ actor AcpClient {
             "id": .integer(Int64(id)),
             "method": .string(method),
             "params": params,
-        ]))
+        ]), purpose: .request(method: method))
         return try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
             if timeoutNanoseconds > 0 {
@@ -1207,21 +1401,32 @@ actor AcpClient {
             "jsonrpc": .string("2.0"),
             "method": .string(method),
             "params": params,
-        ])) else { return }
+        ]), purpose: .notification(method: method)) else { return }
         Task { try? await transport.send(frame) }
     }
 
-    private func respond(id: JSONValue, result: JSONValue) {
-        guard let frame = try? encode(.object([
-            "jsonrpc": .string("2.0"),
-            "id": id,
-            "result": result,
-        ])) else { return }
-        Task { try? await transport.send(frame) }
+    private func respond(id: JSONValue, method: String, result: JSONValue) {
+        do {
+            let frame = try encode(.object([
+                "jsonrpc": .string("2.0"),
+                "id": id,
+                "result": result,
+            ]), purpose: .response(method: method))
+            Task { try? await transport.send(frame) }
+        } catch {
+            respondError(
+                id: id,
+                method: method,
+                code: -32001,
+                message: "Outbound ACP response rejected",
+                data: outboundFrameRejectionData(error)
+            )
+        }
     }
 
     private func respondError(
         id: JSONValue,
+        method: String? = nil,
         code: Int,
         message: String,
         data: JSONValue? = nil
@@ -1231,18 +1436,52 @@ actor AcpClient {
             "message": .string(message),
         ]
         if let data { error["data"] = data }
-        guard let frame = try? encode(.object([
+        let purpose = AcpOutboundFramePurpose.response(method: method ?? "")
+        let value = JSONValue.object([
             "jsonrpc": .string("2.0"),
             "id": id,
             "error": .object(error),
-        ])) else { return }
+        ])
+        let frame: Data
+        do {
+            frame = try encode(value, purpose: purpose)
+        } catch {
+            // The adapter still needs a terminal response. Never copy an
+            // oversized error/result into this fallback or silently leave its
+            // request hanging.
+            let fallback = JSONValue.object([
+                "jsonrpc": .string("2.0"),
+                "id": id,
+                "error": .object([
+                    "code": .integer(-32001),
+                    "message": .string("Outbound ACP response rejected"),
+                    "data": outboundFrameRejectionData(error),
+                ]),
+            ])
+            guard let bounded = try? encode(fallback, purpose: purpose) else { return }
+            frame = bounded
+        }
         Task { try? await transport.send(frame) }
     }
 
-    private func encode(_ value: JSONValue) throws -> Data {
-        var data = try JSONEncoder().encode(value)
-        data.append(0x0A)
-        return data
+    private func encode(
+        _ value: JSONValue,
+        purpose: AcpOutboundFramePurpose
+    ) throws -> Data {
+        try outboundFrameEncoder.encode(value, purpose: purpose).data
+    }
+
+    private func outboundFrameRejectionData(_ error: any Error) -> JSONValue {
+        var data: [String: JSONValue] = [
+            "type": .string("outbound_frame_rejected"),
+            "reason": .string(
+                (error as? AcpOutboundFrameError)?.reason ?? "encoding_failed"
+            ),
+        ]
+        if case let .tooLarge(maximumBytes) = error as? AcpOutboundFrameError {
+            data["maximumBytes"] = .integer(Int64(maximumBytes))
+        }
+        return .object(data)
     }
 
     private func failRequest(_ id: Int, error: any Error) {
@@ -1389,7 +1628,12 @@ actor AcpClient {
         default:
             // An unanswered request would hang the agent — fail it explicitly.
             if let id {
-                respondError(id: id, code: -32601, message: "Method not handled: \(method)")
+                respondError(
+                    id: id,
+                    method: method,
+                    code: -32601,
+                    message: "Method not handled: \(method)"
+                )
             }
         }
         return false
@@ -1614,7 +1858,11 @@ actor AcpClient {
                     let terminalID = try await terminalHost.create(
                         command: command, args: args, env: env, cwd: cwd, outputByteLimit: limit
                     )
-                    respond(id: id, result: .object(["terminalId": .string(terminalID)]))
+                    respond(
+                        id: id,
+                        method: method,
+                        result: .object(["terminalId": .string(terminalID)])
+                    )
                 case "terminal/output":
                     guard let terminalID = object["terminalId"]?.stringValue,
                           let snapshot = await terminalHost.output(terminalID) else {
@@ -1625,30 +1873,39 @@ actor AcpClient {
                         "truncated": .bool(snapshot.truncated),
                     ]
                     if let status = snapshot.exitStatus { result["exitStatus"] = Self.encode(status) }
-                    respond(id: id, result: .object(result))
+                    respond(id: id, method: method, result: .object(result))
                 case "terminal/wait_for_exit":
                     guard let terminalID = object["terminalId"]?.stringValue,
                           let status = await terminalHost.waitForExit(terminalID) else {
                         throw AcpClientError.requestFailed("unknown terminal")
                     }
-                    respond(id: id, result: .object(["exitStatus": Self.encode(status)]))
+                    respond(
+                        id: id,
+                        method: method,
+                        result: .object(["exitStatus": Self.encode(status)])
+                    )
                 case "terminal/kill":
                     guard let terminalID = object["terminalId"]?.stringValue else {
                         throw AcpClientError.requestFailed("terminal/kill requires terminalId")
                     }
                     await terminalHost.kill(terminalID)
-                    respond(id: id, result: .object([:]))
+                    respond(id: id, method: method, result: .object([:]))
                 case "terminal/release":
                     guard let terminalID = object["terminalId"]?.stringValue else {
                         throw AcpClientError.requestFailed("terminal/release requires terminalId")
                     }
                     await terminalHost.release(terminalID)
-                    respond(id: id, result: .object([:]))
+                    respond(id: id, method: method, result: .object([:]))
                 default:
-                    respondError(id: id, code: -32601, message: "Method not handled: \(method)")
+                    respondError(
+                        id: id,
+                        method: method,
+                        code: -32601,
+                        message: "Method not handled: \(method)"
+                    )
                 }
             } catch {
-                respondError(id: id, code: -32000, message: errorText(error))
+                respondError(id: id, method: method, code: -32000, message: errorText(error))
             }
         }
     }
@@ -1883,7 +2140,11 @@ actor AcpClient {
             case .cancelled:
                 outcome = .object(["outcome": .string("cancelled")])
             }
-            respond(id: id, result: .object(["outcome": outcome]))
+            respond(
+                id: id,
+                method: "session/request_permission",
+                result: .object(["outcome": outcome])
+            )
         }
     }
 
@@ -2284,9 +2545,18 @@ actor AcpClient {
                 throw AcpClientError.requestFailed("Text file exceeds the \(Self.maxTextFileBytes)-byte ACP limit")
             }
             let content = try String(contentsOfFile: path, encoding: .utf8)
-            respond(id: id, result: .object(["content": .string(content)]))
+            respond(
+                id: id,
+                method: "fs/read_text_file",
+                result: .object(["content": .string(content)])
+            )
         } catch {
-            respondError(id: id, code: -32000, message: errorText(error))
+            respondError(
+                id: id,
+                method: "fs/read_text_file",
+                code: -32000,
+                message: errorText(error)
+            )
         }
     }
 
@@ -2309,9 +2579,14 @@ actor AcpClient {
             // cannot turn the write into an escape (mirrors acp.cjs).
             let checked = try workspacePath(path)
             try content.write(toFile: checked, atomically: true, encoding: .utf8)
-            respond(id: id, result: .object([:]))
+            respond(id: id, method: "fs/write_text_file", result: .object([:]))
         } catch {
-            respondError(id: id, code: -32000, message: errorText(error))
+            respondError(
+                id: id,
+                method: "fs/write_text_file",
+                code: -32000,
+                message: errorText(error)
+            )
         }
     }
 

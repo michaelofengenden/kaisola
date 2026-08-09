@@ -1,5 +1,7 @@
 import AppKit
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 @testable import Kaisola
 
@@ -321,6 +323,92 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(warning.severity, .warning)
         XCTAssertEqual(warning.message, "The file changed on disk.")
     }
+
+    func testImagePreviewAccessibilityUsesDecodedFormatPixelsAndExplicitMissingDescription() throws {
+        let file = root.appendingPathComponent("release-map.jpg")
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 37,
+            pixelsHigh: 23,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ))
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        try png.write(to: file, options: .atomic)
+
+        let metadata = try XCTUnwrap(ImagePreviewAccessibilityMetadata.load(from: file))
+        XCTAssertEqual(metadata.filename, "release-map.jpg")
+        XCTAssertEqual(metadata.pixelWidth, 37)
+        XCTAssertEqual(metadata.pixelHeight, 23)
+        XCTAssertEqual(metadata.format, "PNG")
+        XCTAssertNil(metadata.authoredDescription)
+        XCTAssertEqual(
+            metadata.accessibilityDescription,
+            "Image preview: release-map.jpg. PNG format, 37 by 23 pixels. "
+                + "No authored description is available."
+        )
+    }
+
+    func testImagePreviewAccessibilityPreservesAuthoredDescriptionVerbatimAfterTrimming() {
+        let metadata = ImagePreviewAccessibilityMetadata(
+            filename: "architecture.tiff",
+            pixelWidth: 640,
+            pixelHeight: 480,
+            format: "TIFF",
+            authoredDescription: "  Service ownership diagram.  "
+        )
+
+        XCTAssertEqual(metadata.authoredDescription, "Service ownership diagram.")
+        XCTAssertEqual(
+            metadata.accessibilityDescription,
+            "Image preview: architecture.tiff. TIFF format, 640 by 480 pixels. "
+                + "Authored description: Service ownership diagram."
+        )
+    }
+
+    func testImagePreviewAccessibilityReadsAnAuthoredDescriptionFromTheFile() throws {
+        let file = root.appendingPathComponent("diagram.asset")
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 19,
+            pixelsHigh: 11,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ))
+        let image = try XCTUnwrap(bitmap.cgImage)
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
+            file as CFURL,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ))
+        CGImageDestinationAddImage(destination, image, [
+            kCGImagePropertyPNGDictionary: [
+                kCGImagePropertyPNGDescription: "Deployment dependency graph.",
+            ],
+        ] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+
+        let metadata = try XCTUnwrap(ImagePreviewAccessibilityMetadata.load(from: file))
+        XCTAssertEqual(metadata.format, "PNG")
+        XCTAssertEqual(metadata.pixelWidth, 19)
+        XCTAssertEqual(metadata.pixelHeight, 11)
+        XCTAssertEqual(metadata.authoredDescription, "Deployment dependency graph.")
+        XCTAssertTrue(metadata.accessibilityDescription.hasSuffix(
+            "Authored description: Deployment dependency graph."
+        ))
+    }
+
     private var root: URL!
 
     override func setUpWithError() throws {

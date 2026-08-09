@@ -35,6 +35,15 @@ const NO_CLIENT_EXIT_MS = process.env.NODE_ENV === 'test' && process.env.KAISOLA
 // the pathname cheaply and publish a replacement listener without disturbing
 // existing authenticated connections or terminal processes.
 const SOCKET_PATH_CHECK_MS = 1_000
+// The info file is how a restarted GUI finds and authenticates to this broker.
+// A transient write failure (ENOSPC, a momentarily unwritable userData) leaves
+// every socket and PTY alive but strands those durable sessions, so republish
+// on a doubling backoff until the file is back. The ceiling is derived from the
+// base so a shortened test loop keeps a bounded, quick retry cadence.
+const RENDEZVOUS_RETRY_MIN_MS = process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_RENDEZVOUS_RETRY_MS
+  ? Math.max(10, Math.min(1_000, Number(process.env.KAISOLA_TEST_BROKER_RENDEZVOUS_RETRY_MS) || 250))
+  : 250
+const RENDEZVOUS_RETRY_MAX_MS = Math.min(15_000, RENDEZVOUS_RETRY_MIN_MS * 64)
 
 function readLaunch() {
   const marker = process.argv.indexOf('--launch')
@@ -264,6 +273,9 @@ async function dispatch(client, method, params = {}) {
         inFlightMutations,
         generationState: drainingTarget ? 'draining' : 'current',
         drainingTargetContentDigest: drainingTarget?.targetContentDigest ?? null,
+        // Degraded means the live sockets and PTYs are fine but the info file
+        // is stale or absent, so a restarted GUI cannot rendezvous yet.
+        rendezvous: rendezvousStatus(),
         authenticatedClientCount: clients.size,
         terminals: mgr.diagnostics(),
       }
@@ -640,6 +652,12 @@ const servers = new Set()
 let server = null
 let socketRecoveryPending = false
 let socketPathTimer = null
+let rendezvousState = 'pending' // 'pending' | 'published' | 'degraded'
+let rendezvousPublishedAt = null
+let rendezvousFailures = 0
+let rendezvousLastError = null
+let rendezvousRetryTimer = null
+let rendezvousRetryMs = RENDEZVOUS_RETRY_MIN_MS
 
 function brokerInfo() {
   return {
@@ -673,13 +691,77 @@ function configureServer(candidate, { recovery = false } = {}) {
   return candidate
 }
 
+function rendezvousStatus() {
+  return {
+    state: rendezvousState,
+    publishedAt: rendezvousPublishedAt,
+    consecutiveFailures: rendezvousFailures,
+    lastError: rendezvousLastError,
+    retryPending: rendezvousRetryTimer != null,
+  }
+}
+
+function clearRendezvousRetry() {
+  if (rendezvousRetryTimer) clearTimeout(rendezvousRetryTimer)
+  rendezvousRetryTimer = null
+}
+
+function listenerHealthy() {
+  return !shuttingDown && server?.listening === true && socketPathState() !== 'missing'
+}
+
+function scheduleRendezvousRetry() {
+  if (shuttingDown || rendezvousRetryTimer) return
+  rendezvousRetryTimer = setTimeout(() => {
+    rendezvousRetryTimer = null
+    publishRendezvous()
+  }, rendezvousRetryMs)
+  rendezvousRetryTimer.unref?.()
+  rendezvousRetryMs = Math.min(RENDEZVOUS_RETRY_MAX_MS, rendezvousRetryMs * 2)
+}
+
+// Info-file publication is diagnostics/rendezvous, not session state. A
+// transient write failure (ENOSPC, unwritable userData) during socket-path
+// recovery must degrade — letting it escape into uncaughtException would
+// gracefulExit(true) and kill every live PTY over a bookkeeping file. Degrading
+// alone still strands those PTYs, because a restarted GUI has no other way to
+// discover or authenticate to them, so keep republishing on a bounded backoff
+// until the write lands again.
+function publishRendezvous() {
+  if (shuttingDown) return
+  if (!listenerHealthy()) {
+    // A vanished socket path belongs to the recovery timer, whose own
+    // publishListener call re-arms rendezvous publication for the replacement
+    // listener. Republishing now would only advertise an unreachable path.
+    log(`publish info deferred socket=${socketPathState()} failures=${rendezvousFailures}`)
+    return
+  }
+  try {
+    atomicJson(config.infoFile, brokerInfo())
+  } catch (error) {
+    rendezvousFailures++
+    rendezvousLastError = String(error?.code || error?.message || error).slice(0, 200)
+    rendezvousState = 'degraded'
+    log(`publish info failed attempt=${rendezvousFailures} retryInMs=${rendezvousRetryMs} ${error?.code || ''} ${error?.message || error}`)
+    scheduleRendezvousRetry()
+    return
+  }
+  if (rendezvousState === 'degraded') log(`publish info recovered afterFailures=${rendezvousFailures}`)
+  clearRendezvousRetry()
+  rendezvousState = 'published'
+  rendezvousPublishedAt = Date.now()
+  rendezvousFailures = 0
+  rendezvousLastError = null
+  rendezvousRetryMs = RENDEZVOUS_RETRY_MIN_MS
+}
+
 function publishListener({ recovered = false } = {}) {
   if (process.platform !== 'win32') try { fs.chmodSync(config.socketPath, 0o600) } catch { /* token still gates */ }
-  // Info-file publication is diagnostics/rendezvous, not session state. A
-  // transient write failure (ENOSPC, unwritable userData) during socket-path
-  // recovery must degrade — letting it escape into uncaughtException would
-  // gracefulExit(true) and kill every live PTY over a bookkeeping file.
-  try { atomicJson(config.infoFile, brokerInfo()) } catch (error) { log(`publish info failed ${error?.code || ''} ${error?.message || error}`) }
+  // A fresh listener deserves a fresh backoff: whatever stalled the previous
+  // generation's info file has nothing to say about this one.
+  clearRendezvousRetry()
+  rendezvousRetryMs = RENDEZVOUS_RETRY_MIN_MS
+  publishRendezvous()
   log(`${recovered ? 'recovered socket' : 'ready'} pid=${process.pid} protocol=${PROTOCOL} version=${config.version}`)
 }
 
@@ -728,6 +810,7 @@ function gracefulExit(killSessions) {
   if (shuttingDown) return
   shuttingDown = true
   clearNoClientTimer()
+  clearRendezvousRetry()
   if (socketPathTimer) clearInterval(socketPathTimer)
   socketPathTimer = null
   if (killSessions) mgr.killAll()

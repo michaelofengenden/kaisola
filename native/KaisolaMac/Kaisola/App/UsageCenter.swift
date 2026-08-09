@@ -770,6 +770,18 @@ final class UsageCenter: ObservableObject {
         }
     }
 
+    /// A failed live refresh may still have an exact-context snapshot worth
+    /// showing. Keep the failure and the snapshot's age together so callers
+    /// cannot accidentally present cached limits as current.
+    struct PlanUsageStaleness: Equatable, Sendable {
+        let error: String
+        let lastSuccessfulRefresh: Date
+
+        func notice(lastUpdatedDescription: String) -> String {
+            "\(error) Showing account limits last updated \(lastUpdatedDescription)."
+        }
+    }
+
     struct PlanUsageRequest: Equatable, Sendable {
         let provider: UsageAccountProfile.Provider
         let profileID: String
@@ -860,11 +872,13 @@ final class UsageCenter: ObservableObject {
     }
     @Published private(set) var isRefreshingPlanUsage = false
     @Published private(set) var planUsageError: String?
+    @Published private(set) var planUsageStaleness: PlanUsageStaleness?
 
     private var planRefreshTask: Task<Void, Never>?
     private var planRefreshGeneration = 0
     private var planRefreshContextKey: String?
     private var planUsageCache: [String: (providers: [ProviderPlanUsage], fetchedAt: Date)] = [:]
+    private var planUsageFailures: [String: PlanUsageStaleness] = [:]
     /// Disk backing for `planUsageCache`, so cards render on launch instead of
     /// after a multi-second probe. Hydrated lazily on first access.
     private let planUsageSnapshots = PlanUsageSnapshotStore()
@@ -872,6 +886,9 @@ final class UsageCenter: ObservableObject {
     private let now: () -> Date
     private let persistenceStore: AcpTranscriptStore?
     private let planUsageContextResolver: PlanUsageContextResolver
+    private let planUsageReader: @Sendable (
+        URL?, URL?, [String: String], [PlanUsageRequest]
+    ) async -> ProviderPlanReadResult
     private let usageAccountStore: UsageAccountStore
     private var persistenceTask: Task<Void, Never>?
     private var chatSources: [String: Set<String>] = [:]
@@ -882,12 +899,23 @@ final class UsageCenter: ObservableObject {
         usageAccountStore: UsageAccountStore = UsageAccountStore(),
         planUsageContextResolver: @escaping PlanUsageContextResolver = { workspace, environment in
             UsageCenter.planUsageContextKey(workspace: workspace, environment: environment)
+        },
+        planUsageReader: @escaping @Sendable (
+            URL?, URL?, [String: String], [PlanUsageRequest]
+        ) async -> ProviderPlanReadResult = { helperRoot, currentDirectory, environment, requests in
+            await UsageCenter.readProviderPlanUsage(
+                helperRoot: helperRoot,
+                currentDirectory: currentDirectory,
+                environment: environment,
+                requests: requests
+            )
         }
     ) {
         self.now = now
         self.persistenceStore = persistenceStore
         self.usageAccountStore = usageAccountStore
         self.planUsageContextResolver = planUsageContextResolver
+        self.planUsageReader = planUsageReader
     }
 
     /// Every tracked chat, heaviest first (peak used tokens, descending). The
@@ -1121,11 +1149,13 @@ final class UsageCenter: ObservableObject {
         let generation = planRefreshGeneration
         isRefreshingPlanUsage = true
         planUsageError = nil
+        planUsageStaleness = nil
 
         let helperRoot = Bundle.main.resourceURL?
             .appendingPathComponent("BrokerHelper", isDirectory: true)
         let currentDirectory = workspace
         let contextResolver = planUsageContextResolver
+        let planUsageReader = planUsageReader
 
         planRefreshTask = Task { [weak self] in
             // Credential files can live on a slow or synchronized volume. Their
@@ -1153,7 +1183,9 @@ final class UsageCenter: ObservableObject {
                self.now().timeIntervalSince(cached.fetchedAt) < Self.automaticPlanUsageTTL {
                 self.planRefreshContextKey = contextKey
                 self.planUsage = cached.providers
-                self.planUsageError = nil
+                let staleness = self.planUsageFailures[contextKey]
+                self.planUsageError = staleness?.error
+                self.planUsageStaleness = staleness
                 self.isRefreshingPlanUsage = false
                 self.planRefreshTask = nil
                 return
@@ -1168,14 +1200,12 @@ final class UsageCenter: ObservableObject {
                 self.planUsage = self.planUsageCache[contextKey]?.providers ?? []
             }
             self.planRefreshContextKey = contextKey
+            let priorFailure = self.planUsageFailures[contextKey]
+            self.planUsageError = priorFailure?.error
+            self.planUsageStaleness = priorFailure
 
             let reader = Task.detached(priority: .userInitiated) {
-                await Self.readProviderPlanUsage(
-                    helperRoot: helperRoot,
-                    currentDirectory: currentDirectory,
-                    environment: environment,
-                    requests: requests
-                )
+                await planUsageReader(helperRoot, currentDirectory, environment, requests)
             }
             let result = await withTaskCancellationHandler {
                 await reader.value
@@ -1187,16 +1217,29 @@ final class UsageCenter: ObservableObject {
                   self.planRefreshContextKey == contextKey else { return }
             switch result {
             case let .success(providers):
+                let fetchedAt = self.now()
                 self.planUsage = providers
                 // Reuse the already-resolved opaque context. Re-reading and
                 // hashing credentials here used to double the I/O for every
                 // successful refresh.
-                self.storeCachedPlanUsage(providers, contextKey: contextKey, fetchedAt: self.now())
+                self.storeCachedPlanUsage(providers, contextKey: contextKey, fetchedAt: fetchedAt)
                 self.planUsageError = nil
+                self.planUsageStaleness = nil
             case let .failure(message):
-                self.planUsageCache.removeValue(forKey: contextKey)
-                self.planUsage = []
                 self.planUsageError = message
+                if let cached = self.planUsageCache[contextKey] {
+                    self.planUsage = cached.providers
+                    let staleness = PlanUsageStaleness(
+                        error: message,
+                        lastSuccessfulRefresh: cached.fetchedAt
+                    )
+                    self.planUsageFailures[contextKey] = staleness
+                    self.planUsageStaleness = staleness
+                } else {
+                    self.planUsage = []
+                    self.planUsageFailures.removeValue(forKey: contextKey)
+                    self.planUsageStaleness = nil
+                }
             }
             self.isRefreshingPlanUsage = false
             self.planRefreshTask = nil
@@ -1250,6 +1293,7 @@ final class UsageCenter: ObservableObject {
     ) {
         hydratePlanUsageSnapshotsIfNeeded()
         planUsageCache[contextKey] = (providers, fetchedAt)
+        planUsageFailures.removeValue(forKey: contextKey)
         // Persist off the main actor: this is a small JSON write, but it runs
         // on every completed refresh and must not sit in the UI's path.
         let snapshot = planUsageCache.mapValues {
@@ -1469,6 +1513,7 @@ final class UsageCenter: ObservableObject {
             ),
         ]
         planUsageError = nil
+        planUsageStaleness = nil
         isRefreshingPlanUsage = false
     }
 
@@ -1664,7 +1709,7 @@ final class UsageCenter: ObservableObject {
     }
 }
 
-private enum ProviderPlanReadResult: Sendable {
+enum ProviderPlanReadResult: Sendable {
     case success([UsageCenter.ProviderPlanUsage])
     case failure(String)
 }

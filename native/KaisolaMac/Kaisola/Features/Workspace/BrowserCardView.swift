@@ -52,13 +52,19 @@ struct BrowserCardOrigin: Equatable, Sendable {
     }
 }
 
-/// What the card's web view is doing right now. A dev server that is still
-/// starting, or has just died, otherwise shows as a blank page with nothing in
-/// the accessibility tree to explain it, so the header mirrors this state.
+/// The exact WebKit navigation milestone currently reached by the card. A dev
+/// server that is still starting, or has just died, otherwise shows as a blank
+/// page with nothing in the accessibility tree to explain it.
 enum BrowserCardLoadState: Equatable {
-    case loading
-    case loaded
+    case provisional
+    case committed
+    case finished
     case failed(String)
+
+    var isFailure: Bool {
+        if case .failed = self { return true }
+        return false
+    }
 
     /// A navigation error as a card state, or `nil` when the error is not a
     /// real failure. WebKit reports a cancelled provisional navigation whenever
@@ -121,8 +127,9 @@ struct BrowserCardAccessibility {
     /// Load state as spoken.
     var statusName: String {
         switch state {
-        case .loading: "Loading"
-        case .loaded: "Loaded"
+        case .provisional: "Connecting"
+        case .committed: "Loading"
+        case .finished: "Loaded"
         case .failed(let reason): "Failed to load: \(reason)"
         }
     }
@@ -140,11 +147,27 @@ struct BrowserCardAccessibility {
     /// swipe past.
     var statusIndicatorLabel: String? {
         switch state {
-        case .loading: "Loading \(address)"
-        case .loaded: nil
+        case .provisional: "Connecting to \(address)"
+        case .committed: "Loading \(address)"
+        case .finished: nil
         case .failed(let reason): "\(address) failed to load: \(reason)"
         }
     }
+
+    /// Failure copy is also used by the visible in-card recovery surface. It
+    /// deliberately names the local service while keeping the detailed WebKit
+    /// error selectable as its own element.
+    var failureTitle: String? {
+        guard case .failed = state else { return nil }
+        return "Couldn’t load \(address)"
+    }
+
+    var failureDetail: String? {
+        guard case .failed(let reason) = state else { return nil }
+        return reason
+    }
+
+    var retryLabel: String { "Retry loading \(address)" }
 
     /// Action names stay constant across load states: a control that renames
     /// itself mid-load is unusable by Voice Control.
@@ -166,7 +189,8 @@ struct BrowserCardView: View {
     /// Bumping this drives a reload through the representable's `updateNSView`
     /// without holding a reference to the WKWebView from the header.
     @State private var reloadToken = 0
-    @State private var loadState: BrowserCardLoadState = .loading
+    @State private var retryToken = 0
+    @State private var loadState: BrowserCardLoadState = .provisional
     @State private var addressState: BrowserCardAddressState
 
     init(url: URL, close: @escaping () -> Void) {
@@ -183,16 +207,23 @@ struct BrowserCardView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            ConfinedWebView(
-                url: url,
-                reloadToken: reloadToken,
-                loadState: $loadState,
-                addressState: $addressState
-            )
+            ZStack {
+                ConfinedWebView(
+                    url: url,
+                    reloadToken: reloadToken,
+                    retryToken: retryToken,
+                    loadState: $loadState,
+                    addressState: $addressState
+                )
+                .allowsHitTesting(!loadState.isFailure)
+                .accessibilityHidden(loadState.isFailure)
+                failureSurface
+            }
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .onChange(of: url) { _, requestedURL in
             addressState.retarget(to: requestedURL)
+            loadState = .provisional
         }
     }
 
@@ -211,7 +242,13 @@ struct BrowserCardView: View {
             statusIndicator
             Spacer(minLength: 12)
             Button {
-                reloadToken &+= 1
+                let wasFailed = loadState.isFailure
+                loadState = .provisional
+                if wasFailed {
+                    retryToken &+= 1
+                } else {
+                    reloadToken &+= 1
+                }
             } label: {
                 Image(systemName: "arrow.clockwise")
             }
@@ -240,7 +277,7 @@ struct BrowserCardView: View {
     private var statusIndicator: some View {
         if let label = accessibility.statusIndicatorLabel {
             switch loadState {
-            case .loading:
+            case .provisional, .committed:
                 ProgressView()
                     .controlSize(.mini)
                     .accessibilityLabel(label)
@@ -249,9 +286,38 @@ struct BrowserCardView: View {
                     .foregroundStyle(.orange)
                     .help(label)
                     .accessibilityLabel(label)
-            case .loaded:
+            case .finished:
                 EmptyView()
             }
+        }
+    }
+
+    @ViewBuilder
+    private var failureSurface: some View {
+        if let title = accessibility.failureTitle,
+           let detail = accessibility.failureDetail {
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.orange)
+                    .accessibilityHidden(true)
+                Text(title)
+                    .font(.headline)
+                Text(detail)
+                    .font(.callout)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .multilineTextAlignment(.center)
+                    .textSelection(.enabled)
+                Button("Retry") {
+                    loadState = .provisional
+                    retryToken &+= 1
+                }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityLabel(accessibility.retryLabel)
+            }
+            .padding(32)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background(Color(nsColor: .windowBackgroundColor))
         }
     }
 }
@@ -265,6 +331,7 @@ struct BrowserCardView: View {
 private struct ConfinedWebView: NSViewRepresentable {
     let url: URL
     let reloadToken: Int
+    let retryToken: Int
     @Binding var loadState: BrowserCardLoadState
     @Binding var addressState: BrowserCardAddressState
 
@@ -285,6 +352,7 @@ private struct ConfinedWebView: NSViewRepresentable {
         coordinator.loadedURL = url
         coordinator.origin = BrowserCardOrigin(url: url)
         coordinator.reloadToken = reloadToken
+        coordinator.retryToken = retryToken
         coordinator.report = report
         coordinator.reportCommittedURL = reportCommittedURL
         webView.load(URLRequest(url: url))
@@ -315,7 +383,11 @@ private struct ConfinedWebView: NSViewRepresentable {
         if coordinator.loadedURL != url {
             coordinator.loadedURL = url
             coordinator.origin = BrowserCardOrigin(url: url)
+            coordinator.retryToken = retryToken
             webView.load(URLRequest(url: url))
+        } else if coordinator.retryToken != retryToken {
+            coordinator.retryToken = retryToken
+            webView.load(URLRequest(url: addressState.currentURL))
         }
         // Header reload button was pressed.
         if coordinator.reloadToken != reloadToken {
@@ -328,22 +400,24 @@ private struct ConfinedWebView: NSViewRepresentable {
         var loadedURL: URL?
         var origin: BrowserCardOrigin?
         var reloadToken = 0
+        var retryToken = 0
         var report: (BrowserCardLoadState) -> Void = { _ in }
         var reportCommittedURL: (URL?) -> Void = { _ in }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-            report(.loading)
+            report(.provisional)
         }
 
         func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
             reportCommittedURL(webView.url)
+            report(.committed)
         }
 
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
             // `didCommit` is the primary address transition. Re-publish at
             // finish so a final URL change between commit and completion wins.
             reportCommittedURL(webView.url)
-            report(.loaded)
+            report(.finished)
         }
 
         func webView(

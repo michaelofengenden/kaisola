@@ -10,7 +10,7 @@ import XCTest
 final class BrowserCardAccessibilityTests: XCTestCase {
     private func accessibility(
         _ string: String = "http://localhost:3000/dashboard?tab=logs",
-        state: BrowserCardLoadState = .loaded
+        state: BrowserCardLoadState = .finished
     ) throws -> BrowserCardAccessibility {
         let url = try XCTUnwrap(URL(string: string), "Could not parse URL: \(string)")
         return BrowserCardAccessibility(url: url, state: state)
@@ -41,20 +41,30 @@ final class BrowserCardAccessibilityTests: XCTestCase {
     }
 
     func testEveryLoadStateIsReachableInTheHeader() throws {
-        let loading = try accessibility(state: .loading)
+        let provisional = try accessibility(state: .provisional)
         XCTAssertEqual(
-            loading.addressValue,
+            provisional.addressValue,
+            "http://localhost:3000/dashboard?tab=logs, Connecting"
+        )
+        XCTAssertEqual(
+            provisional.statusIndicatorLabel,
+            "Connecting to localhost:3000"
+        )
+
+        let committed = try accessibility(state: .committed)
+        XCTAssertEqual(
+            committed.addressValue,
             "http://localhost:3000/dashboard?tab=logs, Loading"
         )
-        XCTAssertEqual(loading.statusIndicatorLabel, "Loading localhost:3000")
+        XCTAssertEqual(committed.statusIndicatorLabel, "Loading localhost:3000")
 
-        let loaded = try accessibility(state: .loaded)
+        let finished = try accessibility(state: .finished)
         XCTAssertEqual(
-            loaded.addressValue,
+            finished.addressValue,
             "http://localhost:3000/dashboard?tab=logs, Loaded"
         )
         XCTAssertNil(
-            loaded.statusIndicatorLabel,
+            finished.statusIndicatorLabel,
             "a page that is up needs no status badge to swipe past"
         )
 
@@ -69,6 +79,23 @@ final class BrowserCardAccessibilityTests: XCTestCase {
         )
     }
 
+    func testFailureKeepsDetailAndAnInCardRetryActionReachable() throws {
+        let failed = try accessibility(
+            "http://localhost:3000/dashboard",
+            state: .failed("The server stopped accepting connections.")
+        )
+
+        XCTAssertEqual(failed.failureTitle, "Couldn’t load localhost:3000")
+        XCTAssertEqual(failed.failureDetail, "The server stopped accepting connections.")
+        XCTAssertEqual(failed.retryLabel, "Retry loading localhost:3000")
+        XCTAssertTrue(failed.state.isFailure)
+
+        let finished = try accessibility(state: .finished)
+        XCTAssertNil(finished.failureTitle)
+        XCTAssertNil(finished.failureDetail)
+        XCTAssertFalse(finished.state.isFailure)
+    }
+
     func testAddressValueCarriesTheFullURLTheLabelReplaces() throws {
         // The header labels the address element "Address", which drops its
         // visible text from the tree; the value has to carry the URL back.
@@ -80,7 +107,12 @@ final class BrowserCardAccessibilityTests: XCTestCase {
     }
 
     func testActionNamesDoNotChangeWithLoadState() throws {
-        for state in [BrowserCardLoadState.loading, .loaded, .failed("boom")] {
+        for state in [
+            BrowserCardLoadState.provisional,
+            .committed,
+            .finished,
+            .failed("boom"),
+        ] {
             let header = try accessibility(state: state)
             XCTAssertEqual(header.reloadLabel, "Reload localhost:3000", "state: \(state)")
             XCTAssertEqual(
@@ -120,7 +152,7 @@ final class BrowserCardAccessibilityTests: XCTestCase {
             address.currentURL,
             try url("http://localhost:3000/dashboard?from=redirect")
         )
-        let accessibility = BrowserCardAccessibility(url: address.currentURL, state: .loaded)
+        let accessibility = BrowserCardAccessibility(url: address.currentURL, state: .finished)
         XCTAssertEqual(
             accessibility.addressValue,
             "http://localhost:3000/dashboard?from=redirect, Loaded"

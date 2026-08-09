@@ -32,7 +32,7 @@ struct SignInCardView: View {
                 .font(.headline)
             Text("Kaisola drives your installed Claude and Codex CLIs — sign in once per account directory. Sign-in runs in a real terminal here: a device-code flow prints in the terminal, and your browser may pop to finish it.")
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack(spacing: 10) {
                 Button {
@@ -50,7 +50,7 @@ struct SignInCardView: View {
             }
             Text("Claude runs \u{201C}claude auth login\u{201D}; Codex runs \u{201C}codex login\u{201D}. Each signs in to the CLAUDE_CONFIG_DIR / CODEX_HOME that applies to the active project — its per-project account if set, otherwise the app default.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(16)

@@ -240,6 +240,38 @@ final class AcpPermissionRulesTests: XCTestCase {
         )
     }
 
+    func testSensitiveGlobFieldAssociatesInvalidStateAndCurrentError() {
+        let error = "Patterns cannot contain control characters."
+        let invalid = SensitiveGlobFieldAccessibility(issue: error)
+
+        XCTAssertEqual(invalid.value, "Invalid")
+        XCTAssertEqual(invalid.description, "Invalid. \(error)")
+
+        let valid = SensitiveGlobFieldAccessibility(issue: nil)
+        XCTAssertEqual(valid.value, "Valid")
+        XCTAssertEqual(valid.description, "No validation error.")
+    }
+
+    func testSensitiveGlobFieldAnnouncesEachValidationTransitionOnce() {
+        let broad = "Name at least part of a sensitive file; a wildcard-only pattern is too broad."
+        let unsupported = "Only * and ** wildcards are supported; ?, brackets, and braces are not."
+
+        XCTAssertNil(SensitiveGlobFieldAccessibility.announcement(previous: nil, current: nil))
+        XCTAssertEqual(
+            SensitiveGlobFieldAccessibility.announcement(previous: nil, current: broad),
+            "Sensitive file pattern invalid. \(broad)"
+        )
+        XCTAssertNil(SensitiveGlobFieldAccessibility.announcement(previous: broad, current: broad))
+        XCTAssertEqual(
+            SensitiveGlobFieldAccessibility.announcement(previous: broad, current: unsupported),
+            "Sensitive file pattern invalid. \(unsupported)"
+        )
+        XCTAssertEqual(
+            SensitiveGlobFieldAccessibility.announcement(previous: unsupported, current: nil),
+            "Sensitive file pattern is valid."
+        )
+    }
+
     // MARK: - Action summary
     //
     // These live in this class on purpose: the focused runner selects tests by

@@ -1338,6 +1338,30 @@ enum SensitiveGlobPolicy {
     }
 }
 
+struct SensitiveGlobFieldAccessibility: Equatable {
+    static let identifier = "settings.guardrails.sensitive-glob"
+
+    let issue: String?
+
+    var value: String {
+        issue == nil ? "Valid" : "Invalid"
+    }
+
+    var description: String {
+        guard let issue else { return "No validation error." }
+        return "Invalid. \(issue)"
+    }
+
+    static func announcement(previous: String?, current: String?) -> String? {
+        guard previous != current else { return nil }
+        if let current {
+            return "Sensitive file pattern invalid. \(current)"
+        }
+        guard previous != nil else { return nil }
+        return "Sensitive file pattern is valid."
+    }
+}
+
 /// Guardrails tab: standing permission rules (delete) + sensitive globs (edit).
 private struct GuardrailsSettings: View {
     @ObservedObject var settings: NativePreviewSettings
@@ -1391,6 +1415,13 @@ private struct GuardrailsSettings: View {
                 HStack {
                     TextField("Add glob (e.g. **/*.p12)", text: $newGlob)
                         .onSubmit(addGlob)
+                        .accessibilityLabel("Sensitive file pattern")
+                        .accessibilityValue(newGlobAccessibility.value)
+                        .accessibilityHint(newGlobAccessibility.description)
+                        .accessibilityIdentifier(SensitiveGlobFieldAccessibility.identifier)
+                        .onChange(of: newGlobIssue) { previous, current in
+                            announceValidationChange(previous: previous, current: current)
+                        }
                     Button("Add", action: addGlob)
                         .disabled(!canAddGlob)
                 }
@@ -1398,6 +1429,7 @@ private struct GuardrailsSettings: View {
                     Text(issue)
                         .font(.caption)
                         .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                        .accessibilityHidden(true)
                 }
                 Button("Restore Defaults") { showsRestoreDefaultsConfirmation = true }
                 .font(.caption)
@@ -1424,6 +1456,10 @@ private struct GuardrailsSettings: View {
         SensitiveGlobPolicy.validationMessage(newGlob, existing: settings.sensitiveGlobs)
     }
 
+    private var newGlobAccessibility: SensitiveGlobFieldAccessibility {
+        SensitiveGlobFieldAccessibility(issue: newGlobIssue)
+    }
+
     private var canAddGlob: Bool {
         !newGlob.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && newGlobIssue == nil
     }
@@ -1436,5 +1472,20 @@ private struct GuardrailsSettings: View {
         }
         settings.sensitiveGlobs.append(trimmed)
         newGlob = ""
+    }
+
+    private func announceValidationChange(previous: String?, current: String?) {
+        guard let announcement = SensitiveGlobFieldAccessibility.announcement(
+            previous: previous,
+            current: current
+        ) else { return }
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: announcement,
+                .priority: NSAccessibilityPriorityLevel.low.rawValue,
+            ]
+        )
     }
 }

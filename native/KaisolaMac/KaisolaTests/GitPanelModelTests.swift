@@ -546,6 +546,37 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertNil(GitStatsRendering.summary(.empty))
     }
 
+    func testGitStatusAccessibilityExpandsEveryPorcelainState() {
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "M"), "Modified")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "A"), "Added")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "D"), "Deleted")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "?"), "Untracked")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "R"), "Renamed")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "C"), "Copied")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "T"), "Type changed")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "U"), "Unmerged")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "X"), "Git status X")
+    }
+
+    func testGitStatusAccessibilityNamesSectionAndFullPath() {
+        XCTAssertEqual(
+            GitStatusAccessibility.rowLabel(
+                path: "Sources/Feature/Status Row.swift",
+                code: "M",
+                staged: true
+            ),
+            "Modified, staged, Sources/Feature/Status Row.swift"
+        )
+        XCTAssertEqual(
+            GitStatusAccessibility.rowLabel(
+                path: "資料/新規.swift",
+                code: "?",
+                staged: false
+            ),
+            "Untracked, unstaged, 資料/新規.swift"
+        )
+    }
+
     @MainActor
     func testRejectingCommitMessageHookKeepsDraftAndStagedIndexVisible() throws {
         try write("base.txt", "base\n")

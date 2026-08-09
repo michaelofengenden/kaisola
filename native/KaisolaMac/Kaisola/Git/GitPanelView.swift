@@ -1028,7 +1028,11 @@ struct GitPanelView: View {
             ForEach(files, id: \.0) { path, code in
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 8) {
-                        Text(code).font(.caption.monospaced()).foregroundStyle(color(code)).frame(width: 14)
+                        Text(code)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(color(code))
+                            .frame(width: 14)
+                            .accessibilityHidden(true)
                         Button {
                             model.toggleDiff(path, staged: staged)
                         } label: {
@@ -1042,6 +1046,10 @@ struct GitPanelView: View {
                         .buttonStyle(.plain)
                         .disabled(model.isBusy)
                         .help("Show the diff")
+                        .accessibilityLabel(
+                            GitStatusAccessibility.rowLabel(path: path, code: code, staged: staged)
+                        )
+                        .accessibilityHint("Show the \(staged ? "staged" : "unstaged") diff")
                         Spacer()
                         if restorable {
                             Button("Discard") { restoreCandidate = path }
@@ -1049,6 +1057,7 @@ struct GitPanelView: View {
                                 .font(.caption)
                                 .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
                                 .disabled(model.isBusy)
+                                .accessibilityLabel("Discard unstaged changes to \(path)")
                         }
                         Button(action) { perform(path) }
                             .buttonStyle(.borderless)
@@ -1058,6 +1067,7 @@ struct GitPanelView: View {
                             // re-enable Push & Create PR (double-submit), and
                             // clobber status with a stale snapshot.
                             .disabled(model.isBusy)
+                            .accessibilityLabel("\(action) \(path)")
                     }
                     if let patch = model.diffs[path] {
                         PatchText(patch: patch)
@@ -1076,6 +1086,33 @@ struct GitPanelView: View {
         case "?": .secondary
         default: .primary
         }
+    }
+}
+
+enum GitStatusAccessibility {
+    /// Expand porcelain-v2's compact status codes without changing the visual
+    /// row. Unknown codes stay inspectable instead of being announced as an
+    /// unexplained letter.
+    static func statusName(for code: String) -> String {
+        switch code {
+        case "M": "Modified"
+        case "A": "Added"
+        case "D": "Deleted"
+        case "?": "Untracked"
+        case "R": "Renamed"
+        case "C": "Copied"
+        case "T": "Type changed"
+        case "U": "Unmerged"
+        case "": "Unknown Git status"
+        default: "Git status \(code)"
+        }
+    }
+
+    /// The filename button is the row's primary accessible element. Include
+    /// the complete relative path and index context so equal basenames and a
+    /// partially staged file remain unambiguous to VoiceOver.
+    static func rowLabel(path: String, code: String, staged: Bool) -> String {
+        "\(statusName(for: code)), \(staged ? "staged" : "unstaged"), \(path)"
     }
 }
 

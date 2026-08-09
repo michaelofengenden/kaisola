@@ -379,6 +379,34 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertFalse(center.isRefreshingPlanUsage)
     }
 
+    func testCorruptProjectAccountsBlockUsageProbeBeforeContextResolutionOrProviderProcess() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-corrupt-account-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let accountURL = root.appendingPathComponent("project-accounts.json")
+        let original = Data("not project account json".utf8)
+        try original.write(to: accountURL)
+        let recoveryCenter = ProjectAccountRecoveryCenter(
+            store: ProjectAccountStore(fileURL: accountURL)
+        )
+        let probe = UsageContextResolverProbe(delay: 0, key: "must-not-resolve")
+        let center = UsageCenter(
+            projectAccountRecoveryCenter: recoveryCenter,
+            planUsageContextResolver: { workspace, environment in
+                probe.resolve(workspace: workspace, environment: environment)
+            }
+        )
+
+        center.refreshPlanUsage(workspace: root)
+
+        XCTAssertEqual(probe.count, 0, "the helper context must not be prepared for a blocked launch")
+        XCTAssertFalse(center.isRefreshingPlanUsage)
+        XCTAssertTrue(center.planUsageError?.contains("blocked") == true)
+        XCTAssertEqual(recoveryCenter.issue?.kind, .corrupt)
+        XCTAssertEqual(try Data(contentsOf: accountURL), original)
+    }
+
     func testProviderCacheContextChangesWithEffectiveAccountWithoutExposingIt() {
         let workspace = URL(fileURLWithPath: "/tmp/kaisola-usage-account", isDirectory: true)
         let first = UsageCenter.planUsageContextKey(

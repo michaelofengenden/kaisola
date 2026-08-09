@@ -3021,13 +3021,18 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
-        savedWindows.save(SavedWindowState(
+        let result = savedWindows.save(SavedWindowState(
             name: name,
             frame: NSStringFromRect(window.frame),
             projectName: model.selectedProjectName,
             projectPath: model.currentProjectDirectory?.standardizedFileURL.path
         ))
-        ToastCenter.shared.show("Layout saved", style: .success)
+        switch result {
+        case .persisted:
+            ToastCenter.shared.show("Layout saved", style: .success)
+        case .blocked(let recovery):
+            presentSavedWindowsRecovery(recovery)
+        }
     }
 
     @objc private func openSavedWindow(_ sender: Any?) {
@@ -3054,7 +3059,32 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
     @objc private func deleteSavedWindow(_ sender: Any?) {
         guard let name = (sender as? NSMenuItem)?.representedObject as? String else { return }
-        savedWindows.remove(name: name)
+        if case .blocked(let recovery) = savedWindows.remove(name: name) {
+            presentSavedWindowsRecovery(recovery)
+        }
+    }
+
+    @objc private func reviewSavedWindowsRecovery(_ sender: Any?) {
+        guard let recovery = savedWindows.snapshot().recovery else { return }
+        presentSavedWindowsRecovery(recovery)
+    }
+
+    private func presentSavedWindowsRecovery(_ recovery: SavedWindowsStore.RecoveryIssue) {
+        let recoveryText = savedWindows.recoveryExportText()
+        let alert = NSAlert()
+        alert.alertStyle = recovery.blocksWrites ? .critical : .warning
+        alert.messageText = recovery.alertTitle
+        alert.informativeText = recovery.message
+        if recoveryText != nil {
+            alert.addButton(withTitle: "Copy Original Data")
+        }
+        alert.addButton(withTitle: "OK")
+        let response = alert.runModal()
+        guard response == .alertFirstButtonReturn, let recoveryText else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(recoveryText, forType: .string)
+        ToastCenter.shared.show("Saved Windows recovery data copied", style: .success)
     }
 
     /// Populates the dynamic submenus (Open Recent / Saved Windows) on open.
@@ -3076,28 +3106,78 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 item.representedObject = path
             }
         case "Saved Windows":
-            let states = savedWindows.all()
-            if states.isEmpty {
-                menu.addItem(NSMenuItem(title: "No Saved Windows", action: nil, keyEquivalent: ""))
-            }
-            for state in states {
-                let item = menu.addItem(withTitle: state.name, action: #selector(openSavedWindow(_:)), keyEquivalent: "")
-                item.target = self
-                item.representedObject = state.name
-            }
-            if !states.isEmpty {
-                menu.addItem(.separator())
-                let deleteItem = menu.addItem(withTitle: "Delete Saved Window", action: nil, keyEquivalent: "")
-                let deleteMenu = NSMenu(title: "Delete Saved Window")
-                for state in states {
-                    let item = deleteMenu.addItem(withTitle: state.name, action: #selector(deleteSavedWindow(_:)), keyEquivalent: "")
-                    item.target = self
-                    item.representedObject = state.name
-                }
-                deleteItem.submenu = deleteMenu
-            }
+            Self.populateSavedWindowsMenu(
+                menu,
+                snapshot: savedWindows.snapshot(),
+                target: self,
+                openAction: #selector(openSavedWindow(_:)),
+                deleteAction: #selector(deleteSavedWindow(_:)),
+                recoveryAction: #selector(reviewSavedWindowsRecovery(_:))
+            )
         default:
             break
+        }
+    }
+
+    static func populateSavedWindowsMenu(
+        _ menu: NSMenu,
+        snapshot: SavedWindowsStore.Snapshot,
+        target: AnyObject?,
+        openAction: Selector,
+        deleteAction: Selector,
+        recoveryAction: Selector
+    ) {
+        if let recovery = snapshot.recovery {
+            let warningItem = menu.addItem(
+                withTitle: recovery.menuTitle,
+                action: recoveryAction,
+                keyEquivalent: ""
+            )
+            warningItem.target = target
+            warningItem.toolTip = recovery.message
+            warningItem.image = NSImage(
+                systemSymbolName: "exclamationmark.triangle",
+                accessibilityDescription: recovery.alertTitle
+            )
+            menu.addItem(.separator())
+        }
+
+        if snapshot.states.isEmpty {
+            let title: String
+            if snapshot.recovery?.blocksWrites == true {
+                title = "Saved Windows Unavailable in This Version"
+            } else {
+                title = "No Saved Windows"
+            }
+            menu.addItem(NSMenuItem(title: title, action: nil, keyEquivalent: ""))
+        }
+        for state in snapshot.states {
+            let item = menu.addItem(
+                withTitle: state.name,
+                action: openAction,
+                keyEquivalent: ""
+            )
+            item.target = target
+            item.representedObject = state.name
+        }
+        if !snapshot.states.isEmpty {
+            menu.addItem(.separator())
+            let deleteItem = menu.addItem(
+                withTitle: "Delete Saved Window",
+                action: nil,
+                keyEquivalent: ""
+            )
+            let deleteMenu = NSMenu(title: "Delete Saved Window")
+            for state in snapshot.states {
+                let item = deleteMenu.addItem(
+                    withTitle: state.name,
+                    action: deleteAction,
+                    keyEquivalent: ""
+                )
+                item.target = target
+                item.representedObject = state.name
+            }
+            deleteItem.submenu = deleteMenu
         }
     }
 

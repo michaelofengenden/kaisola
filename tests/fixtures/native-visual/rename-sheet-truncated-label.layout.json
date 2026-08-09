@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "surface": "workspace-rename",
+  "appearance": "light",
+  "contentWidth": 520,
+  "contentHeight": 324,
+  "inventorySource": "view-tree",
+  "windowControls": [],
+  "controlZone": null,
+  "controlZoneInk": null,
+  "contentInk": {
+    "columns": 3,
+    "rows": 3,
+    "cells": [
+      { "coverage": 0.88, "minimumLuminance": 0.12, "maximumLuminance": 0.95, "samples": 16 },
+      { "coverage": 0.88, "minimumLuminance": 0.12, "maximumLuminance": 0.95, "samples": 16 },
+      { "coverage": 0.88, "minimumLuminance": 0.12, "maximumLuminance": 0.95, "samples": 16 },
+      { "coverage": 0.88, "minimumLuminance": 0.12, "maximumLuminance": 0.95, "samples": 16 },
+      { "coverage": 0.88, "minimumLuminance": 0.12, "maximumLuminance": 0.95, "samples": 16 },
+      { "coverage": 0.88, "minimumLuminance": 0.12, "maximumLuminance": 0.95, "samples": 16 },
+      { "coverage": 0.88, "minimumLuminance": 0.12, "maximumLuminance": 0.95, "samples": 16 },
+      { "coverage": 0.88, "minimumLuminance": 0.12, "maximumLuminance": 0.95, "samples": 16 },
+      { "coverage": 0.88, "minimumLuminance": 0.12, "maximumLuminance": 0.95, "samples": 16 }
+    ]
+  },
+  "elements": [
+    {
+      "id": "0",
+      "role": "AXGroup",
+      "label": "Rename",
+      "frame": { "x": 0, "y": 0, "width": 1, "height": 1 },
+      "isLeaf": false,
+      "isInteractive": false,
+      "isFocused": false,
+      "isTruncated": false,
+      "pointHeight": 324
+    },
+    {
+      "id": "0/0",
+      "role": "AXStaticText",
+      "label": "Rename “Quarterly planning notes and follow-ups.md” to",
+      "frame": { "x": 0.05, "y": 0.12, "width": 0.62, "height": 0.055 },
+      "isLeaf": true,
+      "isInteractive": false,
+      "isFocused": false,
+      "isTruncated": true,
+      "pointHeight": 18
+    },
+    {
+      "id": "0/1",
+      "role": "AXTextField",
+      "label": "New name",
+      "value": "Quarterly planning notes and follow-ups.md",
+      "frame": { "x": 0.05, "y": 0.28, "width": 0.9, "height": 0.08 },
+      "isLeaf": true,
+      "isInteractive": true,
+      "isFocused": true,
+      "isTruncated": false,
+      "pointHeight": 26
+    },
+    {
+      "id": "0/2",
+      "role": "AXButton",
+      "label": "Rename",
+      "frame": { "x": 0.68, "y": 0.78, "width": 0.24, "height": 0.09 },
+      "isLeaf": true,
+      "isInteractive": true,
+      "isFocused": false,
+      "isTruncated": false,
+      "pointHeight": 30
+    }
+  ],
+  "focusedElementID": "0/1"
+}

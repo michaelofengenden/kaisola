@@ -33,9 +33,9 @@ struct ApiKeysSettingsTab: View {
                     )
                 }
                 Text("Stored in this Mac's Keychain and injected only into new direct-API agent terminals and chats. CLI sign-ins do not use these keys; stored values are never displayed.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
                 Text("Testing makes a bounded authenticated model-list request without sending a prompt. You can test a newly pasted key before saving it or verify the saved Keychain value later.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
             }
 
             Section("Provider Routing") {
@@ -99,7 +99,7 @@ struct ApiKeysSettingsTab: View {
 
                 Text(routingDetail)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
@@ -376,10 +376,10 @@ private struct ApiKeyRow: View {
                     .foregroundStyle(
                         isSet
                             ? KaisolaStatusTone.done.foregroundColor
-                            : Color.secondary
+                            : Color.kaisolaSecondary
                     )
                 Text(isSet ? "\(key.rawValue) is set" : "\(key.rawValue) is not set")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             .font(.caption)
             if let errorText {

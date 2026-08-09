@@ -218,7 +218,7 @@ struct OnboardingView: View {
                             systemImage: "info.circle"
                         )
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     }
                 }
                 .padding(28)
@@ -252,7 +252,7 @@ struct OnboardingView: View {
                     .font(.largeTitle.weight(.bold))
                 Text("Confirm the essentials, then start a terminal or agent in your first project.")
                     .font(.title3)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
         }
     }
@@ -288,14 +288,14 @@ struct OnboardingView: View {
         HStack(alignment: .center, spacing: 12) {
             statusSymbol(status.kind)
             Image(systemName: symbol)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: 19)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 Text(title).font(.headline)
                 Text(status.detail)
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 12)
@@ -346,7 +346,7 @@ struct OnboardingView: View {
                 .accessibilityLabel("Needs action")
         case .information:
             Image(systemName: "info.circle.fill")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityLabel("Information")
         }
     }

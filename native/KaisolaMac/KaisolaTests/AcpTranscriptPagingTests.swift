@@ -1,4 +1,5 @@
 import Foundation
+import KaisolaCore
 import XCTest
 @testable import Kaisola
 
@@ -39,6 +40,18 @@ final class AcpTranscriptPagingTests: XCTestCase {
             arguments: [],
             cwd: "/tmp",
             draftKey: draftKey
+        )
+    }
+
+    private func makePermissionConversation() -> AcpConversation {
+        AcpConversation(
+            title: "Permission test",
+            command: "mock",
+            arguments: [],
+            cwd: "/tmp",
+            ruleStore: PermissionRuleStore(fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("kaisola-permission-\(UUID().uuidString).json")),
+            sensitiveGlobs: []
         )
     }
 
@@ -274,6 +287,158 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertEqual(conversation.pendingPermissionCount, 0)
     }
 
+    func testPermissionQueueAcceptsDeclaredCountLimitAndDeniesNextAsk() {
+        let conversation = makePermissionConversation()
+        for id in 1...AcpConversation.maximumOutstandingPermissionCount {
+            conversation.receivePermissionForTesting(Self.permission(id: id))
+        }
+
+        XCTAssertEqual(
+            conversation.pendingPermissionCount,
+            AcpConversation.maximumOutstandingPermissionCount
+        )
+        XCTAssertLessThanOrEqual(
+            conversation.pendingPermissionRetainedBytes,
+            AcpConversation.maximumRetainedPermissionBytes
+        )
+
+        conversation.receivePermissionForTesting(Self.permission(id: 10_000, title: "Overflow"))
+
+        XCTAssertEqual(
+            conversation.pendingPermissionCount,
+            AcpConversation.maximumOutstandingPermissionCount,
+            "the overflowing ask must never enter the retained FIFO"
+        )
+        XCTAssertTrue(conversation.rows.contains { row in
+            guard case let .permissionDecision(_, text) = row else { return false }
+            return text.contains("Overflow") && text.contains("32-prompt limit")
+        })
+    }
+
+    func testPermissionQueueBoundsAggregateEncodedPayloadBytes() {
+        let conversation = makePermissionConversation()
+        let first = Self.permission(
+            id: 1,
+            title: "First payload",
+            rawInput: .string(String(repeating: "a", count: 500_000))
+        )
+        let second = Self.permission(
+            id: 2,
+            title: "Second payload",
+            rawInput: .string(String(repeating: "b", count: 500_000))
+        )
+        let overflow = Self.permission(
+            id: 3,
+            title: "Byte overflow",
+            rawInput: .string(String(repeating: "c", count: 100_000))
+        )
+        let acceptedBytes = AcpConversation.retainedPermissionPayloadBytes(first)
+            + AcpConversation.retainedPermissionPayloadBytes(second)
+        XCTAssertLessThan(acceptedBytes, AcpConversation.maximumRetainedPermissionBytes)
+        XCTAssertGreaterThan(
+            acceptedBytes + AcpConversation.retainedPermissionPayloadBytes(overflow),
+            AcpConversation.maximumRetainedPermissionBytes
+        )
+
+        conversation.receivePermissionForTesting(first)
+        conversation.receivePermissionForTesting(second)
+        conversation.receivePermissionForTesting(overflow)
+
+        XCTAssertEqual(conversation.pendingPermissionCount, 2)
+        XCTAssertEqual(conversation.pendingPermissionRetainedBytes, acceptedBytes)
+        XCTAssertTrue(conversation.rows.contains { row in
+            guard case let .permissionDecision(_, text) = row else { return false }
+            return text.contains("Byte overflow") && text.contains("retained-payload limit")
+        })
+    }
+
+    func testStalePresentedAndQueuedPermissionsExpireInArrivalOrder() {
+        let conversation = makePermissionConversation()
+        let receivedAt = Date()
+        conversation.receivePermissionForTesting(
+            Self.permission(id: 1, title: "Oldest"),
+            receivedAt: receivedAt
+        )
+        conversation.receivePermissionForTesting(
+            Self.permission(id: 2, title: "Next"),
+            receivedAt: receivedAt.addingTimeInterval(1)
+        )
+
+        conversation.expirePermissionsForTesting(
+            at: receivedAt.addingTimeInterval(AcpConversation.permissionPromptLifetime + 2)
+        )
+
+        XCTAssertNil(conversation.pendingPermission)
+        XCTAssertEqual(conversation.pendingPermissionCount, 0)
+        XCTAssertEqual(conversation.pendingPermissionRetainedBytes, 0)
+        let events = conversation.rows.compactMap { row -> String? in
+            guard case let .permissionDecision(_, text) = row else { return nil }
+            return text
+        }
+        XCTAssertEqual(events.count, 2)
+        XCTAssertTrue(events[0].contains("Oldest"))
+        XCTAssertTrue(events[1].contains("Next"))
+        XCTAssertTrue(events.allSatisfy { $0.contains("expired after 5 minutes") })
+    }
+
+    func testAutomaticPermissionEvidencePublishesEveryEventButRetainsABoundedTail() {
+        let conversation = makePermissionConversation()
+        var persistenceSnapshotCount = 0
+        var persistenceReceivedDecision = false
+        conversation.onTranscriptChanged = { rows, _ in
+            persistenceSnapshotCount += 1
+            persistenceReceivedDecision = rows.contains {
+                if case .permissionDecision = $0 { return true }
+                return false
+            }
+        }
+        var observedEventIDs: Set<String> = []
+        var maximumResolutionBacklog = 0
+        let eventCount = AcpConversation.maximumRetainedPermissionDecisionRows + 5
+        let oversizedPayload = String(
+            repeating: "x",
+            count: AcpConversation.maximumRetainedPermissionBytes
+        )
+        for id in 1...eventCount {
+            conversation.receivePermissionForTesting(Self.permission(
+                id: id,
+                title: "Oversized \(id)",
+                rawInput: .string(oversizedPayload)
+            ))
+            if let last = conversation.rows.last, case .permissionDecision = last {
+                observedEventIDs.insert(last.id)
+            }
+            maximumResolutionBacklog = max(
+                maximumResolutionBacklog,
+                conversation.pendingAutomaticPermissionResolutionCount
+            )
+        }
+
+        let retainedEvents = conversation.rows.filter {
+            if case .permissionDecision = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(observedEventIDs.count, eventCount)
+        XCTAssertEqual(
+            retainedEvents.count,
+            AcpConversation.maximumRetainedPermissionDecisionRows
+        )
+        XCTAssertLessThanOrEqual(
+            maximumResolutionBacklog,
+            AcpConversation.maximumPendingAutomaticPermissionResolutions
+        )
+        XCTAssertFalse(
+            persistenceReceivedDecision,
+            "live automatic-denial evidence must not accumulate in durable transcript pages"
+        )
+        XCTAssertEqual(
+            persistenceSnapshotCount,
+            0,
+            "ephemeral evidence must not enqueue redundant durable snapshots"
+        )
+        XCTAssertTrue(retainedEvents.last?.id.contains("\(eventCount)") == true)
+    }
+
     func testPermissionVisualFixtureIsOptInAndDecisionGrade() throws {
         let ordinary = makeConversation()
         ordinary.loadVisualFixture()
@@ -478,5 +643,22 @@ final class AcpTranscriptPagingTests: XCTestCase {
 
     private static func messageRows(count: Int) -> [AcpTranscriptRow] {
         (0..<count).map { .message(id: "m\($0)", text: "row \($0)") }
+    }
+
+    private static func permission(
+        id: Int,
+        title: String? = nil,
+        rawInput: JSONValue? = nil
+    ) -> AcpPermissionRequest {
+        AcpPermissionRequest(
+            id: id,
+            sessionID: "session",
+            title: title ?? "Permission \(id)",
+            options: [
+                .init(id: "allow", name: "Allow", kind: "allow_once"),
+                .init(id: "reject", name: "Reject", kind: "reject_once"),
+            ],
+            rawInput: rawInput
+        )
     }
 }

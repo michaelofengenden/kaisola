@@ -11,8 +11,7 @@ struct MeshView: View {
 
     @ObservedObject var mesh: MeshSession
     private let presentation: Presentation
-    @State private var diffColumnID: String?
-    @State private var diffText = ""
+    @State private var diffSheet = MeshDiffSheetState()
     @State private var integrateColumnID: String?
     @State private var integrationOutcome: MeshIntegrationOutcome?
     /// The column the reported outcome belongs to, so "Try Again" and "Review
@@ -64,7 +63,7 @@ struct MeshView: View {
                             column: column,
                             enablesPermissionShortcuts: column.id == firstPermissionColumnID,
                             stop: { Task { await mesh.stopTurn(columnID: column.id) } },
-                            showDiff: { diffColumnID = column.id },
+                            showDiff: { diffSheet.open(columnID: column.id) },
                             integrate: { integrateColumnID = column.id }
                         )
                     }
@@ -88,25 +87,12 @@ struct MeshView: View {
             Text("Grafts this column's edits onto \(mesh.baseDirectory.lastPathComponent) with a 3-way merge. Conflicts leave git markers you'll need to resolve.")
         }
         .sheet(item: Binding(
-            get: { diffColumnID.map(DiffSheetID.init) },
-            set: { diffColumnID = $0?.id }
+            get: { diffSheet.columnID.map(DiffSheetID.init) },
+            // SwiftUI only ever writes nil here (a dismissal); opening runs
+            // through the column's Diff button so the token is stamped once.
+            set: { if $0 == nil { diffSheet.close() } }
         )) { sheet in
-            VStack(spacing: 0) {
-                HStack {
-                    Text("Worktree diff — \(mesh.columns.first { $0.id == sheet.id }?.agent.name ?? "")")
-                        .font(.headline)
-                    Spacer()
-                    Button("Done") { diffColumnID = nil }.keyboardShortcut(.defaultAction)
-                }
-                .padding(12)
-                Divider()
-                ScrollView {
-                    UnifiedPatchView(patch: diffText.isEmpty ? "No changes yet." : diffText)
-                        .padding(12)
-                }
-            }
-            .frame(width: 640, height: 480)
-            .task { diffText = await mesh.diff(for: sheet.id) }
+            diffSheetBody(for: sheet.id)
         }
         .onAppear { applyFocusRequest(focusRequestGeneration) }
         .onChange(of: focusRequestGeneration) { _, request in
@@ -116,6 +102,49 @@ struct MeshView: View {
 
     private struct DiffSheetID: Identifiable {
         let id: String
+    }
+
+    /// The diff sheet for one column. Until that column's own request comes
+    /// back the body says so out loud rather than rendering whatever the last
+    /// column left in the shared string.
+    @ViewBuilder
+    private func diffSheetBody(for columnID: String) -> some View {
+        let name = mesh.columns.first { $0.id == columnID }?.agent.name ?? ""
+        VStack(spacing: 0) {
+            HStack {
+                Text("Worktree diff — \(name)")
+                    .font(.headline)
+                Spacer()
+                Button("Done") { diffSheet.close() }.keyboardShortcut(.defaultAction)
+            }
+            .padding(12)
+            Divider()
+            ScrollView {
+                if let patch = diffSheet.patch {
+                    UnifiedPatchView(patch: patch.isEmpty ? "No changes yet." : patch)
+                        .padding(12)
+                } else {
+                    ProgressView("Loading diff…")
+                        .controlSize(.small)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(24)
+                        .accessibilityLabel(
+                            name.isEmpty ? "Loading worktree diff" : "Loading \(name)'s worktree diff"
+                        )
+                }
+            }
+        }
+        .frame(width: 640, height: 480)
+        .task(id: columnID) { await loadDiff(for: columnID) }
+    }
+
+    /// Read the column's worktree diff and hand it back through the sheet's
+    /// fence, so a slow result that lands after a switch or a dismissal is
+    /// dropped instead of painted over the wrong column.
+    private func loadDiff(for columnID: String) async {
+        let token = diffSheet.token
+        let patch = await mesh.diff(for: columnID)
+        diffSheet.apply(patch: patch, from: columnID, token: token)
     }
 
     private var header: some View {
@@ -252,7 +281,9 @@ struct MeshView: View {
     private func perform(_ action: MeshIntegrationOutcome.Recovery) {
         switch action {
         case .reviewDiff:
-            diffColumnID = integratedColumnID
+            if let columnID = integratedColumnID {
+                diffSheet.open(columnID: columnID)
+            }
         case .retry:
             if let columnID = integratedColumnID { integrate(columnID) }
         case .revealDestination:

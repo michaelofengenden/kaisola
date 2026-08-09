@@ -96,6 +96,10 @@ actor AcpClient {
     /// Sensitive globs the fs bridge refuses to read or write (set by the
     /// conversation from the user's guardrails; defaults applied otherwise).
     private var fsSensitiveGlobs = AcpPermissionRules.defaultSensitiveGlobs
+    /// Built-ins retain the historical full client bridge. A custom adapter's
+    /// reviewed containment grant narrows advertised MCP/fs/terminal services
+    /// and is enforced again when a request arrives.
+    private var access = AcpAdapterAccess.unrestricted
     /// Mirrors Electron's MAX_TEXT_FILE_BYTES ACP fs limit.
     static let maxTextFileBytes = 8 * 1024 * 1024
 
@@ -124,7 +128,40 @@ actor AcpClient {
         environment: [String: String],
         cwd: String,
         mcpServers: [JSONValue],
-        resumeSessionID: String? = nil
+        resumeSessionID: String? = nil,
+        access: AcpAdapterAccess = .unrestricted
+    ) async throws -> AcpSessionInfo {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let session = try await startConnection(
+                command: command,
+                arguments: arguments,
+                environment: environment,
+                cwd: cwd,
+                mcpServers: mcpServers,
+                resumeSessionID: resumeSessionID,
+                access: access
+            )
+            if Task.isCancelled {
+                await stop()
+                throw CancellationError()
+            }
+            return session
+        } onCancel: {
+            // GUI task cancellation is an ownership close, including while the
+            // initialize/session handshake is still waiting for its first byte.
+            Task { await self.stop() }
+        }
+    }
+
+    private func startConnection(
+        command: String,
+        arguments: [String],
+        environment: [String: String],
+        cwd: String,
+        mcpServers: [JSONValue],
+        resumeSessionID: String?,
+        access: AcpAdapterAccess
     ) async throws -> AcpSessionInfo {
         connectionGeneration &+= 1
         decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
@@ -133,6 +170,7 @@ actor AcpClient {
         toolCallReviewContexts.removeAll(keepingCapacity: true)
         toolCallReviewOrder.removeAll(keepingCapacity: true)
         workspaceRoot = (cwd as NSString).standardizingPath
+        self.access = access
         do {
             try await transport.start(command: command, arguments: arguments, environment: environment, cwd: cwd)
             readerTask = Task { await readLoop() }
@@ -140,10 +178,13 @@ actor AcpClient {
             let initResult = try await request("initialize", params: .object([
             "protocolVersion": .integer(Int64(AcpWire.protocolVersion)),
             "clientCapabilities": .object([
-                "fs": .object(["readTextFile": .bool(true), "writeTextFile": .bool(true)]),
-                "terminal": .bool(true),
-                "auth": .object(["terminal": .bool(true)]),
-                "_meta": .object(["terminal-auth": .bool(true)]),
+                "fs": .object([
+                    "readTextFile": .bool(access.workspaceRead),
+                    "writeTextFile": .bool(access.workspaceWrite),
+                ]),
+                "terminal": .bool(access.hostTerminal),
+                "auth": .object(["terminal": .bool(access.hostTerminal)]),
+                "_meta": .object(["terminal-auth": .bool(access.hostTerminal)]),
             ]),
         ]))
         // ACP requires the client to disconnect when the negotiated protocol is
@@ -231,6 +272,7 @@ actor AcpClient {
             // reader task behind. This is especially important while users swap
             // agent profiles rapidly from the project menu.
             await stop()
+            if Task.isCancelled { throw CancellationError() }
             throw error
         }
     }
@@ -367,19 +409,22 @@ actor AcpClient {
         }
     }
 
-    /// Set an adapter config option (e.g. reasoning effort). The response echoes
-    /// the full option set, which is re-emitted so the UI reflects adapter-side
-    /// normalization.
-    func setConfigOption(id: String, value: String) async {
-        guard let sessionID else { return }
-        let result = try? await request("session/set_config_option", params: .object([
+    /// Set an adapter config option (e.g. reasoning effort) and return only the
+    /// option set the adapter confirmed. Callers must not present the requested
+    /// value before this succeeds: adapters can reject a level for one model or
+    /// normalize it to another supported value.
+    func setConfigOption(id: String, value: String) async throws -> [AcpConfigOption] {
+        guard let sessionID else { throw AcpClientError.notRunning }
+        let result = try await request("session/set_config_option", params: .object([
             "sessionId": .string(sessionID),
             "configId": .string(id),
             "value": .string(value),
         ]))
-        if let options = result?.objectValue?["configOptions"] {
-            eventHandler?(.configOptions(Self.parseConfigOptions(options)))
+        let options = Self.parseConfigOptions(result.objectValue?["configOptions"])
+        guard options.contains(where: { $0.id == id && $0.currentValue != nil }) else {
+            throw AcpClientError.malformedResponse
         }
+        return options
     }
 
     /// Resolve a pending permission request with the user's chosen option.
@@ -454,9 +499,14 @@ actor AcpClient {
     private func sessionMcpServers(_ servers: [JSONValue]) -> [JSONValue] {
         servers.filter { entry in
             switch entry.objectValue?["type"]?.stringValue {
-            case "http": capabilities.mcpHTTP
-            case "sse": capabilities.mcpSSE
-            default: true
+            case "http": access.network && capabilities.mcpHTTP
+            case "sse": access.network && capabilities.mcpSSE
+            case nil: access.childProcess
+            default:
+                // Preserve the historical pass-through for built-ins, but a
+                // contained adapter must never gain an unclassified transport
+                // through the broader child-process grant.
+                access == .unrestricted
             }
         }
     }
@@ -534,6 +584,12 @@ actor AcpClient {
         do {
             while !Task.isCancelled {
                 guard let data = try await transport.receive(maximumBytes: 256 * 1_024) else {
+                    guard !Task.isCancelled else { return }
+                    // EOF is the transport connection closing. Reap the whole
+                    // adapter-owned process group before publishing the exit;
+                    // the adapter may have closed stdout while remaining alive.
+                    await transport.terminate()
+                    guard !Task.isCancelled else { return }
                     let code = await transport.exitCode() ?? 0
                     connectionGeneration &+= 1
                     cancelPermissionRequests()
@@ -554,6 +610,8 @@ actor AcpClient {
                 decoder = active
             }
         } catch {
+            guard !Task.isCancelled else { return }
+            await transport.terminate()
             guard !Task.isCancelled else { return }
             connectionGeneration &+= 1
             cancelPermissionRequests()
@@ -604,6 +662,14 @@ actor AcpClient {
 
     private func handleTerminalMethod(_ method: String, id: JSONValue?, params: JSONValue?) {
         guard let id else { return }
+        guard access.hostTerminal else {
+            respondError(
+                id: id,
+                code: -32000,
+                message: "Blocked by custom adapter containment: host terminals are unavailable; use a reviewed in-sandbox child-process grant instead."
+            )
+            return
+        }
         let object = params?.objectValue ?? [:]
         Task {
             do {
@@ -824,8 +890,24 @@ actor AcpClient {
         }
     }
 
+    /// JSON-RPC 2.0 "Invalid params" — the answer an ask we cannot put in front
+    /// of a human has to carry.
+    private static let invalidParamsCode = -32602
+
     private func handlePermissionRequest(id: JSONValue?, params: JSONValue?) {
-        guard let id, let sessionID else { return }
+        // No id means the agent sent this as a notification; JSON-RPC forbids
+        // answering one, and there is no decision to route back.
+        guard let id else { return }
+        // Every remaining path must reply. Dropping a malformed ask left the
+        // adapter blocked forever on a decision the user was never shown.
+        guard let sessionID else {
+            respondError(
+                id: id,
+                code: Self.invalidParamsCode,
+                message: "session/request_permission arrived with no active session"
+            )
+            return
+        }
         permissionCounter += 1
         let localID = permissionCounter
         let toolCallID = params?.objectValue?["toolCall"]?.objectValue?["toolCallId"]?.stringValue
@@ -835,7 +917,14 @@ actor AcpClient {
             sessionID: sessionID,
             params: params,
             priorContext: priorContext
-        ) else { return }
+        ) else {
+            respondError(
+                id: id,
+                code: Self.invalidParamsCode,
+                message: "session/request_permission needs object params with at least one option"
+            )
+            return
+        }
         activePermissionIDs.insert(localID)
         let generation = connectionGeneration
         activePermissionRequests[localID] = ActivePermissionRequest(
@@ -875,6 +964,13 @@ actor AcpClient {
 
     /// Decode the complete permission review payload, including ACP v1's
     /// arbitrary `rawInput`. Kept pure for wire-contract tests.
+    ///
+    /// Returns nil for an ask no user could answer — params that are not an
+    /// object, or an `options` list with nothing selectable in it. The caller
+    /// turns that into a JSON-RPC error, because a review card with no buttons
+    /// blocks the adapter just as thoroughly as no card at all. A missing
+    /// `toolCall` is NOT malformed: partial asks fall back to the disclosure an
+    /// earlier `session/update` already streamed.
     static func parsePermissionRequest(
         localID: Int,
         sessionID: String,
@@ -913,6 +1009,7 @@ actor AcpClient {
                 kind: o["kind"]?.stringValue ?? "other"
             )
         }
+        guard !options.isEmpty else { return nil }
         var seenPaths = Set<String>()
         let paths = (locationPaths + diffPaths).filter {
             !$0.isEmpty && seenPaths.insert($0).inserted
@@ -980,6 +1077,14 @@ actor AcpClient {
 
     private func handleReadTextFile(id: JSONValue?, params: JSONValue?) {
         guard let id else { return }
+        guard access.workspaceRead else {
+            respondError(
+                id: id,
+                code: -32000,
+                message: "Blocked by custom adapter containment: workspace read was not approved."
+            )
+            return
+        }
         do {
             let path = try workspacePath(params?.objectValue?["path"]?.stringValue, mustExist: true)
             guard !AcpPermissionRules.pathIsSensitive(globs: fsSensitiveGlobs, pathish: path) else {
@@ -998,6 +1103,14 @@ actor AcpClient {
 
     private func handleWriteTextFile(id: JSONValue?, params: JSONValue?) {
         guard let id else { return }
+        guard access.workspaceWrite else {
+            respondError(
+                id: id,
+                code: -32000,
+                message: "Blocked by custom adapter containment: workspace write was not approved."
+            )
+            return
+        }
         do {
             let content = params?.objectValue?["content"]?.stringValue ?? ""
             guard content.utf8.count <= Self.maxTextFileBytes else {

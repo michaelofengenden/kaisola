@@ -367,19 +367,22 @@ actor AcpClient {
         }
     }
 
-    /// Set an adapter config option (e.g. reasoning effort). The response echoes
-    /// the full option set, which is re-emitted so the UI reflects adapter-side
-    /// normalization.
-    func setConfigOption(id: String, value: String) async {
-        guard let sessionID else { return }
-        let result = try? await request("session/set_config_option", params: .object([
+    /// Set an adapter config option (e.g. reasoning effort) and return only the
+    /// option set the adapter confirmed. Callers must not present the requested
+    /// value before this succeeds: adapters can reject a level for one model or
+    /// normalize it to another supported value.
+    func setConfigOption(id: String, value: String) async throws -> [AcpConfigOption] {
+        guard let sessionID else { throw AcpClientError.notRunning }
+        let result = try await request("session/set_config_option", params: .object([
             "sessionId": .string(sessionID),
             "configId": .string(id),
             "value": .string(value),
         ]))
-        if let options = result?.objectValue?["configOptions"] {
-            eventHandler?(.configOptions(Self.parseConfigOptions(options)))
+        let options = Self.parseConfigOptions(result.objectValue?["configOptions"])
+        guard options.contains(where: { $0.id == id && $0.currentValue != nil }) else {
+            throw AcpClientError.malformedResponse
         }
+        return options
     }
 
     /// Resolve a pending permission request with the user's chosen option.
@@ -823,8 +826,24 @@ actor AcpClient {
         }
     }
 
+    /// JSON-RPC 2.0 "Invalid params" — the answer an ask we cannot put in front
+    /// of a human has to carry.
+    private static let invalidParamsCode = -32602
+
     private func handlePermissionRequest(id: JSONValue?, params: JSONValue?) {
-        guard let id, let sessionID else { return }
+        // No id means the agent sent this as a notification; JSON-RPC forbids
+        // answering one, and there is no decision to route back.
+        guard let id else { return }
+        // Every remaining path must reply. Dropping a malformed ask left the
+        // adapter blocked forever on a decision the user was never shown.
+        guard let sessionID else {
+            respondError(
+                id: id,
+                code: Self.invalidParamsCode,
+                message: "session/request_permission arrived with no active session"
+            )
+            return
+        }
         permissionCounter += 1
         let localID = permissionCounter
         let toolCallID = params?.objectValue?["toolCall"]?.objectValue?["toolCallId"]?.stringValue
@@ -834,7 +853,14 @@ actor AcpClient {
             sessionID: sessionID,
             params: params,
             priorContext: priorContext
-        ) else { return }
+        ) else {
+            respondError(
+                id: id,
+                code: Self.invalidParamsCode,
+                message: "session/request_permission needs object params with at least one option"
+            )
+            return
+        }
         activePermissionIDs.insert(localID)
         let generation = connectionGeneration
         eventHandler?(.permission(request))
@@ -864,6 +890,13 @@ actor AcpClient {
 
     /// Decode the complete permission review payload, including ACP v1's
     /// arbitrary `rawInput`. Kept pure for wire-contract tests.
+    ///
+    /// Returns nil for an ask no user could answer — params that are not an
+    /// object, or an `options` list with nothing selectable in it. The caller
+    /// turns that into a JSON-RPC error, because a review card with no buttons
+    /// blocks the adapter just as thoroughly as no card at all. A missing
+    /// `toolCall` is NOT malformed: partial asks fall back to the disclosure an
+    /// earlier `session/update` already streamed.
     static func parsePermissionRequest(
         localID: Int,
         sessionID: String,
@@ -902,6 +935,7 @@ actor AcpClient {
                 kind: o["kind"]?.stringValue ?? "other"
             )
         }
+        guard !options.isEmpty else { return nil }
         var seenPaths = Set<String>()
         let paths = (locationPaths + diffPaths).filter {
             !$0.isEmpty && seenPaths.insert($0).inserted

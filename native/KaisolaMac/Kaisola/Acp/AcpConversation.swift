@@ -144,6 +144,10 @@ final class AcpConversation: ObservableObject {
     @Published private(set) var modes: [AcpSessionInfo.Mode] = []
     @Published private(set) var currentModeID: String?
     @Published private(set) var configOptions: [AcpConfigOption] = []
+    /// The one adapter-owned setting currently awaiting confirmation. Keeping
+    /// the prior value visible until this clears prevents a rejected effort
+    /// level from masquerading as the value the next prompt will use.
+    @Published private(set) var pendingConfigOptionID: String?
     @Published private(set) var commands: [AcpCommand] = []
     /// Whether this adapter advertised `_session/steering` at `initialize`.
     /// Reset on every connect so a swapped agent can never inherit the previous
@@ -212,9 +216,13 @@ final class AcpConversation: ObservableObject {
     }
 
     struct TurnCheckpoint: Identifiable, Equatable, Sendable {
-        let id: String       // stash commit hash
+        let checkpoint: GitService.Checkpoint
         let turn: Int
         let at: Date
+
+        /// A stash commit can be identical across owners or turns. The exact
+        /// owner ref is the durable UI identity and cleanup capability.
+        var id: String { checkpoint.keepAliveRef }
     }
 
     @Published var title: String
@@ -245,6 +253,11 @@ final class AcpConversation: ObservableObject {
     /// parameter. Nil disables persistence: `loadDraft` returns "" and
     /// `saveDraft` is a no-op.
     var draftStorageKey: String?
+    /// Stable chat/column identity plus a per-live-instance incarnation keep
+    /// checkpoint refs independent across windows and concurrently running app
+    /// builds that restore the same durable conversation.
+    private let checkpointOwnerID: String
+    private let checkpointIncarnationID: UUID
     private var client: AcpClient
     /// Reconciles adapter-reported user messages against the rows already shown.
     private var userMessageLedger: AcpUserMessageLedger
@@ -300,6 +313,11 @@ final class AcpConversation: ObservableObject {
     private var attachmentCounter = 0
     private var draftPersistenceTask: Task<Void, Never>?
     private var pendingDraftPersistence: String?
+    /// Fences a late setting response after stop, restart, or adapter exit.
+    private var configOptionRequestGeneration: UInt64 = 0
+    /// Lets a later successful retry clear only the failure this setting path
+    /// published, without erasing an unrelated turn or reconnect notice.
+    private var lastConfigOptionFailureMessage: String?
     /// ACP adapters may issue several permission requests before the user has
     /// answered the first. Keep one visible request and preserve the remainder
     /// in arrival order instead of replacing the on-screen card.
@@ -325,6 +343,7 @@ final class AcpConversation: ObservableObject {
         ruleStore: PermissionRuleStore = PermissionRuleStore(),
         sensitiveGlobs: [String] = AcpPermissionRules.defaultSensitiveGlobs,
         draftKey: String? = nil,
+        checkpointIncarnationID: UUID = UUID(),
         resumeSessionID: String? = nil,
         initialRows: [AcpTranscriptRow] = [],
         initialRowStartOrdinal: Int64 = 0,
@@ -349,6 +368,13 @@ final class AcpConversation: ObservableObject {
         self.ruleStore = ruleStore
         self.sensitiveGlobs = sensitiveGlobs
         self.draftStorageKey = draftKey
+        self.checkpointIncarnationID = checkpointIncarnationID
+        if let draftKey,
+           !draftKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            self.checkpointOwnerID = draftKey
+        } else {
+            self.checkpointOwnerID = "ephemeral-\(checkpointIncarnationID.uuidString.lowercased())"
+        }
         self.resumeSessionID = resumeSessionID
         self.rows = initialRows
         self.userMessageLedger = AcpUserMessageLedger(rows: initialRows)
@@ -376,6 +402,7 @@ final class AcpConversation: ObservableObject {
     func start(resumeQueuedPrompts: Bool = false) async {
         guard !hasStarted else { return }
         hasStarted = true
+        invalidateConfigOptionRequest()
         // One ordered pipe from the client's (off-main) event handler to the
         // MainActor consumer: yields preserve order, and a single draining task
         // consumes them serially. The handler captures the continuation (not
@@ -419,6 +446,7 @@ final class AcpConversation: ObservableObject {
             supportsSteering = info.supportsSteering
             isConnected = true
             statusMessage = nil
+            lastConfigOptionFailureMessage = nil
             // Only entries still in `queued` are known never to have been
             // dispatched. An explicit adapter restart resumes them; ordinary
             // app restoration leaves them paused until the user chooses Resume
@@ -445,6 +473,7 @@ final class AcpConversation: ObservableObject {
     /// offered back through ACP load/resume negotiation when supported.
     func restart() async {
         guard canRestart else { return }
+        invalidateConfigOptionRequest()
         isReconnecting = true
         statusMessage = "Restarting agent…"
         eventContinuation?.finish()
@@ -788,13 +817,46 @@ final class AcpConversation: ObservableObject {
         Task { await client.setMode(id) }
     }
 
-    /// Set an adapter config option (effort level etc.); the client re-emits the
-    /// adapter's normalized option set, which `consume` applies.
+    /// Set an adapter config option (effort level etc.) transactionally.
+    ///
+    /// The adapter's last confirmed value remains on screen while the request
+    /// is in flight. Only the returned option set may replace it; a rejection
+    /// leaves the draft, transcript, running turn, and confirmed value intact.
+    /// One request at a time also makes response order unambiguous.
     func selectConfigOption(_ id: String, value: String) {
-        if let index = configOptions.firstIndex(where: { $0.id == id }) {
-            configOptions[index].currentValue = value   // optimistic
+        guard isConnected, pendingConfigOptionID == nil,
+              let option = configOptions.first(where: { $0.id == id }),
+              option.currentValue != value,
+              let choice = option.choices.first(where: { $0.value == value }) else { return }
+
+        configOptionRequestGeneration &+= 1
+        let generation = configOptionRequestGeneration
+        pendingConfigOptionID = id
+        let requestClient = client
+        Task { [weak self] in
+            do {
+                let confirmed = try await requestClient.setConfigOption(id: id, value: value)
+                guard let self, self.configOptionRequestGeneration == generation else { return }
+                self.pendingConfigOptionID = nil
+                self.configOptions = confirmed
+                if self.statusMessage == self.lastConfigOptionFailureMessage {
+                    self.statusMessage = nil
+                }
+                self.lastConfigOptionFailureMessage = nil
+            } catch {
+                guard let self, self.configOptionRequestGeneration == generation else { return }
+                self.pendingConfigOptionID = nil
+                let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                let message = "Couldn’t change \(option.name) to \(choice.name). \(detail)"
+                self.lastConfigOptionFailureMessage = message
+                self.statusMessage = message
+            }
         }
-        Task { await client.setConfigOption(id: id, value: value) }
+    }
+
+    private func invalidateConfigOptionRequest() {
+        configOptionRequestGeneration &+= 1
+        pendingConfigOptionID = nil
     }
 
     func answerPermission(_ optionID: String) {
@@ -922,6 +984,7 @@ final class AcpConversation: ObservableObject {
     /// debounced composer value lets the window owner durably save it before
     /// AppKit receives the quit reply.
     func stop() async -> String? {
+        invalidateConfigOptionRequest()
         draftPersistenceTask?.cancel()
         draftPersistenceTask = nil
         let finalDraft = pendingDraftPersistence
@@ -958,36 +1021,43 @@ final class AcpConversation: ObservableObject {
     /// Snapshots cover TRACKED files (git stash create semantics).
     private func recordCheckpoint(turn: Int) async {
         let workspace = cwd
-        let hash = await Task.detached(priority: .userInitiated) { () -> String? in
+        let ownerID = checkpointOwnerID
+        let incarnationID = checkpointIncarnationID
+        let checkpoint = await Task.detached(priority: .userInitiated) { () -> GitService.Checkpoint? in
             let service = GitService(repoRoot: URL(fileURLWithPath: workspace, isDirectory: true))
-            return try? service.checkpoint()
+            return try? service.checkpoint(
+                ownerID: ownerID,
+                incarnationID: incarnationID,
+                turn: turn
+            )
         }.value
-        guard let hash else { return }
-        checkpoints.append(TurnCheckpoint(id: hash, turn: turn, at: Date()))
+        guard let checkpoint else { return }
+        checkpoints.append(TurnCheckpoint(checkpoint: checkpoint, turn: turn, at: Date()))
         if checkpoints.count > 20 {
             let dropped = checkpoints.removeFirst()
-            dropCheckpointRef(dropped.id)
+            dropCheckpointRef(dropped.checkpoint)
         }
     }
 
     /// Release a checkpoint's keep-alive ref once it ages out of the menu.
-    private func dropCheckpointRef(_ hash: String) {
+    private func dropCheckpointRef(_ checkpoint: GitService.Checkpoint) {
         let workspace = cwd
         Task.detached(priority: .utility) {
             let service = GitService(repoRoot: URL(fileURLWithPath: workspace, isDirectory: true))
-            try? service.dropCheckpoint(hash)
+            try? service.dropCheckpoint(checkpoint)
         }
     }
 
     /// Restore a checkpoint's files over the current tree (user-confirmed in
     /// the header). Conflicts surface as a status message, never silently.
-    func restoreCheckpoint(_ id: String) {
+    func restoreCheckpoint(_ checkpoint: TurnCheckpoint) {
         let workspace = cwd
+        let snapshot = checkpoint.checkpoint
         Task.detached(priority: .userInitiated) { [weak self] in
             let service = GitService(repoRoot: URL(fileURLWithPath: workspace, isDirectory: true))
             let outcome: Result<Void, any Error>
             do {
-                try service.applyCheckpoint(id)
+                try service.applyCheckpoint(snapshot)
                 outcome = .success(())
             } catch {
                 outcome = .failure(error)
@@ -1232,6 +1302,7 @@ final class AcpConversation: ObservableObject {
             // Leave the queue intact on error — auto-dispatching into a failing
             // agent would loop; the user can retry or clear it.
         case let .exited(code):
+            invalidateConfigOptionRequest()
             flushPendingChunk()
             isConnected = false
             isRunning = false

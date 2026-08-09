@@ -1996,11 +1996,11 @@ final class NativePreviewSettingsTests: XCTestCase {
         }
     }
 
-    /// The mechanism that *would* lift light's secondary over the floor, kept as
-    /// a live measurement rather than a note: a custom ink instead of the system
-    /// semantic. Recorded here so the follow-up has a number, and so it stops
-    /// being true the moment the surface drifts far enough that it would not
-    /// work.
+    /// The mechanism that lifts light's secondary over the floor, kept as a live
+    /// measurement rather than a note: a custom ink instead of the system
+    /// semantic. It now reads the *shipped* alpha out of `KaisolaInk` rather
+    /// than a literal, so the number here cannot drift away from the ink the app
+    /// actually draws with.
     func testACustomSecondaryInkWouldClearTheFloorOnLightGlass() throws {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "kaisola-lightink-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -2027,15 +2027,397 @@ final class NativePreviewSettingsTests: XCTestCase {
                 over: patch
             )
         }
+        let shipped = KaisolaInk.alpha(.secondary, isDark: false, on: .glass)
         print(String(
-            format: "[light-glass] worst-patch secondary: AppKit α0.498 %.2f:1, custom α0.60 %.2f:1",
-            inked(0.498), inked(0.60)
+            format: "[light-glass] worst-patch secondary: AppKit α0.498 %.2f:1, Kaisola α%.3f %.2f:1",
+            inked(0.498), shipped, inked(shipped)
         ))
         XCTAssertLessThan(inked(0.498), 4.5, "the system semantic clears the floor after all")
         XCTAssertGreaterThanOrEqual(
-            inked(0.60), 4.5,
-            "a custom α0.60 ink no longer buys the floor; the follow-up needs re-deriving"
+            inked(shipped), 4.5,
+            "the shipped secondary ink no longer buys the floor on the adversarial fixture"
         )
+    }
+
+    // MARK: - The ink ladder
+
+    /// Contrast of one rung of `KaisolaInk` against a rendered patch. The ink is
+    /// black in light and white in dark, which is exactly what
+    /// `KaisolaInk.nsColor` resolves to, so this measures the shipped constant
+    /// rather than a copy of it.
+    private func inkContrast(
+        alpha: Double,
+        over patch: (Double, Double, Double),
+        isDark: Bool
+    ) -> Double {
+        let ink = isDark ? 1.0 : 0.0
+        return contrastRatio(
+            text: (
+                ink * alpha + patch.0 * (1 - alpha),
+                ink * alpha + patch.1 * (1 - alpha),
+                ink * alpha + patch.2 * (1 - alpha)
+            ),
+            over: patch
+        )
+    }
+
+    private func inkContrast(
+        _ level: KaisolaInk.Level,
+        over patch: (Double, Double, Double),
+        isDark: Bool,
+        on surface: KaisolaInk.Surface = .glass
+    ) -> Double {
+        inkContrast(
+            alpha: KaisolaInk.alpha(level, isDark: isDark, on: surface),
+            over: patch,
+            isDark: isDark
+        )
+    }
+
+    /// A colour as the given appearance actually draws it, in sRGB.
+    private func resolved(_ color: NSColor, in appearance: NSAppearance)
+        -> (red: Double, green: Double, blue: Double, alpha: Double) {
+        var components = (red: 0.0, green: 0.0, blue: 0.0, alpha: 0.0)
+        appearance.performAsCurrentDrawingAppearance {
+            guard let srgb = color.usingColorSpace(.sRGB) else { return }
+            components = (
+                Double(srgb.redComponent), Double(srgb.greenComponent),
+                Double(srgb.blueComponent), Double(srgb.alphaComponent)
+            )
+        }
+        return components
+    }
+
+    /// The six wallpapers the light and dark worst-patch tests already hold the
+    /// veil to. The ink is held to the same ones so the two constraints cannot
+    /// be measured on different ground.
+    private static let inkFixtures: [(name: String, base: (Double, Double, Double), range: Double)] = [
+        ("aerial", (0.263, 0.476, 0.575), 0.9),     // Michael's own desktop
+        ("dim", (0.06, 0.07, 0.09), 0.9),
+        ("bright", (0.82, 0.80, 0.76), 0.7),
+        ("saturated", (0.42, 0.20, 0.08), 0.8),
+        ("neutral-wide", (0.435, 0.435, 0.435), 1.6),
+        ("adversarial", (0.5, 0.5, 0.5), 1.95),
+    ]
+
+    /// **The criterion this whole change exists for.** Kaisola's secondary ink
+    /// clears 4.5:1 on the worst patch of every light-glass fixture, on both
+    /// surfaces, at every clarity that does not declare a contrast trade.
+    ///
+    /// The same loop measures AppKit's `secondaryLabelColor` alongside, and
+    /// asserts it *fails* somewhere — without that, a future veil change that
+    /// happened to lift the system semantic over the floor would leave this test
+    /// green while proving nothing about the ink.
+    func testTheSecondaryInkClearsTheFloorOnEveryLightGlassFixture() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-inkfloor-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let clarities = GlassClarity.allCases.filter { !$0.relaxesTextContrast }
+        XCTAssertEqual(clarities.count, 2, "a clarity was added without deciding its text floor")
+        var systemSemanticFailedSomewhere = false
+
+        for (name, base, range) in Self.inkFixtures {
+            let url = try writeRampWallpaper(base: base, range: range, into: directory, named: name)
+            let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
+            guard case let .wallpaper(still, _, _)? = DesktopBackdropRenderer.render(key: key) else {
+                return XCTFail("\(name) produced no painting")
+            }
+            for clarity in clarities {
+                for (surface, wash, width, height) in [
+                    ("sidebar", GlassBackdropWash.sidebar(isDark: false, clarity: clarity), 210, 900),
+                    ("workspace", GlassBackdropWash.workspace(isDark: false, clarity: clarity), 900, 900),
+                ] {
+                    let pixels = try renderGlassSurface(
+                        still: still, wash: wash, isDark: false, width: width, height: height
+                    )
+                    let patch = worstPatchContrast(pixels, isDark: false).patch
+                    let kaisola = inkContrast(.secondary, over: patch, isDark: false)
+                    let appKit = inkContrast(alpha: 0.498, over: patch, isDark: false)
+                    systemSemanticFailedSomewhere = systemSemanticFailedSomewhere || appKit < 4.5
+                    print(String(
+                        format: "[ink] light %@ %@ %@ secondary: AppKit %.2f:1  Kaisola %.2f:1",
+                        clarity.rawValue, name, surface, appKit, kaisola
+                    ))
+                    XCTAssertGreaterThanOrEqual(
+                        kaisola, 4.5,
+                        """
+                        \(clarity.rawValue) \(name) \(surface): the secondary ink measures \
+                        \(kaisola):1 on the worst patch, under the 4.5 floor
+                        """
+                    )
+                    XCTAssertGreaterThanOrEqual(
+                        inkContrast(.primary, over: patch, isDark: false), 7,
+                        "\(clarity.rawValue) \(name) \(surface): primary fell under 7:1"
+                    )
+                }
+            }
+        }
+
+        XCTAssertTrue(
+            systemSemanticFailedSomewhere,
+            "AppKit's secondary now clears 4.5 everywhere, so this test no longer proves the ink"
+        )
+    }
+
+    /// The dark half, which the ink deliberately leaves where AppKit had it —
+    /// asserted so "unchanged" stays a measured claim rather than a memory.
+    func testTheSecondaryInkHoldsDarkGlassWhereTheSystemSemanticAlreadyDid() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-inkdark-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertEqual(
+            KaisolaInk.alpha(.secondary, isDark: true), 0.55, accuracy: 0.001,
+            "dark secondary moved off AppKit's alpha; the dark measurements below were not re-derived"
+        )
+
+        for (name, base, range) in Self.inkFixtures {
+            let url = try writeRampWallpaper(base: base, range: range, into: directory, named: name)
+            let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: true)
+            guard case let .wallpaper(still, _, _)? = DesktopBackdropRenderer.render(key: key) else {
+                return XCTFail("\(name) produced no painting")
+            }
+            for (surface, wash, width, height) in [
+                ("sidebar", GlassBackdropWash.sidebar(isDark: true), 210, 900),
+                ("workspace", GlassBackdropWash.workspace(isDark: true), 900, 900),
+            ] {
+                let pixels = try renderGlassSurface(
+                    still: still, wash: wash, isDark: true, width: width, height: height
+                )
+                let patch = worstPatchContrast(pixels, isDark: true).patch
+                let secondary = inkContrast(.secondary, over: patch, isDark: true)
+                let tertiary = inkContrast(.tertiary, over: patch, isDark: true)
+                print(String(
+                    format: "[ink] dark %@ %@ secondary %.2f:1  tertiary %.2f:1",
+                    name, surface, secondary, tertiary
+                ))
+                XCTAssertGreaterThanOrEqual(
+                    secondary, 4.5, "\(name) \(surface): dark secondary is \(secondary):1"
+                )
+                XCTAssertGreaterThanOrEqual(
+                    tertiary, 3, "\(name) \(surface): dark tertiary is \(tertiary):1"
+                )
+            }
+        }
+    }
+
+    /// The other two surfaces of the token set: the opaque ones. Light solid is
+    /// white in Aqua — `windowBackgroundColor`, `controlBackgroundColor` and
+    /// `textBackgroundColor` all resolve there — so the solid ink is measured
+    /// against whatever AppKit actually returns rather than against an assumed
+    /// #FFFFFF.
+    func testTheSecondaryInkClearsTheFloorOnEverySolidSurface() throws {
+        let surfaces: [(String, NSColor)] = [
+            ("window", .windowBackgroundColor),
+            ("control", .controlBackgroundColor),
+            ("text", .textBackgroundColor),
+        ]
+        for (isDark, appearanceName) in [(false, NSAppearance.Name.aqua), (true, .darkAqua)] {
+            let appearance = try XCTUnwrap(NSAppearance(named: appearanceName))
+            for (name, color) in surfaces {
+                let resolvedColour = resolved(color, in: appearance)
+                let patch = (resolvedColour.red, resolvedColour.green, resolvedColour.blue)
+                let secondary = inkContrast(.secondary, over: patch, isDark: isDark, on: .solid)
+                let tertiary = inkContrast(.tertiary, over: patch, isDark: isDark, on: .solid)
+                print(String(
+                    format: "[ink] %@ solid %@ (%.3f) secondary %.2f:1  tertiary %.2f:1",
+                    isDark ? "dark" : "light", name, patch.1, secondary, tertiary
+                ))
+                XCTAssertGreaterThanOrEqual(
+                    secondary, 4.5,
+                    "\(name) in \(appearanceName.rawValue): solid secondary is \(secondary):1"
+                )
+                XCTAssertGreaterThanOrEqual(
+                    tertiary, 3,
+                    "\(name) in \(appearanceName.rawValue): solid tertiary is \(tertiary):1"
+                )
+            }
+        }
+    }
+
+    /// Hierarchy, which is the constraint a contrast floor on its own would
+    /// happily destroy: four rungs, each strictly lighter than the one above it
+    /// by a real step, on every surface the tokens name.
+    ///
+    /// The floors each rung is held to are not the same floor, and that is the
+    /// point of having rungs at all:
+    ///
+    ///   * primary — 7:1, and AppKit's own `labelColor` alpha, unchanged.
+    ///   * secondary — 4.5:1, WCAG 1.4.3 for body text.
+    ///   * tertiary — 3:1, WCAG 1.4.11, because an **icon-only control** is a
+    ///     non-text UI component and tertiary is the rung its glyph sits on.
+    ///   * disabled — no floor. 1.4.3 exempts inactive controls, and this is the
+    ///     only rung that takes the exemption.
+    func testTheInkLadderKeepsItsHierarchy() throws {
+        // Primary is AppKit's, read from AppKit, so a platform change shows up
+        // here rather than in a screenshot.
+        let aqua = try XCTUnwrap(NSAppearance(named: .aqua))
+        XCTAssertEqual(
+            KaisolaInk.alpha(.primary, isDark: false),
+            resolved(.labelColor, in: aqua).alpha,
+            accuracy: 0.01,
+            "primary drifted off `labelColor`; it is meant to be the system's, untouched"
+        )
+
+        for surface in KaisolaInk.Surface.allCases {
+            for isDark in [false, true] {
+                let alphas = KaisolaInk.Level.allCases.map {
+                    KaisolaInk.alpha($0, isDark: isDark, on: surface)
+                }
+                XCTAssertEqual(
+                    alphas, alphas.sorted(by: >),
+                    "\(surface.rawValue) \(isDark ? "dark" : "light"): the ladder is not monotone"
+                )
+                XCTAssertEqual(
+                    KaisolaInk.placeholderAlpha(isDark: isDark, on: surface),
+                    KaisolaInk.alpha(.secondary, isDark: isDark, on: surface),
+                    accuracy: 0.0001,
+                    "placeholder text is text; it takes the secondary ink, not a lighter rung"
+                )
+            }
+        }
+
+        // And in contrast, on the two glass worst patches, which is where the
+        // rungs are closest together and so where a collapse would show first.
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-inkladder-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        for isDark in [false, true] {
+            let url = try writeRampWallpaper(
+                base: (0.5, 0.5, 0.5), range: 1.95, into: directory,
+                named: "adversarial-\(isDark ? "dark" : "light")"
+            )
+            let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: isDark)
+            guard case let .wallpaper(still, _, _)? = DesktopBackdropRenderer.render(key: key) else {
+                return XCTFail("the adversarial fixture produced no painting")
+            }
+            let pixels = try renderGlassSurface(
+                still: still, wash: GlassBackdropWash.workspace(isDark: isDark),
+                isDark: isDark, width: 900, height: 900
+            )
+            let patch = worstPatchContrast(pixels, isDark: isDark).patch
+            let ladder = KaisolaInk.Level.allCases.map {
+                inkContrast($0, over: patch, isDark: isDark)
+            }
+            print(String(
+                format: "[ink] %@ glass ladder  primary %.2f:1  secondary %.2f:1"
+                    + "  tertiary %.2f:1  disabled %.2f:1",
+                isDark ? "dark" : "light", ladder[0], ladder[1], ladder[2], ladder[3]
+            ))
+            for (index, level) in KaisolaInk.Level.allCases.enumerated() where index > 0 {
+                XCTAssertGreaterThanOrEqual(
+                    ladder[index - 1] / ladder[index], 1.3,
+                    """
+                    \(isDark ? "dark" : "light"): \(level.rawValue) is within \
+                    \(ladder[index - 1] / ladder[index])× of the rung above it, \
+                    which is not a visible step
+                    """
+                )
+            }
+            XCTAssertGreaterThanOrEqual(ladder[0], 7, "primary")
+            XCTAssertGreaterThanOrEqual(ladder[1], 4.5, "secondary")
+            XCTAssertGreaterThanOrEqual(
+                ladder[2], 3,
+                "tertiary carries icon-only controls, which WCAG 1.4.11 holds to 3:1"
+            )
+        }
+    }
+
+    /// Clear clarity is the one setting that declares a contrast trade, and the
+    /// ink does not repeal it: a surface that is 92% desktop cannot also promise
+    /// 4.5:1. What the ink does buy there is measured — **3.08:1 → 3.99:1** on
+    /// the worst patch of the adversarial fixture — so the trade stays a number
+    /// rather than a shrug. Clear still falls back to Balanced, which meets the
+    /// full floor, for anyone who asked the system for contrast; that is
+    /// `GlassClarityTradeTests.testAccessibilitySettingsOverrideClear`.
+    func testClearClarityKeepsItsTradeButTheInkStillBuysIntoIt() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-inkclear-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let url = try writeRampWallpaper(
+            base: (0.5, 0.5, 0.5), range: 1.95, into: directory, named: "adversarial"
+        )
+        let key = DesktopBackdropKey(path: url.path, modified: nil, isDark: false)
+        guard case let .wallpaper(still, _, _)? = DesktopBackdropRenderer.render(key: key) else {
+            return XCTFail("the adversarial fixture produced no painting")
+        }
+        let pixels = try renderGlassSurface(
+            still: still,
+            wash: GlassBackdropWash.workspace(isDark: false, clarity: .clear),
+            isDark: false, width: 900, height: 900
+        )
+        let patch = worstPatchContrast(pixels, isDark: false).patch
+        let kaisola = inkContrast(.secondary, over: patch, isDark: false)
+        let appKit = inkContrast(alpha: 0.498, over: patch, isDark: false)
+        print(String(
+            format: "[ink] light clear adversarial workspace secondary: AppKit %.2f:1  Kaisola %.2f:1",
+            appKit, kaisola
+        ))
+        XCTAssertGreaterThan(
+            kaisola, appKit,
+            "the ink stopped helping at Clear, where it is the only thing that can"
+        )
+        XCTAssertGreaterThanOrEqual(
+            kaisola, 3.9,
+            "Clear's relaxed secondary floor moved; re-derive it or re-tune the ink"
+        )
+    }
+
+    /// The ink is one colour that resolves per appearance at draw time, not two
+    /// colours a view has to choose between — the property every AppKit call
+    /// site depends on, since a text-view attribute is baked once and drawn
+    /// under whatever appearance is current later.
+    func testTheInkResolvesPerAppearanceAtDrawTime() throws {
+        for level in KaisolaInk.Level.allCases {
+            for surface in KaisolaInk.Surface.allCases {
+                let colour = KaisolaInk.nsColor(level, on: surface)
+                let light = resolved(colour, in: try XCTUnwrap(NSAppearance(named: .aqua)))
+                let dark = resolved(colour, in: try XCTUnwrap(NSAppearance(named: .darkAqua)))
+                XCTAssertEqual(light.red, 0, accuracy: 0.001, "\(level.rawValue) is not black in Aqua")
+                XCTAssertEqual(dark.red, 1, accuracy: 0.001, "\(level.rawValue) is not white in Dark Aqua")
+                XCTAssertEqual(
+                    light.alpha, KaisolaInk.alpha(level, isDark: false, on: surface), accuracy: 0.001
+                )
+                XCTAssertEqual(
+                    dark.alpha, KaisolaInk.alpha(level, isDark: true, on: surface), accuracy: 0.001
+                )
+            }
+        }
+    }
+
+    /// One audited call site, kept honest: the Markdown editor's missing-image
+    /// placeholder draws its label on a `quaternaryLabelColor` plate rather than
+    /// on the document's white, so it takes the *glass* weight of the secondary
+    /// ink. This asserts the composite it actually lands on.
+    func testTheDocumentPlaceholderPlateClearsTheFloor() throws {
+        for (isDark, appearanceName) in [(false, NSAppearance.Name.aqua), (true, .darkAqua)] {
+            let appearance = try XCTUnwrap(NSAppearance(named: appearanceName))
+            let page = resolved(.textBackgroundColor, in: appearance)
+            let plate = resolved(.quaternaryLabelColor, in: appearance)
+            // The plate is a translucent ink over the page, exactly as drawn.
+            let composite = (
+                plate.red * plate.alpha + page.red * (1 - plate.alpha),
+                plate.green * plate.alpha + page.green * (1 - plate.alpha),
+                plate.blue * plate.alpha + page.blue * (1 - plate.alpha)
+            )
+            let label = inkContrast(.secondary, over: composite, isDark: isDark)
+            let solid = inkContrast(.secondary, over: composite, isDark: isDark, on: .solid)
+            print(String(
+                format: "[ink] %@ document placeholder plate %.3f  glass %.2f:1  solid %.2f:1",
+                isDark ? "dark" : "light", composite.1, label, solid
+            ))
+            XCTAssertGreaterThanOrEqual(
+                label, 4.5,
+                "the missing-image placeholder label measures \(label):1 on its own plate"
+            )
+        }
     }
 
     /// A wallpaper with the mid-frequency structure a photograph has — a

@@ -40,7 +40,7 @@ struct CustomAgentsSection: View {
         Section("Custom Agents") {
             if specs.isEmpty {
                 Text("Add any terminal CLI — it appears in the New menu and launches into an owned terminal.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
                     .accessibilityIdentifier("extensions.agents.empty")
             }
             if let registryError {
@@ -55,7 +55,7 @@ struct CustomAgentsSection: View {
                         VStack(alignment: .leading, spacing: 1) {
                             Text(spec.name).font(.callout)
                             Text(spec.launchCommand)
-                                .font(.caption.monospaced()).foregroundStyle(.secondary)
+                                .font(.caption.monospaced()).foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1).truncationMode(.middle)
                         }
                         Spacer()
@@ -104,10 +104,10 @@ struct CustomAgentsSection: View {
             }
             if specs.count >= cap {
                 Text("Custom-agent limit reached (\(cap)).")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
             } else {
                 Text("Terminal commands use the user's shell. Optional chat adapters run separately under a reviewed sandbox grant.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
             }
         }
         .onAppear(perform: load)
@@ -259,7 +259,7 @@ struct CustomAgentsSection: View {
                 if let approval = spec.containmentApproval {
                     Text(approval.reviewSummary)
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
             }
         }
@@ -276,7 +276,7 @@ struct CustomAgentsSection: View {
             case let .verified(binURL, _):
                 let version = installs.store.record(agentID: spec.id)?.resolvedVersion ?? "?"
                 Text("Chat enabled · \(spec.acpPackage ?? "") v\(version) · contained \(binURL.lastPathComponent) · \(approval.reviewSummary)")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
             case let .drifted(reason):
                 Text("Chat disabled: \(reason) Re-enable to approve the current version.")
                     .font(.caption).foregroundStyle(.orange)
@@ -291,7 +291,7 @@ struct CustomAgentsSection: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Enabling installs \(spec.acpPackage ?? "") with install scripts disabled, pins its exact dependency graph, and runs the pinned JavaScript under Kaisola's sealed Node runtime and a deny-by-default macOS sandbox. Reviewed grant: \(spec.containmentApproval?.reviewSummary ?? "invalid — choose access above"). Process/network grants also share the matching enabled workspace MCP definitions, including their configured environment/header values. Unrelated process-environment credentials, your ordinary home files, local Unix sockets, inbound network, and Kaisola's host terminal bridge stay blocked. Install or access changes disable chat until you approve again.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack {
                     Button("Install and Enable") { enableChat(index) }

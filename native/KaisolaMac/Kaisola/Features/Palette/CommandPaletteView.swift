@@ -52,7 +52,7 @@ struct CommandPaletteView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                Image(systemName: "magnifyingglass").foregroundStyle(.kaisolaSecondary)
                 TextField("Run a command or jump to…", text: $query)
                     .textFieldStyle(.plain)
                     .font(.title3)
@@ -87,7 +87,7 @@ struct CommandPaletteView: View {
                         }
                         if filtered.isEmpty {
                             Text("No matching commands")
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .padding(16)
                         }
                     }

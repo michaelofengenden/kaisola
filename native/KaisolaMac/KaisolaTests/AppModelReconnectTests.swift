@@ -1056,6 +1056,57 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    func testAcknowledgedAgentTurnOpensLocalActivityAndLeavesUpdatesFlowing() async throws {
+        let fixture = try AgentTurnGateFixture(agentTurnAccepted: true)
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+
+        fixture.model.sendInput("go\r", to: fixture.terminalID)
+        await waitUntil { await fixture.control.agentTurnCalls() == [true] }
+
+        XCTAssertEqual(fixture.model.openAgentTurnTerminalIDs, [fixture.terminalID])
+        XCTAssertTrue(fixture.model.agentTurnSignalFailureTerminalIDs.isEmpty)
+        XCTAssertTrue(fixture.model.unprotectedAgentTurnTerminalIDs.isEmpty)
+        XCTAssertNil(fixture.model.brokerUpdateGateBlockedDetail)
+
+        let before = await fixture.upgradeAttempts.count()
+        await fixture.model.refreshInventory()
+        let after = await fixture.upgradeAttempts.count()
+        XCTAssertEqual(after, before + 1, "An acknowledged turn leaves the update gate open.")
+        await fixture.model.disconnect()
+    }
+
+    func testRefusedAgentTurnLeavesNoLocalTurnAndShutsTheUpdateGate() async throws {
+        let fixture = try AgentTurnGateFixture(agentTurnAccepted: false)
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+
+        // The broker refuses the turn, so it still counts this terminal idle
+        // and would accept a rolling cutover underneath the running agent.
+        fixture.model.sendInput("go\r", to: fixture.terminalID)
+        await waitUntil { await fixture.control.agentTurnCalls() == [true] }
+
+        XCTAssertTrue(fixture.model.openAgentTurnTerminalIDs.isEmpty)
+        XCTAssertEqual(fixture.model.agentTurnSignalFailureTerminalIDs, [fixture.terminalID])
+        XCTAssertEqual(fixture.model.unprotectedAgentTurnTerminalIDs, [fixture.terminalID])
+        XCTAssertNotNil(fixture.model.brokerUpdateGateBlockedDetail)
+        XCTAssertEqual(
+            ToastCenter.shared.toasts.last?.message,
+            "Agent activity could not be reported; terminal-continuity updates are paused"
+        )
+
+        // A refused signal must not cost the keystrokes themselves.
+        let writes = await fixture.control.writes()
+        XCTAssertEqual(writes, ["go\r"])
+
+        let before = await fixture.upgradeAttempts.count()
+        await fixture.model.refreshInventory()
+        let after = await fixture.upgradeAttempts.count()
+        XCTAssertEqual(after, before, "An unprotected turn must hold the update gate shut.")
+        await fixture.model.disconnect()
+    }
+
     func testStaleAttentionJumpLeavesCurrentSurfaceSelected() async throws {
         let fixture = try VisualControlFixture()
         defer { fixture.cleanUp() }
@@ -1162,6 +1213,12 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
     private var disconnectHandler: (@Sendable (any Error) -> Void)?
     private var connectCount = 0
     private var recordedAttaches: [String] = []
+    private let agentTurnAccepted: Bool
+    private var recordedAgentTurns: [Bool] = []
+
+    init(agentTurnAccepted: Bool = true) {
+        self.agentTurnAccepted = agentTurnAccepted
+    }
 
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {
         disconnectHandler = handler
@@ -1212,11 +1269,20 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
     func kill(projectID: String, terminalID: String) async throws {}
     func release(projectID: String, terminalID: String) async throws {}
     func detachOwner(projectID: String, terminalID: String) async throws {}
-    func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws {}
+    /// Mirrors `BrokerControlClient`, which now turns the broker's inner
+    /// `{ok:false}` into this error instead of discarding it.
+    func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws {
+        recordedAgentTurns.append(busy)
+        guard agentTurnAccepted else {
+            throw BrokerClientError.requestFailed("terminal.agentTurn")
+        }
+    }
+
     func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {}
     func disconnect() async {}
 
     func resizeCalls() -> [RecordedTerminalResize] { recordedResizes }
+    func agentTurnCalls() -> [Bool] { recordedAgentTurns }
     func writes() -> [String] { recordedWrites }
     func failNextWrite(to terminalID: String) {
         writeFailuresRemainingByTerminalID[terminalID, default: 0] += 1
@@ -1464,6 +1530,105 @@ private final class ControllerReconnectFixture {
             pid: 12_345,
             socketPath: "/tmp/kaisola-controller-reconnect.sock",
             token: String(repeating: "b", count: 64),
+            startedAt: 1_784_250_001_000,
+            version: "test"
+        )
+    }
+}
+
+private actor UpgradeAttemptRecorder {
+    private var attempts = 0
+
+    func record() { attempts += 1 }
+    func count() -> Int { attempts }
+}
+
+/// A preparer that is also the upgrade monitor, so a test can see whether the
+/// app asked for a terminal-continuity update on an inventory tick.
+private struct MonitoredBrokerPreparer: BrokerInfoPreparing, BrokerUpgradeMonitoring {
+    let info: BrokerInfo
+    let attempts: UpgradeAttemptRecorder
+
+    func prepare() async throws -> BrokerInfo { info }
+
+    func upgradeState() async -> BrokerUpgradeState { .unknown }
+
+    func attemptUpgradeIfNeeded() async -> BrokerUpgradeState {
+        await attempts.record()
+        return .unknown
+    }
+
+    func retirementDiagnostics() async -> [BrokerRetirementDiagnostic] { [] }
+}
+
+/// An owned agent terminal on a broker whose upgrade monitor is observable,
+/// so the agent-turn signal and the update gate can be exercised together.
+@MainActor
+private final class AgentTurnGateFixture {
+    let root: URL
+    let client = ReconnectBrokerClient(failingConnectAttempts: [])
+    let control: RecordingBrokerControlClient
+    let upgradeAttempts = UpgradeAttemptRecorder()
+    let model: AppModel
+
+    var terminalID: String { ReconnectBrokerClient.firstTerminalID }
+
+    init(agentTurnAccepted: Bool) throws {
+        control = RecordingBrokerControlClient(agentTurnAccepted: agentTurnAccepted)
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-agent-turn-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let sessionStore = NativeSessionStore(fileURL: root.appendingPathComponent("sessions.json"))
+        sessionStore.upsert(NativeOwnedSession(
+            id: ReconnectBrokerClient.firstTerminalID,
+            projectID: "project.one",
+            cwd: root.path,
+            title: "Codex · agent turn",
+            createdAt: 1,
+            agentID: "codex"
+        ))
+        let transcriptStore = AcpTranscriptStore(fileURL: root.appendingPathComponent("transcripts.json"))
+        model = AppModel(
+            brokerPreparer: MonitoredBrokerPreparer(info: Self.brokerInfo, attempts: upgradeAttempts),
+            client: client,
+            controlClient: control,
+            sessionStore: sessionStore,
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            workspaceStateStore: NativeWorkspaceStateStore(fileURL: root.appendingPathComponent("workspace.json")),
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore),
+            attentionCenter: AttentionCenter(
+                defaults: UserDefaults(suiteName: "kaisola-agent-turn-\(UUID().uuidString)")!,
+                postsNotifications: false,
+                updatesDockBadge: false
+            ),
+            reconnectBackoff: BrokerReconnectBackoff(
+                baseNanoseconds: 1,
+                maximumNanoseconds: 2,
+                jitterFraction: 0
+            ),
+            sleep: { nanoseconds in
+                if nanoseconds >= 1_000_000_000 {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                } else {
+                    await Task.yield()
+                }
+            },
+            jitter: { 0 }
+        )
+    }
+
+    func cleanUp() {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private static var brokerInfo: BrokerInfo {
+        BrokerInfo(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            pid: 12_345,
+            socketPath: "/tmp/kaisola-agent-turn.sock",
+            token: String(repeating: "c", count: 64),
             startedAt: 1_784_250_001_000,
             version: "test"
         )

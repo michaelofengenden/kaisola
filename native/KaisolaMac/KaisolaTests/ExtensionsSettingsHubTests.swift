@@ -125,6 +125,39 @@ final class ExtensionsSettingsHubTests: XCTestCase {
         }
     }
 
+    func testUnreadablePreviewRegistryIsASecretFreeActionableCatalogRow() {
+        let preservedURL = URL(fileURLWithPath: "/private/tmp/preview-mappings.json.preserved-deadbeef.json")
+        let state = PreviewMappingStore.LoadState.corrupt(.preserved(preservedURL))
+        let item = ExtensionSettingsItem.previewMappingRegistryIssue(state)
+
+        XCTAssertEqual(item.id, PreviewMappingStore.registryIssueID)
+        XCTAssertEqual(item.category, .previewMappings)
+        XCTAssertEqual(item.status, .disabled("Needs attention"))
+        XCTAssertEqual(item.source, .user)
+        XCTAssertEqual(item.scope, .appWide)
+        XCTAssertEqual(item.versionIntegrity, "Unreadable registry preserved")
+        XCTAssertEqual(item.updateState, .manual("Reset explicitly to repair"))
+        XCTAssertTrue(item.validationMessage?.contains(preservedURL.lastPathComponent) == true)
+        XCTAssertFalse(item.searchableText.contains("/private/tmp"))
+        XCTAssertFalse(item.accessibilityDescription.contains("/private/tmp"))
+        XCTAssertTrue(state.canReset)
+        XCTAssertFalse(state.allowsMutations)
+        XCTAssertEqual(state.preservedCopyURL, preservedURL)
+    }
+
+    func testPreviewRegistryIOFailureCannotOfferDestructiveRecovery() {
+        let state = PreviewMappingStore.LoadState.ioFailure("permission denied at /secret/location")
+        let item = ExtensionSettingsItem.previewMappingRegistryIssue(state)
+
+        XCTAssertFalse(state.canReset)
+        XCTAssertFalse(state.allowsMutations)
+        XCTAssertNil(state.preservedCopyURL)
+        XCTAssertEqual(item.versionIntegrity, "Registry unavailable")
+        XCTAssertEqual(item.updateState, .manual("Resolve storage access to continue"))
+        XCTAssertFalse(item.searchableText.contains("/secret/location"))
+        XCTAssertFalse(item.accessibilityDescription.contains("/secret/location"))
+    }
+
     func testMCPRowsStayProjectOwnedAndNeverExposeCredentialValues() {
         let server = McpServerConfig(
             name: "project-files",

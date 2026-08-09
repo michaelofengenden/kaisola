@@ -829,19 +829,64 @@ private struct LanguageGrammarsExtensionEditor: View {
 
 private struct PreviewMappingsExtensionEditor: View {
     let highlightedID: String?
-    @State private var specs: [PreviewMappingSpec] = []
+    @State private var snapshot = PreviewMappingStore.Snapshot(specs: [], state: .missing)
     @State private var name = ""
     @State private var extensionsText = ""
     @State private var kind = PreviewMappingSpec.Kind.text
+    @State private var operationError: String?
+    @State private var confirmReset = false
     private let store = PreviewMappingStore()
 
     var body: some View {
         ScrollViewReader { proxy in
             Form {
                 ExtensionCategoryIntro(category: .previewMappings, workspace: nil)
+                if !snapshot.state.allowsMutations {
+                    Section("Registry Recovery") {
+                        let item = ExtensionSettingsItem.previewMappingRegistryIssue(snapshot.state)
+                        Label(item.versionIntegrity, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("extensions.previews.registry-warning")
+                        if let message = item.validationMessage {
+                            Text(message)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                        if let recoveryURL = snapshot.state.preservedCopyURL {
+                            Text(recoveryURL.path)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .lineLimit(2)
+                                .accessibilityLabel("Preview mapping recovery copy \(recoveryURL.lastPathComponent)")
+                            HStack {
+                                Button("Reveal Recovery Copy") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([recoveryURL])
+                                }
+                                Button("Reset Registry", role: .destructive) {
+                                    confirmReset = true
+                                }
+                                .disabled(!snapshot.state.canReset)
+                                .accessibilityHint("Replaces the active unreadable registry with an empty version. The recovery copy is kept.")
+                            }
+                        } else {
+                            Button("Reload Registry") { reload() }
+                                .accessibilityHint("Tries to read and preserve the preview-mapping registry again.")
+                        }
+                    }
+                }
+                if let operationError {
+                    Section("Save Error") {
+                        Label(operationError, systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("extensions.previews.save-error")
+                    }
+                }
                 Section("Installed Mappings") {
                     if specs.isEmpty {
-                        Text("No custom preview mappings. Built-in file classifications still run first.")
+                        Text(snapshot.state.allowsMutations
+                            ? "No custom preview mappings. Built-in file classifications still run first."
+                            : "Preview mappings are unavailable until the registry issue is resolved.")
                             .font(.callout)
                             .foregroundStyle(.secondary)
                             .accessibilityIdentifier("extensions.previews.empty")
@@ -852,6 +897,7 @@ private struct PreviewMappingsExtensionEditor: View {
                                 Image(systemName: "trash")
                             }
                             .buttonStyle(.borderless)
+                            .disabled(!snapshot.state.allowsMutations)
                             .accessibilityLabel("Remove preview mapping \(spec.id)")
                         }
                         .id(spec.id)
@@ -884,11 +930,23 @@ private struct PreviewMappingsExtensionEditor: View {
             .formStyle(.grouped)
             .padding(6)
             .onAppear {
-                specs = store.specs()
+                reload()
                 scrollToHighlight(using: proxy)
+            }
+            .confirmationDialog(
+                "Reset preview mappings?",
+                isPresented: $confirmReset,
+                titleVisibility: .visible
+            ) {
+                Button("Reset Registry", role: .destructive) { reset() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Kaisola will replace the active unreadable registry with an empty version. The recovery copy will remain on disk.")
             }
         }
     }
+
+    private var specs: [PreviewMappingSpec] { snapshot.specs }
 
     private func scrollToHighlight(using proxy: ScrollViewProxy) {
         guard let highlightedID else { return }
@@ -898,7 +956,8 @@ private struct PreviewMappingsExtensionEditor: View {
     }
 
     private var canAdd: Bool {
-        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        snapshot.state.allowsMutations
+            && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !extensionsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
@@ -909,20 +968,51 @@ private struct PreviewMappingsExtensionEditor: View {
             extensions: ExtensionsSettingsDraftPolicy.extensions(extensionsText),
             kind: kind.rawValue
         )
-        if let reason = store.upsert(spec) {
-            ToastCenter.shared.show("Added as disabled: \(reason)", style: .info, duration: 6)
-        } else {
-            ToastCenter.shared.show("Added \(id)", style: .success)
+        do {
+            let reason = try store.upsert(spec)
+            reload()
+            name = ""
+            extensionsText = ""
+            if let reason {
+                ToastCenter.shared.show("Added as disabled: \(reason)", style: .info, duration: 6)
+            } else {
+                ToastCenter.shared.show("Added \(id)", style: .success)
+            }
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
         }
-        specs = store.specs()
-        name = ""
-        extensionsText = ""
-        NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
     }
 
     private func remove(_ spec: PreviewMappingSpec) {
-        _ = store.remove(id: spec.id)
-        specs = store.specs()
-        NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        do {
+            _ = try store.remove(id: spec.id)
+            reload()
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
+        }
+    }
+
+    private func reset() {
+        do {
+            snapshot = try store.resetUnreadableRegistry()
+            operationError = nil
+            ToastCenter.shared.show("Reset preview mappings; recovery copy kept", style: .success, duration: 6)
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
+        }
+    }
+
+    private func reload() {
+        snapshot = store.load()
+        operationError = nil
+    }
+
+    private func report(_ error: Error) {
+        snapshot = store.load()
+        operationError = error.localizedDescription
+        ToastCenter.shared.show(error.localizedDescription, style: .error, duration: 6)
     }
 }

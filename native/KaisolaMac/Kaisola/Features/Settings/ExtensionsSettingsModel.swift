@@ -324,6 +324,51 @@ struct ExtensionSettingsItem: Equatable, Sendable {
             validationMessage: validation
         )
     }
+
+    static func previewMappingRegistryIssue(_ state: PreviewMappingStore.LoadState) -> Self {
+        let integrity: String
+        let updates: String
+        let message: String
+        switch state {
+        case let .corrupt(.preserved(url)):
+            integrity = "Unreadable registry preserved"
+            updates = "Reset explicitly to repair"
+            message = "Kaisola preserved the unreadable registry as \(url.lastPathComponent). Review that recovery copy, then reset explicitly to repair mappings."
+        case .corrupt(.failed):
+            integrity = "Unreadable registry not preserved"
+            updates = "Resolve storage access before reset"
+            message = "Kaisola could not preserve the unreadable registry. Resolve storage access before attempting recovery."
+        case let .newerVersion(version, .preserved(url)):
+            integrity = "Newer registry v\(version) preserved"
+            updates = "Reset explicitly to replace"
+            message = "This registry uses schema v\(version), which is newer than Kaisola supports. It was preserved as \(url.lastPathComponent)."
+        case let .newerVersion(version, .failed):
+            integrity = "Newer registry v\(version) not preserved"
+            updates = "Resolve storage access before reset"
+            message = "This registry uses unsupported schema v\(version), and Kaisola could not create a recovery copy."
+        case .ioFailure:
+            integrity = "Registry unavailable"
+            updates = "Resolve storage access to continue"
+            message = "Kaisola could not read the preview-mapping registry. The file was not changed; resolve storage access and try again."
+        case .missing, .ready:
+            integrity = "Registry ready"
+            updates = "Local · no remote updates"
+            message = "The preview-mapping registry is ready."
+        }
+
+        return Self(
+            id: PreviewMappingStore.registryIssueID,
+            category: .previewMappings,
+            name: "Preview mapping registry",
+            detail: "Recovery required before mappings can change",
+            status: .disabled("Needs attention"),
+            source: .user,
+            versionIntegrity: integrity,
+            scope: .appWide,
+            updateState: .manual(updates),
+            validationMessage: message
+        )
+    }
 }
 
 enum ExtensionsSettingsCatalog {
@@ -351,7 +396,11 @@ enum ExtensionsSettingsCatalog {
             ExtensionSettingsItem.customTheme($0, selected: selectedThemeID == $0.id)
         }
         let grammars = CustomGrammarStore().specs().map(ExtensionSettingsItem.languageGrammar)
-        let mappings = PreviewMappingStore().specs().map(ExtensionSettingsItem.previewMapping)
+        let mappingSnapshot = PreviewMappingStore().load()
+        var mappings = mappingSnapshot.specs.map(ExtensionSettingsItem.previewMapping)
+        if !mappingSnapshot.state.allowsMutations {
+            mappings.append(.previewMappingRegistryIssue(mappingSnapshot.state))
+        }
         return agents + servers + shippedThemes + customThemes + grammars + mappings
     }
 

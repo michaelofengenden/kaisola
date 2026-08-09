@@ -8,6 +8,48 @@ import XCTest
 /// ProjectFiles (tree listing + bounded enumeration) and FilePreviewContent
 /// (what a file renders as) — the workspace rail's foundations.
 final class WorkspaceFilesTests: XCTestCase {
+    func testExternalOpenFailurePersistsUntilMacOSAcceptsTheRequest() throws {
+        let file = URL(fileURLWithPath: "/tmp/Preview report.pdf")
+        var state = FilePreviewExternalOpenState()
+
+        state.recordDefaultApplicationResult(for: file, accepted: false)
+
+        XCTAssertEqual(state.failedURL, file)
+        XCTAssertEqual(state.title, "Couldn’t open Preview report.pdf")
+        XCTAssertEqual(state.detail, "macOS did not accept the request to open this file.")
+        XCTAssertEqual(state.revealLabel, "Reveal Preview report.pdf in Finder")
+        XCTAssertEqual(state.chooseApplicationLabel, "Choose Application for Preview report.pdf")
+
+        state.recordDefaultApplicationResult(for: file, accepted: false)
+        XCTAssertEqual(state.failedURL, file, "another rejection must not dismiss the error")
+
+        state.recordDefaultApplicationResult(for: file, accepted: true)
+        XCTAssertNil(state.failedURL, "only an accepted open request confirms recovery")
+    }
+
+    func testChosenApplicationFailureStaysVisibleAndRetargetClearsOnlyAnotherFile() {
+        let first = URL(fileURLWithPath: "/tmp/first.bin")
+        let second = URL(fileURLWithPath: "/tmp/second.bin")
+        var state = FilePreviewExternalOpenState()
+
+        state.recordDefaultApplicationResult(for: first, accepted: false)
+        state.recordChosenApplicationResult(for: first, error: CocoaError(.fileReadNoPermission))
+        XCTAssertEqual(state.failedURL, first)
+        XCTAssertEqual(state.detail, "The chosen application could not open this file.")
+
+        state.retarget(to: first)
+        XCTAssertEqual(state.failedURL, first, "reloading the same file keeps its recovery visible")
+
+        state.retarget(to: second)
+        XCTAssertNil(state.failedURL, "a failure for one document must not follow another tab")
+        state.recordChosenApplicationResult(for: first, error: CocoaError(.fileReadNoPermission))
+        XCTAssertNil(state.failedURL, "a delayed result for the prior file must stay stale")
+
+        state.recordDefaultApplicationResult(for: second, accepted: false)
+        state.recordChosenApplicationResult(for: second, error: nil)
+        XCTAssertNil(state.failedURL)
+    }
+
     func testMarkdownListContinuationHandlesBulletsTasksAndOrderedLists() {
         XCTAssertEqual(MarkdownListContinuation.action(for: "- first"), .continueWith("- "))
         XCTAssertEqual(MarkdownListContinuation.action(for: "  * nested"), .continueWith("  * "))

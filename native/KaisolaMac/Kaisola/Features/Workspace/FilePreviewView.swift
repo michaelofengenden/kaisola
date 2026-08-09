@@ -109,6 +109,81 @@ private extension String {
     var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
+/// Persistent recovery state for an external-open request that macOS rejected.
+/// A failed button press must not look successful merely because the request
+/// API returned; only an accepted default-app request or a successful explicit
+/// application launch clears the failure for that exact document.
+struct FilePreviewExternalOpenState: Equatable {
+    private enum Failure: Equatable {
+        case defaultApplicationRejected
+        case chosenApplicationFailed
+    }
+
+    private(set) var failedURL: URL?
+    private var failure: Failure?
+
+    var title: String? {
+        guard let failedURL else { return nil }
+        return "Couldn’t open \(filename(for: failedURL))"
+    }
+
+    var detail: String? {
+        switch failure {
+        case .defaultApplicationRejected:
+            "macOS did not accept the request to open this file."
+        case .chosenApplicationFailed:
+            "The chosen application could not open this file."
+        case nil:
+            nil
+        }
+    }
+
+    var revealLabel: String? {
+        failedURL.map { "Reveal \(filename(for: $0)) in Finder" }
+    }
+
+    var chooseApplicationLabel: String? {
+        failedURL.map { "Choose Application for \(filename(for: $0))" }
+    }
+
+    mutating func recordDefaultApplicationResult(for url: URL, accepted: Bool) {
+        if accepted {
+            clearFailure(for: url)
+        } else {
+            failedURL = url
+            failure = .defaultApplicationRejected
+        }
+    }
+
+    mutating func recordChosenApplicationResult(for url: URL, error: Error?) {
+        // The app chooser completes asynchronously. If the user moved to a
+        // different document while it was open, its old result cannot revive
+        // a banner for the prior file in the replacement preview.
+        guard failedURL == url else { return }
+        if error == nil {
+            clearFailure(for: url)
+        } else {
+            failure = .chosenApplicationFailed
+        }
+    }
+
+    mutating func retarget(to url: URL) {
+        guard let failedURL, failedURL != url else { return }
+        self.failedURL = nil
+        failure = nil
+    }
+
+    private mutating func clearFailure(for url: URL) {
+        guard failedURL == url else { return }
+        failedURL = nil
+        failure = nil
+    }
+
+    private func filename(for url: URL) -> String {
+        url.lastPathComponent.nilIfEmpty ?? "this file"
+    }
+}
+
 /// File preview/editor pane: UTF-8 text is editable with ⌘S save + revert,
 /// markdown renders styled (with a raw-source toggle), images display, and
 /// binary/oversized files degrade to a clear notice.
@@ -200,6 +275,7 @@ struct FilePreviewView: View {
     /// same line at the top of the viewport.
     @State private var textScrollMemory = FilePreviewTextScrollMemory()
     @State private var previewNotice: FilePreviewNotice?
+    @State private var externalOpen = FilePreviewExternalOpenState()
     /// The URL that produced the currently rendered draft. It deliberately
     /// stays unchanged while another URL loads, so Save can never target the
     /// incoming file with the outgoing file's contents.
@@ -269,6 +345,10 @@ struct FilePreviewView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            if externalOpen.failedURL != nil {
+                externalOpenFailureBanner
+                Divider()
+            }
             if let previewNotice {
                 noticeBanner(previewNotice)
                 Divider()
@@ -653,6 +733,44 @@ struct FilePreviewView: View {
         .accessibilityElement(children: .contain)
     }
 
+    @ViewBuilder
+    private var externalOpenFailureBanner: some View {
+        if let title = externalOpen.title,
+           let detail = externalOpen.detail,
+           let revealLabel = externalOpen.revealLabel,
+           let chooseApplicationLabel = externalOpen.chooseApplicationLabel {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "xmark.octagon.fill")
+                    .foregroundStyle(.red)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title)
+                        .font(.caption.weight(.medium))
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                Spacer(minLength: 8)
+                Button("Reveal in Finder", action: revealExternalOpenFailureInFinder)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityLabel(revealLabel)
+                Button("Choose Application…", action: chooseApplicationForExternalOpen)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityLabel(chooseApplicationLabel)
+            }
+            .padding(.horizontal, 11)
+            .padding(.vertical, 7)
+            .frame(minHeight: 32)
+            .background(Color.red.opacity(colorScheme == .dark ? 0.13 : 0.08))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("Error: \(title). \(detail)")
+        }
+    }
+
     /// FSEvents is project-wide, so re-check the exact mounted file before
     /// acting. Clean previews follow agent writes automatically; dirty editors
     /// retain the user's draft and show a reversible reload choice.
@@ -932,7 +1050,7 @@ struct FilePreviewView: View {
                 }
                 .disabled(copyableContents == nil)
                 Button("Open Externally") {
-                    NSWorkspace.shared.open(loadedURL ?? url)
+                    openCurrentFileExternally()
                 }
             }
             if case .docx = content {
@@ -1018,6 +1136,48 @@ struct FilePreviewView: View {
             return
         }
         NSWorkspace.shared.activateFileViewerSelecting([reachable])
+    }
+
+    private func openCurrentFileExternally() {
+        let target = loadedURL ?? url
+        externalOpen.recordDefaultApplicationResult(
+            for: target,
+            accepted: NSWorkspace.shared.open(target)
+        )
+    }
+
+    private func revealExternalOpenFailureInFinder() {
+        guard let target = externalOpen.failedURL,
+              let reachable = TerminalFileLinkResolver.revealTarget(for: target) else {
+            ToastCenter.shared.show("The file is no longer on disk.", style: .error)
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([reachable])
+    }
+
+    private func chooseApplicationForExternalOpen() {
+        guard let target = externalOpen.failedURL else { return }
+        let panel = NSOpenPanel()
+        panel.title = "Choose an Application"
+        panel.message = "Choose an application to open \(target.lastPathComponent)."
+        panel.prompt = "Open"
+        panel.allowedContentTypes = [.applicationBundle]
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.begin { response in
+            guard response == .OK, let applicationURL = panel.url else { return }
+            let configuration = NSWorkspace.OpenConfiguration()
+            NSWorkspace.shared.open(
+                [target],
+                withApplicationAt: applicationURL,
+                configuration: configuration
+            ) { _, error in
+                Task { @MainActor in
+                    externalOpen.recordChosenApplicationResult(for: target, error: error)
+                }
+            }
+        }
     }
 
     private var supportsZoom: Bool {
@@ -1176,7 +1336,7 @@ struct FilePreviewView: View {
             HStack {
                 Button("Reveal in Finder", action: revealCurrentFileInFinder)
                 Button("Open Externally") {
-                    NSWorkspace.shared.open(loadedURL ?? url)
+                    openCurrentFileExternally()
                 }
             }
         }
@@ -1236,6 +1396,7 @@ struct FilePreviewView: View {
         recoveryGeneration &+= 1
         releaseRecoveryClaims()
         loadingURL = target
+        externalOpen.retarget(to: target)
         isLoading = true
         previewNotice = nil
         outlineItems = []

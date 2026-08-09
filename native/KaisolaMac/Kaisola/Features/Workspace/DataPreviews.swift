@@ -304,7 +304,7 @@ struct CsvPreview: View {
             systemImage: "exclamationmark.triangle.fill"
         )
         .font(.caption)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.kaisolaSecondary)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -540,7 +540,7 @@ struct JsonPreview: View {
             systemImage: "exclamationmark.triangle.fill"
         )
         .font(.caption)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.kaisolaSecondary)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -601,8 +601,8 @@ private struct JsonNodeRow: View {
     private var leafRow: some View {
         HStack(alignment: .firstTextBaseline, spacing: 4) {
             if let key = node.key {
-                Text(key).foregroundStyle(.secondary)
-                Text(":").foregroundStyle(.tertiary)
+                Text(key).foregroundStyle(.kaisolaSecondary)
+                Text(":").foregroundStyle(.kaisolaTertiary)
             }
             Text(scalarText)
                 .foregroundStyle(scalarColor)
@@ -614,10 +614,10 @@ private struct JsonNodeRow: View {
     private var containerLabel: some View {
         HStack(spacing: 4) {
             if let key = node.key {
-                Text(key).foregroundStyle(.secondary)
-                Text(":").foregroundStyle(.tertiary)
+                Text(key).foregroundStyle(.kaisolaSecondary)
+                Text(":").foregroundStyle(.kaisolaTertiary)
             }
-            Text(node.display).foregroundStyle(.tertiary)
+            Text(node.display).foregroundStyle(.kaisolaTertiary)
         }
     }
 
@@ -778,7 +778,7 @@ struct HtmlFilePreview: View {
                         .font(.headline)
                     Text("Project scripts stay off until you allow them for this preview.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 260)
                     HStack(spacing: 8) {

@@ -1,4 +1,5 @@
 import Foundation
+import KaisolaCore
 import XCTest
 @testable import Kaisola
 
@@ -559,9 +560,20 @@ final class AcpComposerModelTests: XCTestCase {
     func testOptionSubmenuMarksTheChosenValue() {
         let submenu = AcpComposerMenu.optionSubmenu(effortOption)
         XCTAssertEqual(submenu.title, "Effort")
+        XCTAssertEqual(submenu.note, "Applies to the next message in this chat.")
         XCTAssertEqual(submenu.options.map(\.name), ["Light", "Medium", "High"])
         XCTAssertEqual(submenu.options.map(\.isSelected), [true, false, false])
         XCTAssertFalse(submenu.showsSearch)
+    }
+
+    func testNonEffortOptionsDoNotInventTimingSemantics() {
+        let submenu = AcpComposerMenu.optionSubmenu(AcpConfigOption(
+            id: "approval_preset",
+            name: "Approval preset",
+            currentValue: "default",
+            choices: [.init(value: "default", name: "Default")]
+        ))
+        XCTAssertNil(submenu.note)
     }
 
     // MARK: - Agent submenu
@@ -829,5 +841,201 @@ final class AcpComposerModelTests: XCTestCase {
             "Developer"
         )
         XCTAssertEqual(AcpEmptyState.projectName(for: nil), "")
+    }
+}
+
+extension AcpComposerModelTests {
+    @MainActor
+    func testRejectedEffortChangeKeepsTheAdapterConfirmedValueAndDraft() async throws {
+        let transport = ReasoningEffortAcpTransport(rejectedValues: ["high"])
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport),
+            initialDraft: "keep this unsent draft"
+        )
+        await conversation.start()
+        XCTAssertEqual(conversation.configOptions.first?.currentValue, "low")
+
+        conversation.selectConfigOption("reasoning_effort", value: "high")
+
+        XCTAssertEqual(conversation.pendingConfigOptionID, "reasoning_effort")
+        XCTAssertEqual(
+            conversation.configOptions.first?.currentValue,
+            "low",
+            "the picker must not claim an unconfirmed effort while the adapter decides"
+        )
+        let deadline = ContinuousClock.now + .seconds(2)
+        while conversation.statusMessage == nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(conversation.configOptions.first?.currentValue, "low")
+        XCTAssertNil(conversation.pendingConfigOptionID)
+        XCTAssertTrue(conversation.statusMessage?.contains("Rejected reasoning effort") == true)
+        XCTAssertEqual(conversation.loadDraft(), "keep this unsent draft")
+        XCTAssertTrue(conversation.rows.isEmpty)
+        XCTAssertFalse(conversation.isRunning)
+    }
+
+    @MainActor
+    func testEffortChangesOnlyAfterAdapterConfirmation() async throws {
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: ReasoningEffortAcpTransport()),
+            initialDraft: "another unsent draft"
+        )
+        await conversation.start()
+
+        conversation.selectConfigOption("reasoning_effort", value: "high")
+
+        XCTAssertEqual(conversation.pendingConfigOptionID, "reasoning_effort")
+        XCTAssertEqual(conversation.configOptions.first?.currentValue, "low")
+        let deadline = ContinuousClock.now + .seconds(2)
+        while conversation.pendingConfigOptionID != nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertNil(conversation.pendingConfigOptionID)
+        XCTAssertEqual(conversation.configOptions.first?.currentValue, "high")
+        XCTAssertEqual(conversation.loadDraft(), "another unsent draft")
+        XCTAssertTrue(conversation.rows.isEmpty)
+    }
+
+    func testConfirmedEffortRestoresFromTheAdapterSession() async throws {
+        let transport = ReasoningEffortAcpTransport()
+        let client = AcpClient(transport: transport)
+        let opened = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        XCTAssertEqual(opened.configOptions.first?.currentValue, "low")
+        let confirmed = try await client.setConfigOption(id: "reasoning_effort", value: "high")
+        XCTAssertEqual(confirmed.first?.currentValue, "high")
+
+        await client.stop()
+        let restored = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp",
+            mcpServers: [], resumeSessionID: opened.sessionID
+        )
+        XCTAssertEqual(restored.sessionID, opened.sessionID)
+        XCTAssertEqual(
+            restored.configOptions.first?.currentValue,
+            "high",
+            "restore must use the adapter-confirmed session value, not a local guess"
+        )
+    }
+}
+
+/// Narrow ACP fixture for reasoning-effort state. It persists the confirmed
+/// value across a client stop/resume and can reject selected values without
+/// spawning a process or sharing the broader AcpClientTests transport.
+private actor ReasoningEffortAcpTransport: AcpByteTransport {
+    private var outbound: [Data] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+    private var effort = "low"
+    private let rejectedValues: Set<String>
+
+    init(rejectedValues: Set<String> = []) {
+        self.rejectedValues = rejectedValues
+    }
+
+    func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {}
+
+    func send(_ data: Data) async throws {
+        guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else {
+            return
+        }
+        let id = object["id"]
+        switch object["method"]?.stringValue {
+        case "initialize":
+            reply(id: id, result: .object([
+                "protocolVersion": .integer(1),
+                "agentCapabilities": .object([
+                    "loadSession": .bool(true),
+                    "sessionCapabilities": .object(["resume": .bool(true)]),
+                ]),
+            ]))
+        case "session/new":
+            reply(id: id, result: sessionResult(id: "effort-session"))
+        case "session/load", "session/resume":
+            let sessionID = object["params"]?.objectValue?["sessionId"]?.stringValue ?? "effort-session"
+            reply(id: id, result: sessionResult(id: sessionID))
+        case "session/set_config_option":
+            guard let params = object["params"]?.objectValue,
+                  params["configId"]?.stringValue == "reasoning_effort",
+                  let value = params["value"]?.stringValue else {
+                replyError(id: id, message: "Unknown config option")
+                return
+            }
+            guard !rejectedValues.contains(value) else {
+                replyError(id: id, message: "Rejected reasoning effort: \(value)")
+                return
+            }
+            effort = value
+            reply(id: id, result: .object(["configOptions": configOptions()]))
+        default:
+            if let id { reply(id: id, result: .null) }
+        }
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !outbound.isEmpty { return outbound.removeFirst() }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func terminate() async {
+        waiter?.resume(returning: nil)
+        waiter = nil
+    }
+
+    func exitCode() async -> Int32? { 0 }
+
+    private func sessionResult(id: String) -> JSONValue {
+        .object([
+            "sessionId": .string(id),
+            "configOptions": configOptions(),
+        ])
+    }
+
+    private func configOptions() -> JSONValue {
+        .array([
+            .object([
+                "id": .string("reasoning_effort"),
+                "name": .string("Reasoning effort"),
+                "category": .string("thought_level"),
+                "type": .string("select"),
+                "currentValue": .string(effort),
+                "options": .array([
+                    .object(["value": .string("low"), "name": .string("Low")]),
+                    .object(["value": .string("high"), "name": .string("High")]),
+                ]),
+            ]),
+        ])
+    }
+
+    private func reply(id: JSONValue?, result: JSONValue) {
+        guard let id else { return }
+        enqueue(.object(["jsonrpc": .string("2.0"), "id": id, "result": result]))
+    }
+
+    private func replyError(id: JSONValue?, message: String) {
+        guard let id else { return }
+        enqueue(.object([
+            "jsonrpc": .string("2.0"),
+            "id": id,
+            "error": .object(["code": .integer(-32602), "message": .string(message)]),
+        ]))
+    }
+
+    private func enqueue(_ value: JSONValue) {
+        guard var data = try? JSONEncoder().encode(value) else { return }
+        data.append(0x0A)
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            outbound.append(data)
+        }
+    }
+
+    private func trimmed(_ data: Data) -> Data {
+        data.last == 0x0A ? data.dropLast() : data
     }
 }

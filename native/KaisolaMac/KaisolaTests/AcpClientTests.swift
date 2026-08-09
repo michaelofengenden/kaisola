@@ -2826,7 +2826,7 @@ final class AcpClientTests: XCTestCase {
         XCTAssertEqual(diagnostics, [.invalidResponseShape])
     }
 
-    func testInvalidInboundMessagesReturnProtocolErrorsAndValidTrafficContinues() async throws {
+    func testInvalidDecodedMessagesReturnProtocolErrorsAndValidTrafficContinues() async throws {
         let transport = ScriptedAcpTransport()
         let client = AcpClient(transport: transport)
         let collector = EventCollector()
@@ -2844,7 +2844,6 @@ final class AcpClientTests: XCTestCase {
             "id": .string("bad-version-request"),
             "method": .string("custom/method"),
         ]))
-        await transport.emitRawFrame("{\"jsonrpc\":\"2.0\",broken}")
         await transport.emitInbound(.array([
             .object(["jsonrpc": .string("2.0"), "method": .string("batched/notification")]),
         ]))
@@ -2853,8 +2852,8 @@ final class AcpClientTests: XCTestCase {
             "content": .object(["type": .string("text"), "text": .string("still healthy")]),
         ]))
 
-        try await Self.until("three protocol errors and a later valid update") {
-            await transport.receivedProtocolResponses().count == 3
+        try await Self.until("two protocol errors and a later valid update") {
+            await transport.receivedProtocolResponses().count == 2
                 && collector.events.contains { event in
                     if case let .turnItem(.message(_, text)) = event { return text == "still healthy" }
                     return false
@@ -2864,7 +2863,7 @@ final class AcpClientTests: XCTestCase {
         let codes = responses.compactMap {
             $0.objectValue?["error"]?.objectValue?["code"]?.intValue
         }.sorted()
-        XCTAssertEqual(codes, [-32700, -32600, -32600])
+        XCTAssertEqual(codes, [-32600, -32600])
         XCTAssertTrue(responses.contains {
             $0.objectValue?["id"] == .string("bad-version-request")
         })
@@ -2872,8 +2871,8 @@ final class AcpClientTests: XCTestCase {
         let violationCount = await client.inboundProtocolViolationCountForTesting()
         let diagnostics = await client.inboundProtocolViolationDiagnosticsForTesting()
         XCTAssertEqual(terminationCount, 0)
-        XCTAssertEqual(violationCount, 3)
-        XCTAssertEqual(diagnostics, [.invalidVersion, .parseError, .unsupportedBatch])
+        XCTAssertEqual(violationCount, 2)
+        XCTAssertEqual(diagnostics, [.invalidVersion, .unsupportedBatch])
         await client.stop()
     }
 
@@ -3490,7 +3489,452 @@ final class AcpClientTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
     }
+    // MARK: - Request timeout bookkeeping
+
+    /// The synchronous `until` above cannot await the client actor, so the
+    /// in-flight timer count needs its own poll.
+    private static func untilClient(
+        _ description: String,
+        timeout: TimeInterval = 5,
+        _ condition: @Sendable () async -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while await !condition() {
+            if Date() > deadline { return XCTFail("timed out waiting for \(description)") }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private static func connectedClient() async throws -> (AcpClient, ControllableAcpTransport) {
+        let transport = ControllableAcpTransport()
+        let client = AcpClient(transport: transport)
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        return (client, transport)
+    }
+
+    func testAnsweredRequestLeavesNoTimeoutTaskBehind() async throws {
+        let (client, transport) = try await Self.connectedClient()
+
+        // The handshake's own two requests (initialize, session/new) already
+        // settled, so nothing may still be sleeping on them.
+        var outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "the handshake left timeout tasks running")
+
+        let response = Task {
+            try await client.requestForTesting("session/set_model", timeoutNanoseconds: 30_000_000_000)
+        }
+        try await Self.untilClient("the request to go in flight") {
+            await client.outstandingRequestTimeoutCountForTesting() == 1
+        }
+        let inFlight = await transport.unansweredRequestIDs()
+        await transport.answer(id: try XCTUnwrap(inFlight.first))
+        _ = try await response.value
+
+        outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "a successful response left its timeout task running")
+        await client.stop()
+    }
+
+    func testSendFailureCancelsThatRequestsTimeout() async throws {
+        let (client, transport) = try await Self.connectedClient()
+        await transport.failSends(true)
+
+        do {
+            _ = try await client.requestForTesting("session/set_mode", timeoutNanoseconds: 30_000_000_000)
+            XCTFail("a failed send must surface to the caller")
+        } catch {
+            XCTAssertEqual(error as? AcpClientError, .notRunning)
+        }
+
+        let outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "a failed send left its timeout task running")
+        await client.stop()
+    }
+
+    // MARK: - Callback delivery health
+
+    func testFailedNotificationSendClosesTheConnectionWithAVisibleReason() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.failClientNotifications(true)
+        await client.cancel()
+
+        try await Self.untilAsync("the failed notification to retire the connection") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        let errors = collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message }
+            return nil
+        }
+        XCTAssertEqual(
+            errors,
+            ["Kaisola could not send an ACP notification. The agent connection was closed."]
+        )
+        XCTAssertEqual(
+            collector.events.filter { if case .exited = $0 { return true } else { return false } }.count,
+            1
+        )
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(terminationCount, 1)
+    }
+
+    func testFailedCallbackResponsesShareOneConnectionHealthTransition() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.failClientResponses(true)
+        await transport.sendAgentRequest(
+            id: 37_001,
+            method: "test/first_unhandled_callback",
+            params: .object([:])
+        )
+        await transport.sendAgentRequest(
+            id: 37_002,
+            method: "test/second_unhandled_callback",
+            params: .object([:])
+        )
+
+        try await Self.untilAsync("the failed responses to retire the connection once") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        let errors = collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message }
+            return nil
+        }
+        XCTAssertEqual(
+            errors,
+            ["Kaisola could not send an ACP callback response. The agent connection was closed."]
+        )
+        XCTAssertEqual(
+            collector.events.filter { if case .exited = $0 { return true } else { return false } }.count,
+            1
+        )
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(terminationCount, 1)
+    }
+
+    func testUnencodableRequiredCallbackResponseClosesTheConnection() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(
+            transport: transport,
+            outboundFrameLimits: AcpOutboundFrameLimits(
+                globalMaximumBytes: 4 * 1_024,
+                promptMaximumBytes: 4 * 1_024,
+                toolResponseMaximumBytes: 1
+            )
+        )
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.sendAgentRequest(
+            id: 37_003,
+            method: "fs/read_text_file",
+            params: .object(["path": .string("/var/empty/kaisola-callback-fixture")])
+        )
+
+        try await Self.untilAsync("the rejected callback encoding to retire the connection") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        XCTAssertTrue(collector.events.contains { event in
+            if case let .error(message) = event {
+                return message
+                    == "Kaisola could not send an ACP callback response. The agent connection was closed."
+            }
+            return false
+        })
+        let responseCount = await transport.receivedProtocolResponses().count
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(responseCount, 0)
+        XCTAssertEqual(terminationCount, 1)
+    }
+
+    func testAdapterExitCancelsEveryInFlightTimeout() async throws {
+        let (client, transport) = try await Self.connectedClient()
+
+        let first = Task { () -> (any Error)? in
+            do {
+                _ = try await client.requestForTesting("session/set_model", timeoutNanoseconds: 30_000_000_000)
+                return nil
+            } catch { return error }
+        }
+        let second = Task { () -> (any Error)? in
+            do {
+                _ = try await client.requestForTesting("session/set_mode", timeoutNanoseconds: 30_000_000_000)
+                return nil
+            } catch { return error }
+        }
+        try await Self.untilClient("both requests to go in flight") {
+            await client.outstandingRequestTimeoutCountForTesting() == 2
+        }
+
+        await transport.closeOutput(exitCode: 9)
+        let firstError = await first.value
+        let secondError = await second.value
+        XCTAssertEqual(firstError as? AcpClientError, .adapterExited(code: 9))
+        XCTAssertEqual(secondError as? AcpClientError, .adapterExited(code: 9))
+
+        let outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "an adapter exit left timeout tasks running")
+        await client.stop()
+    }
+
+    func testFiredTimeoutClearsItsOwnTask() async throws {
+        let (client, _) = try await Self.connectedClient()
+
+        do {
+            _ = try await client.requestForTesting("session/set_model", timeoutNanoseconds: 40_000_000)
+            XCTFail("an unanswered request must time out")
+        } catch let AcpClientError.requestFailed(message) {
+            XCTAssertTrue(message.contains("timed out"), message)
+        }
+
+        let outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "a fired timeout left its own task in the table")
+        await client.stop()
+    }
+
+    func testCancellingTheCallerSettlesTheRequestAndItsTimeout() async throws {
+        let (client, _) = try await Self.connectedClient()
+
+        let response = Task { () -> (any Error)? in
+            do {
+                _ = try await client.requestForTesting("session/set_model", timeoutNanoseconds: 30_000_000_000)
+                return nil
+            } catch { return error }
+        }
+        try await Self.untilClient("the request to go in flight") {
+            await client.outstandingRequestTimeoutCountForTesting() == 1
+        }
+
+        // A cancelled caller settles now; before, it (and its sleeper) waited
+        // out the whole 30s window against an adapter that never answers.
+        let cancelledAt = Date()
+        response.cancel()
+        let error = await response.value
+        XCTAssertTrue(error is CancellationError, String(describing: error))
+        XCTAssertLessThan(
+            Date().timeIntervalSince(cancelledAt), 5,
+            "a cancelled caller waited out the request timeout"
+        )
+
+        let outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "a cancelled caller left its timeout task running")
+        await client.stop()
+    }
+
+    func testStopCancelsTimeoutsForRequestsItAborts() async throws {
+        let (client, _) = try await Self.connectedClient()
+
+        let response = Task { () -> (any Error)? in
+            do {
+                _ = try await client.requestForTesting("session/set_model", timeoutNanoseconds: 30_000_000_000)
+                return nil
+            } catch { return error }
+        }
+        try await Self.untilClient("the request to go in flight") {
+            await client.outstandingRequestTimeoutCountForTesting() == 1
+        }
+
+        await client.stop()
+        // Stop terminates the transport before it drains its own table, so the
+        // read loop usually reports the abort as an adapter exit. Either way the
+        // caller settles and its timer goes with it.
+        let stopError = await response.value
+        XCTAssertNotNil(stopError as? AcpClientError, String(describing: stopError))
+        let outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "stop left timeout tasks running")
+    }
+
+    // MARK: - Malformed frames
+
+    func testMalformedJsonBetweenValidFramesFailsTheConnection() async throws {
+        let transport = ScriptedAcpTransport(holdPromptOpen: true)
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        // The prompt is never answered, so it stands in for the response the
+        // corrupted bytes could have been: it must fail, not wait out a timeout.
+        let outcome = PromptOutcomeBox()
+        let prompt = Task {
+            do { try await client.prompt("what happened to my answer?"); outcome.record(.success(())) }
+            catch { outcome.record(.failure(error)) }
+        }
+        try await Self.untilAsync("the prompt to reach the adapter") {
+            await transport.receivedPromptTexts().count == 1
+        }
+
+        // One stdout chunk: a good frame, an unparsable one, then another good
+        // frame that must never be acted on.
+        var corrupted = Data(#"{"jsonrpc":"2.0","method":"session/update","params":{"#.utf8)
+        corrupted.append(Data(repeating: UInt8(ascii: "x"), count: 20_000))
+        var chunk = Self.agentMessageFrame(text: "before the corruption")
+        chunk.append(corrupted)
+        chunk.append(0x0A)
+        chunk.append(Self.agentMessageFrame(text: "after the corruption"))
+        await transport.emit(chunk)
+
+        try await Self.untilAsync("the malformed frame to fail the connection") {
+            collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        try await Self.untilAsync("the awaiting prompt to fail") { outcome.failure != nil }
+
+        let texts = collector.events.compactMap { event -> String? in
+            if case let .turnItem(.message(_, text)) = event { return text } else { return nil }
+        }
+        XCTAssertEqual(texts, ["before the corruption"], "frames after the break must not be acted on")
+        let diagnostic = try XCTUnwrap(collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message } else { return nil }
+        }.first)
+        XCTAssertTrue(diagnostic.contains("malformed"), diagnostic)
+        XCTAssertTrue(diagnostic.contains("session/update"), "the excerpt should show the offending head")
+        XCTAssertTrue(diagnostic.contains("(\(corrupted.count) bytes)"), diagnostic)
+        XCTAssertLessThan(diagnostic.count, 400, "a 20 KB frame must not become a 20 KB diagnostic")
+        XCTAssertTrue(
+            collector.events.contains { if case .exited = $0 { return true } else { return false } },
+            "a broken stream must mark the connection gone so the chat can restart it"
+        )
+        let terminations = await transport.terminationCount()
+        XCTAssertEqual(terminations, 1, "the adapter must not be left running behind a dead read loop")
+        switch outcome.failure as? AcpClientError {
+        case .malformedFrame: break
+        default: XCTFail(
+            "the awaiting prompt should fail with the protocol error, got \(String(describing: outcome.failure))"
+        )
+        }
+        // Release the prompt task last: awaiting it earlier would hang forever
+        // against a client that still swallows the malformed frame.
+        await client.stop()
+        _ = await prompt.value
+    }
+
+    func testInvalidUtf8FramingFailsTheConnectionWithAReadableReason() async throws {
+        let transport = ScriptedAcpTransport(holdPromptOpen: true)
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        let outcome = PromptOutcomeBox()
+        let prompt = Task {
+            do { try await client.prompt("garbled adapter output"); outcome.record(.success(())) }
+            catch { outcome.record(.failure(error)) }
+        }
+        try await Self.untilAsync("the prompt to reach the adapter") {
+            await transport.receivedPromptTexts().count == 1
+        }
+
+        // 0xFF is not legal in any UTF-8 sequence, so this never reaches JSON.
+        var chunk = Data(#"{"jsonrpc":"2.0","method":"session/update","params":""#.utf8)
+        chunk.append(0xFF)
+        chunk.append(contentsOf: Data(#""}"#.utf8))
+        chunk.append(0x0A)
+        chunk.append(Self.agentMessageFrame(text: "after the corruption"))
+        await transport.emit(chunk)
+
+        try await Self.untilAsync("the invalid framing to fail the connection") {
+            collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        try await Self.untilAsync("the awaiting prompt to fail") { outcome.failure != nil }
+
+        let diagnostic = try XCTUnwrap(collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message } else { return nil }
+        }.first)
+        XCTAssertTrue(diagnostic.contains("UTF-8"), "expected a readable reason, got: \(diagnostic)")
+        XCTAssertFalse(
+            diagnostic.contains("BrokerWireError"),
+            "the framing error must be translated, not leaked as an opaque code: \(diagnostic)"
+        )
+        XCTAssertLessThan(diagnostic.count, 400, diagnostic)
+        XCTAssertFalse(
+            collector.events.contains { if case .turnItem = $0 { return true } else { return false } },
+            "frames after the break must not be acted on"
+        )
+        XCTAssertTrue(
+            collector.events.contains { if case .exited = $0 { return true } else { return false } },
+            "a broken stream must mark the connection gone so the chat can restart it"
+        )
+        let terminations = await transport.terminationCount()
+        XCTAssertEqual(terminations, 1, "the adapter must not be left running behind a dead read loop")
+        XCTAssertEqual(
+            outcome.failure as? AcpClientError,
+            .malformedFrame("the bytes are not valid UTF-8")
+        )
+        await client.stop()
+        _ = await prompt.value
+    }
+
+    /// One newline-delimited `session/update` frame carrying an agent message.
+    private static func agentMessageFrame(text: String) -> Data {
+        var data = (try? JSONEncoder().encode(JSONValue.object([
+            "jsonrpc": .string("2.0"),
+            "method": .string("session/update"),
+            "params": .object([
+                "sessionId": .string("sess-1"),
+                "update": .object([
+                    "sessionUpdate": .string("agent_message_chunk"),
+                    "content": .object(["type": .string("text"), "text": .string(text)]),
+                ]),
+            ]),
+        ]))) ?? Data()
+        data.append(0x0A)
+        return data
+    }
+
+    /// Poll an async condition until it holds, failing on timeout. The
+    /// `@MainActor` sibling above cannot await inside its predicate.
+    private static func untilAsync(
+        _ description: String,
+        timeout: TimeInterval = 5,
+        _ condition: () async -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            if await condition() { return }
+            if Date() > deadline { return XCTFail("timed out waiting for \(description)") }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
 }
+
+private final class PromptOutcomeBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: Result<Void, any Error>?
+    func record(_ outcome: Result<Void, any Error>) {
+        lock.lock(); storage = outcome; lock.unlock()
+    }
+    var failure: (any Error)? {
+        lock.lock(); defer { lock.unlock() }
+        if case let .failure(error) = storage { return error }
+        return nil
+    }
+}
+
 
 /// Returns one syntactically decodable but ambiguous response so the client's
 /// pending-request failure path is exercised without modifying the healthy
@@ -3685,6 +4129,8 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
+    private var failingClientNotifications = false
+    private var failingClientResponses = false
     private var clientCapabilities: JSONValue?
     private var clientResponses: [Int64: JSONValue] = [:]
 
@@ -3741,6 +4187,8 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func receivedProtocolResponses() -> [JSONValue] { protocolResponses }
     func terminationCount() -> Int { terminations }
     func receivedClientCapabilities() -> JSONValue? { clientCapabilities }
+    func failClientNotifications(_ failing: Bool) { failingClientNotifications = failing }
+    func failClientResponses(_ failing: Bool) { failingClientResponses = failing }
 
     func sendAgentRequest(id: Int64, method: String, params: JSONValue) {
         enqueue(.object([
@@ -3768,6 +4216,12 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         var data = Data(value.utf8)
         data.append(0x0A)
         enqueue(data)
+    }
+
+    /// Deliver an arbitrary stdout chunk, including bytes no JSON encoder can
+    /// produce and multiple newline-delimited frames around a corrupt one.
+    func emit(_ raw: Data) {
+        enqueue(raw)
     }
 
     func emitPermission(
@@ -3853,6 +4307,12 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func send(_ data: Data) async throws {
         guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else { return }
         let id = object["id"]
+        if object["method"] == nil, failingClientResponses {
+            throw AcpClientError.notRunning
+        }
+        if id == nil, object["method"] != nil, failingClientNotifications {
+            throw AcpClientError.notRunning
+        }
         if object["method"] == nil {
             protocolResponses.append(.object(object))
             if let wireID = id?.intValue {
@@ -4104,6 +4564,90 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     }
 
     func exitCode() async -> Int32? { recordedExitCode }
+
+    private func trimmed(_ data: Data) -> Data {
+        data.last == 0x0A ? data.dropLast() : data
+    }
+}
+
+/// A transport that answers only the handshake. Every later request is recorded
+/// and left unanswered, so a test settles it deliberately — a reply, a send
+/// failure, or the adapter closing its output — and inspects what that leaves
+/// behind on the client.
+private actor ControllableAcpTransport: AcpByteTransport {
+    private var outbound: [Data] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+    private var unanswered: [Int64] = []
+    private var sendFails = false
+    private var closed = false
+    private var recordedExitCode: Int32 = 0
+
+    func failSends(_ failing: Bool) { sendFails = failing }
+    func unansweredRequestIDs() -> [Int64] { unanswered }
+
+    func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
+        closed = false
+    }
+
+    func send(_ data: Data) async throws {
+        if sendFails { throw AcpClientError.notRunning }
+        guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue,
+              let id = object["id"]?.intValue else { return }
+        switch object["method"]?.stringValue {
+        case "initialize":
+            reply(id: id, result: .object([
+                "protocolVersion": .integer(Int64(AcpWire.protocolVersion)),
+            ]))
+        case "session/new":
+            reply(id: id, result: .object(["sessionId": .string("sess-1")]))
+        default:
+            unanswered.append(id)
+        }
+    }
+
+    /// Answer a request the client is still waiting on.
+    func answer(id: Int64) {
+        unanswered.removeAll { $0 == id }
+        reply(id: id, result: .object(["ok": .bool(true)]))
+    }
+
+    /// Close the adapter's stdout, which is how a dead agent reaches the read
+    /// loop.
+    func closeOutput(exitCode: Int32) {
+        recordedExitCode = exitCode
+        closed = true
+        waiter?.resume(returning: nil)
+        waiter = nil
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !outbound.isEmpty { return outbound.removeFirst() }
+        if closed { return nil }
+        return await withCheckedContinuation { continuation in waiter = continuation }
+    }
+
+    func terminate() async {
+        closed = true
+        waiter?.resume(returning: nil)
+        waiter = nil
+    }
+
+    func exitCode() async -> Int32? { recordedExitCode }
+
+    private func reply(id: Int64, result: JSONValue) {
+        guard var data = try? JSONEncoder().encode(JSONValue.object([
+            "jsonrpc": .string("2.0"),
+            "id": .integer(id),
+            "result": result,
+        ])) else { return }
+        data.append(0x0A)
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            outbound.append(data)
+        }
+    }
 
     private func trimmed(_ data: Data) -> Data {
         data.last == 0x0A ? data.dropLast() : data

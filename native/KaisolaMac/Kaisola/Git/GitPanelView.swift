@@ -14,7 +14,9 @@ import SwiftUI
 /// an agent's commit and endless on an idle repository.
 ///
 /// **Opening a pull request is two steps.** `preparePR` assembles a `PRPlan` and
-/// shows it; `confirmPR` executes that reviewed plan and nothing else.
+/// shows it; `confirmPR` executes that reviewed plan and nothing else. A confirm
+/// that stops part way keeps its completed phases in `PRExecutionProgress`, so
+/// the panel names them and Retry resumes rather than restarts.
 @MainActor
 final class GitPanelModel: ObservableObject {
     @Published private(set) var status: GitService.Status?
@@ -45,6 +47,11 @@ final class GitPanelModel: ObservableObject {
     /// differs from what it was reviewed against). The card stays on screen so
     /// the user's edits aren't lost, but Confirm is disabled until review.
     @Published private(set) var prPlanStale = false
+    /// What the last confirm actually completed before it stopped. Empty on a
+    /// clean slate and after a successful run; populated when a confirm failed
+    /// part way, so the panel can name the branch it created, link the branch it
+    /// pushed, and let Retry resume instead of starting the sequence over.
+    @Published private(set) var prProgress = PRExecutionProgress()
     /// Review-stage edits. Seeded from the plan when it is assembled.
     @Published var prBranchDraft = "kaisola/pr-branch"
     @Published var prTitleDraft = ""
@@ -191,7 +198,12 @@ final class GitPanelModel: ObservableObject {
                     plan: plan,
                     currentHeadOID: snapshot.headOID,
                     currentBranch: snapshot.prep?.branch,
-                    currentDestination: snapshot.destination
+                    currentDestination: snapshot.destination,
+                    // A failed confirm that already forked the branch left it
+                    // checked out. That is the plan running, not the repository
+                    // drifting away from it — reading it as staleness would
+                    // disable the very Retry that finishes the job.
+                    completedBranchCreation: self.prProgress.createdBranch == plan.headBranch
                 )
             } else {
                 self.prPlanStale = false
@@ -276,7 +288,27 @@ final class GitPanelModel: ObservableObject {
         }
     }
 
+    /// The one gate on committing, shared by the Commit button, Return in the
+    /// message field, and `commit()` itself. Keyboard submit used to call
+    /// `commit()` straight through, so Return could fire a commit the disabled
+    /// button had already refused (blank message, nothing staged).
+    var canCommit: Bool {
+        !isBusy
+            && status?.staged.isEmpty == false
+            && !commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var commitHelp: String {
+        if isBusy { return "Wait for the current Git operation to finish" }
+        if status?.staged.isEmpty != false { return "Stage at least one file before committing" }
+        if commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Enter a commit message"
+        }
+        return "Commit the staged files"
+    }
+
     func commit() {
+        guard canCommit else { return }
         let message = commitMessage
         perform { (try $0.commit(message: message), try $0.status(), try? $0.prPrep()) } apply: {
             self.status = $0.1
@@ -346,6 +378,11 @@ final class GitPanelModel: ObservableObject {
         } apply: { plan in
             self.prPlan = plan
             self.prPlanStale = false
+            // Keep only the completed phases this freshly assembled plan is
+            // still standing on. A branch an earlier attempt pushed at this
+            // exact commit does not need pushing again; anything else about the
+            // old run no longer describes this plan and is dropped.
+            self.prProgress = self.prProgress.carriedForward(into: plan)
             self.prBranchDraft = plan.headBranch
             // "Review Again" re-runs this exact path once the reviewed plan
             // goes stale. Only reseed a field the user left exactly as this
@@ -383,8 +420,17 @@ final class GitPanelModel: ObservableObject {
     /// Refuses to run when the repository moved past the reviewed commit, so a
     /// commit or checkout landing between the two clicks (an agent, a terminal)
     /// can never silently turn into a pull request nobody looked at.
+    ///
+    /// It is also the retry. The fork and the push are real, non-idempotent side
+    /// effects, so each one is recorded in `prProgress` as it lands and a second
+    /// run resumes at the first phase that has not happened yet: a `gh` failure
+    /// costs one more `gh` call, not a duplicate branch or a redundant push.
     func confirmPR() {
         guard let reviewed = prPlan else { return }
+        // An attempt that already forked the branch is standing on it, so its
+        // name is settled — pin the draft to it rather than let a field the user
+        // was still editing rename the head `gh` is told about.
+        if let created = prProgress.createdBranch { prBranchDraft = created }
         let plan: PRPlan
         do {
             plan = try reviewed.applyingEdits(
@@ -400,52 +446,83 @@ final class GitPanelModel: ObservableObject {
         }
         prState = nil
         prURL = nil
+        let resumed = prProgress
         perform { service -> PROutcome in
+            var progress = resumed
             if let stale = GitPRPlanner.stalenessMessage(
                 plan: plan,
                 currentHeadOID: try service.headOID(),
                 currentBranch: try service.prPrep().branch,
-                currentDestination: service.prDestination()
+                currentDestination: service.prDestination(),
+                completedBranchCreation: progress.createdBranch == plan.headBranch
             ) {
-                throw GitService.GitError.commandFailed(stale)
+                throw PRExecutionFailure(
+                    progress: progress,
+                    underlying: GitService.GitError.commandFailed(stale)
+                )
             }
             guard plan.destination.isReadyForPullRequest,
                   let repositoryURL = plan.destination.webURL else {
-                throw GitService.GitError.commandFailed(
-                    "Add a web origin remote, then review the pull request again."
+                throw PRExecutionFailure(
+                    progress: progress,
+                    underlying: GitService.GitError.commandFailed(
+                        "Add a web origin remote, then review the pull request again."
+                    )
                 )
             }
-            if plan.createsBranch {
-                try service.createBranchFromHead(named: plan.headBranch)
-            }
-            try service.pushCurrentBranch(
-                setUpstream: plan.setsUpstream,
-                remoteName: plan.destination.remoteName
-            )
+            do {
+                if progress.needsBranchCreation(for: plan) {
+                    try service.createBranchFromHead(named: plan.headBranch)
+                    progress.createdBranch = plan.headBranch
+                }
+                if progress.needsPush(for: plan) {
+                    try service.pushCurrentBranch(
+                        setUpstream: plan.setsUpstream,
+                        remoteName: plan.destination.remoteName
+                    )
+                    progress.pushedBranch = plan.headBranch
+                    progress.pushedHeadOID = plan.headOID
+                    progress.remoteBranchURL = GitService.branchWebURL(
+                        destination: plan.destination,
+                        headBranch: plan.headBranch
+                    )
+                }
 
-            let result: PRResult
-            if GitService.ghAvailable() {
-                result = .created(url: try service.createPullRequest(
-                    title: plan.title,
-                    body: plan.body,
-                    baseBranch: plan.baseBranch,
-                    headBranch: plan.headBranch,
-                    repositoryURL: repositoryURL
-                ))
-            } else if let compare = service.compareURL(
-                destination: plan.destination,
-                headBranch: plan.headBranch
-            ) {
-                result = .compare(url: compare)
-            } else {
-                throw GitService.GitError.commandFailed("Install the GitHub CLI (gh) or add a GitHub origin remote to open a pull request.")
+                let result: PRResult
+                if GitService.ghAvailable() {
+                    switch try service.createPullRequest(
+                        title: plan.title,
+                        body: plan.body,
+                        baseBranch: plan.baseBranch,
+                        headBranch: plan.headBranch,
+                        repositoryURL: repositoryURL
+                    ) {
+                    case let .opened(url):
+                        result = .created(url: url)
+                    case let .openedWithoutURL(recoveryURL):
+                        result = .createdWithoutURL(url: recoveryURL)
+                    }
+                } else if let compare = service.compareURL(
+                    destination: plan.destination,
+                    headBranch: plan.headBranch
+                ) {
+                    result = .compare(url: compare)
+                } else {
+                    throw GitService.GitError.commandFailed("Install the GitHub CLI (gh) or add a GitHub origin remote to open a pull request.")
+                }
+                return PROutcome(result: result, status: try service.status(), prep: try? service.prPrep())
+            } catch {
+                // Whatever stopped the run, the phases above it already
+                // happened. Carry them out with the error so the panel reports
+                // them instead of only the failure.
+                throw PRExecutionFailure(progress: progress, underlying: error)
             }
-            return PROutcome(result: result, status: try service.status(), prep: try? service.prPrep())
         } apply: { outcome in
             self.status = outcome.status
             self.prPrepInfo = outcome.prep
             self.prPlan = nil
             self.prPlanStale = false
+            self.prProgress = PRExecutionProgress()
             self.diffs.removeAll()
             self.diffRequests.removeAll()
             self.log.removeAll()
@@ -454,12 +531,24 @@ final class GitPanelModel: ObservableObject {
                 self.prURL = url
                 self.prState = "Pull request opened."
                 ToastCenter.shared.show("Pull request opened", style: .success)
+            case let .createdWithoutURL(url):
+                self.prURL = url
+                self.prState = "Pull request opened, but gh printed no usable link — this opens the branch's pull requests instead."
+                ToastCenter.shared.show("Pull request opened — link unconfirmed", style: .info)
             case let .compare(url):
                 self.prURL = url
                 self.prState = "gh not installed — opened a compare page in your browser."
                 if let target = URL(string: url) { _ = NSWorkspace.shared.open(target) }
                 ToastCenter.shared.show("Opened compare page in browser", style: .info)
             }
+        } onError: { error in
+            // The error banner says what went wrong; this says what already
+            // happened anyway. Both outlive a cancelled review card, so a user
+            // who walks away still knows a branch of theirs is on the remote.
+            guard let failure = error as? PRExecutionFailure else { return }
+            self.prProgress = failure.progress
+            self.prURL = failure.progress.remoteBranchURL
+            self.prState = failure.progress.recoveryNote
         }
     }
 
@@ -544,8 +633,9 @@ private struct PROutcome: Sendable {
 }
 
 private enum PRResult: Sendable {
-    case created(url: String)   // gh opened a real pull request
-    case compare(url: String)   // gh missing — a browser compare page instead
+    case created(url: String)             // gh opened a real pull request
+    case createdWithoutURL(url: String)   // opened, but gh named no PR — a list to recover from
+    case compare(url: String)             // gh missing — a browser compare page instead
 }
 
 struct GitPanelView: View {
@@ -690,7 +780,9 @@ struct GitPanelView: View {
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { model.commit() }
                 Button("Commit") { model.commit() }
-                    .disabled(model.commitMessage.trimmingCharacters(in: .whitespaces).isEmpty || status.staged.isEmpty || model.isBusy)
+                    .disabled(!model.canCommit)
+                    .help(model.commitHelp)
+                    .accessibilityIdentifier("git.commit")
             }
             .padding(12)
         }
@@ -755,7 +847,9 @@ struct GitPanelView: View {
     /// shows it — remote, destination, base and head branch, commits, exact
     /// changed files, and editable title/body — without running anything. "Push
     /// and Create PR" then executes exactly what is on screen (or opens a
-    /// browser compare page when gh is absent). The result URL is tappable.
+    /// browser compare page when gh is absent). The result URL is tappable, and
+    /// after a half-finished run that URL is the pushed branch: the note and the
+    /// link sit outside the card so they survive cancelling the review.
     @ViewBuilder
     private var prSection: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -835,6 +929,24 @@ struct GitPanelView: View {
                     .font(.caption)
                     .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
                     .accessibilityIdentifier("git.pr.stale")
+            }
+
+            // A confirm that stopped part way: name every phase that did run so
+            // the branch and the push are never invisible completed work.
+            if model.prProgress.hasSideEffects {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Already done by the last attempt")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(model.prProgress.completedPhases, id: \.self) { phase in
+                        Label(phase, systemImage: "checkmark.circle")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("git.pr.completedPhases")
             }
 
             HStack(spacing: 6) {
@@ -936,6 +1048,9 @@ struct GitPanelView: View {
                 TextField("Branch name", text: $model.prBranchDraft)
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
+                    // Once the branch exists renaming it here would only tell
+                    // `gh` about a head that was never pushed.
+                    .disabled(model.prProgress.createdBranch != nil)
                     .accessibilityIdentifier("git.pr.branch")
                     .accessibilityLabel("Pull request branch name")
             }
@@ -952,9 +1067,14 @@ struct GitPanelView: View {
                 .accessibilityLabel("Pull request description")
 
             if !model.prPlanStale {
+                // After a half-finished run "nothing has run yet" would be a
+                // lie, so the caption states the remaining work either way.
                 Text(
-                    "Nothing has run yet — confirm to push \(plan.headBranch) to "
-                        + "\(plan.destination.remoteName) and open the pull request against \(plan.baseBranch)."
+                    model.prProgress.hasSideEffects
+                        ? "Retry resumes where the last attempt stopped: "
+                            + "\(model.prProgress.remainingWork(for: plan))."
+                        : "Nothing has run yet — confirm to "
+                            + "\(model.prProgress.remainingWork(for: plan))."
                 )
                     .font(.caption2)
                     .foregroundStyle(.kaisolaSecondary)
@@ -964,7 +1084,12 @@ struct GitPanelView: View {
                 Button {
                     model.confirmPR()
                 } label: {
-                    Label("Push and Create PR", systemImage: "arrow.up.forward.square")
+                    Label(
+                        model.prProgress.hasSideEffects ? "Retry Pull Request" : "Push and Create PR",
+                        systemImage: model.prProgress.hasSideEffects
+                            ? "arrow.clockwise.circle"
+                            : "arrow.up.forward.square"
+                    )
                         .font(.caption)
                 }
                 .disabled(

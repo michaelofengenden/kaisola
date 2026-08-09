@@ -73,6 +73,28 @@ enum BrowserCardLoadState: Equatable {
     }
 }
 
+/// The address the browser card is actually showing. The source `url` is only
+/// the latest address requested by the shell; redirects and back/forward
+/// navigation can commit a different URL without rebuilding `BrowserCardView`.
+/// Keeping this transition pure makes the header/action contract directly
+/// testable without launching WebKit.
+struct BrowserCardAddressState: Equatable {
+    private(set) var currentURL: URL
+
+    init(requestedURL: URL) {
+        currentURL = requestedURL
+    }
+
+    mutating func retarget(to requestedURL: URL) {
+        currentURL = requestedURL
+    }
+
+    mutating func commit(_ committedURL: URL?) {
+        guard let committedURL, committedURL != currentURL else { return }
+        currentURL = committedURL
+    }
+}
+
 /// Spoken names for the card's header. The reload and close controls are
 /// image-only, so without explicit labels VoiceOver falls back to the SF Symbol
 /// name ("arrow.clockwise") and never says which page is being acted on — the
@@ -145,18 +167,33 @@ struct BrowserCardView: View {
     /// without holding a reference to the WKWebView from the header.
     @State private var reloadToken = 0
     @State private var loadState: BrowserCardLoadState = .loading
+    @State private var addressState: BrowserCardAddressState
+
+    init(url: URL, close: @escaping () -> Void) {
+        self.url = url
+        self.close = close
+        _addressState = State(initialValue: BrowserCardAddressState(requestedURL: url))
+    }
 
     private var accessibility: BrowserCardAccessibility {
-        BrowserCardAccessibility(url: url, state: loadState)
+        BrowserCardAccessibility(url: addressState.currentURL, state: loadState)
     }
 
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider()
-            ConfinedWebView(url: url, reloadToken: reloadToken, loadState: $loadState)
+            ConfinedWebView(
+                url: url,
+                reloadToken: reloadToken,
+                loadState: $loadState,
+                addressState: $addressState
+            )
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .onChange(of: url) { _, requestedURL in
+            addressState.retarget(to: requestedURL)
+        }
     }
 
     private var header: some View {
@@ -164,7 +201,7 @@ struct BrowserCardView: View {
             Image(systemName: "globe")
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
-            Text(url.absoluteString)
+            Text(addressState.currentURL.absoluteString)
                 .font(.subheadline.weight(.medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -182,7 +219,7 @@ struct BrowserCardView: View {
             .help("Reload this page")
             .accessibilityLabel(accessibility.reloadLabel)
             Button("Open in Browser") {
-                NSWorkspace.shared.open(url)
+                NSWorkspace.shared.open(addressState.currentURL)
             }
             .help("Open this URL in your default browser")
             .accessibilityLabel(accessibility.openExternallyLabel)
@@ -229,6 +266,7 @@ private struct ConfinedWebView: NSViewRepresentable {
     let url: URL
     let reloadToken: Int
     @Binding var loadState: BrowserCardLoadState
+    @Binding var addressState: BrowserCardAddressState
 
     func makeCoordinator() -> Coordinator {
         Coordinator()
@@ -248,6 +286,7 @@ private struct ConfinedWebView: NSViewRepresentable {
         coordinator.origin = BrowserCardOrigin(url: url)
         coordinator.reloadToken = reloadToken
         coordinator.report = report
+        coordinator.reportCommittedURL = reportCommittedURL
         webView.load(URLRequest(url: url))
         return webView
     }
@@ -261,9 +300,16 @@ private struct ConfinedWebView: NSViewRepresentable {
         loadState = state
     }
 
+    /// Delegate callbacks arrive after SwiftUI's update pass, so committing the
+    /// actual WebKit URL here does not mutate state during `updateNSView`.
+    private func reportCommittedURL(_ url: URL?) {
+        addressState.commit(url)
+    }
+
     func updateNSView(_ webView: WKWebView, context: Context) {
         let coordinator = context.coordinator
         coordinator.report = report
+        coordinator.reportCommittedURL = reportCommittedURL
         // The card was retargeted at a different URL (user clicked another
         // localhost link while this card was already up).
         if coordinator.loadedURL != url {
@@ -283,12 +329,20 @@ private struct ConfinedWebView: NSViewRepresentable {
         var origin: BrowserCardOrigin?
         var reloadToken = 0
         var report: (BrowserCardLoadState) -> Void = { _ in }
+        var reportCommittedURL: (URL?) -> Void = { _ in }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             report(.loading)
         }
 
+        func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+            reportCommittedURL(webView.url)
+        }
+
         func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+            // `didCommit` is the primary address transition. Re-publish at
+            // finish so a final URL change between commit and completion wins.
+            reportCommittedURL(webView.url)
             report(.loaded)
         }
 

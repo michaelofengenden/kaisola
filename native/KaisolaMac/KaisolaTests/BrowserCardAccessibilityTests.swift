@@ -107,6 +107,52 @@ final class BrowserCardAccessibilityTests: XCTestCase {
         )
     }
 
+    // MARK: - Current address
+
+    func testCommittedRedirectReplacesTheRequestedAddressEverywhere() throws {
+        var address = BrowserCardAddressState(
+            requestedURL: try url("http://localhost:3000/start")
+        )
+
+        address.commit(try url("http://localhost:3000/dashboard?from=redirect"))
+
+        XCTAssertEqual(
+            address.currentURL,
+            try url("http://localhost:3000/dashboard?from=redirect")
+        )
+        let accessibility = BrowserCardAccessibility(url: address.currentURL, state: .loaded)
+        XCTAssertEqual(
+            accessibility.addressValue,
+            "http://localhost:3000/dashboard?from=redirect, Loaded"
+        )
+        XCTAssertEqual(accessibility.openExternallyLabel, "Open in Browser, localhost:3000")
+    }
+
+    func testCommittedHistoryNavigationTracksBothDirections() throws {
+        var address = BrowserCardAddressState(
+            requestedURL: try url("http://localhost:3000/first")
+        )
+
+        address.commit(try url("http://localhost:3000/second"))
+        XCTAssertEqual(address.currentURL, try url("http://localhost:3000/second"))
+
+        address.commit(try url("http://localhost:3000/first"))
+        XCTAssertEqual(address.currentURL, try url("http://localhost:3000/first"))
+    }
+
+    func testRetargetReplacesPriorNavigationAndMissingCommitCannotRollItBack() throws {
+        var address = BrowserCardAddressState(
+            requestedURL: try url("http://localhost:3000/first")
+        )
+        address.commit(try url("http://localhost:3000/first/deep-link"))
+
+        let retargeted = try url("http://admin.localhost:4400/new-root")
+        address.retarget(to: retargeted)
+        address.commit(nil)
+
+        XCTAssertEqual(address.currentURL, retargeted)
+    }
+
     // MARK: - Origin confinement
 
     /// Browser-card navigations stay inside the exact local web origin that

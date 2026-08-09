@@ -7,6 +7,189 @@ import XCTest
 /// parsing (diff / content / terminal), which feed the chat's inline diff cards.
 final class AcpToolArtifactsTests: XCTestCase {
 
+    // MARK: - Checkpoint menu accessibility
+
+    func testCheckpointMenuAccessibilityNamesPurposeAndAvailableCount() {
+        XCTAssertEqual(CheckpointMenuAccessibility.label, "Restore checkpoint")
+        XCTAssertEqual(
+            CheckpointMenuAccessibility.value(checkpointCount: 1),
+            "1 checkpoint available"
+        )
+        XCTAssertEqual(
+            CheckpointMenuAccessibility.value(checkpointCount: 3),
+            "3 checkpoints available"
+        )
+        XCTAssertEqual(
+            CheckpointMenuAccessibility.hint,
+            "Choose a snapshot taken before a turn. Restoring replaces current working tree files after confirmation."
+        )
+        XCTAssertEqual(CheckpointMenuAccessibility.identifier, "acp.checkpoints.restore")
+    }
+
+    func testCheckpointChoiceAccessibilityExplainsTurnTimeAndDestructiveConsequence() {
+        XCTAssertEqual(
+            CheckpointMenuAccessibility.choiceLabel(turn: 7, time: "3:14 PM"),
+            "Restore checkpoint before turn 7 at 3:14 PM"
+        )
+        XCTAssertEqual(
+            CheckpointMenuAccessibility.choiceHint,
+            "Replaces current working tree files with this snapshot after confirmation."
+        )
+    }
+
+    // MARK: - Tool call accessibility
+
+    func testToolCallAccessibilityNamesEveryTypedStatusAndDisclosureState() {
+        let expectedStatuses: [(AcpToolCall.Status, String)] = [
+            (.pending, "Pending"),
+            (.inProgress, "In progress"),
+            (.completed, "Completed"),
+            (.failed, "Failed"),
+        ]
+
+        for (status, statusLabel) in expectedStatuses {
+            let call = AcpToolCall(
+                id: "tool-\(status.rawValue)",
+                title: "Inspect native project",
+                kind: "read",
+                status: status,
+                content: [.text("one"), .terminal(id: "terminal-1")]
+            )
+
+            let collapsed = ToolCallAccessibility(call: call, expanded: false)
+            XCTAssertEqual(collapsed.label, "Show details for Inspect native project")
+            XCTAssertEqual(
+                collapsed.value,
+                "read tool, \(statusLabel), 2 artifacts, Collapsed"
+            )
+            XCTAssertEqual(collapsed.actionName, "Show details")
+            XCTAssertEqual(collapsed.identifier, "acp.tool.tool-\(status.rawValue)")
+
+            let expanded = ToolCallAccessibility(call: call, expanded: true)
+            XCTAssertEqual(expanded.label, "Hide details for Inspect native project")
+            XCTAssertEqual(
+                expanded.value,
+                "read tool, \(statusLabel), 2 artifacts, Expanded"
+            )
+            XCTAssertEqual(expanded.actionName, "Hide details")
+        }
+    }
+
+    func testToolCallAccessibilityDoesNotExposeDisclosureActionWithoutArtifacts() {
+        let call = AcpToolCall(
+            id: "tool-empty",
+            title: "Check status",
+            kind: "inspect",
+            status: .completed
+        )
+
+        let accessibility = ToolCallAccessibility(call: call, expanded: false)
+        XCTAssertEqual(accessibility.label, "Check status")
+        XCTAssertEqual(accessibility.value, "inspect tool, Completed, 0 artifacts")
+        XCTAssertNil(accessibility.actionName)
+        XCTAssertEqual(accessibility.identifier, "acp.tool.tool-empty")
+    }
+
+    // MARK: - Tool-call density
+
+    private var densityFixture: AcpToolCall {
+        AcpToolCall(
+            id: "density-tool",
+            title: "Update project files",
+            kind: "edit",
+            status: .failed,
+            content: [
+                .diff(path: "Sources/App.swift", oldText: "old", newText: "new"),
+                .text("permission decision: allowed once"),
+                .terminal(id: "terminal-1"),
+            ],
+            locations: ["Tests/AppTests.swift", "Sources/App.swift"]
+        )
+    }
+
+    func testEveryToolCallDensityRetainsCriticalEvidenceAndExpandability() {
+        for density in ToolCallDensity.allCases {
+            let presentation = ToolCallDensityPresentation(
+                call: densityFixture,
+                density: density
+            )
+            XCTAssertEqual(presentation.statusLabel, "Failed", density.title)
+            XCTAssertEqual(presentation.affectedFiles, [
+                "Tests/AppTests.swift", "Sources/App.swift",
+            ], density.title)
+            XCTAssertEqual(presentation.artifactCount, 3, density.title)
+            XCTAssertTrue(presentation.hasExpandableContent, density.title)
+            XCTAssertEqual(presentation.accessibilityOrder, [
+                "Failed",
+                "Update project files",
+                "edit",
+                "Affected files: Tests/AppTests.swift, Sources/App.swift",
+                "3 expandable artifacts",
+            ], density.title)
+        }
+    }
+
+    func testNamedDensitiesExposeIncreasingDetailWithoutExpandingUnboundedOutput() {
+        let presentations = ToolCallDensity.allCases.map {
+            ToolCallDensityPresentation(call: densityFixture, density: $0)
+        }
+
+        XCTAssertEqual(presentations.map(\.visibleDetailLevel), [1, 2, 3])
+        XCTAssertEqual(presentations.map(\.showsArtifactSummary), [false, true, true])
+        XCTAssertEqual(presentations.map(\.wrapsAffectedFiles), [false, false, true])
+        XCTAssertTrue(presentations.allSatisfy { !$0.expandsArtifactsByDefault })
+    }
+
+    func testDensityProjectionNeverMutatesTranscriptRowsOrStableIdentity() {
+        let row = AcpTranscriptRow.tool(densityFixture)
+        let baseline = row
+        for density in ToolCallDensity.allCases {
+            _ = ToolCallDensityPresentation(call: densityFixture, density: density)
+            XCTAssertEqual(row, baseline)
+            XCTAssertEqual(row.id, "tool-density-tool")
+        }
+    }
+
+    func testDensityChangeKeepsStableReadingAnchorIdentity() {
+        let rows: [AcpTranscriptRow] = [
+            .message(id: "before", text: "Before"),
+            .tool(densityFixture),
+            .message(id: "after", text: "After"),
+        ]
+        let readingAnchor = rows[1].id
+
+        for density in ToolCallDensity.allCases {
+            _ = ToolCallDensityPresentation(call: densityFixture, density: density)
+            XCTAssertEqual(rows[1].id, readingAnchor, density.title)
+            XCTAssertEqual(rows.map(\.id), ["msg-before", "tool-density-tool", "msg-after"])
+        }
+    }
+
+    func testLargeChatProjectionIsMeasuredWithinBudgetForEveryDensity() {
+        let calls = (0..<20_000).map { index in
+            AcpToolCall(
+                id: "tool-\(index)",
+                title: "Read source \(index)",
+                kind: index.isMultiple(of: 2) ? "read" : "edit",
+                status: index.isMultiple(of: 7) ? .failed : .completed,
+                content: [.text("bounded output")],
+                locations: ["Sources/File\(index).swift"]
+            )
+        }
+        let clock = ContinuousClock()
+        for density in ToolCallDensity.allCases {
+            var checksum = 0
+            let elapsed = clock.measure {
+                for call in calls {
+                    let presentation = ToolCallDensityPresentation(call: call, density: density)
+                    checksum &+= presentation.accessibilityOrder.count
+                }
+            }
+            XCTAssertEqual(checksum, calls.count * 5, density.title)
+            XCTAssertLessThan(elapsed, .seconds(2), "\(density.title) projection: \(elapsed)")
+        }
+    }
+
     // MARK: - AcpDiff
 
     func testFreshFileIsAllAdditions() {

@@ -16,6 +16,34 @@ enum NavigationLayout: String, CaseIterable, Identifiable, Sendable {
     var title: String { self == .leftTree ? "Left Tree" : "Top Bar" }
 }
 
+/// How much always-visible detail each tool-call card uses. Every level keeps
+/// the same status, affected-file, failure, and disclosure evidence; density
+/// changes only the card's spacing and how much summary text is visible before
+/// the user expands bounded artifacts.
+enum ToolCallDensity: String, CaseIterable, Identifiable, Sendable {
+    case compact
+    case balanced
+    case detailed
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .compact: "Compact"
+        case .balanced: "Balanced"
+        case .detailed: "Detailed"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .compact: "Tight cards with essential evidence"
+        case .balanced: "Status, files, and artifact summary"
+        case .detailed: "Roomier cards with wrapped file paths"
+        }
+    }
+}
+
 /// Appearance mode. Follows the system by default; shell chrome and the chosen
 /// terminal palette both resolve against it.
 enum AppearanceMode: String, CaseIterable, Identifiable, Sendable {
@@ -508,6 +536,10 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(workspaceBackdrop.rawValue, forKey: Keys.workspaceBackdrop) }
     }
 
+    @Published var toolCallDensity: ToolCallDensity {
+        didSet { persist(toolCallDensity.rawValue, forKey: Keys.toolCallDensity) }
+    }
+
     @Published var glassTexture: GlassTexture {
         didSet { persist(glassTexture.rawValue, forKey: Keys.glassTexture) }
     }
@@ -822,6 +854,7 @@ final class NativePreviewSettings: ObservableObject {
         static let appearance = "appearanceMode"
         static let sidebarAppearance = "sidebarAppearance"
         static let workspaceBackdrop = "workspaceBackdrop"
+        static let toolCallDensity = "toolCallDensity"
         static let glassBackdropSource = "glassBackdropSource"
         static let glassTexture = "glassTexture"
         static let glassColour = "glassColour"
@@ -859,6 +892,8 @@ final class NativePreviewSettings: ObservableObject {
         appearance = defaults.string(forKey: Keys.appearance).flatMap(AppearanceMode.init) ?? .system
         sidebarAppearance = defaults.string(forKey: Keys.sidebarAppearance).flatMap(SidebarAppearance.init) ?? .glass
         workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .glass
+        toolCallDensity = defaults.string(forKey: Keys.toolCallDensity)
+            .flatMap(ToolCallDensity.init) ?? .balanced
         glassBackdropSource = defaults.string(forKey: Keys.glassBackdropSource)
             .flatMap(GlassBackdropSource.init) ?? .wallpaper
         glassWallpaper = defaults.string(forKey: Keys.glassWallpaper) ?? ""

@@ -14,6 +14,8 @@ struct AcpComposerCard: View {
     @ObservedObject var conversation: AcpConversation
     @Binding var draft: String
     @FocusState.Binding var focused: Bool
+    @FocusState.Binding var attachmentFocused: Bool
+    var attachmentAccessibilityFocused: AccessibilityFocusState<Bool>.Binding
     /// True while the conversation has produced nothing, which is the only
     /// thing that changes about the card: its placeholder.
     var isNewConversation = false
@@ -24,6 +26,7 @@ struct AcpComposerCard: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var menuPresented = false
+    @State private var attachmentMenuPresented = false
     @State private var menuQuery = ""
     /// Bumped on every open so the menu's own `@State` — which row is armed,
     /// where the highlight sits, whether Advanced is expanded — starts clean.
@@ -160,22 +163,8 @@ struct AcpComposerCard: View {
     // MARK: - Attachment menu
 
     private var attachmentMenu: some View {
-        Menu {
-            Button(action: openAttachmentPanel) {
-                Label("Add files or photos", systemImage: "paperclip")
-            }
-            .keyboardShortcut("u", modifiers: .command)
-
-            // "Add folder" and "Import GitHub issue" are deliberately absent:
-            // `AcpAttachmentClassifier` rejects directories, and nothing in the
-            // app turns an issue into a prompt. A greyed-out row would only
-            // advertise a capability that does not exist.
-            if !conversation.commands.isEmpty {
-                Divider()
-                Button(action: beginSlashCommand) {
-                    Label("Slash commands", systemImage: "text.badge.plus")
-                }
-            }
+        Button {
+            attachmentMenuPresented = true
         } label: {
             Group {
                 if conversation.preparingAttachmentCount > 0 {
@@ -187,13 +176,47 @@ struct AcpComposerCard: View {
             .frame(width: 22, height: 22)
             .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
         .fixedSize()
         .disabled(!conversation.isConnected)
         .help("Attach files or photos, or insert a slash command")
         .accessibilityLabel("Add attachments")
         .accessibilityIdentifier("acp.composer.attach")
+        .focusable()
+        .focused($attachmentFocused)
+        .accessibilityFocused(attachmentAccessibilityFocused)
+        .popover(isPresented: $attachmentMenuPresented, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 4) {
+                Button {
+                    attachmentMenuPresented = false
+                    openAttachmentPanel()
+                } label: {
+                    Label("Add files or photos", systemImage: "paperclip")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .keyboardShortcut("u", modifiers: .command)
+
+                // "Add folder" and "Import GitHub issue" are deliberately absent:
+                // `AcpAttachmentClassifier` rejects directories, and nothing in the
+                // app turns an issue into a prompt. A greyed-out row would only
+                // advertise a capability that does not exist.
+                if !conversation.commands.isEmpty {
+                    Divider()
+                    Button {
+                        attachmentMenuPresented = false
+                        beginSlashCommand()
+                    } label: {
+                        Label("Slash commands", systemImage: "text.badge.plus")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .padding(8)
+            .frame(minWidth: 190)
+        }
     }
 
     private func beginSlashCommand() {

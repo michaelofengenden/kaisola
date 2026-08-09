@@ -563,6 +563,20 @@ struct SettingsView: View {
                         .menuIndicator(.hidden)
                         .accessibilityLabel("Canvas backdrop")
                     }
+                    SettingsDivider()
+                    SettingsRow(
+                        title: "Tool-call detail",
+                        detail: settings.toolCallDensity.detail,
+                        symbol: "list.bullet.rectangle"
+                    ) {
+                        Menu {
+                            ForEach(ToolCallDensity.allCases) { density in
+                                Button(density.title) { settings.toolCallDensity = density }
+                            }
+                        } label: { SettingsChoiceLabel(settings.toolCallDensity.title) }
+                        .menuIndicator(.hidden)
+                        .accessibilityLabel("Tool-call detail")
+                    }
                 }
 
                 SettingsCard(title: "System", symbol: "macwindow") {

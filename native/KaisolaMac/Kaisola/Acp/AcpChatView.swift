@@ -2,6 +2,59 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// One spoken contract for the symbol-only checkpoint menu and its destructive
+/// choices. Keep the consequence in the choice hint even though a confirmation
+/// follows: VoiceOver users need to understand the action before selecting it.
+enum CheckpointMenuAccessibility {
+    static let label = "Restore checkpoint"
+    static let hint = "Choose a snapshot taken before a turn. "
+        + "Restoring replaces current working tree files after confirmation."
+    static let choiceHint = "Replaces current working tree files with this snapshot after confirmation."
+    static let identifier = "acp.checkpoints.restore"
+
+    static func value(checkpointCount: Int) -> String {
+        "\(checkpointCount) checkpoint\(checkpointCount == 1 ? "" : "s") available"
+    }
+
+    static func choiceLabel(turn: Int, time: String) -> String {
+        "Restore checkpoint before turn \(turn) at \(time)"
+    }
+}
+
+/// One deterministic spoken contract for staged attachments. The chip owns
+/// the filename and size while its destructive child names the exact file it
+/// removes; focus routing never depends on a row index after the mutation.
+enum AcpAttachmentAccessibility {
+    enum FocusDestination: Equatable {
+        case removalButton(id: String)
+        case attachmentControl
+    }
+
+    static func chipLabel(name: String) -> String {
+        "Attachment \(name)"
+    }
+
+    static func chipValue(byteSize: Int) -> String {
+        "Size \(ByteCountFormatter.string(fromByteCount: Int64(byteSize), countStyle: .file))"
+    }
+
+    static func removalLabel(name: String) -> String {
+        "Remove attachment \(name)"
+    }
+
+    static func removalAnnouncement(name: String) -> String {
+        "Removed attachment \(name)"
+    }
+
+    static func focusDestination(removing id: String, orderedIDs: [String]) -> FocusDestination {
+        guard let index = orderedIDs.firstIndex(of: id),
+              orderedIDs.indices.contains(index + 1) else {
+            return .attachmentControl
+        }
+        return .removalButton(id: orderedIDs[index + 1])
+    }
+}
+
 /// The ACP conversation surface: streaming messages, thinking blocks,
 /// tool-call cards, a plan, a live permission prompt, model picker, usage, and
 /// a composer. Mirrors the Electron Assistant transcript.
@@ -26,6 +79,10 @@ struct AcpChatView: View {
     @State private var hasUnseenTranscriptUpdates = false
     @State private var transcriptConversationID: ObjectIdentifier?
     @FocusState private var composerFocused: Bool
+    @FocusState private var focusedAttachmentRemovalID: String?
+    @AccessibilityFocusState private var accessibilityFocusedAttachmentRemovalID: String?
+    @FocusState private var attachmentControlFocused: Bool
+    @AccessibilityFocusState private var attachmentControlAccessibilityFocused: Bool
     private let focusRequestGeneration: UInt64?
     private let onKeyboardFocus: (() -> Void)?
 
@@ -164,15 +221,27 @@ struct AcpChatView: View {
             Menu {
                 Text("Restore the working tree to before a turn:")
                 ForEach(conversation.checkpoints.reversed()) { checkpoint in
-                    Button("Turn \(checkpoint.turn) — \(checkpoint.at.formatted(date: .omitted, time: .shortened))") {
+                    let time = checkpoint.at.formatted(date: .omitted, time: .shortened)
+                    Button("Turn \(checkpoint.turn) — \(time)") {
                         restoreTarget = checkpoint
                     }
+                    .accessibilityLabel(CheckpointMenuAccessibility.choiceLabel(
+                        turn: checkpoint.turn,
+                        time: time
+                    ))
+                    .accessibilityHint(CheckpointMenuAccessibility.choiceHint)
                 }
             } label: {
                 Image(systemName: "clock.arrow.circlepath")
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .accessibilityLabel(CheckpointMenuAccessibility.label)
+            .accessibilityValue(CheckpointMenuAccessibility.value(
+                checkpointCount: conversation.checkpoints.count
+            ))
+            .accessibilityHint(CheckpointMenuAccessibility.hint)
+            .accessibilityIdentifier(CheckpointMenuAccessibility.identifier)
             .help("Pre-turn checkpoints (git snapshots)")
             .confirmationDialog(
                 "Restore checkpoint?",
@@ -394,6 +463,8 @@ struct AcpChatView: View {
                 conversation: conversation,
                 draft: $draft,
                 focused: $composerFocused,
+                attachmentFocused: $attachmentControlFocused,
+                attachmentAccessibilityFocused: $attachmentControlAccessibilityFocused,
                 isNewConversation: showsEmptyState,
                 send: sendDraft,
                 onKeyboardFocus: onKeyboardFocus
@@ -457,16 +528,34 @@ struct AcpChatView: View {
                         Text(byteLabel(attachment.byteSize))
                             .font(.caption2).foregroundStyle(.kaisolaSecondary)
                         Button {
-                            conversation.removeAttachment(attachment.id)
+                            removeAttachment(attachment)
                         } label: {
                             Image(systemName: "xmark.circle.fill").font(.caption2)
                         }
                         .buttonStyle(.borderless)
                         .foregroundStyle(.kaisolaSecondary)
                         .help("Remove this attachment")
+                        .accessibilityLabel(
+                            AcpAttachmentAccessibility.removalLabel(name: attachment.name)
+                        )
+                        .accessibilityIdentifier("acp.attachment.remove.\(attachment.id)")
+                        .accessibilityFocused(
+                            $accessibilityFocusedAttachmentRemovalID,
+                            equals: attachment.id
+                        )
+                        .focusable()
+                        .focused($focusedAttachmentRemovalID, equals: attachment.id)
                     }
                     .padding(.horizontal, 8).padding(.vertical, 4)
                     .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel(
+                        AcpAttachmentAccessibility.chipLabel(name: attachment.name)
+                    )
+                    .accessibilityValue(
+                        AcpAttachmentAccessibility.chipValue(byteSize: attachment.byteSize)
+                    )
+                    .accessibilityIdentifier("acp.attachment.\(attachment.id)")
                 }
             }
             .padding(.horizontal, 2)
@@ -478,6 +567,46 @@ struct AcpChatView: View {
 
     private func byteLabel(_ bytes: Int) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    private func removeAttachment(_ attachment: AcpConversation.PendingAttachment) {
+        let focusDestination = AcpAttachmentAccessibility.focusDestination(
+            removing: attachment.id,
+            orderedIDs: conversation.pendingAttachments.map(\.id)
+        )
+        conversation.removeAttachment(attachment.id)
+        let announcement = AcpAttachmentAccessibility.removalAnnouncement(name: attachment.name)
+
+        // Wait until SwiftUI has removed the chip before assigning accessibility
+        // focus, otherwise the disappearing button can consume the request.
+        DispatchQueue.main.async {
+            switch focusDestination {
+            case .removalButton(let id):
+                attachmentControlFocused = false
+                attachmentControlAccessibilityFocused = false
+                focusedAttachmentRemovalID = id
+                accessibilityFocusedAttachmentRemovalID = id
+            case .attachmentControl:
+                focusedAttachmentRemovalID = nil
+                accessibilityFocusedAttachmentRemovalID = nil
+                // Removing the last chip also removes the strip that precedes
+                // the composer, which rebuilds the native menu control. Assign
+                // its focus on the following turn so the new control, rather
+                // than the disappearing hierarchy, consumes the request.
+                DispatchQueue.main.async {
+                    attachmentControlFocused = true
+                    attachmentControlAccessibilityFocused = true
+                }
+            }
+            NSAccessibility.post(
+                element: NSApplication.shared,
+                notification: .announcementRequested,
+                userInfo: [
+                    .announcement: announcement,
+                    .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+                ]
+            )
+        }
     }
 
     /// Stage files dropped onto the composer.
@@ -622,6 +751,66 @@ enum AcpChatRendering {
     }
 }
 
+struct ToolCallDensityPresentation: Equatable, Sendable {
+    let call: AcpToolCall
+    let density: ToolCallDensity
+
+    var statusLabel: String {
+        switch call.status {
+        case .pending: "Pending"
+        case .inProgress: "In progress"
+        case .completed: "Completed"
+        case .failed: "Failed"
+        }
+    }
+
+    var affectedFiles: [String] { call.declaredFilePaths }
+    var artifactCount: Int { call.content.count }
+    var hasExpandableContent: Bool { artifactCount > 0 }
+
+    var visibleDetailLevel: Int {
+        switch density {
+        case .compact: 1
+        case .balanced: 2
+        case .detailed: 3
+        }
+    }
+
+    var showsArtifactSummary: Bool { density != .compact }
+    var wrapsAffectedFiles: Bool { density == .detailed }
+    var expandsArtifactsByDefault: Bool { false }
+
+    var accessibilityOrder: [String] {
+        [
+            statusLabel,
+            call.title,
+            call.kind,
+            affectedFiles.isEmpty
+                ? "No affected files"
+                : "Affected files: \(affectedFiles.joined(separator: ", "))",
+            artifactCount == 1
+                ? "1 expandable artifact"
+                : "\(artifactCount) expandable artifacts",
+        ]
+    }
+
+    var cardSpacing: CGFloat {
+        switch density {
+        case .compact: 4
+        case .balanced: 8
+        case .detailed: 10
+        }
+    }
+
+    var cardPadding: CGFloat {
+        switch density {
+        case .compact: 6
+        case .balanced: 9
+        case .detailed: 12
+        }
+    }
+}
+
 struct TranscriptRowView: View {
     let row: AcpTranscriptRow
     var workspaceURL: URL?
@@ -711,41 +900,102 @@ struct TranscriptRowView: View {
     }
 }
 
+/// One spoken contract for the tool header. The visible row contains a status
+/// symbol, title, disclosure chevron, and kind; exposing those children
+/// separately made the symbol-derived button name opaque and left status
+/// changes silent. Keep the description bounded to metadata already visible in
+/// the row — artifact contents may contain sensitive output and are available
+/// only after the user opens the disclosure.
+struct ToolCallAccessibility: Equatable {
+    let label: String
+    let value: String
+    let actionName: String?
+    let identifier: String
+
+    init(call: AcpToolCall, expanded: Bool) {
+        let artifactCount = call.content.count
+        let artifactLabel = "\(artifactCount) artifact\(artifactCount == 1 ? "" : "s")"
+        let statusLabel: String
+        switch call.status {
+        case .pending: statusLabel = "Pending"
+        case .inProgress: statusLabel = "In progress"
+        case .completed: statusLabel = "Completed"
+        case .failed: statusLabel = "Failed"
+        }
+
+        if artifactCount > 0 {
+            let disclosureLabel = expanded ? "Hide details" : "Show details"
+            label = "\(disclosureLabel) for \(call.title)"
+            value = "\(call.kind) tool, \(statusLabel), \(artifactLabel), \(expanded ? "Expanded" : "Collapsed")"
+            actionName = disclosureLabel
+        } else {
+            label = call.title
+            value = "\(call.kind) tool, \(statusLabel), \(artifactLabel)"
+            actionName = nil
+        }
+        identifier = "acp.tool.\(call.id)"
+    }
+}
+
 struct ToolCallCard: View {
     let call: AcpToolCall
     var workspaceURL: URL?
     var terminalSnapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
+    @ObservedObject private var settings = NativePreviewSettings.shared
     @State private var expanded = false
 
-    private var hasArtifacts: Bool { !call.content.isEmpty }
+    private var density: ToolCallDensity { settings.toolCallDensity }
+    private var presentation: ToolCallDensityPresentation {
+        ToolCallDensityPresentation(call: call, density: density)
+    }
+    private var hasArtifacts: Bool { presentation.hasExpandableContent }
+    private var accessibility: ToolCallAccessibility {
+        ToolCallAccessibility(call: call, expanded: expanded)
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button {
-                if hasArtifacts { expanded.toggle() }
-            } label: {
-                HStack(spacing: 9) {
-                    Image(systemName: statusSymbol)
-                        .foregroundStyle(statusColor)
-                    Text(call.title).lineLimit(1)
-                    Spacer()
-                    if hasArtifacts {
-                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                            .font(.caption2).foregroundStyle(.kaisolaSecondary)
-                    }
-                    Text(call.kind).font(.caption).foregroundStyle(.kaisolaSecondary)
+        VStack(alignment: .leading, spacing: presentation.cardSpacing) {
+            if hasArtifacts {
+                Button {
+                    expanded.toggle()
+                } label: {
+                    header
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(accessibility.label)
+                .accessibilityValue(accessibility.value)
+                .accessibilityIdentifier(accessibility.identifier)
+                .accessibilityAddTraits([.isButton, .updatesFrequently])
+            } else {
+                header
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(accessibility.label)
+                    .accessibilityValue(accessibility.value)
+                    .accessibilityIdentifier(accessibility.identifier)
+                    .accessibilityAddTraits(.updatesFrequently)
             }
-            .buttonStyle(.plain)
-            .disabled(!hasArtifacts)
 
-            if !call.locations.isEmpty {
+            if !presentation.affectedFiles.isEmpty {
                 Text(AcpTranscriptInlineRendering.attributed(
-                    call.locations.joined(separator: ", "),
+                    presentation.affectedFiles.joined(separator: ", "),
                     workspaceURL: workspaceURL
                 ))
-                    .font(.caption).foregroundStyle(.kaisolaSecondary).lineLimit(1)
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .lineLimit(presentation.wrapsAffectedFiles ? nil : 1)
+                    .accessibilityLabel(presentation.accessibilityOrder[3])
+            }
+
+            if presentation.showsArtifactSummary, presentation.hasExpandableContent {
+                Text(
+                    presentation.artifactCount == 1
+                        ? "1 artifact"
+                        : "\(presentation.artifactCount) artifacts"
+                )
+                .font(.caption2)
+                .foregroundStyle(.kaisolaSecondary)
+                .accessibilityLabel(presentation.accessibilityOrder[4])
             }
 
             if expanded {
@@ -761,11 +1011,31 @@ struct ToolCallCard: View {
                 }
             }
         }
-        .padding(9)
+        .padding(presentation.cardPadding)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
         .environment(\.openURL, OpenURLAction { link in
             AcpTranscriptLinkRouting.open(link, workspaceURL: workspaceURL)
         })
+    }
+
+    private var header: some View {
+        HStack(spacing: density == .compact ? 6 : 9) {
+            Image(systemName: statusSymbol)
+                .foregroundStyle(statusColor)
+                .accessibilityHidden(true)
+            Text(presentation.statusLabel)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(statusColor)
+            Text(call.title)
+                .lineLimit(density == .detailed ? 2 : 1)
+            Spacer()
+            if hasArtifacts {
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2).foregroundStyle(.kaisolaSecondary)
+            }
+            Text(call.kind).font(.caption).foregroundStyle(.kaisolaSecondary)
+        }
+        .contentShape(Rectangle())
     }
 
     private var statusSymbol: String {

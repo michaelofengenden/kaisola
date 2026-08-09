@@ -228,6 +228,45 @@ final class AcpAttachmentsTests: XCTestCase {
         XCTAssertTrue(conversation.pendingAttachments.isEmpty)
     }
 
+    func testAttachmentAccessibilityNamesChipSizeRemovalAndAnnouncement() {
+        XCTAssertEqual(
+            AcpAttachmentAccessibility.chipLabel(name: "field notes.txt"),
+            "Attachment field notes.txt"
+        )
+        XCTAssertEqual(
+            AcpAttachmentAccessibility.chipValue(byteSize: 1_536),
+            "Size 2 KB"
+        )
+        XCTAssertEqual(
+            AcpAttachmentAccessibility.removalLabel(name: "field notes.txt"),
+            "Remove attachment field notes.txt"
+        )
+        XCTAssertEqual(
+            AcpAttachmentAccessibility.removalAnnouncement(name: "field notes.txt"),
+            "Removed attachment field notes.txt"
+        )
+    }
+
+    func testAttachmentRemovalFocusMovesToNextChipOrAttachmentControl() {
+        let ids = ["att1", "att2", "att3"]
+        XCTAssertEqual(
+            AcpAttachmentAccessibility.focusDestination(removing: "att1", orderedIDs: ids),
+            .removalButton(id: "att2")
+        )
+        XCTAssertEqual(
+            AcpAttachmentAccessibility.focusDestination(removing: "att2", orderedIDs: ids),
+            .removalButton(id: "att3")
+        )
+        XCTAssertEqual(
+            AcpAttachmentAccessibility.focusDestination(removing: "att3", orderedIDs: ids),
+            .attachmentControl
+        )
+        XCTAssertEqual(
+            AcpAttachmentAccessibility.focusDestination(removing: "stale", orderedIDs: ids),
+            .attachmentControl
+        )
+    }
+
     @MainActor
     func testPendingAttachmentsHaveAnAggregateCountLimit() {
         let conversation = makeConversation()

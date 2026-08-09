@@ -647,8 +647,12 @@ private struct JsonNodeRow: View {
 /// preview keeps project scripts off by default, but an empty app shell should
 /// explain that choice instead of presenting a mysterious blank pane.
 enum HTMLPreviewReadiness {
+    nonisolated static func containsJavaScript(_ source: String) -> Bool {
+        contains(source, pattern: #"<script\b"#)
+    }
+
     nonisolated static func requiresJavaScriptPrompt(_ source: String) -> Bool {
-        guard contains(source, pattern: #"<script\b"#) else { return false }
+        guard containsJavaScript(source) else { return false }
 
         let body = firstCapture(
             in: source,
@@ -764,19 +768,54 @@ struct HTMLScriptApproval: Equatable {
     }
 }
 
-/// One pass over the HTML source: whether the page needs the script prompt,
-/// and the fingerprint that pins a grant to these exact bytes. Both ride the
-/// same cache entry so neither hashes a megabyte on the main actor.
+/// Cached preparation of the HTML source: whether it contains scripts,
+/// whether its blank shell needs the automatic review, and the fingerprint
+/// that pins a grant to these exact bytes. All work stays off the main actor
+/// and is reused for identical content.
 struct HTMLPreviewPreparation: Equatable, Sendable {
+    let containsJavaScript: Bool
     let requiresJavaScriptPrompt: Bool
     let fingerprint: String
 
     nonisolated static func make(_ source: String) -> HTMLPreviewPreparation {
         HTMLPreviewPreparation(
+            containsJavaScript: HTMLPreviewReadiness.containsJavaScript(source),
             requiresJavaScriptPrompt: HTMLPreviewReadiness.requiresJavaScriptPrompt(source),
             fingerprint: HTMLScriptApproval.fingerprint(source)
         )
     }
+}
+
+/// Keeps JavaScript-disabled affordances exhaustive without conflating two
+/// different jobs: blank-shell detection may open the review automatically,
+/// while a page that already renders static content still keeps a persistent
+/// route into that same security review.
+struct HTMLJavaScriptDisabledPresentation: Equatable, Sendable {
+    let containsJavaScript: Bool
+    let requiresAutomaticReview: Bool
+
+    init(containsJavaScript: Bool, requiresAutomaticReview: Bool) {
+        self.containsJavaScript = containsJavaScript
+        self.requiresAutomaticReview = requiresAutomaticReview
+    }
+
+    init(preparation: HTMLPreviewPreparation) {
+        self.init(
+            containsJavaScript: preparation.containsJavaScript,
+            requiresAutomaticReview: preparation.requiresJavaScriptPrompt
+        )
+    }
+
+    var showsAutomaticReview: Bool {
+        containsJavaScript && requiresAutomaticReview
+    }
+
+    var showsCompactIndicator: Bool {
+        containsJavaScript && !requiresAutomaticReview
+    }
+
+    var indicatorTitle: String { "JavaScript is off" }
+    var reviewActionTitle: String { "Review and Allow…" }
 }
 
 /// User-facing disclosure derived from the same effective local-file boundary
@@ -875,6 +914,7 @@ struct HtmlFilePreview: View {
     let contentRevision: Int
 
     @State private var preparationCache = PreviewParseCache<HTMLPreviewPreparation>()
+    @State private var containsJavaScript = false
     @State private var requiresJavaScriptPrompt = false
     @State private var preparedIdentity: PreviewParseIdentity?
     @State private var reloadToken = 0
@@ -891,6 +931,13 @@ struct HtmlFilePreview: View {
 
     private var javaScriptSecurityScope: HTMLJavaScriptSecurityScope {
         HTMLJavaScriptSecurityScope(fileURL: fileURL, readAccessRoot: readAccessRoot)
+    }
+
+    private var javaScriptDisabledPresentation: HTMLJavaScriptDisabledPresentation {
+        HTMLJavaScriptDisabledPresentation(
+            containsJavaScript: containsJavaScript,
+            requiresAutomaticReview: requiresJavaScriptPrompt
+        )
     }
 
     var body: some View {
@@ -931,13 +978,14 @@ struct HtmlFilePreview: View {
                 }
             }
 
-            if !allowsJavaScript, requiresJavaScriptPrompt || showsJavaScriptReview {
+            if !allowsJavaScript,
+               javaScriptDisabledPresentation.showsAutomaticReview || showsJavaScriptReview {
                 VStack(spacing: 10) {
                     Image(systemName: "curlybraces.square")
                         .font(.system(size: 23, weight: .medium))
                         .foregroundStyle(Color.accentColor)
                         .accessibilityHidden(true)
-                    Text(requiresJavaScriptPrompt
+                    Text(javaScriptDisabledPresentation.showsAutomaticReview
                         ? "This page needs JavaScript"
                         : "Review JavaScript Access")
                         .font(.headline)
@@ -955,7 +1003,8 @@ struct HtmlFilePreview: View {
                         }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction)
-                        if showsJavaScriptReview, !requiresJavaScriptPrompt {
+                        if showsJavaScriptReview,
+                           !javaScriptDisabledPresentation.showsAutomaticReview {
                             Button("Cancel") { showsJavaScriptReview = false }
                                 .buttonStyle(.bordered)
                                 .keyboardShortcut(.cancelAction)
@@ -968,6 +1017,14 @@ struct HtmlFilePreview: View {
                 .padding(22)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(.regularMaterial)
+            }
+
+            if !allowsJavaScript,
+               javaScriptDisabledPresentation.showsCompactIndicator,
+               !showsJavaScriptReview {
+                javaScriptDisabledBanner
+                    .padding(8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
             }
 
             if allowsJavaScript {
@@ -1023,10 +1080,33 @@ struct HtmlFilePreview: View {
                 parse: HTMLPreviewPreparation.make
             )
             guard !Task.isCancelled else { return }
+            containsJavaScript = preparation.containsJavaScript
             requiresJavaScriptPrompt = preparation.requiresJavaScriptPrompt
             scriptApproval.adopt(identity: identity, fingerprint: preparation.fingerprint)
             preparedIdentity = identity
         }
+    }
+
+    private var javaScriptDisabledBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "curlybraces.square")
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            Text(javaScriptDisabledPresentation.indicatorTitle)
+                .font(.caption.weight(.medium))
+            Button(javaScriptDisabledPresentation.reviewActionTitle) {
+                showsJavaScriptReview = true
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityHint("Reviews the security scope before allowing project scripts")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.10)))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("html-preview.javascript-disabled")
     }
 
     private var javaScriptEnabledBanner: some View {

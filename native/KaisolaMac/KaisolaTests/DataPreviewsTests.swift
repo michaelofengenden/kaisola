@@ -368,6 +368,13 @@ final class DataPreviewsTests: XCTestCase {
     private static let benignHTML = "<html><body><p>Weekly report</p></body></html>"
     private static let scriptedHTML =
         "<html><body><div id=\"root\"></div><script>exfiltrate()</script></body></html>"
+    private static let staticShellHTML = """
+        <html><body>
+          <p>Loading weekly report…</p>
+          <div id="root"></div>
+          <SCRIPT src="report.js"></SCRIPT>
+        </body></html>
+        """
 
     private func htmlIdentity(
         path: String = "/project/report.html",
@@ -501,17 +508,57 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertFalse(approval.allowsJavaScript(for: reloaded))
     }
 
-    func testHtmlPreviewPreparationCarriesReadinessAndFingerprintFromOnePass() async {
+    func testHtmlPreviewPreparationCarriesScriptPresenceReadinessAndFingerprintFromOneCachedPreparation() async {
         let cache = PreviewParseCache<HTMLPreviewPreparation>()
         _ = await cache.value(for: Self.scriptedHTML, parse: HTMLPreviewPreparation.make)
         let preparation = await cache.value(for: Self.scriptedHTML, parse: HTMLPreviewPreparation.make)
         let parseCount = await cache.parseCount
 
         XCTAssertEqual(parseCount, 1)
+        XCTAssertTrue(preparation.containsJavaScript)
         XCTAssertTrue(preparation.requiresJavaScriptPrompt)
         XCTAssertEqual(preparation.fingerprint, HTMLScriptApproval.fingerprint(Self.scriptedHTML))
         XCTAssertNotEqual(preparation.fingerprint, HTMLScriptApproval.fingerprint(Self.benignHTML))
-        XCTAssertFalse(HTMLPreviewPreparation.make(Self.benignHTML).requiresJavaScriptPrompt)
+        let benign = HTMLPreviewPreparation.make(Self.benignHTML)
+        XCTAssertFalse(benign.containsJavaScript)
+        XCTAssertFalse(benign.requiresJavaScriptPrompt)
+    }
+
+    func testStaticShellWithScriptsKeepsJavaScriptDisabledActionDiscoverable() {
+        let preparation = HTMLPreviewPreparation.make(Self.staticShellHTML)
+        let presentation = HTMLJavaScriptDisabledPresentation(preparation: preparation)
+
+        XCTAssertTrue(preparation.containsJavaScript)
+        XCTAssertFalse(preparation.requiresJavaScriptPrompt)
+        XCTAssertFalse(presentation.showsAutomaticReview)
+        XCTAssertTrue(presentation.showsCompactIndicator)
+        XCTAssertEqual(presentation.indicatorTitle, "JavaScript is off")
+        XCTAssertEqual(presentation.reviewActionTitle, "Review and Allow…")
+    }
+
+    func testEveryScriptBearingDocumentGetsAnAutomaticReviewOrCompactIndicator() {
+        let fixtures = [
+            Self.scriptedHTML,
+            Self.staticShellHTML,
+            "<html><body><svg></svg><script type=\"module\">boot()</script></body></html>",
+        ]
+
+        for source in fixtures {
+            let presentation = HTMLJavaScriptDisabledPresentation(
+                preparation: HTMLPreviewPreparation.make(source)
+            )
+            XCTAssertNotEqual(
+                presentation.showsAutomaticReview,
+                presentation.showsCompactIndicator,
+                "every script-bearing fixture must have exactly one discoverable route"
+            )
+        }
+
+        let benign = HTMLJavaScriptDisabledPresentation(
+            preparation: HTMLPreviewPreparation.make(Self.benignHTML)
+        )
+        XCTAssertFalse(benign.showsAutomaticReview)
+        XCTAssertFalse(benign.showsCompactIndicator)
     }
 
     func testHtmlJavaScriptSecurityScopeExplainsEveryCapabilityBeforeApproval() {

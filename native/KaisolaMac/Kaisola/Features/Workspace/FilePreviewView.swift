@@ -107,7 +107,10 @@ struct FilePreviewView: View {
     @State private var autosavePendingAction = false
     @State private var showUnsavedPrompt = false
     @State private var showExternalChangePrompt = false
-    @State private var externalChangeDetected = false
+    /// Collapsible, never dismissible: the banner can fold into a header
+    /// indicator, but only reloading, saving through the conflict decision, or
+    /// discarding the draft clears the conflict.
+    @State private var conflict = FilePreviewConflictState()
     @State private var isLoading = false
     @State private var isSaving = false
     @State private var loadTask: Task<Void, Never>?
@@ -158,7 +161,7 @@ struct FilePreviewView: View {
                 noticeBanner(previewNotice)
                 Divider()
             }
-            if externalChangeDetected {
+            if conflict.showsBanner {
                 externalChangeBanner
                 Divider()
             }
@@ -196,7 +199,7 @@ struct FilePreviewView: View {
                 isDirty: isDirty,
                 isMarkdown: isMarkdownContent,
                 isSaving: isSaving,
-                hasExternalConflict: externalChangeDetected || showExternalChangePrompt
+                hasExternalConflict: conflict.isActive || showExternalChangePrompt
             ) {
             case .navigate:
                 beginLoad(newURL)
@@ -300,6 +303,7 @@ struct FilePreviewView: View {
                 draft = savedText
                 richDraft = savedRichText
                 recoveredDraftPending = false
+                conflict.apply(.draftDiscarded)
                 completePendingAction()
             }
             Button("Cancel", role: .cancel) {
@@ -385,14 +389,17 @@ struct FilePreviewView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+            // Collapsing folds the banner into the header indicator. There is
+            // deliberately no dismissal: the conflict outlives the banner.
             Button {
-                externalChangeDetected = false
+                conflict.apply(.collapseRequested)
             } label: {
-                Image(systemName: "xmark")
+                Image(systemName: "chevron.up")
             }
             .buttonStyle(.borderless)
-            .help("Dismiss change notice")
-            .accessibilityLabel("Dismiss changed-on-disk notice")
+            .help("Collapse to a compact conflict indicator")
+            .accessibilityLabel("Collapse changed-on-disk notice")
+            .accessibilityIdentifier("preview.conflictCollapse")
         }
         .padding(.horizontal, 11)
         .frame(minHeight: 32)
@@ -441,18 +448,14 @@ struct FilePreviewView: View {
               FilePreviewDiskState.changed(onDisk: loadedURL, since: loadedModificationDate) else {
             return
         }
-        if isDirty {
-            externalChangeDetected = true
-        } else {
-            externalChangeDetected = false
-            beginLoad(loadedURL)
-        }
+        conflict.apply(.detectedExternalChange(isDirty: isDirty))
+        if !isDirty { beginLoad(loadedURL) }
     }
 
     private func reloadExternalVersion() {
         guard let loadedURL else { return }
         guard clearRecoveryTokens(for: loadedURL) else { return }
-        externalChangeDetected = false
+        conflict.apply(.reloaded)
         recoveredDraftPending = false
         beginLoad(loadedURL)
     }
@@ -479,14 +482,34 @@ struct FilePreviewView: View {
             } else if case .html = content {
                 editModeButton(help: "Edit HTML source")
             }
+            if conflict.showsCompactIndicator {
+                Button {
+                    conflict.apply(.expandRequested)
+                } label: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                }
+                .buttonStyle(.borderless)
+                .help("Changed on disk — show reload options")
+                .accessibilityLabel("Changed on disk, show reload options")
+                .accessibilityIdentifier("preview.conflictIndicator")
+            }
             if isEditable {
                 Button { save() } label: {
                     Image(systemName: "square.and.arrow.down")
+                        // Tinted only under a conflict; otherwise the control
+                        // keeps the header's ordinary borderless styling.
+                        .foregroundStyle(
+                            conflict.isActive
+                                ? AnyShapeStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                                : AnyShapeStyle(.foreground)
+                        )
                 }
                 .buttonStyle(.borderless)
                 .keyboardShortcut("s", modifiers: .command)
                 .disabled(!isDirty || isLoading || isSaving)
-                .help("Save")
+                .help(conflict.saveHelpText)
+                .accessibilityLabel(conflict.saveAccessibilityLabel)
             }
             previewOptionsMenu
             Button {
@@ -718,6 +741,13 @@ struct FilePreviewView: View {
             if isEditable {
                 Divider()
                 Button("Revert Changes") {
+                    // Under an unresolved conflict the saved file is the newer
+                    // disk version, so reverting takes that rather than leaving
+                    // a stale buffer behind an indicator that just cleared.
+                    guard !conflict.isActive else {
+                        reloadExternalVersion()
+                        return
+                    }
                     if let loadedURL, !clearRecoveryTokens(for: loadedURL) { return }
                     if case .docx = content { richDraft = savedRichText }
                     else { draft = savedText }
@@ -988,7 +1018,7 @@ struct FilePreviewView: View {
         outlineItems = []
         outlineTargetLine = nil
         outlineNavigationRevision &+= 1
-        externalChangeDetected = false
+        conflict.apply(.documentLoaded)
         recoveredDraftPending = false
         ownedRecoveryToken = nil
         claimedRecoverySourceTokens = []
@@ -1346,6 +1376,10 @@ struct FilePreviewView: View {
             case let .saved(modificationDate):
                 loadedModificationDate = modificationDate
                 recoveredDraftPending = false
+                // The write either found the file untouched or came back
+                // through the reload/overwrite decision, so the draft and the
+                // file agree again.
+                conflict.apply(.savedThroughConflictDecision)
                 if savingRichDocument { savedRichText = richSnapshot.value }
                 else { savedText = textSnapshot }
                 guard clearRecoveryTokens(for: target) else {
@@ -1728,6 +1762,7 @@ struct FilePreviewView: View {
         switch result {
         case let .saved(modificationDate):
             recoveredDraftPending = false
+            conflict.apply(.savedThroughConflictDecision)
             if savingRichDocument { savedRichText = richSnapshot }
             else { savedText = textSnapshot }
             loadedModificationDate = modificationDate

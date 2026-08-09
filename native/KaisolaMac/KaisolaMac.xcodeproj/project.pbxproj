@@ -58,6 +58,10 @@
 		2B0106FB232612C7046A680A /* CodeEditorViewTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B7E991B45873080FAD43C47 /* CodeEditorViewTests.swift */; };
 		2BF9CEBCA7CFB95452D31EFD /* CompanionIdentityStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AF176037F884FCA78D3646F /* CompanionIdentityStore.swift */; };
 		2D4F3E75A2BD0372C6732DC0 /* NativeTerminalSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = E66C339455BFF598A81C41DE /* NativeTerminalSurface.swift */; };
+		A31900000000000000000001 /* NativeTerminalCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = B31900000000000000000001 /* NativeTerminalCoordinator.swift */; };
+		A31900000000000000000002 /* TerminalInputPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = B31900000000000000000002 /* TerminalInputPolicy.swift */; };
+		A31900000000000000000003 /* TerminalSemantics.swift in Sources */ = {isa = PBXBuildFile; fileRef = B31900000000000000000003 /* TerminalSemantics.swift */; };
+		A31900000000000000000004 /* TerminalAccessibilityAdapter.swift in Sources */ = {isa = PBXBuildFile; fileRef = B31900000000000000000004 /* TerminalAccessibilityAdapter.swift */; };
 		2D548448B8258638948FF620 /* AcpTranscriptStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = E0BA874BD9613768958ED354 /* AcpTranscriptStore.swift */; };
 		2D87B2E1CE804065E07728CC /* RememberedSessionCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8A8DBF7E5E633D17ADDE128 /* RememberedSessionCatalog.swift */; };
 		2DDDCA865F413721721D800C /* ApiKeyStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5661F60153A30E55C8217B2A /* ApiKeyStoreTests.swift */; };
@@ -608,6 +612,10 @@
 		E438E95AD251C6069A846859 /* CompanionTerminalControlTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionTerminalControlTests.swift; sourceTree = "<group>"; };
 		E49280DD117D97BF6CBB23B5 /* GitRefreshPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitRefreshPolicy.swift; sourceTree = "<group>"; };
 		E66C339455BFF598A81C41DE /* NativeTerminalSurface.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalSurface.swift; sourceTree = "<group>"; };
+		B31900000000000000000001 /* NativeTerminalCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeTerminalCoordinator.swift; sourceTree = "<group>"; };
+		B31900000000000000000002 /* TerminalInputPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalInputPolicy.swift; sourceTree = "<group>"; };
+		B31900000000000000000003 /* TerminalSemantics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSemantics.swift; sourceTree = "<group>"; };
+		B31900000000000000000004 /* TerminalAccessibilityAdapter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalAccessibilityAdapter.swift; sourceTree = "<group>"; };
 		E7C5B0168DF6FF4903C2AD34 /* editor.bundle.js */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.javascript; path = editor.bundle.js; sourceTree = "<group>"; };
 		E871B07C959F4B3AA9233CFE /* QuietSessionStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuietSessionStatus.swift; sourceTree = "<group>"; };
 		E9BB2E9EA7403C1040B07AB9 /* TerminalTheme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalTheme.swift; sourceTree = "<group>"; };
@@ -839,6 +847,7 @@
 				A14E04EB9F13D5A9D6834430 /* AttentionInboxModel.swift */,
 				0947C7DA82513DC2C0D20226 /* CustomThemeStore.swift */,
 				055F15AB1B998161AD252189 /* DetailShowDoors.swift */,
+				B31900000000000000000001 /* NativeTerminalCoordinator.swift */,
 				E66C339455BFF598A81C41DE /* NativeTerminalSurface.swift */,
 				9BBE0412CE376DD5EA36FC81 /* ProjectTabStripView.swift */,
 				DD0520C7CA820BC9B9798C98 /* ProjectTint.swift */,
@@ -853,6 +862,9 @@
 				1D546C26BAA99A03D0E76CA7 /* SessionPaneLayout.swift */,
 				2D21E5A80D0B8BA9622A84FE /* SessionTitleTracker.swift */,
 				13BFA68C0E2E3E83379B2835 /* TerminalDocument.swift */,
+				B31900000000000000000004 /* TerminalAccessibilityAdapter.swift */,
+				B31900000000000000000002 /* TerminalInputPolicy.swift */,
+				B31900000000000000000003 /* TerminalSemantics.swift */,
 				48B188286E91EA94C628221F /* TerminalFileLinkResolver.swift */,
 				00599FEEB522F6C880664E5E /* TerminalFontOptions.swift */,
 				678CF5145359C73DCF6F759F /* TerminalImageDrop.swift */,
@@ -1425,6 +1437,10 @@
 				D8684CF2B2E76859A488B89C /* NativeSessionStore+AutoTitle.swift in Sources */,
 				A6466707F079FD97BD9432B1 /* NativeSessionStore.swift in Sources */,
 				2D4F3E75A2BD0372C6732DC0 /* NativeTerminalSurface.swift in Sources */,
+				A31900000000000000000001 /* NativeTerminalCoordinator.swift in Sources */,
+				A31900000000000000000004 /* TerminalAccessibilityAdapter.swift in Sources */,
+				A31900000000000000000002 /* TerminalInputPolicy.swift in Sources */,
+				A31900000000000000000003 /* TerminalSemantics.swift in Sources */,
 				3A3057A403EEDE75E24FCFE6 /* NativeUpdateConfiguration.swift in Sources */,
 				BA2BA718F195BAADA3415BA8 /* NativeUpdateController.swift in Sources */,
 				D067393E0B5AB8131238FAC4 /* NotificationBridge.swift in Sources */,

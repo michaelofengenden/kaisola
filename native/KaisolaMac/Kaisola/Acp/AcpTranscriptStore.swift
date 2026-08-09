@@ -422,19 +422,31 @@ actor AcpTranscriptStore {
         return found
     }
 
-    /// Tombstones whose chat rows are fully gone can drain — run once per
-    /// open; keeps the table from growing forever without ever weakening the
-    /// guarantee while references remain.
+    /// Resume any deletion interrupted after its durable tombstone commit,
+    /// then drain tombstones whose chat rows are fully gone. Both statements
+    /// share one transaction so a failed launch cleanup retains the fence for
+    /// the next retry instead of stranding transcript bytes without intent.
     func vacuumTombstones() {
         guard let database = try? openDatabase(),
               tableExists("deleted_chats", database: database) else { return }
-        try? execute(
-            """
-            DELETE FROM deleted_chats
-            WHERE chat_id NOT IN (SELECT chat_id FROM chats)
-            """,
-            database: database
-        )
+        try? transaction(database) {
+            // `transcript_rows` follows through its ON DELETE CASCADE. This is
+            // the idempotent restart path for a crash before remove(chatID:).
+            try execute(
+                """
+                DELETE FROM chats
+                WHERE chat_id IN (SELECT chat_id FROM deleted_chats)
+                """,
+                database: database
+            )
+            try execute(
+                """
+                DELETE FROM deleted_chats
+                WHERE chat_id NOT IN (SELECT chat_id FROM chats)
+                """,
+                database: database
+            )
+        }
     }
 
     private func tableExists(_ name: String, database: SQLiteHandle) -> Bool {

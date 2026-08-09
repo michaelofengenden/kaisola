@@ -8,6 +8,68 @@ import XCTest
 /// ProjectFiles (tree listing + bounded enumeration) and FilePreviewContent
 /// (what a file renders as) — the workspace rail's foundations.
 final class WorkspaceFilesTests: XCTestCase {
+    func testEditorModeControlsSpeakTheirActionAndCurrentToggleValue() {
+        let cases: [(FilePreviewEditorControlAccessibility.Kind, Bool, String, String)] = [
+            (.markdown, false, "Edit Markdown source", "Markdown preview shown"),
+            (.markdown, true, "Show Markdown preview", "Markdown source editor shown"),
+            (.text, false, "Edit text", "Text preview shown"),
+            (.text, true, "Show text preview", "Text editor shown"),
+            (.html, false, "Edit HTML source", "HTML preview shown"),
+            (.html, true, "Show HTML preview", "HTML source editor shown"),
+        ]
+
+        for (kind, editorVisible, label, value) in cases {
+            let accessibility = FilePreviewEditorControlAccessibility(
+                kind: kind,
+                editorVisible: editorVisible
+            )
+            XCTAssertEqual(accessibility.label, label)
+            XCTAssertEqual(accessibility.value, value)
+        }
+    }
+
+    func testSaveControlSpeaksCleanDirtySavingAndConflictStates() {
+        let file = URL(fileURLWithPath: "/tmp/main.swift")
+
+        let clean = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: false,
+            isLoading: false,
+            isSaving: false,
+            hasConflict: false
+        )
+        XCTAssertEqual(clean.label, "Save main.swift")
+        XCTAssertEqual(clean.value, "Saved")
+        XCTAssertFalse(clean.isEnabled)
+
+        let dirty = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: true,
+            isLoading: false,
+            isSaving: false,
+            hasConflict: true
+        )
+        XCTAssertEqual(dirty.value, "Changes pending, file changed on disk")
+        XCTAssertTrue(dirty.isEnabled)
+
+        let saving = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: true,
+            isLoading: false,
+            isSaving: true,
+            hasConflict: false
+        )
+        XCTAssertEqual(saving.value, "Saving")
+        XCTAssertFalse(saving.isEnabled)
+    }
+
+    func testDocumentHeaderFocusOrderIsStable() {
+        XCTAssertEqual(
+            FilePreviewControlAccessibility.headerFocusOrder,
+            ["preview.editorMode", "preview.save", "preview.options", "preview.hide"]
+        )
+    }
+
     func testRevertConfirmationNamesTheExactDocumentAndRecoveredDraft() {
         let confirmation = FilePreviewRevertConfirmation(
             fileURL: URL(fileURLWithPath: "/tmp/Incident notes.md"),

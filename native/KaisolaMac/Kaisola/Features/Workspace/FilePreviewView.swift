@@ -235,6 +235,73 @@ private struct FilePreviewRevertConfirmationModifier: ViewModifier {
     }
 }
 
+struct FilePreviewEditorControlAccessibility: Equatable {
+    enum Kind: Equatable {
+        case markdown
+        case text
+        case html
+    }
+
+    let kind: Kind
+    let editorVisible: Bool
+
+    var label: String {
+        switch (kind, editorVisible) {
+        case (.markdown, false): "Edit Markdown source"
+        case (.markdown, true): "Show Markdown preview"
+        case (.text, false): "Edit text"
+        case (.text, true): "Show text preview"
+        case (.html, false): "Edit HTML source"
+        case (.html, true): "Show HTML preview"
+        }
+    }
+
+    var value: String {
+        switch (kind, editorVisible) {
+        case (.markdown, false): "Markdown preview shown"
+        case (.markdown, true): "Markdown source editor shown"
+        case (.text, false): "Text preview shown"
+        case (.text, true): "Text editor shown"
+        case (.html, false): "HTML preview shown"
+        case (.html, true): "HTML source editor shown"
+        }
+    }
+}
+
+struct FilePreviewSaveControlAccessibility: Equatable {
+    let fileURL: URL
+    let isDirty: Bool
+    let isLoading: Bool
+    let isSaving: Bool
+    let hasConflict: Bool
+
+    private var filename: String {
+        fileURL.lastPathComponent.nilIfEmpty ?? "this file"
+    }
+
+    var label: String { "Save \(filename)" }
+
+    var value: String {
+        let state: String
+        if isSaving { state = "Saving" }
+        else if isLoading { state = "Loading document" }
+        else if isDirty { state = "Changes pending" }
+        else { state = "Saved" }
+        return hasConflict ? "\(state), file changed on disk" : state
+    }
+
+    var isEnabled: Bool { isDirty && !isLoading && !isSaving }
+}
+
+enum FilePreviewControlAccessibility {
+    static let headerFocusOrder = [
+        "preview.editorMode",
+        "preview.save",
+        "preview.options",
+        "preview.hide",
+    ]
+}
+
 /// File preview/editor pane: UTF-8 text is editable with ⌘S save + revert,
 /// markdown renders styled (with a raw-source toggle), images display, and
 /// binary/oversized files degrade to a clear notice.
@@ -861,15 +928,22 @@ struct FilePreviewView: View {
                 outlineMenu
             }
             if case .markdown = content {
+                let accessibility = FilePreviewEditorControlAccessibility(
+                    kind: .markdown,
+                    editorVisible: showMarkdownSource
+                )
                 Button { showMarkdownSource.toggle() } label: {
                     Image(systemName: showMarkdownSource ? "doc.richtext.fill" : "pencil")
                 }
                 .buttonStyle(.borderless)
                 .help(showMarkdownSource ? "Show formatted Markdown" : "Edit Markdown")
+                .accessibilityLabel(accessibility.label)
+                .accessibilityValue(accessibility.value)
+                .accessibilityIdentifier("preview.editorMode")
             } else if case .text = content {
-                editModeButton(help: "Edit text")
+                editModeButton(kind: .text, help: "Edit text")
             } else if case .html = content {
-                editModeButton(help: "Edit HTML source")
+                editModeButton(kind: .html, help: "Edit HTML source")
             }
             if conflict.showsCompactIndicator {
                 Button {
@@ -884,6 +958,13 @@ struct FilePreviewView: View {
                 .accessibilityIdentifier("preview.conflictIndicator")
             }
             if isEditable {
+                let accessibility = FilePreviewSaveControlAccessibility(
+                    fileURL: loadedURL ?? url,
+                    isDirty: isDirty,
+                    isLoading: isLoading,
+                    isSaving: isSaving,
+                    hasConflict: conflict.isActive
+                )
                 Button { save() } label: {
                     Image(systemName: "square.and.arrow.down")
                         // Tinted only under a conflict; otherwise the control
@@ -896,9 +977,11 @@ struct FilePreviewView: View {
                 }
                 .buttonStyle(.borderless)
                 .keyboardShortcut("s", modifiers: .command)
-                .disabled(!isDirty || isLoading || isSaving)
+                .disabled(!accessibility.isEnabled)
                 .help(conflict.saveHelpText)
-                .accessibilityLabel(conflict.saveAccessibilityLabel)
+                .accessibilityLabel(accessibility.label)
+                .accessibilityValue(accessibility.value)
+                .accessibilityIdentifier("preview.save")
             }
             previewOptionsMenu
             Button {
@@ -1047,12 +1130,22 @@ struct FilePreviewView: View {
         }
     }
 
-    private func editModeButton(help: String) -> some View {
-        Button { isEditingText.toggle() } label: {
+    private func editModeButton(
+        kind: FilePreviewEditorControlAccessibility.Kind,
+        help: String
+    ) -> some View {
+        let accessibility = FilePreviewEditorControlAccessibility(
+            kind: kind,
+            editorVisible: isEditingText
+        )
+        return Button { isEditingText.toggle() } label: {
             Image(systemName: isEditingText ? "eye" : "pencil")
         }
         .buttonStyle(.borderless)
         .help(isEditingText ? "Show preview" : help)
+        .accessibilityLabel(accessibility.label)
+        .accessibilityValue(accessibility.value)
+        .accessibilityIdentifier("preview.editorMode")
     }
 
     private var outlineMenu: some View {
@@ -1144,6 +1237,7 @@ struct FilePreviewView: View {
         .menuIndicator(.hidden)
         .help("Document options")
         .accessibilityLabel("Document options")
+        .accessibilityIdentifier("preview.options")
     }
 
     private var copyableContents: String? {

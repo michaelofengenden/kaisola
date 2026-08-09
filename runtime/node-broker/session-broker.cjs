@@ -14,6 +14,7 @@ const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
 const { terminalAttachRoute, terminalCreateRoute, terminalKillRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalDetachOwnerRoute } = require('./ipc/terminalDetachOwnerRoute.cjs')
+const { BrokerRequestGate, dispatchBrokerRequest } = require('./ipc/brokerRequestGate.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
@@ -94,6 +95,7 @@ let activityEpoch = 1
 let companionLeaseEpoch = 1
 const companionLeases = new Set()
 let inFlightMutations = 0
+const requestGate = new BrokerRequestGate()
 let everConnected = false
 
 const MUTATING_METHODS = new Set([
@@ -591,16 +593,17 @@ function handleLine(client, line) {
   }
   if (frame?.type !== 'request' || typeof frame.id !== 'string' || typeof frame.method !== 'string') return
   const mutating = MUTATING_METHODS.has(frame.method)
-  if (mutating) beginMutation()
-  void dispatch(client, frame.method, frame.params).finally(() => {
-    if (mutating) endMutation()
-  }).then(
-    (result) => {
-      send(client.socket, { type: 'response', id: frame.id, ok: true, result })
-      scheduleNoClientExit()
-    },
-    (error) => send(client.socket, { type: 'response', id: frame.id, ok: false, message: String(error?.message || error) }),
-  )
+  dispatchBrokerRequest({
+    gate: requestGate,
+    client,
+    requestID: frame.id,
+    mutating,
+    dispatch: () => dispatch(client, frame.method, frame.params),
+    beginMutation,
+    endMutation,
+    respond: (response) => send(client.socket, response),
+    onSuccess: scheduleNoClientExit,
+  })
 }
 
 function acceptClient(socket) {

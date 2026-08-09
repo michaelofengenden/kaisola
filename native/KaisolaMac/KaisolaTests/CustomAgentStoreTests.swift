@@ -4,8 +4,9 @@ import XCTest
 
 /// CustomAgentStore persistence against a throwaway file — save/all round-trip
 /// across instances, corrupt-file degradation, the 12-entry cap, the slugify
-/// matrix, `asProfiles` mapping (symbol fallback) — plus the `AgentRegistry`
-/// integration through the `customStoreOverride` test seam.
+/// matrix, the duplicate display-name rules, `asProfiles` mapping (symbol
+/// fallback) — plus the `AgentRegistry` integration through the
+/// `customStoreOverride` test seam.
 final class CustomAgentStoreTests: XCTestCase {
     private var fileURL: URL!
     private var store: CustomAgentStore!
@@ -70,6 +71,104 @@ final class CustomAgentStoreTests: XCTestCase {
         XCTAssertEqual(CustomAgentStore.slugify("--Lead--"), "custom-lead")
         // Collision suffixing is intentionally NOT applied: same name → same id.
         XCTAssertEqual(CustomAgentStore.slugify("My Agent"), CustomAgentStore.slugify("my  agent"))
+    }
+
+    // MARK: - Duplicate display names
+
+    func testNormalizedNameFoldsCaseAndWhitespace() {
+        XCTAssertEqual(CustomAgentStore.normalizedName("  My   Agent \n"), "my agent")
+        XCTAssertEqual(CustomAgentStore.normalizedName("MY\tAGENT"), "my agent")
+        XCTAssertEqual(CustomAgentStore.normalizedName("   "), "")
+        // Folding stops at spacing and case: joined words stay a different name.
+        XCTAssertNotEqual(
+            CustomAgentStore.normalizedName("myagent"),
+            CustomAgentStore.normalizedName("my agent"))
+    }
+
+    func testDuplicateNameErrorCatchesCaseAndWhitespaceTwins() throws {
+        let roster = [makeSpec("custom-aider", "Aider"), makeSpec("custom-lead", "Lead Dev")]
+        XCTAssertNil(CustomAgentStore.duplicateNameError("Reviewer", in: roster))
+        XCTAssertNil(CustomAgentStore.duplicateNameError("   ", in: roster))
+        for twin in ["Aider", "aider", "  AIDER  ", "lead   dev", "LEAD\tDEV"] {
+            XCTAssertNotNil(CustomAgentStore.duplicateNameError(twin, in: roster), twin)
+        }
+        // The refusal names the entry that took it, so the fix is obvious.
+        let reason = try XCTUnwrap(CustomAgentStore.duplicateNameError(" aider ", in: roster))
+        XCTAssertTrue(reason.contains("\"Aider\""), reason)
+    }
+
+    func testDuplicateNameErrorExemptsOnlyTheRowBeingRenamed() {
+        let roster = [makeSpec("custom-aider", "Aider")]
+        // A row re-saved under its own name does not collide with itself…
+        XCTAssertNil(CustomAgentStore.duplicateNameError("Aider", in: roster, ignoring: "custom-aider"))
+        XCTAssertNil(CustomAgentStore.duplicateNameError("aider", in: roster, ignoring: "custom-aider"))
+        // …and exempting some other row does not excuse the collision.
+        XCTAssertNotNil(CustomAgentStore.duplicateNameError("Aider", in: roster, ignoring: "custom-other"))
+    }
+
+    func testAddingRefusesADuplicateDisplayName() throws {
+        let roster = try XCTUnwrap(CustomAgentStore.adding(makeSpec("custom-aider", "Aider"), to: []))
+        XCTAssertEqual(roster.map(\.name), ["Aider"])
+
+        // Unique ids are not enough: these all read as "Aider" in the New menu.
+        for twin in ["aider", "  Aider  ", "AIDER"] {
+            let candidate = CustomAgentSpec(
+                id: CustomAgentStore.slugify(twin, existing: Set(roster.map(\.id))),
+                name: twin,
+                launchCommand: "aider --other-model",
+                symbol: "cpu")
+            XCTAssertNotEqual(candidate.id, "custom-aider")   // the id really did differ
+            XCTAssertNil(CustomAgentStore.adding(candidate, to: roster), twin)
+        }
+        // A distinct name is still free; a repeated id is refused too.
+        XCTAssertEqual(
+            CustomAgentStore.adding(makeSpec("custom-aider-cli", "Aider CLI"), to: roster)?.map(\.name),
+            ["Aider", "Aider CLI"])
+        XCTAssertNil(CustomAgentStore.adding(makeSpec("custom-aider", "Something Else"), to: roster))
+    }
+
+    func testAddSequenceStoresOneRowPerVisibleName() {
+        // The Settings ▸ Agents add row, three times over.
+        var roster: [CustomAgentSpec] = []
+        for (name, command) in [("Aider", "aider"), (" aider  ", "aider --alt"), ("Aider Two", "aider2")] {
+            let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+            let candidate = CustomAgentSpec(
+                id: CustomAgentStore.slugify(trimmed, existing: Set(roster.map(\.id))),
+                name: trimmed,
+                launchCommand: command,
+                symbol: "terminal")
+            if let next = CustomAgentStore.adding(candidate, to: roster) { roster = next }
+        }
+        store.save(roster)
+
+        XCTAssertEqual(store.all().map(\.name), ["Aider", "Aider Two"])
+        XCTAssertEqual(store.all().map(\.launchCommand), ["aider", "aider2"])
+    }
+
+    func testExistingDuplicatesSurviveSaveAndAreRepairableByRename() throws {
+        // A roster written before this rule existed: two rows, one visible name.
+        store.save([makeSpec("custom-aider", "Aider"), makeSpec("custom-aider-2", "aider")])
+        var roster = store.all()
+        XCTAssertEqual(roster.count, 2, "an existing duplicate must never be dropped on save")
+        XCTAssertNotNil(
+            CustomAgentStore.duplicateNameError(roster[1].name, in: roster, ignoring: roster[1].id),
+            "the duplicated row should flag itself so the user can find it")
+
+        // The repair is a rename in place — the id, and with it the pinned
+        // adapter install and credential context, is untouched.
+        roster[1].name = "Aider Alt"
+        store.save(roster)
+
+        let repaired = store.all()
+        XCTAssertEqual(repaired.map(\.id), ["custom-aider", "custom-aider-2"])
+        XCTAssertEqual(repaired.map(\.name), ["Aider", "Aider Alt"])
+        for entry in repaired {
+            XCTAssertNil(CustomAgentStore.duplicateNameError(entry.name, in: repaired, ignoring: entry.id))
+        }
+    }
+
+    private func makeSpec(_ id: String, _ name: String) -> CustomAgentSpec {
+        CustomAgentSpec(id: id, name: name, launchCommand: "cli", symbol: "terminal")
     }
 
     // MARK: - asProfiles mapping

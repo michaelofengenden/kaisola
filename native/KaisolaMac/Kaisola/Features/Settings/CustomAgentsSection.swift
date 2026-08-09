@@ -40,7 +40,9 @@ struct CustomAgentsSection: View {
                 VStack(alignment: .leading, spacing: 5) {
                     HStack(spacing: 10) {
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(spec.name).font(.callout)
+                            TextField("Name", text: nameBinding(index))
+                                .font(.callout)
+                                .textFieldStyle(.plain)
                             Text(spec.launchCommand)
                                 .font(.caption.monospaced()).foregroundStyle(.secondary)
                                 .lineLimit(1).truncationMode(.middle)
@@ -59,6 +61,12 @@ struct CustomAgentsSection: View {
                         }
                         .buttonStyle(.borderless)
                     }
+                    // A roster written before names were checked can still hold
+                    // twins; each one says so until it is renamed apart.
+                    if let reason = CustomAgentStore.duplicateNameError(
+                        spec.name, in: specs, ignoring: spec.id) {
+                        Text(reason).font(.caption).foregroundStyle(.orange)
+                    }
                     acpControls(index: index, spec: spec)
                 }
             }
@@ -71,7 +79,9 @@ struct CustomAgentsSection: View {
                 Button("Add", action: add)
                     .disabled(!canAdd)
             }
-            if specs.count >= cap {
+            if let reason = newNameDuplicateError {
+                Text(reason).font(.caption).foregroundStyle(.orange)
+            } else if specs.count >= cap {
                 Text("Custom-agent limit reached (\(cap)).")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
@@ -86,6 +96,34 @@ struct CustomAgentsSection: View {
         specs.count < cap
             && !newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !newCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && newNameDuplicateError == nil
+    }
+
+    /// Which existing entry the typed name would be indistinguishable from.
+    private var newNameDuplicateError: String? {
+        CustomAgentStore.duplicateNameError(newName, in: specs)
+    }
+
+    /// A binding that renames a row in place, keeping its id — and with it the
+    /// agent's pinned adapter install and credential context. The typed text
+    /// always lands in the row so the field never fights the caret; only a free
+    /// name is persisted, which is how an existing duplicate gets repaired.
+    private func nameBinding(_ index: Int) -> Binding<String> {
+        Binding(
+            get: { specs.indices.contains(index) ? specs[index].name : "" },
+            set: { newValue in
+                guard specs.indices.contains(index) else { return }
+                specs[index].name = newValue
+                let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty,
+                      CustomAgentStore.duplicateNameError(
+                        trimmed, in: specs, ignoring: specs[index].id) == nil
+                else { return }
+                var renamed = specs
+                renamed[index].name = trimmed
+                persist(renamed)
+            }
+        )
     }
 
     /// A binding that persists an icon change and rebuilds menus on set.
@@ -104,12 +142,16 @@ struct CustomAgentsSection: View {
         let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         let command = newCommand.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty, !command.isEmpty, specs.count < cap else { return }
-        specs.append(CustomAgentSpec(
+        let spec = CustomAgentSpec(
             id: CustomAgentStore.slugify(name, existing: Set(specs.map(\.id))),
             name: name,
             launchCommand: command,
             symbol: symbolChoices.first ?? "terminal"
-        ))
+        )
+        // Refused when the roster already shows this name under some other
+        // spacing or capitalization — the add row names the entry that took it.
+        guard let next = CustomAgentStore.adding(spec, to: specs) else { return }
+        specs = next
         store.save(specs)
         specs = store.all()   // reflect the store's cap
         newName = ""
@@ -125,7 +167,11 @@ struct CustomAgentsSection: View {
 
     /// Save the current list and announce the change so menus rebuild.
     private func persist() {
-        store.save(specs)
+        persist(specs)
+    }
+
+    private func persist(_ roster: [CustomAgentSpec]) {
+        store.save(roster)
         NotificationCenter.default.post(name: .kaisolaAgentsChanged, object: nil)
     }
 

@@ -183,7 +183,7 @@ jobs:
             'int main(void) {' \
             '  struct utsname value;' \
             '  if (uname(&value) != 0) return 2;' \
-            '  return printf("%s\\n", value.machine) < 0 ? 3 : 0;' \
+            '  return printf("%s\n", value.machine) < 0 ? 3 : 0;' \
             '}' > "$PROBE_SOURCE"
           xcrun --sdk iphonesimulator clang \
             -target "$KAISOLA_COMPANION_SIMULATOR_ARCH-apple-ios$KAISOLA_COMPANION_SIMULATOR_OS-simulator" \

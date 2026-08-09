@@ -589,6 +589,8 @@ test('swift-contracts workflow preserves full failure evidence without blind ret
   assert.match(workflow, /simulator-architecture-probe\.c/)
   assert.match(workflow, /-target "\$KAISOLA_COMPANION_SIMULATOR_ARCH-apple-ios\$KAISOLA_COMPANION_SIMULATOR_OS-simulator"/)
   assert.match(workflow, /codesign --force --sign - "\$PROBE_BINARY"/)
+  assert.ok(workflow.includes('return printf("%s\\n", value.machine)'))
+  assert.ok(!workflow.includes('return printf("%s\\\\n", value.machine)'))
   assert.match(workflow, /simctl spawn --arch="\$KAISOLA_COMPANION_SIMULATOR_ARCH" "\$UDID" "\$PROBE_BINARY"/)
   assert.doesNotMatch(workflow, /simctl spawn[^\n]*uname/)
   assert.match(workflow, /-resultBundlePath "\$KAISOLA_COMPANION_RESULT_BUNDLE"/)

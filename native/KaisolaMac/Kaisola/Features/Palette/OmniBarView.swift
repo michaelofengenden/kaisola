@@ -17,7 +17,7 @@ struct OmniBarView: View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 10) {
                 Image(systemName: "bubble.left.and.text.bubble.right")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 TextField("Message the current agent…", text: $text)
                     .textFieldStyle(.plain)
                     .font(.title3)
@@ -28,7 +28,7 @@ struct OmniBarView: View {
             // always sees where Enter will send before committing.
             Text(OmniBarDispatch.targetDescription(model: model))
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .lineLimit(1)
                 .padding(.leading, 28)   // align under the field, past the icon
         }

@@ -19,7 +19,7 @@ struct McpSettingsTab: View {
                 Section("MCP Servers") {
                     Text("Open a project to configure its MCP servers. Servers are scoped to that project and are available to every agent chat you start there.")
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
             }
             .formStyle(.grouped)
@@ -137,7 +137,7 @@ private struct McpServerEditor: View {
             if servers.isEmpty {
                 Text("No MCP servers yet — add one below.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             ForEach(servers) { server in
                 VStack(alignment: .leading, spacing: 5) {
@@ -150,7 +150,7 @@ private struct McpServerEditor: View {
                             Text(server.name).font(.callout)
                             Text(subtitle(for: server))
                                 .font(.caption2.monospaced())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
@@ -189,14 +189,14 @@ private struct McpServerEditor: View {
                                 .accessibilityHidden(true)
                             Text(result.message)
                             if let identity = probeIdentity(result) {
-                                Text(identity).foregroundStyle(.tertiary)
+                                Text(identity).foregroundStyle(.kaisolaTertiary)
                             }
                         }
                         .font(.caption)
                         .foregroundStyle(
                             result.status == .failed
                                 ? KaisolaStatusTone.failed.foregroundColor
-                                : Color.secondary
+                                : Color.kaisolaSecondary
                         )
                         .accessibilityElement(children: .combine)
                     }
@@ -206,7 +206,7 @@ private struct McpServerEditor: View {
                 HStack(spacing: 8) {
                     Label("\(deleted.server.name) removed", systemImage: "trash")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     Spacer()
                     Button("Undo") { restore(deleted) }
                         .buttonStyle(.borderless)
@@ -283,7 +283,7 @@ private struct McpServerEditor: View {
         Section("Import Existing Configuration") {
             Text("Find MCP servers already configured in Cursor, Claude, Codex, Gemini, VS Code, or Windsurf. Kaisola reads only their standard local config files, never expands secrets, and imports selected servers disabled.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
 
             if discoveries.isEmpty {
                 Button {
@@ -303,7 +303,7 @@ private struct McpServerEditor: View {
                             Text(discovery.config.name)
                             Text("\(discovery.origin) · \(subtitle(for: discovery.config))")
                                 .font(.caption2.monospaced())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
@@ -321,12 +321,12 @@ private struct McpServerEditor: View {
             if let discoveryMessage {
                 Text(discoveryMessage)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             if remainingCapacity == 0 {
                 Text("MCP server limit reached (\(McpConfigStore.maximumServerCount)). Remove a server before importing another.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
         }
     }
@@ -416,7 +416,7 @@ private struct McpServerEditor: View {
             if remainingCapacity == 0 {
                 Text("MCP server limit reached (\(McpConfigStore.maximumServerCount)). Remove a server before adding another.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             Button("Add Server", action: add)
                 .disabled(!hasRequiredFields || remainingCapacity == 0)
@@ -427,7 +427,7 @@ private struct McpServerEditor: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             TextEditor(text: text)
                 .font(.callout.monospaced())
                 .frame(minHeight: 52)

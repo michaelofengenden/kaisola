@@ -34,7 +34,7 @@ struct CustomAgentsSection: View {
         Section("Custom Agents") {
             if specs.isEmpty {
                 Text("Add any terminal CLI — it appears in the New menu and launches into an owned terminal.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
             }
             ForEach(Array(specs.enumerated()), id: \.offset) { index, spec in
                 VStack(alignment: .leading, spacing: 5) {
@@ -42,7 +42,7 @@ struct CustomAgentsSection: View {
                         VStack(alignment: .leading, spacing: 1) {
                             Text(spec.name).font(.callout)
                             Text(spec.launchCommand)
-                                .font(.caption.monospaced()).foregroundStyle(.secondary)
+                                .font(.caption.monospaced()).foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1).truncationMode(.middle)
                         }
                         Spacer()
@@ -73,10 +73,10 @@ struct CustomAgentsSection: View {
             }
             if specs.count >= cap {
                 Text("Custom-agent limit reached (\(cap)).")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
             } else {
                 Text("Runs through a login shell like the built-in agents; terminal-only, no chat surface.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
             }
         }
         .onAppear { specs = store.all() }
@@ -168,7 +168,7 @@ struct CustomAgentsSection: View {
             case let .verified(binURL):
                 let version = installs.store.record(agentID: spec.id)?.resolvedVersion ?? "?"
                 Text("Chat enabled · \(spec.acpPackage ?? "") v\(version) · runs \(binURL.lastPathComponent)")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
             case let .drifted(reason):
                 Text("Chat disabled: \(reason) Re-enable to approve the current version.")
                     .font(.caption).foregroundStyle(.orange)
@@ -183,7 +183,7 @@ struct CustomAgentsSection: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("Enabling installs \(spec.acpPackage ?? "") from the npm registry with install scripts disabled, pins its exact dependency graph, and runs that pinned code as this agent's chat adapter. It runs with your user's ordinary file and network access — Kaisola does not sandbox it. Any change to the pinned install disables chat until you approve again.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack {
                     Button("Install and Enable") { enableChat(index) }

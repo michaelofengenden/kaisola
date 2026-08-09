@@ -43,7 +43,7 @@ struct MeshView: View {
                     .foregroundStyle(
                         isConflictStatus(status)
                             ? KaisolaStatusTone.needsYou.foregroundColor
-                            : Color.secondary
+                            : Color.kaisolaSecondary
                     )
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -293,7 +293,7 @@ struct MeshStagedPromptQueueButton: View {
                         .font(.headline)
                     Text("Waiting in dispatch order")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
                 Spacer()
                 Button {
@@ -315,7 +315,7 @@ struct MeshStagedPromptQueueButton: View {
                             HStack {
                                 Text("Prompt \(index + 1)")
                                     .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                                 Spacer()
                                 Button(role: .destructive) {
                                     if mesh.removeStagedPrompt(prompt, at: index), mesh.stagedPrompts.isEmpty {
@@ -385,7 +385,7 @@ struct MeshConfigurationMenu: View {
                 Text("\(mesh.configuredAgentNames.count) ACP · \(mesh.configuredMCPServerNames.count) MCP")
             }
             .font(.caption.weight(.medium))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
             .kaisolaControlSurface(active: true, tint: .purple)
@@ -489,7 +489,7 @@ private struct MeshColumnView: View {
                                     if loadingEarlierRows { ProgressView().controlSize(.mini) }
                                     Text(loadingEarlierRows ? "Loading earlier messages…" : "Earlier messages")
                                         .font(.caption2)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(.kaisolaSecondary)
                                 }
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 5)
@@ -509,13 +509,13 @@ private struct MeshColumnView: View {
                             } else if transcriptIsReady, !conversation.rows.isEmpty {
                                 Text("Beginning of session")
                                     .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                                     .frame(maxWidth: .infinity)
                                     .padding(.vertical, 5)
                             }
                             if let status = conversation.statusMessage {
                                 Label(status, systemImage: "exclamationmark.triangle")
-                                    .font(.caption).foregroundStyle(.secondary)
+                                    .font(.caption).foregroundStyle(.kaisolaSecondary)
                             }
                             ForEach(conversation.visibleRows) { row in
                                 TranscriptRowView(
@@ -616,7 +616,7 @@ struct UnifiedPatchView: View {
             if rendered.isTruncated {
                 Label("Large diff truncated in this view", systemImage: "ellipsis.rectangle")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.top, 6)
             }
         }

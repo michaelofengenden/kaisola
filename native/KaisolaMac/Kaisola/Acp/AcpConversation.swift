@@ -127,6 +127,10 @@ final class AcpConversation: ObservableObject {
             }
         }
     }
+    /// Durable notice that older saved rows were pruned by the per-chat disk
+    /// quota. It survives relaunch and remains visible instead of making the
+    /// retained tail look like the complete transcript.
+    @Published private(set) var transcriptRetentionStatus: AcpTranscriptStore.RetentionStatus
     /// Advances for both appended rows and in-place streaming updates. Views
     /// must follow this rather than `rows.count`: an agent can stream thousands
     /// of chunks into one existing Markdown row without changing the count.
@@ -328,6 +332,7 @@ final class AcpConversation: ObservableObject {
         initialRowStartOrdinal: Int64 = 0,
         initialEarlierRowCount: Int = 0,
         initialTotalRowCount: Int? = nil,
+        initialRetentionStatus: AcpTranscriptStore.RetentionStatus = .empty,
         initialDraft: String? = nil,
         initialAttachments: [AcpAttachment] = [],
         initialUsage: AcpUsage? = nil,
@@ -351,6 +356,7 @@ final class AcpConversation: ObservableObject {
         self.userMessageLedger = AcpUserMessageLedger(rows: initialRows)
         self.loadedRowStartOrdinal = max(0, initialRowStartOrdinal)
         self.unloadedEarlierRowCount = max(0, initialEarlierRowCount)
+        self.transcriptRetentionStatus = initialRetentionStatus
         self.restoredDraft = initialDraft
         self.pendingAttachments = Self.restoredPendingAttachments(initialAttachments)
         self.attachmentCounter = self.pendingAttachments.count

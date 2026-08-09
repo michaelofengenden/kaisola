@@ -80,6 +80,23 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertEqual(conversation.hiddenEarlierCount, 0)
     }
 
+    func testRestoredQuotaStatusRemainsAvailableForPersistentDisclosure() {
+        let status = AcpTranscriptStore.RetentionStatus(
+            truncatedRowCount: 42,
+            truncatedByteCount: 4_096
+        )
+        let conversation = AcpConversation(
+            title: "Test",
+            command: "mock",
+            arguments: [],
+            cwd: "/tmp",
+            initialRetentionStatus: status
+        )
+
+        XCTAssertEqual(conversation.transcriptRetentionStatus, status)
+        XCTAssertTrue(conversation.transcriptRetentionStatus.isTruncated)
+    }
+
     func testVisibleLimitIsSettableToDriveTheView() {
         let conversation = makeConversation()
         conversation.seedRowsForTesting(Self.messageRows(count: 500))

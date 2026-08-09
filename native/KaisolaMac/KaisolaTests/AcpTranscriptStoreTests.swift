@@ -133,6 +133,228 @@ final class AcpTranscriptStoreTests: XCTestCase {
         XCTAssertEqual(restoredRows, rows)
     }
 
+    func testPerChatRowQuotaPreservesPinnedEvidenceAndNewestRows() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-quota-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = AcpTranscriptStore(
+            databaseURL: directory.appendingPathComponent("transcripts.sqlite3"),
+            schedulesAutomaticFlush: false,
+            retentionPolicy: .init(
+                maximumRowCount: 5,
+                maximumBytes: 1_048_576,
+                recentRowCount: 2
+            )
+        )
+        let rows: [AcpTranscriptRow] = [
+            .message(id: "discard-message", text: "old narration"),
+            .user(id: "pinned-user", text: "keep my prompt", failed: false),
+            .thought(id: "discard-thought", text: "old thought"),
+            .tool(AcpToolCall(
+                id: "pinned-tool",
+                title: "Read source",
+                kind: "read",
+                status: .completed
+            )),
+            .plan(id: "middle", entries: []),
+            .message(id: "recent-one", text: "recent"),
+            .message(id: "recent-two", text: "newest"),
+        ]
+
+        await store.scheduleSave(rows, for: "chat-row-quota", now: 1)
+        await store.flush()
+
+        let outcome = await store.restoration(for: "chat-row-quota", tailLimit: 2)
+        let restoration = try XCTUnwrap(outcome.restoration)
+        XCTAssertEqual(restoration.page.rows.map(\.id), ["msg-recent-one", "msg-recent-two"])
+        let earlierPage = await store.page(
+            for: "chat-row-quota",
+            beforeOrdinal: restoration.page.startOrdinal,
+            limit: 10
+        )
+        let earlier = try XCTUnwrap(earlierPage)
+        XCTAssertEqual(earlier.endOrdinalExclusive, restoration.page.startOrdinal)
+        XCTAssertEqual(earlier.rows.map(\.id) + restoration.page.rows.map(\.id), [
+            "user-pinned-user",
+            "tool-pinned-tool",
+            "plan-middle",
+            "msg-recent-one",
+            "msg-recent-two",
+        ])
+        XCTAssertEqual(restoration.retentionStatus.truncatedRowCount, 2)
+        XCTAssertGreaterThan(restoration.retentionStatus.truncatedByteCount, 0)
+        XCTAssertTrue(restoration.retentionStatus.isTruncated)
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT COUNT(*) FROM transcript_rows WHERE chat_id = 'chat-row-quota'",
+                databaseURL: store.databaseURL
+            ),
+            5
+        )
+    }
+
+    func testPerChatByteQuotaReportsExactTruncationAndSurvivesTailRewrite() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-byte-quota-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let pinned = AcpTranscriptRow.user(
+            id: "pinned",
+            text: String(repeating: "p", count: 48),
+            failed: false
+        )
+        let discarded = AcpTranscriptRow.message(
+            id: "discarded",
+            text: String(repeating: "d", count: 96)
+        )
+        let newest = AcpTranscriptRow.message(
+            id: "newest",
+            text: String(repeating: "n", count: 48)
+        )
+        let encoder = JSONEncoder()
+        let retainedBytes = try encoder.encode(pinned).count + encoder.encode(newest).count
+        let discardedBytes = try encoder.encode(discarded).count
+        let store = AcpTranscriptStore(
+            databaseURL: directory.appendingPathComponent("transcripts.sqlite3"),
+            schedulesAutomaticFlush: false,
+            retentionPolicy: .init(
+                maximumRowCount: 10,
+                maximumBytes: retainedBytes,
+                recentRowCount: 1
+            )
+        )
+
+        await store.scheduleSave([pinned, discarded, newest], for: "chat-byte-quota", now: 1)
+        await store.flush()
+        let firstOutcome = await store.restoration(for: "chat-byte-quota", tailLimit: 10)
+        let first = try XCTUnwrap(firstOutcome.restoration)
+        XCTAssertEqual(first.page.rows, [pinned, newest])
+        XCTAssertEqual(first.retentionStatus.truncatedRowCount, 1)
+        XCTAssertEqual(first.retentionStatus.truncatedByteCount, Int64(discardedBytes))
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT COALESCE(SUM(length(row_json)), 0) FROM transcript_rows WHERE chat_id = 'chat-byte-quota'",
+                databaseURL: store.databaseURL
+            ),
+            retainedBytes
+        )
+
+        let updatedNewest = AcpTranscriptRow.message(id: "newest", text: "updated")
+        await store.scheduleSave(
+            [updatedNewest],
+            for: "chat-byte-quota",
+            startOrdinal: 2,
+            now: 2
+        )
+        await store.flush()
+        let rewrittenOutcome = await store.restoration(for: "chat-byte-quota", tailLimit: 10)
+        let rewritten = try XCTUnwrap(rewrittenOutcome.restoration)
+        XCTAssertEqual(rewritten.page.rows, [pinned, updatedNewest])
+        XCTAssertEqual(rewritten.retentionStatus.truncatedRowCount, 1)
+        XCTAssertEqual(rewritten.retentionStatus.truncatedByteCount, Int64(discardedBytes))
+
+        let reopened = AcpTranscriptStore(
+            databaseURL: store.databaseURL,
+            schedulesAutomaticFlush: false,
+            retentionPolicy: .init(
+                maximumRowCount: 10,
+                maximumBytes: retainedBytes,
+                recentRowCount: 1
+            )
+        )
+        let reopenedOutcome = await reopened.restoration(for: "chat-byte-quota", tailLimit: 10)
+        XCTAssertEqual(
+            try XCTUnwrap(reopenedOutcome.restoration).retentionStatus,
+            rewritten.retentionStatus
+        )
+    }
+
+    func testSingleOversizedRowIsNeverInsertedAndItsTruncationStatusPersists() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-single-quota-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let row = AcpTranscriptRow.message(
+            id: "oversized",
+            text: String(repeating: "x", count: 2_048)
+        )
+        let encodedBytes = try JSONEncoder().encode(row).count
+        let store = AcpTranscriptStore(
+            databaseURL: directory.appendingPathComponent("transcripts.sqlite3"),
+            schedulesAutomaticFlush: false,
+            retentionPolicy: .init(
+                maximumRowCount: 10,
+                maximumBytes: encodedBytes - 1,
+                recentRowCount: 10
+            )
+        )
+
+        await store.scheduleSave([row], for: "chat-oversized", now: 1)
+        await store.flush()
+
+        let outcome = await store.restoration(for: "chat-oversized", tailLimit: 10)
+        let restoration = try XCTUnwrap(outcome.restoration)
+        XCTAssertTrue(restoration.page.rows.isEmpty)
+        XCTAssertEqual(restoration.retentionStatus.truncatedRowCount, 1)
+        XCTAssertEqual(restoration.retentionStatus.truncatedByteCount, Int64(encodedBytes))
+        XCTAssertEqual(
+            try TranscriptDatabaseProbe.rowCount(chatID: "chat-oversized", at: store.databaseURL),
+            0
+        )
+    }
+
+    func testExistingSchemaBackfillsPinnedEvidenceBeforeApplyingQuota() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-quota-migration-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        XCTAssertTrue(FileManager.default.createFile(atPath: databaseURL.path, contents: nil))
+        let row = AcpTranscriptRow.user(id: "legacy-user", text: "keep", failed: false)
+        let rowHex = try JSONEncoder().encode(row).map { String(format: "%02X", $0) }.joined()
+        try TranscriptDatabaseProbe.execute(
+            """
+            CREATE TABLE store_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL) WITHOUT ROWID;
+            CREATE TABLE chats (
+                chat_id TEXT PRIMARY KEY NOT NULL,
+                updated_at INTEGER NOT NULL,
+                usage_json BLOB,
+                draft TEXT,
+                attachments_json BLOB,
+                session_id TEXT
+            ) WITHOUT ROWID;
+            CREATE TABLE transcript_rows (
+                chat_id TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+                row_json BLOB NOT NULL,
+                PRIMARY KEY (chat_id, ordinal)
+            ) WITHOUT ROWID;
+            INSERT INTO chats(chat_id, updated_at) VALUES ('legacy-chat', 1);
+            INSERT INTO transcript_rows(chat_id, ordinal, row_json)
+            VALUES ('legacy-chat', 0, X'\(rowHex)');
+            """,
+            at: databaseURL
+        )
+
+        let store = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            schedulesAutomaticFlush: false,
+            retentionPolicy: .init(
+                maximumRowCount: 1,
+                maximumBytes: 1_048_576,
+                recentRowCount: 0
+            )
+        )
+        let outcome = await store.restoration(for: "legacy-chat", tailLimit: 10)
+
+        XCTAssertEqual(try XCTUnwrap(outcome.restoration).page.rows, [row])
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT quota_pinned FROM transcript_rows WHERE chat_id = 'legacy-chat'",
+                databaseURL: databaseURL
+            ),
+            1
+        )
+    }
+
     func testTranscriptKeepsTheFirstMessage() async {
         let (store, directory) = temporaryStore()
         defer { try? FileManager.default.removeItem(at: directory) }

@@ -75,6 +75,10 @@ struct AcpChatView: View {
                 embeddedControls
             }
             Divider()
+            if conversation.transcriptRetentionStatus.isTruncated {
+                transcriptRetentionNotice
+                Divider()
+            }
             if showsEmptyState {
                 emptyState
             } else {
@@ -131,6 +135,30 @@ struct AcpChatView: View {
         .onChange(of: focusRequestGeneration) { _, request in
             applyFocusRequest(request)
         }
+    }
+
+    private var transcriptRetentionNotice: some View {
+        let status = conversation.transcriptRetentionStatus
+        let bytes = ByteCountFormatter.string(
+            fromByteCount: status.truncatedByteCount,
+            countStyle: .file
+        )
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "archivebox")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text("Earlier saved history was truncated at this chat's disk quota (\(status.truncatedRowCount.formatted()) rows, \(bytes)). User prompts, tool evidence, and the newest transcript were kept first.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.secondary.opacity(0.06))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Saved chat history truncated")
+        .accessibilityValue("\(status.truncatedRowCount) rows and \(bytes) removed after this chat reached its disk quota")
     }
 
     private var standardHeader: some View {

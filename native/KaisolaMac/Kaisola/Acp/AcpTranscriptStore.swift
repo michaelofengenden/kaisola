@@ -23,6 +23,36 @@ struct AcpPersistedUsage: Codable, Equatable, Sendable {
 /// transcript at launch. Rows have stable per-chat ordinals and are read from
 /// the tail backwards in bounded pages.
 actor AcpTranscriptStore {
+    struct RetentionPolicy: Equatable, Sendable {
+        var maximumRowCount: Int
+        var maximumBytes: Int
+        var recentRowCount: Int
+
+        init(maximumRowCount: Int, maximumBytes: Int, recentRowCount: Int) {
+            self.maximumRowCount = max(1, maximumRowCount)
+            self.maximumBytes = max(1, maximumBytes)
+            self.recentRowCount = max(0, min(recentRowCount, self.maximumRowCount))
+        }
+
+        /// One pathological chat may spend at most 32 MiB and 10,000 rows.
+        /// The newest 2,000 rows are the first retention priority; older user
+        /// prompts and tool cards are pinned evidence and outrank narration,
+        /// thoughts, and superseded plans when the quota is tight.
+        static let production = RetentionPolicy(
+            maximumRowCount: 10_000,
+            maximumBytes: 32 * 1_048_576,
+            recentRowCount: 2_000
+        )
+    }
+
+    struct RetentionStatus: Equatable, Sendable {
+        var truncatedRowCount: Int64
+        var truncatedByteCount: Int64
+
+        static let empty = RetentionStatus(truncatedRowCount: 0, truncatedByteCount: 0)
+        var isTruncated: Bool { truncatedRowCount > 0 || truncatedByteCount > 0 }
+    }
+
     struct Entry: Codable, Equatable, Sendable {
         var rows: [AcpTranscriptRow]
         var updatedAt: Int64
@@ -75,6 +105,7 @@ actor AcpTranscriptStore {
         var draft: String?
         var attachments: [AcpAttachment]
         var sessionID: String?
+        var retentionStatus: RetentionStatus = .empty
     }
 
     /// Why a read produced no transcript when the chat may still have one on
@@ -248,6 +279,16 @@ actor AcpTranscriptStore {
         var draft: String?
         var attachments: [AcpAttachment]
         var sessionID: String?
+        var retentionStatus: RetentionStatus
+    }
+
+    private struct RetentionCandidate: Sendable {
+        var ordinal: Int64
+        var byteCount: Int
+        var isPinnedEvidence: Bool
+        /// Pending candidates are measured before insertion, so a pathological
+        /// snapshot never grows SQLite past the logical quota even briefly.
+        var isPending: Bool
     }
 
     /// SQLite exposes its connection as an `OpaquePointer`, which older Swift 6
@@ -273,12 +314,17 @@ actor AcpTranscriptStore {
     /// and overwrite metadata we never saw, so every write for the chat is
     /// refused until one of its reads succeeds or it is explicitly removed.
     private var unreadableChatIDs: Set<String> = []
+    /// A quota scan is required once per chat per actor lifetime, then writes
+    /// enforce the policy as part of their existing transaction. Avoid making
+    /// every top-edge page read perform an empty FULL-synchronous commit.
+    private var retentionCheckedChatIDs: Set<String> = []
     private var pending: [String: PendingWrite] = [:]
     private var flushTask: Task<Void, Never>?
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
     private let writerID: String
     private let schedulesAutomaticFlush: Bool
+    private let retentionPolicy: RetentionPolicy
     private var writerGeneration: Int64?
     private var writerLeaseExpiresAt: Int64 = 0
     private var injectedRemovalFailure: RemovalFailurePoint?
@@ -293,6 +339,7 @@ actor AcpTranscriptStore {
         self.legacyJSONURL = legacy
         self.writerID = UUID().uuidString
         self.schedulesAutomaticFlush = true
+        self.retentionPolicy = .production
         self.injectedRemovalFailure = nil
         self.injectedTombstoneFailure = nil
     }
@@ -303,12 +350,14 @@ actor AcpTranscriptStore {
         writerID: String = UUID().uuidString,
         schedulesAutomaticFlush: Bool = true,
         injectedRemovalFailure: RemovalFailurePoint? = nil,
-        injectedTombstoneFailure: TombstoneFailurePoint? = nil
+        injectedTombstoneFailure: TombstoneFailurePoint? = nil,
+        retentionPolicy: RetentionPolicy = .production
     ) {
         self.databaseURL = databaseURL.standardizedFileURL
         self.legacyJSONURL = legacyJSONURL?.standardizedFileURL
         self.writerID = writerID
         self.schedulesAutomaticFlush = schedulesAutomaticFlush
+        self.retentionPolicy = retentionPolicy
         self.injectedRemovalFailure = injectedRemovalFailure
         self.injectedTombstoneFailure = injectedTombstoneFailure
     }
@@ -325,6 +374,7 @@ actor AcpTranscriptStore {
         flush()
         do {
             let database = try openDatabase()
+            try ensureRetentionPolicyApplied(chatID: chatID, database: database)
             guard let metadata = try readMetadata(chatID: chatID, database: database) else {
                 unreadableChatIDs.remove(chatID)
                 return nil
@@ -358,6 +408,7 @@ actor AcpTranscriptStore {
         flush()
         do {
             let database = try openDatabase()
+            try ensureRetentionPolicyApplied(chatID: chatID, database: database)
             guard let metadata = try readMetadata(chatID: chatID, database: database) else {
                 unreadableChatIDs.remove(chatID)
                 return .missing
@@ -374,7 +425,8 @@ actor AcpTranscriptStore {
                 usage: metadata.usage,
                 draft: metadata.draft,
                 attachments: metadata.attachments,
-                sessionID: metadata.sessionID
+                sessionID: metadata.sessionID,
+                retentionStatus: metadata.retentionStatus
             ))
         } catch {
             unreadableChatIDs.insert(chatID)
@@ -418,6 +470,10 @@ actor AcpTranscriptStore {
     func page(for chatID: String, beforeOrdinal: Int64, limit: Int) -> Page? {
         guard Self.validChatID(chatID), beforeOrdinal >= 0,
               let database = try? openDatabase() else { return nil }
+        do { try ensureRetentionPolicyApplied(chatID: chatID, database: database) }
+        catch {
+            return nil
+        }
         return try? readPage(
             chatID: chatID,
             beforeOrdinal: beforeOrdinal,
@@ -823,6 +879,7 @@ actor AcpTranscriptStore {
             }
             writerGeneration = completedGeneration
             writerLeaseExpiresAt = 0
+            retentionCheckedChatIDs.formUnion(writes.keys)
             try secureDatabaseFile()
         } catch {
             // Retain the exact coalesced snapshots. A later stream update or an
@@ -898,7 +955,9 @@ actor AcpTranscriptStore {
                 usage_json BLOB,
                 draft TEXT,
                 attachments_json BLOB,
-                session_id TEXT
+                session_id TEXT,
+                quota_truncated_rows INTEGER NOT NULL DEFAULT 0 CHECK (quota_truncated_rows >= 0),
+                quota_truncated_bytes INTEGER NOT NULL DEFAULT 0 CHECK (quota_truncated_bytes >= 0)
             ) WITHOUT ROWID
             """,
             database: database
@@ -909,6 +968,7 @@ actor AcpTranscriptStore {
                 chat_id TEXT NOT NULL REFERENCES chats(chat_id) ON DELETE CASCADE,
                 ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
                 row_json BLOB NOT NULL,
+                quota_pinned INTEGER NOT NULL DEFAULT 0 CHECK (quota_pinned IN (0, 1)),
                 PRIMARY KEY (chat_id, ordinal)
             ) WITHOUT ROWID
             """,
@@ -931,8 +991,56 @@ actor AcpTranscriptStore {
         if try metadataValue(for: "deletion_generation", database: database) == nil {
             try setMetadataValue("0", for: "deletion_generation", database: database)
         }
+        try migrateRetentionSchemaIfNeeded(database)
         try migrateDeletedChatsGenerationIfNeeded(database)
-        try execute("PRAGMA user_version = 3", database: database)
+        try execute("PRAGMA user_version = 4", database: database)
+    }
+
+    private func migrateRetentionSchemaIfNeeded(_ database: SQLiteHandle) throws {
+        if try !tableHasColumn("chats", column: "quota_truncated_rows", database: database) {
+            try execute(
+                "ALTER TABLE chats ADD COLUMN quota_truncated_rows INTEGER NOT NULL DEFAULT 0 CHECK (quota_truncated_rows >= 0)",
+                database: database
+            )
+        }
+        if try !tableHasColumn("chats", column: "quota_truncated_bytes", database: database) {
+            try execute(
+                "ALTER TABLE chats ADD COLUMN quota_truncated_bytes INTEGER NOT NULL DEFAULT 0 CHECK (quota_truncated_bytes >= 0)",
+                database: database
+            )
+        }
+        if try !tableHasColumn("transcript_rows", column: "quota_pinned", database: database) {
+            try execute(
+                "ALTER TABLE transcript_rows ADD COLUMN quota_pinned INTEGER NOT NULL DEFAULT 0 CHECK (quota_pinned IN (0, 1))",
+                database: database
+            )
+        }
+        guard try metadataValue(for: "retention_pin_classification", database: database) != "1" else {
+            return
+        }
+        try withStatement(
+            "SELECT chat_id, ordinal, row_json FROM transcript_rows ORDER BY chat_id, ordinal",
+            database: database
+        ) { statement in
+            while try stepRow(statement, database: database) {
+                guard let chatID = Self.columnString(statement, column: 0),
+                      let data = Self.columnData(statement, column: 2),
+                      let row = try? decoder.decode(AcpTranscriptRow.self, from: data) else {
+                    throw StoreError.corruptRecord("stored transcript row could not be classified")
+                }
+                guard Self.isPinnedEvidence(row) else { continue }
+                let ordinal = sqlite3_column_int64(statement, 1)
+                try withStatement(
+                    "UPDATE transcript_rows SET quota_pinned = 1 WHERE chat_id = ? AND ordinal = ?",
+                    database: database
+                ) { update in
+                    try bind(chatID, at: 1, statement: update, database: database)
+                    try bind(ordinal, at: 2, statement: update, database: database)
+                    try stepDone(update, database: database)
+                }
+            }
+        }
+        try setMetadataValue("1", for: "retention_pin_classification", database: database)
     }
 
     private func ensureDeletedChatsTable(_ database: SQLiteHandle) throws {
@@ -977,9 +1085,17 @@ actor AcpTranscriptStore {
     }
 
     private func deletedChatsHaveGenerationColumn(_ database: SQLiteHandle) throws -> Bool {
-        try withStatement("PRAGMA table_info(deleted_chats)", database: database) { statement in
+        try tableHasColumn("deleted_chats", column: "generation", database: database)
+    }
+
+    private func tableHasColumn(
+        _ table: String,
+        column: String,
+        database: SQLiteHandle
+    ) throws -> Bool {
+        try withStatement("PRAGMA table_info(\(table))", database: database) { statement in
             while try stepRow(statement, database: database) {
-                if Self.columnString(statement, column: 1) == "generation" { return true }
+                if Self.columnString(statement, column: 1) == column { return true }
             }
             return false
         }
@@ -1057,30 +1173,9 @@ actor AcpTranscriptStore {
     private func apply(_ write: PendingWrite, chatID: String, database: SQLiteHandle) throws {
         try ensureChat(chatID, updatedAt: write.updatedAt, database: database)
         if let rowWrite = write.rows {
-            let prefixCount = try rowCount(
-                chatID: chatID,
-                beforeOrdinal: rowWrite.startOrdinal,
-                database: database
-            )
-            guard rowWrite.startOrdinal == 0 || prefixCount == Int(rowWrite.startOrdinal) else {
-                throw StoreError.invalidSnapshot
-            }
-            try withStatement(
-                "DELETE FROM transcript_rows WHERE chat_id = ? AND ordinal >= ?",
-                database: database
-            ) {
-                try bind(chatID, at: 1, statement: $0, database: database)
-                sqlite3_bind_int64($0, 2, rowWrite.startOrdinal)
-                try stepDone($0, database: database)
-            }
-            for (offset, row) in rowWrite.rows.enumerated() {
-                try insertRow(
-                    row,
-                    chatID: chatID,
-                    ordinal: rowWrite.startOrdinal + Int64(offset),
-                    database: database
-                )
-            }
+            try applyRows(rowWrite, chatID: chatID, database: database)
+        } else {
+            try enforceRetentionPolicy(chatID: chatID, database: database)
         }
         switch write.usage {
         case .unchanged: break
@@ -1128,6 +1223,334 @@ actor AcpTranscriptStore {
         }
     }
 
+    private func applyRows(
+        _ write: RowWrite,
+        chatID: String,
+        database: SQLiteHandle
+    ) throws {
+        // An upgraded database can begin above the new contract. Reduce that
+        // prefix in bounded batches before combining it with this snapshot.
+        try enforceRetentionPolicy(chatID: chatID, database: database)
+        guard try validSnapshotBoundary(
+            chatID: chatID,
+            startOrdinal: write.startOrdinal,
+            database: database
+        ) else {
+            throw StoreError.invalidSnapshot
+        }
+        try withStatement(
+            "DELETE FROM transcript_rows WHERE chat_id = ? AND ordinal >= ?",
+            database: database
+        ) { statement in
+            try bind(chatID, at: 1, statement: statement, database: database)
+            try bind(write.startOrdinal, at: 2, statement: statement, database: database)
+            try stepDone(statement, database: database)
+        }
+
+        var candidates = try retentionCandidates(chatID: chatID, database: database)
+        candidates.reserveCapacity(candidates.count + write.rows.count)
+        for (offset, row) in write.rows.enumerated() {
+            let data = try encoder.encode(row)
+            candidates.append(RetentionCandidate(
+                ordinal: write.startOrdinal + Int64(offset),
+                byteCount: data.count,
+                isPinnedEvidence: Self.isPinnedEvidence(row),
+                isPending: true
+            ))
+        }
+        let removed = retentionEvictions(from: candidates)
+        try deleteRetentionCandidates(
+            candidates.filter { !$0.isPending && removed.contains($0.ordinal) },
+            chatID: chatID,
+            database: database
+        )
+        for (offset, row) in write.rows.enumerated() {
+            let ordinal = write.startOrdinal + Int64(offset)
+            guard !removed.contains(ordinal) else { continue }
+            try insertEncodedRow(
+                encoder.encode(row),
+                pinned: Self.isPinnedEvidence(row),
+                chatID: chatID,
+                ordinal: ordinal,
+                database: database
+            )
+        }
+        try recordRetentionEvictions(
+            candidates.filter { removed.contains($0.ordinal) },
+            chatID: chatID,
+            database: database
+        )
+    }
+
+    private func enforceRetentionPolicy(chatID: String, database: SQLiteHandle) throws {
+        var totals = try retentionTotals(chatID: chatID, database: database)
+        var removedRows: Int64 = 0
+        var removedBytes: Int64 = 0
+        while totals.count > retentionPolicy.maximumRowCount
+                || totals.bytes > Int64(retentionPolicy.maximumBytes) {
+            let recentCutoff = try retentionRecentCutoff(
+                chatID: chatID,
+                rowCount: totals.count,
+                database: database
+            )
+            let batch = try retentionEvictionBatch(
+                chatID: chatID,
+                recentCutoff: recentCutoff,
+                database: database
+            )
+            guard !batch.isEmpty else {
+                throw StoreError.database("transcript quota could not select an eviction candidate")
+            }
+            var selected: [RetentionCandidate] = []
+            for candidate in batch {
+                guard totals.count > retentionPolicy.maximumRowCount
+                        || totals.bytes > Int64(retentionPolicy.maximumBytes) else { break }
+                selected.append(candidate)
+                totals.count -= 1
+                totals.bytes = max(0, totals.bytes - Int64(candidate.byteCount))
+                removedRows = Self.saturatingAdd(removedRows, 1)
+                removedBytes = Self.saturatingAdd(removedBytes, Int64(candidate.byteCount))
+            }
+            try deleteRetentionCandidates(selected, chatID: chatID, database: database)
+        }
+        try recordRetentionEvictions(
+            rows: removedRows,
+            bytes: removedBytes,
+            chatID: chatID,
+            database: database
+        )
+    }
+
+    private func retentionTotals(
+        chatID: String,
+        database: SQLiteHandle
+    ) throws -> (count: Int, bytes: Int64) {
+        try withStatement(
+            "SELECT COUNT(*), COALESCE(SUM(length(row_json)), 0) FROM transcript_rows WHERE chat_id = ?",
+            database: database
+        ) { statement in
+            try bind(chatID, at: 1, statement: statement, database: database)
+            guard try stepRow(statement, database: database) else { return (0, 0) }
+            return (
+                max(0, Int(sqlite3_column_int64(statement, 0))),
+                max(0, sqlite3_column_int64(statement, 1))
+            )
+        }
+    }
+
+    private func retentionRecentCutoff(
+        chatID: String,
+        rowCount: Int,
+        database: SQLiteHandle
+    ) throws -> Int64 {
+        guard retentionPolicy.recentRowCount > 0, rowCount > 0 else { return Int64.max }
+        let offset = min(rowCount, retentionPolicy.recentRowCount) - 1
+        return try withStatement(
+            "SELECT ordinal FROM transcript_rows WHERE chat_id = ? ORDER BY ordinal DESC LIMIT 1 OFFSET ?",
+            database: database
+        ) { statement in
+            try bind(chatID, at: 1, statement: statement, database: database)
+            sqlite3_bind_int64(statement, 2, Int64(offset))
+            guard try stepRow(statement, database: database) else { return Int64.max }
+            return sqlite3_column_int64(statement, 0)
+        }
+    }
+
+    private func retentionEvictionBatch(
+        chatID: String,
+        recentCutoff: Int64,
+        database: SQLiteHandle
+    ) throws -> [RetentionCandidate] {
+        try withStatement(
+            """
+            SELECT ordinal, length(row_json), quota_pinned
+            FROM transcript_rows WHERE chat_id = ?
+            ORDER BY CASE
+                WHEN ordinal >= ? THEN 2
+                WHEN quota_pinned = 1 THEN 1
+                ELSE 0
+            END ASC, ordinal ASC
+            LIMIT 256
+            """,
+            database: database
+        ) { statement in
+            try bind(chatID, at: 1, statement: statement, database: database)
+            try bind(recentCutoff, at: 2, statement: statement, database: database)
+            var candidates: [RetentionCandidate] = []
+            while try stepRow(statement, database: database) {
+                candidates.append(RetentionCandidate(
+                    ordinal: sqlite3_column_int64(statement, 0),
+                    byteCount: max(0, Int(sqlite3_column_int64(statement, 1))),
+                    isPinnedEvidence: sqlite3_column_int(statement, 2) == 1,
+                    isPending: false
+                ))
+            }
+            return candidates
+        }
+    }
+
+    private func ensureRetentionPolicyApplied(
+        chatID: String,
+        database: SQLiteHandle
+    ) throws {
+        guard !retentionCheckedChatIDs.contains(chatID) else { return }
+        try transaction(database) {
+            try enforceRetentionPolicy(chatID: chatID, database: database)
+        }
+        retentionCheckedChatIDs.insert(chatID)
+    }
+
+    private func retentionCandidates(
+        chatID: String,
+        database: SQLiteHandle
+    ) throws -> [RetentionCandidate] {
+        try withStatement(
+            "SELECT ordinal, length(row_json), quota_pinned FROM transcript_rows WHERE chat_id = ? ORDER BY ordinal ASC",
+            database: database
+        ) { statement in
+            try bind(chatID, at: 1, statement: statement, database: database)
+            var candidates: [RetentionCandidate] = []
+            while try stepRow(statement, database: database) {
+                candidates.append(RetentionCandidate(
+                    ordinal: sqlite3_column_int64(statement, 0),
+                    byteCount: max(0, Int(sqlite3_column_int64(statement, 1))),
+                    isPinnedEvidence: sqlite3_column_int(statement, 2) == 1,
+                    isPending: false
+                ))
+            }
+            return candidates
+        }
+    }
+
+    private func retentionEvictions(from candidates: [RetentionCandidate]) -> Set<Int64> {
+        var retainedCount = candidates.count
+        var retainedBytes = candidates.reduce(into: Int64(0)) { total, candidate in
+            total = Self.saturatingAdd(total, Int64(candidate.byteCount))
+        }
+        let maximumBytes = Int64(retentionPolicy.maximumBytes)
+        func isOverQuota() -> Bool {
+            retainedCount > retentionPolicy.maximumRowCount || retainedBytes > maximumBytes
+        }
+        guard isOverQuota() else { return [] }
+
+        let recentStart = max(0, candidates.count - retentionPolicy.recentRowCount)
+        let older = candidates[..<recentStart]
+        let evictionOrder = older.filter { !$0.isPinnedEvidence }
+            + older.filter(\.isPinnedEvidence)
+            + candidates[recentStart...]
+        var removed: Set<Int64> = []
+        for candidate in evictionOrder where isOverQuota() {
+            removed.insert(candidate.ordinal)
+            retainedCount -= 1
+            retainedBytes = max(0, retainedBytes - Int64(candidate.byteCount))
+        }
+        return removed
+    }
+
+    private func deleteRetentionCandidates(
+        _ candidates: [RetentionCandidate],
+        chatID: String,
+        database: SQLiteHandle
+    ) throws {
+        guard !candidates.isEmpty else { return }
+        try withStatement(
+            "DELETE FROM transcript_rows WHERE chat_id = ? AND ordinal = ?",
+            database: database
+        ) { statement in
+            for candidate in candidates {
+                sqlite3_reset(statement)
+                sqlite3_clear_bindings(statement)
+                try bind(chatID, at: 1, statement: statement, database: database)
+                try bind(candidate.ordinal, at: 2, statement: statement, database: database)
+                try stepDone(statement, database: database)
+            }
+        }
+    }
+
+    private func recordRetentionEvictions(
+        _ candidates: [RetentionCandidate],
+        chatID: String,
+        database: SQLiteHandle
+    ) throws {
+        let removedRows = Int64(candidates.count)
+        let removedBytes = candidates.reduce(into: Int64(0)) { total, candidate in
+            total = Self.saturatingAdd(total, Int64(candidate.byteCount))
+        }
+        try recordRetentionEvictions(
+            rows: removedRows,
+            bytes: removedBytes,
+            chatID: chatID,
+            database: database
+        )
+    }
+
+    private func recordRetentionEvictions(
+        rows removedRows: Int64,
+        bytes removedBytes: Int64,
+        chatID: String,
+        database: SQLiteHandle
+    ) throws {
+        guard removedRows > 0 || removedBytes > 0 else { return }
+        let current = try retentionStatus(chatID: chatID, database: database)
+        try withStatement(
+            "UPDATE chats SET quota_truncated_rows = ?, quota_truncated_bytes = ? WHERE chat_id = ?",
+            database: database
+        ) { statement in
+            try bind(Self.saturatingAdd(current.truncatedRowCount, removedRows), at: 1, statement: statement, database: database)
+            try bind(Self.saturatingAdd(current.truncatedByteCount, removedBytes), at: 2, statement: statement, database: database)
+            try bind(chatID, at: 3, statement: statement, database: database)
+            try stepDone(statement, database: database)
+        }
+    }
+
+    private func retentionStatus(chatID: String, database: SQLiteHandle) throws -> RetentionStatus {
+        try withStatement(
+            "SELECT quota_truncated_rows, quota_truncated_bytes FROM chats WHERE chat_id = ?",
+            database: database
+        ) { statement in
+            try bind(chatID, at: 1, statement: statement, database: database)
+            guard try stepRow(statement, database: database) else { return .empty }
+            return RetentionStatus(
+                truncatedRowCount: max(0, sqlite3_column_int64(statement, 0)),
+                truncatedByteCount: max(0, sqlite3_column_int64(statement, 1))
+            )
+        }
+    }
+
+    private func validSnapshotBoundary(
+        chatID: String,
+        startOrdinal: Int64,
+        database: SQLiteHandle
+    ) throws -> Bool {
+        guard startOrdinal > 0 else { return startOrdinal == 0 }
+        return try withStatement(
+            "SELECT MAX(ordinal), SUM(CASE WHEN ordinal = ? THEN 1 ELSE 0 END) FROM transcript_rows WHERE chat_id = ?",
+            database: database
+        ) { statement in
+            try bind(startOrdinal, at: 1, statement: statement, database: database)
+            try bind(chatID, at: 2, statement: statement, database: database)
+            guard try stepRow(statement, database: database),
+                  sqlite3_column_type(statement, 0) != SQLITE_NULL else { return false }
+            let maximumOrdinal = sqlite3_column_int64(statement, 0)
+            let boundaryExists = sqlite3_column_int64(statement, 1) > 0
+            if boundaryExists || maximumOrdinal == startOrdinal - 1 { return true }
+            let status = try retentionStatus(chatID: chatID, database: database)
+            return status.isTruncated && startOrdinal <= maximumOrdinal + 1
+        }
+    }
+
+    private static func isPinnedEvidence(_ row: AcpTranscriptRow) -> Bool {
+        switch row {
+        case .user, .tool: true
+        case .message, .thought, .plan: false
+        }
+    }
+
+    private static func saturatingAdd(_ lhs: Int64, _ rhs: Int64) -> Int64 {
+        guard rhs > 0 else { return lhs }
+        return lhs > Int64.max - rhs ? Int64.max : lhs + rhs
+    }
+
     private func insertRow(
         _ row: AcpTranscriptRow,
         chatID: String,
@@ -1135,13 +1558,30 @@ actor AcpTranscriptStore {
         database: SQLiteHandle
     ) throws {
         let data = try encoder.encode(row)
+        try insertEncodedRow(
+            data,
+            pinned: Self.isPinnedEvidence(row),
+            chatID: chatID,
+            ordinal: ordinal,
+            database: database
+        )
+    }
+
+    private func insertEncodedRow(
+        _ data: Data,
+        pinned: Bool,
+        chatID: String,
+        ordinal: Int64,
+        database: SQLiteHandle
+    ) throws {
         try withStatement(
-            "INSERT INTO transcript_rows(chat_id, ordinal, row_json) VALUES (?, ?, ?)",
+            "INSERT INTO transcript_rows(chat_id, ordinal, row_json, quota_pinned) VALUES (?, ?, ?, ?)",
             database: database
         ) {
             try bind(chatID, at: 1, statement: $0, database: database)
             sqlite3_bind_int64($0, 2, ordinal)
             try bind(data, at: 3, statement: $0, database: database)
+            sqlite3_bind_int($0, 4, pinned ? 1 : 0)
             try stepDone($0, database: database)
         }
     }
@@ -1179,6 +1619,7 @@ actor AcpTranscriptStore {
             """
             DELETE FROM chats
             WHERE usage_json IS NULL AND draft IS NULL AND attachments_json IS NULL AND session_id IS NULL
+              AND quota_truncated_rows = 0 AND quota_truncated_bytes = 0
               AND NOT EXISTS (
                   SELECT 1 FROM transcript_rows WHERE transcript_rows.chat_id = chats.chat_id
               )
@@ -1205,7 +1646,8 @@ actor AcpTranscriptStore {
     private func readMetadata(chatID: String, database: SQLiteHandle) throws -> StoredMetadata? {
         try withStatement(
             """
-            SELECT updated_at, usage_json, draft, attachments_json, session_id
+            SELECT updated_at, usage_json, draft, attachments_json, session_id,
+                   quota_truncated_rows, quota_truncated_bytes
             FROM chats WHERE chat_id = ?
             """,
             database: database
@@ -1238,7 +1680,11 @@ actor AcpTranscriptStore {
                 usage: usage,
                 draft: draft,
                 attachments: attachments,
-                sessionID: sessionID
+                sessionID: sessionID,
+                retentionStatus: RetentionStatus(
+                    truncatedRowCount: max(0, sqlite3_column_int64(statement, 5)),
+                    truncatedByteCount: max(0, sqlite3_column_int64(statement, 6))
+                )
             )
         }
     }
@@ -1351,7 +1797,10 @@ actor AcpTranscriptStore {
             return Page(
                 rows: decoded.map(\.1),
                 startOrdinal: first.0,
-                endOrdinalExclusive: last.0 + 1,
+                // Quota pruning can leave intentional ordinal gaps. A page
+                // requested before a loaded boundary still joins that boundary
+                // even when its newest retained evidence row is older.
+                endOrdinalExclusive: boundary ?? (last.0 + 1),
                 earlierRowCount: earlier,
                 totalRowCount: total
             )

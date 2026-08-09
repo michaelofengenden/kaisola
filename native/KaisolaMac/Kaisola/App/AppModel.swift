@@ -3212,6 +3212,7 @@ final class AppModel: ObservableObject {
             initialRowStartOrdinal: initialTranscript?.page.startOrdinal ?? 0,
             initialEarlierRowCount: initialTranscript?.page.earlierRowCount ?? 0,
             initialTotalRowCount: initialTranscript?.page.totalRowCount ?? 0,
+            initialRetentionStatus: initialTranscript?.retentionStatus ?? .empty,
             initialDraft: initialDraft,
             initialAttachments: initialTranscript?.attachments ?? [],
             initialUsage: initialTranscript?.usage.map {

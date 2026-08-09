@@ -272,6 +272,81 @@ final class QuickActionStoreTests: XCTestCase {
         XCTAssertTrue(reopened.quarantinedRows.isEmpty)
     }
 
+    // MARK: - Reversible deletion
+
+    func testDeletionUndoRestoresTheExactActionAtItsOriginalIndex() throws {
+        let actions = [
+            QuickAction(id: "build", title: "Build", command: "make"),
+            QuickAction(id: "test", title: "Test", command: "npm test -- --watch=false"),
+            QuickAction(id: "deploy", title: "Deploy", command: "make deploy"),
+        ]
+        let tokenID = try XCTUnwrap(UUID(uuidString: "10000000-0000-0000-0000-000000000001"))
+        let undo = QuickActionDeletionUndo(
+            id: tokenID,
+            action: actions[1],
+            originalIndex: 1
+        )
+
+        XCTAssertEqual(
+            undo.restoring(
+                in: [actions[0], actions[2]],
+                activeUndoID: tokenID
+            ),
+            actions,
+            "Undo must preserve the deleted id, title, command, and original order"
+        )
+    }
+
+    func testDeletionUndoRejectsAStaleTokenAfterAConcurrentDelete() throws {
+        let build = QuickAction(id: "build", title: "Build", command: "make")
+        let test = QuickAction(id: "test", title: "Test", command: "npm test")
+        let deploy = QuickAction(id: "deploy", title: "Deploy", command: "make deploy")
+        let first = QuickActionDeletionUndo(
+            id: try XCTUnwrap(UUID(uuidString: "20000000-0000-0000-0000-000000000001")),
+            action: test,
+            originalIndex: 1
+        )
+        let second = QuickActionDeletionUndo(
+            id: try XCTUnwrap(UUID(uuidString: "20000000-0000-0000-0000-000000000002")),
+            action: deploy,
+            originalIndex: 1
+        )
+        let afterBothDeletes = [build]
+
+        XCTAssertNil(
+            first.restoring(in: afterBothDeletes, activeUndoID: second.id),
+            "a superseded Undo control must never resurrect the wrong deletion"
+        )
+        XCTAssertEqual(
+            second.restoring(in: afterBothDeletes, activeUndoID: second.id),
+            [build, deploy]
+        )
+    }
+
+    func testDeletionUndoRejectsAnIdentityThatAlreadyReappeared() throws {
+        let action = QuickAction(id: "test", title: "Test", command: "npm test")
+        let tokenID = try XCTUnwrap(UUID(uuidString: "30000000-0000-0000-0000-000000000001"))
+        let undo = QuickActionDeletionUndo(id: tokenID, action: action, originalIndex: 0)
+
+        XCTAssertNil(
+            undo.restoring(in: [action], activeUndoID: tokenID),
+            "a concurrent restore must not create duplicate row identity"
+        )
+    }
+
+    func testDeletionDescriptorNamesValidActionsWithoutLeakingInvalidCommands() {
+        let valid = QuickAction(id: "deploy", title: "  Deploy  ", command: "make deploy")
+        let invalid = QuickAction(id: "untitled", title: "   ", command: "secret-token-command")
+
+        XCTAssertEqual(
+            QuickActionDeletionUndo.actionDescriptor(for: valid, originalIndex: 2),
+            "Quick Action “Deploy”"
+        )
+        let fallback = QuickActionDeletionUndo.actionDescriptor(for: invalid, originalIndex: 1)
+        XCTAssertEqual(fallback, "Quick Action row 2")
+        XCTAssertFalse(fallback.contains(invalid.command))
+    }
+
     // MARK: - Corrupt file
 
     func testCorruptFileDegradesToEmpty() throws {

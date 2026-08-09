@@ -119,6 +119,64 @@ final class AcpPermissionRulesTests: XCTestCase {
         XCTAssertNil(AcpPermissionRules.requestMatchesRule(rules, workspace: nil, kind: "execute", resource: "anything"))
     }
 
+    func testStandingRuleRemovalConfirmationDisclosesTheExactScope() {
+        let rule = PermissionRule(
+            id: "release-rule",
+            workspace: "/work/研究 project",
+            action: "execute",
+            resource: "git push --force-with-lease origin release/*",
+            at: 17
+        )
+
+        let presentation = StandingRuleRemovalPresentation(rule: rule)
+
+        XCTAssertEqual(presentation.title, "Delete Standing Allow Rule?")
+        XCTAssertEqual(
+            presentation.message,
+            "Action: execute\nResource: git push --force-with-lease origin release/*\nWorkspace: /work/研究 project\n\nFuture matching requests will require approval again."
+        )
+        XCTAssertEqual(
+            presentation.announcement,
+            "Standing allow rule deleted. git push --force-with-lease origin release/* in /work/研究 project now requires approval."
+        )
+    }
+
+    func testStandingRuleRemovalReturnsFocusToTheNearestRemainingRule() {
+        let rules = [
+            PermissionRule(id: "first", workspace: "/w", action: "read", resource: "*", at: 1),
+            PermissionRule(id: "middle", workspace: "/w", action: "execute", resource: "git *", at: 2),
+            PermissionRule(id: "last", workspace: "/w", action: "edit", resource: "*", at: 3),
+        ]
+
+        XCTAssertEqual(
+            StandingRuleRemovalPresentation.focusTarget(afterRemoving: "middle", from: rules),
+            .rule("last")
+        )
+        XCTAssertEqual(
+            StandingRuleRemovalPresentation.focusTarget(afterRemoving: "last", from: rules),
+            .rule("middle")
+        )
+        XCTAssertEqual(
+            StandingRuleRemovalPresentation.focusTarget(afterRemoving: "first", from: [rules[0]]),
+            .emptyState
+        )
+    }
+
+    func testStandingRuleRemovalDoesNotClaimADeletionThatDidNotPersist() {
+        let rule = PermissionRule(id: "kept", workspace: "/w", action: "read", resource: "*", at: 1)
+        let replacement = PermissionRule(
+            id: "replacement",
+            workspace: rule.workspace,
+            action: rule.action,
+            resource: rule.resource,
+            at: 2
+        )
+
+        XCTAssertFalse(StandingRuleRemovalPresentation.didRemove(rule, persistedRules: [rule]))
+        XCTAssertFalse(StandingRuleRemovalPresentation.didRemove(rule, persistedRules: [replacement]))
+        XCTAssertTrue(StandingRuleRemovalPresentation.didRemove(rule, persistedRules: []))
+    }
+
     @MainActor
     func testCreateRulePersistsTheScopeShownInReview() throws {
         let directory = FileManager.default.temporaryDirectory

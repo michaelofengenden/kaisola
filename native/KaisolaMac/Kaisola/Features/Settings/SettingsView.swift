@@ -1362,12 +1362,61 @@ struct SensitiveGlobFieldAccessibility: Equatable {
     }
 }
 
+struct StandingRuleRemovalPresentation: Equatable {
+    enum FocusTarget: Equatable {
+        case rule(String)
+        case emptyState
+    }
+
+    let rule: PermissionRule
+
+    var title: String { "Delete Standing Allow Rule?" }
+
+    var message: String {
+        """
+        Action: \(rule.action)
+        Resource: \(rule.resource)
+        Workspace: \(rule.workspace)
+
+        Future matching requests will require approval again.
+        """
+    }
+
+    var announcement: String {
+        let label = AcpPermissionRules.ruleLabel(action: rule.action, resource: rule.resource)
+        return "Standing allow rule deleted. \(label) in \(rule.workspace) now requires approval."
+    }
+
+    static func focusTarget(afterRemoving id: String, from rules: [PermissionRule]) -> FocusTarget {
+        let originalIndex = rules.firstIndex { $0.id == id } ?? 0
+        let remaining = rules.filter { $0.id != id }
+        guard !remaining.isEmpty else { return .emptyState }
+        return .rule(remaining[min(originalIndex, remaining.count - 1)].id)
+    }
+
+    static func didRemove(_ rule: PermissionRule, persistedRules: [PermissionRule]) -> Bool {
+        !persistedRules.contains { candidate in
+            candidate.id == rule.id
+                || (candidate.workspace == rule.workspace
+                    && candidate.action == rule.action
+                    && candidate.resource == rule.resource)
+        }
+    }
+}
+
 /// Guardrails tab: standing permission rules (delete) + sensitive globs (edit).
 private struct GuardrailsSettings: View {
     @ObservedObject var settings: NativePreviewSettings
     @State private var rules: [PermissionRule] = []
     @State private var newGlob = ""
     @State private var showsRestoreDefaultsConfirmation = false
+    @State private var pendingRuleRemoval: PermissionRule?
+    @State private var showsRuleRemovalConfirmation = false
+    @State private var pendingRuleFocus: StandingRuleRemovalPresentation.FocusTarget?
+    @State private var pendingRuleAnnouncement: String?
+    @State private var ruleRemovalFailure: String?
+    @FocusState private var focusedRuleID: String?
+    @FocusState private var emptyRuleStateFocused: Bool
     private let store = PermissionRuleStore()
 
     var body: some View {
@@ -1376,6 +1425,9 @@ private struct GuardrailsSettings: View {
                 if rules.isEmpty {
                     Text("No rules yet — \"Always Allow\" on a permission ask creates one.")
                         .font(.caption).foregroundStyle(.kaisolaSecondary)
+                        .focusable()
+                        .focused($emptyRuleStateFocused)
+                        .accessibilityIdentifier("settings.guardrails.allow-rules.empty")
                 }
                 ForEach(rules) { rule in
                     HStack {
@@ -1388,14 +1440,21 @@ private struct GuardrailsSettings: View {
                         }
                         Spacer()
                         Button(role: .destructive) {
-                            store.remove(id: rule.id)
-                            rules = store.rules()
+                            requestRuleRemoval(rule)
                         } label: {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
+                        .focused($focusedRuleID, equals: rule.id)
                         .accessibilityLabel("Delete allow-rule \(AcpPermissionRules.ruleLabel(action: rule.action, resource: rule.resource))")
+                        .accessibilityHint("Opens a confirmation showing the exact action, resource, and workspace.")
                     }
+                }
+                if let ruleRemovalFailure {
+                    Text(ruleRemovalFailure)
+                        .font(.caption)
+                        .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                        .accessibilityIdentifier("settings.guardrails.allow-rule-removal-error")
                 }
             }
             Section("Sensitive Files (Always Ask, Never Rule-Covered)") {
@@ -1439,6 +1498,27 @@ private struct GuardrailsSettings: View {
         .padding(6)
         .onAppear { rules = store.rules() }
         .confirmationDialog(
+            pendingRuleRemoval.map { StandingRuleRemovalPresentation(rule: $0).title }
+                ?? "Delete Standing Allow Rule?",
+            isPresented: $showsRuleRemovalConfirmation,
+            titleVisibility: .visible
+        ) {
+            if let rule = pendingRuleRemoval {
+                Button("Delete Allow Rule", role: .destructive) {
+                    confirmRuleRemoval(rule)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            if let rule = pendingRuleRemoval {
+                Text(StandingRuleRemovalPresentation(rule: rule).message)
+            }
+        }
+        .onChange(of: showsRuleRemovalConfirmation) { previous, current in
+            guard previous, !current else { return }
+            finishRuleRemovalDialog()
+        }
+        .confirmationDialog(
             "Restore Default Sensitive-File Patterns?",
             isPresented: $showsRestoreDefaultsConfirmation,
             titleVisibility: .visible
@@ -1472,6 +1552,60 @@ private struct GuardrailsSettings: View {
         }
         settings.sensitiveGlobs.append(trimmed)
         newGlob = ""
+    }
+
+    private func requestRuleRemoval(_ rule: PermissionRule) {
+        pendingRuleRemoval = rule
+        pendingRuleFocus = .rule(rule.id)
+        pendingRuleAnnouncement = nil
+        ruleRemovalFailure = nil
+        showsRuleRemovalConfirmation = true
+    }
+
+    private func confirmRuleRemoval(_ rule: PermissionRule) {
+        let presentation = StandingRuleRemovalPresentation(rule: rule)
+        let successFocus = StandingRuleRemovalPresentation.focusTarget(
+            afterRemoving: rule.id,
+            from: rules
+        )
+        store.remove(id: rule.id)
+        let persistedRules = store.rules()
+        rules = persistedRules
+        if StandingRuleRemovalPresentation.didRemove(rule, persistedRules: persistedRules) {
+            pendingRuleFocus = successFocus
+            pendingRuleAnnouncement = presentation.announcement
+            ruleRemovalFailure = nil
+        } else {
+            pendingRuleFocus = .rule(rule.id)
+            pendingRuleAnnouncement = nil
+            ruleRemovalFailure = "The allow rule could not be deleted. Nothing changed; try again."
+        }
+    }
+
+    private func finishRuleRemovalDialog() {
+        pendingRuleRemoval = nil
+        if let pendingRuleFocus {
+            focusedRuleID = nil
+            emptyRuleStateFocused = false
+            switch pendingRuleFocus {
+            case let .rule(id):
+                focusedRuleID = id
+            case .emptyState:
+                emptyRuleStateFocused = true
+            }
+        }
+        pendingRuleFocus = nil
+        if let pendingRuleAnnouncement {
+            NSAccessibility.post(
+                element: NSApplication.shared,
+                notification: .announcementRequested,
+                userInfo: [
+                    .announcement: pendingRuleAnnouncement,
+                    .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+                ]
+            )
+        }
+        pendingRuleAnnouncement = nil
     }
 
     private func announceValidationChange(previous: String?, current: String?) {

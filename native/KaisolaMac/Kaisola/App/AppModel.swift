@@ -2705,8 +2705,10 @@ final class AppModel: ObservableObject {
                       chats.contains(where: { $0.id == descriptor.id }) == false,
                       // A tombstoned chat was deleted; a stale archived pane
                       // (crash between phases, another window) must not
-                      // revive it (§4e).
-                      await transcriptStore.isTombstoned(chatID: descriptor.id) == false,
+                      // revive it (§4e). Only a proven `.absent` restores, so a
+                      // lookup the store cannot complete on a busy, corrupt, or
+                      // unreadable database leaves the pane out instead.
+                      await transcriptStore.tombstoneState(chatID: descriptor.id) == .absent,
                       let agent = AgentRegistry.profile(id: descriptor.agentID) else { continue }
                 let directory = URL(fileURLWithPath: descriptor.workspacePath, isDirectory: true)
                     .standardizedFileURL

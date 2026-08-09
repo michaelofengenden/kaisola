@@ -77,6 +77,19 @@ actor AcpTranscriptStore {
         var sessionID: String?
     }
 
+    /// Answer to "did the user delete this chat?". The third case exists so a
+    /// SQLite failure stays distinguishable from a proven absence of any
+    /// deletion record (§4e).
+    enum TombstoneState: Equatable, Sendable {
+        /// The store proved no deletion record exists.
+        case absent
+        /// A durable deletion record exists.
+        case present
+        /// The store could not answer. Treated as neither restorable nor
+        /// writable, because the chat may well be deleted.
+        case unknown
+    }
+
     enum StoreError: Error, Equatable {
         case database(String)
         case corruptLegacyArchive
@@ -407,12 +420,28 @@ actor AcpTranscriptStore {
         }
     }
 
-    func isTombstoned(chatID: String) -> Bool {
-        guard Self.validChatID(chatID),
-              let database = try? openDatabase(),
-              tableExists("deleted_chats", database: database) else { return false }
+    /// Tri-state deletion probe. Restoration and persistence proceed only on
+    /// `.absent`, so a lookup the store cannot complete fails closed instead
+    /// of authorizing content the user permanently deleted.
+    func tombstoneState(chatID: String) -> TombstoneState {
+        // A malformed id is unanswerable rather than provably undeleted; the
+        // store never wrote one, so nothing legitimate is refused here.
+        guard Self.validChatID(chatID) else { return .unknown }
+        do {
+            let database = try openDatabase()
+            return try hasTombstone(chatID: chatID, database: database) ? .present : .absent
+        } catch {
+            return .unknown
+        }
+    }
+
+    /// Throwing probe shared by every in-actor caller. Database-open, table
+    /// inspection, prepare, bind, and step failures all propagate: a transient
+    /// SQLite error must never read as "this chat was never deleted".
+    private func hasTombstone(chatID: String, database: SQLiteHandle) throws -> Bool {
+        guard try tableExists("deleted_chats", database: database) else { return false }
         var found = false
-        try? withStatement(
+        try withStatement(
             "SELECT 1 FROM deleted_chats WHERE chat_id = ? LIMIT 1",
             database: database
         ) {
@@ -428,7 +457,7 @@ actor AcpTranscriptStore {
     /// the next retry instead of stranding transcript bytes without intent.
     func vacuumTombstones() {
         guard let database = try? openDatabase(),
-              tableExists("deleted_chats", database: database) else { return }
+              (try? tableExists("deleted_chats", database: database)) == true else { return }
         try? transaction(database) {
             // `transcript_rows` follows through its ON DELETE CASCADE. This is
             // the idempotent restart path for a crash before remove(chatID:).
@@ -449,16 +478,14 @@ actor AcpTranscriptStore {
         }
     }
 
-    private func tableExists(_ name: String, database: SQLiteHandle) -> Bool {
-        var exists = false
-        try? withStatement(
+    private func tableExists(_ name: String, database: SQLiteHandle) throws -> Bool {
+        try withStatement(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1",
             database: database
-        ) {
-            try bind(name, at: 1, statement: $0, database: database)
-            exists = try stepRow($0, database: database)
+        ) { statement in
+            try bind(name, at: 1, statement: statement, database: database)
+            return try stepRow(statement, database: database)
         }
-        return exists
     }
 
     func flush() {
@@ -473,8 +500,11 @@ actor AcpTranscriptStore {
                     guard let write = writes[chatID] else { continue }
                     // A buffered write racing a deletion (a final stream chunk
                     // landing as the user hits delete) must not re-materialize
-                    // tombstoned content 350ms later (§4e).
-                    guard !isTombstoned(chatID: chatID) else { continue }
+                    // tombstoned content 350ms later (§4e). A probe that cannot
+                    // complete fails closed: it throws, the transaction rolls
+                    // back, and the coalesced snapshots below stay queued for a
+                    // later retry rather than being written unverified.
+                    guard try !hasTombstone(chatID: chatID, database: database) else { continue }
                     try apply(write, chatID: chatID, database: database)
                 }
                 try pruneEmptyChats(database)

@@ -505,7 +505,9 @@ async function dispatch(client, method, params = {}) {
     case 'terminal.kill': {
       const id = terminalId()
       requireAllowed(id)
-      return { ok: mgr.kill(id) }
+      // Forwarded verbatim: a refused signal carries its own diagnostic and
+      // must not be flattened back into a bare ok.
+      return mgr.kill(id)
     }
     case 'terminal.release': {
       const id = terminalId()

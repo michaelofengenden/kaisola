@@ -809,16 +809,30 @@ function waitForExit(id) {
   return new Promise((resolve) => r.waiters.push(resolve))
 }
 
+/** Signal failures travel to the renderer and into agent transcripts, so only
+ * an errno-shaped token ever leaves this module — never the raw error text,
+ * which can carry a stack, a cwd, or the spawned command line. */
+function signalFailureCode(error) {
+  const code = error?.code
+  return typeof code === 'string' && /^[A-Z][A-Z0-9_]{1,31}$/.test(code) ? code : 'unknown'
+}
+
+/** node-pty can refuse a kill — EPERM after a setuid child, EBADF once the
+ * backend fd is gone — and a refused signal leaves the command running. The
+ * record still being in the map is not evidence that it stopped, so the
+ * refusal is reported: a caller told the stop succeeded stops watching a
+ * process that is still mutating the workspace. */
 function kill(id) {
   const r = terms.get(id)
-  if (r) {
-    try {
-      if (r.pty) r.pty.kill()
-    } catch {
-      /* noop */
-    }
+  if (!r) return { ok: false, message: 'Terminal is no longer available.' }
+  // Nothing left to signal — an already-ended command is genuinely stopped.
+  if (r.exited || !r.pty) return { ok: true }
+  try {
+    r.pty.kill()
+  } catch (error) {
+    return { ok: false, message: `terminal kill refused by node-pty (${signalFailureCode(error)})` }
   }
-  return !!r
+  return { ok: true }
 }
 
 function release(id) {

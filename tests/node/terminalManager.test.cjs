@@ -261,6 +261,69 @@ test('release deletes the spool without recreating exit evidence', async () => {
   assert.equal(TerminalSpool.coldTail(id, managerSpoolDir), null)
 })
 
+test('a refused pty signal reports failure and leaves the command running', async (t) => {
+  const id = 'kill-refused-by-node-pty'
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  const acceptSignal = record.pty.kill.bind(record.pty)
+  t.after(() => {
+    // Restore first: a refusal left injected would survive this test as a real
+    // orphaned pty holding the runner's event loop open.
+    record.pty.kill = acceptSignal
+    manager.release(id)
+  })
+
+  const refusal = new Error(`kill EPERM for ${managerSpoolDir}/private-command-line`)
+  refusal.code = 'EPERM'
+  record.pty.kill = () => { throw refusal }
+
+  const refused = manager.kill(id)
+  assert.equal(refused.ok, false, 'a swallowed refusal reports a stop that never happened')
+  assert.match(refused.message, /EPERM/)
+  // Safe diagnostic: the errno travels, the raw error text does not.
+  assert.doesNotMatch(refused.message, /private-command-line/)
+  assert.equal(manager.isLive(id), true)
+
+  // Liveness proven by the process rather than by the surviving record:
+  // /bin/cat echoes on a pty, so returning bytes mean the command outlived
+  // the signal the caller was told had stopped it.
+  assert.deepEqual(manager.write(id, 'still-running\n'), { ok: true })
+  let echoed = ''
+  for (let attempt = 0; attempt < 40 && !echoed.includes('still-running'); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    echoed = manager.snapshot(id).output
+  }
+  assert.match(echoed, /still-running/)
+
+  record.pty.kill = acceptSignal
+  assert.deepEqual(manager.kill(id), { ok: true })
+  await manager.waitForExit(id)
+  assert.equal(manager.isLive(id), false)
+})
+
+test('kill answers a stop for an ended terminal and a failure for an unknown one', async (t) => {
+  const id = 'kill-after-natural-exit'
+  t.after(() => manager.release(id))
+  manager.spawn({
+    id,
+    command: '/bin/sh',
+    args: ['-c', 'exit 0'],
+    cwd: managerSpoolDir,
+  })
+  await manager.waitForExit(id)
+
+  // Already ended: there is nothing left to signal, so the stop is real.
+  assert.deepEqual(manager.kill(id), { ok: true })
+  assert.deepEqual(manager.kill('terminal-this-broker-never-had'), {
+    ok: false,
+    message: 'Terminal is no longer available.',
+  })
+})
+
 test('killAll suppresses exit stamping during managed broker shutdown', async () => {
   const id = 'managed-shutdown-has-no-exit-evidence'
   const record = manager.spawn({

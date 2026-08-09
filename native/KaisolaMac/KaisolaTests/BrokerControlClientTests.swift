@@ -52,6 +52,38 @@ final class BrokerControlClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testKillRequiresPositiveBrokerAcknowledgement() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true, killAccepted: false)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        do {
+            try await client.kill(projectID: "project.one", terminalID: "terminal-one")
+            XCTFail("A broker that could not signal the pty must not read as a completed stop.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .requestFailed("terminal.kill"))
+        }
+        await client.disconnect()
+    }
+
+    func testKillAcceptsExplicitPositiveBrokerAcknowledgement() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.kill(projectID: "project.one", terminalID: "terminal-one")
+        let frames = await transport.sentFrames()
+        let request = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(request["method"]?.stringValue, "terminal.kill")
+        XCTAssertEqual(request["params"]?.objectValue?["id"]?.stringValue, "terminal-one")
+        await client.disconnect()
+    }
+
     func testControllerLaneReportsUnexpectedPeerDisconnect() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
         let client = BrokerControlClient(
@@ -363,12 +395,14 @@ private actor DisconnectSignal {
 
 private actor ScriptedControlBrokerTransport: BrokerByteTransport {
     private let resizeAccepted: Bool
+    private let killAccepted: Bool
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []
     private var waiter: CheckedContinuation<Data?, Never>?
 
-    init(resizeAccepted: Bool) {
+    init(resizeAccepted: Bool, killAccepted: Bool = true) {
         self.resizeAccepted = resizeAccepted
+        self.killAccepted = killAccepted
     }
 
     func connect(path: String) async throws {}
@@ -393,9 +427,14 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
         }
         guard type == "request", let id = object["id"]?.stringValue else { return }
         let result: JSONValue
-        if object["method"]?.stringValue == "terminal.resize" {
+        switch object["method"]?.stringValue {
+        case "terminal.resize":
             result = .object(["ok": .bool(resizeAccepted)])
-        } else {
+        case "terminal.kill":
+            result = killAccepted
+                ? .object(["ok": .bool(true)])
+                : .object(["ok": .bool(false), "message": .string("terminal kill refused by node-pty (EPERM)")])
+        default:
             result = .object(["ok": .bool(true)])
         }
         deliver(try encoded(.object([

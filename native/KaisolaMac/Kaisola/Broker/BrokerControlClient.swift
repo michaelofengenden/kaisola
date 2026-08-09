@@ -279,8 +279,14 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         }
     }
 
+    /// A broker that could not signal the pty answers `{ok:false}`: the command
+    /// is still running, so the refusal has to reach the caller instead of
+    /// reading as a completed stop.
     func kill(projectID: String, terminalID: String) async throws {
-        _ = try await request(.kill, params: identity(projectID: projectID, terminalID: terminalID))
+        let result = try await request(.kill, params: identity(projectID: projectID, terminalID: terminalID))
+        guard result.objectValue?["ok"]?.boolValue == true else {
+            throw BrokerClientError.requestFailed("terminal.kill")
+        }
     }
 
     /// Permanently ends an owned terminal and removes its retained broker

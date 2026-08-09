@@ -62,7 +62,9 @@ struct QuietProjectRail: View {
     private let deleteRecentlyClosed: (AppModel.RecentlyClosedSurface) -> Void
 
     /// Time-in-state, not time-since-creation: rows report how long the surface
-    /// has been in the state it is showing.
+    /// has been in the state it is showing. `QuietTimeSemantic` is where that
+    /// one rule is spelled out per status for the tooltip and VoiceOver — the
+    /// compact label is four characters wide and can only ever be a number.
     @State private var clock = QuietStatusClock()
     @State private var now = Date()
     /// Held in `@State` so a parent re-render (which happens on every streamed
@@ -120,7 +122,14 @@ struct QuietProjectRail: View {
                 model.moveProject(id: move.id, toIndex: move.toIndex)
             }
         }
-        .onReceive(tick) { now = $0 }
+        .onReceive(tick) { instant in
+            now = instant
+            // A wall clock that moved backwards leaves stamps in the future,
+            // and a future stamp reads "now" forever. Checked on the tick
+            // rather than at the moment of the change because nothing tells the
+            // app the clock moved.
+            clock.reconcile(now: instant)
+        }
     }
 
     private func group(_ project: AppModel.ProjectGroup, placement: QuietProjectPlacement) -> some View {
@@ -132,7 +141,7 @@ struct QuietProjectRail: View {
             placement: placement,
             now: now,
             orderStore: orderStore,
-            since: { clock.since(id: $0) },
+            reading: { clock.reading(id: $0) },
             note: { id, status in clock.note(id: id, status: status, at: Date()) },
             selectSession: selectSession,
             launchMenu: launchMenu,
@@ -437,7 +446,7 @@ private struct QuietProjectGroup: View {
     let placement: QuietProjectPlacement
     let now: Date
     let orderStore: SessionOrderStore
-    let since: (String) -> Date?
+    let reading: (String) -> QuietStatusClock.Reading?
     let note: (String, QuietSessionStatus) -> Void
     let selectSession: (BrokerTerminalRecord) -> Void
     let launchMenu: (AppModel.ProjectGroup) -> AnyView
@@ -875,6 +884,7 @@ private struct QuietProjectGroup: View {
             ),
             status: status,
             timeLabel: timeLabel(record.id),
+            timeDetail: timeDetail(record.id, status: status),
             isSelected: selected == record.id,
             isOnScreen: onScreen.contains(record.id),
             tooltip: tooltip(for: record),
@@ -892,6 +902,7 @@ private struct QuietProjectGroup: View {
             title: chat.conversation.title,
             status: status,
             timeLabel: timeLabel(chat.id),
+            timeDetail: timeDetail(chat.id, status: status),
             isSelected: selected == chat.id,
             isOnScreen: onScreen.contains(chat.id),
             tooltip: chatTooltip(chat),
@@ -909,6 +920,7 @@ private struct QuietProjectGroup: View {
             title: mesh.title,
             status: status,
             timeLabel: timeLabel(mesh.id),
+            timeDetail: timeDetail(mesh.id, status: status),
             isSelected: selected == mesh.id,
             isOnScreen: onScreen.contains(mesh.id),
             tooltip: mesh.stage == "Idle" ? "Mesh · Ready" : "Mesh · \(mesh.stage)",
@@ -922,8 +934,26 @@ private struct QuietProjectGroup: View {
     // MARK: Derivations
 
     private func timeLabel(_ id: String) -> String {
-        guard let start = since(id) else { return "" }
+        guard let start = reading(id)?.at else { return "" }
         return QuietTimeLabel.label(since: start, now: now)
+    }
+
+    /// The same value as a sentence, for the tooltip and the row's
+    /// accessibility value. The compact label can only ever be a number; this
+    /// is where it says which clock the number came from.
+    ///
+    /// The status is the row's own rather than the stamp's: both come from the
+    /// `statuses` map that stamped the clock in the same body pass, so they
+    /// agree, and if a future edit ever breaks that the row's words will still
+    /// match the dot beside them.
+    private func timeDetail(_ id: String, status: QuietSessionStatus) -> String {
+        guard let reading = reading(id) else { return "" }
+        return QuietTimeSemantic.phrase(
+            status: status,
+            since: reading.at,
+            now: now,
+            origin: reading.origin
+        )
     }
 
     /// Everything the rollup and the expanded rows both need, derived once per
@@ -1350,6 +1380,9 @@ private struct QuietSurfaceRowView: View {
     let title: String
     let status: QuietSessionStatus
     let timeLabel: String
+    /// What the compact `timeLabel` means, spelled out for the tooltip and for
+    /// VoiceOver. Empty until the clock has stamped this surface.
+    let timeDetail: String
     let isSelected: Bool
     /// On screen, but not the pane holding focus.
     var isOnScreen = false
@@ -1387,7 +1420,10 @@ private struct QuietSurfaceRowView: View {
         // never surfaces as the Button's AXTitle/description, which left
         // System Events seeing a row with AXPress but no readable title.
         .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel)
+        .accessibilityLabel(QuietRowSpeech.label(title: title, status: status))
+        // The time is the row's VALUE, not part of its name: "34m" spoken after
+        // the title said a number with no unit and no clock behind it.
+        .accessibilityValue(timeDetail)
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
         .accessibilityIdentifier(id)
         .accessibilityAction { select() }
@@ -1396,19 +1432,11 @@ private struct QuietSurfaceRowView: View {
             groupHover(inside)
             withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
         }
-        .help(tooltip)
+        .help(QuietRowSpeech.tooltip(details: tooltip, time: timeDetail))
         .contextMenu { menu() }
         .listRowInsets(QuietRailMetrics.listRowBleed)
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
-    }
-
-    /// A row with no time-in-state yet must not read as "…, idle, " — the
-    /// components are joined only when they carry something.
-    private var accessibilityLabel: String {
-        [title, status.accessibilityWord ?? "idle", timeLabel]
-            .filter { !$0.isEmpty }
-            .joined(separator: ", ")
     }
 
     /// ⌘-click opens the surface beside the current one instead of replacing

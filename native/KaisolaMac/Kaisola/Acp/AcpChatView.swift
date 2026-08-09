@@ -16,6 +16,7 @@ struct AcpChatView: View {
 
     @State private var restoreTarget: AcpConversation.TurnCheckpoint?
     @ObservedObject var conversation: AcpConversation
+    @ObservedObject private var accountAccess: ChatAccountAccess
     private let presentation: Presentation
     @State private var draft = ""
     /// Highlights the composer while an OS file drag hovers it.
@@ -25,20 +26,37 @@ struct AcpChatView: View {
     @State private var transcriptIsAtBottom = true
     @State private var hasUnseenTranscriptUpdates = false
     @State private var transcriptConversationID: ObjectIdentifier?
+    @State private var isExportingTranscript = false
     @FocusState private var composerFocused: Bool
     private let focusRequestGeneration: UInt64?
     private let onKeyboardFocus: (() -> Void)?
+    private let onSignIn: () -> Void
+    private let onChooseAccount: () -> Void
+    private let onPreserveTranscript: () -> Void
+
+    private struct StartupTaskID: Hashable {
+        let conversation: ObjectIdentifier
+        let accountAllowsStart: Bool
+    }
 
     init(
         conversation: AcpConversation,
+        accountAccess: ChatAccountAccess,
         presentation: Presentation = .standard,
         focusRequestGeneration: UInt64? = nil,
-        onKeyboardFocus: (() -> Void)? = nil
+        onKeyboardFocus: (() -> Void)? = nil,
+        onSignIn: @escaping () -> Void = {},
+        onChooseAccount: @escaping () -> Void = {},
+        onPreserveTranscript: @escaping () -> Void = {}
     ) {
         _conversation = ObservedObject(wrappedValue: conversation)
+        _accountAccess = ObservedObject(wrappedValue: accountAccess)
         self.presentation = presentation
         self.focusRequestGeneration = focusRequestGeneration
         self.onKeyboardFocus = onKeyboardFocus
+        self.onSignIn = onSignIn
+        self.onChooseAccount = onChooseAccount
+        self.onPreserveTranscript = onPreserveTranscript
     }
 
     /// The chat has produced nothing yet, so the transcript's space belongs to
@@ -58,6 +76,14 @@ struct AcpChatView: View {
                 embeddedControls
             }
             Divider()
+            if conversation.transcriptRetentionStatus.isTruncated {
+                transcriptRetentionNotice
+                Divider()
+            }
+            if conversation.transcriptPersistenceHealth.needsAttention {
+                transcriptPersistenceNotice
+                Divider()
+            }
             if showsEmptyState {
                 emptyState
             } else {
@@ -99,6 +125,12 @@ struct AcpChatView: View {
         // saves the preceding session's draft.
         .task(id: ObjectIdentifier(conversation)) {
             draft = conversation.loadDraft()
+        }
+        .task(id: StartupTaskID(
+            conversation: ObjectIdentifier(conversation),
+            accountAllowsStart: accountAccess.allowsAdapterStart
+        )) {
+            guard accountAccess.allowsAdapterStart else { return }
             await conversation.start()
         }
         .onChange(of: draft) { _, newValue in
@@ -107,6 +139,97 @@ struct AcpChatView: View {
         .onAppear { applyFocusRequest(focusRequestGeneration) }
         .onChange(of: focusRequestGeneration) { _, request in
             applyFocusRequest(request)
+        }
+    }
+
+    private var transcriptRetentionNotice: some View {
+        let status = conversation.transcriptRetentionStatus
+        let bytes = ByteCountFormatter.string(
+            fromByteCount: status.truncatedByteCount,
+            countStyle: .file
+        )
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "archivebox")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text("Earlier saved history was truncated at this chat's disk quota (\(status.truncatedRowCount.formatted()) rows, \(bytes)). User prompts, tool evidence, and the newest transcript were kept first.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.secondary.opacity(0.06))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Saved chat history truncated")
+        .accessibilityValue("\(status.truncatedRowCount) rows and \(bytes) removed after this chat reached its disk quota")
+    }
+
+    private var transcriptPersistenceNotice: some View {
+        let health = conversation.transcriptPersistenceHealth
+        let detail: String
+        let canRetry: Bool
+        switch health {
+        case .healthy:
+            detail = ""
+            canRetry = false
+        case let .retrying(attempt, maximumAttempts):
+            detail = "Saving the latest transcript failed. Retry \(attempt) of \(maximumAttempts) is pending; keep this chat open."
+            canRetry = false
+        case let .failed(failure):
+            detail = "\(failure.detail) \(failure.guidance)"
+            canRetry = true
+        }
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            if canRetry {
+                Button("Retry") { conversation.retryTranscriptPersistence() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
+            Button("Export Recovery Copy") { exportTranscriptRecoveryCopy() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.08))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("acp.transcriptPersistenceWarning")
+        .accessibilityLabel("Transcript is not saved")
+        .accessibilityValue(detail)
+    }
+
+    @MainActor
+    private func exportTranscriptRecoveryCopy() {
+        let panel = NSSavePanel()
+        panel.title = "Export Chat Transcript Recovery Copy"
+        panel.prompt = "Export"
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = AcpTranscriptRecoveryExport.suggestedFileName(
+            for: conversation.title
+        )
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try AcpTranscriptRecoveryExport.data(
+                title: conversation.title,
+                startOrdinal: conversation.loadedRowStartOrdinal,
+                rows: conversation.rows
+            )
+            try data.write(to: url, options: .atomic)
+        } catch {
+            ToastCenter.shared.show(
+                "Could not export the transcript recovery copy: \(error.localizedDescription)",
+                style: .error
+            )
         }
     }
 
@@ -198,6 +321,65 @@ struct AcpChatView: View {
                     .foregroundStyle(.secondary)
                     .help("Cumulative cost reported by this agent session")
                     .accessibilityLabel("Session cost \(cost)")
+            }
+        }
+        Menu {
+            Button("Copy Last Response") { copyLastResponse() }
+                .disabled(conversation.lastAssistantResponse == nil)
+            Button("Export/Open as Markdown…") { exportAndOpenMarkdown() }
+                .disabled(
+                    isExportingTranscript
+                        || (conversation.rows.isEmpty && conversation.hiddenEarlierCount == 0)
+                )
+        } label: {
+            if isExportingTranscript {
+                ProgressView().controlSize(.mini)
+            } else {
+                Image(systemName: "square.and.arrow.up")
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Copy or export this conversation")
+        .accessibilityLabel("Conversation export actions")
+        .accessibilityIdentifier("acp.transcriptExportMenu")
+    }
+
+    @MainActor
+    private func copyLastResponse() {
+        guard let response = conversation.lastAssistantResponse else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(response, forType: .string) else {
+            ToastCenter.shared.show("Could not copy the last response.", style: .error)
+            return
+        }
+        ToastCenter.shared.show("Last response copied.", style: .success)
+    }
+
+    @MainActor
+    private func exportAndOpenMarkdown() {
+        let panel = NSSavePanel()
+        panel.title = "Export and Open Chat as Markdown"
+        panel.prompt = "Export & Open"
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = AcpTranscriptMarkdownExport.suggestedFileName(
+            for: conversation.title
+        )
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        isExportingTranscript = true
+        Task { @MainActor in
+            defer { isExportingTranscript = false }
+            do {
+                _ = try await conversation.exportTranscriptMarkdown(to: destination)
+                guard NSWorkspace.shared.open(destination) else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
+            } catch {
+                ToastCenter.shared.show(
+                    "Could not export the chat as Markdown: \(error.localizedDescription)",
+                    style: .error
+                )
             }
         }
     }
@@ -341,7 +523,9 @@ struct AcpChatView: View {
 
     private var composer: some View {
         VStack(spacing: 6) {
-            if !conversation.isConnected, conversation.statusMessage != nil {
+            if let account = accountAccess.presentation {
+                accountRecoveryCard(account)
+            } else if !conversation.isConnected, conversation.statusMessage != nil {
                 HStack(spacing: 8) {
                     Label("Agent disconnected — your draft and queued follow-ups are preserved.", systemImage: "bolt.slash")
                         .font(.caption)
@@ -444,6 +628,63 @@ struct AcpChatView: View {
         DispatchQueue.main.async {
             composerFocused = true
         }
+    }
+
+    private func accountRecoveryCard(
+        _ account: ChatAccountAccess.Presentation
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                if account.showsActivityIndicator {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel(account.headline)
+                } else {
+                    Image(systemName: "person.crop.circle.badge.exclamationmark")
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(account.headline)
+                        .font(.caption.weight(.semibold))
+                    Text("\(account.provider) · \(account.account)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                    Text(account.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            if !account.actions.isEmpty {
+                HStack(spacing: 8) {
+                    Button(ChatAccountAccess.RecoveryAction.signIn.rawValue, action: onSignIn)
+                        .buttonStyle(.borderedProminent)
+                    Button(
+                        ChatAccountAccess.RecoveryAction.chooseAccount.rawValue,
+                        action: onChooseAccount
+                    )
+                        .buttonStyle(.bordered)
+                    Button(
+                        ChatAccountAccess.RecoveryAction.preserveTranscript.rawValue,
+                        action: onPreserveTranscript
+                    )
+                        .buttonStyle(.bordered)
+                    Spacer(minLength: 0)
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(.orange.opacity(0.3), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(account.headline). \(account.provider) account \(account.account). \(account.detail)")
     }
 
     private var attachmentStrip: some View {
@@ -1300,6 +1541,46 @@ struct AcpPermissionBar: View {
                 .textSelection(.enabled)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+enum AcpTranscriptRecoveryExport {
+    struct Document: Codable, Equatable, Sendable {
+        var formatVersion: Int
+        var title: String
+        var startOrdinal: Int64
+        var isCompleteTranscript: Bool
+        var rows: [AcpTranscriptRow]
+
+        init(title: String, startOrdinal: Int64, rows: [AcpTranscriptRow]) {
+            let boundedStartOrdinal = max(0, startOrdinal)
+            self.formatVersion = 1
+            self.title = title
+            self.startOrdinal = boundedStartOrdinal
+            self.isCompleteTranscript = boundedStartOrdinal == 0
+            self.rows = rows
+        }
+    }
+
+    static func data(title: String, startOrdinal: Int64, rows: [AcpTranscriptRow]) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(Document(
+            title: title,
+            startOrdinal: startOrdinal,
+            rows: rows
+        ))
+    }
+
+    static func suggestedFileName(for title: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let stem = title.lowercased().unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(String(scalar)) : "-"
+        }
+        let compact = String(stem)
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .joined(separator: "-")
+        return "\(compact.isEmpty ? "chat" : compact)-transcript-recovery.json"
     }
 }
 

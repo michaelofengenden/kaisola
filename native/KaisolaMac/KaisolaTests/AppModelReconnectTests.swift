@@ -637,6 +637,157 @@ final class AppModelReconnectTests: XCTestCase {
         XCTAssertNil(entry)
     }
 
+    func testTranscriptRemovalFailureIsCallerVisibleAndKeepsNewestTailRetryable() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            transcriptRemovalFailure: .delete
+        )
+        defer { fixture.cleanUp() }
+        let chatID = "failed-explicit-removal"
+        let durableRows: [AcpTranscriptRow] = [.message(id: "1", text: "durable")]
+        let newestRows: [AcpTranscriptRow] = [
+            .message(id: "1", text: "durable"),
+            .message(id: "2", text: "newest buffered tail"),
+        ]
+
+        fixture.model.enqueueTranscriptSave(durableRows, chatID: chatID)
+        await fixture.model.flushTranscriptPersistence()
+        fixture.model.enqueueTranscriptSave(newestRows, chatID: chatID)
+
+        let result = await fixture.model.enqueueTranscriptRemoval(chatID: chatID).value
+        XCTAssertEqual(
+            result,
+            .failed(.database("injected transcript removal DELETE failure"))
+        )
+
+        await fixture.model.flushTranscriptPersistence()
+        let restored = await fixture.transcriptStore.entry(for: chatID)
+        XCTAssertEqual(restored?.rows, newestRows)
+    }
+
+    func testTombstoneFailurePreservesEveryDraftStoreUntilRetryCommitsDeletion() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            transcriptTombstoneFailure: .commit
+        )
+        defer { fixture.cleanUp() }
+        let chatID = "failed-tombstone-\(UUID().uuidString)"
+        let unrelatedChatID = "unrelated-\(UUID().uuidString)"
+        let defaultsKeys = AcpConversation.persistedDraftDefaultsKeys(for: chatID)
+        let unrelatedDefaultsKeys = AcpConversation.persistedDraftDefaultsKeys(
+            for: unrelatedChatID
+        )
+        defer {
+            for key in defaultsKeys + unrelatedDefaultsKeys {
+                fixture.chatDraftDefaults.removeObject(forKey: key)
+                fixture.migratedChatDraftDefaults.removeObject(forKey: key)
+            }
+        }
+        let durableRows: [AcpTranscriptRow] = [.message(id: "1", text: "durable")]
+        let newestRows: [AcpTranscriptRow] = [
+            .message(id: "1", text: "durable"),
+            .message(id: "2", text: "newest buffered tail"),
+        ]
+        let transcriptSecret = "CURRENT_TRANSCRIPT_DRAFT_493_\(UUID().uuidString)"
+        let workspaceSecret = "MIGRATED_WORKSPACE_DRAFT_493_\(UUID().uuidString)"
+        let defaultsSecret = "CURRENT_USER_DEFAULTS_DRAFT_493_\(UUID().uuidString)"
+        let migratedDefaultsSecret = "MIGRATED_USER_DEFAULTS_DRAFT_493_\(UUID().uuidString)"
+        let unrelatedSecret = "UNRELATED_CURRENT_DEFAULTS_493_\(UUID().uuidString)"
+        let unrelatedMigratedSecret = "UNRELATED_MIGRATED_DEFAULTS_493_\(UUID().uuidString)"
+        let workspaceStableKey = "chat|\(chatID)"
+
+        await fixture.transcriptStore.scheduleSave(durableRows, for: chatID, now: 1)
+        await fixture.transcriptStore.flush()
+        await fixture.transcriptStore.scheduleSave(newestRows, for: chatID, now: 2)
+        await fixture.transcriptStore.scheduleDraft(transcriptSecret, for: chatID, now: 3)
+        try await fixture.workspaceStore.saveDraft(
+            workspaceSecret,
+            stableKey: workspaceStableKey,
+            projectID: "project-493",
+            agentID: "claude-code",
+            workspacePath: fixture.root.path,
+            updatedAt: 4
+        )
+        for key in defaultsKeys {
+            fixture.chatDraftDefaults.set(defaultsSecret, forKey: key)
+            fixture.migratedChatDraftDefaults.set(migratedDefaultsSecret, forKey: key)
+        }
+        for key in unrelatedDefaultsKeys {
+            fixture.chatDraftDefaults.set(unrelatedSecret, forKey: key)
+            fixture.migratedChatDraftDefaults.set(unrelatedMigratedSecret, forKey: key)
+        }
+
+        let result = await fixture.model.deleteChat(chatID)
+        XCTAssertEqual(
+            result,
+            .failed(.database("injected transcript tombstone commit failure"))
+        )
+
+        await fixture.transcriptStore.flush()
+        let restored = await fixture.transcriptStore.entry(for: chatID)
+        XCTAssertEqual(restored?.rows, newestRows)
+        XCTAssertEqual(restored?.draft, transcriptSecret)
+        let preservedWorkspaceDraft = try await fixture.workspaceStore.draft(
+            for: workspaceStableKey
+        )
+        XCTAssertEqual(preservedWorkspaceDraft, workspaceSecret)
+        for key in defaultsKeys {
+            XCTAssertEqual(fixture.chatDraftDefaults.string(forKey: key), defaultsSecret)
+            XCTAssertEqual(
+                fixture.migratedChatDraftDefaults.string(forKey: key),
+                migratedDefaultsSecret
+            )
+        }
+
+        let databaseURL = fixture.transcriptStore.databaseURL
+        let workspaceURL = fixture.workspaceStore.archiveURL
+        XCTAssertNotNil(try Data(contentsOf: databaseURL).range(of: Data(transcriptSecret.utf8)))
+        XCTAssertNotNil(try Data(contentsOf: workspaceURL).range(of: Data(workspaceSecret.utf8)))
+
+        // The deterministic injection is single-use. A successful retry now
+        // commits the tombstone and must clear the current transcript, migrated
+        // workspace archive, and both defaults domains before its caller
+        // observes completion.
+        let retry = await fixture.model.deleteChat(chatID)
+        XCTAssertEqual(retry, .removed)
+
+        let relaunchedTranscript = AcpTranscriptStore(databaseURL: databaseURL)
+        let relaunchedWorkspace = NativeWorkspaceStateStore(fileURL: workspaceURL)
+        let deletedTranscript = await relaunchedTranscript.entry(for: chatID)
+        let deletedWorkspaceDraft = try await relaunchedWorkspace.draft(
+            for: workspaceStableKey
+        )
+        XCTAssertNil(deletedTranscript)
+        XCTAssertNil(deletedWorkspaceDraft)
+        XCTAssertNil(try Data(contentsOf: databaseURL).range(of: Data(transcriptSecret.utf8)))
+        XCTAssertNil(try Data(contentsOf: workspaceURL).range(of: Data(workspaceSecret.utf8)))
+        for key in defaultsKeys {
+            XCTAssertNil(fixture.chatDraftDefaults.object(forKey: key))
+            XCTAssertNil(fixture.migratedChatDraftDefaults.object(forKey: key))
+            XCTAssertFalse(fixture.chatDraftDefaults.dictionaryRepresentation().keys.contains(key))
+            XCTAssertFalse(
+                fixture.migratedChatDraftDefaults.dictionaryRepresentation().keys.contains(key)
+            )
+        }
+        XCTAssertFalse(
+            fixture.chatDraftDefaults.dictionaryRepresentation().values.contains {
+                ($0 as? String) == defaultsSecret
+            }
+        )
+        XCTAssertFalse(
+            fixture.migratedChatDraftDefaults.dictionaryRepresentation().values.contains {
+                ($0 as? String) == migratedDefaultsSecret
+            }
+        )
+        for key in unrelatedDefaultsKeys {
+            XCTAssertEqual(fixture.chatDraftDefaults.string(forKey: key), unrelatedSecret)
+            XCTAssertEqual(
+                fixture.migratedChatDraftDefaults.string(forKey: key),
+                unrelatedMigratedSecret
+            )
+        }
+    }
+
     func testTerminalResizeSendsOnlyLatestSettledGeometryAndDeduplicatesRepeats() async throws {
         let fixture = try VisualControlFixture()
         defer { fixture.cleanUp() }
@@ -1741,11 +1892,17 @@ private final class Fixture {
     let transcriptStore: AcpTranscriptStore
     let workspaceStore: NativeWorkspaceStateStore
     let attentionCenter: AttentionCenter
+    let chatDraftDefaults: UserDefaults
+    let migratedChatDraftDefaults: UserDefaults
     let model: AppModel
+    private let chatDraftDefaultsSuite: String
+    private let migratedChatDraftDefaultsSuite: String
 
     init(
         failingConnectAttempts: Set<Int>,
-        completedAtByTerminalID: [String: Int64] = [:]
+        completedAtByTerminalID: [String: Int64] = [:],
+        transcriptRemovalFailure: AcpTranscriptStore.RemovalFailurePoint? = nil,
+        transcriptTombstoneFailure: AcpTranscriptStore.TombstoneFailurePoint? = nil
     ) throws {
         root = URL(fileURLWithPath: "/tmp/kaisola-app-model-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(
@@ -1758,12 +1915,24 @@ private final class Fixture {
             failingConnectAttempts: failingConnectAttempts,
             completedAtByTerminalID: completedAtByTerminalID
         )
+        let legacyTranscriptURL = root.appendingPathComponent("agent-chat-transcripts-v1.json")
         transcriptStore = AcpTranscriptStore(
-            fileURL: root.appendingPathComponent("agent-chat-transcripts-v1.json")
+            databaseURL: legacyTranscriptURL.deletingPathExtension().appendingPathExtension("sqlite3"),
+            legacyJSONURL: legacyTranscriptURL,
+            schedulesAutomaticFlush: transcriptRemovalFailure == nil
+                && transcriptTombstoneFailure == nil,
+            injectedRemovalFailure: transcriptRemovalFailure,
+            injectedTombstoneFailure: transcriptTombstoneFailure
         )
         workspaceStore = NativeWorkspaceStateStore(
             fileURL: root.appendingPathComponent("workspace-state-v1.json")
         )
+        chatDraftDefaultsSuite = "kaisola-chat-drafts-\(UUID().uuidString)"
+        migratedChatDraftDefaultsSuite = "kaisola-migrated-chat-drafts-\(UUID().uuidString)"
+        chatDraftDefaults = UserDefaults(suiteName: chatDraftDefaultsSuite)!
+        migratedChatDraftDefaults = UserDefaults(suiteName: migratedChatDraftDefaultsSuite)!
+        chatDraftDefaults.removePersistentDomain(forName: chatDraftDefaultsSuite)
+        migratedChatDraftDefaults.removePersistentDomain(forName: migratedChatDraftDefaultsSuite)
         let defaultsSuite = "kaisola-app-model-attention-\(UUID().uuidString)"
         let attentionDefaults = UserDefaults(suiteName: defaultsSuite)!
         attentionDefaults.removePersistentDomain(forName: defaultsSuite)
@@ -1781,6 +1950,8 @@ private final class Fixture {
             transcriptStore: transcriptStore,
             usageCenter: UsageCenter(persistenceStore: transcriptStore),
             attentionCenter: attentionCenter,
+            chatDraftDefaults: chatDraftDefaults,
+            migratedChatDraftDefaults: migratedChatDraftDefaults,
             reconnectBackoff: BrokerReconnectBackoff(
                 baseNanoseconds: 1,
                 maximumNanoseconds: 2,
@@ -1803,6 +1974,8 @@ private final class Fixture {
     }
 
     func cleanUp() {
+        chatDraftDefaults.removePersistentDomain(forName: chatDraftDefaultsSuite)
+        migratedChatDraftDefaults.removePersistentDomain(forName: migratedChatDraftDefaultsSuite)
         try? FileManager.default.removeItem(at: root)
     }
 

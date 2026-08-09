@@ -114,6 +114,53 @@ final class AcpTerminalHostTests: XCTestCase {
         XCTAssertNil(snapshot)
     }
 
+    func testLingeringDescendantSealsOutputInsteadOfAppendingBehindTheExit() async throws {
+        let host = AcpTerminalHost()
+        // The child exits immediately but leaves a background subshell holding
+        // the write end of the pipe, so EOF never arrives. The subshell writes
+        // again well after the two-second grace period.
+        let id = try await host.create(
+            command: "/bin/sh",
+            args: ["-c", "printf before-exit; ( sleep 3; printf after-grace ) & exit 0"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        let status = await host.waitForExit(id)
+        let atExit = await host.output(id)
+        XCTAssertEqual(status?.exitCode, 0)
+        XCTAssertTrue(atExit?.output.contains("before-exit") == true)
+        XCTAssertFalse(atExit?.output.contains("after-grace") == true,
+                       "the descendant had not written yet when exit resolved")
+        // The lingering descendant is a fact of its own, not a fake EOF.
+        XCTAssertEqual(atExit?.outputDetached, true)
+
+        // Past the descendant's write: the snapshot behind the reported exit
+        // must be byte-for-byte the one wait_for_exit resolved against.
+        try await Task.sleep(nanoseconds: 2_500_000_000)
+        let later = await host.output(id)
+        XCTAssertEqual(later?.output, atExit?.output,
+                       "output was appended after wait_for_exit resolved")
+        XCTAssertFalse(later?.output.contains("after-grace") == true)
+        await host.release(id)
+    }
+
+    func testCleanExitReportsCompleteOutputRatherThanDetachedOutput() async throws {
+        let host = AcpTerminalHost()
+        let id = try await host.create(
+            command: "/bin/sh",
+            args: ["-c", "printf clean-eof"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        _ = await host.waitForExit(id)
+        let snapshot = await host.output(id)
+        XCTAssertTrue(snapshot?.output.contains("clean-eof") == true)
+        // Nothing held the pipe: the exit rode a real EOF.
+        XCTAssertEqual(snapshot?.outputDetached, false)
+    }
+
     func testEnvOverlayReachesTheProcess() async throws {
         let host = AcpTerminalHost()
         let id = try await host.create(

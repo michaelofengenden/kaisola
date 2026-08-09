@@ -223,7 +223,10 @@ test('PDF budget launch returns before updater, broker, workspace, and PTY start
     __dirname,
     '../../native/KaisolaMac/Kaisola/App/NativePreviewSettings.swift',
   ), 'utf8')
-  assert.match(delegate, /private lazy var updateController = NativeUpdateController\(\)/u)
+  assert.match(
+    delegate,
+    /private lazy var updateController = NativeUpdateController\(\s*isolatedFixture: visualFixture \|\| resourceWorkload != nil \|\| pdfPreviewBudgetRequested\s*\)/u,
+  )
   assert.match(settings, /environment\["KAISOLA_NATIVE_PDF_PREVIEW_BUDGET"\] != nil/u)
 
   const launch = delegate.slice(delegate.indexOf('func applicationDidFinishLaunching'))

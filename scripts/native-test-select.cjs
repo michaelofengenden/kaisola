@@ -97,7 +97,7 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ]],
   ['native/KaisolaMac/Kaisola/App/KaisolaMacAppDelegate.swift', [
     'CommandRegistryTests', 'NativePreviewSettingsTests', 'NativeTerminalInteractionTests',
-    'PDFPreviewBudgetTests',
+    'PDFPreviewBudgetTests', 'TerminalReplayFidelityTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Palette/CommandPaletteView.swift', [
     'CommandRegistryTests', 'FuzzyMatchTests',
@@ -108,15 +108,20 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/App/AppModel.swift', [
     'AppModelBrokerFallbackTests', 'AppModelProjectContextTests',
     'AppModelReconnectTests', 'AppModelTerminalRetentionTests',
+    'TerminalReplayFidelityTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Sessions/NativeTerminalSurface.swift', [
     'NativeTerminalInteractionTests', 'SwiftTermStressTests',
+    'TerminalOptionClickTests',
     'TerminalReplayFidelityTests', 'TerminalScrollPinTests',
     'TerminalScrollbackDepthTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Sessions/RootShellView.swift', [
     'AppModelProjectContextTests', 'CommandRegistryTests', 'NativePreviewSettingsTests',
-    'SessionPaneLayoutTests',
+    'SessionPaneLayoutTests', 'TerminalReplayFidelityTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Features/Sessions/TerminalSurfaceCache.swift', [
+    'TerminalReplayFidelityTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/BrowserCardView.swift', [
     'AppModelProjectContextTests', 'LocalhostDetectorTests',

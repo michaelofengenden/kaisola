@@ -168,6 +168,16 @@ struct LocatedBrokerInfoPreparer: BrokerInfoPreparing {
     }
 }
 
+/// Fail-closed broker seam for installed visual fixtures. Unlike a preview
+/// locator pointed at an empty directory, this type has no launcher and cannot
+/// discover, adopt, start, upgrade, or reconnect to any broker even if a future
+/// fixture accidentally invokes `AppModel.reload()`.
+struct BrokerFreeFixturePreparer: BrokerInfoPreparing {
+    func prepare() async throws -> BrokerInfo {
+        throw BrokerDiscoveryError.notRunning
+    }
+}
+
 actor BrokerStartupCoordinator:
     BrokerGenerationTopologyProviding,
     BrokerUpgradeMonitoring,

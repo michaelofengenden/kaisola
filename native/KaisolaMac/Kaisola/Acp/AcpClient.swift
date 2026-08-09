@@ -68,11 +68,20 @@ actor AcpClient {
         case selected(String)
         case cancelled
     }
+    private struct ActivePermissionRequest: Sendable {
+        let connectionGeneration: UInt64
+        let offeredOptionIDs: Set<String>
+    }
     private var permissionWaiters: [Int: CheckedContinuation<PermissionResolution, Never>] = [:]
     /// A permission event is delivered synchronously, so a fast policy/UI can
     /// answer before the continuation task gets its first actor turn. Track the
     /// request first and retain that early resolution instead of dropping it.
     private var activePermissionIDs: Set<Int> = []
+    /// The exact option set is scoped to this local request and adapter
+    /// generation. It is consumed by the first valid resolution and discarded
+    /// on every completion/cancellation boundary, so a stale UI path cannot
+    /// select an option that a new adapter never offered.
+    private var activePermissionRequests: [Int: ActivePermissionRequest] = [:]
     private var earlyPermissionResolutions: [Int: PermissionResolution] = [:]
     /// Permission requests are partial ToolCallUpdates. Retain a bounded set of
     /// prior review fields so a later ask can disclose paths/raw input already
@@ -375,7 +384,14 @@ actor AcpClient {
 
     /// Resolve a pending permission request with the user's chosen option.
     func resolvePermission(id: Int, optionID: String) {
-        guard activePermissionIDs.contains(id) else { return }
+        guard !optionID.isEmpty,
+              let active = activePermissionRequests[id],
+              active.connectionGeneration == connectionGeneration,
+              active.offeredOptionIDs.contains(optionID) else { return }
+        // Consume before resuming the waiter. Duplicate calls must not mutate
+        // the early-resolution slot while the first response task is waking.
+        activePermissionIDs.remove(id)
+        activePermissionRequests.removeValue(forKey: id)
         let resolution = PermissionResolution.selected(optionID)
         if let waiter = permissionWaiters.removeValue(forKey: id) {
             waiter.resume(returning: resolution)
@@ -388,7 +404,10 @@ actor AcpClient {
     /// option. ACP's cancelled outcome denies the pending operation without
     /// granting the adapter an undisclosed persistent decision.
     func cancelPermission(id: Int) {
-        guard activePermissionIDs.contains(id) else { return }
+        guard let active = activePermissionRequests[id],
+              active.connectionGeneration == connectionGeneration else { return }
+        activePermissionIDs.remove(id)
+        activePermissionRequests.removeValue(forKey: id)
         let resolution = PermissionResolution.cancelled
         if let waiter = permissionWaiters.removeValue(forKey: id) {
             waiter.resume(returning: resolution)
@@ -417,7 +436,11 @@ actor AcpClient {
 
     private func cancelPermissionRequests() {
         let ids = activePermissionIDs
-        activePermissionIDs.removeAll()
+            .union(activePermissionRequests.keys)
+            .union(permissionWaiters.keys)
+            .union(earlyPermissionResolutions.keys)
+        activePermissionIDs.removeAll(keepingCapacity: false)
+        activePermissionRequests.removeAll(keepingCapacity: false)
         for id in ids {
             earlyPermissionResolutions.removeValue(forKey: id)
             if let waiter = permissionWaiters.removeValue(forKey: id) {
@@ -815,18 +838,24 @@ actor AcpClient {
         ) else { return }
         activePermissionIDs.insert(localID)
         let generation = connectionGeneration
+        activePermissionRequests[localID] = ActivePermissionRequest(
+            connectionGeneration: generation,
+            offeredOptionIDs: Set(request.options.map(\.id))
+        )
         eventHandler?(.permission(request))
         Task {
             let resolution = await withCheckedContinuation { (continuation: CheckedContinuation<PermissionResolution, Never>) in
                 if let early = earlyPermissionResolutions.removeValue(forKey: localID) {
                     continuation.resume(returning: early)
-                } else if activePermissionIDs.contains(localID) {
+                } else if activePermissionIDs.contains(localID),
+                          activePermissionRequests[localID]?.connectionGeneration == generation {
                     permissionWaiters[localID] = continuation
                 } else {
                     continuation.resume(returning: .cancelled)
                 }
             }
             activePermissionIDs.remove(localID)
+            activePermissionRequests.removeValue(forKey: localID)
             earlyPermissionResolutions.removeValue(forKey: localID)
             guard connectionGeneration == generation else { return }
             let outcome: JSONValue
@@ -839,6 +868,10 @@ actor AcpClient {
             respond(id: id, result: .object(["outcome": outcome]))
         }
     }
+
+    /// Test-visible lifecycle count for the security metadata introduced at
+    /// this boundary. It must describe active asks only, never request history.
+    var retainedPermissionOptionSetCount: Int { activePermissionRequests.count }
 
     /// Decode the complete permission review payload, including ACP v1's
     /// arbitrary `rawInput`. Kept pure for wire-contract tests.

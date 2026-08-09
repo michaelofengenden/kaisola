@@ -337,6 +337,151 @@ final class AcpClientTests: XCTestCase {
         _ = await conversation.stop()
     }
 
+    func testPermissionResolutionSendsOnlyAnExactlyOfferedOptionOnce() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let events = EventCollector()
+        await client.setEventHandler { events.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        let wireID: Int64 = 48_101
+        await transport.emitPermission(
+            wireID: wireID,
+            title: "Exact membership",
+            optionIDs: ["allow-once", "reject-once"]
+        )
+        try await Self.until("the exact-membership request surfaced") {
+            events.permissionRequests.count == 1
+        }
+        let request = try XCTUnwrap(events.permissionRequests.first)
+
+        await client.resolvePermission(id: request.id, optionID: "allow-once")
+        try await Self.until("the valid one-shot response reached the adapter") {
+            await transport.permissionResponseCount(for: wireID) == 1
+        }
+        let response = await transport.permissionResponse(for: wireID)
+        XCTAssertEqual(response, .object([
+            "outcome": .object([
+                "outcome": .string("selected"),
+                "optionId": .string("allow-once"),
+            ]),
+        ]))
+        let retainedAfterResolution = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterResolution, 0)
+
+        // A duplicate selection arrives after the request has been consumed.
+        // It must neither overwrite the result nor create another wire frame.
+        await client.resolvePermission(id: request.id, optionID: "reject-once")
+        let duplicateResponseCount = await transport.permissionResponseCount(for: wireID)
+        let retainedAfterDuplicate = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(duplicateResponseCount, 1)
+        XCTAssertEqual(retainedAfterDuplicate, 0)
+    }
+
+    func testPermissionResolutionRejectsEmptyAndNeverOfferedIDsWithoutConsumingRequest() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let events = EventCollector()
+        await client.setEventHandler { events.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        let wireID: Int64 = 48_102
+        await transport.emitPermission(
+            wireID: wireID,
+            title: "Invalid selections",
+            optionIDs: ["offered", ""]
+        )
+        try await Self.until("the invalid-selection request surfaced") {
+            events.permissionRequests.count == 1
+        }
+        let request = try XCTUnwrap(events.permissionRequests.first)
+
+        // Empty is rejected even when a malformed adapter offered it. An
+        // undisclosed nonempty id is rejected by the same exact-membership gate.
+        await client.resolvePermission(id: request.id, optionID: "")
+        await client.resolvePermission(id: request.id, optionID: "never-offered")
+        let invalidResponseCount = await transport.permissionResponseCount(for: wireID)
+        let retainedAfterInvalidSelections = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(invalidResponseCount, 0)
+        XCTAssertEqual(retainedAfterInvalidSelections, 1)
+
+        // Invalid attempts leave the real ask active and usable.
+        await client.resolvePermission(id: request.id, optionID: "offered")
+        try await Self.until("the request remained valid after rejected selections") {
+            await transport.permissionResponseCount(for: wireID) == 1
+        }
+        let selectedOptionID = await transport.permissionResponse(for: wireID)?
+            .objectValue?["outcome"]?.objectValue?["optionId"]
+        let retainedAfterValidSelection = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(selectedOptionID, .string("offered"))
+        XCTAssertEqual(retainedAfterValidSelection, 0)
+    }
+
+    func testStalePermissionCannotResolveSameWireIDInANewGeneration() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let events = EventCollector()
+        await client.setEventHandler { events.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        let reusedWireID: Int64 = 48_103
+        await transport.emitPermission(
+            wireID: reusedWireID,
+            title: "Old generation",
+            optionIDs: ["shared-option"]
+        )
+        try await Self.until("the old-generation request surfaced") {
+            events.permissionRequests.count == 1
+        }
+        let staleRequest = try XCTUnwrap(events.permissionRequests.first)
+        await client.stop()
+        let retainedAfterStop = await client.retainedPermissionOptionSetCount
+        let oldGenerationResponseCount = await transport.permissionResponseCount(for: reusedWireID)
+        XCTAssertEqual(retainedAfterStop, 0)
+        XCTAssertEqual(oldGenerationResponseCount, 0)
+
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+        await transport.emitPermission(
+            wireID: reusedWireID,
+            title: "New generation",
+            optionIDs: ["shared-option"]
+        )
+        try await Self.until("the new-generation request surfaced") {
+            events.permissionRequests.count == 2
+        }
+        let currentRequest = try XCTUnwrap(events.permissionRequests.last)
+        XCTAssertNotEqual(staleRequest.id, currentRequest.id)
+
+        // Even the same wire id and same offered option string do not let a
+        // stale local request cross the adapter-generation boundary.
+        await client.resolvePermission(id: staleRequest.id, optionID: "shared-option")
+        let staleResponseCount = await transport.permissionResponseCount(for: reusedWireID)
+        let retainedCurrentRequest = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(staleResponseCount, 0)
+        XCTAssertEqual(retainedCurrentRequest, 1)
+
+        await client.resolvePermission(id: currentRequest.id, optionID: "shared-option")
+        try await Self.until("the current generation resolved") {
+            await transport.permissionResponseCount(for: reusedWireID) == 1
+        }
+        let newSelectedOptionID = await transport.permissionResponse(for: reusedWireID)?
+            .objectValue?["outcome"]?.objectValue?["optionId"]
+        let retainedAfterCurrentResolution = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(newSelectedOptionID, .string("shared-option"))
+        XCTAssertEqual(retainedAfterCurrentResolution, 0)
+    }
+
     @MainActor
     func testInjectingQueuedMessageLeavesTheTurnAndItsPermissionsAlone() async throws {
         let transport = ScriptedAcpTransport()
@@ -377,9 +522,10 @@ final class AcpClientTests: XCTestCase {
     @MainActor
     func testPermissionCountOverflowReturnsExactRejectOnceResponse() async throws {
         let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
         let conversation = AcpConversation(
             title: "Permission bounds", command: "mock", arguments: [], environment: [:],
-            cwd: "/tmp", client: AcpClient(transport: transport)
+            cwd: "/tmp", client: client
         )
         await conversation.start()
         for id in 1...AcpConversation.maximumOutstandingPermissionCount {
@@ -404,19 +550,26 @@ final class AcpClientTests: XCTestCase {
             conversation.pendingPermissionCount,
             AcpConversation.maximumOutstandingPermissionCount
         )
+        let retainedAtQueueBound = await client.retainedPermissionOptionSetCount
+        XCTAssertLessThanOrEqual(
+            retainedAtQueueBound, AcpConversation.maximumOutstandingPermissionCount
+        )
         XCTAssertTrue(conversation.rows.contains { row in
             guard case let .permissionDecision(_, text) = row else { return false }
             return text.contains("Overflow") && text.contains("denied automatically")
         })
         _ = await conversation.stop()
+        let retainedAfterStop = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterStop, 0)
     }
 
     @MainActor
     func testExpiredPermissionReturnsRejectOnceResponseAndTimelineEvent() async throws {
         let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
         let conversation = AcpConversation(
             title: "Permission expiry", command: "mock", arguments: [], environment: [:],
-            cwd: "/tmp", client: AcpClient(transport: transport)
+            cwd: "/tmp", client: client
         )
         await conversation.start()
         let wireID: Int64 = 8_888
@@ -424,6 +577,7 @@ final class AcpClientTests: XCTestCase {
         try await Self.until("the permission surfaced") {
             conversation.pendingPermission != nil
         }
+        let expiredRequestID = try XCTUnwrap(conversation.pendingPermission?.id)
 
         conversation.expirePermissionsForTesting(
             at: Date().addingTimeInterval(AcpConversation.permissionPromptLifetime + 1)
@@ -438,6 +592,11 @@ final class AcpClientTests: XCTestCase {
             "optionId": .string("reject"),
         ]))
         XCTAssertNil(conversation.pendingPermission)
+        let retainedAfterSelectedExpiry = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterSelectedExpiry, 0)
+        await client.resolvePermission(id: expiredRequestID, optionID: "allow")
+        let selectedExpiryResponseCount = await transport.permissionResponseCount(for: wireID)
+        XCTAssertEqual(selectedExpiryResponseCount, 1, "an expired request must stay consumed")
         XCTAssertTrue(conversation.rows.contains { row in
             guard case let .permissionDecision(_, text) = row else { return false }
             return text.contains("Stale operation") && text.contains("expired after 5 minutes")
@@ -454,6 +613,7 @@ final class AcpClientTests: XCTestCase {
         try await Self.until("the fallback permission surfaced") {
             conversation.pendingPermission != nil
         }
+        let cancelledRequestID = try XCTUnwrap(conversation.pendingPermission?.id)
         conversation.expirePermissionsForTesting(
             at: Date().addingTimeInterval(AcpConversation.permissionPromptLifetime + 1)
         )
@@ -465,6 +625,11 @@ final class AcpClientTests: XCTestCase {
             cancelled?.objectValue?["outcome"],
             .object(["outcome": .string("cancelled")])
         )
+        let retainedAfterCancelledExpiry = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterCancelledExpiry, 0)
+        await client.resolvePermission(id: cancelledRequestID, optionID: "allow")
+        let cancelledExpiryResponseCount = await transport.permissionResponseCount(for: cancelledWireID)
+        XCTAssertEqual(cancelledExpiryResponseCount, 1, "a cancelled request must stay consumed")
         _ = await conversation.stop()
     }
 
@@ -1129,6 +1294,12 @@ private final class EventCollector: @unchecked Sendable {
     private var storage: [AcpEvent] = []
     func append(_ event: AcpEvent) { lock.lock(); storage.append(event); lock.unlock() }
     var events: [AcpEvent] { lock.lock(); defer { lock.unlock() }; return storage }
+    var permissionRequests: [AcpPermissionRequest] {
+        events.compactMap { event in
+            if case let .permission(request) = event { return request }
+            return nil
+        }
+    }
 }
 
 /// A transport that answers the ACP handshake and, on a prompt, streams a
@@ -1157,7 +1328,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var promptTexts: [String] = []
     private var promptBlocks: [[JSONValue]] = []
     private var steerRequests: [JSONValue] = []
-    private var permissionResponses: [Int64: JSONValue] = [:]
+    private var permissionResponses: [Int64: [JSONValue]] = [:]
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
@@ -1200,29 +1371,47 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func receivedPromptTexts() -> [String] { promptTexts }
     func receivedPromptBlocks() -> [[JSONValue]] { promptBlocks }
     func receivedSteerRequests() -> [JSONValue] { steerRequests }
-    func permissionResponse(for wireID: Int64) -> JSONValue? { permissionResponses[wireID] }
+    func permissionResponse(for wireID: Int64) -> JSONValue? { permissionResponses[wireID]?.last }
+    func permissionResponseCount(for wireID: Int64) -> Int { permissionResponses[wireID]?.count ?? 0 }
     func terminationCount() -> Int { terminations }
 
     func emitPermission(
         wireID: Int64,
         title: String,
-        includeRejectOnce: Bool = true
+        includeRejectOnce: Bool = true,
+        optionIDs: [String]? = nil
     ) {
-        var options: [JSONValue] = [
-            .object(["optionId": .string("allow"), "name": .string("Allow"), "kind": .string("allow_once")]),
-        ]
-        if includeRejectOnce {
-            options.append(.object([
-                "optionId": .string("reject"),
-                "name": .string("Reject"),
-                "kind": .string("reject_once"),
-            ]))
+        let options: [JSONValue]
+        if let optionIDs {
+            options = optionIDs.map { optionID in
+                .object([
+                    "optionId": .string(optionID),
+                    "name": .string(optionID.isEmpty ? "Empty" : optionID),
+                    "kind": .string("allow_once"),
+                ])
+            }
         } else {
-            options.append(.object([
-                "optionId": .string("reject-always"),
-                "name": .string("Always reject"),
-                "kind": .string("reject_always"),
-            ]))
+            var defaultOptions: [JSONValue] = [
+                .object([
+                    "optionId": .string("allow"),
+                    "name": .string("Allow"),
+                    "kind": .string("allow_once"),
+                ]),
+            ]
+            if includeRejectOnce {
+                defaultOptions.append(.object([
+                    "optionId": .string("reject"),
+                    "name": .string("Reject"),
+                    "kind": .string("reject_once"),
+                ]))
+            } else {
+                defaultOptions.append(.object([
+                    "optionId": .string("reject-always"),
+                    "name": .string("Always reject"),
+                    "kind": .string("reject_always"),
+                ]))
+            }
+            options = defaultOptions
         }
         enqueue(.object([
             "jsonrpc": .string("2.0"),
@@ -1251,7 +1440,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         if object["method"] == nil,
            let wireID = id?.intValue,
            let result = object["result"] {
-            permissionResponses[wireID] = result
+            permissionResponses[wireID, default: []].append(result)
             return
         }
         switch object["method"]?.stringValue {

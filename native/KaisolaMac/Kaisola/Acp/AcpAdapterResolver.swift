@@ -63,7 +63,8 @@ struct AcpAdapter: Equatable, Sendable {
         store: CustomAgentStore = CustomAgentStore(),
         installs: AdapterInstallManager = AdapterInstallManager()
     ) -> AcpAdapter? {
-        guard let spec = store.all().first(where: { $0.id == agentID }),
+        guard case let .success(specs) = store.load(),
+              let spec = specs.first(where: { $0.id == agentID }),
               spec.chatEnabled == true,
               let package = spec.acpPackage, !package.isEmpty,
               spec.acpPackageValidationError == nil,

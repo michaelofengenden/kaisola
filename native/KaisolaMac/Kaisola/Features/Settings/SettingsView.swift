@@ -831,7 +831,7 @@ struct SettingsView: View {
                         }
                     }
                 }
-                Text("Adapters resolve @latest on every chat, so they stay current automatically.")
+                Text("Built-in adapters resolve @latest. Custom adapters are pinned and launch only through their reviewed containment grant.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }

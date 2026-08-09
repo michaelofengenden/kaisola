@@ -7,11 +7,12 @@ import Foundation
 ///
 /// The record freezes what the approval meant: the package as typed, the
 /// version npm resolved it to, a SHA-256 over the lockfile that pins the
-/// complete dependency graph, and the executable's path inside the install.
+/// complete dependency graph, the executable's path inside the install, and
+/// the exact credential/containment grant the user reviewed.
 /// At spawn time `AdapterInstallManager.verify` recomputes the hash; any
 /// drift — an edited lockfile, a swapped binary, a vanished install — refuses
 /// the chat surface until the user approves again.
-struct InstalledAdapterRecord: Codable, Equatable, Identifiable {
+struct InstalledAdapterRecord: Codable, Equatable, Identifiable, Sendable {
     let agentID: String
     let package: String
     let resolvedVersion: String
@@ -24,9 +25,34 @@ struct InstalledAdapterRecord: Codable, Equatable, Identifiable {
     /// resolved; this pins what actually sits on disk, so editing `cli.js`
     /// or any dependency file after approval reads as drift.
     let treeSHA256: String
+    /// Nil only for records written before containment approval shipped (or
+    /// tests that exercise installation independently of custom-agent launch).
+    /// A custom adapter resolver always supplies an expected approval, so a
+    /// legacy nil record cannot launch.
+    let approval: CustomAdapterApproval?
     let installedAt: Date
 
     var id: String { agentID }
+
+    init(
+        agentID: String,
+        package: String,
+        resolvedVersion: String,
+        binRelativePath: String,
+        lockfileSHA256: String,
+        treeSHA256: String,
+        approval: CustomAdapterApproval? = nil,
+        installedAt: Date
+    ) {
+        self.agentID = agentID
+        self.package = package
+        self.resolvedVersion = resolvedVersion
+        self.binRelativePath = binRelativePath
+        self.lockfileSHA256 = lockfileSHA256
+        self.treeSHA256 = treeSHA256
+        self.approval = approval
+        self.installedAt = installedAt
+    }
 }
 
 /// Installs, verifies, and records custom-agent ACP adapters.
@@ -35,8 +61,9 @@ struct InstalledAdapterRecord: Codable, Equatable, Identifiable {
 /// plain npm prefix (`node_modules`, `package-lock.json`). Installation runs
 /// with **scripts disabled** — a lifecycle script executing during
 /// enablement would be arbitrary code before the user's approval finished
-/// meaning anything. The adapter itself still runs with the user's ordinary
-/// access once enabled; the enable sheet says so in those words (finding 1).
+/// meaning anything. Runtime launch is a separate fail-closed step: a verified
+/// install must also carry the current `CustomAdapterApproval` before it can
+/// enter the Seatbelt boundary.
 struct AdapterInstallManager: Sendable {
     struct Store: Sendable {
         let fileURL: URL
@@ -93,7 +120,7 @@ struct AdapterInstallManager: Sendable {
     }
 
     enum VerifyResult: Equatable {
-        case verified(binURL: URL)
+        case verified(binURL: URL, record: InstalledAdapterRecord)
         /// The named reason feeds the settings row and the refusal toast.
         case drifted(reason: String)
         case notInstalled
@@ -137,12 +164,39 @@ struct AdapterInstallManager: Sendable {
     /// next verify, but a write that lands inside that window is not; closing
     /// it needs descriptor-based spawning, which is deliberately out of scope
     /// here and noted rather than pretended away.
-    func verify(agentID: String, expectedPackage: String? = nil) -> VerifyResult {
+    func verify(
+        agentID: String,
+        expectedPackage: String? = nil,
+        expectedApproval: CustomAdapterApproval? = nil
+    ) -> VerifyResult {
         guard let record = store.record(agentID: agentID) else { return .notInstalled }
+        return Self.verify(
+            record: record,
+            installRoot: installRoot(agentID: agentID),
+            expectedPackage: expectedPackage,
+            expectedApproval: expectedApproval
+        )
+    }
+
+    /// Verify one captured record against one exact root. Contained launches
+    /// retain the record returned by the resolver and repeat this check on
+    /// every start/restart, keeping the residual race to verify-to-spawn rather
+    /// than the lifetime of the conversation.
+    static func verify(
+        record: InstalledAdapterRecord,
+        installRoot root: URL,
+        expectedPackage: String? = nil,
+        expectedApproval: CustomAdapterApproval? = nil
+    ) -> VerifyResult {
         if let expectedPackage, expectedPackage != record.package {
             return .drifted(reason: "The approved install is for \(record.package), not \(expectedPackage).")
         }
-        let root = installRoot(agentID: agentID)
+        if let expectedApproval,
+           !expectedApproval.isCurrentAndValid || record.approval != expectedApproval {
+            return .drifted(
+                reason: "The adapter's requested credentials or contained access changed since it was approved."
+            )
+        }
         let lockfile = root.appendingPathComponent("package-lock.json")
         guard let lockData = try? Data(contentsOf: lockfile) else {
             return .drifted(reason: "The install's lockfile is missing.")
@@ -164,7 +218,7 @@ struct AdapterInstallManager: Sendable {
         guard FileManager.default.isExecutableFile(atPath: bin.path) else {
             return .drifted(reason: "The adapter executable is missing or not executable.")
         }
-        return .verified(binURL: bin)
+        return .verified(binURL: bin, record: record)
     }
 
     /// One digest over every file under `root`, deterministic: sorted
@@ -208,6 +262,7 @@ struct AdapterInstallManager: Sendable {
     func install(
         agentID: String,
         package rawPackage: String,
+        approval: CustomAdapterApproval? = nil,
         runner: @Sendable (URL, String) async throws -> Void = AdapterInstallManager.npmInstall,
         now: Date = Date()
     ) async throws -> InstalledAdapterRecord {
@@ -250,6 +305,7 @@ struct AdapterInstallManager: Sendable {
             binRelativePath: binRelative,
             lockfileSHA256: Self.sha256(lockData),
             treeSHA256: tree,
+            approval: approval,
             installedAt: now
         )
         store.upsert(record)

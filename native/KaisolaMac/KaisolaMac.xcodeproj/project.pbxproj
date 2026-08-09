@@ -203,6 +203,7 @@
 		A56F42A67BA70F97CC9B7396 /* CommandRegistryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EEC8E541404472EF4F2F17A4 /* CommandRegistryTests.swift */; };
 		A6252144DE017774F84FE935 /* THIRD_PARTY_NOTICES.md in Resources */ = {isa = PBXBuildFile; fileRef = 47544E136A1B0FEEC9D16378 /* THIRD_PARTY_NOTICES.md */; };
 		A6466707F079FD97BD9432B1 /* NativeSessionStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1DBE251CF21C42D3D77AA57C /* NativeSessionStore.swift */; };
+		A80E8E039AE75D4F9B5A47DA /* CustomAdapterContainment.swift in Sources */ = {isa = PBXBuildFile; fileRef = 41C91AB99F8C78E8B748AB42 /* CustomAdapterContainment.swift */; };
 		A82D652E2C835E8ACC2DAFA0 /* AcpConversation.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3ACF651DE22A050B1D4AF49C /* AcpConversation.swift */; };
 		A83C0BFF243C1F87812AABFA /* GitService+Apply.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84F61B27B7189310A3E0304F /* GitService+Apply.swift */; };
 		A8806C7327F8E8D62F9D1CE7 /* KaisolaBrokerProtocol in Frameworks */ = {isa = PBXBuildFile; productRef = 04350F4604DBC09B96669134 /* KaisolaBrokerProtocol */; };
@@ -411,6 +412,7 @@
 		40508869DD92A10AE3EF0352 /* CompanionHost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionHost.swift; sourceTree = "<group>"; };
 		40AFF780B226613EC2DA25AA /* AcpTranscriptRendering.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpTranscriptRendering.swift; sourceTree = "<group>"; };
 		40FA963B9539F48222ACB620 /* UpdateCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpdateCenter.swift; sourceTree = "<group>"; };
+		41C91AB99F8C78E8B748AB42 /* CustomAdapterContainment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomAdapterContainment.swift; sourceTree = "<group>"; };
 		426D7BDBEB0882FAF75AC5F3 /* DesktopCaptureSource.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopCaptureSource.swift; sourceTree = "<group>"; };
 		43DE8262D5D789B8D0AF17B1 /* MarkdownTaskToggleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownTaskToggleTests.swift; sourceTree = "<group>"; };
 		44220D13FC4D0265D132F67A /* TerminalCursorStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalCursorStore.swift; sourceTree = "<group>"; };
@@ -1130,6 +1132,7 @@
 				40AFF780B226613EC2DA25AA /* AcpTranscriptRendering.swift */,
 				E0BA874BD9613768958ED354 /* AcpTranscriptStore.swift */,
 				1423BFC7C8A3FCE35B4366C9 /* AdapterInstallManager.swift */,
+				41C91AB99F8C78E8B748AB42 /* CustomAdapterContainment.swift */,
 				FDE152F4457B8AF7E5A92225 /* McpConfigStore.swift */,
 				3D06ED8A6604C6BD4447869A /* PermissionRuleStore.swift */,
 			);
@@ -1360,6 +1363,7 @@
 				9A94CB3A0C12A31A71AB1C92 /* CompanionSettingsTab.swift in Sources */,
 				E255262499CA22D8FB25AD64 /* CompanionTerminalControl.swift in Sources */,
 				D83D8C6FE8AE67D4E40DB17E /* CompanionTerminalStreamHub.swift in Sources */,
+				A80E8E039AE75D4F9B5A47DA /* CustomAdapterContainment.swift in Sources */,
 				F4C6C5462997C4F025270D7D /* CustomAgentStore.swift in Sources */,
 				5760827CF9F4168466291A60 /* CustomAgentsSection.swift in Sources */,
 				4D51A3AC4497E78269BBCC81 /* CustomGrammarStore.swift in Sources */,

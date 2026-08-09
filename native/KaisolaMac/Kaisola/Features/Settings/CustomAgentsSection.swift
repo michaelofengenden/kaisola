@@ -13,8 +13,9 @@ extension Notification.Name {
 /// Settings ▸ Agents parity): list existing custom agents — name, launch
 /// command, an SF-symbol picker, delete — plus an add row. Every mutation
 /// persists through `CustomAgentStore` and posts `.kaisolaAgentsChanged`.
-/// Terminal-only by construction: these agents have no ACP adapter, so they
-/// never appear on chat surfaces.
+/// Terminal launch stays independent. An optional ACP package reaches chat only
+/// after its exact install, credential context, and containment privileges are
+/// reviewed together.
 struct CustomAgentsSection: View {
     private let store = CustomAgentStore()
     /// A small, curated set so every custom agent gets a recognizable glyph.
@@ -58,6 +59,7 @@ struct CustomAgentsSection: View {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
+                        .disabled(installingAgentID == spec.id)
                     }
                     acpControls(index: index, spec: spec)
                 }
@@ -75,7 +77,7 @@ struct CustomAgentsSection: View {
                 Text("Custom-agent limit reached (\(cap)).")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
-                Text("Runs through a login shell like the built-in agents; terminal-only, no chat surface.")
+                Text("Terminal commands use the user's shell. Optional chat adapters run separately under a reviewed sandbox grant.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
@@ -108,7 +110,8 @@ struct CustomAgentsSection: View {
             id: CustomAgentStore.slugify(name, existing: Set(specs.map(\.id))),
             name: name,
             launchCommand: command,
-            symbol: symbolChoices.first ?? "terminal"
+            symbol: symbolChoices.first ?? "terminal",
+            acpPrivileges: []
         ))
         store.save(specs)
         specs = store.all()   // reflect the store's cap
@@ -119,7 +122,13 @@ struct CustomAgentsSection: View {
 
     private func delete(_ index: Int) {
         guard specs.indices.contains(index) else { return }
+        installs.uninstall(agentID: specs[index].id)
         specs.remove(at: index)
+        if pendingEnableIndex == index {
+            pendingEnableIndex = nil
+        } else if let pendingEnableIndex, pendingEnableIndex > index {
+            self.pendingEnableIndex = pendingEnableIndex - 1
+        }
         persist()
     }
 
@@ -136,11 +145,13 @@ struct CustomAgentsSection: View {
     /// Every state names itself — invalid package, install failure, drift.
     @ViewBuilder
     private func acpControls(index: Int, spec: CustomAgentSpec) -> some View {
+        let hasReviewedAccess = spec.containmentApproval != nil
+        let locksContract = spec.chatEnabled == true && hasReviewedAccess
         HStack(spacing: 8) {
             TextField("ACP adapter (npm package, optional)", text: packageBinding(index))
                 .font(.caption.monospaced())
                 .textFieldStyle(.plain)
-                .disabled(spec.chatEnabled == true)
+                .disabled(locksContract)
             Picker("", selection: credentialsBinding(index)) {
                 ForEach(CustomAgentSpec.Credentials.allCases) { credentials in
                     Text(credentials.title).tag(credentials.rawValue)
@@ -149,25 +160,57 @@ struct CustomAgentsSection: View {
             .labelsHidden()
             .pickerStyle(.menu)
             .frame(width: 150)
-            .disabled(spec.chatEnabled == true)
-            if spec.chatEnabled == true {
+            .disabled(locksContract)
+            if locksContract {
                 Button("Disable Chat") { disableChat(index) }
                     .font(.caption)
             } else if spec.acpPackage?.isEmpty == false, spec.acpPackageValidationError == nil {
-                Button(installingAgentID == spec.id ? "Installing…" : "Enable Chat…") {
-                    pendingEnableIndex = index
+                Button(installingAgentID == spec.id
+                    ? "Installing…"
+                    : (spec.chatEnabled == true ? "Review Access…" : "Enable Chat…")) {
+                    beginEnable(index)
                 }
                 .font(.caption)
                 .disabled(installingAgentID != nil)
             }
         }
+        if spec.acpPackage?.isEmpty == false {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Contained access")
+                    .font(.caption.weight(.medium))
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 180), spacing: 12, alignment: .leading)],
+                    alignment: .leading,
+                    spacing: 4
+                ) {
+                    ForEach(CustomAdapterPrivilege.allCases) { privilege in
+                        Toggle(privilege.title, isOn: privilegeBinding(index, privilege))
+                            .toggleStyle(.checkbox)
+                            .font(.caption)
+                            .disabled(locksContract)
+                            .help(privilege.reviewDetail)
+                    }
+                }
+                if let approval = spec.containmentApproval {
+                    Text(approval.reviewSummary)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
         if let reason = spec.acpPackageValidationError {
             Text(reason).font(.caption).foregroundStyle(.orange)
-        } else if spec.chatEnabled == true {
-            switch installs.verify(agentID: spec.id) {
-            case let .verified(binURL):
+        } else if let issue = spec.containmentIssue, spec.acpPackage?.isEmpty == false {
+            Text("Chat disabled: \(issue)").font(.caption).foregroundStyle(.orange)
+        } else if spec.chatEnabled == true, let approval = spec.containmentApproval {
+            switch installs.verify(
+                agentID: spec.id,
+                expectedPackage: spec.acpPackage,
+                expectedApproval: approval
+            ) {
+            case let .verified(binURL, _):
                 let version = installs.store.record(agentID: spec.id)?.resolvedVersion ?? "?"
-                Text("Chat enabled · \(spec.acpPackage ?? "") v\(version) · runs \(binURL.lastPathComponent)")
+                Text("Chat enabled · \(spec.acpPackage ?? "") v\(version) · contained \(binURL.lastPathComponent) · \(approval.reviewSummary)")
                     .font(.caption).foregroundStyle(.secondary)
             case let .drifted(reason):
                 Text("Chat disabled: \(reason) Re-enable to approve the current version.")
@@ -178,10 +221,10 @@ struct CustomAgentsSection: View {
             }
         }
         if pendingEnableIndex == index {
-            // The honest grant (review finding 1): enabling runs
-            // publisher-controlled code with this account's ordinary access.
+            // The exact grant remains visible before installation and, through
+            // the status line above, for the lifetime of the approval.
             VStack(alignment: .leading, spacing: 6) {
-                Text("Enabling installs \(spec.acpPackage ?? "") from the npm registry with install scripts disabled, pins its exact dependency graph, and runs that pinned code as this agent's chat adapter. It runs with your user's ordinary file and network access — Kaisola does not sandbox it. Any change to the pinned install disables chat until you approve again.")
+                Text("Enabling installs \(spec.acpPackage ?? "") with install scripts disabled, pins its exact dependency graph, and runs the pinned JavaScript under Kaisola's sealed Node runtime and a deny-by-default macOS sandbox. Reviewed grant: \(spec.containmentApproval?.reviewSummary ?? "invalid — choose access above"). Process/network grants also share the matching enabled workspace MCP definitions, including their configured environment/header values. Unrelated process-environment credentials, your ordinary home files, local Unix sockets, inbound network, and Kaisola's host terminal bridge stay blocked. Install or access changes disable chat until you approve again.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -224,22 +267,72 @@ struct CustomAgentsSection: View {
         )
     }
 
+    private func privilegeBinding(
+        _ index: Int,
+        _ privilege: CustomAdapterPrivilege
+    ) -> Binding<Bool> {
+        Binding(
+            get: {
+                guard specs.indices.contains(index) else { return false }
+                return specs[index].acpPrivileges?.contains(privilege.rawValue) == true
+            },
+            set: { enabled in
+                guard specs.indices.contains(index) else { return }
+                var privileges = Set(specs[index].acpPrivileges ?? [])
+                if enabled {
+                    privileges.insert(privilege.rawValue)
+                } else {
+                    privileges.remove(privilege.rawValue)
+                }
+                specs[index].acpPrivileges = CustomAdapterPrivilege.allCases
+                    .filter { privileges.contains($0.rawValue) }
+                    .map(\.rawValue)
+                persist()
+            }
+        )
+    }
+
+    private func beginEnable(_ index: Int) {
+        guard specs.indices.contains(index) else { return }
+        // A legacy pre-containment enablement is not an approval. Drop its old
+        // install before opening the new review so no stale record can satisfy
+        // the resolver while the user is choosing a grant.
+        if specs[index].chatEnabled == true, specs[index].containmentApproval == nil {
+            installs.uninstall(agentID: specs[index].id)
+            specs[index].chatEnabled = false
+        }
+        if specs[index].acpPrivileges == nil { specs[index].acpPrivileges = [] }
+        persist()
+        pendingEnableIndex = index
+    }
+
     private func enableChat(_ index: Int) {
         guard specs.indices.contains(index),
-              let package = specs[index].acpPackage else { return }
+              let package = specs[index].acpPackage,
+              let approval = specs[index].containmentApproval else {
+            ToastCenter.shared.show(
+                "Review the adapter's contained access before enabling chat.",
+                style: .error
+            )
+            return
+        }
         let agentID = specs[index].id
         pendingEnableIndex = nil
         installingAgentID = agentID
         Task { @MainActor in
             defer { installingAgentID = nil }
             do {
-                let record = try await installs.install(agentID: agentID, package: package)
+                let record = try await installs.install(
+                    agentID: agentID,
+                    package: package,
+                    approval: approval
+                )
                 if let liveIndex = specs.firstIndex(where: { $0.id == agentID }) {
                     specs[liveIndex].chatEnabled = true
                     persist()
                 }
                 ToastCenter.shared.show(
-                    "\(package) v\(record.resolvedVersion) installed and pinned. Chat is enabled.",
+                    "\(package) v\(record.resolvedVersion) installed, pinned, and contained. Chat is enabled.",
                     style: .success
                 )
             } catch {

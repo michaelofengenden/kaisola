@@ -3131,6 +3131,7 @@ final class AppModel: ObservableObject {
             title: title,
             command: adapter.command,
             arguments: adapter.arguments,
+            containment: adapter.containment,
             environment: environment,
             cwd: directory.path,
             mcpServers: McpConfigStore.jsonValues(mcp),

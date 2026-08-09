@@ -260,7 +260,8 @@ final class AdapterInstallTests: XCTestCase {
         let store = CustomAgentStore(fileURL: directory.appending(path: "agents.json"))
         var spec = CustomAgentSpec(
             id: "custom-probe", name: "Probe", launchCommand: "probe", symbol: "cpu",
-            acpPackage: "probe-acp", credentials: "none", chatEnabled: nil
+            acpPackage: "probe-acp", credentials: "none", chatEnabled: nil,
+            acpPrivileges: []
         )
         store.save([spec])
         XCTAssertNil(
@@ -273,17 +274,19 @@ final class AdapterInstallTests: XCTestCase {
             AcpAdapter.forCustomAgent("custom-probe", store: store, installs: manager),
             "enabled without a verified install stays chatless"
         )
+        let approval = try XCTUnwrap(spec.containmentApproval)
         _ = try await manager.install(
-            agentID: "custom-probe", package: "probe-acp", runner: fakeInstaller()
+            agentID: "custom-probe", package: "probe-acp", approval: approval,
+            runner: fakeInstaller()
         )
         let adapter = try XCTUnwrap(
             AcpAdapter.forCustomAgent("custom-probe", store: store, installs: manager)
         )
         XCTAssertTrue(
-            adapter.arguments.last?.contains("node_modules/probe-acp/cli.js") == true,
-            "the executed command is the pinned executable, not npx"
+            adapter.containment?.executableURL.path.contains("node_modules/probe-acp/cli.js") == true,
+            "the contained launch binds the pinned executable, not npx"
         )
-        XCTAssertFalse(adapter.arguments.last?.contains("npx") == true)
+        XCTAssertFalse(adapter.containment?.executableURL.path.contains("npx") == true)
     }
 
     /// Declared credentials, never inferred (finding 3), and legacy specs

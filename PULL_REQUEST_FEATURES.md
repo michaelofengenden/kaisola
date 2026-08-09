@@ -21,7 +21,7 @@ feature or acceptance completion, and PR 8 was untouched.
 | PR | Completion in the iteration | Remaining state |
 | --- | --- | --- |
 | PR 5 | Simulator/build blockers removed | Final real-device and production acceptance remains open |
-| PR 6 | Core registry and custom-agent process slices shipped | Consolidated settings UI remains; stronger process sandboxing is optional future work |
+| PR 6 | Core registry and custom-agent process slices shipped | Consolidated settings UI remains; custom ACP adapters now use the issue #26 allowlist + Seatbelt boundary |
 | PR 7 | 2 of 4 major slices shipped | Cross-project groups need a design decision; workflow automation is deferred |
 | PR 8 | No new completion | Pixel-smooth viewport implementation and physical-trackpad acceptance remain open |
 | PR 11 | 2 of 4 explicit acceptance gates completed | Bounded-PDF and installed-app momentum gates remain |
@@ -92,7 +92,8 @@ review). Shipped 2026-08-04:
   runs first.
 - MCP packages were already the reference registry; unchanged.
 
-The process slice shipped 2026-08-04 against all four review findings:
+The process slice shipped 2026-08-04 against all four review findings, and its
+runtime boundary was tightened for issue #26:
 custom agents reach chat only through `AdapterInstallManager` — enable
 resolves the npm package into an app-owned install with scripts disabled,
 pins the full dependency graph by lockfile hash, and spawns the resolved
@@ -100,10 +101,13 @@ executable itself (never `npx`); any drift refuses chat by name until
 re-approved. Credential contexts are declared roster data
 (claude/codex/none — `.none` chats open bindingless), built-in ids and
 adapters are untouched, legacy specs decode chat-disabled, and the enable
-sheet states plainly that the adapter runs with the user's ordinary
-access. Remaining niceties: a consolidated Extensions settings tab
-(grammar/mapping rosters still have stores but no UI), and sandboxing the
-adapter process if the stronger promise is ever wanted.
+sheet originally stated plainly that the adapter ran with the user's ordinary
+access. Custom adapters now launch through a deny-by-default macOS Seatbelt,
+provider-scoped environment allowlist, private home/cache tree, and a closed
+reviewed workspace/network/process grant bound to the install record. ACP fs,
+terminal, and MCP bridges enforce the same grant; see
+`notes/custom-acp-adapter-containment.md`. Remaining nicety: a consolidated
+Extensions settings tab (grammar/mapping rosters still have stores but no UI).
 
 ## PR 7 — Project and session ergonomics
 

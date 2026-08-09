@@ -116,4 +116,133 @@ final class CustomAgentStoreTests: XCTestCase {
         XCTAssertTrue(AgentRegistry.custom.isEmpty)
         XCTAssertEqual(AgentRegistry.all.count, AgentRegistry.builtIns.count)
     }
+
+    func testContainmentApprovalRoundTripsAndLegacyEntriesFailClosed() throws {
+        let spec = CustomAgentSpec(
+            id: "custom-contained",
+            name: "Contained",
+            launchCommand: "contained",
+            symbol: "cpu",
+            acpPackage: "contained-acp",
+            credentials: "claude",
+            chatEnabled: true,
+            acpPrivileges: ["workspaceRead", "network"]
+        )
+        store.save([spec])
+
+        let reopened = try XCTUnwrap(store.all().first)
+        XCTAssertEqual(reopened, spec)
+        XCTAssertEqual(
+            reopened.containmentApproval,
+            CustomAdapterApproval(
+                credentials: .claude,
+                privileges: [.network, .workspaceRead]
+            )
+        )
+        XCTAssertEqual(reopened.containmentApproval?.privileges, ["network", "workspaceRead"])
+
+        let explicitLeastPrivilege = CustomAgentSpec(
+            id: "custom-none",
+            name: "None",
+            launchCommand: "none",
+            symbol: "cpu",
+            acpPackage: "none-acp",
+            acpPrivileges: []
+        )
+        XCTAssertEqual(
+            explicitLeastPrivilege.containmentApproval,
+            CustomAdapterApproval(credentials: .none, privileges: [])
+        )
+
+        let legacy = Data(#"{"agents":[{"id":"custom-old","name":"Old","launchCommand":"old","symbol":"cpu","acpPackage":"old-acp","credentials":"none","chatEnabled":true}]}"#.utf8)
+        try legacy.write(to: fileURL)
+        let decodedLegacy = try XCTUnwrap(store.all().first)
+        XCTAssertNil(decodedLegacy.containmentApproval)
+        XCTAssertTrue(decodedLegacy.containmentIssue?.localizedCaseInsensitiveContains("review") == true)
+
+        var unknown = spec
+        unknown.acpPrivileges = ["network", "futureHostEscape"]
+        XCTAssertNil(unknown.containmentApproval)
+        XCTAssertTrue(unknown.containmentIssue?.contains("unknown") == true)
+
+        var unknownCredentials = spec
+        unknownCredentials.credentials = "future-provider"
+        XCTAssertNil(unknownCredentials.containmentApproval)
+        XCTAssertTrue(unknownCredentials.containmentIssue?.contains("credential context is unknown") == true)
+    }
+
+    @MainActor
+    func testInstallApprovalMustMatchTheCurrentRosterContract() async throws {
+        let directory = fileURL.deletingLastPathComponent()
+        let manager = AdapterInstallManager(
+            store: .init(fileURL: directory.appending(path: "installs.json")),
+            installsRoot: directory.appending(path: "adapters", directoryHint: .isDirectory)
+        )
+        let approval = CustomAdapterApproval(
+            credentials: .codex,
+            privileges: [.network, .workspaceRead]
+        )
+        let runner: @Sendable (URL, String) async throws -> Void = { root, package in
+            let bare = AdapterInstallManager.bareName(of: package)
+            let packageDirectory = root.appending(path: "node_modules/\(bare)", directoryHint: .isDirectory)
+            try FileManager.default.createDirectory(at: packageDirectory, withIntermediateDirectories: true)
+            try Data(#"{"lockfileVersion":3,"packages":{"node_modules/contained-acp":{"version":"1.0.0"}}}"#.utf8)
+                .write(to: root.appending(path: "package-lock.json"))
+            try Data(#"{"name":"contained-acp","bin":{"adapter":"./cli.js"}}"#.utf8)
+                .write(to: packageDirectory.appending(path: "package.json"))
+            let executable = packageDirectory.appending(path: "cli.js")
+            try Data("#!/usr/bin/env node\n".utf8).write(to: executable)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        }
+        _ = try await manager.install(
+            agentID: "custom-contained",
+            package: "contained-acp",
+            approval: approval,
+            runner: runner
+        )
+
+        guard case .verified = manager.verify(
+            agentID: "custom-contained",
+            expectedPackage: "contained-acp",
+            expectedApproval: approval
+        ) else { return XCTFail("the exact reviewed containment contract must verify") }
+        guard case let .drifted(privilegeReason) = manager.verify(
+            agentID: "custom-contained",
+            expectedApproval: CustomAdapterApproval(credentials: .codex, privileges: [.network])
+        ) else { return XCTFail("privilege drift must invalidate approval") }
+        XCTAssertTrue(privilegeReason.contains("access changed"), privilegeReason)
+        guard case let .drifted(credentialsReason) = manager.verify(
+            agentID: "custom-contained",
+            expectedApproval: CustomAdapterApproval(credentials: .claude, privileges: [.network, .workspaceRead])
+        ) else { return XCTFail("credential-context drift must invalidate approval") }
+        XCTAssertTrue(credentialsReason.contains("access changed"), credentialsReason)
+
+        store.save([CustomAgentSpec(
+            id: "custom-contained",
+            name: "Contained",
+            launchCommand: "contained",
+            symbol: "cpu",
+            acpPackage: "contained-acp",
+            credentials: "codex",
+            chatEnabled: true,
+            acpPrivileges: ["network", "workspaceRead"]
+        )])
+        let containment = try XCTUnwrap(
+            AcpAdapter.forCustomAgent(
+                "custom-contained",
+                store: store,
+                installs: manager
+            )?.containment
+        )
+        try Data("#!/usr/bin/env node\nrequire('drift')\n".utf8).write(
+            to: containment.executableURL
+        )
+        let workspace = directory.appending(path: "workspace", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        XCTAssertThrowsError(
+            try containment.prepare(environment: [:], cwd: workspace.path)
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("files changed"), error.localizedDescription)
+        }
+    }
 }

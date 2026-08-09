@@ -23,7 +23,7 @@ const NATIVE_CONTRACT_TESTS = Object.freeze([
 const NATIVE_DIRECTORY_TESTS = Object.freeze([
   ['native/KaisolaMac/Kaisola/Acp/', [
     'AcpClientTests', 'AcpPermissionRulesTests', 'AcpTerminalHostTests',
-    'AcpTranscriptStoreTests', 'AcpToolArtifactsTests',
+    'AcpTranscriptStoreTests', 'AcpToolArtifactsTests', 'CustomAgentStoreTests',
   ]],
   ['native/KaisolaMac/Kaisola/App/', [
     'AppModelProjectContextTests', 'AppModelReconnectTests',
@@ -76,6 +76,15 @@ const CODE_EDITOR_TESTS = Object.freeze([
 ])
 
 const NATIVE_FILE_TESTS = Object.freeze(new Map([
+  ['native/KaisolaMac/Kaisola/Acp/AcpAdapterResolver.swift', [
+    'AcpClientTests', 'CustomAgentStoreTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Acp/AdapterInstallManager.swift', [
+    'AcpClientTests', 'CustomAgentStoreTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Acp/CustomAdapterContainment.swift', [
+    'AcpClientTests', 'CustomAgentStoreTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Acp/AcpTranscriptStore.swift', [
     'AcpTranscriptStoreTests', 'AppModelProjectContextTests', 'UsageCenterTests',
   ]],
@@ -91,6 +100,12 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ]],
   ['native/KaisolaMac/Kaisola/App/NativePreviewPaths.swift', [
     'AcpTranscriptStoreTests', 'NativePreviewSettingsTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Broker/CustomAgentStore.swift', [
+    'AcpClientTests', 'CustomAgentStoreTests',
+  ]],
+  ['native/KaisolaMac/Kaisola/Features/Settings/CustomAgentsSection.swift', [
+    'AcpClientTests', 'CustomAgentStoreTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Onboarding/OnboardingView.swift', [
     'CommandRegistryTests', 'OnboardingStateTests', 'UsageCenterTests',

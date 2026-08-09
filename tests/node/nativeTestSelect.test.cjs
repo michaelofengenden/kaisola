@@ -160,6 +160,21 @@ test('confined editor sources select bridge, bundle, and workspace contracts', (
   assert.equal(plan.fallback, false)
 })
 
+test('custom ACP containment sources select launch and approval contracts', () => {
+  const plan = selector.planForChanges([
+    'native/KaisolaMac/Kaisola/Acp/AcpAdapterResolver.swift',
+    'native/KaisolaMac/Kaisola/Acp/AdapterInstallManager.swift',
+    'native/KaisolaMac/Kaisola/Acp/CustomAdapterContainment.swift',
+    'native/KaisolaMac/Kaisola/Broker/CustomAgentStore.swift',
+    'native/KaisolaMac/Kaisola/Features/Settings/CustomAgentsSection.swift',
+  ], inventory)
+
+  assert.equal(plan.native.mode, 'focused')
+  assert.deepEqual(plan.native.selectors, ['AcpClientTests', 'CustomAgentStoreTests'])
+  assert.equal(plan.node.mode, 'none')
+  assert.equal(plan.fallback, false)
+})
+
 test('broker and shared wire changes expand to the reproducible contract lane', () => {
   const plan = selector.planForChanges([
     'runtime/node-broker/ipc/brokerWire.cjs',

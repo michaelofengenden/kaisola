@@ -112,7 +112,8 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
         store: CustomAgentStore = CustomAgentStore()
     ) -> UsageAccountProfile.Provider? {
         if let builtin = provider(forAgentID: agentID) { return builtin }
-        guard let spec = store.all().first(where: { $0.id == agentID }) else { return nil }
+        guard case let .success(specs) = store.load(),
+              let spec = specs.first(where: { $0.id == agentID }) else { return nil }
         switch spec.resolvedCredentials {
         case .claude: return .claude
         case .codex: return .codex

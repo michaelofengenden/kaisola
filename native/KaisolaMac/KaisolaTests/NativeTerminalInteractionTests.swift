@@ -754,6 +754,8 @@ final class NativeTerminalInteractionTests: XCTestCase {
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        coordinator.setInputAuthorized(true)
+        view.setInputAuthorized(true)
 
         XCTAssertTrue(
             view.getTerminal().options.enableSixelReported,
@@ -771,13 +773,15 @@ final class NativeTerminalInteractionTests: XCTestCase {
 
     func testOwnedTerminalPasteUsesCodexBracketedPasteProtocol() {
         let coordinator = NativeTerminalSurface.Coordinator()
-        var captured = ""
-        coordinator.onInput = { captured += $0 }
+        var captured: [String] = []
+        coordinator.onInput = { captured.append($0) }
         let view = OwnedTerminalView(
             frame: NSRect(x: 0, y: 0, width: 640, height: 320),
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        coordinator.setInputAuthorized(true)
+        view.setInputAuthorized(true)
         // Codex enables DEC private mode 2004 while its prompt is active.
         view.feed(text: "\u{1B}[?2004h")
         XCTAssertTrue(view.getTerminal().bracketedPasteMode)
@@ -799,7 +803,11 @@ final class NativeTerminalInteractionTests: XCTestCase {
 
         view.paste(NSNull())
 
-        XCTAssertEqual(captured, "\u{1B}[200~first line\nsecond line 张\u{1B}[201~")
+        XCTAssertEqual(
+            captured,
+            ["\u{1B}[200~first line\nsecond line 张\u{1B}[201~"],
+            "A bracketed paste must cross the ownership-epoch boundary as one packet."
+        )
     }
 
     func testCommandPasteForwardsImageOnlyClipboardToCodexControlV() throws {
@@ -811,6 +819,8 @@ final class NativeTerminalInteractionTests: XCTestCase {
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        coordinator.setInputAuthorized(true)
+        view.setInputAuthorized(true)
         view.agentLaunchCommand = "codex"
 
         let pasteboard = NSPasteboard.general
@@ -865,6 +875,12 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertEqual(readOnly.menu(for: rightClick)?.items.map(\.title), ["Copy", "", "Select All"])
 
         let owned = OwnedTerminalView(frame: .zero, font: font)
+        XCTAssertEqual(
+            owned.menu(for: rightClick)?.items.map(\.title),
+            ["Copy", "", "Select All"],
+            "A controller-capable view starts sealed and must not advertise Paste."
+        )
+        owned.setInputAuthorized(true)
         XCTAssertEqual(owned.menu(for: rightClick)?.items.map(\.title), ["Copy", "Paste", "", "Select All"])
     }
 
@@ -1075,18 +1091,185 @@ final class NativeTerminalInteractionTests: XCTestCase {
     func testOwnedSurfaceForwardsKeyboardBytesToInputCallback() {
         let coordinator = NativeTerminalSurface.Coordinator()
         var captured: [String] = []
-        coordinator.onInput = { captured.append($0) }
         let view = OwnedTerminalView(
             frame: .zero,
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        NativeTerminalSurface.configureAuthority(
+            .localController(active: true),
+            on: view,
+            coordinator: coordinator,
+            onInput: { captured.append($0) },
+            onResize: nil,
+            onTitleChange: nil
+        )
 
-        // The owned view forwards the Terminal engine's outbound bytes (the
-        // path keyboard input travels) to the delegate; the coordinator turns
-        // them into an onInput string bound to the broker controller write.
-        view.send(source: view.getTerminal(), data: ArraySlice(Array("ls -la\r".utf8)))
+        // SwiftTerm's ordinary keyboard path calls this inherited overload
+        // directly; it does not pass through OwnedTerminalView's terminal-query
+        // reply override.
+        view.send(data: ArraySlice(Array("ls -la\r".utf8)))
         XCTAssertEqual(captured, ["ls -la\r"])
+    }
+
+    func testObserverSurfaceCannotBePromotedByMismatchedAuthority() {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        var captured: [String] = []
+        let view = ReadOnlyTerminalView(
+            frame: .zero,
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+
+        NativeTerminalSurface.configureAuthority(
+            .localController(active: true),
+            on: view,
+            coordinator: coordinator,
+            onInput: { captured.append($0) },
+            onResize: nil,
+            onTitleChange: nil
+        )
+        view.send(data: ArraySlice(Array("must-stay-observed".utf8)))
+        coordinator.send(
+            source: view,
+            data: ArraySlice(Array("delegate-mismatch".utf8))
+        )
+
+        XCTAssertTrue(captured.isEmpty)
+        XCTAssertFalse(view.allowMouseReporting)
+        XCTAssertEqual(view.accessibilityLabel(), "Read-only terminal output")
+    }
+
+    func testSealedOwnedSurfaceBlocksEveryOutboundInputPath() throws {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        var captured: [String] = []
+        var resizeCalls: [(Int, Int)] = []
+        var titleCalls: [String] = []
+        coordinator.onInput = { captured.append($0) }
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 320),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+        let terminal = view.getTerminal()
+        let droppedURL = URL(fileURLWithPath: "/tmp/Kaisola ownership flap.txt")
+        let rightClick = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .rightMouseDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+
+        XCTAssertFalse(view.isInputAuthorized, "Controller-capable views must start fail-closed.")
+        XCTAssertFalse(view.allowMouseReporting)
+        XCTAssertEqual(view.accessibilityLabel(), "Read-only terminal output")
+        view.send(data: ArraySlice(Array("sealed-keyboard".utf8)))
+        view.send(source: terminal, data: ArraySlice(Array("sealed-reply".utf8)))
+        coordinator.send(source: view, data: ArraySlice(Array("delegate-bypass".utf8)))
+        view.paste(view)
+        XCTAssertFalse(view.handleControlVIfImagePresent())
+        XCTAssertFalse(view.sendShiftEnter())
+        XCTAssertFalse(view.performFileDrop(urls: [droppedURL]))
+        XCTAssertFalse(view.menu(for: rightClick)?.items.contains { $0.title == "Paste" } == true)
+        XCTAssertTrue(captured.isEmpty)
+
+        NativeTerminalSurface.configureAuthority(
+            .localController(active: true),
+            on: view,
+            coordinator: coordinator,
+            onInput: { captured.append($0) },
+            onResize: { resizeCalls.append(($0, $1)) },
+            onTitleChange: { titleCalls.append($0) }
+        )
+        XCTAssertTrue(view.isInputAuthorized)
+        XCTAssertTrue(view.allowMouseReporting)
+        XCTAssertEqual(view.accessibilityLabel(), "Terminal")
+        view.send(data: ArraySlice(Array("live".utf8)))
+        XCTAssertTrue(view.sendShiftEnter())
+        XCTAssertTrue(view.performFileDrop(urls: [droppedURL]))
+        XCTAssertTrue(view.menu(for: rightClick)?.items.contains { $0.title == "Paste" } == true)
+        XCTAssertEqual(captured.first, "live")
+        XCTAssertEqual(Array(captured.dropFirst().first?.utf8 ?? "".utf8), [0x1B, 0x0D])
+        XCTAssertTrue(captured.joined().contains("Kaisola ownership flap.txt"))
+
+        let countBeforeRevocation = captured.count
+        let resizeCountBeforeRevocation = resizeCalls.count
+        coordinator.setTerminalTitle(source: view, title: "queued-before-revocation")
+        NativeTerminalSurface.configureAuthority(
+            .localController(active: false),
+            on: view,
+            coordinator: coordinator,
+            onInput: { captured.append($0) },
+            onResize: { resizeCalls.append(($0, $1)) },
+            onTitleChange: { titleCalls.append($0) }
+        )
+        view.send(data: ArraySlice(Array("stale-keyboard".utf8)))
+        view.send(source: terminal, data: ArraySlice(Array("stale-reply".utf8)))
+        coordinator.send(source: view, data: ArraySlice(Array("stale-delegate".utf8)))
+        coordinator.sizeChanged(source: view, newCols: 91, newRows: 37)
+        view.paste(view)
+        XCTAssertFalse(view.handleControlVIfImagePresent())
+        XCTAssertFalse(view.sendShiftEnter())
+        XCTAssertFalse(view.performFileDrop(urls: [droppedURL]))
+        XCTAssertEqual(captured.count, countBeforeRevocation)
+        XCTAssertEqual(resizeCalls.count, resizeCountBeforeRevocation)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertTrue(titleCalls.isEmpty, "Revocation must cancel a title still waiting in the debounce.")
+        XCTAssertFalse(view.allowMouseReporting)
+        XCTAssertEqual(view.accessibilityLabel(), "Read-only terminal output")
+    }
+
+    func testDismantleSealsOwnedSurfaceBeforeCaching() throws {
+        let cache = TerminalSurfaceCache.shared
+        cache.removeAll()
+        defer { cache.removeAll() }
+        let coordinator = NativeTerminalSurface.Coordinator()
+        coordinator.retainedSessionID = "retained-owned"
+        var captured: [String] = []
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 320),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+        NativeTerminalSurface.configureAuthority(
+            .localController(active: true),
+            on: view,
+            coordinator: coordinator,
+            onInput: { captured.append($0) },
+            onResize: nil,
+            onTitleChange: nil
+        )
+        XCTAssertTrue(view.isInputAuthorized)
+
+        NativeTerminalSurface.dismantleNSView(view, coordinator: coordinator)
+        view.send(data: ArraySlice(Array("parked-keyboard".utf8)))
+        coordinator.send(source: view, data: ArraySlice(Array("parked-delegate".utf8)))
+
+        XCTAssertFalse(view.isInputAuthorized)
+        XCTAssertFalse(view.allowMouseReporting)
+        XCTAssertEqual(view.accessibilityLabel(), "Read-only terminal output")
+        XCTAssertTrue(captured.isEmpty)
+        let rightClick = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .rightMouseDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+        XCTAssertFalse(view.menu(for: rightClick)?.items.contains { $0.title == "Paste" } == true)
+        XCTAssertTrue(cache.claim(
+            sessionID: "retained-owned",
+            controllerCapable: true
+        )?.view === view)
     }
 
     func testShiftEnterRequiresExactlyShift() {
@@ -1178,6 +1361,8 @@ final class NativeTerminalInteractionTests: XCTestCase {
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        coordinator.setInputAuthorized(true)
+        view.setInputAuthorized(true)
         view.configureTerminalTheme(light: true, themeID: "native")
 
         // These are the exact families seen in the corrupted prompt screenshot:
@@ -1257,6 +1442,8 @@ final class NativeTerminalInteractionTests: XCTestCase {
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        coordinator.setInputAuthorized(true)
+        view.setInputAuthorized(true)
         view.configureTerminalTheme(light: true, themeID: "native")
 
         coordinator.apply(output: "", epoch: "epoch-a", endOffset: 0, to: view)

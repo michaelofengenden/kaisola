@@ -10,6 +10,10 @@ const {
   SPOOL_APPEND_DEBOUNCE_MS,
 } = require('../../runtime/node-broker/ipc/terminalSpool.cjs')
 
+// Three UTF-8 bytes each, so a cap of 10 lands inside a scalar and the tail has
+// to move forward to the next character boundary.
+const SNOWMAN = '☃'
+
 function fixture(t, options = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-spool-'))
   const spool = new TerminalSpool({
@@ -43,6 +47,46 @@ test('evicting the durable hot tail never queues bytes a second time', (t) => {
 
   assert.equal(fs.readFileSync(spool.file, 'utf8'), chunks.join(''))
   assert.equal(spool.snapshot(1024).output, chunks.join(''))
+})
+
+test('a lone oversized chunk is trimmed to the hot cap on a character boundary', (t) => {
+  const spool = fixture(t, { hotCap: 10 })
+
+  spool.push(SNOWMAN.repeat(8)) // 24 bytes in a single write
+  spool.flush()
+
+  const retained = spool.chunks.join('')
+  assert.equal(retained, SNOWMAN.repeat(3)) // 9 bytes: the 10th would split a scalar
+  assert.equal(spool.stats().ramBytes, 9)
+  assert.ok(!retained.includes('\uFFFD'))
+  assert.equal(fs.readFileSync(spool.file, 'utf8'), SNOWMAN.repeat(8)) // durable copy is whole
+})
+
+test('a lone oversized chunk is trimmed in the disk-failure fallback too', (t) => {
+  const spool = fixture(t, { hotCap: 10 })
+  // A directory where the log belongs makes every append fail, which is the
+  // path that retains a hot tail in RAM instead of on disk.
+  fs.mkdirSync(spool.file)
+  spool.setVisible(false) // isolate the fallback from the visible read cache
+
+  spool.push(SNOWMAN.repeat(8))
+  spool.flush()
+
+  const retained = spool.fallbackChunks.join('')
+  assert.ok(spool.diskError)
+  assert.equal(retained, SNOWMAN.repeat(3))
+  assert.equal(spool.fallbackLen, 9)
+  assert.ok(!retained.includes('\uFFFD'))
+})
+
+test('a hot cap smaller than the trailing scalar retains nothing', (t) => {
+  const spool = fixture(t, { hotCap: 1 })
+
+  spool.push(SNOWMAN)
+  spool.flush()
+
+  assert.deepEqual(spool.chunks, [])
+  assert.equal(spool.stats().ramBytes, 0)
 })
 
 test('late pty output after close({remove}) cannot resurrect the deleted spool file', async (t) => {

@@ -73,6 +73,29 @@ function utf8Tail(value, bytes) {
   return buffer.subarray(start).toString('utf8')
 }
 
+/** Evict whole chunks from the front of `chunks` until the retained tail fits
+ * `cap`, then trim what is left when a single chunk is still oversized, and
+ * return the new byte length. Dropping only while more than one chunk remained
+ * left one write larger than the cap retained whole, so a terminal that emitted
+ * a megabyte in a single burst kept all of it and the RAM ceiling did not hold.
+ * The surviving trim is a UTF-8 tail: the tail can only start on a character
+ * boundary. Mutates `chunks` in place. */
+function trimChunksToCap(chunks, byteLength, cap) {
+  const limit = Number.isFinite(Number(cap)) ? Math.max(0, Math.floor(Number(cap))) : 0
+  let length = byteLength
+  while (chunks.length > 1 && length > limit) {
+    length -= Buffer.byteLength(chunks.shift())
+  }
+  if (chunks.length === 1 && length > limit) {
+    const tail = utf8Tail(chunks[0], limit)
+    length = Buffer.byteLength(tail)
+    // A cap smaller than the trailing scalar leaves nothing retainable.
+    if (length) chunks[0] = tail
+    else chunks.length = 0
+  }
+  return length
+}
+
 function readTail(file, bytes) {
   if (!bytes || !fs.existsSync(file)) return ''
   let fd
@@ -287,10 +310,7 @@ class TerminalSpool {
     if (!text) return
     this.fallbackChunks.push(text)
     this.fallbackLen += Buffer.byteLength(text)
-    while (this.fallbackChunks.length > 1 && this.fallbackLen > this.hotCap) {
-      const old = this.fallbackChunks.shift()
-      this.fallbackLen -= Buffer.byteLength(old)
-    }
+    this.fallbackLen = trimChunksToCap(this.fallbackChunks, this.fallbackLen, this.hotCap)
   }
 
   _diskSegments(startOffset = 0) {
@@ -353,10 +373,7 @@ class TerminalSpool {
     if (!this.visible) return
     this.chunks.push(data)
     this.chunksLen += Buffer.byteLength(data)
-    while (this.chunks.length > 1 && this.chunksLen > this.hotCap) {
-      const old = this.chunks.shift()
-      this.chunksLen -= Buffer.byteLength(old)
-    }
+    this.chunksLen = trimChunksToCap(this.chunks, this.chunksLen, this.hotCap)
   }
 
   setVisible(visible, viewState) {

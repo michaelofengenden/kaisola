@@ -127,6 +127,15 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         "CODEX_THREAD_ID": .string(""),
     ]
 
+    /// The broker one in-flight handshake is opening. Two callers that name the
+    /// same broker share that handshake; a caller that names a different one is
+    /// refused rather than opening a second transport underneath the first.
+    private struct ConnectTarget: Equatable {
+        let socketPath: String
+        let token: String
+        let ownerID: String
+    }
+
     private let transport: any BrokerByteTransport
     private let operationTimeoutNanoseconds: UInt64
     nonisolated let connectionInstanceID: String
@@ -134,7 +143,12 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     private var connected = false
     private var connectedFeatures: Set<String> = []
     private var ownerID = ""
-    private var helloWaiter: CheckedContinuation<Void, any Error>?
+    private var connectInFlight: ConnectTarget?
+    /// Every caller waiting on the single in-flight handshake, in arrival
+    /// order. A list rather than one slot: the old single continuation was
+    /// overwritten by a second concurrent connect, and the first caller then
+    /// waited forever on a continuation nobody could resume.
+    private var helloWaiters: [CheckedContinuation<Void, any Error>] = []
     private var handshakeTimeoutTask: Task<Void, Never>?
     private var pending: [String: CheckedContinuation<JSONValue, any Error>] = [:]
     private var requestTimeoutTasks: [String: Task<Void, Never>] = [:]
@@ -157,28 +171,57 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         disconnectHandler = handler
     }
 
+    /// Test seam: how many callers are parked on the in-flight handshake right
+    /// now. Lets a concurrency test wait for a second connect to coalesce
+    /// instead of guessing at a sleep.
+    var connectWaiterCount: Int { helloWaiters.count }
+
     func connect(to info: BrokerInfo, ownerID: String) async throws {
         if connected { return }
         try info.validate()
         guard !ownerID.isEmpty else { throw BrokerClientError.requestFailed("controller owner id") }
+        let target = ConnectTarget(socketPath: info.socketPath, token: info.token, ownerID: ownerID)
+        if let connectInFlight {
+            // Opening the socket and awaiting hello both suspend, so a second
+            // caller can arrive mid-handshake. Same broker: wait on the one
+            // already running. Different broker: refuse, because succeeding
+            // here would hand the caller a connection to somebody else's.
+            guard connectInFlight == target else {
+                throw BrokerClientError.requestFailed("broker connect target")
+            }
+            return try await withCheckedThrowingContinuation { continuation in
+                helloWaiters.append(continuation)
+            }
+        }
+        connectInFlight = target
         self.ownerID = ownerID
-        try await transport.connect(path: info.socketPath)
+
+        let encoded: Data
+        do {
+            try await transport.connect(path: info.socketPath)
+            let frame: JSONValue = .object([
+                "type": .string("hello"),
+                "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+                "token": .string(info.token),
+                // The broker validates instanceId as a UUID shape; the durable
+                // owner identity travels in request params instead, and reattach
+                // is authorized by project capability rather than instance.
+                "instanceId": .string(connectionInstanceID),
+                "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native"),
+                "access": .string("controller"),
+            ])
+            encoded = try encode(frame)
+        } catch {
+            // Callers that joined while the socket was opening fail with the
+            // error this one saw instead of waiting on a handshake that will
+            // never be sent.
+            failConnect(with: error)
+            throw error
+        }
         readerTask = Task { await readLoop() }
 
-        let frame: JSONValue = .object([
-            "type": .string("hello"),
-            "protocol": .integer(Int64(BrokerWire.protocolVersion)),
-            "token": .string(info.token),
-            // The broker validates instanceId as a UUID shape; the durable
-            // owner identity travels in request params instead, and reattach
-            // is authorized by project capability rather than instance.
-            "instanceId": .string(connectionInstanceID),
-            "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native"),
-            "access": .string("controller"),
-        ])
-        let encoded = try encode(frame)
         return try await withCheckedThrowingContinuation { continuation in
-            helloWaiter = continuation
+            helloWaiters.append(continuation)
             handshakeTimeoutTask?.cancel()
             handshakeTimeoutTask = Task {
                 do {
@@ -621,8 +664,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             connectedFeatures = features
             handshakeTimeoutTask?.cancel()
             handshakeTimeoutTask = nil
-            helloWaiter?.resume(returning: ())
-            helloWaiter = nil
+            completeConnect()
         case "response":
             guard let id = object["id"]?.stringValue, let continuation = pending.removeValue(forKey: id) else {
                 return
@@ -654,11 +696,26 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         pending.removeValue(forKey: id)?.resume(throwing: error)
     }
 
+    /// Hands the settled handshake to everyone who coalesced onto it and closes
+    /// the window, so the next connect starts a fresh one.
+    private func completeConnect() {
+        connectInFlight = nil
+        let waiters = helloWaiters
+        helloWaiters.removeAll()
+        for waiter in waiters { waiter.resume(returning: ()) }
+    }
+
+    private func failConnect(with error: any Error) {
+        connectInFlight = nil
+        let waiters = helloWaiters
+        helloWaiters.removeAll()
+        for waiter in waiters { waiter.resume(throwing: error) }
+    }
+
     private func failConnection(with error: any Error) {
         handshakeTimeoutTask?.cancel()
         handshakeTimeoutTask = nil
-        helloWaiter?.resume(throwing: error)
-        helloWaiter = nil
+        failConnect(with: error)
         for task in requestTimeoutTasks.values { task.cancel() }
         requestTimeoutTasks.removeAll()
         for continuation in pending.values { continuation.resume(throwing: error) }

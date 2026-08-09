@@ -94,6 +94,153 @@ final class BrokerControlClientTests: XCTestCase {
         XCTAssertEqual(disconnectCount, 0, "App quit/reload must not schedule a recovery reconnect.")
     }
 
+    /// Two callers asking for the same broker at once must share one handshake.
+    /// The old single-slot waiter let the second connect overwrite the first
+    /// caller's continuation, and that caller then waited forever.
+    func testConcurrentConnectsToOneBrokerShareASingleHandshake() async throws {
+        let transport = GatedControlBrokerTransport()
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 2_000_000_000
+        )
+        let outcomes = ConnectOutcomes()
+        let info = controlBrokerInfo
+
+        let first = Task { [client] in
+            do {
+                try await client.connect(to: info, ownerID: "native-test")
+                await outcomes.record("first", failure: nil)
+            } catch {
+                await outcomes.record("first", failure: error)
+            }
+        }
+        defer { first.cancel() }
+        try await waitUntil("the first connect reaches the socket") {
+            await transport.connectAttemptCount == 1
+        }
+
+        let second = Task { [client] in
+            do {
+                try await client.connect(to: info, ownerID: "native-test")
+                await outcomes.record("second", failure: nil)
+            } catch {
+                await outcomes.record("second", failure: error)
+            }
+        }
+        defer { second.cancel() }
+        try await waitUntil("the second connect coalesces onto the first") {
+            await client.connectWaiterCount == 1
+        }
+
+        await transport.openConnectGate()
+        try await waitUntil("both callers are answered") { await outcomes.count == 2 }
+
+        let firstFailure = await outcomes.failure(for: "first")
+        let secondFailure = await outcomes.failure(for: "second")
+        let connectAttempts = await transport.connectAttemptCount
+        let helloFrames = await transport.helloFrameCount()
+        let parkedWaiters = await client.connectWaiterCount
+        XCTAssertNil(firstFailure)
+        XCTAssertNil(secondFailure)
+        XCTAssertEqual(connectAttempts, 1, "A coalesced connect must not open a second transport.")
+        XCTAssertEqual(
+            helloFrames,
+            1,
+            "Both callers must ride one handshake, not race two on a shared decoder."
+        )
+        XCTAssertEqual(
+            parkedWaiters,
+            0,
+            "Every coalesced caller must be resumed; none may be left parked."
+        )
+        await client.disconnect()
+    }
+
+    /// A concurrent connect naming a different broker is refused outright. It
+    /// must not open a second socket, and the handshake already in flight must
+    /// still answer its own caller.
+    func testConcurrentConnectToADifferentBrokerIsRefused() async throws {
+        let transport = GatedControlBrokerTransport()
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 2_000_000_000
+        )
+        let outcomes = ConnectOutcomes()
+        let info = controlBrokerInfo
+        let other = otherControlBrokerInfo
+
+        let first = Task { [client] in
+            do {
+                try await client.connect(to: info, ownerID: "native-test")
+                await outcomes.record("first", failure: nil)
+            } catch {
+                await outcomes.record("first", failure: error)
+            }
+        }
+        defer { first.cancel() }
+        try await waitUntil("the first connect reaches the socket") {
+            await transport.connectAttemptCount == 1
+        }
+
+        let second = Task { [client] in
+            do {
+                try await client.connect(to: other, ownerID: "native-test")
+                await outcomes.record("second", failure: nil)
+            } catch {
+                await outcomes.record("second", failure: error)
+            }
+        }
+        defer { second.cancel() }
+        try await waitUntil("the mismatched connect is answered") {
+            await outcomes.count == 1
+        }
+        let refusal = await outcomes.failure(for: "second")
+        XCTAssertEqual(
+            refusal as? BrokerClientError,
+            .requestFailed("broker connect target"),
+            "A connect to another broker must be refused, not raced onto this one."
+        )
+
+        await transport.openConnectGate()
+        try await waitUntil("the original caller is answered") { await outcomes.count == 2 }
+        let firstFailure = await outcomes.failure(for: "first")
+        let paths = await transport.connectedPaths()
+        let helloFrames = await transport.helloFrameCount()
+        let parkedWaiters = await client.connectWaiterCount
+        XCTAssertNil(firstFailure, "The in-flight handshake must still answer its own caller.")
+        XCTAssertEqual(paths, [info.socketPath])
+        XCTAssertEqual(helloFrames, 1)
+        XCTAssertEqual(parkedWaiters, 0)
+        await client.disconnect()
+    }
+
+    /// Polls a condition instead of sleeping a fixed span, so a regression
+    /// fails the assertion rather than hanging the suite.
+    private func waitUntil(
+        _ description: String,
+        timeoutNanoseconds: UInt64 = 2_000_000_000,
+        _ condition: () async -> Bool
+    ) async throws {
+        let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            if await condition() { return }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTFail("Timed out waiting for \(description).")
+    }
+
+    private var otherControlBrokerInfo: BrokerInfo {
+        BrokerInfo(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            pid: 12_346,
+            socketPath: "/tmp/kaisola-controller-test-other.sock",
+            token: String(repeating: "b", count: 64),
+            startedAt: 1_784_250_002_000,
+            version: "test"
+        )
+    }
+
     func testUnixTransportShutdownWakesBlockedReceive() async throws {
         var descriptors = [Int32](repeating: -1, count: 2)
         XCTAssertEqual(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
@@ -348,6 +495,92 @@ final class BrokerControlClientTests: XCTestCase {
         let store = NativeSessionStore(fileURL: file)
         XCTAssertEqual(store.sessions(), [])
         XCTAssertTrue(store.ownerID().hasPrefix("native-"))
+    }
+}
+
+private actor ConnectOutcomes {
+    private var failures: [String: (any Error)?] = [:]
+
+    var count: Int { failures.count }
+
+    func record(_ label: String, failure: (any Error)?) {
+        failures[label] = failure
+    }
+
+    func failure(for label: String) -> (any Error)? {
+        failures[label] ?? nil
+    }
+}
+
+/// A broker double whose socket open parks until the test opens the gate, so a
+/// second connect is guaranteed to arrive while the first handshake is still in
+/// flight. Otherwise it answers hello exactly like the scripted double.
+private actor GatedControlBrokerTransport: BrokerByteTransport {
+    private(set) var connectAttemptCount = 0
+    private var paths: [String] = []
+    private var gateOpen = false
+    private var gateWaiters: [CheckedContinuation<Void, Never>] = []
+    private var frames: [JSONValue] = []
+    private var incoming: [Data?] = []
+    private var receiveWaiters: [CheckedContinuation<Data?, Never>] = []
+
+    func connect(path: String) async throws {
+        connectAttemptCount += 1
+        paths.append(path)
+        if gateOpen { return }
+        await withCheckedContinuation { continuation in
+            gateWaiters.append(continuation)
+        }
+    }
+
+    func openConnectGate() {
+        gateOpen = true
+        let parked = gateWaiters
+        gateWaiters.removeAll()
+        for continuation in parked { continuation.resume() }
+    }
+
+    func send(_ data: Data) async throws {
+        guard let newline = data.firstIndex(of: 0x0A) else {
+            throw BrokerClientError.malformedResponse
+        }
+        let frame = try JSONDecoder().decode(JSONValue.self, from: data[..<newline])
+        frames.append(frame)
+        guard frame.objectValue?["type"]?.stringValue == "hello" else { return }
+        var reply = try JSONEncoder().encode(JSONValue.object([
+            "type": .string("hello"),
+            "ok": .bool(true),
+            "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+            "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
+            "features": .array([.string(BrokerWire.terminalObserveFeature)]),
+        ]))
+        reply.append(0x0A)
+        deliver(reply)
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !incoming.isEmpty { return incoming.removeFirst() }
+        return await withCheckedContinuation { continuation in
+            receiveWaiters.append(continuation)
+        }
+    }
+
+    func close() async {
+        deliver(nil)
+    }
+
+    func connectedPaths() -> [String] { paths }
+
+    func helloFrameCount() -> Int {
+        frames.filter { $0.objectValue?["type"]?.stringValue == "hello" }.count
+    }
+
+    private func deliver(_ data: Data?) {
+        if receiveWaiters.isEmpty {
+            incoming.append(data)
+        } else {
+            receiveWaiters.removeFirst().resume(returning: data)
+        }
     }
 }
 

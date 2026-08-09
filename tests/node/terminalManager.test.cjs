@@ -2,6 +2,7 @@
 
 const { after, test } = require('node:test')
 const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -279,6 +280,8 @@ test('restore spawn reuses retained bytes and appends new output', async (t) => 
     exited: false,
     exitStatus: null,
     agentBusy: false,
+    agentTurnOpen: false,
+    agentCompletionSignal: null,
     agentCompletedAt: null,
     agentRespondedAt: null,
   })
@@ -489,4 +492,334 @@ test('spool hot cache lives only while observed', async (t) => {
   assert.equal(record.spool.visible, true, 'a remaining observer keeps the cache')
   manager.unsubscribeSubscriberPrefix('window-b|')
   assert.equal(record.spool.visible, false)
+})
+
+test('the renderer exit channel carries the signal that killed the session', async (t) => {
+  const id = 'signal-exit-keeps-its-cause'
+  const events = []
+  manager.setEventSink((sender, channel, payload) => {
+    events.push({ sender, channel, payload })
+    return true
+  })
+  t.after(() => {
+    manager.setEventSink(null)
+    manager.release(id)
+  })
+  manager.spawn({
+    id,
+    command: '/bin/sh',
+    args: ['-c', 'kill -TERM $$'],
+    cwd: managerSpoolDir,
+    sender: 'instance-a|1|project',
+  })
+
+  const exitStatus = await manager.waitForExit(id)
+  // SIGTERM leaves exitCode 0, so the code alone reads as a clean exit.
+  assert.deepEqual(exitStatus, { exitCode: 0, signal: 15 })
+  assert.deepEqual(events.filter((event) => event.channel === `terminal:exit:${id}`), [{
+    sender: 'instance-a|1|project',
+    channel: `terminal:exit:${id}`,
+    payload: { exitCode: 0, signal: 15 },
+  }])
+})
+
+test('agent silence relaxes the busy indicator but never completes the turn', async (t) => {
+  const id = 'agent-turn-silence-is-not-completion'
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  t.after(() => manager.release(id))
+
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  assert.equal(manager.agentTurn(id, true), true)
+  assert.equal(record.agentBusy, true)
+  assert.equal(record.agentTurnOpen, true)
+  assert.equal(manager.rollingUpdateReadiness().safe, false)
+
+  // Well past AGENT_QUIET_MS with the pty saying nothing at all.
+  t.mock.timers.tick(30_000)
+
+  // Degraded, not done: the indicator relaxes so the UI stops claiming live
+  // work, and the record still reports an open, unconfirmed turn.
+  assert.equal(record.agentBusy, false)
+  assert.equal(record.agentTurnOpen, true)
+  assert.equal(record.agentCompletionSignal, null)
+  assert.ok(Number.isSafeInteger(record.agentQuietSince))
+  assert.equal(manager.snapshot(id).agentCompletionSignal, null)
+
+  const quiet = manager.rollingUpdateReadiness()
+  assert.equal(quiet.safe, false, 'silence must not authorize a broker cutover')
+  assert.deepEqual(quiet.busyTerminalIds, [id])
+  assert.deepEqual(quiet.unconfirmedTurnIds, [id])
+  assert.ok(manager.upgradeReadiness().busyTerminalIds.includes(id))
+
+  // Only the explicit lifecycle signal closes the turn.
+  assert.equal(manager.agentTurn(id, false), true)
+  assert.equal(record.agentTurnOpen, false)
+  assert.equal(record.agentCompletionSignal, 'agent-turn')
+  const settled = manager.rollingUpdateReadiness()
+  assert.equal(settled.safe, true)
+  assert.deepEqual(settled.busyTerminalIds, [])
+  assert.deepEqual(settled.unconfirmedTurnIds, [])
+})
+
+test('a pty exit completes an open agent turn as an explicit signal', async (t) => {
+  const id = 'agent-turn-closed-by-exit'
+  const record = manager.spawn({
+    id,
+    command: '/bin/sh',
+    args: ['-c', 'exit 0'],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  t.after(() => manager.release(id))
+
+  assert.equal(manager.agentTurn(id, true), true)
+  await manager.waitForExit(id)
+
+  assert.equal(record.agentTurnOpen, false)
+  assert.equal(record.agentCompletionSignal, 'terminal-exit')
+  assert.equal(manager.rollingUpdateReadiness().safe, true)
+})
+
+test('a shell command-end mark completes an open agent turn', async (t) => {
+  const id = 'agent-turn-closed-by-shell-mark'
+  const record = manager.spawn({
+    id,
+    command: '/bin/sh',
+    args: ['-c', 'printf "\\033]133;D;0\\007"; sleep 5'],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  t.after(() => manager.release(id))
+
+  assert.equal(manager.agentTurn(id, true), true)
+  for (let attempt = 0; attempt < 50 && record.agentTurnOpen; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+
+  assert.equal(record.agentTurnOpen, false)
+  assert.equal(record.agentCompletionSignal, 'shell-command-end')
+  assert.equal(record.agentBusy, false)
+})
+
+test('a command-end mark split across two pty writes still counts', () => {
+  const record = { agentMarkCarry: '' }
+  assert.equal(__test.consumeCommandEndMark(record, 'building\r\n\u001b]13'), false)
+  assert.equal(__test.consumeCommandEndMark(record, '3;D;0'), true)
+  assert.equal(__test.consumeCommandEndMark(record, 'ordinary agent output'), false)
+})
+
+test('an unconfirmed turn keeps blocking retirement while a signalled one does not', () => {
+  const quiet = __test.summarizeUpgradeReadiness([
+    { id: 'quiet-agent', exited: false, agentBusy: false, agentTurnOpen: true },
+  ], 0)
+  assert.equal(quiet.busyAgentCount, 1)
+  assert.deepEqual(quiet.busyTerminalIds, ['quiet-agent'])
+  assert.equal(quiet.unconfirmedTurnCount, 1)
+  assert.equal(quiet.safe, false)
+
+  const signalled = __test.summarizeUpgradeReadiness([
+    { id: 'quiet-agent', exited: false, agentBusy: false, agentTurnOpen: false },
+  ], 0)
+  assert.equal(signalled.busyAgentCount, 0)
+  assert.equal(signalled.unconfirmedTurnCount, 0)
+})
+
+// --- signed spawn-helper staging -------------------------------------------
+// The helper copied into private storage is the executable node-pty hands to
+// posix_spawn, so anything pre-created on that path is treated as hostile.
+
+function helperFixture(t) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-helper-root-'))
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const outside = path.join(base, 'attacker')
+  fs.mkdirSync(outside, { mode: 0o700 })
+  const source = path.join(base, 'signed-spawn-helper')
+  fs.writeFileSync(source, 'signed-helper-bytes', { mode: 0o600 })
+  return { base, outside, source, root: path.join(base, 'storage', '.native') }
+}
+
+test('helper staging rejects a symlinked root planted before launch', (t) => {
+  const { outside, root } = helperFixture(t)
+  fs.mkdirSync(path.dirname(root), { mode: 0o700 })
+  fs.symlinkSync(outside, root)
+
+  assert.throws(() => __test.prepareHelperDir(root, process.arch), /helper path component is a symlink/)
+  assert.deepEqual(fs.readdirSync(outside), [], 'nothing is created outside private storage')
+})
+
+test('helper staging rejects a symlinked architecture directory', (t) => {
+  const { outside, root } = helperFixture(t)
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+  fs.symlinkSync(outside, path.join(root, `darwin-${process.arch}`))
+
+  assert.throws(() => __test.prepareHelperDir(root, process.arch), /helper path component is a symlink/)
+  assert.deepEqual(fs.readdirSync(outside), [])
+})
+
+test('helper staging rejects a plain file planted at the root path', (t) => {
+  const { root } = helperFixture(t)
+  fs.mkdirSync(path.dirname(root), { mode: 0o700 })
+  fs.writeFileSync(root, '', { mode: 0o600 })
+
+  assert.throws(() => __test.prepareHelperDir(root, process.arch), /helper path component is not a directory/)
+})
+
+test('helper staging rejects an ancestor other users can write', (t) => {
+  const { root } = helperFixture(t)
+  const storage = path.dirname(root)
+  fs.mkdirSync(storage, { mode: 0o700 })
+  fs.chmodSync(storage, 0o777)
+
+  assert.throws(() => __test.prepareHelperDir(root, process.arch), /helper path component is writable by other users/)
+})
+
+test('helper staging tightens a loose pre-created directory back to owner-only', (t) => {
+  const { root } = helperFixture(t)
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+  fs.chmodSync(root, 0o777)
+
+  const helperDir = __test.prepareHelperDir(root, process.arch)
+  assert.equal(helperDir, path.join(fs.realpathSync(root), `darwin-${process.arch}`))
+  assert.equal(fs.lstatSync(fs.realpathSync(root)).mode & 0o777, 0o700)
+  assert.equal(fs.lstatSync(helperDir).mode & 0o777, 0o700)
+})
+
+test('helper install replaces a symlinked helper instead of writing through it', (t) => {
+  const { outside, source, root } = helperFixture(t)
+  const decoy = path.join(outside, 'target')
+  fs.writeFileSync(decoy, 'untouched', { mode: 0o600 })
+  const helperDir = __test.prepareHelperDir(root, process.arch)
+  fs.symlinkSync(decoy, path.join(helperDir, 'spawn-helper'))
+
+  const helper = __test.installSpawnHelper(source, helperDir)
+  assert.equal(fs.readFileSync(decoy, 'utf8'), 'untouched', 'the symlink target is never written')
+  assert.equal(fs.lstatSync(helper).isSymbolicLink(), false)
+  assert.equal(fs.readFileSync(helper, 'utf8'), 'signed-helper-bytes')
+  assert.equal(fs.lstatSync(helper).mode & 0o777, 0o700)
+  assert.deepEqual(fs.readdirSync(helperDir), ['spawn-helper'], 'no temp file survives the install')
+})
+
+test('helper install refuses a symlink pre-planted at the temp path', (t) => {
+  const { outside, source, root } = helperFixture(t)
+  const decoy = path.join(outside, 'target')
+  fs.writeFileSync(decoy, 'untouched', { mode: 0o600 })
+  const helperDir = __test.prepareHelperDir(root, process.arch)
+  // Pin the random suffix so the test can plant the exact entry an attacker
+  // would otherwise have to guess, then watch exclusive creation refuse it.
+  t.mock.method(crypto, 'randomBytes', () => Buffer.alloc(8, 0xab))
+  fs.symlinkSync(decoy, path.join(helperDir, `spawn-helper.${process.pid}.${'ab'.repeat(8)}.tmp`))
+
+  assert.throws(() => __test.installSpawnHelper(source, helperDir), /EEXIST/)
+  assert.equal(fs.readFileSync(decoy, 'utf8'), 'untouched', 'the symlink target is never written')
+  assert.equal(fs.existsSync(path.join(helperDir, 'spawn-helper')), false)
+})
+
+test('helper install creates its temp file exclusively', (t) => {
+  const { source, root } = helperFixture(t)
+  const helperDir = __test.prepareHelperDir(root, process.arch)
+  const opened = []
+  const openSync = fs.openSync
+  t.mock.method(fs, 'openSync', (file, flags, mode) => {
+    opened.push({ file, flags, mode })
+    return openSync(file, flags, mode)
+  })
+  const copies = []
+  t.mock.method(fs, 'copyFileSync', (from, to) => copies.push([from, to]))
+
+  __test.installSpawnHelper(source, helperDir)
+
+  const temp = opened.find((call) => call.file.endsWith('.tmp'))
+  assert.ok(temp, 'the helper is staged through a temp file')
+  assert.equal(temp.flags & fs.constants.O_EXCL, fs.constants.O_EXCL)
+  assert.equal(temp.flags & fs.constants.O_CREAT, fs.constants.O_CREAT)
+  assert.equal(temp.mode, 0o700)
+  assert.deepEqual(copies, [], 'copyFileSync would follow a pre-planted symlink')
+})
+
+// Each of these awaits a promise that a broken cancel/cap/bound path would
+// leave pending forever, so they carry an explicit timeout: the failure mode
+// under test is a wait that never ends.
+test('an exit wait is owned by its client and leaves when that client does', { timeout: 10_000 }, async (t) => {
+  const id = 'exit-wait-follows-its-client'
+  assert.ok(manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+  t.after(() => manager.release(id))
+
+  const gone = manager.waitForExit(id, { owner: 'window-a|3|kaisola' })
+  const repeat = manager.waitForExit(id, { owner: 'window-a|3|kaisola' })
+  const survivor = manager.waitForExit(id, { owner: 'window-b|3|kaisola' })
+  assert.equal(repeat, gone, 'one client asking twice shares a single resolver')
+  assert.equal(__test.exitWaiterCount(id), 2)
+
+  assert.equal(manager.cancelExitWaitersPrefix('window-a|'), 1)
+  assert.equal(__test.exitWaiterCount(id), 1, 'a departed client keeps no closure')
+  await assert.rejects(gone, /terminal exit wait cancelled/)
+
+  // Cancelling one client must not disturb the terminal or anyone else's wait.
+  manager.kill(id)
+  const status = await survivor
+  assert.equal(Number.isInteger(status.exitCode), true)
+  assert.equal(__test.exitWaiterCount(id), 0)
+  assert.equal(manager.cancelExitWaiters(id, 'window-b|3|kaisola'), 0)
+})
+
+test('a terminal caps its exit waiters and answers every retained one on release', { timeout: 10_000 }, async (t) => {
+  const id = 'exit-wait-cap'
+  assert.ok(manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+  t.after(() => manager.release(id))
+
+  const waits = []
+  for (let index = 0; index < __test.MAX_EXIT_WAITERS; index += 1) {
+    waits.push(manager.waitForExit(id, { owner: `window-flood|${index}|kaisola` }))
+  }
+  assert.equal(__test.exitWaiterCount(id), __test.MAX_EXIT_WAITERS)
+
+  await assert.rejects(
+    manager.waitForExit(id, { owner: 'window-flood|overflow|kaisola' }),
+    /too many terminal exit waiters/,
+  )
+  assert.equal(__test.exitWaiterCount(id), __test.MAX_EXIT_WAITERS, 'a refused wait adds nothing')
+
+  // Release deletes the record, so its pty exit can never answer these: they
+  // must fail now instead of staying pending for the broker's lifetime.
+  manager.release(id)
+  const settled = await Promise.allSettled(waits)
+  assert.deepEqual(
+    [...new Set(settled.map((result) => `${result.status}:${result.reason?.message ?? ''}`))],
+    ['rejected:Terminal is no longer available.'],
+  )
+  assert.equal(__test.exitWaiterCount(id), 0)
+})
+
+test('an exit wait accepts a bound and drops itself when the bound expires', { timeout: 10_000 }, async (t) => {
+  const id = 'exit-wait-bound'
+  assert.ok(manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+  t.after(() => manager.release(id))
+
+  await assert.rejects(
+    manager.waitForExit(id, { owner: 'window-c|3|kaisola', timeoutMs: 25 }),
+    /terminal exit wait timed out/,
+  )
+  assert.equal(__test.exitWaiterCount(id), 0, 'an expired wait leaves nothing behind')
+  assert.equal(manager.diagnostics().find((row) => row.id === id)?.exitWaiterCount, 0)
 })

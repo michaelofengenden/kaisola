@@ -5,6 +5,49 @@ import XCTest
 @testable import Kaisola
 
 final class ObserveOnlyBrokerClientTests: XCTestCase {
+    func testInventoryResponseUsesCorrelatedMethodLimitBeforeDecode() async throws {
+        let transport = ScriptedBrokerTransport()
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 500_000_000
+        )
+        _ = try await client.connect(to: brokerInfo)
+        let inventory = Task { try await client.inventory() }
+        var requestID: String?
+        for _ in 0..<100 {
+            requestID = await transport.sentFrames().last?.objectValue?["id"]?.stringValue
+            if requestID != nil { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let id = try XCTUnwrap(requestID)
+        var response = try JSONEncoder().encode(JSONValue.object([
+            "type": .string("response"),
+            "id": .string(id),
+            "ok": .bool(true),
+            "result": .object([
+                "padding": .string(
+                    String(
+                        repeating: "x",
+                        count: BrokerWire.maximumEncodedBytes(for: .response("broker.status"))
+                    )
+                ),
+            ]),
+        ]))
+        response.append(0x0A)
+        await transport.inject(response)
+
+        do {
+            _ = try await inventory.value
+            XCTFail("broker.status must not inherit the 56 MiB transport ceiling.")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerWireError,
+                .frameTooLarge(maximum: BrokerWire.maximumEncodedBytes(for: .response("broker.status")))
+            )
+        }
+        await client.disconnect()
+    }
+
     func testConcurrentConnectsToSameBrokerShareOneTransportAndHandshake() async throws {
         let transport = ScriptedBrokerTransport(
             suspendConnect: true,
@@ -264,11 +307,17 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
         await requestClient.disconnect()
     }
 
-    func testInventoryUsesEveryPlannedReadSurfaceInOrder() async throws {
+    func testInventoryUsesOneAtomicBrokerSnapshotWhenAdvertised() async throws {
         let transport = ScriptedBrokerTransport(
             helloAccess: "observer",
             advertiseObserverRole: true,
-            replyToRequests: true
+            advertiseAtomicInventory: true,
+            replyToRequests: true,
+            terminalCapacity: .object([
+                "liveTerminalCount": .integer(1),
+                "maximumLiveTerminals": .integer(64),
+                "availableTerminalSlots": .integer(63),
+            ])
         )
         let client = ObserveOnlyBrokerClient(
             transport: transport,
@@ -283,9 +332,128 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
 
         XCTAssertEqual(
             methods,
-            ["broker.status", "terminal.diagnostics", "terminal.list"]
+            ["broker.inventory"]
         )
         XCTAssertEqual(inventory.terminals.map(\.id), ["terminal:codex-1"])
+        XCTAssertEqual(inventory.terminalCapacity?.liveTerminalCount, 1)
+        XCTAssertEqual(inventory.terminalCapacity?.maximumLiveTerminals, 64)
+        XCTAssertEqual(inventory.terminalCapacity?.availableTerminalSlots, 63)
+        await client.disconnect()
+    }
+
+    func testAtomicInventoryRetriesEpochRejectionsAndStopsAtTheBound() async throws {
+        let retryTransport = ScriptedBrokerTransport(
+            helloAccess: "observer",
+            advertiseObserverRole: true,
+            advertiseAtomicInventory: true,
+            replyToRequests: true,
+            atomicInventoryRejections: 2
+        )
+        let retryClient = ObserveOnlyBrokerClient(
+            transport: retryTransport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        _ = try await retryClient.connect(to: brokerInfo)
+        let inventory = try await retryClient.inventory()
+        XCTAssertEqual(inventory.terminals.map(\.id), ["terminal:codex-1"])
+        let retryMethods = await retryTransport.sentFrames().compactMap {
+            $0.objectValue?["method"]?.stringValue
+        }
+        XCTAssertEqual(retryMethods, ["broker.inventory", "broker.inventory", "broker.inventory"])
+        await retryClient.disconnect()
+
+        let changingTransport = ScriptedBrokerTransport(
+            helloAccess: "observer",
+            advertiseObserverRole: true,
+            advertiseAtomicInventory: true,
+            replyToRequests: true,
+            atomicInventoryRejections: 3
+        )
+        let changingClient = ObserveOnlyBrokerClient(
+            transport: changingTransport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        _ = try await changingClient.connect(to: brokerInfo)
+        do {
+            _ = try await changingClient.inventory()
+            XCTFail("An inventory that changes on every bounded attempt must be rejected")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerClientError,
+                .requestFailed("broker inventory kept changing while the snapshot was collected")
+            )
+        }
+        await changingClient.disconnect()
+    }
+
+    func testAtomicInventoryRejectsAWrapperAndStatusEpochMismatch() async throws {
+        let transport = ScriptedBrokerTransport(
+            helloAccess: "observer",
+            advertiseObserverRole: true,
+            advertiseAtomicInventory: true,
+            replyToRequests: true,
+            atomicInventoryStatusEpochOffset: 1
+        )
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        _ = try await client.connect(to: brokerInfo)
+        do {
+            _ = try await client.inventory()
+            XCTFail("A mixed-epoch atomic payload must fail closed")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+        }
+        await client.disconnect()
+    }
+
+    func testLegacyInventoryRetriesWhenItsStatusFenceChanges() async throws {
+        let transport = ScriptedBrokerTransport(
+            helloAccess: "observer",
+            advertiseObserverRole: true,
+            replyToRequests: true,
+            statusEpochs: [1, 2, 2, 2]
+        )
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        _ = try await client.connect(to: brokerInfo)
+
+        let inventory = try await client.inventory()
+        XCTAssertEqual(inventory.activityEpoch, 2)
+        XCTAssertEqual(inventory.terminals.map(\.id), ["terminal:codex-1"])
+        let methods = await transport.sentFrames().compactMap {
+            $0.objectValue?["method"]?.stringValue
+        }
+        XCTAssertEqual(methods, [
+            "broker.status", "terminal.diagnostics", "terminal.list", "broker.status",
+            "broker.status", "terminal.diagnostics", "terminal.list", "broker.status",
+        ])
+        await client.disconnect()
+    }
+
+    func testActivityEpochProbeUsesOnlyBrokerStatus() async throws {
+        let transport = ScriptedBrokerTransport(
+            helloAccess: "observer",
+            advertiseObserverRole: true,
+            replyToRequests: true,
+            activityEpoch: 73
+        )
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        _ = try await client.connect(to: brokerInfo)
+
+        let activityEpoch = try await client.inventoryActivityEpoch()
+        let methods = await transport.sentFrames().compactMap {
+            $0.objectValue?["method"]?.stringValue
+        }
+
+        XCTAssertEqual(activityEpoch, 73)
+        XCTAssertEqual(methods, ["broker.status"])
         await client.disconnect()
     }
 
@@ -507,16 +675,22 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     private let helloAccess: String?
     private let advertiseObserverRole: Bool
     private let advertiseHistory: Bool
+    private let advertiseAtomicInventory: Bool
     private let replyToRequests: Bool
     private let implementationVersion: Int?
     private let packageSchema: Int?
     private let packageVersion: String?
     private let contentDigest: String?
     private let statusImplementationVersion: Int?
+    private let activityEpoch: Int64
+    private let terminalCapacity: JSONValue?
+    private let atomicInventoryStatusEpochOffset: Int64
     private let subscribeOutput: String?
     private let subscribeStartOffset: Int64
     private let historyPageBytes: Int?
     private var connectCallCount = 0
+    private var atomicInventoryRejections: Int
+    private var statusEpochs: [Int64]
     private var connectReleased: Bool
     private var connectGates: [CheckedContinuation<Void, Never>] = []
     private var connectCallWaiters: [(
@@ -533,12 +707,18 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         helloAccess: String? = nil,
         advertiseObserverRole: Bool = false,
         advertiseHistory: Bool = false,
+        advertiseAtomicInventory: Bool = false,
         replyToRequests: Bool = false,
         implementationVersion: Int? = BrokerWire.implementationVersion,
         packageSchema: Int? = BrokerWire.helperPackageSchema,
         packageVersion: String? = "1.0.0",
         contentDigest: String? = String(repeating: "a", count: 64),
         statusImplementationVersion: Int? = nil,
+        activityEpoch: Int64 = 1,
+        terminalCapacity: JSONValue? = nil,
+        statusEpochs: [Int64] = [],
+        atomicInventoryRejections: Int = 0,
+        atomicInventoryStatusEpochOffset: Int64 = 0,
         subscribeOutput: String? = nil,
         subscribeStartOffset: Int64 = 0,
         historyPageBytes: Int? = nil
@@ -549,12 +729,18 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         self.helloAccess = helloAccess
         self.advertiseObserverRole = advertiseObserverRole
         self.advertiseHistory = advertiseHistory
+        self.advertiseAtomicInventory = advertiseAtomicInventory
         self.replyToRequests = replyToRequests
         self.implementationVersion = implementationVersion
         self.packageSchema = packageSchema
         self.packageVersion = packageVersion
         self.contentDigest = contentDigest
         self.statusImplementationVersion = statusImplementationVersion
+        self.activityEpoch = activityEpoch
+        self.terminalCapacity = terminalCapacity
+        self.statusEpochs = statusEpochs
+        self.atomicInventoryRejections = atomicInventoryRejections
+        self.atomicInventoryStatusEpochOffset = atomicInventoryStatusEpochOffset
         self.subscribeOutput = subscribeOutput
         self.subscribeStartOffset = subscribeStartOffset
         self.historyPageBytes = historyPageBytes
@@ -594,6 +780,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
             var features: [JSONValue] = [.string(BrokerWire.terminalObserveFeature)]
             if advertiseObserverRole { features.append(.string(BrokerWire.observerRoleFeature)) }
             if advertiseHistory { features.append(.string(BrokerWire.terminalHistoryFeature)) }
+            if advertiseAtomicInventory { features.append(.string(BrokerWire.brokerInventoryFeature)) }
             var fields: [String: JSONValue] = [
                 "type": .string("hello"),
                 "ok": .bool(true),
@@ -623,33 +810,32 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         let result: JSONValue
         switch method {
         case "broker.status":
-            var status: [String: JSONValue] = [
-                "ok": .bool(true),
-                "protocol": .integer(Int64(BrokerWire.protocolVersion)),
-                "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
-                "pid": .integer(12_345),
-                "startedAt": .integer(1_784_250_001_000),
-            ]
-            if let value = statusImplementationVersion ?? implementationVersion {
-                status["implementationVersion"] = .integer(Int64(value))
+            let epoch = statusEpochs.isEmpty ? activityEpoch : statusEpochs.removeFirst()
+            result = statusValue(activityEpoch: epoch)
+        case "broker.inventory":
+            if atomicInventoryRejections > 0 {
+                atomicInventoryRejections -= 1
+                result = .object([
+                    "ok": .bool(false),
+                    "state": .string("activity_changed"),
+                    "activityEpoch": .integer(activityEpoch),
+                ])
+            } else {
+                result = .object([
+                    "ok": .bool(true),
+                    "state": .string("stable"),
+                    "activityEpoch": .integer(activityEpoch),
+                    "status": statusValue(
+                        activityEpoch: activityEpoch + atomicInventoryStatusEpochOffset
+                    ),
+                    "diagnostics": diagnosticsValue(),
+                    "live": liveValue(),
+                ])
             }
-            if let packageSchema { status["packageSchema"] = .integer(Int64(packageSchema)) }
-            if let packageVersion { status["packageVersion"] = .string(packageVersion) }
-            if let contentDigest { status["contentDigest"] = .string(contentDigest) }
-            result = .object(status)
         case "terminal.diagnostics":
-            result = .array([.object([
-                "id": .string("terminal:codex-1"),
-                "owner": .string("instance|42|project.one"),
-                "pid": .integer(123),
-                "streamEpoch": .string("epoch"),
-                "endOffset": .integer(0),
-            ])])
+            result = diagnosticsValue()
         case "terminal.list":
-            result = .array([.object([
-                "id": .string("terminal:codex-1"),
-                "pid": .integer(123),
-            ])])
+            result = liveValue()
         case "terminal.history":
             // A broker may answer with fewer bytes than were requested; the
             // page is still exactly contiguous with `beforeOffset`.
@@ -713,6 +899,45 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     }
 
     func sentFrames() -> [JSONValue] { frames }
+
+    func inject(_ data: Data?) { deliver(data) }
+
+    private func statusValue(activityEpoch: Int64) -> JSONValue {
+        var status: [String: JSONValue] = [
+            "ok": .bool(true),
+            "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+            "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
+            "pid": .integer(12_345),
+            "startedAt": .integer(1_784_250_001_000),
+            "activityEpoch": .integer(activityEpoch),
+            "inFlightMutations": .integer(0),
+        ]
+        if let value = statusImplementationVersion ?? implementationVersion {
+            status["implementationVersion"] = .integer(Int64(value))
+        }
+        if let packageSchema { status["packageSchema"] = .integer(Int64(packageSchema)) }
+        if let packageVersion { status["packageVersion"] = .string(packageVersion) }
+        if let contentDigest { status["contentDigest"] = .string(contentDigest) }
+        if let terminalCapacity { status["terminalCapacity"] = terminalCapacity }
+        return .object(status)
+    }
+
+    private func diagnosticsValue() -> JSONValue {
+        .array([.object([
+            "id": .string("terminal:codex-1"),
+            "owner": .string("instance|42|project.one"),
+            "pid": .integer(123),
+            "streamEpoch": .string("epoch"),
+            "endOffset": .integer(0),
+        ])])
+    }
+
+    private func liveValue() -> JSONValue {
+        .array([.object([
+            "id": .string("terminal:codex-1"),
+            "pid": .integer(123),
+        ])])
+    }
 
     private func encoded(_ frame: JSONValue) throws -> Data {
         var data = try JSONEncoder().encode(frame)

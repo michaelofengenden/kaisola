@@ -686,6 +686,12 @@ final class AppModelProjectContextTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         model.openChat(agent, inDirectory: directory)
         let chat = try XCTUnwrap(model.chats.first)
+        let defaultsKeys = AcpConversation.persistedDraftDefaultsKeys(for: chat.id)
+        defer {
+            for key in defaultsKeys {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
         let rows: [AcpTranscriptRow] = [
             .user(id: "user-1", text: "keep this question", failed: false),
             .message(id: "agent-1", text: "keep this answer"),
@@ -728,11 +734,17 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertTrue(model.recentlyClosedSurfaces(in: chat.projectID).isEmpty)
 
         XCTAssertTrue(model.closeChat(chat.id))
+        for key in defaultsKeys {
+            XCTAssertNotNil(UserDefaults.standard.string(forKey: key))
+        }
         let deleteResult = await model.deleteRecentlyClosedSurface(
             chat.id,
             allowRecoverableWork: true
         )
         XCTAssertEqual(deleteResult, .completed)
+        for key in defaultsKeys {
+            XCTAssertNil(UserDefaults.standard.object(forKey: key))
+        }
         XCTAssertTrue(model.recentlyClosedSurfaces(in: chat.projectID).isEmpty)
         let missingResult = await model.restoreRecentlyClosedSurface(chat.id)
         XCTAssertEqual(missingResult, .unavailable)
@@ -1089,6 +1101,188 @@ final class AppModelProjectContextTests: XCTestCase {
     }
 
     @MainActor
+    func testColdRestoreWithRemovedNamedAccountStopsAtActionableState() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let now = Date(timeIntervalSince1970: 10)
+        let access = ChatAccountAccess(
+            binding: binding,
+            requiresResolution: true,
+            now: now
+        )
+
+        let transition = access.reconcile(.init(
+            profiles: [],
+            readings: [],
+            isRefreshing: false,
+            now: now
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.accountRemoved))
+        XCTAssertFalse(access.allowsAdapterStart)
+        let presentation = try XCTUnwrap(access.presentation)
+        XCTAssertEqual(presentation.provider, profile.provider.displayName)
+        XCTAssertEqual(presentation.account, profile.label)
+        XCTAssertFalse(presentation.showsActivityIndicator)
+        XCTAssertEqual(presentation.actions, [.signIn, .chooseAccount, .preserveTranscript])
+        XCTAssertTrue(presentation.detail.contains("Claude account “Work”"))
+        XCTAssertTrue(presentation.detail.contains("transcript and draft are still here"))
+    }
+
+    @MainActor
+    func testDelayedAccountResolutionUnlocksBeforeBoundedDeadline() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let now = Date(timeIntervalSince1970: 20)
+        let access = ChatAccountAccess(
+            binding: binding,
+            requiresResolution: true,
+            now: now
+        )
+
+        _ = access.reconcile(.init(
+            profiles: [profile],
+            readings: [],
+            isRefreshing: true,
+            now: now
+        ))
+        XCTAssertEqual(access.phase, .resolving)
+        XCTAssertEqual(access.presentation?.showsActivityIndicator, true)
+        XCTAssertTrue(access.presentation?.actions.isEmpty == true)
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [signedInReading(profile)],
+            isRefreshing: false,
+            now: now.addingTimeInterval(1)
+        ))
+        XCTAssertEqual(transition, .changed)
+        XCTAssertEqual(access.phase, .ready)
+        XCTAssertTrue(access.allowsAdapterStart)
+        XCTAssertNil(access.presentation)
+    }
+
+    @MainActor
+    func testLogoutInvalidatesResumeAndExposesAllRecoveryActions() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let access = ChatAccountAccess(binding: binding, requiresResolution: false)
+        let signedOut = UsageCenter.ProviderPlanUsage(
+            provider: profile.provider.rawValue,
+            displayName: profile.provider.displayName,
+            profileID: profile.id,
+            profileLabel: profile.label,
+            ok: false,
+            sourceLabel: "fixture",
+            windows: [],
+            message: "Sign in required"
+        )
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [signedOut],
+            isRefreshing: false,
+            now: Date()
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.signedOut))
+        XCTAssertEqual(access.presentation?.actions, [.signIn, .chooseAccount, .preserveTranscript])
+        XCTAssertEqual(access.presentation?.showsActivityIndicator, false)
+    }
+
+    @MainActor
+    func testAccountRemovalInvalidatesPreviouslyReadyChatWithoutDeletingItsContract() throws {
+        let (_, binding) = try restoredChatAccountFixture()
+        let access = ChatAccountAccess(binding: binding, requiresResolution: false)
+
+        let transition = access.reconcile(.init(
+            profiles: [],
+            readings: [],
+            isRefreshing: false,
+            now: Date()
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.accountRemoved))
+        XCTAssertEqual(access.binding, binding)
+        XCTAssertTrue(access.presentation?.detail.contains("transcript and draft are still here") == true)
+    }
+
+    @MainActor
+    func testOrdinarySignedInRestorationStartsWithoutRecoveryUI() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let access = ChatAccountAccess(binding: binding, requiresResolution: true)
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [signedInReading(profile)],
+            isRefreshing: false,
+            now: Date()
+        ))
+
+        XCTAssertEqual(transition, .changed)
+        XCTAssertEqual(access.phase, .ready)
+        XCTAssertTrue(access.allowsAdapterStart)
+        XCTAssertNil(access.presentation)
+    }
+
+    @MainActor
+    func testUnresolvedAccountStopsSpinnerAtDeadline() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let now = Date(timeIntervalSince1970: 30)
+        let access = ChatAccountAccess(
+            binding: binding,
+            requiresResolution: true,
+            now: now,
+            timeout: 5
+        )
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [],
+            isRefreshing: false,
+            now: now.addingTimeInterval(5)
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.resolutionTimedOut))
+        XCTAssertFalse(try XCTUnwrap(access.presentation).showsActivityIndicator)
+    }
+
+    private func restoredChatAccountFixture() throws -> (
+        UsageAccountProfile,
+        SessionAccountBinding
+    ) {
+        let profile = UsageAccountProfile(
+            id: "restored-work",
+            provider: .claude,
+            label: "Work",
+            directory: storeFile.deletingLastPathComponent()
+                .appendingPathComponent("claude-work", isDirectory: true).path
+        )
+        let binding = try XCTUnwrap(SessionAccountBinding.resolve(
+            provider: profile.provider,
+            profile: profile,
+            fallbackEnvironment: [:]
+        ))
+        return (profile, binding)
+    }
+
+    private func signedInReading(
+        _ profile: UsageAccountProfile
+    ) -> UsageCenter.ProviderPlanUsage {
+        UsageCenter.ProviderPlanUsage(
+            provider: profile.provider.rawValue,
+            displayName: profile.provider.displayName,
+            profileID: profile.id,
+            profileLabel: profile.label,
+            ok: true,
+            sourceLabel: "fixture",
+            account: "ready@example.test",
+            windows: []
+        )
+    }
+
+    @MainActor
     func testChatRestorationLoadsOnlyTailThenFetchesEarlierSQLitePage() async throws {
         let root = storeFile.deletingLastPathComponent()
         let projectDirectory = root.appendingPathComponent("paged-chat-project", isDirectory: true)
@@ -1153,6 +1347,73 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertEqual(conversation.rows.first?.id, "msg-680")
         XCTAssertEqual(conversation.loadedRowStartOrdinal, 680)
         XCTAssertEqual(conversation.hiddenEarlierCount, 680)
+        await model.teardown()
+    }
+
+    /// A chat whose stored rows cannot be decoded keeps its surface, says so,
+    /// and does not have its damaged history overwritten by the empty
+    /// transcript restoration produced.
+    @MainActor
+    func testDamagedTranscriptRestoresWithGuidanceAndKeepsTheStoredRows() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        let projectDirectory = root.appendingPathComponent("damaged-chat-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
+        let projectID = NativeSessionStore.projectID(forDirectory: projectDirectory.path)
+        let chatID = "damaged-chat"
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-damaged-restore.json")
+        )
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: projectID,
+            layout: SessionPaneLayout(sessionID: chatID),
+            panes: [NativeRestorablePaneState(
+                id: chatID,
+                surface: NativeRestorableSurfaceState(agentChat: NativeRestorableAgentChatDescriptor(
+                    id: chatID,
+                    projectID: projectID,
+                    agentID: agent.id,
+                    workspacePath: projectDirectory.path,
+                    acpSessionID: nil,
+                    accountBinding: nil,
+                    title: "Damaged chat"
+                ))
+            )],
+            focusedPaneID: chatID
+        ))
+
+        let transcriptURL = root.appendingPathComponent("transcripts-damaged-restore.json")
+        let seed = AcpTranscriptStore(fileURL: transcriptURL)
+        let rows = (0..<3).map { AcpTranscriptRow.message(id: "\($0)", text: "row \($0)") }
+        await seed.scheduleSave(rows, for: chatID, now: 1)
+        await seed.flush()
+        let databaseURL = seed.databaseURL
+        try TranscriptDatabaseProbe.execute(
+            "UPDATE transcript_rows SET row_json = X'6E6F70' WHERE chat_id = '\(chatID)'",
+            at: databaseURL
+        )
+
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        let model = makeRestoringModel(
+            workspaceStore: workspaceStore,
+            root: root,
+            identity: "damaged-restore",
+            projectDirectory: projectDirectory
+        )
+        await model.restoreWorkspaceStateIfNeeded()
+
+        let conversation = try XCTUnwrap(model.chats.first { $0.id == chatID }?.conversation)
+        XCTAssertTrue(conversation.rows.isEmpty)
+        XCTAssertTrue(ToastCenter.shared.toasts.contains {
+            $0.message.contains("saved history is damaged")
+                && $0.message.contains(databaseURL.path)
+        })
+
+        // The chat keeps streaming into a surface whose history we could not
+        // read; none of that may reach the rows still on disk.
+        model.enqueueTranscriptSave([.message(id: "new", text: "post-damage turn")], chatID: chatID)
+        await model.flushTranscriptPersistence()
+        XCTAssertEqual(try TranscriptDatabaseProbe.rowCount(chatID: chatID, at: databaseURL), 3)
         await model.teardown()
     }
 

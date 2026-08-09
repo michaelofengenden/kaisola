@@ -670,13 +670,16 @@ enum TerminalHistoryStoragePolicy {
         "\(ByteCountFormatter.string(fromByteCount: max(0, diskBytes), countStyle: .file)) on disk"
     }
 
+    /// The warning stays soft: crossing it deletes nothing. It sits under the
+    /// broker's far larger disk quota, which is the only thing that ever drops
+    /// the oldest output, and which no budget offered here can reach first.
     static func help(diskBytes: Int64, warningMiB: Int) -> String {
         let usage = usageLabel(diskBytes: diskBytes)
         let threshold = ByteCountFormatter.string(fromByteCount: warningBytes(warningMiB), countStyle: .file)
         if isExceeded(diskBytes: diskBytes, warningMiB: warningMiB) {
-            return "Terminal history uses \(usage), above the \(threshold) warning. Close this terminal to reclaim it; Kaisola never deletes earlier output automatically."
+            return "Terminal history uses \(usage), above the \(threshold) warning. Close this terminal to reclaim it; crossing this warning deletes nothing, and only the far larger disk quota ever drops the oldest output."
         }
-        return "Terminal history uses \(usage). Kaisola warns at \(threshold) and keeps the first byte until this terminal is closed."
+        return "Terminal history uses \(usage). Kaisola warns at \(threshold) and keeps the first byte until this terminal is closed or its far larger disk quota drops the oldest output."
     }
 }
 

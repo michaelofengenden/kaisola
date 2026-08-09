@@ -8,6 +8,7 @@ protocol ObserveOnlyBrokerServing: Sendable {
     func connect(to info: BrokerInfo) async throws -> BrokerHello
     func connect(to topology: BrokerGenerationTopology) async throws -> BrokerHello
     func inventory() async throws -> BrokerStatus
+    func inventoryActivityEpoch() async throws -> Int64?
     func subscribe(
         to terminal: BrokerTerminalRecord,
         ownerID: String,
@@ -37,6 +38,9 @@ extension ObserveOnlyBrokerServing {
     func detachEmptyDrainingGenerations() async -> Set<String> { [] }
     func connect(to topology: BrokerGenerationTopology) async throws -> BrokerHello {
         try await connect(to: topology.current.info)
+    }
+    func inventoryActivityEpoch() async throws -> Int64? {
+        try await inventory().activityEpoch
     }
 
     func subscribeBounded(
@@ -83,7 +87,7 @@ enum ObserverHistoryTailPolicy {
     /// SwiftTerm's whole default scrollback — so a deeper tail could not put a
     /// single additional row within reach.
     static let coldSubscribeTailBytes = 4 * 1_024 * 1_024
-    static let maximumPageBytes = 4 * 1_024 * 1_024
+    static let maximumPageBytes = BrokerWire.terminalHistoryPageBytes
 
     /// Bytes to request immediately before a cold snapshot, or `nil` when the
     /// snapshot already covers the tail or the stream has no earlier bytes.
@@ -99,7 +103,12 @@ enum ObserverHistoryTailPolicy {
 actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     typealias EventHandler = @Sendable (BrokerEvent) -> Void
     typealias DisconnectHandler = @Sendable (any Error) -> Void
+    private struct PendingRequest {
+        let method: String
+        let continuation: CheckedContinuation<JSONValue, any Error>
+    }
     private static let historyPageBytes = ObserverHistoryTailPolicy.maximumPageBytes
+    private static let maximumInventoryAttempts = 3
 
     private let transport: any BrokerByteTransport
     private let operationTimeoutNanoseconds: UInt64
@@ -111,7 +120,7 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     private var connectAttemptTask: Task<Void, Never>?
     private var connectionGeneration: UInt64 = 0
     private var handshakeTimeoutTask: Task<Void, Never>?
-    private var pending: [String: CheckedContinuation<JSONValue, any Error>] = [:]
+    private var pending: [String: PendingRequest] = [:]
     private var requestTimeoutTasks: [String: Task<Void, Never>] = [:]
     private var readerTask: Task<Void, Never>?
     private var eventHandler: EventHandler?
@@ -182,7 +191,7 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
                 "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native"),
                 "access": .string("observer"),
             ])
-            let encoded = try encode(frame)
+            let encoded = try encode(frame, purpose: .hello)
 
             handshakeTimeoutTask?.cancel()
             let timeoutNanoseconds = operationTimeoutNanoseconds
@@ -213,17 +222,104 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
 
     func inventory() async throws -> BrokerStatus {
         guard let hello else { throw BrokerClientError.notConnected }
-        // These are typed read methods. The raw request encoder stays private,
-        // so application code cannot represent or emit an arbitrary method.
+        for _ in 0..<Self.maximumInventoryAttempts {
+            let stable: BrokerStatus?
+            if hello.features.contains(BrokerWire.brokerInventoryFeature) {
+                stable = try await atomicInventoryAttempt(expectedHello: hello)
+            } else {
+                stable = try await legacyInventoryAttempt(expectedHello: hello)
+            }
+            if let stable { return stable }
+        }
+        throw BrokerClientError.requestFailed(
+            "broker inventory kept changing while the snapshot was collected"
+        )
+    }
+
+    /// One upgraded broker request samples status, diagnostics, and live rows
+    /// without yielding the Node event loop. The result still carries a typed
+    /// rejection because an async mutation may already span the collection.
+    private func atomicInventoryAttempt(expectedHello: BrokerHello) async throws -> BrokerStatus? {
+        let value = try await request(
+            .inventory,
+            params: .object(["ownerId": .string("0")])
+        )
+        guard let object = value.objectValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        if object["ok"]?.boolValue == false {
+            guard object["state"]?.stringValue == "activity_changed" else {
+                throw BrokerClientError.malformedResponse
+            }
+            return nil
+        }
+        guard object["ok"]?.boolValue == true,
+              object["state"]?.stringValue == "stable",
+              let activityEpoch = object["activityEpoch"]?.intValue,
+              activityEpoch > 0,
+              let status = object["status"],
+              let diagnostics = object["diagnostics"],
+              let live = object["live"] else {
+            throw BrokerClientError.malformedResponse
+        }
+        let parsed = try BrokerStatus(
+            status: status,
+            diagnostics: diagnostics,
+            live: live,
+            expectedHello: expectedHello
+        )
+        guard parsed.activityEpoch == activityEpoch else {
+            throw BrokerClientError.malformedResponse
+        }
+        return parsed
+    }
+
+    /// Compatible protocol-2 brokers may predate `broker.inventory`. Fence the
+    /// old three-read surface with status reads on both sides and discard it if
+    /// a mutation is active or the activity epoch changes anywhere in between.
+    private func legacyInventoryAttempt(expectedHello: BrokerHello) async throws -> BrokerStatus? {
         let status = try await request(.status, params: .object(["ownerId": .string("0")]))
+        guard let startedEpoch = try stableActivityEpoch(
+            status: status,
+            expectedHello: expectedHello
+        ) else { return nil }
         let diagnostics = try await request(.diagnostics, params: .object(["ownerId": .string("0")]))
         let live = try await request(.list, params: .object(["ownerId": .string("0")]))
+        let finalStatus = try await request(.status, params: .object(["ownerId": .string("0")]))
+        guard try stableActivityEpoch(status: finalStatus, expectedHello: expectedHello) == startedEpoch else {
+            return nil
+        }
         return try BrokerStatus(
             status: status,
             diagnostics: diagnostics,
             live: live,
-            expectedHello: hello
+            expectedHello: expectedHello
         )
+    }
+
+    private func stableActivityEpoch(
+        status: JSONValue,
+        expectedHello: BrokerHello
+    ) throws -> Int64? {
+        guard let object = status.objectValue,
+              let inFlightMutations = object["inFlightMutations"]?.intValue,
+              inFlightMutations >= 0,
+              let activityEpoch = try BrokerStatus.validatedActivityEpoch(
+                  status: status,
+                  expectedHello: expectedHello
+              ) else {
+            throw BrokerClientError.malformedResponse
+        }
+        return inFlightMutations == 0 ? activityEpoch : nil
+    }
+
+    /// Cheap second phase for a multi-generation inventory. The router uses
+    /// this after collecting every child snapshot to prove that none changed
+    /// while another generation was being inventoried.
+    func inventoryActivityEpoch() async throws -> Int64? {
+        guard let hello else { throw BrokerClientError.notConnected }
+        let status = try await request(.status, params: .object(["ownerId": .string("0")]))
+        return try BrokerStatus.validatedActivityEpoch(status: status, expectedHello: hello)
     }
 
     func subscribe(
@@ -331,7 +427,8 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             startOffset: snapshot.endOffset - retained,
             endOffset: snapshot.endOffset,
             truncated: true,
-            exited: snapshot.exited
+            exited: snapshot.exited,
+            readError: snapshot.readError
         )
     }
 
@@ -381,7 +478,11 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             startOffset: page.startOffset,
             endOffset: snapshot.endOffset,
             truncated: page.hasMore || page.truncated || page.startOffset > 0,
-            exited: snapshot.exited
+            exited: snapshot.exited,
+            // A top-up page that could not read a segment leaves the combined
+            // tail incomplete, so the combined snapshot is not authoritative
+            // either.
+            readError: snapshot.readError ?? page.readError
         )
     }
 
@@ -451,9 +552,9 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             "method": .string(method.rawValue),
             "params": params,
         ])
-        let encoded = try encode(frame)
+        let encoded = try encode(frame, purpose: .request(method.rawValue))
         return try await withCheckedThrowingContinuation { continuation in
-            pending[requestID] = continuation
+            pending[requestID] = PendingRequest(method: method.rawValue, continuation: continuation)
             requestTimeoutTasks[requestID] = Task {
                 do {
                     try await Task.sleep(nanoseconds: operationTimeoutNanoseconds)
@@ -480,6 +581,9 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
                 if data.isEmpty { continue }
                 var activeDecoder = decoder
                 try activeDecoder.consume(data) { data in
+                    _ = try BrokerWire.validateDecodedFrame(data) { id in
+                        pending[id]?.method
+                    }
                     let frame = try JSONDecoder().decode(JSONValue.self, from: data)
                     try handle(frame)
                 }
@@ -580,14 +684,16 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             connectWaiters.removeAll()
             for waiter in waiters { waiter.resume(returning: hello) }
         case "response":
-            guard let id = object["id"]?.stringValue, let continuation = pending.removeValue(forKey: id) else {
+            guard let id = object["id"]?.stringValue, let request = pending.removeValue(forKey: id) else {
                 return
             }
             requestTimeoutTasks.removeValue(forKey: id)?.cancel()
             if object["ok"]?.boolValue == true, let result = object["result"] {
-                continuation.resume(returning: result)
+                request.continuation.resume(returning: result)
             } else {
-                continuation.resume(throwing: BrokerClientError.requestFailed(object["message"]?.stringValue ?? "request"))
+                request.continuation.resume(
+                    throwing: BrokerClientError.requestFailed(object["message"]?.stringValue ?? "request")
+                )
             }
         case "event":
             if let event = BrokerEvent(frame: frame) { eventHandler?(event) }
@@ -596,16 +702,20 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         }
     }
 
-    private func encode(_ frame: JSONValue) throws -> Data {
+    private func encode(_ frame: JSONValue, purpose: BrokerFramePurpose) throws -> Data {
         var data = try JSONEncoder().encode(frame)
-        guard data.count <= BrokerWire.maximumFrameBytes else { throw BrokerClientError.frameRejected }
+        do {
+            try BrokerWire.validateEncodedFrame(data, purpose: purpose)
+        } catch {
+            throw BrokerClientError.frameRejected
+        }
         data.append(0x0A)
         return data
     }
 
     private func failRequest(_ id: String, with error: any Error) {
         requestTimeoutTasks.removeValue(forKey: id)?.cancel()
-        pending.removeValue(forKey: id)?.resume(throwing: error)
+        pending.removeValue(forKey: id)?.continuation.resume(throwing: error)
     }
 
     private func failConnection(with error: any Error) {
@@ -616,7 +726,7 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         for waiter in waiters { waiter.resume(throwing: error) }
         for task in requestTimeoutTasks.values { task.cancel() }
         requestTimeoutTasks.removeAll()
-        for continuation in pending.values { continuation.resume(throwing: error) }
+        for request in pending.values { request.continuation.resume(throwing: error) }
         pending.removeAll()
         hello = nil
     }

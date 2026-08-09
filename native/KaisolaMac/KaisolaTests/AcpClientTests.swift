@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import KaisolaBrokerProtocol
 import KaisolaCore
 import XCTest
 @testable import Kaisola
@@ -3772,6 +3773,13 @@ final class AcpClientTests: XCTestCase {
         )
         await client.stop()
         _ = await prompt.value
+    }
+
+    func testInvalidBrokerEnvelopeMapsToBoundedProtocolFailure() {
+        XCTAssertEqual(
+            AcpClient.protocolFailure(BrokerWireError.invalidEnvelope),
+            .malformedFrame("the message envelope is invalid")
+        )
     }
 
     /// One newline-delimited `session/update` frame carrying an agent message.

@@ -122,6 +122,23 @@ enum OnboardingReadiness {
             ? .init(kind: .ready, detail: "Kaisola will check for signed updates automatically.")
             : .init(kind: .needsAction, detail: "Automatic update checks are off.")
     }
+
+    /// The action the Updates row may offer, if any.
+    ///
+    /// An `.information` status reports a limitation Settings cannot change:
+    /// an unsigned build has no updater, so the Settings toggles are disabled
+    /// there too, and a checklist button that changes nothing teaches people
+    /// that these buttons are dead ends. Only `.needsAction` states reach a
+    /// live control, whether that is switching automatic checks on or
+    /// installing a pending version with Restart and Update.
+    static func updateAction(for status: OnboardingReadinessStatus) -> String? {
+        switch status.kind {
+        case .needsAction:
+            return "Update Settings"
+        case .ready, .checking, .information:
+            return nil
+        }
+    }
 }
 
 /// First-run setup is an operational checklist rather than a feature tour. It
@@ -207,7 +224,7 @@ struct OnboardingView: View {
                             title: "Updates",
                             symbol: "arrow.triangle.2.circlepath",
                             status: updateStatus,
-                            actionTitle: updateStatus.kind == .ready ? nil : "Update Settings",
+                            actionTitle: OnboardingReadiness.updateAction(for: updateStatus),
                             action: openUpdateSettings
                         )
                     }

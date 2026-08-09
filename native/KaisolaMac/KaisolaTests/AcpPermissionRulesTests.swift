@@ -272,6 +272,45 @@ final class AcpPermissionRulesTests: XCTestCase {
         )
     }
 
+    func testSensitiveGlobRemovalPlansExactMutationAndStableAdjacentFocus() {
+        XCTAssertEqual(
+            SensitiveGlobRemovalPolicy.plan(
+                removing: "**/.env*",
+                from: ["**/.env*", "**/*.pem", "**/*.key"]
+            ),
+            SensitiveGlobRemovalPlan(
+                remaining: ["**/*.pem", "**/*.key"],
+                nextFocus: .remove("**/*.pem")
+            )
+        )
+        XCTAssertEqual(
+            SensitiveGlobRemovalPolicy.plan(
+                removing: "**/*.key",
+                from: ["**/.env*", "**/*.pem", "**/*.key"]
+            )?.nextFocus,
+            .remove("**/*.pem")
+        )
+        XCTAssertEqual(
+            SensitiveGlobRemovalPolicy.plan(removing: "**/.env*", from: ["**/.env*"])?.nextFocus,
+            .newPattern
+        )
+        XCTAssertNil(
+            SensitiveGlobRemovalPolicy.plan(removing: "**/missing", from: ["**/.env*"])
+        )
+    }
+
+    func testSensitiveGlobRemovalNamesScopeAndProtectionChange() {
+        let glob = "**/*.p12"
+        XCTAssertEqual(
+            SensitiveGlobRemovalPolicy.confirmationMessage(for: glob),
+            "Remove **/*.p12? Paths matching this pattern will no longer always require approval."
+        )
+        XCTAssertEqual(
+            SensitiveGlobRemovalPolicy.announcement(for: glob),
+            "Sensitive file pattern **/*.p12 removed. Matching paths are no longer always-ask protected."
+        )
+    }
+
     // MARK: - Action summary
     //
     // These live in this class on purpose: the focused runner selects tests by

@@ -1362,12 +1362,48 @@ struct SensitiveGlobFieldAccessibility: Equatable {
     }
 }
 
+enum SensitiveGlobControlFocus: Hashable {
+    case remove(String)
+    case newPattern
+}
+
+struct SensitiveGlobRemovalPlan: Equatable {
+    let remaining: [String]
+    let nextFocus: SensitiveGlobControlFocus
+}
+
+enum SensitiveGlobRemovalPolicy {
+    static func plan(removing glob: String, from existing: [String]) -> SensitiveGlobRemovalPlan? {
+        guard let removalIndex = existing.firstIndex(of: glob) else { return nil }
+        var remaining = existing
+        remaining.remove(at: removalIndex)
+        let nextFocus: SensitiveGlobControlFocus
+        if remaining.isEmpty {
+            nextFocus = .newPattern
+        } else {
+            nextFocus = .remove(remaining[min(removalIndex, remaining.count - 1)])
+        }
+        return SensitiveGlobRemovalPlan(remaining: remaining, nextFocus: nextFocus)
+    }
+
+    static func confirmationMessage(for glob: String) -> String {
+        "Remove \(glob)? Paths matching this pattern will no longer always require approval."
+    }
+
+    static func announcement(for glob: String) -> String {
+        "Sensitive file pattern \(glob) removed. Matching paths are no longer always-ask protected."
+    }
+}
+
 /// Guardrails tab: standing permission rules (delete) + sensitive globs (edit).
 private struct GuardrailsSettings: View {
     @ObservedObject var settings: NativePreviewSettings
     @State private var rules: [PermissionRule] = []
     @State private var newGlob = ""
+    @State private var globPendingRemoval: String?
     @State private var showsRestoreDefaultsConfirmation = false
+    @FocusState private var focusedControl: SensitiveGlobControlFocus?
+    @AccessibilityFocusState private var accessibilityFocusedControl: SensitiveGlobControlFocus?
     private let store = PermissionRuleStore()
 
     var body: some View {
@@ -1404,17 +1440,22 @@ private struct GuardrailsSettings: View {
                         Text(glob).font(.callout.monospaced())
                         Spacer()
                         Button(role: .destructive) {
-                            settings.sensitiveGlobs.removeAll { $0 == glob }
+                            globPendingRemoval = glob
                         } label: {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
                         .accessibilityLabel("Remove sensitive file pattern \(glob)")
+                        .accessibilityHint("Requires confirmation before changing always-ask protection")
+                        .focused($focusedControl, equals: .remove(glob))
+                        .accessibilityFocused($accessibilityFocusedControl, equals: .remove(glob))
                     }
                 }
                 HStack {
                     TextField("Add glob (e.g. **/*.p12)", text: $newGlob)
                         .onSubmit(addGlob)
+                        .focused($focusedControl, equals: .newPattern)
+                        .accessibilityFocused($accessibilityFocusedControl, equals: .newPattern)
                         .accessibilityLabel("Sensitive file pattern")
                         .accessibilityValue(newGlobAccessibility.value)
                         .accessibilityHint(newGlobAccessibility.description)
@@ -1439,6 +1480,21 @@ private struct GuardrailsSettings: View {
         .padding(6)
         .onAppear { rules = store.rules() }
         .confirmationDialog(
+            "Remove Sensitive-File Pattern?",
+            isPresented: showsGlobRemovalConfirmation,
+            titleVisibility: .visible,
+            presenting: globPendingRemoval
+        ) { glob in
+            Button("Remove \(glob)", role: .destructive) {
+                removeSensitiveGlob(glob)
+            }
+            Button("Cancel", role: .cancel) {
+                globPendingRemoval = nil
+            }
+        } message: { glob in
+            Text(SensitiveGlobRemovalPolicy.confirmationMessage(for: glob))
+        }
+        .confirmationDialog(
             "Restore Default Sensitive-File Patterns?",
             isPresented: $showsRestoreDefaultsConfirmation,
             titleVisibility: .visible
@@ -1454,6 +1510,15 @@ private struct GuardrailsSettings: View {
 
     private var newGlobIssue: String? {
         SensitiveGlobPolicy.validationMessage(newGlob, existing: settings.sensitiveGlobs)
+    }
+
+    private var showsGlobRemovalConfirmation: Binding<Bool> {
+        Binding(
+            get: { globPendingRemoval != nil },
+            set: { isPresented in
+                if !isPresented { globPendingRemoval = nil }
+            }
+        )
     }
 
     private var newGlobAccessibility: SensitiveGlobFieldAccessibility {
@@ -1472,6 +1537,31 @@ private struct GuardrailsSettings: View {
         }
         settings.sensitiveGlobs.append(trimmed)
         newGlob = ""
+    }
+
+    private func removeSensitiveGlob(_ glob: String) {
+        guard let plan = SensitiveGlobRemovalPolicy.plan(
+            removing: glob,
+            from: settings.sensitiveGlobs
+        ) else {
+            globPendingRemoval = nil
+            return
+        }
+        settings.sensitiveGlobs = plan.remaining
+        globPendingRemoval = nil
+
+        DispatchQueue.main.async {
+            focusedControl = plan.nextFocus
+            accessibilityFocusedControl = plan.nextFocus
+        }
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: SensitiveGlobRemovalPolicy.announcement(for: glob),
+                .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+            ]
+        )
     }
 
     private func announceValidationChange(previous: String?, current: String?) {

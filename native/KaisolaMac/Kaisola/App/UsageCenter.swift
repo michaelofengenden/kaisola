@@ -20,6 +20,54 @@ final class UsageProcessCompletionGate: @unchecked Sendable {
     }
 }
 
+/// Directory identity for named accounts.
+///
+/// Two pointers at one credential directory are one account, however the path
+/// was spelled: a symlink, a `..` hop, a trailing slash, or the same name in a
+/// different case on a case-insensitive volume. Duplicate detection used to
+/// compare tilde-expanded strings, so an alias registered a second copy of a
+/// subscription and split its usage and attribution between the two rows.
+enum AccountDirectory {
+    /// Absolute, lexically standardized, symlink-resolved path, or nil when the
+    /// value cannot name a directory at all.
+    ///
+    /// Existing symlink components are resolved now rather than at use time.
+    /// Otherwise changing a profile symlink after session creation could
+    /// silently redirect an existing provider continuation to different
+    /// credentials.
+    static func canonicalPath(_ rawValue: String) -> String? {
+        guard let trimmed = UsageAccountProfile.validatedDirectory(rawValue) else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return nil }
+        let canonical = URL(fileURLWithPath: expanded, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        return UsageAccountProfile.validatedDirectory(canonical)
+    }
+
+    /// Volume + inode of a directory that exists, as a comparable key. Resolved
+    /// paths miss the aliases the filesystem itself collapses: a case-insensitive
+    /// volume answers `~/.Claude-Work` and `~/.claude-work` with one directory,
+    /// and a firmlinked path spells one directory two ways.
+    static func fileIdentity(_ path: String) -> String? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let device = attributes[.systemNumber] as? NSNumber,
+              let inode = attributes[.systemFileNumber] as? NSNumber else { return nil }
+        return "\(device.uint64Value)\u{1f}\(inode.uint64Value)"
+    }
+
+    /// The key duplicate detection compares: filesystem identity when the
+    /// directory exists, the resolved path when it does not. A named account is
+    /// often added before its provider CLI has created the directory, so an
+    /// absent path still has to compare equal to itself.
+    static func identityKey(_ rawValue: String) -> String? {
+        guard let path = canonicalPath(rawValue) else { return nil }
+        guard let identity = fileIdentity(path) else { return "path\u{1f}\(path)" }
+        return "node\u{1f}\(identity)"
+    }
+}
+
 /// A locally named subscription whose credentials remain inside the provider's
 /// normal config directory. Kaisola stores only this label + directory pointer;
 /// tokens and credential contents are never copied into app state or usage
@@ -68,6 +116,19 @@ struct UsageAccountProfile: Codable, Equatable, Identifiable, Sendable {
 
     var expandedDirectory: String {
         (directory as NSString).expandingTildeInPath
+    }
+
+    /// The directory this account actually points at, with `~`, `.`, `..`,
+    /// trailing slashes and symlinks resolved. `expandedDirectory` stays the
+    /// value handed to a provider CLI; this is the one identity comparisons use.
+    var canonicalDirectory: String {
+        AccountDirectory.canonicalPath(directory) ?? expandedDirectory
+    }
+
+    /// Provider-scoped duplicate key. Same provider plus same directory on disk
+    /// is one account, whichever alias the path was typed as.
+    var identityKey: String {
+        "\(provider.rawValue)\u{1f}\(AccountDirectory.identityKey(directory) ?? expandedDirectory)"
     }
 }
 
@@ -377,17 +438,7 @@ enum SessionModelOverride {
 
 extension SessionAccountBinding {
     fileprivate static func canonicalDirectory(_ rawValue: String) -> String? {
-        guard let trimmed = UsageAccountProfile.validatedDirectory(rawValue) else { return nil }
-        let expanded = (trimmed as NSString).expandingTildeInPath
-        guard expanded.hasPrefix("/") else { return nil }
-        // Resolve any existing symlink components now. Otherwise changing a
-        // profile symlink after session creation could silently redirect an
-        // existing provider continuation to different credentials.
-        let canonical = URL(fileURLWithPath: expanded, isDirectory: true)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-            .path
-        return UsageAccountProfile.validatedDirectory(canonical)
+        AccountDirectory.canonicalPath(rawValue)
     }
 }
 
@@ -402,21 +453,54 @@ struct UsageAccountStore: Sendable {
 
     static let schemaVersion = 1
     let fileURL: URL
+    private let installTemporary: @Sendable (URL, URL) throws -> Void
 
-    init(fileURL: URL = NativePreviewPaths.applicationSupportDirectory
-        .appendingPathComponent("usage-accounts.json", isDirectory: false)) {
+    init(
+        fileURL: URL = NativePreviewPaths.applicationSupportDirectory
+            .appendingPathComponent("usage-accounts.json", isDirectory: false),
+        installTemporary: @escaping @Sendable (URL, URL) throws -> Void = { temporary, destination in
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+        }
+    ) {
         self.fileURL = fileURL
+        self.installTemporary = installTemporary
     }
 
     func profiles() -> [UsageAccountProfile] {
         guard let data = try? Data(contentsOf: fileURL),
               let payload = try? JSONDecoder().decode(Payload.self, from: data),
               payload.schemaVersion == Self.schemaVersion else { return [] }
+        // Already-stored rows are collapsed by canonical identity too: two
+        // aliases of one credential directory may have been saved before the
+        // add path knew to compare them.
         var seen = Set<String>()
-        return payload.profiles.compactMap(\.normalized).filter { profile in
-            let key = "\(profile.provider.rawValue)\u{1f}\(profile.expandedDirectory)"
-            return seen.insert(key).inserted
+        return payload.profiles.compactMap(\.normalized).filter { seen.insert($0.identityKey).inserted }
+    }
+
+    /// The account that already owns `directory`, compared by canonical
+    /// directory identity rather than by the typed string, so an alias is
+    /// recognized as the account it aliases. Callers use the returned profile to
+    /// say *which* account the directory collides with.
+    static func existingProfile(
+        in profiles: [UsageAccountProfile],
+        provider: UsageAccountProfile.Provider,
+        directory: String
+    ) -> UsageAccountProfile? {
+        guard let key = AccountDirectory.identityKey(directory) else { return nil }
+        return profiles.first {
+            $0.provider == provider && AccountDirectory.identityKey($0.directory) == key
         }
+    }
+
+    func existingProfile(
+        provider: UsageAccountProfile.Provider,
+        directory: String
+    ) -> UsageAccountProfile? {
+        Self.existingProfile(in: profiles(), provider: provider, directory: directory)
     }
 
     @discardableResult
@@ -428,9 +512,11 @@ struct UsageAccountStore: Sendable {
             directory: directory
         ).normalized else { return nil }
         return withRegistryLock { current -> UsageAccountProfile? in
-            guard !current.contains(where: {
-                $0.provider == profile.provider && $0.expandedDirectory == profile.expandedDirectory
-            }) else { return nil }
+            guard Self.existingProfile(
+                in: current,
+                provider: profile.provider,
+                directory: profile.directory
+            ) == nil else { return nil }
             guard write(current + [profile]) else { return nil }
             return profile
         }
@@ -516,6 +602,12 @@ struct UsageAccountStore: Sendable {
 
     private func write(_ profiles: [UsageAccountProfile]) -> Bool {
         let directory = fileURL.deletingLastPathComponent()
+        var temporary: URL?
+        defer {
+            if let temporary {
+                try? FileManager.default.removeItem(at: temporary)
+            }
+        }
         do {
             try FileManager.default.createDirectory(
                 at: directory,
@@ -524,17 +616,14 @@ struct UsageAccountStore: Sendable {
             )
             let payload = Payload(schemaVersion: Self.schemaVersion, profiles: profiles)
             let data = try JSONEncoder().encode(payload)
-            let temporary = directory.appendingPathComponent(
+            let candidate = directory.appendingPathComponent(
                 ".\(fileURL.lastPathComponent).\(UUID().uuidString)",
                 isDirectory: false
             )
-            try data.write(to: temporary, options: [.atomic])
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
-            } else {
-                try FileManager.default.moveItem(at: temporary, to: fileURL)
-            }
+            temporary = candidate
+            try data.write(to: candidate, options: [.atomic])
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: candidate.path)
+            try installTemporary(candidate, fileURL)
             return true
         } catch {
             return false
@@ -1212,16 +1301,18 @@ final class UsageCenter: ObservableObject {
         profiles: [UsageAccountProfile]
     ) -> [PlanUsageRequest] {
         let home = environment["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
-        func canonical(_ value: String) -> String {
-            let expanded = (value as NSString).expandingTildeInPath
-            return URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL.path
+        // Compare accounts by what they point at, not by how the path is
+        // spelled: an alias of the active directory has to collapse into the
+        // active request instead of billing one subscription a second query.
+        func identity(_ value: String) -> String {
+            AccountDirectory.identityKey(value) ?? (value as NSString).expandingTildeInPath
         }
-        func activeDirectory(for provider: UsageAccountProfile.Provider) -> String {
+        func activeIdentity(for provider: UsageAccountProfile.Provider) -> String {
             if let configured = environment[provider.environmentKey]?
                 .trimmingCharacters(in: .whitespacesAndNewlines), !configured.isEmpty {
-                return canonical(configured)
+                return identity(configured)
             }
-            return canonical((home as NSString).appendingPathComponent(
+            return identity((home as NSString).appendingPathComponent(
                 provider == .claude ? ".claude" : ".codex"
             ))
         }
@@ -1235,8 +1326,8 @@ final class UsageCenter: ObservableObject {
                     if $0.label != $1.label { return $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
                     return $0.id < $1.id
                 }
-            let active = activeDirectory(for: provider)
-            let matched = providerProfiles.first { canonical($0.expandedDirectory) == active }
+            let active = activeIdentity(for: provider)
+            let matched = providerProfiles.first { identity($0.directory) == active }
             requests.append(PlanUsageRequest(
                 provider: provider,
                 profileID: matched?.id ?? "active",
@@ -1244,7 +1335,7 @@ final class UsageCenter: ObservableObject {
                 environment: environment
             ))
 
-            for profile in providerProfiles where canonical(profile.expandedDirectory) != active {
+            for profile in providerProfiles where identity(profile.directory) != active {
                 var profileEnvironment = environment
                 profileEnvironment[provider.environmentKey] = profile.expandedDirectory
                 requests.append(PlanUsageRequest(

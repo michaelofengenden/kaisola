@@ -167,6 +167,57 @@ final class AccountSignInControllerTests: XCTestCase {
         )
     }
 
+    func testOutputAfterSubmitDoesNotReopenTheOldCodePrompt() throws {
+        let url = try XCTUnwrap(URL(string: "https://example.com/oauth"))
+        var tracker = AccountSignInController.OutputPhaseTracker()
+        tracker.beginSubmission()
+        let transcript = """
+        Visit https://example.com/oauth
+        Paste code here if prompted >
+        Verifying your code…
+        """
+
+        XCTAssertEqual(
+            tracker.phaseAfterOutput(
+                current: .submitting,
+                transcript: transcript,
+                newOutput: "Verifying your code…\n"
+            ),
+            .submitting
+        )
+        XCTAssertEqual(AccountSignInController.signInURL(in: transcript), url)
+    }
+
+    func testAnExplicitNewCodePromptCanReopenSubmissionAcrossOutputChunks() throws {
+        let url = try XCTUnwrap(URL(string: "https://example.com/oauth"))
+        var tracker = AccountSignInController.OutputPhaseTracker()
+        tracker.beginSubmission()
+        let oldTranscript = """
+        Visit https://example.com/oauth
+        Paste code here if prompted >
+        """
+        let firstChunk = "That code expired. Paste "
+
+        XCTAssertEqual(
+            tracker.phaseAfterOutput(
+                current: .submitting,
+                transcript: oldTranscript + firstChunk,
+                newOutput: firstChunk
+            ),
+            .submitting
+        )
+
+        let outputSinceSubmission = firstChunk + "code here if prompted >\n"
+        XCTAssertEqual(
+            tracker.phaseAfterOutput(
+                current: .submitting,
+                transcript: oldTranscript + outputSinceSubmission,
+                newOutput: "code here if prompted >\n"
+            ),
+            .awaitingCode(url)
+        )
+    }
+
     /// A failure should say what the CLI said. An exit code alone tells the
     /// user nothing they can act on.
     func testFailureQuotesTheCLIRatherThanAnExitCode() {

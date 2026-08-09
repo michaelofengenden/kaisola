@@ -147,6 +147,38 @@ final class AccountSignInController: ObservableObject {
         }
     }
 
+    /// Carries only the output emitted since the latest code submission so an
+    /// old prompt in the full transcript cannot move the UI backwards.
+    struct OutputPhaseTracker {
+        private var postSubmissionOutput = ""
+
+        mutating func reset() {
+            postSubmissionOutput = ""
+        }
+
+        mutating func beginSubmission() {
+            postSubmissionOutput = ""
+        }
+
+        mutating func phaseAfterOutput(
+            current: Phase,
+            transcript: String,
+            newOutput: String
+        ) -> Phase {
+            guard !current.isFinished else { return current }
+            let url = AccountSignInController.signInURL(in: transcript) ?? current.url
+            if case .submitting = current {
+                postSubmissionOutput += newOutput
+                return AccountSignInController.promptsForCode(postSubmissionOutput)
+                    ? .awaitingCode(url)
+                    : .submitting
+            }
+            return AccountSignInController.promptsForCode(transcript)
+                ? .awaitingCode(url)
+                : .awaitingBrowser(url)
+        }
+    }
+
     /// How discovery ended. A shell that never answered is a different problem
     /// from a CLI that was never installed, so the two are not collapsed into
     /// one absent path.
@@ -165,6 +197,7 @@ final class AccountSignInController: ObservableObject {
 
     private var process: Process?
     private var input: FileHandle?
+    private var outputPhaseTracker = OutputPhaseTracker()
     /// The off-main lookup, held so an abandoned sheet can call it off.
     private var discovery: Task<Void, Never>?
     /// Ours, so the blocking read loop never occupies a cooperative thread.
@@ -455,6 +488,7 @@ final class AccountSignInController: ObservableObject {
     func start(profile: UsageAccountProfile) {
         let tool = Self.toolName(for: profile.provider)
         phase = .launching
+        outputPhaseTracker.reset()
         transcript += "Looking for the \(tool) command…\n"
         discovery?.cancel()
         discovery = Task { [weak self] in
@@ -561,14 +595,18 @@ final class AccountSignInController: ObservableObject {
     private func absorb(_ text: String) {
         transcript += text
         guard !phase.isFinished else { return }
-        let url = Self.signInURL(in: transcript) ?? phase.url
-        phase = Self.promptsForCode(transcript) ? .awaitingCode(url) : .awaitingBrowser(url)
+        phase = outputPhaseTracker.phaseAfterOutput(
+            current: phase,
+            transcript: transcript,
+            newOutput: text
+        )
     }
 
     /// Hand the pasted code to the waiting CLI.
     func submit(code: String) {
         let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let input else { return }
+        outputPhaseTracker.beginSubmission()
         phase = .submitting
         try? input.write(contentsOf: Data((trimmed + "\n").utf8))
     }

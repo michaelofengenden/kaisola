@@ -106,4 +106,74 @@ final class BrowserCardAccessibilityTests: XCTestCase {
             .failed("Could not connect to the server.")
         )
     }
+
+    // MARK: - Origin confinement
+
+    /// Browser-card navigations stay inside the exact local web origin that
+    /// opened the card. A host-only comparison would let one localhost service
+    /// navigate into another service, or even into a non-web scheme, without
+    /// leaving the embedded browser boundary.
+    private func url(_ string: String) throws -> URL {
+        try XCTUnwrap(URL(string: string), "Could not parse URL: \(string)")
+    }
+
+    private func origin(_ string: String) throws -> BrowserCardOrigin {
+        try XCTUnwrap(BrowserCardOrigin(url: url(string)))
+    }
+
+    func testPathsQueriesAndDefaultPortSpellingStayInsideTheOrigin() throws {
+        let http = try origin("http://LOCALHOST/start")
+        XCTAssertTrue(http.allows(try url("http://localhost:80/next?tab=logs")))
+        XCTAssertTrue(http.allows(try url("http://localhost/final#status")))
+
+        let https = try origin("https://localhost:443/start")
+        XCTAssertTrue(https.allows(try url("https://LOCALHOST/next")))
+    }
+
+    func testHTTPAndHTTPSNeverShareAnOrigin() throws {
+        XCTAssertFalse(
+            try origin("http://localhost:3000").allows(url("https://localhost:3000"))
+        )
+        XCTAssertFalse(
+            try origin("https://localhost").allows(url("http://localhost"))
+        )
+    }
+
+    func testDifferentEffectivePortsNeverShareAnOrigin() throws {
+        XCTAssertFalse(
+            try origin("http://localhost:3000").allows(url("http://localhost:3001"))
+        )
+        XCTAssertFalse(
+            try origin("http://localhost").allows(url("http://localhost:8080"))
+        )
+    }
+
+    func testCredentialsCannotHideInsideAnOtherwiseMatchingOrigin() throws {
+        let clean = try origin("http://localhost:3000")
+        let credentialed = try url("http://user:secret@localhost:3000/private")
+        XCTAssertFalse(clean.allows(credentialed))
+        XCTAssertFalse(LocalhostDetector.isLocalDevURL(credentialed))
+        XCTAssertNil(BrowserCardOrigin(url: try url("http://user@localhost:3000")))
+        XCTAssertNil(BrowserCardOrigin(url: try url("http://:secret@localhost:3000")))
+    }
+
+    func testNonWebAndHostlessURLsHaveNoBrowserCardOrigin() throws {
+        let local = try origin("http://localhost:3000")
+        for candidate in [
+            "ftp://localhost:3000/archive",
+            "file://localhost/tmp/index.html",
+            "javascript:alert(1)",
+            "about:blank",
+        ] {
+            let candidateURL = try url(candidate)
+            XCTAssertNil(BrowserCardOrigin(url: candidateURL), candidate)
+            XCTAssertFalse(local.allows(candidateURL), candidate)
+        }
+    }
+
+    func testAnotherLocalhostNameIsStillAnotherOrigin() throws {
+        XCTAssertFalse(
+            try origin("http://localhost:3000").allows(url("http://admin.localhost:3000"))
+        )
+    }
 }

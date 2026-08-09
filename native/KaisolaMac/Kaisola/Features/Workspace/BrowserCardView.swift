@@ -13,9 +13,7 @@ enum LocalhostDetector {
     private static let loopbackHosts: Set<String> = ["localhost", "127.0.0.1", "::1", "0.0.0.0"]
 
     static func isLocalDevURL(_ url: URL) -> Bool {
-        guard let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
-            return false
-        }
+        guard BrowserCardOrigin(url: url) != nil else { return false }
         // `host(percentEncoded:)` strips IPv6 brackets ([::1] -> ::1) and, like
         // the host itself, preserves case — so normalize to lowercase. A bare
         // authority-less URL (e.g. file paths that slipped through) has no host.
@@ -23,6 +21,34 @@ enum LocalhostDetector {
             return false
         }
         return loopbackHosts.contains(host) || host.hasSuffix(".localhost")
+    }
+}
+
+/// A normalized web origin for the embedded local browser. Paths, queries, and
+/// fragments do not affect an origin; scheme, host, and effective port all do.
+/// Credentials are rejected instead of being silently discarded because a URL
+/// that looks host-equal can otherwise carry authority-changing userinfo.
+struct BrowserCardOrigin: Equatable, Sendable {
+    private let scheme: String
+    private let host: String
+    private let port: Int
+
+    init?(url: URL) {
+        guard url.user == nil, url.password == nil,
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host(percentEncoded: false)?.lowercased(),
+              !host.isEmpty else { return nil }
+
+        let effectivePort = url.port ?? (scheme == "http" ? 80 : 443)
+        guard (1...65_535).contains(effectivePort) else { return nil }
+        self.scheme = scheme
+        self.host = host
+        self.port = effectivePort
+    }
+
+    func allows(_ url: URL) -> Bool {
+        BrowserCardOrigin(url: url) == self
     }
 }
 
@@ -194,7 +220,7 @@ struct BrowserCardView: View {
 }
 
 /// A WKWebView whose navigation is confined to the dev server: it only follows
-/// links that are themselves local dev URLs or share the card's origin host.
+/// links that share the card's exact normalized web origin.
 /// Anything else (an OAuth bounce, an external link, a `target=_blank`) is
 /// handed to the system browser for top-level navigations and silently dropped
 /// for off-origin subframes, so the card can never wander onto the open web.
@@ -219,7 +245,7 @@ private struct ConfinedWebView: NSViewRepresentable {
 
         let coordinator = context.coordinator
         coordinator.loadedURL = url
-        coordinator.originHost = url.host(percentEncoded: false)?.lowercased()
+        coordinator.origin = BrowserCardOrigin(url: url)
         coordinator.reloadToken = reloadToken
         coordinator.report = report
         webView.load(URLRequest(url: url))
@@ -242,7 +268,7 @@ private struct ConfinedWebView: NSViewRepresentable {
         // localhost link while this card was already up).
         if coordinator.loadedURL != url {
             coordinator.loadedURL = url
-            coordinator.originHost = url.host(percentEncoded: false)?.lowercased()
+            coordinator.origin = BrowserCardOrigin(url: url)
             webView.load(URLRequest(url: url))
         }
         // Header reload button was pressed.
@@ -254,7 +280,7 @@ private struct ConfinedWebView: NSViewRepresentable {
 
     final class Coordinator: NSObject, WKNavigationDelegate {
         var loadedURL: URL?
-        var originHost: String?
+        var origin: BrowserCardOrigin?
         var reloadToken = 0
         var report: (BrowserCardLoadState) -> Void = { _ in }
 
@@ -290,9 +316,7 @@ private struct ConfinedWebView: NSViewRepresentable {
                 decisionHandler(.cancel)
                 return
             }
-            let targetHost = target.host(percentEncoded: false)?.lowercased()
-            let sameHost = originHost != nil && targetHost == originHost
-            if LocalhostDetector.isLocalDevURL(target) || sameHost {
+            if origin?.allows(target) == true {
                 decisionHandler(.allow)
                 return
             }

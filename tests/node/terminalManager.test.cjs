@@ -8,7 +8,13 @@ const os = require('node:os')
 const path = require('node:path')
 const manager = require('../../runtime/node-broker/ipc/terminalManager.cjs')
 const { TerminalSpool } = require('../../runtime/node-broker/ipc/terminalSpool.cjs')
+const { TERMINAL_GEOMETRY_LIMITS } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
 const { __test } = manager
+
+const {
+  maxCols: MAX_TERMINAL_COLS,
+  maxRows: MAX_TERMINAL_ROWS,
+} = TERMINAL_GEOMETRY_LIMITS
 
 const managerSpoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-manager-'))
 manager.configureStorage(managerSpoolDir)
@@ -51,10 +57,121 @@ test('terminal resize rejects invalid or fractional wire geometry', () => {
   }
 
   assert.equal(__test.resizeRecord(record, 0, 24), false)
+  assert.equal(__test.resizeRecord(record, -1, 24), false)
   assert.equal(__test.resizeRecord(record, 80.5, 24), false)
+  assert.equal(__test.resizeRecord(record, '80', 24), false)
+  assert.equal(__test.resizeRecord(record, 80, '24'), false)
+  assert.equal(__test.resizeRecord(record, Number.POSITIVE_INFINITY, 24), false)
   assert.equal(__test.resizeRecord(record, 80, Number.NaN), false)
   assert.equal(record.cols, 80)
   assert.equal(record.rows, 24)
+})
+
+test('terminal resize applies the create validator maxima before node-pty', () => {
+  const calls = []
+  const record = {
+    cols: 80,
+    rows: 24,
+    pty: { resize: (cols, rows) => calls.push([cols, rows]) },
+  }
+
+  assert.equal(__test.resizeRecord(record, MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS), true)
+  assert.equal(__test.resizeRecord(record, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER), true)
+  assert.deepEqual(calls, [
+    [MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS],
+    [MAX_TERMINAL_COLS, MAX_TERMINAL_ROWS],
+  ])
+  assert.equal(record.cols, MAX_TERMINAL_COLS)
+  assert.equal(record.rows, MAX_TERMINAL_ROWS)
+})
+
+function spawnKillTestRecord(t, id) {
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  const pty = record.pty
+  const acceptedKill = pty.kill.bind(pty)
+  t.after(() => {
+    record.exited = false
+    record.pty = pty
+    pty.kill = acceptedKill
+    manager.release(id)
+  })
+  return { record, pty }
+}
+
+test('terminal kill reports node-pty refusal and leaves the registered terminal live', (t) => {
+  const id = 'kill-refusal-stays-live'
+  const { record, pty } = spawnKillTestRecord(t, id)
+
+  pty.kill = () => false
+  assert.deepEqual(manager.kill(id), {
+    id,
+    ok: false,
+    code: 'terminal_kill_failed',
+    message: 'terminal signal failed',
+  })
+  assert.equal(manager.has(id), true)
+  assert.equal(manager.isLive(id), true)
+
+  pty.kill = () => { throw new Error('sensitive node-pty diagnostic') }
+  assert.deepEqual(manager.kill(id), {
+    id,
+    ok: false,
+    code: 'terminal_kill_failed',
+    message: 'terminal signal failed',
+  })
+  assert.equal(manager.has(id), true)
+  assert.equal(manager.isLive(id), true)
+})
+
+test('terminal kill distinguishes a missing record from signaling refusal', () => {
+  const id = 'missing-terminal-kill'
+  assert.deepEqual(manager.kill(id), {
+    id,
+    ok: false,
+    code: 'terminal_not_found',
+    message: 'terminal is no longer available',
+  })
+})
+
+test('terminal kill is idempotent after exit and never signals node-pty', (t) => {
+  const id = 'kill-already-exited'
+  const { record, pty } = spawnKillTestRecord(t, id)
+  let killCalls = 0
+  pty.kill = () => { killCalls += 1 }
+  record.exited = true
+  const alreadyExited = { id, ok: true, alreadyExited: true }
+  assert.deepEqual(manager.kill(id), alreadyExited)
+  assert.deepEqual(manager.kill(id), alreadyExited)
+  assert.equal(killCalls, 0)
+})
+
+test('terminal kill fails closed when a live record has no pty', (t) => {
+  const id = 'kill-live-without-pty'
+  const { record } = spawnKillTestRecord(t, id)
+  record.pty = null
+  assert.deepEqual(manager.kill(id), {
+    id,
+    ok: false,
+    code: 'terminal_kill_unavailable',
+    message: 'terminal signal unavailable',
+  })
+})
+
+test('terminal kill reports accepted signaling without claiming synchronous exit', (t) => {
+  const id = 'kill-signal-accepted'
+  const { record, pty } = spawnKillTestRecord(t, id)
+  let killCalls = 0
+  pty.kill = () => { killCalls += 1 }
+
+  assert.deepEqual(manager.kill(id), { id, ok: true })
+  assert.equal(killCalls, 1)
+  assert.equal(record.exited, false)
 })
 
 test('coldTail reads the bounded retained tail across previous and current segments', (t) => {
@@ -566,4 +683,86 @@ test('helper install creates its temp file exclusively', (t) => {
   assert.equal(temp.flags & fs.constants.O_CREAT, fs.constants.O_CREAT)
   assert.equal(temp.mode, 0o700)
   assert.deepEqual(copies, [], 'copyFileSync would follow a pre-planted symlink')
+})
+
+// Each of these awaits a promise that a broken cancel/cap/bound path would
+// leave pending forever, so they carry an explicit timeout: the failure mode
+// under test is a wait that never ends.
+test('an exit wait is owned by its client and leaves when that client does', { timeout: 10_000 }, async (t) => {
+  const id = 'exit-wait-follows-its-client'
+  assert.ok(manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+  t.after(() => manager.release(id))
+
+  const gone = manager.waitForExit(id, { owner: 'window-a|3|kaisola' })
+  const repeat = manager.waitForExit(id, { owner: 'window-a|3|kaisola' })
+  const survivor = manager.waitForExit(id, { owner: 'window-b|3|kaisola' })
+  assert.equal(repeat, gone, 'one client asking twice shares a single resolver')
+  assert.equal(__test.exitWaiterCount(id), 2)
+
+  assert.equal(manager.cancelExitWaitersPrefix('window-a|'), 1)
+  assert.equal(__test.exitWaiterCount(id), 1, 'a departed client keeps no closure')
+  await assert.rejects(gone, /terminal exit wait cancelled/)
+
+  // Cancelling one client must not disturb the terminal or anyone else's wait.
+  manager.kill(id)
+  const status = await survivor
+  assert.equal(Number.isInteger(status.exitCode), true)
+  assert.equal(__test.exitWaiterCount(id), 0)
+  assert.equal(manager.cancelExitWaiters(id, 'window-b|3|kaisola'), 0)
+})
+
+test('a terminal caps its exit waiters and answers every retained one on release', { timeout: 10_000 }, async (t) => {
+  const id = 'exit-wait-cap'
+  assert.ok(manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+  t.after(() => manager.release(id))
+
+  const waits = []
+  for (let index = 0; index < __test.MAX_EXIT_WAITERS; index += 1) {
+    waits.push(manager.waitForExit(id, { owner: `window-flood|${index}|kaisola` }))
+  }
+  assert.equal(__test.exitWaiterCount(id), __test.MAX_EXIT_WAITERS)
+
+  await assert.rejects(
+    manager.waitForExit(id, { owner: 'window-flood|overflow|kaisola' }),
+    /too many terminal exit waiters/,
+  )
+  assert.equal(__test.exitWaiterCount(id), __test.MAX_EXIT_WAITERS, 'a refused wait adds nothing')
+
+  // Release deletes the record, so its pty exit can never answer these: they
+  // must fail now instead of staying pending for the broker's lifetime.
+  manager.release(id)
+  const settled = await Promise.allSettled(waits)
+  assert.deepEqual(
+    [...new Set(settled.map((result) => `${result.status}:${result.reason?.message ?? ''}`))],
+    ['rejected:Terminal is no longer available.'],
+  )
+  assert.equal(__test.exitWaiterCount(id), 0)
+})
+
+test('an exit wait accepts a bound and drops itself when the bound expires', { timeout: 10_000 }, async (t) => {
+  const id = 'exit-wait-bound'
+  assert.ok(manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+  t.after(() => manager.release(id))
+
+  await assert.rejects(
+    manager.waitForExit(id, { owner: 'window-c|3|kaisola', timeoutMs: 25 }),
+    /terminal exit wait timed out/,
+  )
+  assert.equal(__test.exitWaiterCount(id), 0, 'an expired wait leaves nothing behind')
+  assert.equal(manager.diagnostics().find((row) => row.id === id)?.exitWaiterCount, 0)
 })

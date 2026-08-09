@@ -12,6 +12,7 @@ const { agentEnv } = require('./shellEnv.cjs')
 const { TerminalSpool, DEFAULT_HOT_CAP, DEFAULT_SNAPSHOT_CAP } = require('./terminalSpool.cjs')
 const { TerminalObservers } = require('./terminalObservers.cjs')
 const { TerminalCursor, isUtf8Boundary } = require('../companion/terminalCursor.cjs')
+const { validatedTerminalGeometry } = require('./terminalCreateRoute.cjs')
 
 let pty = null
 let ptyLoadAttempted = false
@@ -163,6 +164,17 @@ const FLUSH_CAP = 65_536 // a burst bigger than this flushes immediately
 const OBSERVER_CHUNK_BYTES = 64 * 1024
 const AGENT_QUIET_MS = 4500
 const CWD_REFRESH_COALESCE_MS = 250
+// An exit wait lives as long as the pty it watches, which for a dev server is
+// hours. Every waiter therefore carries the owner key that asked for it, so a
+// dropped socket can drop its closures, and one terminal holds at most this
+// many: a reconnect-looping or abusive client must not be able to pin an
+// unbounded list of resolvers to a long-running terminal.
+const MAX_EXIT_WAITERS = 32
+// A caller may bound its own wait; this clamps that bound, because setTimeout
+// fires IMMEDIATELY past 2^31-1 ms and a wild timeoutMs would then read as an
+// instant timeout. Unbounded stays the default: a wait is how the agent learns
+// a command finished, and cutting it short would report a false non-exit.
+const MAX_EXIT_WAIT_MS = 6 * 60 * 60 * 1_000
 
 /** main.cjs calls this on app focus/blur — the stream profile follows. */
 function setAppFocused(focused) {
@@ -438,6 +450,8 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
   // never decreases. No caller combines these today — refuse loudly so a
   // future one cannot silently corrupt history offsets.
   if (restore && Number.isFinite(outputByteLimit)) return null
+  const geometry = validatedTerminalGeometry({ cols, rows }, { defaults: true })
+  if (!geometry.ok) return null
   cancelRelease(id)
   const restoring = restore === true
   const prior = terms.get(id)
@@ -450,8 +464,8 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     terms.delete(id)
   }
   const retainedOutputBytes = Number.isFinite(outputByteLimit) ? Math.max(0, Math.floor(outputByteLimit)) : null
-  const initialCols = cols || 80
-  const initialRows = rows || 24
+  const initialCols = geometry.value.cols
+  const initialRows = geometry.value.rows
   const spoolOptions = {
     dir: spoolDir,
     id,
@@ -503,6 +517,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     rec.observers = new TerminalObservers({
       terminalId: id,
       deliver: (subscriber, channel, payload, options) => send(subscriber, channel, payload, options),
+      onDrop: () => syncSpoolVisibility(rec),
     })
     terms.set(id, rec)
     return rec
@@ -568,6 +583,9 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
   rec.observers = new TerminalObservers({
     terminalId: id,
     deliver: (subscriber, channel, payload, options) => send(subscriber, channel, payload, options),
+    // A retired subscription changes the observer count, and the spool's RAM
+    // read cache is derived from it.
+    onDrop: () => syncSpoolVisibility(rec),
   })
   const broadcastAgentActivity = () => {
     send(rec.sender || rec.lastSender, 'terminal:agent-activity', {
@@ -698,8 +716,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       offset: rec.cursor.nextOffset,
       exitStatus: rec.exitStatus,
     }, { streamEpoch: rec.cursor.streamEpoch, endOffset: rec.cursor.nextOffset })
-    rec.waiters.forEach((w) => w(rec.exitStatus))
-    rec.waiters = []
+    resolveExitWaiters(rec, rec.exitStatus)
   })
   terms.set(id, rec)
   if (missingCwd) {
@@ -729,18 +746,18 @@ function agentTurn(id, busy) {
 }
 
 function resizeRecord(record, cols, rows) {
-  if (!record || !Number.isInteger(cols) || !Number.isInteger(rows) || cols <= 0 || rows <= 0) {
-    return false
-  }
+  if (!record) return false
+  const geometry = validatedTerminalGeometry({ cols, rows })
+  if (!geometry.ok) return false
   try {
-    record.pty.resize(cols, rows)
+    record.pty.resize(geometry.value.cols, geometry.value.rows)
   } catch {
     // The controller must not cache a geometry the PTY never accepted. A later
     // level-triggered desktop synchronization can safely retry the same size.
     return false
   }
-  record.cols = cols
-  record.rows = rows
+  record.cols = geometry.value.cols
+  record.rows = geometry.value.rows
   return true
 }
 
@@ -956,23 +973,141 @@ function unsubscribeSubscriberPrefix(prefix) {
   return removed
 }
 
-function waitForExit(id) {
+function disarmExitWaiter(entry) {
+  if (entry.timer) clearTimeout(entry.timer)
+  entry.timer = null
+  return entry
+}
+
+/** Take the whole waiter list off a record so a settle can never run twice. */
+function takeExitWaiters(record) {
+  const entries = record.waiters
+  record.waiters = []
+  return entries.map(disarmExitWaiter)
+}
+
+function resolveExitWaiters(record, exitStatus) {
+  for (const entry of takeExitWaiters(record)) entry.resolve(exitStatus)
+}
+
+/** A wait that can no longer be answered is rejected, never left pending: the
+ * caller's request must fail loudly instead of hanging on a dead terminal. */
+function rejectExitWaiters(entries, message) {
+  for (const entry of entries) entry.reject(new Error(message))
+  return entries.length
+}
+
+function dropExitWaiter(record, entry) {
+  const index = record.waiters.indexOf(entry)
+  if (index >= 0) record.waiters.splice(index, 1)
+  disarmExitWaiter(entry)
+}
+
+/** Reject and forget every waiter a predicate matches. The terminal itself is
+ * untouched: a client leaving says nothing about the command it was watching. */
+function cancelMatchingExitWaiters(record, matches) {
+  const kept = []
+  const cancelled = []
+  for (const entry of record.waiters) {
+    if (matches(entry)) cancelled.push(disarmExitWaiter(entry))
+    else kept.push(entry)
+  }
+  record.waiters = kept
+  return rejectExitWaiters(cancelled, 'terminal exit wait cancelled')
+}
+
+/**
+ * Await a terminal's exit status. `owner` is the requesting client's capability
+ * key: one client asking twice for the same terminal shares a single resolver
+ * (and the first ask's bound), and cancelExitWaiters[Prefix]() can drop that
+ * closure when the client goes away. `timeoutMs` bounds one wait; without it the
+ * wait lasts as long as the pty, which is the right answer for a command that
+ * legitimately runs for hours.
+ */
+function waitForExit(id, { owner = null, timeoutMs = null } = {}) {
   const r = terms.get(id)
   if (!r) return Promise.reject(new Error('Terminal is no longer available.'))
   if (r.exited) return Promise.resolve(r.exitStatus)
-  return new Promise((resolve) => r.waiters.push(resolve))
+  const key = senderId(owner)
+  const existing = key ? r.waiters.find((entry) => entry.owner === key) : null
+  if (existing) return existing.promise
+  if (r.waiters.length >= MAX_EXIT_WAITERS) {
+    return Promise.reject(new Error('too many terminal exit waiters'))
+  }
+  const entry = { owner: key, resolve: null, reject: null, timer: null, promise: null }
+  entry.promise = new Promise((resolve, reject) => {
+    entry.resolve = resolve
+    entry.reject = reject
+  })
+  const bound = Number(timeoutMs)
+  if (Number.isFinite(bound) && bound > 0) {
+    entry.timer = setTimeout(() => {
+      dropExitWaiter(r, entry)
+      entry.reject(new Error('terminal exit wait timed out'))
+    }, Math.min(bound, MAX_EXIT_WAIT_MS))
+    entry.timer.unref?.()
+  }
+  r.waiters.push(entry)
+  return entry.promise
+}
+
+function exitWaiterCount(id) {
+  return terms.get(id)?.waiters.length ?? 0
+}
+
+/** Cancel one owner's pending waits on one terminal. */
+function cancelExitWaiters(id, owner) {
+  const r = terms.get(id)
+  const key = senderId(owner)
+  if (!r || !key) return 0
+  return cancelMatchingExitWaiters(r, (entry) => entry.owner === key)
+}
+
+/** Broker socket loss: every wait owned by that app instance is unanswerable,
+ * so the closures go with the connection instead of outliving it on a pty that
+ * may keep running for hours. */
+function cancelExitWaitersPrefix(prefix) {
+  if (!prefix) return 0
+  let cancelled = 0
+  for (const r of terms.values()) {
+    cancelled += cancelMatchingExitWaiters(r, (entry) => entry.owner.startsWith(prefix))
+  }
+  return cancelled
+}
+
+function killRecord(record) {
+  if (!record) {
+    return {
+      ok: false,
+      code: 'terminal_not_found',
+      message: 'terminal is no longer available',
+    }
+  }
+  // Killing is idempotent once node-pty has already delivered its exit event.
+  // Cold history records also have no pty, but always carry exited=true.
+  if (record.exited) return { ok: true, alreadyExited: true }
+  if (!record.pty) {
+    return {
+      ok: false,
+      code: 'terminal_kill_unavailable',
+      message: 'terminal signal unavailable',
+    }
+  }
+  try {
+    if (record.pty.kill() === false) {
+      return { ok: false, code: 'terminal_kill_failed', message: 'terminal signal failed' }
+    }
+  } catch {
+    // Never reflect a native/backend diagnostic across the authenticated wire:
+    // it can contain process or filesystem details. The fixed code remains
+    // actionable while the unchanged record proves the terminal is still live.
+    return { ok: false, code: 'terminal_kill_failed', message: 'terminal signal failed' }
+  }
+  return { ok: true }
 }
 
 function kill(id) {
-  const r = terms.get(id)
-  if (r) {
-    try {
-      if (r.pty) r.pty.kill()
-    } catch {
-      /* noop */
-    }
-  }
-  return !!r
+  return { id, ...killRecord(terms.get(id)) }
 }
 
 function release(id) {
@@ -983,6 +1118,8 @@ function release(id) {
   kill(id)
   r?.spool.close({ remove: true })
   terms.delete(id)
+  // The record is gone, so its pty exit can no longer reach these resolvers.
+  if (r) rejectExitWaiters(takeExitWaiters(r), 'Terminal is no longer available.')
 }
 
 /** Broker-owned close grace survives renderer crashes, appearance swaps, and
@@ -1090,6 +1227,7 @@ function killAll() {
     // App quit is not a user close: retain the spool so persisted terminal
     // records can restore their previous scrollback on next launch.
     r.spool.close()
+    rejectExitWaiters(takeExitWaiters(r), 'Terminal is no longer available.')
   }
   terms.clear()
   // terminal:run children are plain child_process, not ptys — reap them too, or
@@ -1147,7 +1285,8 @@ function diagnostics() {
     endOffset: r.cursor.nextOffset,
     observerCount: r.observers.stats().subscribers,
     pausedObserverCount: r.observers.stats().paused,
+    exitWaiterCount: r.waiters.length,
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, MAX_EXIT_WAITERS } }

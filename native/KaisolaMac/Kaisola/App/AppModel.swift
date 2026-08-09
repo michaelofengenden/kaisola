@@ -409,6 +409,12 @@ final class AppModel: ObservableObject {
         sessionAdoptions = adoptionStore.adoptions()
     }
 
+    /// Visual receipts can prove the mounted model has a preparer that owns no
+    /// broker locator or launcher, rather than trusting an environment flag.
+    var usesBrokerFreeFixturePreparer: Bool {
+        brokerPreparer is BrokerFreeFixturePreparer
+    }
+
     /// Keeps each chat's usage observers alive only while that chat exists.
     /// Keying by id avoids retaining closed conversations and stale Usage rows.
     private var usageObservers: [String: Set<AnyCancellable>] = [:]

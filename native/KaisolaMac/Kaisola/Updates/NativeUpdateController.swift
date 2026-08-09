@@ -20,9 +20,26 @@ final class NativeUpdateController: NSObject {
 
     private(set) var availability: Availability
     private var standardController: SPUStandardUpdaterController?
+    private(set) var startedUpdater = false
 
     override convenience init() {
         self.init(bundle: .main)
+    }
+
+    /// An installed visual fixture must never start Sparkle: doing so could
+    /// replace the evidence bundle and relaunch outside its isolated HOME.
+    convenience init(isolatedFixture: Bool) {
+        if isolatedFixture {
+            self.init(disabledReason: "Updates are disabled in isolated fixtures.")
+        } else {
+            self.init(bundle: .main)
+        }
+    }
+
+    private init(disabledReason: String) {
+        availability = .unavailable(disabledReason)
+        standardController = nil
+        super.init()
     }
 
     init(bundle: Bundle) {
@@ -42,6 +59,7 @@ final class NativeUpdateController: NSObject {
             )
             try controller.updater.start()
             standardController = controller
+            startedUpdater = true
             availability = .ready
             UpdateCenter.shared.installPreferenceBridge(
                 UpdateCenter.PreferenceBridge(

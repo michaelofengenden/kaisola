@@ -168,6 +168,15 @@ struct LocatedBrokerInfoPreparer: BrokerInfoPreparing {
     }
 }
 
+/// A visual Settings fixture must remain broker-free even if future view work
+/// accidentally invokes `AppModel.reload()`. This seam has no locator or
+/// launcher, so it cannot discover, adopt, start, upgrade, or reconnect.
+struct BrokerFreeFixturePreparer: BrokerInfoPreparing {
+    func prepare() async throws -> BrokerInfo {
+        throw BrokerDiscoveryError.notRunning
+    }
+}
+
 actor BrokerStartupCoordinator:
     BrokerGenerationTopologyProviding,
     BrokerUpgradeMonitoring,

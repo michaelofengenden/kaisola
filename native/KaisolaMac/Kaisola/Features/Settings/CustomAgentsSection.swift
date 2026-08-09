@@ -16,6 +16,7 @@ extension Notification.Name {
 /// Terminal-only by construction: these agents have no ACP adapter, so they
 /// never appear on chat surfaces.
 struct CustomAgentsSection: View {
+    var highlightedID: String? = nil
     private let store = CustomAgentStore()
     /// A small, curated set so every custom agent gets a recognizable glyph.
     private let symbolChoices = ["terminal", "cpu", "bolt", "ant", "bird", "cloud"]
@@ -35,6 +36,7 @@ struct CustomAgentsSection: View {
             if specs.isEmpty {
                 Text("Add any terminal CLI — it appears in the New menu and launches into an owned terminal.")
                     .font(.caption).foregroundStyle(.secondary)
+                    .accessibilityIdentifier("extensions.agents.empty")
             }
             ForEach(Array(specs.enumerated()), id: \.offset) { index, spec in
                 VStack(alignment: .leading, spacing: 5) {
@@ -58,9 +60,26 @@ struct CustomAgentsSection: View {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
+                        .accessibilityLabel("Remove custom agent \(spec.name)")
                     }
                     acpControls(index: index, spec: spec)
+                    ExtensionMetadataGrid(
+                        item: .customAgent(
+                            spec,
+                            install: installs.store.record(agentID: spec.id)
+                        )
+                    )
                 }
+                .padding(.vertical, 4)
+                .id(spec.id)
+                .overlay {
+                    if highlightedID == spec.id {
+                        RoundedRectangle(cornerRadius: 9)
+                            .stroke(Color.accentColor, lineWidth: 2)
+                            .allowsHitTesting(false)
+                    }
+                }
+                .accessibilityIdentifier("extensions.agent.\(spec.id)")
             }
             HStack {
                 TextField("Name", text: $newName)
@@ -115,6 +134,7 @@ struct CustomAgentsSection: View {
         newName = ""
         newCommand = ""
         NotificationCenter.default.post(name: .kaisolaAgentsChanged, object: nil)
+        NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
     }
 
     private func delete(_ index: Int) {
@@ -127,6 +147,7 @@ struct CustomAgentsSection: View {
     private func persist() {
         store.save(specs)
         NotificationCenter.default.post(name: .kaisolaAgentsChanged, object: nil)
+        NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
     }
 
     // MARK: - Chat surface (ACP adapter)

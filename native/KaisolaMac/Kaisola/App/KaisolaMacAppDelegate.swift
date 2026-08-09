@@ -578,7 +578,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             signedOutNotice: notice
         )
     }()
-    private let updateController = NativeUpdateController()
+    private lazy var updateController = NativeUpdateController(
+        isolatedFixture: visualFixture || resourceWorkload != nil
+    )
 
     /// The in-workspace settings sheet needs the updater's state without a
     /// delegate reference threaded through every view (spec §3c).
@@ -787,8 +789,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         MemoryPressureResponder.shared.start()
         // Usage stats stay fresh on their own (spec §3e): frontmost window's
         // workspace, every 5 minutes while active.
-        UsageCenter.shared.startBackgroundRefresh { [weak self] in
-            self?.activeSettingsModel()?.currentProjectDirectory
+        if !visualFixture && resourceWorkload == nil {
+            UsageCenter.shared.startBackgroundRefresh { [weak self] in
+                self?.activeSettingsModel()?.currentProjectDirectory
+            }
         }
         if resourceWorkloadRequested, resourceWorkload == nil {
             print("KAISOLA_NATIVE_RESOURCE_WORKLOAD_READY=FAIL invalid-private-temporary-root")
@@ -1207,7 +1211,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 openAccounts: {},
                 openUpdateSettings: {}
             ))
-        } else if visualFixture, ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface) {
+        } else if visualFixture, ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-extensions", "settings-extensions-narrow", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface) {
             let workspace = URL(
                 fileURLWithPath: visualWorkspace ?? FileManager.default.currentDirectoryPath,
                 isDirectory: true
@@ -1223,6 +1227,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             case "settings-terminal", "settings-terminal-history", "settings-terminal-interaction": initialSectionID = "terminal"
             case "settings-companion": initialSectionID = "companion"
             case "settings-mcp": initialSectionID = "mcp"
+            case "settings-extensions", "settings-extensions-narrow": initialSectionID = "extensions"
             case "settings-accounts": initialSectionID = "accounts"
             case "settings-models": initialSectionID = "models"
             case "settings-shortcuts": initialSectionID = "shortcuts"
@@ -1251,15 +1256,17 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
 
         let visualSettings = visualFixture
-            && ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface)
+            && ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-extensions", "settings-extensions-narrow", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface)
         let visualOnboarding = visualFixture && visualSurface == "onboarding"
+        let visualExtensions = visualFixture && visualSurface == "settings-extensions"
+        let visualExtensionsNarrow = visualFixture && visualSurface == "settings-extensions-narrow"
 
         let window = NSWindow(
             contentRect: NSRect(
                 x: 0,
                 y: 0,
-                width: visualSettings ? 810 : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualFixture ? 1_360 : 1_080))),
-                height: visualSettings ? 540 : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700)))
+                width: visualExtensions ? 1_100 : (visualExtensionsNarrow ? 820 : (visualSettings ? 810 : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualFixture ? 1_360 : 1_080))))),
+                height: visualExtensions ? 800 : (visualExtensionsNarrow ? 560 : (visualSettings ? 540 : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700)))))
             ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
@@ -1370,10 +1377,18 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let transcriptStore = AcpTranscriptStore(
             fileURL: root.appendingPathComponent("agent-chat-transcripts-v1.json")
         )
+        let brokerPreparer: any BrokerInfoPreparing
+        if let resourceWorkload {
+            brokerPreparer = BrokerStartupCoordinator.resourceFixture(
+                userDataRoot: resourceWorkload.brokerUserDataRoot
+            )
+        } else if visualFixture {
+            brokerPreparer = BrokerFreeFixturePreparer()
+        } else {
+            brokerPreparer = BrokerStartupCoordinator.live()
+        }
         return AppModel(
-            brokerPreparer: resourceWorkload.map {
-                BrokerStartupCoordinator.resourceFixture(userDataRoot: $0.brokerUserDataRoot)
-            } ?? BrokerStartupCoordinator.live(),
+            brokerPreparer: brokerPreparer,
             sessionStore: NativeSessionStore(
                 fileURL: root.appendingPathComponent("native-sessions.json")
             ),
@@ -1681,6 +1696,43 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 print("KAISOLA_NATIVE_VISUAL_CAPTURE=FAIL no-content-view")
                 requestVisualFixtureTermination()
                 return
+            }
+
+            if ["settings-extensions", "settings-extensions-narrow"].contains(visualSurface) {
+                guard let model = windowModels[ObjectIdentifier(window)] else {
+                    print("KAISOLA_NATIVE_EXTENSIONS_SETTINGS=FAIL no-mounted-model")
+                    requestVisualFixtureTermination()
+                    return
+                }
+                let accessibility = NativeVisualAccessibilitySnapshot.capture(from: view)
+                let fixtureItems = ExtensionsSettingsFixture.items
+                let receipt = NativeVisualExtensionsSettingsReceipt(
+                    surface: visualSurface,
+                    contentWidth: view.bounds.width,
+                    contentHeight: view.bounds.height,
+                    categoryCount: Set(fixtureItems.map(\.category)).count,
+                    itemCount: fixtureItems.count,
+                    invalidCount: fixtureItems.filter { $0.validationMessage != nil }.count,
+                    accessibilityIdentifiers: accessibility.identifiers.sorted(),
+                    accessibilityLabels: accessibility.labels.sorted(),
+                    fixtureUpdaterDisabled: !updateController.startedUpdater,
+                    fixtureBrokerIsolated: model.usesBrokerFreeFixturePreparer
+                )
+                guard let payload = receipt.json else {
+                    print("KAISOLA_NATIVE_EXTENSIONS_SETTINGS=FAIL receipt-encoding")
+                    requestVisualFixtureTermination()
+                    return
+                }
+                FileHandle.standardOutput.write(Data("KAISOLA_NATIVE_EXTENSIONS_SETTINGS=".utf8))
+                FileHandle.standardOutput.write(Data(payload.utf8))
+                FileHandle.standardOutput.write(Data("\n".utf8))
+                try? FileHandle.standardOutput.synchronize()
+                if let failure = receipt.failure {
+                    print("KAISOLA_NATIVE_EXTENSIONS_SETTINGS=FAIL \(failure)")
+                    requestVisualFixtureTermination()
+                    return
+                }
+                print("KAISOLA_NATIVE_EXTENSIONS_SETTINGS=PASS surface=\(visualSurface)")
             }
 
             // Mixed and Mesh both select a non-terminal pane before the view is
@@ -3103,13 +3155,55 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
     private var settingsWindow: NSWindow?
 
-    /// Settings, opened on the Agents pane. The composer's agent menu offers
-    /// "Manage agents…" as the answer to "why can this agent not chat?", and
-    /// landing on whichever pane was last visited would not answer it.
+    /// The composer's "Manage agents…" affordance lands on the exact registry
+    /// inside Extensions, rather than on the built-in Agents overview.
     /// `openSettings` re-installs the content in both its branches, so setting
     /// the remembered section first is all the deep link needs.
     @objc func openAgentSettings(_ sender: Any?) {
-        settingsSelectedSectionID = "agents"
+        settingsSelectedSectionID = ExtensionsSettingsRoute(
+            category: .customAgents,
+            itemID: nil
+        ).rawValue
+        openSettings(sender)
+    }
+
+    @objc func openExtensionSettings(_ sender: Any?) {
+        let candidate = sender as? String
+            ?? (sender as? NSMenuItem)?.representedObject as? String
+        settingsSelectedSectionID = ExtensionsSettingsRoute.parse(candidate)?.rawValue
+            ?? ExtensionsSettingsRoute(category: nil, itemID: nil).rawValue
+        openSettings(sender)
+    }
+
+    @objc func openMcpSettings(_ sender: Any?) {
+        settingsSelectedSectionID = ExtensionsSettingsRoute(
+            category: .mcpServers,
+            itemID: nil
+        ).rawValue
+        openSettings(sender)
+    }
+
+    @objc func openTerminalThemeSettings(_ sender: Any?) {
+        settingsSelectedSectionID = ExtensionsSettingsRoute(
+            category: .terminalThemes,
+            itemID: nil
+        ).rawValue
+        openSettings(sender)
+    }
+
+    @objc func openGrammarSettings(_ sender: Any?) {
+        settingsSelectedSectionID = ExtensionsSettingsRoute(
+            category: .languageGrammars,
+            itemID: nil
+        ).rawValue
+        openSettings(sender)
+    }
+
+    @objc func openPreviewMappingSettings(_ sender: Any?) {
+        settingsSelectedSectionID = ExtensionsSettingsRoute(
+            category: .previewMappings,
+            itemID: nil
+        ).rawValue
         openSettings(sender)
     }
 
@@ -3723,6 +3817,130 @@ enum NativeVisualCaptureTarget {
             || surface == "workspace-move"
             ? root.attachedSheet
             : root
+    }
+}
+
+struct NativeVisualExtensionsSettingsReceipt: Codable, Equatable {
+    let surface: String
+    let contentWidth: CGFloat
+    let contentHeight: CGFloat
+    let categoryCount: Int
+    let itemCount: Int
+    let invalidCount: Int
+    let accessibilityIdentifiers: [String]
+    let accessibilityLabels: [String]
+    let fixtureUpdaterDisabled: Bool
+    let fixtureBrokerIsolated: Bool
+
+    var failure: String? {
+        guard surface == "settings-extensions" || surface == "settings-extensions-narrow" else {
+            return "unexpected-surface"
+        }
+        guard categoryCount == ExtensionsSettingsCategory.allCases.count else {
+            return "missing-registry-category-\(categoryCount)"
+        }
+        guard itemCount >= ExtensionsSettingsCategory.allCases.count else {
+            return "missing-fixture-entry-\(itemCount)"
+        }
+        guard invalidCount == 1 else { return "wrong-invalid-count-\(invalidCount)" }
+        guard fixtureUpdaterDisabled else { return "fixture-updater-started" }
+        guard fixtureBrokerIsolated else { return "fixture-broker-route-live" }
+        guard contentHeight >= 540 else { return "content-too-short-\(contentHeight)" }
+        if surface == "settings-extensions" {
+            guard contentWidth >= 1_050 else { return "wide-content-too-narrow-\(contentWidth)" }
+        } else {
+            guard (800...900).contains(contentWidth) else {
+                return "narrow-content-out-of-range-\(contentWidth)"
+            }
+        }
+
+        let identifiers = Set(accessibilityIdentifiers)
+        guard identifiers.contains("extensions.hub") else { return "missing-hub-ax" }
+        guard accessibilityLabels.contains(where: {
+            $0.localizedCaseInsensitiveContains("Search extensions")
+        }) else { return "missing-search-label-ax" }
+        if surface == "settings-extensions-narrow" {
+            guard accessibilityLabels.contains(where: {
+                $0.localizedCaseInsensitiveContains("Extension category")
+            }) else { return "missing-compact-picker-label-ax" }
+        }
+        let joined = accessibilityLabels.joined(separator: " ").lowercased()
+        guard !joined.contains("fixture-secret") else { return "secret-leaked-to-ax" }
+        return nil
+    }
+
+    var json: String? {
+        guard let data = try? JSONEncoder().encode(self) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
+@MainActor
+enum NativeVisualAccessibilitySnapshot {
+    struct Snapshot {
+        var identifiers = Set<String>()
+        var labels = Set<String>()
+    }
+
+    /// Read the mounted AppKit/SwiftUI AX graph, including SwiftUI's virtual
+    /// `NSAccessibilityProtocol` descendants. SwiftUI's bridge vends private
+    /// protocol-conforming objects rather than necessarily concrete
+    /// `NSAccessibilityElement` instances, and navigation-order children are
+    /// sometimes the first projection it materializes. The view hierarchy is a
+    /// fallback only to reach hosting containers; acceptance still requires the
+    /// identifiers and labels returned by mounted AX objects themselves.
+    static func capture(from root: NSView) -> Snapshot {
+        var snapshot = Snapshot()
+        var visited = Set<ObjectIdentifier>()
+        if let window = root.window {
+            walk(window, depth: 0, visited: &visited, snapshot: &snapshot)
+        }
+        walk(root, depth: 0, visited: &visited, snapshot: &snapshot)
+        if let descendant = NSAccessibility.unignoredDescendant(of: root) {
+            walk(descendant, depth: 0, visited: &visited, snapshot: &snapshot)
+        }
+        return snapshot
+    }
+
+    private static func walk(
+        _ value: Any,
+        depth: Int,
+        visited: inout Set<ObjectIdentifier>,
+        snapshot: inout Snapshot
+    ) {
+        guard depth < 40, visited.count < 4_000 else { return }
+        let object = value as AnyObject
+        guard visited.insert(ObjectIdentifier(object)).inserted else { return }
+
+        if let element = value as? any NSAccessibilityProtocol {
+            record(
+                identifier: element.accessibilityIdentifier(),
+                label: element.accessibilityLabel(),
+                in: &snapshot
+            )
+            let childGroups = [
+                element.accessibilityChildren() ?? [],
+                element.accessibilityChildrenInNavigationOrder() ?? [],
+                element.accessibilityContents() ?? [],
+            ]
+            for child in NSAccessibility.unignoredChildren(from: childGroups.flatMap { $0 }) {
+                walk(child, depth: depth + 1, visited: &visited, snapshot: &snapshot)
+            }
+        }
+        if let view = value as? NSView {
+            for subview in view.subviews {
+                walk(subview, depth: depth + 1, visited: &visited, snapshot: &snapshot)
+            }
+        }
+    }
+
+    private static func record(
+        identifier: String?,
+        label: String?,
+        in snapshot: inout Snapshot
+    ) {
+        if let identifier, !identifier.isEmpty { snapshot.identifiers.insert(identifier) }
+        if let label, !label.isEmpty { snapshot.labels.insert(label) }
     }
 }
 

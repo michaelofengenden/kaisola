@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "surface": "settings",
+  "appearance": "dark",
+  "contentWidth": 810,
+  "contentHeight": 540,
+  "inventorySource": "none",
+  "windowControls": [
+    { "name": "close", "isHidden": false, "frame": { "x": 0.01111, "y": 0.01481, "width": 0.01728, "height": 0.02593 } },
+    { "name": "miniaturize", "isHidden": false, "frame": { "x": 0.03580, "y": 0.01481, "width": 0.01728, "height": 0.02593 } },
+    { "name": "zoom", "isHidden": false, "frame": { "x": 0.06049, "y": 0.01481, "width": 0.01728, "height": 0.02593 } }
+  ],
+  "controlZone": { "x": 0.00370, "y": 0.00370, "width": 0.08149, "height": 0.04815 },
+  "controlZoneInk": {
+    "coverage": 0.0,
+    "minimumLuminance": 0.0,
+    "maximumLuminance": 0.0,
+    "samples": 768
+  },
+  "contentInk": {
+    "columns": 3,
+    "rows": 3,
+    "cells": [
+      { "coverage": 0.0, "minimumLuminance": 0.0, "maximumLuminance": 0.0, "samples": 16 },
+      { "coverage": 0.0, "minimumLuminance": 0.0, "maximumLuminance": 0.0, "samples": 16 },
+      { "coverage": 0.0, "minimumLuminance": 0.0, "maximumLuminance": 0.0, "samples": 16 },
+      { "coverage": 0.0, "minimumLuminance": 0.0, "maximumLuminance": 0.0, "samples": 16 },
+      { "coverage": 0.0, "minimumLuminance": 0.0, "maximumLuminance": 0.0, "samples": 16 },
+      { "coverage": 0.0, "minimumLuminance": 0.0, "maximumLuminance": 0.0, "samples": 16 },
+      { "coverage": 0.0, "minimumLuminance": 0.0, "maximumLuminance": 0.0, "samples": 16 },
+      { "coverage": 0.0, "minimumLuminance": 0.0, "maximumLuminance": 0.0, "samples": 16 },
+      { "coverage": 0.0, "minimumLuminance": 0.0, "maximumLuminance": 0.0, "samples": 16 }
+    ]
+  },
+  "elements": [],
+  "focusedElementID": null
+}

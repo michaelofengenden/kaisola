@@ -76,12 +76,12 @@ struct QuickActionsEditor: View {
         VStack(alignment: .leading, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
                 Text("Quick Actions").font(.headline)
-                Text(projectName).font(.caption).foregroundStyle(.secondary)
+                Text(projectName).font(.caption).foregroundStyle(.kaisolaSecondary)
             }
             if actions.isEmpty {
                 Text("No actions yet. Add a build, test, or dev-server command — it runs in a fresh terminal here.")
                     .font(.caption)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }

@@ -415,13 +415,18 @@ final class GitPanelModel: ObservableObject {
 
             let result: PRResult
             if GitService.ghAvailable() {
-                result = .created(url: try service.createPullRequest(
+                switch try service.createPullRequest(
                     title: plan.title,
                     body: plan.body,
                     baseBranch: plan.baseBranch,
                     headBranch: plan.headBranch,
                     repositoryURL: repositoryURL
-                ))
+                ) {
+                case let .opened(url):
+                    result = .created(url: url)
+                case let .openedWithoutURL(recoveryURL):
+                    result = .createdWithoutURL(url: recoveryURL)
+                }
             } else if let compare = service.compareURL(
                 destination: plan.destination,
                 headBranch: plan.headBranch
@@ -444,6 +449,10 @@ final class GitPanelModel: ObservableObject {
                 self.prURL = url
                 self.prState = "Pull request opened."
                 ToastCenter.shared.show("Pull request opened", style: .success)
+            case let .createdWithoutURL(url):
+                self.prURL = url
+                self.prState = "Pull request opened, but gh printed no usable link — this opens the branch's pull requests instead."
+                ToastCenter.shared.show("Pull request opened — link unconfirmed", style: .info)
             case let .compare(url):
                 self.prURL = url
                 self.prState = "gh not installed — opened a compare page in your browser."
@@ -512,8 +521,9 @@ private struct PROutcome: Sendable {
 }
 
 private enum PRResult: Sendable {
-    case created(url: String)   // gh opened a real pull request
-    case compare(url: String)   // gh missing — a browser compare page instead
+    case created(url: String)             // gh opened a real pull request
+    case createdWithoutURL(url: String)   // opened, but gh named no PR — a list to recover from
+    case compare(url: String)             // gh missing — a browser compare page instead
 }
 
 struct GitPanelView: View {

@@ -486,10 +486,18 @@ enum AppCommandRegistry {
                 ? .available
                 : .unavailable("There is no recently closed file tab to reopen.")
         }
-        if id == .toggleDocumentPreview || id == .openExternalEditor {
+        if id == .toggleDocumentPreview {
             return (model.previewedFileURL ?? model.currentProjectDirectory) == nil
                 ? .unavailable("Open a project or file first.")
                 : .available
+        }
+        if id == .openExternalEditor {
+            guard (model.previewedFileURL ?? model.currentProjectDirectory) != nil else {
+                return .unavailable("Open a project or file first.")
+            }
+            return context.settings.externalEditorResolution.isAvailable
+                ? .available
+                : .unavailable("Choose a valid external editor in Settings first.")
         }
         if id == .previousFileTab || id == .nextFileTab {
             return model.fileTabs(for: model.selectedProjectID).count > 1

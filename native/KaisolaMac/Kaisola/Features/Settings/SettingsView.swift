@@ -149,6 +149,7 @@ struct SettingsView: View {
     /// re-read the bridge (which owns the persisted rules).
     @State private var notificationRuleRevision = 0
     @State private var notificationAuthorization = NotificationAuthorizationState.unknown
+    @State private var externalEditorFeedback: String?
 
     /// Identifiable wrapper so the confirmation presents via `.alert(item:)`.
     private struct RestartRequest: Identifiable { let id = UUID() }
@@ -222,6 +223,10 @@ struct SettingsView: View {
 
     private var settingsSearchResults: [SettingsSection] {
         SettingsCatalogSearch.matches(query: settingsSearchQuery)
+    }
+
+    private var externalEditorDetail: String {
+        externalEditorFeedback ?? settings.externalEditorResolution.detail
     }
 
     var body: some View {
@@ -694,14 +699,34 @@ struct SettingsView: View {
                         .accessibilityLabel("Summon hotkey")
                     }
                     SettingsDivider()
-                    SettingsRow(title: "External editor", detail: "Used by Shift-Command-O", symbol: "arrow.up.forward.app") {
-                        TextField("System default", text: $settings.externalEditorApp)
-                            .textFieldStyle(.plain)
-                            .multilineTextAlignment(.trailing)
-                            .padding(.horizontal, 10)
-                            .frame(width: 190, height: 30)
-                            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
-                            .accessibilityLabel("External editor")
+                    SettingsRow(
+                        title: "External editor",
+                        detail: externalEditorDetail,
+                        symbol: "arrow.up.forward.app"
+                    ) {
+                        VStack(alignment: .trailing, spacing: 6) {
+                            Menu {
+                                Button("System Default") {
+                                    settings.useSystemDefaultExternalEditor()
+                                    externalEditorFeedback = nil
+                                }
+                                Divider()
+                                Button("Choose Application…") { chooseExternalEditor() }
+                            } label: {
+                                ExternalEditorChoiceLabel(resolution: settings.externalEditorResolution)
+                            }
+                            .menuIndicator(.hidden)
+                            .accessibilityLabel("External editor application")
+
+                            Button("Test Open") {
+                                externalEditorFeedback = settings.testExternalEditor()
+                                    ? "Sent a safe test file to \(settings.externalEditorResolution.displayName)"
+                                    : "The external editor could not open the safe test file"
+                            }
+                            .controlSize(.small)
+                            .disabled(!settings.externalEditorResolution.isAvailable)
+                            .accessibilityHint("Opens a generated file containing no project or account data")
+                        }
                     }
                 }
             }
@@ -802,6 +827,21 @@ struct SettingsView: View {
         panel.directoryURL = URL(fileURLWithPath: "/System/Library/Desktop Pictures")
         guard panel.runModal() == .OK, let url = panel.url else { return }
         settings.glassWallpaper = url.path
+    }
+
+    private func chooseExternalEditor() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.application]
+        panel.message = "Choose the application Shift-Command-O should use."
+        panel.prompt = "Use Application"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        externalEditorFeedback = settings.selectExternalEditor(at: url)
+            ? nil
+            : "That item is not a resolvable macOS application"
     }
 
     private var terminal: some View {
@@ -1327,6 +1367,46 @@ private struct SettingsChoiceLabel: View {
         .padding(.horizontal, 10)
         .frame(minWidth: 108, minHeight: 30)
         .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct ExternalEditorChoiceLabel: View {
+    let resolution: ExternalEditorResolution
+
+    var body: some View {
+        HStack(spacing: 7) {
+            icon
+                .frame(width: 18, height: 18)
+            Text(resolution.displayName)
+                .lineLimit(1)
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.kaisolaTertiary)
+        }
+        .font(.callout)
+        .padding(.horizontal, 10)
+        .frame(minWidth: 170, minHeight: 30)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private var icon: some View {
+        switch resolution {
+        case .systemDefault:
+            Image(systemName: "app.dashed")
+                .resizable()
+                .scaledToFit()
+                .foregroundStyle(.kaisolaSecondary)
+        case .application(let application):
+            Image(nsImage: NSWorkspace.shared.icon(forFile: application.url.path))
+                .resizable()
+                .scaledToFit()
+        case .unresolved:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .resizable()
+                .scaledToFit()
+                .foregroundStyle(.orange)
+        }
     }
 }
 

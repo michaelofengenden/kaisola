@@ -435,6 +435,150 @@ enum ProviderRouting {
     }
 }
 
+struct ExternalEditorApplication: Equatable {
+    let url: URL
+    let displayName: String
+    let bundleIdentifier: String?
+
+    init?(url: URL, fileManager: FileManager = .default) {
+        let standardized = url.standardizedFileURL
+        var isDirectory: ObjCBool = false
+        guard standardized.pathExtension.caseInsensitiveCompare("app") == .orderedSame,
+              fileManager.fileExists(atPath: standardized.path, isDirectory: &isDirectory),
+              isDirectory.boolValue,
+              let bundle = Bundle(url: standardized) else {
+            return nil
+        }
+        let named = (bundle.object(forInfoDictionaryKey: "CFBundleDisplayName") as? String)
+            ?? (bundle.object(forInfoDictionaryKey: "CFBundleName") as? String)
+            ?? standardized.deletingPathExtension().lastPathComponent
+        let trimmedName = named.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty else { return nil }
+        self.url = standardized
+        displayName = trimmedName
+        bundleIdentifier = bundle.bundleIdentifier?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+enum ExternalEditorResolution: Equatable {
+    case systemDefault
+    case application(ExternalEditorApplication)
+    case unresolved
+
+    var isAvailable: Bool {
+        if case .unresolved = self { return false }
+        return true
+    }
+
+    var displayName: String {
+        switch self {
+        case .systemDefault: "System Default"
+        case .application(let application): application.displayName
+        case .unresolved: "Application Not Found"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .systemDefault:
+            "Shift-Command-O uses the default app for each file"
+        case .application(let application):
+            "Shift-Command-O opens files in \(application.displayName)"
+        case .unresolved:
+            "The selected application cannot be resolved. Choose another app or use System Default."
+        }
+    }
+}
+
+enum ExternalEditorResolver {
+    static let bundlePrefix = "bundle:"
+    static let pathPrefix = "path:"
+
+    @MainActor
+    static func resolve(_ storedValue: String) -> ExternalEditorResolution {
+        resolve(
+            storedValue,
+            applicationForBundleIdentifier: { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0) },
+            applicationForLegacyName: { applicationURL(forLegacyName: $0) },
+            inspectApplication: { ExternalEditorApplication(url: $0) }
+        )
+    }
+
+    static func resolve(
+        _ storedValue: String,
+        applicationForBundleIdentifier: (String) -> URL?,
+        applicationForLegacyName: (String) -> URL?,
+        inspectApplication: (URL) -> ExternalEditorApplication?
+    ) -> ExternalEditorResolution {
+        let selection = storedValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !selection.isEmpty else { return .systemDefault }
+
+        if selection.hasPrefix(bundlePrefix) {
+            let identifier = String(selection.dropFirst(bundlePrefix.count))
+            guard !identifier.isEmpty,
+                  let url = applicationForBundleIdentifier(identifier),
+                  let application = inspectApplication(url) else {
+                return .unresolved
+            }
+            return .application(application)
+        }
+
+        if selection.hasPrefix(pathPrefix) {
+            let path = String(selection.dropFirst(pathPrefix.count))
+            guard path.hasPrefix("/"),
+                  let application = inspectApplication(URL(fileURLWithPath: path)) else {
+                return .unresolved
+            }
+            return .application(application)
+        }
+
+        if selection.hasPrefix("/"),
+           let application = inspectApplication(URL(fileURLWithPath: selection)) {
+            return .application(application)
+        }
+        if let url = applicationForBundleIdentifier(selection),
+           let application = inspectApplication(url) {
+            return .application(application)
+        }
+        if let url = applicationForLegacyName(selection),
+           let application = inspectApplication(url) {
+            return .application(application)
+        }
+        return .unresolved
+    }
+
+    static func storedValue(for application: ExternalEditorApplication) -> String {
+        if let bundleIdentifier = application.bundleIdentifier, !bundleIdentifier.isEmpty {
+            return bundlePrefix + bundleIdentifier
+        }
+        return pathPrefix + application.url.standardizedFileURL.path
+    }
+
+    private static func applicationURL(
+        forLegacyName name: String,
+        fileManager: FileManager = .default
+    ) -> URL? {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              trimmed.utf8.count <= 128,
+              !trimmed.contains("/"),
+              !trimmed.contains(":") else {
+            return nil
+        }
+        let fileName = trimmed.lowercased().hasSuffix(".app") ? trimmed : trimmed + ".app"
+        let roots = [
+            URL(fileURLWithPath: "/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/Applications/Utilities", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications", isDirectory: true),
+            URL(fileURLWithPath: "/System/Applications/Utilities", isDirectory: true),
+            fileManager.homeDirectoryForCurrentUser.appendingPathComponent("Applications", isDirectory: true),
+        ]
+        return roots.lazy
+            .map { $0.appendingPathComponent(fileName, isDirectory: true) }
+            .first { fileManager.fileExists(atPath: $0.path) }
+    }
+}
+
 /// App-wide preview settings, persisted in UserDefaults under the preview's own
 /// suite so they never touch any Electron profile.
 @MainActor
@@ -763,24 +907,76 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(openAIModel, forKey: Keys.openAIModel) }
     }
 
-    /// Application name for "Open in External Editor" (⇧⌘O), e.g.
-    /// "Visual Studio Code" / "Cursor" / "Zed". Empty = the system default
-    /// app for the file's type.
+    /// Resolved application identity for "Open in External Editor" (⇧⌘O).
+    /// Empty means the system default; new choices persist a bundle identifier
+    /// (or an application path only when the bundle has no identifier). Legacy
+    /// names remain readable, but never become an unchecked `open -a` argument.
     @Published var externalEditorApp: String {
         didSet { persist(externalEditorApp, forKey: Keys.externalEditorApp) }
     }
 
-    /// Open a file (or directory) in the chosen external editor.
-    func openInExternalEditor(_ url: URL) {
-        let app = externalEditorApp.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !app.isEmpty else {
-            NSWorkspace.shared.open(url)
-            return
+    var externalEditorResolution: ExternalEditorResolution {
+        ExternalEditorResolver.resolve(externalEditorApp)
+    }
+
+    @discardableResult
+    func selectExternalEditor(at applicationURL: URL) -> Bool {
+        guard let application = ExternalEditorApplication(url: applicationURL) else { return false }
+        externalEditorApp = ExternalEditorResolver.storedValue(for: application)
+        return true
+    }
+
+    func useSystemDefaultExternalEditor() {
+        externalEditorApp = ""
+    }
+
+    /// Open a file (or directory) only through a currently resolved choice.
+    /// Invalid legacy text is rejected instead of being passed to a subprocess.
+    @discardableResult
+    func openInExternalEditor(_ url: URL) -> Bool {
+        switch externalEditorResolution {
+        case .systemDefault:
+            return NSWorkspace.shared.open(url)
+        case .application(let application):
+            NSWorkspace.shared.open(
+                [url],
+                withApplicationAt: application.url,
+                configuration: NSWorkspace.OpenConfiguration(),
+                completionHandler: nil
+            )
+            return true
+        case .unresolved:
+            return false
         }
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
-        process.arguments = ["-a", app, url.path]
-        try? process.run()
+    }
+
+    static let externalEditorTestFileName = "Kaisola External Editor Test.txt"
+
+    static func writeExternalEditorTestDocument(
+        in temporaryDirectory: URL = FileManager.default.temporaryDirectory,
+        fileManager: FileManager = .default
+    ) throws -> URL {
+        let directory = temporaryDirectory.appendingPathComponent(
+            "Kaisola External Editor Test",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent(externalEditorTestFileName, isDirectory: false)
+        try Data(
+            "This safe test file contains no project or account data.\n".utf8
+        ).write(to: url, options: .atomic)
+        return url
+    }
+
+    /// Exercise the configured route with a benign generated file, never an
+    /// active project file or a user's draft.
+    @discardableResult
+    func testExternalEditor() -> Bool {
+        guard externalEditorResolution.isAvailable,
+              let url = try? Self.writeExternalEditorTestDocument() else {
+            return false
+        }
+        return openInExternalEditor(url)
     }
 
     /// Environment overlay for agent processes from the account settings.

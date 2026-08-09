@@ -66,7 +66,12 @@ function startBroker({ rejectionProbe = false } = {}) {
   return { root, config, child, stderr: () => stderr }
 }
 
-async function connectClient(config, access = 'controller') {
+async function connectClient(
+  config,
+  access = 'administrator',
+  requestedFeatures,
+  expectAccepted = true,
+) {
   await waitFor(() => fs.existsSync(config.socketPath), 'broker socket')
   const socket = net.createConnection(config.socketPath)
   socket.setEncoding('utf8')
@@ -89,6 +94,8 @@ async function connectClient(config, access = 'controller') {
     socket.once('error', reject)
   })
   const next = async (predicate) => waitFor(() => frames.find(predicate), 'broker frame')
+  const features = requestedFeatures
+    ?? (access === 'administrator' ? ['broker-administration-v1'] : [])
   socket.write(`${JSON.stringify({
     type: 'hello',
     protocol: 2,
@@ -96,9 +103,10 @@ async function connectClient(config, access = 'controller') {
     instanceId: crypto.randomUUID(),
     appVersion: 'integration-test',
     access,
+    features,
   })}\n`)
   const hello = await next((frame) => frame.type === 'hello')
-  assert.equal(hello.ok, true)
+  assert.equal(hello.ok, expectAccepted)
   let sequence = 0
   const request = async (method, params = {}) => {
     const id = `request-${++sequence}`
@@ -117,11 +125,12 @@ test('broker mutation ids replay one terminal.write outcome without duplicate in
   })
   await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
   const controller = await connectClient(fixture.config)
+  const ownerId = 'mutation-owner'
   const projectId = 'mutation-idempotency'
   const terminalId = 'idempotent-write-terminal'
   const created = await controller.request('terminal.create', {
     mutationId: crypto.randomUUID(),
-    ownerId: '0',
+    ownerId,
     projectId,
     id: terminalId,
     command: '/bin/sh',
@@ -133,7 +142,7 @@ test('broker mutation ids replay one terminal.write outcome without duplicate in
   const mutationId = crypto.randomUUID()
   const params = {
     mutationId,
-    ownerId: '0',
+    ownerId,
     projectId,
     id: terminalId,
     data: 'apply-once\n',
@@ -145,7 +154,7 @@ test('broker mutation ids replay one terminal.write outcome without duplicate in
 
   const output = await waitFor(async () => {
     const response = await controller.request('terminal.snapshot', {
-      ownerId: '0', projectId, id: terminalId,
+      ownerId, projectId, id: terminalId,
     })
     return response.result.output.includes('SEEN:apply-once') ? response.result.output : null
   }, 'one applied write')
@@ -156,8 +165,128 @@ test('broker mutation ids replay one terminal.write outcome without duplicate in
   assert.equal(reused.code, 'mutation_id_reused')
 
   await controller.request('terminal.release', {
-    mutationId: crypto.randomUUID(), ownerId: '0', projectId, id: terminalId,
+    mutationId: crypto.randomUUID(), ownerId, projectId, id: terminalId,
   })
+  controller.socket.destroy()
+})
+
+test('administration is negotiated separately from controller owner identity', async (t) => {
+  const fixture = startBroker()
+  t.after(() => {
+    try { fixture.child.kill('SIGKILL') } catch {}
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  })
+
+  const rejectedAdministrator = await connectClient(
+    fixture.config,
+    'administrator',
+    [],
+    false,
+  )
+  assert.match(rejectedAdministrator.hello.message, /authentication failed/)
+  rejectedAdministrator.socket.destroy()
+
+  const controller = await connectClient(
+    fixture.config,
+    'controller',
+    ['broker-administration-v1'],
+  )
+  assert.equal(controller.hello.access, 'controller')
+  assert.equal(controller.hello.negotiatedFeatures.includes('broker-administration-v1'), false)
+  const created = await controller.request('terminal.create', {
+    ownerId: 'ordinary-owner',
+    projectId: 'authorization-test',
+    id: 'authorization-terminal',
+    command: '/bin/cat',
+    args: [],
+    cwd: fixture.root,
+  })
+  assert.equal(created.result.ok, true)
+
+  for (const params of [
+    { ownerId: '0' },
+    { ownerId: 0 },
+    { ownerId: ' 0 ' },
+    {},
+    { ownerId: null },
+  ]) {
+    const rejected = await controller.request('terminal.list', params)
+    assert.equal(rejected.ok, false)
+    assert.match(rejected.message, /requires a nonzero owner identity/)
+  }
+  const forbiddenShutdown = await controller.request('broker.shutdown', {
+    ownerId: 'ordinary-owner',
+  })
+  assert.equal(forbiddenShutdown.ok, false)
+  assert.match(forbiddenShutdown.message, /cannot invoke broker administration/)
+
+  const ownedStatus = await controller.request('broker.status', {
+    ownerId: 'ordinary-owner',
+    projectId: 'authorization-test',
+  })
+  assert.equal(ownedStatus.ok, true)
+  assert.deepEqual(ownedStatus.result.terminals.map((row) => row.id), ['authorization-terminal'])
+
+  const peer = await connectClient(fixture.config, 'controller')
+  const peerStatus = await peer.request('broker.status', {
+    ownerId: 'ordinary-owner',
+    projectId: 'authorization-test',
+  })
+  assert.equal(peerStatus.ok, true)
+  assert.deepEqual(peerStatus.result.terminals, [])
+
+  const observer = await connectClient(fixture.config, 'observer')
+  const observed = await observer.request('broker.inventory', { ownerId: '0' })
+  assert.equal(observed.ok, true)
+  assert.ok(observed.result.live.some((row) => row.id === 'authorization-terminal'))
+
+  const administrator = await connectClient(fixture.config, 'administrator')
+  assert.equal(administrator.hello.access, 'administrator')
+  assert.ok(administrator.hello.negotiatedFeatures.includes('broker-administration-v1'))
+  const global = await administrator.request('broker.inventory', { ownerId: '0' })
+  assert.equal(global.ok, true)
+  assert.ok(global.result.live.some((row) => row.id === 'authorization-terminal'))
+
+  administrator.socket.destroy()
+  observer.socket.destroy()
+  peer.socket.destroy()
+  controller.socket.destroy()
+})
+
+test('broker.inventory returns one stable observer snapshot', async (t) => {
+  const fixture = startBroker()
+  t.after(() => {
+    try { fixture.child.kill('SIGKILL') } catch {}
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  })
+  await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
+
+  const controller = await connectClient(fixture.config)
+  const created = await controller.request('terminal.create', {
+    ownerId: '0',
+    projectId: 'atomic-inventory',
+    id: 'atomic-inventory-terminal',
+    command: '/bin/cat',
+    args: [],
+    cwd: fixture.root,
+  })
+  assert.equal(created.result.ok, true)
+
+  const observer = await connectClient(fixture.config, 'observer')
+  assert.ok(observer.hello.features.includes('broker-inventory-v1'))
+  const response = await observer.request('broker.inventory', { ownerId: '0' })
+  assert.equal(response.ok, true)
+  assert.equal(response.result.ok, true)
+  assert.equal(response.result.state, 'stable')
+  assert.equal(response.result.activityEpoch, response.result.status.activityEpoch)
+  assert.equal(response.result.status.inFlightMutations, 0)
+  for (const rows of [response.result.diagnostics, response.result.live]) {
+    assert.ok(rows.some((row) => row.id === 'atomic-inventory-terminal'))
+  }
+
+  observer.socket.destroy()
   controller.socket.destroy()
 })
 

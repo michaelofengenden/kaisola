@@ -26,6 +26,8 @@ const OBSERVER_ROLE_FEATURE = 'observer-role-v1'
 const BROKER_UPDATE_FEATURE = 'broker-update-v1'
 const BROKER_ROLLING_UPDATE_FEATURE = 'broker-rolling-update-v1'
 const BROKER_MUTATION_IDEMPOTENCY_FEATURE = 'broker-mutation-idempotency-v1'
+const BROKER_INVENTORY_FEATURE = 'broker-inventory-v1'
+const BROKER_ADMINISTRATION_FEATURE = 'broker-administration-v1'
 // terminal:exit:<id> shipped as a bare exit code, so a signal-killed session
 // arrived as an ordinary numeric exit and the cause was lost. Clients that
 // declare this feature receive the same { exitCode, signal } record the
@@ -39,17 +41,29 @@ const FEATURES = Object.freeze([
   BROKER_UPDATE_FEATURE,
   BROKER_ROLLING_UPDATE_FEATURE,
   BROKER_MUTATION_IDEMPOTENCY_FEATURE,
+  BROKER_INVENTORY_FEATURE,
+  BROKER_ADMINISTRATION_FEATURE,
   TERMINAL_EXIT_STATUS_FEATURE,
 ])
 const TERMINAL_EXIT_CHANNEL_PREFIX = 'terminal:exit:'
+const CONTROLLER_ACCESS = 'controller'
 const OBSERVER_ACCESS = 'observer'
+const ADMINISTRATOR_ACCESS = 'administrator'
 const OBSERVER_METHODS = Object.freeze([
   'broker.status',
+  'broker.inventory',
   'terminal.list',
   'terminal.diagnostics',
   'terminal.history',
   'terminal.subscribe',
   'terminal.unsubscribe',
+])
+const ADMINISTRATOR_METHODS = Object.freeze([
+  'broker.shutdown',
+  'broker.shutdownForUpdate',
+  'broker.prepareRollingUpdate',
+  'broker.cancelRollingUpdate',
+  'broker.retireDraining',
 ])
 
 // A terminal snapshot may legally carry 8 MiB of retained output in one
@@ -59,6 +73,7 @@ const OBSERVER_METHODS = Object.freeze([
 // a socket teardown + reconnect loop on the durability-critical reattach path.
 const MAX_FRAME = 56 * 1024 * 1024
 const TERMINAL_HISTORY_PAGE_BYTES = 4 * 1024 * 1024
+const BROKER_INVENTORY_RESPONSE_BYTES = 12 * 1024 * 1024
 const HELLO_FRAME_BYTES = 64 * 1024
 const DEFAULT_REQUEST_FRAME_BYTES = 64 * 1024
 const DEFAULT_RESPONSE_FRAME_BYTES = 256 * 1024
@@ -86,6 +101,8 @@ function responseFrameBytes(method) {
     case 'terminal.list':
     case 'terminal.diagnostics':
       return 4 * 1024 * 1024
+    case 'broker.inventory':
+      return BROKER_INVENTORY_RESPONSE_BYTES
     default:
       return DEFAULT_RESPONSE_FRAME_BYTES
   }
@@ -260,14 +277,44 @@ function observerMethodAllowed(method) {
   return OBSERVER_METHODS.includes(String(method || ''))
 }
 
-function brokerMethodAllowedForAccess(access, method) {
-  return access !== OBSERVER_ACCESS || observerMethodAllowed(method)
+function administratorMethod(method) {
+  return ADMINISTRATOR_METHODS.includes(String(method || ''))
 }
 
-/** A client names the event shapes it can decode in its `hello` frame. Only
- * features this broker actually implements survive, so a client can never talk
- * an older broker into emitting a shape it does not know how to build. A
- * client that names nothing keeps every legacy shape. */
+function brokerAccessSupported(access) {
+  return access === CONTROLLER_ACCESS
+    || access === OBSERVER_ACCESS
+    || access === ADMINISTRATOR_ACCESS
+}
+
+function brokerMethodAllowedForAccess(access, method) {
+  if (access === OBSERVER_ACCESS) return observerMethodAllowed(method)
+  if (access === CONTROLLER_ACCESS) return !administratorMethod(method)
+  return access === ADMINISTRATOR_ACCESS
+}
+
+function brokerAccessGrantsAdministration(access) {
+  return access === ADMINISTRATOR_ACCESS
+}
+
+function brokerAccessGrantsGlobalObservation(access) {
+  return access === OBSERVER_ACCESS || access === ADMINISTRATOR_ACCESS
+}
+
+function normalizeBrokerOwnerID(value) {
+  const id = String(value ?? '0').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80)
+  return id || '0'
+}
+
+function brokerOwnerIDAllowedForAccess(access, value) {
+  return access !== CONTROLLER_ACCESS
+    || (value != null && normalizeBrokerOwnerID(value) !== '0')
+}
+
+/** A client names optional wire capabilities in its `hello` frame. Only
+ * capabilities this broker actually implements survive; the authentication
+ * boundary applies access-specific grants after this intersection. A client
+ * that names nothing keeps every legacy event shape. */
 function negotiateFeatures(requested) {
   const negotiated = new Set()
   if (!Array.isArray(requested)) return negotiated
@@ -309,13 +356,19 @@ module.exports = {
   BROKER_UPDATE_FEATURE,
   BROKER_ROLLING_UPDATE_FEATURE,
   BROKER_MUTATION_IDEMPOTENCY_FEATURE,
+  BROKER_INVENTORY_FEATURE,
+  BROKER_ADMINISTRATION_FEATURE,
   TERMINAL_EXIT_STATUS_FEATURE,
   TERMINAL_EXIT_CHANNEL_PREFIX,
   FEATURES,
+  CONTROLLER_ACCESS,
   OBSERVER_ACCESS,
+  ADMINISTRATOR_ACCESS,
   OBSERVER_METHODS,
+  ADMINISTRATOR_METHODS,
   MAX_FRAME,
   TERMINAL_HISTORY_PAGE_BYTES,
+  BROKER_INVENTORY_RESPONSE_BYTES,
   HELLO_FRAME_BYTES,
   DEFAULT_REQUEST_FRAME_BYTES,
   DEFAULT_RESPONSE_FRAME_BYTES,
@@ -326,7 +379,13 @@ module.exports = {
   encodeBrokerFrame,
   atomicJson,
   observerMethodAllowed,
+  administratorMethod,
+  brokerAccessSupported,
   brokerMethodAllowedForAccess,
+  brokerAccessGrantsAdministration,
+  brokerAccessGrantsGlobalObservation,
+  normalizeBrokerOwnerID,
+  brokerOwnerIDAllowedForAccess,
   brokerVersionsCompatible,
   negotiateFeatures,
   eventPayloadForFeatures,

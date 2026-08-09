@@ -88,7 +88,8 @@ async function connectClient(config) {
     token: config.token,
     instanceId: crypto.randomUUID(),
     appVersion: 'exit-waits-test',
-    access: 'controller',
+    access: 'administrator',
+    features: ['broker-administration-v1'],
   })}\n`)
   const hello = await waitFor(() => frames.find((frame) => frame.type === 'hello'), 'broker hello')
   assert.equal(hello.ok, true)

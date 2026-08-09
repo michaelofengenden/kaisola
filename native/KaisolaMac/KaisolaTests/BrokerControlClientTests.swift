@@ -73,6 +73,8 @@ private func controlHello(
         "startedAt": .integer(info.startedAt),
         "version": .string(info.version),
         "features": .array([.string(BrokerWire.terminalObserveFeature)]),
+        "negotiatedFeatures": .array([]),
+        "access": .string("controller"),
     ]
     if let field, let value { object[field] = value }
     return .object(object)
@@ -232,6 +234,81 @@ final class BrokerControlClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testOrdinaryControllerRefusesTheAdministrativeOwnerIdentityBeforeConnect() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+
+        do {
+            try await client.connect(to: controlBrokerInfo, ownerID: "0")
+            XCTFail("The ordinary controller lane must never claim broker administration.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .requestFailed("controller owner id"))
+        }
+        let sentFrames = await transport.sentFrames()
+        XCTAssertEqual(sentFrames, [])
+    }
+
+    func testAdministrativeHandshakeRequestsAndVerifiesItsOwnCapability() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+
+        try await client.connectForAdministration(to: controlBrokerInfo)
+        let frames = await transport.sentFrames()
+        let hello = try XCTUnwrap(frames.first?.objectValue)
+        XCTAssertEqual(hello["access"]?.stringValue, "administrator")
+        XCTAssertEqual(
+            hello["features"]?.arrayValue?.compactMap(\.stringValue),
+            [BrokerWire.brokerAdministrationFeature]
+        )
+        await client.disconnect()
+    }
+
+    func testAdministrativeHandshakeRejectsRoleOrCapabilityDowngrade() async throws {
+        for transport in [
+            ScriptedControlBrokerTransport(
+                resizeAccepted: true,
+                helloAccessOverride: "controller"
+            ),
+            ScriptedControlBrokerTransport(
+                resizeAccepted: true,
+                grantAdministratorFeature: false
+            ),
+        ] {
+            let client = BrokerControlClient(
+                transport: transport,
+                operationTimeoutNanoseconds: 100_000_000
+            )
+            do {
+                try await client.connectForAdministration(to: primaryControlBrokerInfo)
+                XCTFail("A broker must explicitly grant the requested administrative identity.")
+            } catch {
+                XCTAssertEqual(error as? BrokerClientError, .authenticationRejected)
+            }
+            await client.disconnect()
+        }
+    }
+
+    func testOrdinaryHandshakeDoesNotRequestAdministrativeCapability() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+
+        try await client.connect(to: primaryControlBrokerInfo, ownerID: "native-test")
+        let frames = await transport.sentFrames()
+        let hello = try XCTUnwrap(frames.first?.objectValue)
+        XCTAssertEqual(hello["access"]?.stringValue, "controller")
+        XCTAssertEqual(hello["features"]?.arrayValue, [])
+        await client.disconnect()
+    }
+
     func testHandshakeRejectsEveryImmutableBrokerIdentityMismatch() async throws {
         let mismatches: [(field: String, value: JSONValue, error: BrokerClientError)] = [
             ("protocol", .integer(Int64(BrokerWire.protocolVersion + 1)), .protocolMismatch),
@@ -266,7 +343,6 @@ final class BrokerControlClientTests: XCTestCase {
             await client.disconnect()
         }
     }
-
     func testOversizedWriteIsRejectedBeforeTransportSend() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
         let client = BrokerControlClient(
@@ -1230,6 +1306,43 @@ private actor ConnectOutcomes {
     }
 }
 
+private func scriptedControlHello(
+    for request: JSONValue,
+    info: BrokerInfo = primaryControlBrokerInfo,
+    accessOverride: String? = nil,
+    grantAdministratorFeature: Bool = true
+) -> JSONValue {
+    let requestObject = request.objectValue
+    let requestedAccess = requestObject?["access"]?.stringValue ?? "controller"
+    let requestedFeatures = Set(
+        requestObject?["features"]?.arrayValue?.compactMap(\.stringValue) ?? []
+    )
+    let grantsAdministrator = grantAdministratorFeature
+        && requestedAccess == "administrator"
+        && requestedFeatures.contains(BrokerWire.brokerAdministrationFeature)
+    return .object([
+        "type": .string("hello"),
+        "ok": .bool(true),
+        "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+        "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
+        "implementationVersion": .integer(Int64(info.implementationVersion ?? 1)),
+        "packageSchema": info.packageSchema.map { .integer(Int64($0)) } ?? .null,
+        "packageVersion": info.packageVersion.map(JSONValue.string) ?? .null,
+        "contentDigest": info.contentDigest.map(JSONValue.string) ?? .null,
+        "pid": .integer(Int64(info.pid)),
+        "startedAt": .integer(info.startedAt),
+        "version": .string(info.version),
+        "features": .array([
+            .string(BrokerWire.terminalObserveFeature),
+            .string(BrokerWire.brokerAdministrationFeature),
+        ]),
+        "negotiatedFeatures": .array(
+            grantsAdministrator ? [.string(BrokerWire.brokerAdministrationFeature)] : []
+        ),
+        "access": .string(accessOverride ?? requestedAccess),
+    ])
+}
+
 /// A broker double whose socket open parks until the test opens the gate, so a
 /// second connect is guaranteed to arrive while the first handshake is still in
 /// flight. Otherwise it answers hello exactly like the scripted double.
@@ -1265,7 +1378,7 @@ private actor GatedControlBrokerTransport: BrokerByteTransport {
         let frame = try JSONDecoder().decode(JSONValue.self, from: data[..<newline])
         frames.append(frame)
         guard frame.objectValue?["type"]?.stringValue == "hello" else { return }
-        var reply = try JSONEncoder().encode(controlHello(for: primaryControlBrokerInfo))
+        var reply = try JSONEncoder().encode(scriptedControlHello(for: frame))
         reply.append(0x0A)
         deliver(reply)
     }
@@ -1310,6 +1423,8 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
     private let resizeAccepted: Bool
     private let agentTurnAccepted: Bool
     private var failFirstRequestSend: Bool
+    private let helloAccessOverride: String?
+    private let grantAdministratorFeature: Bool
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []
     private var waiter: CheckedContinuation<Data?, Never>?
@@ -1318,11 +1433,15 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
     init(
         resizeAccepted: Bool,
         agentTurnAccepted: Bool = true,
-        failFirstRequestSend: Bool = false
+        failFirstRequestSend: Bool = false,
+        helloAccessOverride: String? = nil,
+        grantAdministratorFeature: Bool = true
     ) {
         self.resizeAccepted = resizeAccepted
         self.agentTurnAccepted = agentTurnAccepted
         self.failFirstRequestSend = failFirstRequestSend
+        self.helloAccessOverride = helloAccessOverride
+        self.grantAdministratorFeature = grantAdministratorFeature
     }
 
     func connect(path: String) async throws {
@@ -1338,7 +1457,12 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
         guard let object = frame.objectValue,
               let type = object["type"]?.stringValue else { return }
         if type == "hello" {
-            deliver(try encoded(controlHello(for: connectedInfo)))
+            deliver(try encoded(scriptedControlHello(
+                for: frame,
+                info: connectedInfo,
+                accessOverride: helloAccessOverride,
+                grantAdministratorFeature: grantAdministratorFeature
+            )))
             return
         }
         if failFirstRequestSend {
@@ -1417,7 +1541,7 @@ private actor ScriptedControlResultBrokerTransport: BrokerByteTransport {
         guard let object = frame.objectValue,
               let type = object["type"]?.stringValue else { return }
         if type == "hello" {
-            deliver(try encoded(controlHello(for: primaryControlBrokerInfo)))
+            deliver(try encoded(scriptedControlHello(for: frame)))
             return
         }
         guard type == "request", let id = object["id"]?.stringValue else { return }
@@ -1525,11 +1649,18 @@ private actor TimeoutReconcilingControlBrokerTransport: BrokerByteTransport {
               let type = object["type"]?.stringValue else { return }
         if type == "hello" {
             var hello = controlHello(for: primaryControlBrokerInfo).objectValue ?? [:]
+            let requestedAccess = object["access"]?.stringValue ?? "controller"
+            let administration = BrokerWire.brokerAdministrationFeature
             hello["features"] = .array([
                 .string(BrokerWire.terminalObserveFeature),
                 .string(BrokerWire.brokerUpdateFeature),
                 .string(BrokerWire.brokerRollingUpdateFeature),
+                .string(administration),
             ] + (supportsIdempotency ? [.string(BrokerWire.brokerMutationIdempotencyFeature)] : []))
+            hello["access"] = .string(requestedAccess)
+            hello["negotiatedFeatures"] = .array(
+                requestedAccess == "administrator" ? [.string(administration)] : []
+            )
             deliver(try encoded(.object(hello)))
             return
         }

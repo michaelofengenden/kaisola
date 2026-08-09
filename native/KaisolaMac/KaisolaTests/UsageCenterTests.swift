@@ -501,6 +501,74 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertNil(closedEntry?.usage)
     }
 
+    func testUsageAccountProfileDirectoryLimitCountsUTF8BytesAndRejectsControls() {
+        let maximumBytes = 4_096
+        let atLimit = "/" + String(repeating: "a", count: maximumBytes - 1)
+        let overLimit = atLimit + "a"
+        let multibyteOverLimit = "/" + String(repeating: "é", count: maximumBytes / 2)
+
+        func profile(directory: String) -> UsageAccountProfile {
+            UsageAccountProfile(
+                id: "directory-boundary",
+                provider: .codex,
+                label: "Boundary",
+                directory: directory
+            )
+        }
+
+        XCTAssertEqual(profile(directory: atLimit).normalized?.directory, atLimit)
+        XCTAssertNil(profile(directory: overLimit).normalized)
+        XCTAssertLessThan(multibyteOverLimit.count, maximumBytes)
+        XCTAssertGreaterThan(multibyteOverLimit.utf8.count, maximumBytes)
+        XCTAssertNil(profile(directory: multibyteOverLimit).normalized)
+
+        for control in ["\0", "\t", "\n", "\u{1B}"] {
+            XCTAssertNil(profile(directory: "/tmp/account\(control)escape").normalized)
+            XCTAssertNil(profile(directory: "/tmp/account\(control)").normalized)
+        }
+    }
+
+    func testUsageAccountStoreRejectsUnsafeDirectoriesOnLoadAndAdd() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("usage-accounts.json")
+        let payload: [String: Any] = [
+            "schemaVersion": 1,
+            "profiles": [
+                [
+                    "id": "valid",
+                    "provider": "codex",
+                    "label": "Valid",
+                    "directory": "/tmp/valid-account",
+                ],
+                [
+                    "id": "control",
+                    "provider": "claude",
+                    "label": "Control",
+                    "directory": "/tmp/unsafe\u{1B}[31m",
+                ],
+            ],
+        ]
+        try JSONSerialization.data(withJSONObject: payload).write(to: fileURL)
+        let store = UsageAccountStore(fileURL: fileURL)
+
+        XCTAssertEqual(store.profiles().map(\.id), ["valid"])
+        let lastKnownGood = try Data(contentsOf: fileURL)
+        XCTAssertNil(store.add(
+            provider: .claude,
+            label: "Control",
+            directory: "/tmp/unsafe\nnext-line"
+        ))
+        XCTAssertNil(store.add(
+            provider: .claude,
+            label: "Oversized",
+            directory: "/" + String(repeating: "a", count: 4_096)
+        ))
+        XCTAssertEqual(try Data(contentsOf: fileURL), lastKnownGood)
+    }
+
     func testUsageAccountStoreRoundTripsNamedProfilesWithoutCredentialMaterial() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
@@ -686,6 +754,27 @@ final class UsageCenterTests: XCTestCase {
             label: "Unsafe",
             configDirectory: "relative/path"
         ).normalized)
+    }
+
+    func testSessionAccountBindingRejectsDirectoryByteOverflowAndControls() {
+        let multibyteOverLimit = "/" + String(repeating: "é", count: 2_048)
+        XCTAssertLessThan(multibyteOverLimit.count, 4_096)
+        XCTAssertGreaterThan(multibyteOverLimit.utf8.count, 4_096)
+        XCTAssertNil(SessionAccountBinding(
+            accountID: "oversized",
+            provider: .codex,
+            label: "Oversized",
+            configDirectory: multibyteOverLimit
+        ).normalized)
+
+        for control in ["\0", "\t", "\n", "\u{1B}"] {
+            XCTAssertNil(SessionAccountBinding(
+                accountID: "control",
+                provider: .codex,
+                label: "Control",
+                configDirectory: "/tmp/account\(control)escape"
+            ).normalized)
+        }
     }
 
     func testSessionAccountBindingPinsExistingSymlinkTarget() throws {

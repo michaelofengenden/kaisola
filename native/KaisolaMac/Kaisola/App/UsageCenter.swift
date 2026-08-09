@@ -40,10 +40,24 @@ struct UsageAccountProfile: Codable, Equatable, Identifiable, Sendable {
     var label: String
     var directory: String
 
+    /// Credential-directory pointers are persisted and later copied into a
+    /// provider subprocess environment. Keep their UTF-8 representation within
+    /// one 4 KiB field and reject terminal/NUL control bytes before storage.
+    static let maximumDirectoryBytes = 4_096
+
+    static func validatedDirectory(_ rawValue: String) -> String? {
+        guard rawValue.utf8.count <= maximumDirectoryBytes,
+              !rawValue.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else { return nil }
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+
     var normalized: UsageAccountProfile? {
         let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanDirectory = directory.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanLabel.isEmpty, !cleanDirectory.isEmpty else { return nil }
+        guard !cleanLabel.isEmpty,
+              let cleanDirectory = Self.validatedDirectory(directory) else { return nil }
         return UsageAccountProfile(
             id: id,
             provider: provider,
@@ -363,20 +377,17 @@ enum SessionModelOverride {
 
 extension SessionAccountBinding {
     fileprivate static func canonicalDirectory(_ rawValue: String) -> String? {
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              trimmed.count <= 4_096,
-              !trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
-        else { return nil }
+        guard let trimmed = UsageAccountProfile.validatedDirectory(rawValue) else { return nil }
         let expanded = (trimmed as NSString).expandingTildeInPath
         guard expanded.hasPrefix("/") else { return nil }
         // Resolve any existing symlink components now. Otherwise changing a
         // profile symlink after session creation could silently redirect an
         // existing provider continuation to different credentials.
-        return URL(fileURLWithPath: expanded, isDirectory: true)
+        let canonical = URL(fileURLWithPath: expanded, isDirectory: true)
             .standardizedFileURL
             .resolvingSymlinksInPath()
             .path
+        return UsageAccountProfile.validatedDirectory(canonical)
     }
 }
 

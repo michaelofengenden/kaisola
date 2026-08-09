@@ -1708,7 +1708,7 @@ actor AcpTranscriptStore {
     private static func isPinnedEvidence(_ row: AcpTranscriptRow) -> Bool {
         switch row {
         case .user, .tool: true
-        case .message, .thought, .plan: false
+        case .message, .thought, .plan, .permissionDecision: false
         }
     }
 

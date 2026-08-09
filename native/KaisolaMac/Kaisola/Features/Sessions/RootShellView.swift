@@ -796,7 +796,7 @@ struct RootShellView: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: NativeWorkspaceChrome.detailChromeGlyphSize, weight: .regular))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: 24, height: 20)
                 .contentShape(Rectangle())
         }
@@ -959,7 +959,7 @@ struct RootShellView: View {
                     .font(.callout)
                 Spacer(minLength: 0)
             }
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .padding(.leading, 12)
             .frame(height: QuietRailMetrics.rowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -994,7 +994,7 @@ struct RootShellView: View {
                 } label: {
                     HStack(spacing: 7) {
                         Circle()
-                            .fill(device.presence == .online ? Color.green : Color.secondary.opacity(0.45))
+                            .fill(device.presence == .online ? Color.green : Color.kaisolaTertiary)
                             .frame(width: 6, height: 6)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(device.deviceName)
@@ -1002,7 +1002,7 @@ struct RootShellView: View {
                                 .lineLimit(1)
                             Text("\(device.sessions.count) remembered \(device.sessions.count == 1 ? "session" : "sessions")")
                                 .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                         }
                     }
                 }
@@ -1019,7 +1019,7 @@ struct RootShellView: View {
                     ? "clock.arrow.circlepath"
                     : "checkmark.icloud")
                     .font(.system(size: 9.5))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .lineLimit(1)
                     .help("Remembered-session catalog freshness")
                     .accessibilityLabel("Remembered sessions, \(freshness)")
@@ -1054,7 +1054,7 @@ struct RootShellView: View {
                     .lineLimit(1)
                 Text("\(session.projectName) · \(rememberedSessionActivityTitle(session.activity))")
                     .font(.system(size: 9.5))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(1)
             }
         }
@@ -1488,6 +1488,7 @@ struct RootShellView: View {
             state: model.connectionState,
             brokerUpgradeState: model.brokerUpgradeState,
             brokerGenerationDetail: model.brokerGenerationDetail,
+            brokerUpdateGateBlockedDetail: model.brokerUpdateGateBlockedDetail,
             brokerRollbackCandidates: model.brokerRollbackCandidates,
             rollbackBrokerGeneration: { generationID in
                 Task { await model.rollbackBrokerGeneration(generationID) }
@@ -1990,7 +1991,7 @@ struct RootShellView: View {
                             .foregroundStyle(
                                 surfaceLive(id)
                                     ? KaisolaStatusTone.done.foregroundColor
-                                    : Color.secondary
+                                    : Color.kaisolaSecondary
                             )
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel(surfaceStatusLabel(id))
@@ -2027,7 +2028,7 @@ struct RootShellView: View {
                     .frame(width: 24, height: 22)
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .help(model.maximizedPaneID == id ? "Restore pane" : "Maximize pane")
             if model.sessions.contains(where: { $0.id == id }) {
                 Button {
@@ -2037,7 +2038,7 @@ struct RootShellView: View {
                         .frame(width: 24, height: 22)
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .disabled(model.terminalTranscriptContext(for: id) == nil)
                 .help("Open the full retained terminal transcript")
                 popOutTerminalButton(id)
@@ -2047,7 +2048,7 @@ struct RootShellView: View {
                     .frame(width: 24, height: 22)
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .help("Hide this session; keep it running")
         }
         .padding(.leading, 10)
@@ -2165,7 +2166,7 @@ struct RootShellView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.kaisolaSecondary)
         .help("Account: \(currentLabel) · Model: \(chat.modelOverride ?? "default") — switch either, even mid-conversation")
         .accessibilityLabel("Account and model: \(currentLabel), \(chat.modelOverride ?? "default model")")
     }
@@ -2284,7 +2285,7 @@ struct RootShellView: View {
                 .fontWeight(.semibold)
             Text(command)
                 .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             Button {
                 Task { await model.runPendingAgentResume(for: id) }
             } label: {
@@ -2317,6 +2318,10 @@ struct RootShellView: View {
         if unifiedTerminalDocument(id) != nil,
            let feed = model.terminalSurfaceFeed(for: id) {
             let owned = model.isOwned(id)
+            let authority = TerminalSurfaceAuthority(
+                isOwned: owned,
+                hasDurableOwnership: model.canClose(id)
+            )
             ZStack(alignment: .top) {
                 TerminalSurfaceFeedView(feed: feed) { liveDocument in
                     NativeTerminalSurface(
@@ -2326,7 +2331,7 @@ struct RootShellView: View {
                         scrollback: liveDocument.scrollback,
                         surfaceDelta: liveDocument.surfaceDelta,
                         workingDirectory: model.directory(for: id),
-                        isOwned: owned,
+                        authority: authority,
                         fontSize: settings.terminalFontSize,
                         fontFamily: settings.terminalFontFamily,
                         fontWeight: settings.terminalFontWeight,
@@ -2345,11 +2350,11 @@ struct RootShellView: View {
                         onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) }
                     )
                 }
-                // A reconnect can promote an observed surface to an owned one
-                // after inventory is already visible. The concrete AppKit class is
-                // part of the input-safety boundary: remount so a formerly
-                // ReadOnlyTerminalView can never keep swallowing owned keystrokes.
-                .id("unified-\(id)-\(owned)")
+                // Live controller ownership may flap while the control socket
+                // reconnects. Keep the exact parsed view for durable local
+                // sessions and revoke its input capability in place; only a
+                // genuine observer/controller class change may remount.
+                .id("unified-\(id)-\(authority.controllerCapable)")
                 .onAppear { fulfillTerminalKeyboardFocusRequest(for: id) }
                 .onChange(of: model.keyboardFocusRequest) { _, _ in
                     fulfillTerminalKeyboardFocusRequest(for: id)
@@ -2400,7 +2405,7 @@ struct RootShellView: View {
                         .disabled(model.terminalTranscriptContext(for: id) == nil)
                 }
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .background(.regularMaterial, in: Capsule())
@@ -2411,10 +2416,32 @@ struct RootShellView: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Session ended")
                 .accessibilityHint("Open the retained terminal transcript to review its output")
+            } else if model.isTerminalInputDegraded(id) {
+                let recovering = model.isTerminalInputRecovering(id)
+                HStack(spacing: 8) {
+                    Label("Input paused", systemImage: "exclamationmark.triangle.fill")
+                    Button(recovering ? "Checking…" : "Resume input") {
+                        Task { await model.recoverTerminalInput(id) }
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(recovering)
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.kaisolaSecondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.regularMaterial, in: Capsule())
+                .overlay {
+                    Capsule().stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+                }
+                .padding(10)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Input paused for \(surfaceTitle(id))")
+                .accessibilityHint("The last write could not be confirmed. Other terminals remain connected. Resume input revalidates only this terminal.")
             } else if case let .reconnecting(attempt) = model.connectionState {
                 Label("Reconnecting…", systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
                     .background(.regularMaterial, in: Capsule())
@@ -2537,7 +2564,7 @@ struct RootShellView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.kaisolaSecondary)
         .help("Open this session in a new window")
     }
 }
@@ -4268,7 +4295,7 @@ private struct SessionStrip: View {
                 if sessions.isEmpty, chats.isEmpty, meshes.isEmpty, recentlyClosed.isEmpty {
                     Text("No activity in this project")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .padding(.horizontal, 8)
                 }
                 ForEach(chats) { chat in
@@ -4287,7 +4314,7 @@ private struct SessionStrip: View {
                                ) {
                                 Text(cost)
                                     .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                             }
                         }
                         .font(.callout)
@@ -4319,7 +4346,7 @@ private struct SessionStrip: View {
                             if mesh.stage != "Idle" {
                                 Text(mesh.stage)
                                     .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                             }
                         }
                         .font(.callout)
@@ -4387,7 +4414,7 @@ private struct SessionStrip: View {
                             Circle()
                                 .fill(visible || working
                                       ? WorkspacePalette.terminal
-                                      : Color.secondary.opacity(0.45))
+                                      : Color.kaisolaTertiary)
                                 .frame(width: 6, height: 6)
                             Text(model.sessionTitle(for: session)).lineLimit(1)
                         }
@@ -4666,6 +4693,11 @@ private struct ConnectionFooter: View {
     let state: AppModel.ConnectionState
     let brokerUpgradeState: BrokerUpgradeState
     let brokerGenerationDetail: String
+    /// Non-nil while the app is holding terminal-continuity updates back
+    /// because a live terminal's agent activity never reached the broker. The
+    /// toast that announced it is long gone by the time anyone wonders why
+    /// updates stopped, so the reason lives here too.
+    var brokerUpdateGateBlockedDetail: String?
     let brokerRollbackCandidates: [BrokerRollbackCandidate]
     let rollbackBrokerGeneration: (String) -> Void
     let reload: () -> Void
@@ -4730,7 +4762,7 @@ private struct ConnectionFooter: View {
         Button(action: showSettings) {
             Image(systemName: "gearshape")
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
                 .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
         }
@@ -4855,7 +4887,7 @@ private struct ConnectionFooter: View {
         } label: {
             Image(systemName: "ellipsis")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
                 .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
         }
@@ -4917,6 +4949,9 @@ private struct ConnectionFooter: View {
                 EmptyView()
             } else {
                 Text(brokerUpgradeState.detail)
+            }
+            if let brokerUpdateGateBlockedDetail {
+                Text(brokerUpdateGateBlockedDetail)
             }
             if usage.totalPeakTokens > 0 {
                 Text("Usage: \(usage.totalPeakTokens / 1000)k tokens · \(Int((usage.contextPressure * 100).rounded()))% context")
@@ -5043,7 +5078,7 @@ private struct ConnectionFooter: View {
                         if attentionContext != nil {
                             Text(section.title)
                                 .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .textCase(.uppercase)
                                 .padding(.horizontal, 12)
                                 .padding(.top, 8)
@@ -5056,7 +5091,7 @@ private struct ConnectionFooter: View {
                     if sections.isEmpty {
                         Text("Nothing needs you in this filter.")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .padding(12)
                     }
                 }
@@ -5077,7 +5112,7 @@ private struct ConnectionFooter: View {
         return Button(label) { inboxFilter = kinds }
             .buttonStyle(.borderless)
             .font(.caption2.weight(selected ? .semibold : .regular))
-            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+            .foregroundStyle(selected ? Color.accentColor : Color.kaisolaSecondary)
             .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
@@ -5102,7 +5137,7 @@ private struct ConnectionFooter: View {
                     attention.clear(targetID: row.entry.targetID)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
                 .buttonStyle(.plain)
                 .help("This session is gone; clear the entry")
@@ -5119,7 +5154,7 @@ private struct ConnectionFooter: View {
             )
             VStack(alignment: .leading, spacing: 1) {
                 Text(row.entry.title).font(.callout).lineLimit(1)
-                Text(row.entry.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(row.entry.detail).font(.caption).foregroundStyle(.kaisolaSecondary).lineLimit(1)
             }
             Spacer()
         }

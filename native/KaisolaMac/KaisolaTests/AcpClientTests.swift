@@ -990,7 +990,7 @@ final class AcpClientTests: XCTestCase {
             await transport.permissionError(for: rawWireID) != nil
         }
         let rawError = await transport.permissionError(for: rawWireID)
-        XCTAssertEqual(Self.permissionErrorReason(rawError), "complexity")
+        XCTAssertEqual(Self.permissionErrorReason(rawError), "incomplete_review_context")
 
         let pathsToolCallID = "retained-paths"
         let inheritedPaths = (0 ... AcpPermissionPayloadLimits.maximumPathCount).map {
@@ -1013,10 +1013,221 @@ final class AcpClientTests: XCTestCase {
             await transport.permissionError(for: pathsWireID) != nil
         }
         let pathsError = await transport.permissionError(for: pathsWireID)
-        XCTAssertEqual(Self.permissionErrorReason(pathsError), "path_count")
+        XCTAssertEqual(Self.permissionErrorReason(pathsError), "incomplete_review_context")
         XCTAssertTrue(events.permissionRequests.isEmpty)
         let retained = await client.retainedPermissionOptionSetCount
         XCTAssertEqual(retained, 0)
+        let retainedContextBytes = await client.retainedToolCallReviewContextBytes
+        XCTAssertLessThanOrEqual(
+            retainedContextBytes,
+            AcpToolCallReviewContextLimits.production.maximumAggregateBytes
+        )
+    }
+
+    func testToolReviewContextUsesExactUTF8AndAggregateByteBoundaries() {
+        let limits = AcpToolCallReviewContextLimits(
+            maximumContextBytes: 128,
+            maximumAggregateBytes: 256,
+            maximumCount: 8
+        )
+        let exactRawInput = String(repeating: "é", count: 39)
+        XCTAssertEqual(exactRawInput.utf8.count, 78)
+        var store = AcpToolCallReviewContextStore(limits: limits)
+
+        store.record(id: "context1", update: ["rawInput": .string(exactRawInput)])
+        XCTAssertEqual(store.retainedBytes, 128)
+        XCTAssertEqual(store.lookup(id: "context1").context?.rawInput, .string(exactRawInput))
+        XCTAssertTrue(store.lookup(id: "context1").unavailableFields.isEmpty)
+
+        store.record(id: "context2", update: ["rawInput": .string(exactRawInput)])
+        XCTAssertEqual(store.retainedBytes, 256)
+        XCTAssertEqual(store.count, 2)
+
+        // A field one UTF-8 byte over the exact per-context boundary is
+        // discarded and explicitly made unavailable rather than partially
+        // retained or allowed to exceed the ceiling.
+        var overBoundaryStore = AcpToolCallReviewContextStore(limits: limits)
+        overBoundaryStore.record(
+            id: "boundary",
+            update: ["rawInput": .string(exactRawInput + "x")]
+        )
+        let overBoundary = overBoundaryStore.lookup(id: "boundary")
+        XCTAssertNil(overBoundary.context?.rawInput)
+        XCTAssertEqual(overBoundary.unavailableFields, [.rawInput])
+        XCTAssertLessThanOrEqual(overBoundaryStore.retainedBytes, limits.maximumContextBytes)
+
+        // Touch context1 so aggregate eviction is deterministic LRU, then add
+        // one more exact-sized entry. The untouched oldest context is removed.
+        store.record(id: "context1", update: ["status": .string("pending")])
+        store.record(id: "context3", update: ["rawInput": .string(exactRawInput)])
+        XCTAssertEqual(store.count, 2)
+        XCTAssertEqual(store.retainedBytes, 256)
+        XCTAssertNotNil(store.lookup(id: "context1").context)
+        XCTAssertNotNil(store.lookup(id: "context3").context)
+        let evicted = store.lookup(id: "context2")
+        XCTAssertNil(evicted.context)
+        XCTAssertEqual(evicted.unavailableFields, Set(AcpToolCallReviewField.allCases))
+        XCTAssertTrue(store.hasEvictedContext)
+
+        let partialValidation = AcpClient.validatePermissionRequestPayload(
+            Self.permissionParams(),
+            priorContext: evicted.context,
+            unavailablePriorFields: evicted.unavailableFields
+        )
+        XCTAssertEqual(partialValidation.rejection, .incompleteReviewContext)
+
+        let selfContainedValidation = AcpClient.validatePermissionRequestPayload(
+            Self.permissionParams(rawInput: .null, locations: [], diffPaths: []),
+            priorContext: evicted.context,
+            unavailablePriorFields: evicted.unavailableFields
+        )
+        XCTAssertNil(selfContainedValidation.rejection)
+
+        store.removeAll(keepingCapacity: true)
+        XCTAssertEqual(store.count, 0)
+        XCTAssertEqual(store.retainedBytes, 0)
+        XCTAssertFalse(store.hasEvictedContext)
+    }
+
+    func testEveryOversizedReviewFieldIsUnavailableUntilExplicitlyReplaced() {
+        var store = AcpToolCallReviewContextStore()
+        store.record(id: "hostile-context", update: [
+            "title": .string(String(
+                repeating: "t",
+                count: AcpPermissionPayloadLimits.maximumTitleBytes + 1
+            )),
+            "kind": .string(String(
+                repeating: "k",
+                count: AcpPermissionPayloadLimits.maximumKindBytes + 1
+            )),
+            "rawInput": .array(Array(
+                repeating: .null,
+                count: AcpPermissionPayloadLimits.maximumRawInputNodes
+            )),
+            "locations": .array((0 ... AcpPermissionPayloadLimits.maximumPathCount).map {
+                .object(["path": .string("Sources/Hostile\($0).swift")])
+            }),
+            "content": .array([.object([
+                "type": .string("diff"),
+                "path": .string(String(
+                    repeating: "p",
+                    count: AcpPermissionPayloadLimits.maximumPathBytes + 1
+                )),
+            ])]),
+        ])
+
+        let redacted = store.lookup(id: "hostile-context")
+        XCTAssertEqual(redacted.unavailableFields, Set(AcpToolCallReviewField.allCases))
+        XCTAssertNil(redacted.context?.title)
+        XCTAssertNil(redacted.context?.kind)
+        XCTAssertNil(redacted.context?.rawInput)
+        XCTAssertEqual(redacted.context?.locationPaths, [])
+        XCTAssertEqual(redacted.context?.diffPaths, [])
+        XCTAssertLessThanOrEqual(
+            store.retainedBytes,
+            AcpToolCallReviewContextLimits.production.maximumContextBytes
+        )
+
+        store.record(id: "hostile-context", update: [
+            "title": .string("Review safe replacement"),
+            "kind": .string("edit"),
+            "rawInput": .object(["operation": .string("replace")]),
+            "locations": .array([.object(["path": .string("Sources/App.swift")])]),
+            "content": .array([.object([
+                "type": .string("diff"),
+                "path": .string("Tests/AppTests.swift"),
+            ])]),
+        ])
+        let replaced = store.lookup(id: "hostile-context")
+        XCTAssertTrue(replaced.unavailableFields.isEmpty)
+        XCTAssertEqual(replaced.context?.title, "Review safe replacement")
+        XCTAssertEqual(replaced.context?.kind, "edit")
+        XCTAssertEqual(replaced.context?.locationPaths, ["Sources/App.swift"])
+        XCTAssertEqual(replaced.context?.diffPaths, ["Tests/AppTests.swift"])
+    }
+
+    func testEvictedToolReviewContextFailsClosedButSelfContainedAskStillWorks() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(
+            transport: transport,
+            toolCallReviewContextLimits: AcpToolCallReviewContextLimits(
+                maximumContextBytes: 128,
+                maximumAggregateBytes: 256,
+                maximumCount: 8
+            )
+        )
+        let events = EventCollector()
+        await client.setEventHandler { events.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        let exactRawInput = String(repeating: "é", count: 39)
+        for id in ["context1", "context2"] {
+            await transport.emitSessionUpdate(.object([
+                "sessionUpdate": .string("tool_call"),
+                "toolCallId": .string(id),
+                "rawInput": .string(exactRawInput),
+            ]))
+        }
+        await transport.emitSessionUpdate(.object([
+            "sessionUpdate": .string("tool_call_update"),
+            "toolCallId": .string("context1"),
+            "status": .string("pending"),
+        ]))
+        await transport.emitSessionUpdate(.object([
+            "sessionUpdate": .string("tool_call"),
+            "toolCallId": .string("context3"),
+            "rawInput": .string(exactRawInput),
+        ]))
+        try await Self.until("the oldest review context was evicted") {
+            await client.hasEvictedToolCallReviewContext
+        }
+        let retainedBytes = await client.retainedToolCallReviewContextBytes
+        let retainedCount = await client.retainedToolCallReviewContextCount
+        XCTAssertEqual(retainedBytes, 256)
+        XCTAssertEqual(retainedCount, 2)
+
+        let partialWireID: Int64 = 48_247
+        await transport.emitPermission(wireID: partialWireID, params: .object([
+            "sessionId": .string("sess-1"),
+            "toolCall": .object(["toolCallId": .string("context2")]),
+            "options": .array([.object(["optionId": .string("allow")])]),
+        ]))
+        try await Self.until("the partial ask depending on evicted evidence was rejected") {
+            await transport.permissionError(for: partialWireID) != nil
+        }
+        let partialError = await transport.permissionError(for: partialWireID)
+        XCTAssertEqual(Self.permissionErrorReason(partialError), "incomplete_review_context")
+        XCTAssertEqual(
+            partialError?.objectValue?["data"]?.objectValue?["summary"],
+            .string("Permission request depends on review details that are no longer available.")
+        )
+        XCTAssertTrue(events.permissionRequests.isEmpty)
+
+        let completeWireID: Int64 = 48_248
+        await transport.emitPermission(wireID: completeWireID, params: .object([
+            "sessionId": .string("sess-1"),
+            "toolCall": .object([
+                "toolCallId": .string("context2"),
+                "title": .string("Self-contained action"),
+                "kind": .string("execute"),
+                "rawInput": .null,
+                "locations": .array([]),
+                "content": .array([]),
+            ]),
+            "options": .array([.object(["optionId": .string("allow")])]),
+        ]))
+        try await Self.until("the self-contained ask surfaced") {
+            events.permissionRequests.count == 1
+        }
+        let request = try XCTUnwrap(events.permissionRequests.first)
+        XCTAssertEqual(request.title, "Self-contained action")
+        await client.resolvePermission(id: request.id, optionID: "allow")
+        try await Self.until("the self-contained ask resolved") {
+            await transport.permissionResponseCount(for: completeWireID) == 1
+        }
     }
 
     func testMalformedPermissionPayloadsNeverEmitCardsOrRetainMetadata() async throws {

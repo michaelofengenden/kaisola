@@ -80,6 +80,7 @@ enum AcpPermissionPayloadRejection: String, Equatable, Sendable {
     case optionKindBytes = "option_kind_bytes"
     case pathCount = "path_count"
     case pathBytes = "path_bytes"
+    case incompleteReviewContext = "incomplete_review_context"
 
     var safeSummary: String {
         switch self {
@@ -97,6 +98,8 @@ enum AcpPermissionPayloadRejection: String, Equatable, Sendable {
         case .optionKindBytes: "Permission option kind exceeds its byte limit."
         case .pathCount: "Permission request has too many distinct paths."
         case .pathBytes: "Permission path exceeds its byte limit."
+        case .incompleteReviewContext:
+            "Permission request depends on review details that are no longer available."
         }
     }
 }
@@ -187,6 +190,340 @@ private struct AcpJSONBudgetScanner {
     }
 }
 
+/// Review fields that can be inherited from an earlier tool-call update. If a
+/// field could not be retained inside the cache budget, a later partial
+/// permission request must replace it explicitly instead of silently asking a
+/// human to decide from incomplete evidence.
+enum AcpToolCallReviewField: CaseIterable, Hashable, Sendable {
+    case title
+    case kind
+    case rawInput
+    case locationPaths
+    case diffPaths
+}
+
+struct AcpToolCallReviewContextLimits: Equatable, Sendable {
+    static let production = AcpToolCallReviewContextLimits(
+        maximumContextBytes: 128 * 1_024,
+        maximumAggregateBytes: 2 * 1_024 * 1_024,
+        maximumCount: 512
+    )
+
+    let maximumContextBytes: Int
+    let maximumAggregateBytes: Int
+    let maximumCount: Int
+
+    init(maximumContextBytes: Int, maximumAggregateBytes: Int, maximumCount: Int) {
+        precondition(maximumContextBytes > 0)
+        precondition(maximumAggregateBytes > 0)
+        precondition(maximumCount > 0)
+        self.maximumContextBytes = maximumContextBytes
+        self.maximumAggregateBytes = maximumAggregateBytes
+        self.maximumCount = maximumCount
+    }
+}
+
+struct AcpToolCallReviewContextLookup: Equatable, Sendable {
+    let context: AcpToolCallReviewContext?
+    let unavailableFields: Set<AcpToolCallReviewField>
+}
+
+/// A payload-byte-bounded, least-recently-updated cache. The byte accounting
+/// covers tool-call identifiers plus every retained UTF-8/JSON field. Aggregate
+/// eviction records a bounded gap bit: an unknown partial ask after any gap is
+/// therefore rejected instead of being mistaken for a context-free request.
+struct AcpToolCallReviewContextStore: Sendable {
+    private struct Entry: Sendable {
+        var context: AcpToolCallReviewContext
+        var unavailableFields: Set<AcpToolCallReviewField>
+        var bytes: Int
+    }
+
+    let limits: AcpToolCallReviewContextLimits
+    private var entries: [String: Entry] = [:]
+    private var order: [String] = []
+    private(set) var retainedBytes = 0
+    private(set) var hasEvictedContext = false
+
+    init(limits: AcpToolCallReviewContextLimits = .production) {
+        self.limits = limits
+    }
+
+    var count: Int { entries.count }
+
+    mutating func record(id: String, update: [String: JSONValue]) {
+        // A permission carrying a larger id is rejected by the request boundary,
+        // so retaining such a session/update key could only waste memory.
+        guard !id.isEmpty,
+              id.utf8.count <= AcpPermissionPayloadLimits.maximumToolCallIDBytes else {
+            return
+        }
+
+        let prior = entries[id]
+        var context = AcpClient.mergeToolCallReviewContext(prior?.context, update: update)
+        var unavailableFields = prior?.unavailableFields
+            ?? (hasEvictedContext ? Set(AcpToolCallReviewField.allCases) : [])
+        updateAvailability(
+            update,
+            context: &context,
+            unavailableFields: &unavailableFields
+        )
+        trimToPerContextLimit(
+            id: id,
+            context: &context,
+            unavailableFields: &unavailableFields
+        )
+        let bytes = Self.byteCount(
+            id: id,
+            context: context,
+            unavailableFields: unavailableFields,
+            maximumBytes: limits.maximumContextBytes
+        )
+
+        if let prior { retainedBytes -= prior.bytes }
+        order.removeAll(where: { $0 == id })
+        guard bytes <= limits.maximumContextBytes else {
+            entries.removeValue(forKey: id)
+            hasEvictedContext = true
+            return
+        }
+        entries[id] = Entry(
+            context: context,
+            unavailableFields: unavailableFields,
+            bytes: bytes
+        )
+        retainedBytes += bytes
+        order.append(id)
+        trimAggregate()
+    }
+
+    func lookup(id: String) -> AcpToolCallReviewContextLookup {
+        if let entry = entries[id] {
+            return AcpToolCallReviewContextLookup(
+                context: entry.context,
+                unavailableFields: entry.unavailableFields
+            )
+        }
+        return AcpToolCallReviewContextLookup(
+            context: nil,
+            unavailableFields: hasEvictedContext
+                ? Set(AcpToolCallReviewField.allCases)
+                : []
+        )
+    }
+
+    mutating func removeAll(keepingCapacity: Bool = false) {
+        entries.removeAll(keepingCapacity: keepingCapacity)
+        order.removeAll(keepingCapacity: keepingCapacity)
+        retainedBytes = 0
+        hasEvictedContext = false
+    }
+
+    private mutating func updateAvailability(
+        _ update: [String: JSONValue],
+        context: inout AcpToolCallReviewContext,
+        unavailableFields: inout Set<AcpToolCallReviewField>
+    ) {
+        if let value = update["title"] {
+            if value == .null || value.stringValue != nil {
+                unavailableFields.remove(.title)
+            } else {
+                context.title = nil
+                unavailableFields.insert(.title)
+            }
+        }
+        if let value = update["kind"] {
+            if value == .null || value.stringValue != nil {
+                unavailableFields.remove(.kind)
+            } else {
+                context.kind = nil
+                unavailableFields.insert(.kind)
+            }
+        }
+        if update["rawInput"] != nil {
+            unavailableFields.remove(.rawInput)
+        }
+        if let value = update["locations"] {
+            if Self.locationsAreWellFormed(value) {
+                unavailableFields.remove(.locationPaths)
+            } else {
+                context.locationPaths = []
+                unavailableFields.insert(.locationPaths)
+            }
+        }
+        if let value = update["content"] {
+            if Self.contentIsWellFormed(value) {
+                unavailableFields.remove(.diffPaths)
+            } else {
+                context.diffPaths = []
+                unavailableFields.insert(.diffPaths)
+            }
+        }
+
+        if let title = context.title,
+           title.utf8.count > AcpPermissionPayloadLimits.maximumTitleBytes {
+            context.title = nil
+            unavailableFields.insert(.title)
+        }
+        if let kind = context.kind,
+           kind.utf8.count > AcpPermissionPayloadLimits.maximumKindBytes {
+            context.kind = nil
+            unavailableFields.insert(.kind)
+        }
+        if let rawInput = context.rawInput {
+            var scanner = AcpJSONBudgetScanner(
+                maximumBytes: limits.maximumContextBytes,
+                maximumNodes: AcpPermissionPayloadLimits.maximumRawInputNodes,
+                maximumDepth: AcpPermissionPayloadLimits.maximumNestingDepth
+            )
+            if scanner.scan(rawInput) != nil {
+                context.rawInput = nil
+                unavailableFields.insert(.rawInput)
+            }
+        }
+        context.locationPaths = boundedPaths(
+            context.locationPaths,
+            field: .locationPaths,
+            unavailableFields: &unavailableFields
+        )
+        context.diffPaths = boundedPaths(
+            context.diffPaths,
+            field: .diffPaths,
+            unavailableFields: &unavailableFields
+        )
+    }
+
+    private func boundedPaths(
+        _ paths: [String],
+        field: AcpToolCallReviewField,
+        unavailableFields: inout Set<AcpToolCallReviewField>
+    ) -> [String] {
+        var result: [String] = []
+        var seen = Set<String>()
+        for path in paths {
+            guard !path.isEmpty,
+                  path.utf8.count <= AcpPermissionPayloadLimits.maximumPathBytes else {
+                unavailableFields.insert(field)
+                return []
+            }
+            if seen.insert(path).inserted { result.append(path) }
+            guard result.count <= AcpPermissionPayloadLimits.maximumPathCount else {
+                unavailableFields.insert(field)
+                return []
+            }
+        }
+        return result
+    }
+
+    private func trimToPerContextLimit(
+        id: String,
+        context: inout AcpToolCallReviewContext,
+        unavailableFields: inout Set<AcpToolCallReviewField>
+    ) {
+        // Prefer the compact rule/path evidence over arbitrary raw input. Any
+        // removed field is explicitly marked unavailable, making inheritance
+        // fail closed rather than turning truncation into silent approval.
+        let discardOrder: [AcpToolCallReviewField] = [
+            .rawInput, .title, .diffPaths, .locationPaths, .kind,
+        ]
+        while Self.byteCount(
+            id: id,
+            context: context,
+            unavailableFields: unavailableFields,
+            maximumBytes: limits.maximumContextBytes
+        ) > limits.maximumContextBytes {
+            guard let field = discardOrder.first(where: {
+                fieldHasRetainedValue($0, context: context)
+            }) else {
+                break
+            }
+            discard(field, context: &context)
+            unavailableFields.insert(field)
+        }
+    }
+
+    private func fieldHasRetainedValue(
+        _ field: AcpToolCallReviewField,
+        context: AcpToolCallReviewContext
+    ) -> Bool {
+        switch field {
+        case .title: context.title != nil
+        case .kind: context.kind != nil
+        case .rawInput: context.rawInput != nil
+        case .locationPaths: !context.locationPaths.isEmpty
+        case .diffPaths: !context.diffPaths.isEmpty
+        }
+    }
+
+    private func discard(
+        _ field: AcpToolCallReviewField,
+        context: inout AcpToolCallReviewContext
+    ) {
+        switch field {
+        case .title: context.title = nil
+        case .kind: context.kind = nil
+        case .rawInput: context.rawInput = nil
+        case .locationPaths: context.locationPaths = []
+        case .diffPaths: context.diffPaths = []
+        }
+    }
+
+    private mutating func trimAggregate() {
+        while entries.count > limits.maximumCount
+            || retainedBytes > limits.maximumAggregateBytes {
+            guard let oldestID = order.first else { break }
+            order.removeFirst()
+            if let removed = entries.removeValue(forKey: oldestID) {
+                retainedBytes -= removed.bytes
+                hasEvictedContext = true
+            }
+        }
+    }
+
+    private static func byteCount(
+        id: String,
+        context: AcpToolCallReviewContext,
+        unavailableFields: Set<AcpToolCallReviewField>,
+        maximumBytes: Int
+    ) -> Int {
+        // Fixed tags/separators make this a conservative serialized-payload
+        // budget rather than pretending Swift collection overhead is exact.
+        var total = 32 + id.utf8.count + unavailableFields.count
+        total += context.title.map { 8 + $0.utf8.count } ?? 0
+        total += context.kind.map { 8 + $0.utf8.count } ?? 0
+        total += context.locationPaths.reduce(0) { $0 + 8 + $1.utf8.count }
+        total += context.diffPaths.reduce(0) { $0 + 8 + $1.utf8.count }
+        if let rawInput = context.rawInput {
+            var scanner = AcpJSONBudgetScanner(
+                maximumBytes: maximumBytes,
+                maximumNodes: AcpPermissionPayloadLimits.maximumRawInputNodes,
+                maximumDepth: AcpPermissionPayloadLimits.maximumNestingDepth
+            )
+            if scanner.scan(rawInput) == nil {
+                total += 8 + scanner.bytes
+            } else {
+                return maximumBytes + 1
+            }
+        }
+        return total
+    }
+
+    private static func locationsAreWellFormed(_ value: JSONValue) -> Bool {
+        guard let locations = value.arrayValue else { return false }
+        return locations.allSatisfy { $0.objectValue?["path"]?.stringValue != nil }
+    }
+
+    private static func contentIsWellFormed(_ value: JSONValue) -> Bool {
+        guard let content = value.arrayValue else { return false }
+        return content.allSatisfy { item in
+            guard let object = item.objectValue else { return false }
+            guard let type = object["type"] else { return true }
+            guard let typeName = type.stringValue else { return false }
+            return typeName != "diff" || object["path"]?.stringValue != nil
+        }
+    }
+}
+
 /// A native ACP client: spawns the adapter, runs the JSON-RPC handshake
 /// (initialize → session/new), sends prompts, and streams the agent's
 /// `session/update` notifications plus permission callbacks. Newline-delimited
@@ -229,9 +566,7 @@ actor AcpClient {
     /// Permission requests are partial ToolCallUpdates. Retain a bounded set of
     /// prior review fields so a later ask can disclose paths/raw input already
     /// streamed for the same tool-call id.
-    private var toolCallReviewContexts: [String: AcpToolCallReviewContext] = [:]
-    private var toolCallReviewOrder: [String] = []
-    private static let maxToolCallReviewContexts = 512
+    private var toolCallReviewContextStore: AcpToolCallReviewContextStore
     /// Host for agent-requested terminals (`terminal/create` …).
     private let terminalHost = AcpTerminalHost()
     /// The session workspace; fs/terminal callbacks are confined inside it.
@@ -242,8 +577,14 @@ actor AcpClient {
     /// Mirrors Electron's MAX_TEXT_FILE_BYTES ACP fs limit.
     static let maxTextFileBytes = 8 * 1024 * 1024
 
-    init(transport: any AcpByteTransport = AcpProcessTransport()) {
+    init(
+        transport: any AcpByteTransport = AcpProcessTransport(),
+        toolCallReviewContextLimits: AcpToolCallReviewContextLimits = .production
+    ) {
         self.transport = transport
+        toolCallReviewContextStore = AcpToolCallReviewContextStore(
+            limits: toolCallReviewContextLimits
+        )
     }
 
     func setEventHandler(_ handler: EventHandler?) {
@@ -273,8 +614,7 @@ actor AcpClient {
         decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
         sessionID = nil
         cancelPermissionRequests()
-        toolCallReviewContexts.removeAll(keepingCapacity: true)
-        toolCallReviewOrder.removeAll(keepingCapacity: true)
+        toolCallReviewContextStore.removeAll(keepingCapacity: true)
         workspaceRoot = (cwd as NSString).standardizingPath
         do {
             try await transport.start(command: command, arguments: arguments, environment: environment, cwd: cwd)
@@ -573,8 +913,7 @@ actor AcpClient {
         sessionID = nil
         workspaceRoot = nil
         capabilities = AcpAgentCapabilities()
-        toolCallReviewContexts.removeAll(keepingCapacity: true)
-        toolCallReviewOrder.removeAll(keepingCapacity: true)
+        toolCallReviewContextStore.removeAll(keepingCapacity: true)
     }
 
     private func cancelPermissionRequests() {
@@ -1002,8 +1341,13 @@ actor AcpClient {
             respondPermissionRequestError(id: id, rejection: .toolCallIDBytes)
             return
         }
-        let priorContext = toolCallID.flatMap { toolCallReviewContexts[$0] }
-        let validation = Self.validatePermissionRequestPayload(params, priorContext: priorContext)
+        let priorLookup = toolCallID.map { toolCallReviewContextStore.lookup(id: $0) }
+        let priorContext = priorLookup?.context
+        let validation = Self.validatePermissionRequestPayload(
+            params,
+            priorContext: priorContext,
+            unavailablePriorFields: priorLookup?.unavailableFields ?? []
+        )
         if let rejection = validation.rejection {
             respondPermissionRequestError(id: id, rejection: rejection)
             return
@@ -1072,7 +1416,8 @@ actor AcpClient {
 
     static func validatePermissionRequestPayload(
         _ value: JSONValue?,
-        priorContext: AcpToolCallReviewContext? = nil
+        priorContext: AcpToolCallReviewContext? = nil,
+        unavailablePriorFields: Set<AcpToolCallReviewField> = []
     ) -> AcpPermissionPayloadValidation {
         var inspectedNodes = 0
         func rejected(
@@ -1093,6 +1438,19 @@ actor AcpClient {
             toolCall = object
         } else {
             toolCall = nil
+        }
+
+        let inheritedFields = Set(AcpToolCallReviewField.allCases.filter { field in
+            switch field {
+            case .title: toolCall?["title"] == nil
+            case .kind: toolCall?["kind"] == nil
+            case .rawInput: toolCall?["rawInput"] == nil
+            case .locationPaths: toolCall?["locations"] == nil
+            case .diffPaths: toolCall?["content"] == nil
+            }
+        })
+        guard inheritedFields.isDisjoint(with: unavailablePriorFields) else {
+            return rejected(.incompleteReviewContext)
         }
 
         let inheritsTitle = toolCall?["title"] == nil
@@ -1308,6 +1666,10 @@ actor AcpClient {
     /// this boundary. It must describe active asks only, never request history.
     var retainedPermissionOptionSetCount: Int { activePermissionRequests.count }
 
+    var retainedToolCallReviewContextCount: Int { toolCallReviewContextStore.count }
+    var retainedToolCallReviewContextBytes: Int { toolCallReviewContextStore.retainedBytes }
+    var hasEvictedToolCallReviewContext: Bool { toolCallReviewContextStore.hasEvictedContext }
+
     /// Decode the complete permission review payload, including ACP v1's
     /// arbitrary `rawInput`. Kept pure for wire-contract tests.
     ///
@@ -1368,20 +1730,7 @@ actor AcpClient {
 
     private func recordToolCallReviewContext(_ update: [String: JSONValue]) {
         guard let id = update["toolCallId"]?.stringValue else { return }
-        let isNew = toolCallReviewContexts[id] == nil
-        toolCallReviewContexts[id] = Self.mergeToolCallReviewContext(
-            toolCallReviewContexts[id],
-            update: update
-        )
-        if isNew {
-            toolCallReviewOrder.append(id)
-            if toolCallReviewOrder.count > Self.maxToolCallReviewContexts {
-                let overflow = toolCallReviewOrder.count - Self.maxToolCallReviewContexts
-                let expired = toolCallReviewOrder.prefix(overflow)
-                for expiredID in expired { toolCallReviewContexts.removeValue(forKey: expiredID) }
-                toolCallReviewOrder.removeFirst(overflow)
-            }
-        }
+        toolCallReviewContextStore.record(id: id, update: update)
     }
 
     /// Merge ACP's replace-when-present ToolCallUpdate semantics. Pure so the

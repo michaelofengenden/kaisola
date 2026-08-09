@@ -69,6 +69,128 @@ final class AccountSignInControllerTests: XCTestCase {
         )
         XCTAssertEqual(message, "Sign-in did not complete (exit code 130).")
     }
+
+    // MARK: - Finding the CLI
+    //
+    // Discovery runs someone's interactive shell startup, which is unbounded
+    // work: a `.zshrc` that waits on a prompt never returns. These pin the
+    // bound, because the lookup used to run synchronously on the main actor and
+    // took the whole Settings window down with the shell.
+
+    /// A shell that ignores the question and sits there, standing in for a
+    /// startup file blocked on input. `exec` so the sleeping process is the one
+    /// the probe holds a pid for, and a finite sleep so a broken terminate
+    /// fails the test instead of wedging the runner.
+    private func hangingShell(seconds: Int) throws -> String {
+        try fakeShell(named: "hanging", body: "exec sleep \(seconds)\n")
+    }
+
+    private func fakeShell(named name: String, body: String) throws -> String {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-\(name)-shell-\(UUID().uuidString).sh")
+        try ("#!/bin/sh\n" + body).write(to: url, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755], ofItemAtPath: url.path
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: url) }
+        return url.path
+    }
+
+    /// The one the issue is about: a shell that never exits must come back as a
+    /// timeout, in about the time it was given rather than never.
+    func testAShellThatNeverAnswersTimesOutRatherThanHanging() async throws {
+        let shellPath = try hangingShell(seconds: 15)
+        let started = Date()
+        let lookup = await AccountSignInController.resolveExecutable(
+            "claude", shell: shellPath, timeout: 0.5
+        )
+        let elapsed = Date().timeIntervalSince(started)
+        XCTAssertEqual(lookup, .timedOut)
+        XCTAssertLessThan(elapsed, 5, "the watchdog did not stop the shell: \(elapsed)s")
+    }
+
+    /// Dismissing the sheet has to take the shell with it, rather than leaving
+    /// a zsh alive until a deadline it was never going to reach. The wait is an
+    /// expectation rather than `await task.value` so a lookup that ignores
+    /// cancellation fails the test instead of wedging the runner.
+    func testCancellingStopsTheShellInsteadOfServingOutTheTimeout() async throws {
+        let shellPath = try hangingShell(seconds: 30)
+        let returned = expectation(description: "the lookup came back")
+        let box = LookupBox()
+        let lookup = Task.detached {
+            box.value = await AccountSignInController.resolveExecutable(
+                "claude", shell: shellPath, timeout: 60
+            )
+            returned.fulfill()
+        }
+        try await Task.sleep(nanoseconds: 250_000_000)
+        let cancelled = Date()
+        lookup.cancel()
+        await fulfillment(of: [returned], timeout: 5)
+        XCTAssertEqual(box.value, .cancelled)
+        let elapsed = Date().timeIntervalSince(cancelled)
+        XCTAssertLessThan(elapsed, 5, "cancelling did not stop the shell: \(elapsed)s")
+    }
+
+    /// A shell that answers still answers. The noise line is the reason the
+    /// parser takes the last absolute path rather than the first.
+    func testAShellThatAnswersYieldsThePathItPrinted() async throws {
+        let shellPath = try fakeShell(
+            named: "answering",
+            body: "echo 'nvm: using node 22'\necho /opt/kaisola-test/bin/claude\n"
+        )
+        let lookup = await AccountSignInController.resolveExecutable("claude", shell: shellPath)
+        XCTAssertEqual(lookup, .found("/opt/kaisola-test/bin/claude"))
+    }
+
+    func testAShellThatFindsNothingIsMissingRatherThanTimedOut() async throws {
+        let shellPath = try fakeShell(named: "empty", body: "exit 1\n")
+        let lookup = await AccountSignInController.resolveExecutable("claude", shell: shellPath)
+        XCTAssertEqual(lookup, .missing)
+    }
+
+    func testAShellThatCannotBeRunSaysSoRatherThanBlamingTheCLI() async {
+        let lookup = await AccountSignInController.resolveExecutable(
+            "claude", shell: "/nonexistent/kaisola/shell"
+        )
+        guard case .couldNotStart = lookup else {
+            return XCTFail("expected a start failure, got \(lookup)")
+        }
+    }
+
+    /// The diagnosis is the point of separating the outcomes: a timeout must
+    /// send someone to their shell startup, not to a CLI they already have.
+    func testTheTimeoutMessageBlamesTheShellAndSaysHowLongItWaited() throws {
+        let message = try XCTUnwrap(AccountSignInController.lookupFailureMessage(
+            tool: "claude", lookup: .timedOut, timeout: 12
+        ))
+        XCTAssertTrue(message.contains("12 seconds"), message)
+        XCTAssertTrue(message.lowercased().contains("shell"), message)
+        XCTAssertTrue(message.contains("command -v claude"), message)
+
+        let missing = try XCTUnwrap(AccountSignInController.lookupFailureMessage(
+            tool: "codex", lookup: .missing
+        ))
+        XCTAssertNotEqual(missing, message)
+        XCTAssertTrue(missing.contains("codex"), missing)
+    }
+
+    /// Nothing to report when there is nothing wrong, and nothing to report to
+    /// a sheet the user already closed.
+    func testThereIsNoMessageForASuccessfulOrAbandonedLookup() {
+        XCTAssertNil(AccountSignInController.lookupFailureMessage(
+            tool: "claude", lookup: .found("/usr/local/bin/claude")
+        ))
+        XCTAssertNil(AccountSignInController.lookupFailureMessage(
+            tool: "claude", lookup: .cancelled
+        ))
+    }
+}
+
+/// Carries one lookup out of a detached task. The expectation it is paired with
+/// orders the write before the read.
+private final class LookupBox: @unchecked Sendable {
+    var value: AccountSignInController.ExecutableLookup?
 }
 
 /// A reset time is said the way its horizon is useful: a countdown when you

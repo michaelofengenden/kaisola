@@ -124,6 +124,36 @@ final class AccountSignInControllerTests: XCTestCase {
         XCTAssertNil(AccountSignInController.signInURL(in: "Opening browser to sign in…"))
     }
 
+    func testIncrementalUTF8DecoderPreservesEveryScalarAcrossEveryByteBoundary() throws {
+        let expected = """
+        Opening browser to sign in… café 研究 🙂
+        Visit https://example.com/oauth?state=été&emoji=✅
+        Paste code here if prompted >
+        OAuth error: accès refusé
+        """
+        let bytes = Data(expected.utf8)
+
+        for split in 0 ... bytes.count {
+            var decoder = AccountSignInUTF8Decoder()
+            var decoded = decoder.decode(Data(bytes[..<split]))
+            decoded += decoder.decode(Data(bytes[split...]))
+            decoded += decoder.finish()
+
+            XCTAssertEqual(decoded, expected, "UTF-8 split at byte \(split)")
+            XCTAssertEqual(
+                try XCTUnwrap(AccountSignInController.signInURL(in: decoded)).absoluteString,
+                "https://example.com/oauth?state=%C3%A9t%C3%A9&emoji=%E2%9C%85"
+            )
+            XCTAssertTrue(AccountSignInController.promptsForCode(decoded))
+        }
+
+        var bytewiseDecoder = AccountSignInUTF8Decoder()
+        let bytewise = bytes.reduce(into: "") { output, byte in
+            output += bytewiseDecoder.decode(Data([byte]))
+        } + bytewiseDecoder.finish()
+        XCTAssertEqual(bytewise, expected)
+    }
+
     /// The code field unlocks on this and nothing else. Codex runs a local
     /// callback and never prints it, which is why the field must stay locked
     /// rather than inviting a paste that would go nowhere.

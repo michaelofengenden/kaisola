@@ -2,6 +2,75 @@ import AppKit
 import Darwin
 import Foundation
 
+/// Preserves an incomplete UTF-8 scalar between pipe reads.
+///
+/// `FileHandle.read(upToCount:)` is free to split a scalar at any byte. Invalid
+/// input is still surfaced with Unicode's replacement character instead of
+/// being silently discarded; only a valid, incomplete suffix is retained.
+struct AccountSignInUTF8Decoder {
+    private var pending = [UInt8]()
+
+    mutating func decode(_ data: Data) -> String {
+        var bytes = pending
+        bytes.append(contentsOf: data)
+
+        let pendingCount = Self.incompleteTrailingSequenceLength(in: bytes)
+        let decodedEnd = bytes.count - pendingCount
+        pending = pendingCount == 0 ? [] : Array(bytes[decodedEnd...])
+        return String(decoding: bytes[..<decodedEnd], as: UTF8.self)
+    }
+
+    mutating func finish() -> String {
+        defer { pending.removeAll(keepingCapacity: false) }
+        return String(decoding: pending, as: UTF8.self)
+    }
+
+    private static func incompleteTrailingSequenceLength(in bytes: [UInt8]) -> Int {
+        guard !bytes.isEmpty else { return 0 }
+
+        var leadIndex = bytes.count - 1
+        let earliestPossibleLead = max(0, bytes.count - 4)
+        while leadIndex > earliestPossibleLead, isContinuation(bytes[leadIndex]) {
+            leadIndex -= 1
+        }
+
+        let lead = bytes[leadIndex]
+        let expectedLength: Int
+        switch lead {
+        case 0xC2 ... 0xDF: expectedLength = 2
+        case 0xE0 ... 0xEF: expectedLength = 3
+        case 0xF0 ... 0xF4: expectedLength = 4
+        default: return 0
+        }
+
+        let availableLength = bytes.count - leadIndex
+        guard availableLength < expectedLength,
+              bytes[(leadIndex + 1)...].allSatisfy(isContinuation) else {
+            return 0
+        }
+
+        // Reject partial prefixes that can never become a valid scalar. If
+        // retained, those bytes could incorrectly absorb a continuation byte
+        // from the next read instead of being surfaced as invalid input now.
+        if availableLength >= 2 {
+            let second = bytes[leadIndex + 1]
+            switch lead {
+            case 0xE0 where second < 0xA0: return 0
+            case 0xED where second > 0x9F: return 0
+            case 0xF0 where second < 0x90: return 0
+            case 0xF4 where second > 0x8F: return 0
+            default: break
+            }
+        }
+
+        return availableLength
+    }
+
+    private static func isContinuation(_ byte: UInt8) -> Bool {
+        byte & 0xC0 == 0x80
+    }
+}
+
 /// Runs a provider's own login command from inside Settings, rather than
 /// spawning a terminal in whichever project happened to be in front.
 ///
@@ -471,9 +540,15 @@ final class AccountSignInController: ObservableObject {
         // descriptor.
         let handle = output.fileHandleForReading
         readQueue.async { [weak self] in
+            var decoder = AccountSignInUTF8Decoder()
             while let chunk = try? handle.read(upToCount: 8_192), !chunk.isEmpty {
-                guard let text = String(data: chunk, encoding: .utf8) else { continue }
+                let text = decoder.decode(chunk)
+                guard !text.isEmpty else { continue }
                 Task { @MainActor [weak self] in self?.absorb(text) }
+            }
+            let trailingText = decoder.finish()
+            if !trailingText.isEmpty {
+                Task { @MainActor [weak self] in self?.absorb(trailingText) }
             }
             // EOF means the child closed its output; waiting now yields the
             // real status rather than racing it.

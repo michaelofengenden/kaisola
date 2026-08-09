@@ -327,4 +327,138 @@ final class TerminalTranscriptTests: XCTestCase {
             TerminalTranscriptSanitizer.incrementalPageText(output: "newest page", isLastLoadedPage: true)
         )
     }
+
+    // MARK: - Search preparation failures
+
+    private func searchRequest(
+        query: String,
+        generation: Int = 1,
+        dark: Bool = false
+    ) -> TerminalTranscriptSearchWorker.Request {
+        TerminalTranscriptSearchWorker.Request(query: query, generation: generation, dark: dark)
+    }
+
+    private func searchPages() -> [TerminalTranscriptSearchWorker.Page] {
+        [
+            TerminalTranscriptSearchWorker.Page(id: 1, text: "build started\nNEEDLE in page one"),
+            TerminalTranscriptSearchWorker.Page(id: 2, text: "NEEDLE again\nbuild finished"),
+        ]
+    }
+
+    /// A worker error used to be swallowed, leaving the status bar on
+    /// "Searching…" with no error and nothing to press. It has to land on an
+    /// unavailable state that offers Retry.
+    func testSearchWorkerErrorEndsTheSearchingLabelAndOffersRetry() async {
+        var state = TerminalTranscriptSearchState()
+        let request = searchRequest(query: "NEEDLE")
+        XCTAssertEqual(state.status(for: request), .searching)
+
+        state.willPrepare()
+        let outcome = await TerminalTranscriptSearchState.outcome(debounce: nil) {
+            throw TranscriptSearchFailure()
+        }
+        state.apply(outcome, for: request)
+
+        XCTAssertEqual(outcome, .failed)
+        XCTAssertEqual(state.status(for: request), .unavailable)
+        XCTAssertEqual(state.status(for: request).label, "Search unavailable")
+        XCTAssertTrue(state.status(for: request).needsRetry)
+    }
+
+    /// The transcript itself is plain selectable text with no highlights, so a
+    /// failed preparation must leave every page rendering through that same
+    /// fallback rather than blanking or holding stale highlights.
+    func testFailedSearchPreparationKeepsThePlainTranscriptRendering() async throws {
+        var state = TerminalTranscriptSearchState()
+        let worker = TerminalTranscriptSearchWorker()
+        let good = searchRequest(query: "NEEDLE")
+        let prepared = try await worker.prepare(searchPages(), request: good)
+        state.apply(.prepared(prepared), for: good)
+        XCTAssertNotNil(state.highlighted(pageID: 1, for: good))
+
+        let broken = searchRequest(query: "build", generation: 2)
+        state.willPrepare()
+        state.apply(
+            await TerminalTranscriptSearchState.outcome(debounce: nil) {
+                throw TranscriptSearchFailure()
+            },
+            for: broken
+        )
+
+        XCTAssertEqual(state.status(for: broken), .unavailable)
+        XCTAssertNil(state.highlighted(pageID: 1, for: broken))
+        XCTAssertNil(state.highlighted(pageID: 2, for: broken))
+    }
+
+    /// Every keystroke cancels the in-flight preparation. Cancellation is not
+    /// a failure: reporting it as one would flash "Search unavailable" while
+    /// the user is still typing.
+    func testSupersededSearchPreparationIsNotReportedAsAFailure() async {
+        var state = TerminalTranscriptSearchState()
+        let request = searchRequest(query: "NEE")
+
+        let task = Task { @MainActor in
+            await TerminalTranscriptSearchState.outcome(debounce: .seconds(30)) {
+                XCTFail("a cancelled debounce must never reach the worker")
+                throw TranscriptSearchFailure()
+            }
+        }
+        task.cancel()
+        let outcome = await task.value
+        state.apply(outcome, for: request)
+
+        XCTAssertEqual(outcome, .superseded)
+        XCTAssertEqual(state.status(for: request), .searching)
+    }
+
+    /// The failure belongs to the request that produced it. Typing on, or
+    /// paging in older history, starts new work and must not inherit it.
+    func testFailureClearsOnQueryAndGenerationChange() async {
+        var state = TerminalTranscriptSearchState()
+        let failed = searchRequest(query: "NEEDLE", generation: 3)
+        state.willPrepare()
+        state.apply(.failed, for: failed)
+        XCTAssertEqual(state.status(for: failed), .unavailable)
+
+        // Typing another character.
+        state.willPrepare()
+        XCTAssertEqual(state.status(for: searchRequest(query: "NEEDLES", generation: 3)), .searching)
+
+        state.apply(.failed, for: failed)
+        XCTAssertEqual(state.status(for: failed), .unavailable)
+
+        // A newly prepended page bumps the rendered generation.
+        state.willPrepare()
+        XCTAssertEqual(state.status(for: searchRequest(query: "NEEDLE", generation: 4)), .searching)
+    }
+
+    /// Retry has to re-run a preparation whose request is identical to the one
+    /// that failed, so it must produce a different `.task(id:)` identity and
+    /// then be able to settle on a real match count.
+    func testRetryStartsAFreshAttemptAndCanRecover() async throws {
+        var state = TerminalTranscriptSearchState()
+        let request = searchRequest(query: "NEEDLE")
+        let failedAttempt = state.attemptID(for: request)
+        state.willPrepare()
+        state.apply(.failed, for: request)
+        XCTAssertEqual(state.status(for: request), .unavailable)
+
+        state.retry()
+        XCTAssertNotEqual(state.attemptID(for: request), failedAttempt)
+        XCTAssertEqual(state.status(for: request), .searching)
+
+        state.willPrepare()
+        let outcome = await TerminalTranscriptSearchState.outcome(debounce: nil) {
+            let worker = TerminalTranscriptSearchWorker()
+            return try await worker.prepare(searchPages(), request: request)
+        }
+        state.apply(outcome, for: request)
+
+        XCTAssertEqual(state.status(for: request), .matches(2))
+        XCTAssertEqual(state.status(for: request).label, "2 matches")
+        XCTAssertNotNil(state.highlighted(pageID: 1, for: request))
+    }
 }
+
+/// Stands in for whatever the search worker can throw that is not cancellation.
+private struct TranscriptSearchFailure: Error {}

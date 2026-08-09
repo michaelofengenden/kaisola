@@ -19,7 +19,7 @@ struct TerminalTranscriptView: View {
     @State private var renderedPages: [Int64: String] = [:]
     @State private var renderedGeneration = 0
     @State private var searchWorker = TerminalTranscriptSearchWorker()
-    @State private var preparedSearch: TerminalTranscriptSearchWorker.Prepared?
+    @State private var searchState = TerminalTranscriptSearchState()
     @State private var isLoading = false
     @State private var didPositionAtBottom = false
     @State private var errorMessage: String?
@@ -60,7 +60,8 @@ struct TerminalTranscriptView: View {
                 .task { await loadInitial(using: proxy) }
             }
         }
-        .task(id: searchRequest) {
+        .task(id: searchState.attemptID(for: searchRequest)) {
+            searchState.willPrepare()
             await prepareSearch(for: searchRequest)
         }
         .frame(minWidth: 620, idealWidth: 820, minHeight: 440, idealHeight: 660)
@@ -136,7 +137,9 @@ struct TerminalTranscriptView: View {
     }
 
     private var statusBar: some View {
-        HStack(spacing: 7) {
+        let searchRequest = self.searchRequest
+        let searchStatus = searchState.status(for: searchRequest)
+        return HStack(spacing: 7) {
             Image(systemName: "lock.open.display")
                 .foregroundStyle(.secondary)
                 .accessibilityHidden(true)
@@ -148,9 +151,19 @@ struct TerminalTranscriptView: View {
             }
             if !pages.isEmpty {
                 if searchRequest.hasQuery {
-                    Text(searchStatus(for: searchRequest))
+                    Text(searchStatus.label)
                         .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(
+                            searchStatus.needsRetry
+                                ? KaisolaStatusTone.needsYou.foregroundColor
+                                : Color.secondary
+                        )
+                    if searchStatus.needsRetry {
+                        Button("Retry") { searchState.retry() }
+                            .buttonStyle(.link)
+                            .help("Search the loaded transcript again")
+                            .accessibilityLabel("Retry transcript search")
+                    }
                 }
                 Text(ByteCountFormatter.string(
                     fromByteCount: Int64(pages.reduce(0) { $0 + $1.output.utf8.count }),
@@ -218,18 +231,10 @@ struct TerminalTranscriptView: View {
         for page: TerminalHistoryPage,
         request: TerminalTranscriptSearchWorker.Request
     ) -> Text {
-        if preparedSearch?.request == request,
-           let highlighted = preparedSearch?.pages[page.id] {
+        if let highlighted = searchState.highlighted(pageID: page.id, for: request) {
             return Text(highlighted)
         }
         return Text(renderedPages[page.id] ?? "")
-    }
-
-    private func searchStatus(for request: TerminalTranscriptSearchWorker.Request) -> String {
-        guard preparedSearch?.request == request, let count = preparedSearch?.matchCount else {
-            return "Searching…"
-        }
-        return "\(count) matches"
     }
 
     @ViewBuilder
@@ -422,27 +427,23 @@ struct TerminalTranscriptView: View {
 
     @MainActor
     private func prepareSearch(for request: TerminalTranscriptSearchWorker.Request) async {
-        do {
-            if request.hasQuery {
-                // Avoid queueing a full retained-history scan for every
-                // intermediate keystroke. SwiftUI cancels this task whenever
-                // the query, appearance, or rendered page generation changes.
-                try await Task.sleep(for: .milliseconds(120))
-            }
+        // The debounce avoids queueing a full retained-history scan for every
+        // intermediate keystroke. SwiftUI cancels this task whenever the query,
+        // appearance, rendered page generation, or retry attempt changes.
+        let outcome = await TerminalTranscriptSearchState.outcome(
+            debounce: request.hasQuery ? .milliseconds(120) : nil
+        ) {
             let snapshot = pages.compactMap { page -> TerminalTranscriptSearchWorker.Page? in
                 guard let text = renderedPages[page.id] else { return nil }
                 return TerminalTranscriptSearchWorker.Page(id: page.id, text: text)
             }
-            let prepared = try await searchWorker.prepare(snapshot, request: request)
-            try Task.checkCancellation()
-            guard request == searchRequest else { return }
-            preparedSearch = prepared
-        } catch is CancellationError {
-            // A new query/generation supersedes this preparation normally.
-        } catch {
-            // Search is an enhancement over the selectable plain transcript.
-            // Keep that transcript available if preparation ever fails.
+            return try await searchWorker.prepare(snapshot, request: request)
         }
+        guard request == searchRequest else { return }
+        // Search is an enhancement over the selectable plain transcript, which
+        // stays rendered either way; a failure says so and offers Retry rather
+        // than leaving the status bar claiming to still be searching.
+        searchState.apply(outcome, for: request)
     }
 
     private func transcriptErrorDescription(_ error: any Error) -> String {
@@ -637,7 +638,7 @@ actor TerminalTranscriptSearchWorker {
         var hasQuery: Bool { !query.isEmpty }
     }
 
-    struct Prepared: Sendable {
+    struct Prepared: Sendable, Equatable {
         let request: Request
         let pages: [Int64: AttributedString]
         let matchCount: Int
@@ -668,6 +669,117 @@ actor TerminalTranscriptSearchWorker {
         cached = prepared
         preparationCount += 1
         return prepared
+    }
+}
+
+/// What the transcript's find field is currently able to say. Preparation
+/// failures used to be swallowed, so a worker that threw left the status bar
+/// on "Searching…" forever: no error, no retry, and no way to tell a slow
+/// scan from a dead one. Holding the outcome here, outside the view, keeps
+/// those transitions directly testable.
+struct TerminalTranscriptSearchState {
+    enum Status: Equatable {
+        case searching
+        case matches(Int)
+        case unavailable
+
+        var label: String {
+            switch self {
+            case .searching: "Searching…"
+            case let .matches(count): "\(count) matches"
+            case .unavailable: "Search unavailable"
+            }
+        }
+
+        var needsRetry: Bool { self == .unavailable }
+    }
+
+    /// The result of one preparation pass. Cancellation is not a failure:
+    /// SwiftUI cancels the in-flight task on every keystroke, so treating it
+    /// as one would flash "Search unavailable" while the user types.
+    enum Outcome: Equatable {
+        case prepared(TerminalTranscriptSearchWorker.Prepared)
+        case superseded
+        case failed
+    }
+
+    /// Identity for `.task(id:)`. Retry has to re-run a preparation whose
+    /// request is byte-for-byte the one that just failed, so the attempt
+    /// counter is what makes the second run a different task.
+    struct Attempt: Equatable {
+        let request: TerminalTranscriptSearchWorker.Request
+        let attempt: Int
+    }
+
+    private(set) var prepared: TerminalTranscriptSearchWorker.Prepared?
+    private(set) var failedRequest: TerminalTranscriptSearchWorker.Request?
+    private(set) var attempt = 0
+
+    func attemptID(for request: TerminalTranscriptSearchWorker.Request) -> Attempt {
+        Attempt(request: request, attempt: attempt)
+    }
+
+    func status(for request: TerminalTranscriptSearchWorker.Request) -> Status {
+        if failedRequest == request { return .unavailable }
+        if let prepared, prepared.request == request { return .matches(prepared.matchCount) }
+        return .searching
+    }
+
+    /// Highlights for one page, or nil when this request has nothing prepared.
+    /// Nil is the ordinary case while searching and after a failure; the view
+    /// falls back to the same selectable plain text it renders with no query.
+    func highlighted(
+        pageID: Int64,
+        for request: TerminalTranscriptSearchWorker.Request
+    ) -> AttributedString? {
+        guard let prepared, prepared.request == request else { return nil }
+        return prepared.pages[pageID]
+    }
+
+    /// A new query, generation, appearance, or Retry starts fresh work, so the
+    /// previous failure stops being the truth about the field.
+    mutating func willPrepare() {
+        failedRequest = nil
+    }
+
+    mutating func retry() {
+        failedRequest = nil
+        attempt &+= 1
+    }
+
+    mutating func apply(
+        _ outcome: Outcome,
+        for request: TerminalTranscriptSearchWorker.Request
+    ) {
+        switch outcome {
+        case let .prepared(prepared):
+            self.prepared = prepared
+            failedRequest = nil
+        case .superseded:
+            break
+        case .failed:
+            failedRequest = request
+        }
+    }
+
+    /// Run one preparation and classify how it ended. The caller supplies the
+    /// work so the page snapshot is taken after the debounce rather than
+    /// before it.
+    @MainActor
+    static func outcome(
+        debounce: Duration?,
+        running prepare: () async throws -> TerminalTranscriptSearchWorker.Prepared
+    ) async -> Outcome {
+        do {
+            if let debounce { try await Task.sleep(for: debounce) }
+            let prepared = try await prepare()
+            try Task.checkCancellation()
+            return .prepared(prepared)
+        } catch is CancellationError {
+            return .superseded
+        } catch {
+            return .failed
+        }
     }
 }
 

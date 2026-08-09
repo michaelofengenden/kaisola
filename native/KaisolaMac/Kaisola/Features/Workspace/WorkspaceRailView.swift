@@ -1,6 +1,84 @@
 import AppKit
 import SwiftUI
 
+/// One source of truth for what a file-tree row says and does through either
+/// Full Keyboard Access or VoiceOver. The visible indentation and glyphs are
+/// presentation only; role, hierarchy, disclosure, and selection live here.
+struct WorkspaceFileTreeRowAccessibility: Equatable, Sendable {
+    enum Activation: Equatable, Sendable {
+        case openFile
+        case expandFolder
+        case collapseFolder
+    }
+
+    let label: String
+    let value: String
+    let hint: String
+    let activation: Activation
+    let disclosureActionLabel: String?
+    let isSelected: Bool
+
+    init(
+        name: String,
+        isDirectory: Bool,
+        depth: Int,
+        isExpanded: Bool,
+        isSelected: Bool
+    ) {
+        let level = max(0, depth) + 1
+        self.label = name
+        self.isSelected = isSelected
+        if isDirectory {
+            let expansion = isExpanded ? "expanded" : "collapsed"
+            self.value = "Folder, level \(level), \(expansion), \(isSelected ? "selected" : "not selected")"
+            self.hint = isExpanded
+                ? "Activate to collapse this folder"
+                : "Activate to expand this folder"
+            self.activation = isExpanded ? .collapseFolder : .expandFolder
+            self.disclosureActionLabel = isExpanded ? "Collapse" : "Expand"
+        } else {
+            self.value = "File, level \(level), \(isSelected ? "selected" : "not selected")"
+            self.hint = "Activate to open this file"
+            self.activation = .openFile
+            self.disclosureActionLabel = nil
+        }
+    }
+
+    /// A focused Button and VoiceOver's default Activate gesture take the same
+    /// route; this name makes the keyboard contract explicit in tests.
+    var keyboardActivation: Activation { activation }
+
+    /// Folders additionally advertise a named Expand/Collapse action. Files
+    /// use the Button's ordinary Activate action and expose no fake disclosure.
+    var voiceOverDisclosureAction: Activation? {
+        disclosureActionLabel == nil ? nil : activation
+    }
+}
+
+private struct WorkspaceFileTreeAccessibilityModifier: ViewModifier {
+    let descriptor: WorkspaceFileTreeRowAccessibility
+    let performDisclosure: () -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        let described = content
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(descriptor.label)
+            .accessibilityValue(descriptor.value)
+            .accessibilityHint(descriptor.hint)
+            .accessibilityAddTraits(
+                descriptor.isSelected ? [.isButton, .isSelected] : .isButton
+            )
+        if let actionLabel = descriptor.disclosureActionLabel {
+            described.accessibilityAction(named: Text(actionLabel)) {
+                performDisclosure()
+            }
+        } else {
+            described
+        }
+    }
+}
+
 /// The workspace rail: a lazy file tree for the active project (⌘B). Clicking a
 /// file opens it in the preview pane.
 struct WorkspaceRailView: View {
@@ -746,6 +824,25 @@ struct WorkspaceRailView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .modifier(WorkspaceFileTreeAccessibilityModifier(
+            descriptor: WorkspaceFileTreeRowAccessibility(
+                name: node.name,
+                isDirectory: node.isDirectory,
+                depth: depth,
+                isExpanded: expanded.contains(node.id),
+                isSelected: !node.isDirectory
+                    && selectedFile?.standardizedFileURL.path == node.url.standardizedFileURL.path
+            ),
+            performDisclosure: {
+                guard node.isDirectory else { return }
+                if expanded.contains(node.id) {
+                    expanded.remove(node.id)
+                } else {
+                    expanded.insert(node.id)
+                    tree.load(node.url)
+                }
+            }
+        ))
         .accessibilityLabel(node.name)
         .id(node.id)
         .simultaneousGesture(

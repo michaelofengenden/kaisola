@@ -3502,6 +3502,77 @@ final class WorkspaceFilesTests: XCTestCase {
         )
     }
 
+    func testFileTreeAccessibilityNamesRoleDepthExpansionAndSelection() {
+        let collapsedFolder = WorkspaceFileTreeRowAccessibility(
+            name: "Sources",
+            isDirectory: true,
+            depth: 0,
+            isExpanded: false,
+            isSelected: false
+        )
+        XCTAssertEqual(collapsedFolder.label, "Sources")
+        XCTAssertEqual(collapsedFolder.value, "Folder, level 1, collapsed, not selected")
+        XCTAssertEqual(collapsedFolder.hint, "Activate to expand this folder")
+        XCTAssertEqual(collapsedFolder.activation, .expandFolder)
+        XCTAssertEqual(collapsedFolder.disclosureActionLabel, "Expand")
+
+        let expandedFolder = WorkspaceFileTreeRowAccessibility(
+            name: "Features",
+            isDirectory: true,
+            depth: 1,
+            isExpanded: true,
+            isSelected: false
+        )
+        XCTAssertEqual(expandedFolder.value, "Folder, level 2, expanded, not selected")
+        XCTAssertEqual(expandedFolder.hint, "Activate to collapse this folder")
+        XCTAssertEqual(expandedFolder.activation, .collapseFolder)
+        XCTAssertEqual(expandedFolder.disclosureActionLabel, "Collapse")
+
+        let selectedFile = WorkspaceFileTreeRowAccessibility(
+            name: "Editor.swift",
+            isDirectory: false,
+            depth: 2,
+            isExpanded: false,
+            isSelected: true
+        )
+        XCTAssertEqual(selectedFile.value, "File, level 3, selected")
+        XCTAssertEqual(selectedFile.hint, "Activate to open this file")
+        XCTAssertEqual(selectedFile.activation, .openFile)
+        XCTAssertNil(selectedFile.disclosureActionLabel)
+    }
+
+    func testFileTreeKeyboardAndVoiceOverActionsFollowTheSameNestedDisclosureState() {
+        let collapsed = WorkspaceFileTreeRowAccessibility(
+            name: "Sources",
+            isDirectory: true,
+            depth: 0,
+            isExpanded: false,
+            isSelected: false
+        )
+        XCTAssertEqual(collapsed.keyboardActivation, .expandFolder)
+        XCTAssertEqual(collapsed.voiceOverDisclosureAction, .expandFolder)
+
+        let expanded = WorkspaceFileTreeRowAccessibility(
+            name: "Sources",
+            isDirectory: true,
+            depth: 0,
+            isExpanded: true,
+            isSelected: false
+        )
+        XCTAssertEqual(expanded.keyboardActivation, .collapseFolder)
+        XCTAssertEqual(expanded.voiceOverDisclosureAction, .collapseFolder)
+
+        let nestedFile = WorkspaceFileTreeRowAccessibility(
+            name: "Editor.swift",
+            isDirectory: false,
+            depth: 2,
+            isExpanded: false,
+            isSelected: false
+        )
+        XCTAssertEqual(nestedFile.keyboardActivation, .openFile)
+        XCTAssertNil(nestedFile.voiceOverDisclosureAction)
+    }
+
     func testDirectoryListingNamesMissingReplacedCancelledAndBoundedFolders() throws {
         XCTAssertEqual(
             ProjectFiles.listing(of: root.appendingPathComponent("gone", isDirectory: true)).failure,

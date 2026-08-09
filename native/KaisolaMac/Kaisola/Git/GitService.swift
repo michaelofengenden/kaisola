@@ -258,6 +258,14 @@ struct GitService: Sendable {
     struct Entry: Equatable, Identifiable, Sendable {
         let path: String
         let code: String
+        let originalPath: String?
+
+        init(path: String, code: String, originalPath: String? = nil) {
+            self.path = path
+            self.code = code
+            self.originalPath = originalPath
+        }
+
         var id: String { path }
     }
 
@@ -310,7 +318,7 @@ struct GitService: Sendable {
     /// class of caller.
     func status() throws -> Status {
         let statusArguments = [
-            "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--find-renames=50%"
+            "--no-optional-locks", "status", "--porcelain=v2", "-z", "--branch", "--find-renames=50%"
         ]
         // Stats require three independent Git views. Fence them with the same
         // porcelain snapshot: if an external stage/commit lands between those
@@ -860,43 +868,92 @@ struct GitService: Sendable {
             unstagedStats: unstagedStats,
             combinedStats: combinedStats
         )
-        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
-            if line.hasPrefix("# branch.head ") {
-                status.branch = String(line.dropFirst("# branch.head ".count))
-            } else if line.hasPrefix("# branch.ab ") {
-                let fields = line.dropFirst("# branch.ab ".count).split(separator: " ")
-                for field in fields {
-                    if field.hasPrefix("+") { status.ahead = Int(field.dropFirst()) ?? 0 }
-                    if field.hasPrefix("-") { status.behind = Int(field.dropFirst()) ?? 0 }
-                }
-            } else if line.hasPrefix("1 ") {
-                // "1 XY ... path"
-                let fields = line.split(separator: " ", maxSplits: 8, omittingEmptySubsequences: false)
-                guard fields.count >= 9 else { continue }
-                let xy = String(fields[1])
-                let pathField = fields[8...].joined(separator: " ")
-                let path = String(pathField)
-                let x = xy.first.map(String.init) ?? "."
-                let y = xy.dropFirst().first.map(String.init) ?? "."
-                if x != "." { status.staged.append(Entry(path: path, code: x)) }
-                if y != "." { status.unstaged.append(Entry(path: path, code: y)) }
-            } else if line.hasPrefix("2 ") {
-                // "2 XY ... R100 destination\tsource". The similarity token
-                // is its own field, not part of the destination pathname.
-                let fields = line.split(separator: " ", maxSplits: 9, omittingEmptySubsequences: false)
-                guard fields.count >= 10 else { continue }
-                let xy = String(fields[1])
-                let pathField = fields[9...].joined(separator: " ")
-                let path = String(pathField.split(separator: "\t").first ?? Substring(pathField))
-                let x = xy.first.map(String.init) ?? "."
-                let y = xy.dropFirst().first.map(String.init) ?? "."
-                if x != "." { status.staged.append(Entry(path: path, code: x)) }
-                if y != "." { status.unstaged.append(Entry(path: path, code: y)) }
-            } else if line.hasPrefix("? ") {
-                status.untracked.append(String(line.dropFirst(2)))
+        let records = output.split(separator: "\0", omittingEmptySubsequences: false)
+        var index = 0
+        while index < records.count {
+            let record = records[index]
+            if record.hasPrefix("# branch.head "),
+               let (_, value) = statusFields(record, fixedFieldCount: 2) {
+                status.branch = String(value)
+            } else if record.hasPrefix("# branch.ab "),
+                      let (fields, behind) = statusFields(record, fixedFieldCount: 3) {
+                status.ahead = Int(fields[2].dropFirst()) ?? 0
+                status.behind = Int(behind.dropFirst()) ?? 0
+            } else if record.hasPrefix("1 "),
+                      let (fields, path) = statusFields(record, fixedFieldCount: 8) {
+                appendStatusEntries(
+                    xy: fields[1],
+                    path: String(path),
+                    originalPath: nil,
+                    to: &status
+                )
+            } else if record.hasPrefix("2 "),
+                      let (fields, path) = statusFields(record, fixedFieldCount: 9),
+                      index + 1 < records.count {
+                let originalPath = String(records[index + 1])
+                appendStatusEntries(
+                    xy: fields[1],
+                    path: String(path),
+                    originalPath: originalPath,
+                    to: &status
+                )
+                // With `-z`, Git writes the rename/copy source as the next NUL
+                // record. Consume it even when it resembles another status row.
+                index += 1
+            } else if record.hasPrefix("u "),
+                      let (fields, path) = statusFields(record, fixedFieldCount: 10) {
+                appendStatusEntries(
+                    xy: fields[1],
+                    path: String(path),
+                    originalPath: nil,
+                    to: &status
+                )
+            } else if record.hasPrefix("? "),
+                      let (_, path) = statusFields(record, fixedFieldCount: 1) {
+                status.untracked.append(String(path))
             }
+            // `!` records are ignored by design. This status command does not
+            // request ignored files, but accepting them keeps parsing aligned
+            // if the caller ever adds `--ignored`.
+            index += 1
         }
         return status
+    }
+
+    /// Consume exactly the fixed ASCII-space-delimited fields at the front of
+    /// a porcelain record and leave the decoded remainder unchanged as its
+    /// path or value. Newlines, tabs, quotes, backslashes, and leading spaces
+    /// in paths are data, never separators in `-z` mode.
+    private static func statusFields(
+        _ record: Substring,
+        fixedFieldCount: Int
+    ) -> (fields: [Substring], remainder: Substring)? {
+        var fields: [Substring] = []
+        var remainder = record
+        for _ in 0 ..< fixedFieldCount {
+            guard let separator = remainder.firstIndex(of: " ") else { return nil }
+            let field = remainder[..<separator]
+            guard !field.isEmpty else { return nil }
+            fields.append(field)
+            remainder = remainder[remainder.index(after: separator)...]
+        }
+        return (fields, remainder)
+    }
+
+    private static func appendStatusEntries(
+        xy: Substring,
+        path: String,
+        originalPath: String?,
+        to status: inout Status
+    ) {
+        let x = xy.first.map(String.init) ?? "."
+        let y = xy.dropFirst().first.map(String.init) ?? "."
+        if x != "." {
+            status.staged.append(Entry(path: path, code: x, originalPath: originalPath))
+        }
+        if y != "." {
+            status.unstaged.append(Entry(path: path, code: y, originalPath: originalPath))
+        }
     }
 
     /// Parse NUL-delimited numstat records. A rename has an empty pathname in

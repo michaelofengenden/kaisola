@@ -173,6 +173,63 @@ test('terminal kill reports accepted signaling without claiming synchronous exit
   assert.equal(record.exited, false)
 })
 
+test('terminal owner detach targets one terminal when an owner has several', (t) => {
+  const owner = 'instance-shared|renderer-7|project-a'
+  const sender = { id: owner, send: () => {}, isDestroyed: () => false }
+  const firstID = 'detach-owner-first-terminal'
+  const secondID = 'detach-owner-second-terminal'
+  for (const id of [firstID, secondID]) {
+    manager.spawn({
+      id,
+      command: '/bin/cat',
+      args: [],
+      cwd: managerSpoolDir,
+      sender,
+    })
+  }
+  t.after(() => {
+    manager.release(firstID)
+    manager.release(secondID)
+  })
+
+  assert.equal(manager.detachSender(owner), 0, 'an omitted terminal id must fail closed')
+  assert.equal(manager.ownership(firstID).owner, owner)
+  assert.equal(manager.ownership(secondID).owner, owner)
+  assert.equal(manager.detachSender(owner, firstID), 1)
+  assert.equal(manager.ownership(firstID).owner, '')
+  assert.equal(manager.ownership(secondID).owner, owner)
+})
+
+test('socket-loss prefix detach remains explicitly broad across projects', async (t) => {
+  const records = [
+    ['detach-prefix-project-a', 'instance-shared|renderer-7|project-a'],
+    ['detach-prefix-project-b', 'instance-shared|renderer-7|project-b'],
+    ['detach-prefix-other-instance', 'instance-other|renderer-7|project-a'],
+  ]
+  manager.setEventSink(() => true)
+  const exits = []
+  for (const [id, owner] of records) {
+    const record = manager.spawn({
+      id,
+      command: '/bin/cat',
+      args: [],
+      cwd: managerSpoolDir,
+      sender: owner,
+    })
+    exits.push(new Promise((resolve) => record.pty.onExit(resolve)))
+  }
+  t.after(async () => {
+    for (const [id] of records) manager.release(id)
+    await Promise.allSettled(exits)
+    manager.setEventSink(null)
+  })
+
+  assert.equal(manager.detachSenderPrefix('instance-shared|'), 2)
+  assert.equal(manager.ownership(records[0][0]).owner, '')
+  assert.equal(manager.ownership(records[1][0]).owner, '')
+  assert.equal(manager.ownership(records[2][0]).owner, records[2][1])
+})
+
 test('coldTail reads the bounded retained tail across previous and current segments', (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-cold-tail-'))
   const spool = new TerminalSpool({ dir, id: 'cold-segments' })

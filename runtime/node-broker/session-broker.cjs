@@ -13,6 +13,7 @@ const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
 const { terminalAttachRoute, terminalCreateRoute, terminalKillRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
+const { terminalDetachOwnerRoute } = require('./ipc/terminalDetachOwnerRoute.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
@@ -161,10 +162,6 @@ function ownerId(value) {
 
 function ownerKey(instanceId, rendererId, projectId) {
   return `${instanceId}|${ownerId(rendererId)}|${projectScope(projectId)}`
-}
-
-function rendererOwnerPrefix(instanceId, rendererId) {
-  return `${instanceId}|${ownerId(rendererId)}|`
 }
 
 function clearNoClientTimer() {
@@ -454,11 +451,9 @@ async function dispatch(client, method, params = {}) {
       requireAllowed(id)
       return { ok: mgr.detachRenderer(id, owner, params.viewState) }
     }
-    case 'terminal.detachOwner':
-      // A WebContents can own parked terminals in several project tabs. Window
-      // teardown drops every one, while normal project handoff remains explicit
-      // through attach/create with that project's capability.
-      return { ok: true, detached: mgr.detachSenderPrefix(rendererOwnerPrefix(client.instanceId, params.ownerId)) }
+    case 'terminal.detachOwner': {
+      return terminalDetachOwnerRoute({ manager: mgr, params, owner, requireAllowed })
+    }
     case 'terminal.write': {
       const id = terminalId()
       requireAllowed(id)

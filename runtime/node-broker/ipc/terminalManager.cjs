@@ -655,21 +655,18 @@ function detachRenderer(id, sender, viewState) {
   return true
 }
 
-/** Main-process fallback for a renderer crash/window close where React cleanup
- * never got a chance to send terminal:detachRenderer. PTYs keep running; only
- * renderer ownership and hot scrollback move to the disk spool. */
-function detachSender(sender) {
-  let detached = 0
-  for (const [id, r] of terms) {
-    if (!r.sender || !sender || !sameSender(r.sender, sender)) continue
-    const prior = r.sender
-    if (detachRenderer(id, prior)) {
-      r.lastSender = prior
-      r.sender = null
-      detached++
-    }
-  }
-  return detached
+/** Drop ownership only for the exact authenticated terminal. A missing id
+ * fails closed; broad socket-loss cleanup has the explicitly named
+ * detachSenderPrefix path below. PTYs keep running and move to the disk spool. */
+function detachSender(sender, terminalId) {
+  if (typeof terminalId !== 'string' || !terminalId) return 0
+  const r = terms.get(terminalId)
+  if (!r?.sender || !sender || !sameSender(r.sender, sender)) return 0
+  const prior = r.sender
+  if (!detachRenderer(terminalId, prior)) return 0
+  r.lastSender = prior
+  r.sender = null
+  return 1
 }
 
 /** Broker socket loss means every renderer owner from that app instance is

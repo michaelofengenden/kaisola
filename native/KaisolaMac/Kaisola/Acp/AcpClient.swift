@@ -1,3 +1,4 @@
+import Dispatch
 import Foundation
 import KaisolaBrokerProtocol
 import KaisolaCore
@@ -902,6 +903,116 @@ struct AcpOutboundFrameEncoder: Sendable {
     }
 }
 
+/// A serial filesystem executor for adapter callbacks. Foundation's file APIs
+/// are synchronous; keeping them on this private utility queue prevents a slow
+/// volume from occupying `AcpClient`'s actor while it must continue decoding
+/// output, permissions, heartbeats, and other callback requests.
+final class AcpFilesystemWorker: @unchecked Sendable {
+    enum Operation: Equatable, Sendable {
+        case read
+        case write
+    }
+
+    typealias OperationHook = @Sendable (Operation) -> Void
+
+    private let queue: DispatchQueue
+    private let operationHook: OperationHook?
+
+    init(
+        label: String = "com.kaisola.acp-filesystem",
+        operationHook: OperationHook? = nil
+    ) {
+        queue = DispatchQueue(label: label, qos: .utility)
+        self.operationHook = operationHook
+    }
+
+    func readTextFile(
+        path: String?,
+        workspaceRoot: String,
+        sensitiveGlobs: [String]
+    ) async throws -> String {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<String, any Error>) in
+            queue.async { [operationHook] in
+                do {
+                    operationHook?(.read)
+                    let confined = try AcpClient.workspacePath(
+                        path,
+                        workspaceRoot: workspaceRoot,
+                        mustExist: true
+                    )
+                    guard !AcpPermissionRules.pathIsSensitive(
+                        globs: sensitiveGlobs,
+                        pathish: confined
+                    ) else {
+                        throw AcpClientError.requestFailed(
+                            "Blocked: sensitive file (Kaisola guardrails)"
+                        )
+                    }
+                    let attributes = try FileManager.default.attributesOfItem(atPath: confined)
+                    if let size = attributes[.size] as? Int, size > AcpClient.maxTextFileBytes {
+                        throw AcpClientError.requestFailed(
+                            "Text file exceeds the \(AcpClient.maxTextFileBytes)-byte ACP limit"
+                        )
+                    }
+                    continuation.resume(
+                        returning: try String(contentsOfFile: confined, encoding: .utf8)
+                    )
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    func writeTextFile(
+        path: String?,
+        content: String,
+        workspaceRoot: String,
+        sensitiveGlobs: [String]
+    ) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            queue.async { [operationHook] in
+                do {
+                    operationHook?(.write)
+                    guard content.utf8.count <= AcpClient.maxTextFileBytes else {
+                        throw AcpClientError.requestFailed(
+                            "Text file exceeds the \(AcpClient.maxTextFileBytes)-byte ACP limit"
+                        )
+                    }
+                    let confined = try AcpClient.workspacePath(
+                        path,
+                        workspaceRoot: workspaceRoot
+                    )
+                    guard !AcpPermissionRules.pathIsSensitive(
+                        globs: sensitiveGlobs,
+                        pathish: confined
+                    ) else {
+                        throw AcpClientError.requestFailed(
+                            "Blocked: sensitive file (Kaisola guardrails)"
+                        )
+                    }
+                    try FileManager.default.createDirectory(
+                        at: URL(fileURLWithPath: confined).deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    // Re-check after mkdir so a concurrently swapped parent
+                    // symlink cannot turn the write into an escape.
+                    let checked = try AcpClient.workspacePath(
+                        confined,
+                        workspaceRoot: workspaceRoot
+                    )
+                    try content.write(toFile: checked, atomically: true, encoding: .utf8)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+}
+
 /// A native ACP client: spawns the adapter, runs the JSON-RPC handshake
 /// (initialize → session/new), sends prompts, and streams the agent's
 /// `session/update` notifications plus permission callbacks. Newline-delimited
@@ -911,6 +1022,7 @@ actor AcpClient {
 
     private let transport: any AcpByteTransport
     private let outboundFrameEncoder: AcpOutboundFrameEncoder
+    private let filesystemWorker: AcpFilesystemWorker
     private var decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
     private var eventHandler: EventHandler?
     private var pending: [Int: CheckedContinuation<JSONValue, any Error>] = [:]
@@ -930,6 +1042,7 @@ actor AcpClient {
     /// path owns the health transition and a stale send failure cannot close a
     /// replacement adapter.
     private var failingConnectionGeneration: UInt64?
+    private var filesystemCallbacksInFlight = 0
     private var sessionID: String?
     private struct ScopedSessionIdentity: Sendable {
         let sessionID: String
@@ -989,10 +1102,12 @@ actor AcpClient {
     init(
         transport: any AcpByteTransport = AcpProcessTransport(),
         toolCallReviewContextLimits: AcpToolCallReviewContextLimits = .production,
-        outboundFrameLimits: AcpOutboundFrameLimits = .production
+        outboundFrameLimits: AcpOutboundFrameLimits = .production,
+        filesystemWorker: AcpFilesystemWorker = AcpFilesystemWorker()
     ) {
         self.transport = transport
         outboundFrameEncoder = AcpOutboundFrameEncoder(limits: outboundFrameLimits)
+        self.filesystemWorker = filesystemWorker
         toolCallReviewContextStore = AcpToolCallReviewContextStore(
             limits: toolCallReviewContextLimits
         )
@@ -2089,6 +2204,10 @@ actor AcpClient {
         connectionGeneration
     }
 
+    func filesystemCallbacksInFlightForTesting() -> Int {
+        filesystemCallbacksInFlight
+    }
+
     // MARK: - Agent-requested terminals
 
     private func handleTerminalMethod(_ method: String, id: JSONValue?, params: JSONValue?) {
@@ -2187,6 +2306,17 @@ actor AcpClient {
     /// the workspace cannot smuggle reads/writes outside it.
     private func workspacePath(_ path: String?, mustExist: Bool = false) throws -> String {
         guard let root = workspaceRoot else { throw AcpClientError.notRunning }
+        return try Self.workspacePath(path, workspaceRoot: root, mustExist: mustExist)
+    }
+
+    /// Pure, explicit-root form used by the filesystem worker after the actor
+    /// snapshots the active workspace. It must remain synchronous so the whole
+    /// resolution/read/write sequence stays on the worker queue.
+    fileprivate static func workspacePath(
+        _ path: String?,
+        workspaceRoot root: String,
+        mustExist: Bool = false
+    ) throws -> String {
         let raw = path?.isEmpty == false ? path! : root
         let resolved = raw.hasPrefix("/")
             ? (raw as NSString).standardizingPath
@@ -2807,28 +2937,42 @@ actor AcpClient {
             )
             return
         }
-        do {
-            let path = try workspacePath(params?.objectValue?["path"]?.stringValue, mustExist: true)
-            guard !AcpPermissionRules.pathIsSensitive(globs: fsSensitiveGlobs, pathish: path) else {
-                throw AcpClientError.requestFailed("Blocked: sensitive file (Kaisola guardrails)")
-            }
-            let attributes = try FileManager.default.attributesOfItem(atPath: path)
-            if let size = attributes[.size] as? Int, size > Self.maxTextFileBytes {
-                throw AcpClientError.requestFailed("Text file exceeds the \(Self.maxTextFileBytes)-byte ACP limit")
-            }
-            let content = try String(contentsOfFile: path, encoding: .utf8)
-            respond(
-                id: id,
-                method: "fs/read_text_file",
-                result: .object(["content": .string(content)])
-            )
-        } catch {
+        guard let workspaceRoot else {
             respondError(
                 id: id,
                 method: "fs/read_text_file",
                 code: -32000,
-                message: errorText(error)
+                message: errorText(AcpClientError.notRunning)
             )
+            return
+        }
+        let generation = connectionGeneration
+        let path = params?.objectValue?["path"]?.stringValue
+        let sensitiveGlobs = fsSensitiveGlobs
+        filesystemCallbacksInFlight += 1
+        Task {
+            defer { filesystemCallbacksInFlight -= 1 }
+            do {
+                let content = try await filesystemWorker.readTextFile(
+                    path: path,
+                    workspaceRoot: workspaceRoot,
+                    sensitiveGlobs: sensitiveGlobs
+                )
+                guard generation == connectionGeneration else { return }
+                respond(
+                    id: id,
+                    method: "fs/read_text_file",
+                    result: .object(["content": .string(content)])
+                )
+            } catch {
+                guard generation == connectionGeneration else { return }
+                respondError(
+                    id: id,
+                    method: "fs/read_text_file",
+                    code: -32000,
+                    message: errorText(error)
+                )
+            }
         }
     }
 
@@ -2842,31 +2986,40 @@ actor AcpClient {
             )
             return
         }
-        do {
-            let content = params?.objectValue?["content"]?.stringValue ?? ""
-            guard content.utf8.count <= Self.maxTextFileBytes else {
-                throw AcpClientError.requestFailed("Text file exceeds the \(Self.maxTextFileBytes)-byte ACP limit")
-            }
-            let path = try workspacePath(params?.objectValue?["path"]?.stringValue)
-            guard !AcpPermissionRules.pathIsSensitive(globs: fsSensitiveGlobs, pathish: path) else {
-                throw AcpClientError.requestFailed("Blocked: sensitive file (Kaisola guardrails)")
-            }
-            try FileManager.default.createDirectory(
-                at: URL(fileURLWithPath: path).deletingLastPathComponent(),
-                withIntermediateDirectories: true
-            )
-            // Re-check after mkdir so a concurrently swapped parent symlink
-            // cannot turn the write into an escape (mirrors acp.cjs).
-            let checked = try workspacePath(path)
-            try content.write(toFile: checked, atomically: true, encoding: .utf8)
-            respond(id: id, method: "fs/write_text_file", result: .object([:]))
-        } catch {
+        guard let workspaceRoot else {
             respondError(
                 id: id,
                 method: "fs/write_text_file",
                 code: -32000,
-                message: errorText(error)
+                message: errorText(AcpClientError.notRunning)
             )
+            return
+        }
+        let generation = connectionGeneration
+        let path = params?.objectValue?["path"]?.stringValue
+        let content = params?.objectValue?["content"]?.stringValue ?? ""
+        let sensitiveGlobs = fsSensitiveGlobs
+        filesystemCallbacksInFlight += 1
+        Task {
+            defer { filesystemCallbacksInFlight -= 1 }
+            do {
+                try await filesystemWorker.writeTextFile(
+                    path: path,
+                    content: content,
+                    workspaceRoot: workspaceRoot,
+                    sensitiveGlobs: sensitiveGlobs
+                )
+                guard generation == connectionGeneration else { return }
+                respond(id: id, method: "fs/write_text_file", result: .object([:]))
+            } catch {
+                guard generation == connectionGeneration else { return }
+                respondError(
+                    id: id,
+                    method: "fs/write_text_file",
+                    code: -32000,
+                    message: errorText(error)
+                )
+            }
         }
     }
 

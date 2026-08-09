@@ -574,13 +574,58 @@ private struct ExtensionsEmptyState: View {
 private struct TerminalThemesExtensionEditor: View {
     @ObservedObject var settings: NativePreviewSettings
     let highlightedID: String?
-    @State private var specs: [CustomThemeSpec] = []
+    @State private var snapshot = CustomThemeStore.Snapshot(specs: [], state: .missing)
+    @State private var operationError: String?
+    @State private var confirmReset = false
+    @State private var pendingRemoval: TerminalThemeRemovalPlan?
     private let store = CustomThemeStore()
 
     var body: some View {
         ScrollViewReader { proxy in
             Form {
                 ExtensionCategoryIntro(category: .terminalThemes, workspace: nil)
+                if !snapshot.state.allowsMutations {
+                    Section("Registry Recovery") {
+                        let item = ExtensionSettingsItem.customThemeRegistryIssue(snapshot.state)
+                        Label(item.versionIntegrity, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("extensions.themes.registry-warning")
+                        if let message = item.validationMessage {
+                            Text(message)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                        if let recoveryURL = snapshot.state.preservedCopyURL {
+                            Text(recoveryURL.path)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                                .lineLimit(2)
+                                .accessibilityLabel("Terminal theme recovery copy \(recoveryURL.lastPathComponent)")
+                            HStack {
+                                Button("Reveal Recovery Copy") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([recoveryURL])
+                                }
+                                Button("Reset Registry", role: .destructive) {
+                                    confirmReset = true
+                                }
+                                .disabled(!snapshot.state.canReset)
+                                .accessibilityHint("Replaces the active unreadable registry with an empty version. The recovery copy is kept.")
+                            }
+                        } else {
+                            Button("Reload Registry") { reload() }
+                                .accessibilityHint("Tries to read and preserve the terminal-theme registry again.")
+                        }
+                    }
+                    .id(CustomThemeStore.registryIssueID)
+                }
+                if let operationError {
+                    Section("Save Error") {
+                        Label(operationError, systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("extensions.themes.save-error")
+                    }
+                }
                 Section("Built-in Themes") {
                     ForEach(TerminalThemeRegistry.shipped) { definition in
                         let item = ExtensionSettingsItem.builtInTheme(
@@ -601,7 +646,9 @@ private struct TerminalThemesExtensionEditor: View {
                 }
                 Section("Custom Themes") {
                     if specs.isEmpty {
-                        Text("No custom themes yet. Import a JSON palette to add one.")
+                        Text(snapshot.state.allowsMutations
+                            ? "No custom themes yet. Import a JSON palette to add one."
+                            : "No last-known-good custom themes are available. Recover or reset the registry before importing one.")
                             .font(.callout)
                             .foregroundStyle(.kaisolaSecondary)
                             .accessibilityIdentifier("extensions.themes.empty")
@@ -621,11 +668,15 @@ private struct TerminalThemesExtensionEditor: View {
                                     .controlSize(.small)
                                     .disabled(settings.terminalThemeID == spec.id)
                                 }
-                                Button(role: .destructive) { remove(spec) } label: {
-                                    Image(systemName: "trash")
+                                Button { requestRemoval(spec) } label: {
+                                    Label("Remove", systemImage: "trash")
                                 }
                                 .buttonStyle(.borderless)
+                                .foregroundStyle(.red)
+                                .disabled(!snapshot.state.allowsMutations)
                                 .accessibilityLabel("Remove theme \(item.name)")
+                                .accessibilityHint("Opens a confirmation before permanently removing this theme.")
+                                .accessibilityAction { requestRemoval(spec) }
                             }
                         }
                         .id(spec.id)
@@ -643,15 +694,51 @@ private struct TerminalThemesExtensionEditor: View {
                         Label("Import Theme…", systemImage: "square.and.arrow.down")
                     }
                     .accessibilityHint("Choose a JSON file with light and dark palettes")
+                    .disabled(!snapshot.state.allowsMutations)
                 }
             }
             .formStyle(.grouped)
             .padding(6)
             .onAppear {
-                specs = store.specs()
+                reload()
                 scrollToHighlight(using: proxy)
             }
+            .confirmationDialog(
+                "Reset custom terminal themes?",
+                isPresented: $confirmReset,
+                titleVisibility: .visible
+            ) {
+                Button("Reset Registry", role: .destructive) { reset() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Kaisola will replace the active unreadable registry with an empty version. The recovery copy will remain on disk.")
+            }
         }
+        // Keep the removal confirmation on a different presentation host from
+        // the registry-reset dialog above. SwiftUI otherwise accepts the row
+        // action but can suppress the second presenter on macOS.
+        .confirmationDialog(
+            pendingRemoval?.title ?? "Remove custom terminal theme?",
+            isPresented: removalConfirmationPresented,
+            titleVisibility: .visible,
+            presenting: pendingRemoval
+        ) { plan in
+            Button("Remove Theme", role: .destructive) { confirmRemoval(plan) }
+            Button("Cancel", role: .cancel) {}
+        } message: { plan in
+            Text(plan.message)
+        }
+    }
+
+    private var specs: [CustomThemeSpec] { snapshot.specs }
+
+    private var removalConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { pendingRemoval != nil },
+            set: { isPresented in
+                if !isPresented { pendingRemoval = nil }
+            }
+        )
     }
 
     private func scrollToHighlight(using proxy: ScrollViewProxy) {
@@ -661,10 +748,31 @@ private struct TerminalThemesExtensionEditor: View {
         }
     }
 
-    private func remove(_ spec: CustomThemeSpec) {
-        _ = store.remove(id: spec.id)
-        specs = store.specs()
-        NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+    private func requestRemoval(_ spec: CustomThemeSpec) {
+        guard let fallback = TerminalThemeRegistry.shipped.first else { return }
+        pendingRemoval = TerminalThemeRemovalPlan(
+            theme: spec,
+            selectedThemeID: settings.terminalThemeID,
+            fallbackThemeID: fallback.id,
+            fallbackThemeTitle: fallback.title
+        )
+    }
+
+    private func confirmRemoval(_ plan: TerminalThemeRemovalPlan) {
+        do {
+            let removed = try store.remove(id: plan.theme.id)
+            settings.terminalThemeID = plan.selectionAfterSuccessfulRemoval(
+                currentThemeID: settings.terminalThemeID
+            )
+            reload()
+            ToastCenter.shared.show(
+                removed ? "Removed \(plan.displayName)" : "That theme was already removed",
+                style: .success
+            )
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
+        }
     }
 
     private func importTheme() {
@@ -686,20 +794,49 @@ private struct TerminalThemesExtensionEditor: View {
                     )
                     return
                 }
-                if let reason = store.upsert(spec) {
-                    ToastCenter.shared.show(
-                        "Imported as disabled: \(reason)",
-                        style: .info,
-                        duration: 6
-                    )
-                } else {
-                    settings.terminalThemeID = spec.id
-                    ToastCenter.shared.show("Imported \(spec.title) and made it active", style: .success)
+                do {
+                    if let reason = try store.upsert(spec) {
+                        ToastCenter.shared.show(
+                            "Imported as disabled: \(reason)",
+                            style: .info,
+                            duration: 6
+                        )
+                    } else {
+                        settings.terminalThemeID = spec.id
+                        ToastCenter.shared.show("Imported \(spec.title) and made it active", style: .success)
+                    }
+                    reload()
+                    NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+                } catch {
+                    report(error)
                 }
-                specs = store.specs()
-                NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
             }
         }
+    }
+
+    private func reset() {
+        do {
+            snapshot = try store.resetUnreadableRegistry()
+            operationError = nil
+            if !TerminalThemeRegistry.shipped.contains(where: { $0.id == settings.terminalThemeID }) {
+                settings.terminalThemeID = TerminalThemeRegistry.shipped[0].id
+            }
+            ToastCenter.shared.show("Reset terminal themes; recovery copy kept", style: .success, duration: 6)
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
+        }
+    }
+
+    private func reload() {
+        snapshot = store.load()
+        operationError = nil
+    }
+
+    private func report(_ error: Error) {
+        snapshot = store.load()
+        operationError = error.localizedDescription
+        ToastCenter.shared.show(error.localizedDescription, style: .error, duration: 6)
     }
 }
 

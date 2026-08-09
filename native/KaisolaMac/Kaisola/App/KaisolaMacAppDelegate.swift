@@ -5,6 +5,7 @@ import KaisolaCore
 import QuartzCore
 import ScreenCaptureKit
 import Security
+import SwiftTerm
 import SwiftUI
 import WebKit
 
@@ -420,7 +421,34 @@ struct NativeFrameCadenceReport: Encodable, Equatable, Sendable {
     }
 }
 
-/// A fixture-only, view-bound main-run-loop cadence probe. Instruments remains
+enum NativeTerminalHistoryFrameCadence {
+    static let environmentKey = "KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE"
+    static let workloadID = "terminal-history-sustained-12-surface-v1"
+    static let receiptPrefix = "KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE="
+
+    static func encodeReceipt(
+        report: NativeFrameCadenceReport,
+        appPID: Int32,
+        brokerPID: Int32,
+        capturedAt: String
+    ) throws -> Data {
+        guard report.workload == workloadID,
+              appPID > 1,
+              brokerPID > 1,
+              !capturedAt.isEmpty,
+              let encoded = try? JSONEncoder().encode(report),
+              let object = try? JSONSerialization.jsonObject(with: encoded),
+              var receipt = object as? [String: Any] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        receipt["appPid"] = appPID
+        receipt["brokerPid"] = brokerPID
+        receipt["capturedAt"] = capturedAt
+        return try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
+    }
+}
+
+/// A request-gated, view-bound main-run-loop cadence probe. Instruments remains
 /// the rendered-hitch authority; this complementary signal catches deadline
 /// loss without enabling a machine-wide trace when unrelated daemons are busy.
 @MainActor
@@ -482,6 +510,132 @@ final class NativeFrameCadenceProbe: NSObject {
     }
 }
 
+/// Machine-readable acceptance contract emitted only by the isolated,
+/// optimized continuous-terminal-scroll visual fixture.
+struct VisualTerminalContinuousScrollReceipt: Codable, Equatable, Sendable {
+    let optimizedBuild: Bool
+    let scheduledHertz: Int
+    let measuredHertz: Double
+    let sampleCount: Int
+    let sampleIntervalCount: Int
+    let sampleTimestampsMilliseconds: [Double]
+    let sampleDurationMilliseconds: Double
+    let cadenceP95Milliseconds: Double
+    let handledSampleCount: Int
+    let momentumSampleCount: Int
+    let distinctOriginCount: Int
+    let maximumAnchorStep: Int
+    let maximumContinuityError: Double
+    let processingP95Milliseconds: Double
+    let scrollbarMaximumError: Double
+    let topRubberBand: Bool
+    let bottomRubberBand: Bool
+    let edgesSettled: Bool
+    let selectionPreserved: Bool
+    let linkPreserved: Bool
+    let semanticPromptPreserved: Bool
+    let promptNavigationCoherent: Bool
+    let keyboardPagingCoherent: Bool
+    let accessibilityPagingCoherent: Bool
+    let accessibilityActionsExposed: Bool
+    let scrollerFramePreserved: Bool
+    let alternateScreenPreserved: Bool
+    let appMouseRoutingPreserved: Bool
+    let liveBottomCoherent: Bool
+    let viewIdentityPreserved: Bool
+    let coordinatorIdentityPreserved: Bool
+    let terminalEngineIdentityPreserved: Bool
+    let finalFractionalViewport: Bool
+    let fixtureUpdaterDisabled: Bool
+    let fixtureBrokerIsolated: Bool
+    let fixtureBuildNumber: Int
+    let feedBuildFloor: Int
+    let cursorBefore: Int64
+    let cursorAfter: Int64
+    let expectedCursorAfter: Int64
+    let finalMarkerPresent: Bool
+
+    var failure: String? {
+        if !optimizedBuild { return "not-optimized" }
+        if scheduledHertz != 120 { return "wrong-scheduled-hertz-\(scheduledHertz)" }
+        if sampleCount != 120 { return "wrong-sample-count-\(sampleCount)" }
+        if sampleIntervalCount != sampleCount - 1 {
+            return "wrong-interval-count-\(sampleIntervalCount)"
+        }
+        if sampleTimestampsMilliseconds.count != sampleCount {
+            return "wrong-timestamp-count-\(sampleTimestampsMilliseconds.count)"
+        }
+        if sampleTimestampsMilliseconds.contains(where: { !$0.isFinite }) {
+            return "timestamp-not-finite"
+        }
+        if sampleTimestampsMilliseconds.first.map({ abs($0) > 0.001 }) ?? true {
+            return "timestamp-origin-invalid"
+        }
+        if zip(
+            sampleTimestampsMilliseconds.dropFirst(),
+            sampleTimestampsMilliseconds
+        ).contains(where: { !$0.0.isFinite || $0.0 <= $0.1 }) {
+            return "timestamps-not-monotonic"
+        }
+        if let timestampDuration = sampleTimestampsMilliseconds.last,
+           abs(timestampDuration - sampleDurationMilliseconds) > 0.001 {
+            return "timestamp-duration-drift-\(timestampDuration)-\(sampleDurationMilliseconds)"
+        }
+        if !(80...145).contains(measuredHertz) {
+            return "measured-cadence-out-of-range-\(measuredHertz)"
+        }
+        if !(800...1_600).contains(sampleDurationMilliseconds) {
+            return "sample-duration-out-of-range-\(sampleDurationMilliseconds)"
+        }
+        if cadenceP95Milliseconds > 25 {
+            return "cadence-p95-out-of-range-\(cadenceP95Milliseconds)"
+        }
+        if handledSampleCount != sampleCount { return "sample-not-handled-\(handledSampleCount)" }
+        if momentumSampleCount != 48 { return "wrong-momentum-count-\(momentumSampleCount)" }
+        if distinctOriginCount < 115 { return "origins-quantized-\(distinctOriginCount)" }
+        if maximumAnchorStep > 1 { return "row-jump-\(maximumAnchorStep)" }
+        if maximumContinuityError > 0.001 { return "continuity-error-\(maximumContinuityError)" }
+        // Sustained cadence is gated independently from this per-sample cost.
+        // Permit an occasional one-and-a-half-frame render on real optimized
+        // hardware while still rejecting visible multi-frame stalls at p95.
+        if processingP95Milliseconds > 12.5 {
+            return "processing-over-budget-\(processingP95Milliseconds)"
+        }
+        if scrollbarMaximumError > 0.000_001 { return "scrollbar-drift-\(scrollbarMaximumError)" }
+        if !topRubberBand { return "no-top-rubber-band" }
+        if !bottomRubberBand { return "no-bottom-rubber-band" }
+        if !edgesSettled { return "edge-did-not-settle" }
+        if !selectionPreserved { return "selection-lost" }
+        if !linkPreserved { return "link-lost" }
+        if !semanticPromptPreserved { return "semantic-prompt-lost" }
+        if !promptNavigationCoherent { return "prompt-navigation-incoherent" }
+        if !keyboardPagingCoherent { return "keyboard-paging-incoherent" }
+        if !accessibilityPagingCoherent { return "accessibility-paging-incoherent" }
+        if !accessibilityActionsExposed { return "accessibility-actions-missing" }
+        if !scrollerFramePreserved { return "scroller-frame-moved" }
+        if !alternateScreenPreserved { return "alternate-screen-routing-changed" }
+        if !appMouseRoutingPreserved { return "app-mouse-routing-changed" }
+        if !liveBottomCoherent { return "live-bottom-incoherent" }
+        if !viewIdentityPreserved { return "view-identity-changed" }
+        if !coordinatorIdentityPreserved { return "coordinator-identity-changed" }
+        if !terminalEngineIdentityPreserved { return "terminal-engine-identity-changed" }
+        if !finalFractionalViewport { return "final-viewport-quantized" }
+        if !fixtureUpdaterDisabled { return "fixture-updater-started" }
+        if !fixtureBrokerIsolated { return "fixture-broker-route-live" }
+        if fixtureBuildNumber <= feedBuildFloor {
+            return "fixture-build-not-above-feed-\(fixtureBuildNumber)-\(feedBuildFloor)"
+        }
+        if cursorAfter != expectedCursorAfter { return "broker-cursor-drift-\(cursorAfter)-\(expectedCursorAfter)" }
+        if !finalMarkerPresent { return "stream-incomplete" }
+        return nil
+    }
+
+    var json: String? {
+        guard let data = try? JSONEncoder().encode(self) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
 @main
 @MainActor
 enum KaisolaMacMain {
@@ -490,7 +644,8 @@ enum KaisolaMacMain {
     static func main() {
         let environment = ProcessInfo.processInfo.environment
         if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
-            || environment["KAISOLA_NATIVE_RESOURCE_WORKLOAD"] != nil {
+            || environment["KAISOLA_NATIVE_RESOURCE_WORKLOAD"] != nil
+            || environment["KAISOLA_NATIVE_PDF_PREVIEW_BUDGET"] != nil {
             // Keep the quit policy process-local so fixture termination cannot
             // opt into saving windows in the production defaults domain. The
             // delegate callbacks below reject save/restore explicitly. Avoid
@@ -578,7 +733,14 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             signedOutNotice: notice
         )
     }()
-    private let updateController = NativeUpdateController()
+    // Installed visual/resource/PDF fixtures return before this property is
+    // touched. Keeping Sparkle lazy prevents a disposable copied app from
+    // checking, downloading, or installing an update before its isolated
+    // launch-mode guard runs; the explicit flag also keeps those modes closed
+    // if a future fixture path needs updater state before returning.
+    private lazy var updateController = NativeUpdateController(
+        isolatedFixture: visualFixture || resourceWorkload != nil || pdfPreviewBudgetRequested
+    )
 
     /// The in-workspace settings sheet needs the updater's state without a
     /// delegate reference threaded through every view (spec §3c).
@@ -706,6 +868,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private let visualWorkspace = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_WORKSPACE"]
     private let visualDocument = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_DOCUMENT"]
     private let visualCapturePath = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_CAPTURE_PATH"]
+    private let pdfPreviewBudgetRequested = ProcessInfo.processInfo.environment[
+        "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET"
+    ] != nil
+    private let pdfPreviewBudget = PDFPreviewBudgetConfiguration.resolve()
+    private var pdfPreviewBudgetRunner: PDFPreviewBudgetRunner?
     private let resourceWorkloadRequested = ProcessInfo.processInfo.environment[
         "KAISOLA_NATIVE_RESOURCE_WORKLOAD"
     ] != nil
@@ -713,13 +880,33 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private let resourceFrameCadenceRequested = ProcessInfo.processInfo.environment[
         "KAISOLA_NATIVE_FRAME_CADENCE"
     ] == "1"
+    /// Release qualification only. Unlike the disposable resource workload,
+    /// this instruments the ordinary installed workspace so a physical
+    /// twelve-surface tour and its live broker share one exact app process.
+    private let terminalHistoryFrameCadenceRequested = ProcessInfo.processInfo.environment[
+        NativeTerminalHistoryFrameCadence.environmentKey
+    ] == "1"
     private var resourceFrameCadenceProbe: NativeFrameCadenceProbe?
     private var visualStreamingFixtureTask: Task<Void, Never>?
+    private var visualContinuousScrollReceipt: VisualTerminalContinuousScrollReceipt?
+    private var visualOwnershipFlapTask: Task<Void, Never>?
     private struct ResourceTerminalReceipt {
         let terminalID: String
         let observedOffset: Int64
         let windowWidth: Int
         let windowHeight: Int
+    }
+    private struct VisualOwnershipSurfaceState: Equatable {
+        let selectionRange: NSRange
+        let topVisibleRow: Int
+        let scrollPosition: Double
+        let cursorX: Int
+        let cursorY: Int
+        let cursorStyle: String
+        let linkMode: String
+        let explicitLinkURL: String?
+        let workingDirectory: URL?
+        let followsLiveOutput: Bool
     }
     private var resourceTerminalReceipts: [ResourceTerminalReceipt] = []
     private var resourceReceiptEmitted = false
@@ -756,11 +943,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     /// modal "restore windows" prompt before `applicationDidFinishLaunching`,
     /// leaving a headless gate waiting forever.
     func applicationShouldRestoreApplicationState(_ sender: NSApplication) -> Bool {
-        !visualFixture && resourceWorkload == nil
+        !visualFixture && resourceWorkload == nil && !pdfPreviewBudgetRequested
     }
 
     func applicationShouldSaveApplicationState(_ sender: NSApplication) -> Bool {
-        !visualFixture && resourceWorkload == nil
+        !visualFixture && resourceWorkload == nil && !pdfPreviewBudgetRequested
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -771,6 +958,35 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         // a live workspace and starve process-based ACP/Mesh tests. Tests create
         // every AppModel/window they need explicitly.
         guard !NotificationBridge.isRunningUnderXCTest else { return }
+        // The installed PDF gate is a single private PDFKit surface. It uses
+        // isolated non-persistent settings, then returns before Sparkle,
+        // usage, Companion, broker, workspace, or PTY startup so the receipt
+        // measures only the optimized app and PDF preview path.
+        if pdfPreviewBudgetRequested {
+            guard let pdfPreviewBudget else {
+                print("\(PDFPreviewBudgetRunner.receiptPrefix)FAIL invalid-private-temporary-root-or-fixture")
+                try? FileHandle.standardOutput.synchronize()
+                NSApp.terminate(nil)
+                return
+            }
+            do {
+                try FileManager.default.createDirectory(
+                    at: pdfPreviewBudget.root,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                _ = chmod(pdfPreviewBudget.root.path, 0o700)
+            } catch {
+                print("\(PDFPreviewBudgetRunner.receiptPrefix)FAIL private-root-create")
+                try? FileHandle.standardOutput.synchronize()
+                NSApp.terminate(nil)
+                return
+            }
+            let runner = PDFPreviewBudgetRunner(configuration: pdfPreviewBudget)
+            pdfPreviewBudgetRunner = runner
+            runner.start()
+            return
+        }
         // Memory pressure sheds every discretionary cache (2026-08-06 §2g).
         MemoryPressureResponder.shared.register(name: "terminal-surfaces") {
             TerminalSurfaceCache.shared.removeAll()
@@ -787,11 +1003,19 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         MemoryPressureResponder.shared.start()
         // Usage stats stay fresh on their own (spec §3e): frontmost window's
         // workspace, every 5 minutes while active.
-        UsageCenter.shared.startBackgroundRefresh { [weak self] in
-            self?.activeSettingsModel()?.currentProjectDirectory
+        if !visualFixture && resourceWorkload == nil {
+            UsageCenter.shared.startBackgroundRefresh { [weak self] in
+                self?.activeSettingsModel()?.currentProjectDirectory
+            }
         }
         if resourceWorkloadRequested, resourceWorkload == nil {
             print("KAISOLA_NATIVE_RESOURCE_WORKLOAD_READY=FAIL invalid-private-temporary-root")
+            NSApp.terminate(nil)
+            return
+        }
+        if terminalHistoryFrameCadenceRequested,
+           visualFixture || resourceWorkloadRequested || runtimeSmoke || linkSmoke || catalogSmoke {
+            print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL invalid-launch-mode")
             NSApp.terminate(nil)
             return
         }
@@ -1207,7 +1431,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 openAccounts: {},
                 openUpdateSettings: {}
             ))
-        } else if visualFixture, ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface) {
+        } else if visualFixture, ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-extensions", "settings-extensions-narrow", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface) {
             let workspace = URL(
                 fileURLWithPath: visualWorkspace ?? FileManager.default.currentDirectoryPath,
                 isDirectory: true
@@ -1223,6 +1447,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             case "settings-terminal", "settings-terminal-history", "settings-terminal-interaction": initialSectionID = "terminal"
             case "settings-companion": initialSectionID = "companion"
             case "settings-mcp": initialSectionID = "mcp"
+            case "settings-extensions", "settings-extensions-narrow": initialSectionID = "extensions"
             case "settings-accounts": initialSectionID = "accounts"
             case "settings-models": initialSectionID = "models"
             case "settings-shortcuts": initialSectionID = "shortcuts"
@@ -1251,15 +1476,17 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
 
         let visualSettings = visualFixture
-            && ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface)
+            && ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-extensions", "settings-extensions-narrow", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface)
         let visualOnboarding = visualFixture && visualSurface == "onboarding"
+        let visualExtensions = visualFixture && visualSurface == "settings-extensions"
+        let visualExtensionsNarrow = visualFixture && visualSurface == "settings-extensions-narrow"
 
         let window = NSWindow(
             contentRect: NSRect(
                 x: 0,
                 y: 0,
-                width: visualSettings ? 810 : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualFixture ? 1_360 : 1_080))),
-                height: visualSettings ? 540 : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700)))
+                width: visualExtensions ? 1_100 : (visualExtensionsNarrow ? 820 : (visualSettings ? 810 : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualFixture ? 1_360 : 1_080))))),
+                height: visualExtensions ? 800 : (visualExtensionsNarrow ? 560 : (visualSettings ? 540 : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700)))))
             ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
@@ -1304,11 +1531,20 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
         windowModels[ObjectIdentifier(window)] = model
+        if terminalHistoryFrameCadenceRequested {
+            startTerminalHistoryFrameCadenceProbe(in: window)
+        }
         if resourceWorkload == nil {
             observeCompanionProjection(model, id: ObjectIdentifier(window))
         }
         if visualFixture, visualSurface == "terminal-scroll-output" {
             scheduleVisualTerminalStreamingFixture(in: window, model: model)
+        }
+        if visualFixture, visualSurface == "terminal-continuous-scroll" {
+            scheduleVisualTerminalContinuousScrollFixture(in: window, model: model)
+        }
+        if visualFixture, visualSurface == "terminal-ownership-flap" {
+            scheduleVisualTerminalOwnershipFlapFixture(in: window, model: model)
         }
         if visualFixture, visualSurface == "preview-tab-overflow" {
             Task { @MainActor in
@@ -1370,10 +1606,18 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let transcriptStore = AcpTranscriptStore(
             fileURL: root.appendingPathComponent("agent-chat-transcripts-v1.json")
         )
+        let brokerPreparer: any BrokerInfoPreparing
+        if let resourceWorkload {
+            brokerPreparer = BrokerStartupCoordinator.resourceFixture(
+                userDataRoot: resourceWorkload.brokerUserDataRoot
+            )
+        } else if visualFixture {
+            brokerPreparer = BrokerFreeFixturePreparer()
+        } else {
+            brokerPreparer = BrokerStartupCoordinator.live()
+        }
         return AppModel(
-            brokerPreparer: resourceWorkload.map {
-                BrokerStartupCoordinator.resourceFixture(userDataRoot: $0.brokerUserDataRoot)
-            } ?? BrokerStartupCoordinator.live(),
+            brokerPreparer: brokerPreparer,
             sessionStore: NativeSessionStore(
                 fileURL: root.appendingPathComponent("native-sessions.json")
             ),
@@ -1597,6 +1841,56 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
     }
 
+    private func startTerminalHistoryFrameCadenceProbe(in window: NSWindow) {
+        guard resourceFrameCadenceProbe == nil,
+              resourceWorkload == nil,
+              !visualFixture,
+              let contentView = window.contentView else {
+            print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL invalid-workspace-surface")
+            try? FileHandle.standardOutput.synchronize()
+            return
+        }
+        resourceFrameCadenceProbe = NativeFrameCadenceProbe(
+            view: contentView,
+            workload: NativeTerminalHistoryFrameCadence.workloadID
+        ) { [weak self] report in
+            defer { self?.resourceFrameCadenceProbe = nil }
+            guard let report else {
+                print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL display-link-timeout")
+                try? FileHandle.standardOutput.synchronize()
+                return
+            }
+            let locator = BrokerInfoLocator.preview()
+            guard let broker = try? locator.locate(), broker.isProcessAlive,
+                  broker.pid > 1 else {
+                print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL broker-identity-unavailable")
+                try? FileHandle.standardOutput.synchronize()
+                return
+            }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.calendar = Calendar(identifier: .gregorian)
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"
+            guard let payload = try? NativeTerminalHistoryFrameCadence.encodeReceipt(
+                report: report,
+                appPID: ProcessInfo.processInfo.processIdentifier,
+                brokerPID: broker.pid,
+                capturedAt: formatter.string(from: Date())
+            ) else {
+                print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL receipt-encoding")
+                try? FileHandle.standardOutput.synchronize()
+                return
+            }
+            FileHandle.standardOutput.write(
+                Data(NativeTerminalHistoryFrameCadence.receiptPrefix.utf8)
+            )
+            FileHandle.standardOutput.write(payload)
+            FileHandle.standardOutput.write(Data("\n".utf8))
+            try? FileHandle.standardOutput.synchronize()
+        }
+    }
+
     private func observeCompanionProjection(_ model: AppModel, id: ObjectIdentifier) {
         companionProjectionObservers[id] = model.objectWillChange
             .debounce(for: .milliseconds(180), scheduler: RunLoop.main)
@@ -1655,7 +1949,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             let delay: UInt64
             switch visualSurface {
             case "preview-code-editor", "preview-html": delay = 4_000_000_000
-            case "terminal-scroll-output": delay = 1_800_000_000
+            case "terminal-scroll-output", "terminal-continuous-scroll": delay = 1_800_000_000
             default: delay = 1_800_000_000
             }
             try? await Task.sleep(nanoseconds: delay)
@@ -1664,9 +1958,13 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             // on loaded CI runners, cancelling it mid-stream and reporting both
             // `stream-incomplete` and `packet-rejected`. Wait for the declared
             // finite burst itself; product launches never enter this path.
-            if visualSurface == "terminal-scroll-output",
+            if ["terminal-scroll-output", "terminal-continuous-scroll"].contains(visualSurface),
                let streamingTask = visualStreamingFixtureTask {
                 await streamingTask.value
+            }
+            if visualSurface == "terminal-ownership-flap",
+               let ownershipFlapTask = visualOwnershipFlapTask {
+                await ownershipFlapTask.value
             }
             guard let captureWindow = NativeVisualCaptureTarget.window(
                 rootedAt: window,
@@ -1681,6 +1979,43 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 print("KAISOLA_NATIVE_VISUAL_CAPTURE=FAIL no-content-view")
                 requestVisualFixtureTermination()
                 return
+            }
+
+            if ["settings-extensions", "settings-extensions-narrow"].contains(visualSurface) {
+                guard let model = windowModels[ObjectIdentifier(window)] else {
+                    print("KAISOLA_NATIVE_EXTENSIONS_SETTINGS=FAIL no-mounted-model")
+                    requestVisualFixtureTermination()
+                    return
+                }
+                let accessibility = NativeVisualAccessibilitySnapshot.capture(from: view)
+                let fixtureItems = ExtensionsSettingsFixture.items
+                let receipt = NativeVisualExtensionsSettingsReceipt(
+                    surface: visualSurface,
+                    contentWidth: view.bounds.width,
+                    contentHeight: view.bounds.height,
+                    categoryCount: Set(fixtureItems.map(\.category)).count,
+                    itemCount: fixtureItems.count,
+                    invalidCount: fixtureItems.filter { $0.validationMessage != nil }.count,
+                    accessibilityIdentifiers: accessibility.identifiers.sorted(),
+                    accessibilityLabels: accessibility.labels.sorted(),
+                    fixtureUpdaterDisabled: !updateController.startedUpdater,
+                    fixtureBrokerIsolated: model.usesBrokerFreeFixturePreparer
+                )
+                guard let payload = receipt.json else {
+                    print("KAISOLA_NATIVE_EXTENSIONS_SETTINGS=FAIL receipt-encoding")
+                    requestVisualFixtureTermination()
+                    return
+                }
+                FileHandle.standardOutput.write(Data("KAISOLA_NATIVE_EXTENSIONS_SETTINGS=".utf8))
+                FileHandle.standardOutput.write(Data(payload.utf8))
+                FileHandle.standardOutput.write(Data("\n".utf8))
+                try? FileHandle.standardOutput.synchronize()
+                if let failure = receipt.failure {
+                    print("KAISOLA_NATIVE_EXTENSIONS_SETTINGS=FAIL \(failure)")
+                    requestVisualFixtureTermination()
+                    return
+                }
+                print("KAISOLA_NATIVE_EXTENSIONS_SETTINGS=PASS surface=\(visualSurface)")
             }
 
             // Mixed and Mesh both select a non-terminal pane before the view is
@@ -1779,6 +2114,35 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                             "KAISOLA_NATIVE_VISUAL_TERMINAL_SCROLL_OUTPUT=PASS "
                                 + "position=\(String(format: "%.3f", scrollPosition)) "
                                 + "finalMarker=true titleStable=true"
+                        )
+                    } else if visualSurface == "terminal-continuous-scroll" {
+                        guard let receipt = visualContinuousScrollReceipt else {
+                            print(
+                                "KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=FAIL "
+                                    + "reason=no-receipt"
+                            )
+                            requestVisualFixtureTermination()
+                            return
+                        }
+                        guard let json = receipt.json else {
+                            print(
+                                "KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=FAIL "
+                                    + "reason=receipt-encoding"
+                            )
+                            requestVisualFixtureTermination()
+                            return
+                        }
+                        if let failure = receipt.failure {
+                            print(
+                                "KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=FAIL "
+                                    + "reason=\(failure) receipt=\(json)"
+                            )
+                            requestVisualFixtureTermination()
+                            return
+                        }
+                        print(
+                            "KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=PASS "
+                                + json
                         )
                     }
                 }
@@ -2002,6 +2366,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private func requestVisualFixtureTermination() {
         visualStreamingFixtureTask?.cancel()
         visualStreamingFixtureTask = nil
+        visualOwnershipFlapTask?.cancel()
+        visualOwnershipFlapTask = nil
         DispatchQueue.main.async { [visualFixture] in
             if visualFixture {
                 // A SwiftUI sheet can keep AppKit's terminate path inside its
@@ -2099,6 +2465,714 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             )
             self.visualStreamingFixtureTask = nil
         }
+    }
+
+    /// Drive the installed optimized renderer with one deterministic second of
+    /// 120 Hz sub-row input while the ordinary AppModel coalescer receives two
+    /// agent packets per sample. The receipt covers interaction invariants that
+    /// pixels alone cannot: momentum, edges, scroller/keyboard/AX agreement,
+    /// alternate-screen routing, selection/semantic state, view identity, and
+    /// the broker-style byte cursor. No broker, PTY, socket, or live app is used.
+    private func scheduleVisualTerminalContinuousScrollFixture(
+        in window: NSWindow,
+        model: AppModel
+    ) {
+        visualStreamingFixtureTask?.cancel()
+        visualContinuousScrollReceipt = nil
+        visualStreamingFixtureTask = Task { @MainActor [weak self, weak window, weak model] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard let self,
+                  let window,
+                  let model,
+                  !Task.isCancelled,
+                  let contentView = window.contentView,
+                  let terminal = self.firstTerminalView(in: contentView),
+                  terminal.canScroll,
+                  let cursorBefore = model.terminalDocument.cursor?.offset else {
+                print(
+                    "KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=FAIL "
+                        + "reason=no-scrollable-terminal"
+                )
+                self?.requestVisualFixtureTermination()
+                return
+            }
+
+            let originalIdentity = ObjectIdentifier(terminal)
+            let originalCoordinatorIdentity = (terminal.terminalDelegate as? NativeTerminalSurface.Coordinator)
+                .map(ObjectIdentifier.init)
+            let originalTerminalEngineIdentity = ObjectIdentifier(terminal.getTerminal())
+            terminal.selectAll(nil)
+            let originalSelection = terminal.selectedRange()
+            var processingMilliseconds: [Double] = []
+            var sampleTimestamps: [TimeInterval] = []
+            var distinctOrigins: Set<Int64> = []
+            var handledSampleCount = 0
+            var maximumAnchorStep = 0
+            var maximumContinuityError: CGFloat = 0
+            var scrollbarMaximumError = 0.0
+            var previousAnchor: Int? = terminal.getTerminal().getTopVisibleRow()
+            let scrollerFrameBefore = terminal.nativeScrollerWindowFrame
+            let cadenceOrigin = ProcessInfo.processInfo.systemUptime
+
+            for sample in 0..<120 {
+                guard !Task.isCancelled else { return }
+                if sample > 0 {
+                    let deadline = cadenceOrigin + Double(sample) / 120
+                    let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                    if remaining > 0 {
+                        do {
+                            try await Task.sleep(
+                                nanoseconds: UInt64((remaining * 1_000_000_000).rounded())
+                            )
+                        } catch {
+                            return
+                        }
+                    }
+                    guard !Task.isCancelled else { return }
+                }
+                let gesturePhase: NSEvent.Phase
+                let momentumPhase: NSEvent.Phase
+                if sample < 72 {
+                    gesturePhase = sample == 0 ? .began : (sample == 71 ? .ended : .changed)
+                    momentumPhase = []
+                } else {
+                    gesturePhase = []
+                    momentumPhase = sample == 72 ? .began : (sample == 119 ? .ended : .changed)
+                }
+                let delta: CGFloat = if sample < 72 {
+                    0.42
+                } else {
+                    0.08 + 0.30 * CGFloat(119 - sample) / 47
+                }
+
+                TerminalScrollGestureMonitor.noteGestureForTesting(
+                    view: terminal,
+                    scrollingUpward: true
+                )
+                let started = ProcessInfo.processInfo.systemUptime
+                sampleTimestamps.append(started)
+                let handled = terminal.handleContinuousScroll(
+                    scrollingDeltaY: delta,
+                    hasPreciseScrollingDeltas: true,
+                    phase: gesturePhase,
+                    momentumPhase: momentumPhase,
+                    routesToNativeScrollback: true
+                )
+                // Force the optimized AppKit renderer to consume this exact
+                // invalidation before recording the processing budget.
+                terminal.displayIfNeeded()
+                processingMilliseconds.append(
+                    (ProcessInfo.processInfo.systemUptime - started) * 1_000
+                )
+                if handled { handledSampleCount += 1 }
+                if let projection = terminal.continuousScrollSnapshot {
+                    distinctOrigins.insert(Int64((terminal.bounds.origin.y * 1_000_000).rounded()))
+                    let actualAnchor = terminal.getTerminal().getTopVisibleRow()
+                    let actualPresentedPosition = CGFloat(actualAnchor) * projection.rowHeight
+                        - terminal.bounds.origin.y
+                    maximumContinuityError = max(
+                        maximumContinuityError,
+                        abs(actualPresentedPosition - projection.presentedPosition)
+                    )
+                    scrollbarMaximumError = max(
+                        scrollbarMaximumError,
+                        abs(terminal.nativeScrollerValue - projection.scrollbarPosition)
+                    )
+                    if let previousAnchor {
+                        maximumAnchorStep = max(
+                            maximumAnchorStep,
+                            abs(actualAnchor - previousAnchor)
+                        )
+                    }
+                    previousAnchor = actualAnchor
+                }
+
+                for packetIndex in (sample * 2 + 1)...(sample * 2 + 2) {
+                    guard model.enqueueVisualTerminalStreamingPacket(packetIndex) else {
+                        print(
+                            "KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=FAIL "
+                                + "reason=packet-rejected index=\(packetIndex)"
+                        )
+                        requestVisualFixtureTermination()
+                        return
+                    }
+                }
+            }
+            model.finishVisualTerminalStreamingBurst()
+            await Task.yield()
+
+            let selectionPreserved = terminal.selectedRange() == originalSelection
+                && originalSelection.length > 0
+            let semanticPromptPreserved = !terminal.semanticTracker.commands.isEmpty
+            let scrollerFrameAfter = terminal.nativeScrollerWindowFrame
+            let scrollerFramePreserved = if let before = scrollerFrameBefore,
+                                            let after = scrollerFrameAfter {
+                abs(before.origin.x - after.origin.x) <= 0.001
+                    && abs(before.origin.y - after.origin.y) <= 0.001
+                    && abs(before.size.width - after.size.width) <= 0.001
+                    && abs(before.size.height - after.size.height) <= 0.001
+            } else {
+                false
+            }
+
+            terminal.prepareForDiscreteScrollInput()
+            terminal.scroll(toPosition: 0)
+            TerminalScrollGestureMonitor.noteGestureForTesting(
+                view: terminal,
+                scrollingUpward: false
+            )
+            let linkHandled = terminal.handleContinuousScroll(
+                scrollingDeltaY: -3.25,
+                hasPreciseScrollingDeltas: true,
+                phase: .changed,
+                momentumPhase: [],
+                routesToNativeScrollback: true
+            )
+            let linkPreserved: Bool
+            if linkHandled,
+               let projection = terminal.continuousScrollSnapshot {
+                let dimensions = terminal.getTerminal().getDims()
+                let optimal = terminal.getOptimalFrameSize().size
+                let scrollerWidth = NSScroller.scrollerWidth(
+                    for: .regular,
+                    scrollerStyle: terminal.scrollerStyle
+                )
+                let cellWidth = (optimal.width - scrollerWidth) / CGFloat(dimensions.cols)
+                let point = NSPoint(
+                    x: cellWidth * 10,
+                    y: terminal.frame.height - projection.rowHeight * 1.5
+                )
+                linkPreserved = terminal.terminalLink(at: point) == "https://kaisola.app"
+            } else {
+                linkPreserved = false
+            }
+
+            terminal.prepareForDiscreteScrollInput()
+            TerminalScrollGestureMonitor.noteGestureForTesting(view: terminal)
+            terminal.scroll(toPosition: 0)
+            _ = terminal.handleContinuousScroll(
+                scrollingDeltaY: 32,
+                hasPreciseScrollingDeltas: true,
+                phase: .ended,
+                momentumPhase: [],
+                routesToNativeScrollback: true
+            )
+            let topRubberBand = terminal.continuousScrollSnapshot?.isRubberBanding == true
+                && terminal.bounds.origin.y > 0
+            terminal.settleContinuousScrollImmediately()
+            let topSettled = terminal.bounds.origin.y == 0
+
+            terminal.resumeLiveFollow()
+            terminal.scrollToLiveBottom()
+            TerminalScrollGestureMonitor.noteGestureForTesting(
+                view: terminal,
+                scrollingUpward: false
+            )
+            _ = terminal.handleContinuousScroll(
+                scrollingDeltaY: -32,
+                hasPreciseScrollingDeltas: true,
+                phase: .ended,
+                momentumPhase: [],
+                routesToNativeScrollback: true
+            )
+            let bottomRubberBand = terminal.continuousScrollSnapshot?.isRubberBanding == true
+                && terminal.bounds.origin.y < 0
+            terminal.settleContinuousScrollImmediately()
+            let bottomSettled = terminal.bounds.origin.y == 0
+            let liveBottomCoherent = terminal.isViewportAtLiveBottom
+
+            terminal.prepareForDiscreteScrollInput()
+            terminal.feed(text: "\u{1B}[?1049h")
+            terminal.reconcileContinuousViewportAfterBufferChange()
+            let alternateScreenPreserved = terminal.getTerminal().isCurrentBufferAlternate
+                && !terminal.handleContinuousScroll(
+                    scrollingDeltaY: 3,
+                    hasPreciseScrollingDeltas: true,
+                    phase: .changed,
+                    momentumPhase: [],
+                    routesToNativeScrollback: true
+                )
+            terminal.feed(text: "\u{1B}[?1049l")
+            terminal.reconcileContinuousViewportAfterBufferChange()
+
+            terminal.feed(text: "\u{1B}[?1000h")
+            let appMouseRoutingPreserved = !terminal.handleContinuousScroll(
+                scrollingDeltaY: 3,
+                hasPreciseScrollingDeltas: true,
+                phase: .changed,
+                momentumPhase: [],
+                routesToNativeScrollback: false
+            )
+            terminal.feed(text: "\u{1B}[?1000l")
+
+            terminal.resumeLiveFollow()
+            terminal.scrollToLiveBottom()
+            let keyboardBottom = terminal.getTerminal().getTopVisibleRow()
+            TerminalScrollGestureMonitor.noteGestureForTesting(view: terminal)
+            terminal.pageUp()
+            let keyboardUp = terminal.getTerminal().getTopVisibleRow()
+            TerminalScrollGestureMonitor.noteGestureForTesting(
+                view: terminal,
+                scrollingUpward: false
+            )
+            terminal.pageDown()
+            let keyboardPagingCoherent = keyboardUp < keyboardBottom
+                && terminal.getTerminal().getTopVisibleRow() > keyboardUp
+                && terminal.continuousScrollSnapshot == nil
+
+            terminal.resumeLiveFollow()
+            terminal.scrollToLiveBottom()
+            let accessibilityBottom = terminal.getTerminal().getTopVisibleRow()
+            let accessibilityUp = terminal.accessibilityPerformDecrement()
+            let accessibilityUpRow = terminal.getTerminal().getTopVisibleRow()
+            let accessibilityDown = terminal.accessibilityPerformIncrement()
+            let accessibilityPagingCoherent = accessibilityUp
+                && accessibilityDown
+                && accessibilityUpRow < accessibilityBottom
+                && terminal.getTerminal().getTopVisibleRow() > accessibilityUpRow
+                && terminal.continuousScrollSnapshot == nil
+            let accessibilityActionNames = Set(
+                terminal.accessibilityCustomActions()?.map(\.name) ?? []
+            )
+            let accessibilityActionsExposed = accessibilityActionNames.contains(
+                "Scroll one page up"
+            ) && accessibilityActionNames.contains("Scroll one page down")
+
+            terminal.resumeLiveFollow()
+            terminal.scrollToLiveBottom()
+            let promptTopBefore = terminal.getTerminal().getTopVisibleRow()
+            let promptNavigationCoherent = terminal.navigateSemanticPrompt(backward: true)
+                && terminal.getTerminal().getTopVisibleRow() < promptTopBefore
+                && terminal.continuousScrollSnapshot == nil
+
+            terminal.prepareForDiscreteScrollInput()
+            TerminalScrollGestureMonitor.noteGestureForTesting(view: terminal)
+            terminal.scroll(toPosition: 0.35)
+            _ = terminal.handleContinuousScroll(
+                scrollingDeltaY: 3.25,
+                hasPreciseScrollingDeltas: true,
+                phase: .changed,
+                momentumPhase: [],
+                routesToNativeScrollback: true
+            )
+            terminal.displayIfNeeded()
+            let finalProjection = terminal.continuousScrollSnapshot
+            let finalFractionalViewport = finalProjection.map {
+                abs($0.offsetWithinAnchor) > 0.1
+                    && abs($0.offsetWithinAnchor) < $0.rowHeight - 0.1
+            } ?? false
+
+            let sortedProcessing = processingMilliseconds.sorted()
+            let p95Index = max(0, Int(ceil(Double(sortedProcessing.count) * 0.95)) - 1)
+            let processingP95 = sortedProcessing.indices.contains(p95Index)
+                ? sortedProcessing[p95Index]
+                : .infinity
+            let sampleIntervals = zip(sampleTimestamps.dropFirst(), sampleTimestamps)
+                .map { ($0.0 - $0.1) * 1_000 }
+            let sortedSampleIntervals = sampleIntervals.sorted()
+            let cadenceP95Index = max(
+                0,
+                Int(ceil(Double(sortedSampleIntervals.count) * 0.95)) - 1
+            )
+            let cadenceP95 = sortedSampleIntervals.indices.contains(cadenceP95Index)
+                ? sortedSampleIntervals[cadenceP95Index]
+                : .infinity
+            let sampleDurationMilliseconds: Double = if let first = sampleTimestamps.first,
+                                                        let last = sampleTimestamps.last {
+                (last - first) * 1_000
+            } else {
+                Double.infinity
+            }
+            let measuredHertz = sampleDurationMilliseconds.isFinite
+                && sampleDurationMilliseconds > 0
+                ? Double(sampleIntervals.count) / (sampleDurationMilliseconds / 1_000)
+                : 0
+            let sampleTimestampsMilliseconds = sampleTimestamps.first.map { first in
+                sampleTimestamps.map { ($0 - first) * 1_000 }
+            } ?? []
+            let remountedTerminal = window.contentView.flatMap {
+                self.firstTerminalView(in: $0)
+            }
+            let viewIdentityPreserved = remountedTerminal.map {
+                ObjectIdentifier($0) == originalIdentity && $0 === terminal
+            } ?? false
+            let coordinatorIdentityPreserved = if let remountedTerminal,
+                                                   let originalCoordinatorIdentity,
+                                                   let coordinator = remountedTerminal.terminalDelegate
+                                                    as? NativeTerminalSurface.Coordinator {
+                ObjectIdentifier(coordinator) == originalCoordinatorIdentity
+            } else {
+                false
+            }
+            let terminalEngineIdentityPreserved = remountedTerminal.map {
+                ObjectIdentifier($0.getTerminal()) == originalTerminalEngineIdentity
+            } ?? false
+            let environment = ProcessInfo.processInfo.environment
+            let fixtureBuildNumber = Int(
+                Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+            ) ?? -1
+            let feedBuildFloor = Int(
+                environment["KAISOLA_NATIVE_VISUAL_FEED_BUILD_FLOOR"] ?? ""
+            ) ?? Int.max
+            let expectedCursorAfter = cursorBefore + VisualTerminalStreamingFixture.packetIndices.reduce(Int64(0)) {
+                $0 + Int64(VisualTerminalStreamingFixture.packet(index: $1).utf8.count)
+            }
+            let cursorAfter = model.terminalDocument.cursor?.offset ?? -1
+            let buffer = terminal.getTerminal().getBufferAsData()
+            let finalMarkerPresent = String(data: buffer, encoding: .utf8)?
+                .contains(VisualTerminalStreamingFixture.finalMarker) == true
+
+            self.visualContinuousScrollReceipt = VisualTerminalContinuousScrollReceipt(
+                optimizedBuild: !_isDebugAssertConfiguration(),
+                scheduledHertz: 120,
+                measuredHertz: measuredHertz,
+                sampleCount: 120,
+                sampleIntervalCount: sampleIntervals.count,
+                sampleTimestampsMilliseconds: sampleTimestampsMilliseconds,
+                sampleDurationMilliseconds: sampleDurationMilliseconds,
+                cadenceP95Milliseconds: cadenceP95,
+                handledSampleCount: handledSampleCount,
+                momentumSampleCount: 48,
+                distinctOriginCount: distinctOrigins.count,
+                maximumAnchorStep: maximumAnchorStep,
+                maximumContinuityError: Double(maximumContinuityError),
+                processingP95Milliseconds: processingP95,
+                scrollbarMaximumError: scrollbarMaximumError,
+                topRubberBand: topRubberBand,
+                bottomRubberBand: bottomRubberBand,
+                edgesSettled: topSettled && bottomSettled,
+                selectionPreserved: selectionPreserved,
+                linkPreserved: linkPreserved,
+                semanticPromptPreserved: semanticPromptPreserved,
+                promptNavigationCoherent: promptNavigationCoherent,
+                keyboardPagingCoherent: keyboardPagingCoherent,
+                accessibilityPagingCoherent: accessibilityPagingCoherent,
+                accessibilityActionsExposed: accessibilityActionsExposed,
+                scrollerFramePreserved: scrollerFramePreserved,
+                alternateScreenPreserved: alternateScreenPreserved,
+                appMouseRoutingPreserved: appMouseRoutingPreserved,
+                liveBottomCoherent: liveBottomCoherent,
+                viewIdentityPreserved: viewIdentityPreserved,
+                coordinatorIdentityPreserved: coordinatorIdentityPreserved,
+                terminalEngineIdentityPreserved: terminalEngineIdentityPreserved,
+                finalFractionalViewport: finalFractionalViewport,
+                fixtureUpdaterDisabled: !self.updateController.startedUpdater,
+                fixtureBrokerIsolated: model.usesBrokerFreeFixturePreparer,
+                fixtureBuildNumber: fixtureBuildNumber,
+                feedBuildFloor: feedBuildFloor,
+                cursorBefore: cursorBefore,
+                cursorAfter: cursorAfter,
+                expectedCursorAfter: expectedCursorAfter,
+                finalMarkerPresent: finalMarkerPresent
+            )
+            self.visualStreamingFixtureTask = nil
+        }
+    }
+
+    /// Drive a real SwiftUI/AppKit ownership transition against the exact
+    /// maximum retained transcript. This fixture is broker-free and runs only
+    /// under `KAISOLA_NATIVE_VISUAL_FIXTURE=1`; its receipt proves that the
+    /// mounted view/parser state never changed while input was revoked.
+    private func scheduleVisualTerminalOwnershipFlapFixture(
+        in window: NSWindow,
+        model: AppModel
+    ) {
+        visualOwnershipFlapTask?.cancel()
+        visualOwnershipFlapTask = Task { @MainActor [weak self, weak window, weak model] in
+            guard let self, let window, let model else { return }
+            let expectedBytes = TerminalDocument.maximumRetainedBytes
+            let readyDeadline = ContinuousClock().now.advanced(by: .seconds(20))
+            var mountedView: OwnedTerminalView?
+            var mountedCoordinator: NativeTerminalSurface.Coordinator?
+            while ContinuousClock().now < readyDeadline, !Task.isCancelled {
+                window.displayIfNeeded()
+                if let view = window.contentView.flatMap({ self.firstTerminalView(in: $0) })
+                    as? OwnedTerminalView,
+                   let coordinator = view.terminalDelegate
+                    as? NativeTerminalSurface.Coordinator,
+                   !coordinator.isProgressivelyReplaying,
+                   coordinator.replayMetrics.fullReplayStarts == 1,
+                   coordinator.replayMetrics.progressiveBytesFed == expectedBytes {
+                    mountedView = view
+                    mountedCoordinator = coordinator
+                    break
+                }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            guard !Task.isCancelled,
+                  let view = mountedView,
+                  let coordinator = mountedCoordinator else {
+                self.emitVisualOwnershipFlapReceipt(ok: false, reason: "surface-not-ready")
+                self.requestVisualFixtureTermination()
+                return
+            }
+
+            let terminal = view.getTerminal()
+            guard let linkAnchor = self.visualOwnershipLinkAnchor(in: terminal) else {
+                self.emitVisualOwnershipFlapReceipt(ok: false, reason: "missing-explicit-link")
+                self.requestVisualFixtureTermination()
+                return
+            }
+            view.selectAll(nil)
+            TerminalScrollGestureMonitor.noteGestureForTesting(view: view)
+            view.scroll(toPosition: 0.35)
+            coordinator.scrolled(source: view, position: view.scrollPosition)
+            let initialSelection = view.getSelection()
+            let initialState = self.visualOwnershipSurfaceState(
+                view: view,
+                coordinator: coordinator,
+                linkPosition: linkAnchor.position
+            )
+            let initialMetrics = coordinator.replayMetrics
+            let viewIdentity = ObjectIdentifier(view)
+            let coordinatorIdentity = ObjectIdentifier(coordinator)
+            let terminalIdentity = ObjectIdentifier(terminal)
+            let linkPresent = linkAnchor.url == VisualTerminalOwnershipFlapFixture.linkURL
+                && initialState.explicitLinkURL == VisualTerminalOwnershipFlapFixture.linkURL
+            guard initialSelection != nil,
+                  !coordinator.isFollowingLiveOutput,
+                  linkPresent,
+                  initialMetrics == .init(
+                    fullReplayStarts: 1,
+                    scheduledProgressiveBytes: expectedBytes,
+                    progressiveBytesFed: expectedBytes,
+                    synchronousReplayBytes: 0
+                  ) else {
+                self.emitVisualOwnershipFlapReceipt(ok: false, reason: "invalid-initial-state")
+                self.requestVisualFixtureTermination()
+                return
+            }
+
+            var samples: [Double] = []
+            var revokedPresentationObserved = true
+            var stateStayedExact = true
+            var scrollStayedExact = true
+            var cursorStayedExact = true
+            var linkStayedExact = true
+            var liveFollowStayedExact = true
+            let recordState: (VisualOwnershipSurfaceState) -> Void = { state in
+                stateStayedExact = stateStayedExact && state == initialState
+                scrollStayedExact = scrollStayedExact
+                    && state.topVisibleRow == initialState.topVisibleRow
+                    && state.scrollPosition == initialState.scrollPosition
+                cursorStayedExact = cursorStayedExact
+                    && state.cursorX == initialState.cursorX
+                    && state.cursorY == initialState.cursorY
+                    && state.cursorStyle == initialState.cursorStyle
+                linkStayedExact = linkStayedExact
+                    && state.linkMode == initialState.linkMode
+                    && state.explicitLinkURL == initialState.explicitLinkURL
+                liveFollowStayedExact = liveFollowStayedExact
+                    && state.followsLiveOutput == initialState.followsLiveOutput
+            }
+
+            for toast in ToastCenter.shared.toasts
+                where toast.message.hasSuffix(AppModel.terminalInputDiscardNoticeSuffix)
+                    || toast.message == AppModel.terminalInputDiscardAggregateNotice {
+                ToastCenter.shared.dismiss(toast.id)
+            }
+            let queuedInputSecrets = [
+                "visual-stale-text-secret",
+                "private visual paste",
+            ]
+            let queuedInputs = [
+                queuedInputSecrets[0],
+                "\u{1B}[A",
+                "\u{1B}[200~\(queuedInputSecrets[1])\r\u{1B}[201~",
+                "\r",
+            ]
+            for data in queuedInputs {
+                model.sendInput(data, to: "visual-terminal")
+            }
+
+            var discardNoticeVisible = false
+            var discardNoticeRedacted = false
+            for _ in 0..<7 {
+                let started = ProcessInfo.processInfo.systemUptime
+                guard model.setVisualFixtureTerminalOwnership(false),
+                      await self.waitForVisualTerminalAuthorization(
+                        false,
+                        view: view,
+                        coordinator: coordinator,
+                        window: window
+                      ) else {
+                    self.emitVisualOwnershipFlapReceipt(ok: false, reason: "revoke-timeout")
+                    self.requestVisualFixtureTermination()
+                    return
+                }
+                let discardNotices = ToastCenter.shared.toasts.filter {
+                    $0.message.hasSuffix(AppModel.terminalInputDiscardNoticeSuffix)
+                        || $0.message == AppModel.terminalInputDiscardAggregateNotice
+                }
+                discardNoticeVisible = discardNoticeVisible || discardNotices.count == 1
+                discardNoticeRedacted = discardNoticeRedacted
+                    || (discardNotices.count == 1 && queuedInputSecrets.allSatisfy {
+                        !discardNotices[0].message.contains($0)
+                    })
+                revokedPresentationObserved = revokedPresentationObserved
+                    && !view.allowMouseReporting
+                    && view.accessibilityLabel() == "Read-only terminal output"
+                recordState(self.visualOwnershipSurfaceState(
+                    view: view,
+                    coordinator: coordinator,
+                    linkPosition: linkAnchor.position
+                ))
+                stateStayedExact = stateStayedExact
+                    && coordinator.replayMetrics == initialMetrics
+
+                guard model.setVisualFixtureTerminalOwnership(true),
+                      await self.waitForVisualTerminalAuthorization(
+                        true,
+                        view: view,
+                        coordinator: coordinator,
+                        window: window
+                      ) else {
+                    self.emitVisualOwnershipFlapReceipt(ok: false, reason: "restore-timeout")
+                    self.requestVisualFixtureTermination()
+                    return
+                }
+                samples.append((ProcessInfo.processInfo.systemUptime - started) * 1_000)
+                recordState(self.visualOwnershipSurfaceState(
+                    view: view,
+                    coordinator: coordinator,
+                    linkPosition: linkAnchor.position
+                ))
+                stateStayedExact = stateStayedExact
+                    && coordinator.replayMetrics == initialMetrics
+            }
+
+            let sortedSamples = samples.sorted()
+            let p95Index = max(0, Int(ceil(Double(sortedSamples.count) * 0.95)) - 1)
+            let p95Milliseconds = sortedSamples[p95Index]
+            let sameView = ObjectIdentifier(view) == viewIdentity
+            let sameCoordinator = ObjectIdentifier(coordinator) == coordinatorIdentity
+                && (view.terminalDelegate as? NativeTerminalSurface.Coordinator) === coordinator
+            let sameTerminal = ObjectIdentifier(view.getTerminal()) == terminalIdentity
+            let mountedViewStable = window.contentView.flatMap({ self.firstTerminalView(in: $0) }) === view
+            let identitiesStable = sameView && sameCoordinator && sameTerminal && mountedViewStable
+            let selectionStable = view.getSelection() == initialSelection
+                && view.selectedRange() == initialState.selectionRange
+            let ok = identitiesStable
+                && stateStayedExact
+                && selectionStable
+                && revokedPresentationObserved
+                && discardNoticeVisible
+                && discardNoticeRedacted
+                && view.isInputAuthorized
+                && coordinator.replayMetrics == initialMetrics
+
+            self.emitVisualOwnershipFlapReceipt(
+                ok: ok,
+                reason: ok ? nil : "state-changed",
+                fields: [
+                    "bytes": expectedBytes,
+                    "samples": samples.count,
+                    "p95Milliseconds": p95Milliseconds,
+                    "sameView": sameView,
+                    "sameCoordinator": sameCoordinator,
+                    "sameTerminal": sameTerminal,
+                    "mountedView": mountedViewStable,
+                    "selectionStable": selectionStable,
+                    "scrollStable": scrollStayedExact,
+                    "cursorStable": cursorStayedExact,
+                    "linkStable": linkPresent && linkStayedExact,
+                    "liveFollowStable": liveFollowStayedExact,
+                    "revokedPresentationObserved": revokedPresentationObserved,
+                    "discardNoticeVisible": discardNoticeVisible,
+                    "discardNoticeRedacted": discardNoticeRedacted,
+                    "additionalReplayStarts": coordinator.replayMetrics.fullReplayStarts
+                        - initialMetrics.fullReplayStarts,
+                ]
+            )
+            self.visualOwnershipFlapTask = nil
+            if !ok { self.requestVisualFixtureTermination() }
+        }
+    }
+
+    private func waitForVisualTerminalAuthorization(
+        _ expected: Bool,
+        view: OwnedTerminalView,
+        coordinator: NativeTerminalSurface.Coordinator,
+        window: NSWindow
+    ) async -> Bool {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(5))
+        while ContinuousClock().now < deadline, !Task.isCancelled {
+            window.displayIfNeeded()
+            if view.isInputAuthorized == expected,
+               window.contentView.flatMap({ firstTerminalView(in: $0) }) === view,
+               (view.terminalDelegate as? NativeTerminalSurface.Coordinator) === coordinator {
+                return true
+            }
+            await Task.yield()
+        }
+        return false
+    }
+
+    private func visualOwnershipSurfaceState(
+        view: OwnedTerminalView,
+        coordinator: NativeTerminalSurface.Coordinator,
+        linkPosition: Position
+    ) -> VisualOwnershipSurfaceState {
+        let terminal = view.getTerminal()
+        let cursor = terminal.getCursorLocation()
+        return VisualOwnershipSurfaceState(
+            selectionRange: view.selectedRange(),
+            topVisibleRow: terminal.getTopVisibleRow(),
+            scrollPosition: view.scrollPosition,
+            cursorX: cursor.x,
+            cursorY: cursor.y,
+            cursorStyle: String(describing: terminal.options.cursorStyle),
+            linkMode: String(describing: view.linkHighlightMode),
+            explicitLinkURL: terminal.link(
+                at: .buffer(linkPosition),
+                mode: .explicitOnly
+            ),
+            workingDirectory: coordinator.workingDirectory,
+            followsLiveOutput: coordinator.isFollowingLiveOutput
+        )
+    }
+
+    /// Resolve the OSC 8 fixture while it is still at live bottom, then retain
+    /// its absolute buffer coordinate while the viewport scrolls away. Checking
+    /// raw visible text is insufficient: a parser reset can preserve glyphs
+    /// while discarding their hyperlink payload.
+    private func visualOwnershipLinkAnchor(
+        in terminal: Terminal
+    ) -> (position: Position, url: String)? {
+        let topVisibleRow = terminal.getTopVisibleRow()
+        for row in stride(from: terminal.rows - 1, through: 0, by: -1) {
+            for column in 0..<terminal.cols {
+                let screenPosition = Position(col: column, row: row)
+                guard let url = terminal.link(
+                    at: .screen(screenPosition),
+                    mode: .explicitOnly
+                ) else { continue }
+                return (
+                    Position(col: column, row: topVisibleRow + row),
+                    url
+                )
+            }
+        }
+        return nil
+    }
+
+    private func emitVisualOwnershipFlapReceipt(
+        ok: Bool,
+        reason: String?,
+        fields: [String: Any] = [:]
+    ) {
+        var payload = fields
+        payload["schemaVersion"] = 1
+        payload["ok"] = ok
+        if let reason { payload["reason"] = reason }
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.sortedKeys]
+        ) else { return }
+        print(
+            "KAISOLA_NATIVE_VISUAL_OWNERSHIP_FLAP="
+                + String(decoding: data, as: UTF8.self)
+        )
     }
 
     private func firstWebView(in view: NSView) -> WKWebView? {
@@ -3103,13 +4177,55 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
     private var settingsWindow: NSWindow?
 
-    /// Settings, opened on the Agents pane. The composer's agent menu offers
-    /// "Manage agents…" as the answer to "why can this agent not chat?", and
-    /// landing on whichever pane was last visited would not answer it.
+    /// The composer's "Manage agents…" affordance lands on the exact registry
+    /// inside Extensions, rather than on the built-in Agents overview.
     /// `openSettings` re-installs the content in both its branches, so setting
     /// the remembered section first is all the deep link needs.
     @objc func openAgentSettings(_ sender: Any?) {
-        settingsSelectedSectionID = "agents"
+        settingsSelectedSectionID = ExtensionsSettingsRoute(
+            category: .customAgents,
+            itemID: nil
+        ).rawValue
+        openSettings(sender)
+    }
+
+    @objc func openExtensionSettings(_ sender: Any?) {
+        let candidate = sender as? String
+            ?? (sender as? NSMenuItem)?.representedObject as? String
+        settingsSelectedSectionID = ExtensionsSettingsRoute.parse(candidate)?.rawValue
+            ?? ExtensionsSettingsRoute(category: nil, itemID: nil).rawValue
+        openSettings(sender)
+    }
+
+    @objc func openMcpSettings(_ sender: Any?) {
+        settingsSelectedSectionID = ExtensionsSettingsRoute(
+            category: .mcpServers,
+            itemID: nil
+        ).rawValue
+        openSettings(sender)
+    }
+
+    @objc func openTerminalThemeSettings(_ sender: Any?) {
+        settingsSelectedSectionID = ExtensionsSettingsRoute(
+            category: .terminalThemes,
+            itemID: nil
+        ).rawValue
+        openSettings(sender)
+    }
+
+    @objc func openGrammarSettings(_ sender: Any?) {
+        settingsSelectedSectionID = ExtensionsSettingsRoute(
+            category: .languageGrammars,
+            itemID: nil
+        ).rawValue
+        openSettings(sender)
+    }
+
+    @objc func openPreviewMappingSettings(_ sender: Any?) {
+        settingsSelectedSectionID = ExtensionsSettingsRoute(
+            category: .previewMappings,
+            itemID: nil
+        ).rawValue
         openSettings(sender)
     }
 
@@ -3726,6 +4842,130 @@ enum NativeVisualCaptureTarget {
     }
 }
 
+struct NativeVisualExtensionsSettingsReceipt: Codable, Equatable {
+    let surface: String
+    let contentWidth: CGFloat
+    let contentHeight: CGFloat
+    let categoryCount: Int
+    let itemCount: Int
+    let invalidCount: Int
+    let accessibilityIdentifiers: [String]
+    let accessibilityLabels: [String]
+    let fixtureUpdaterDisabled: Bool
+    let fixtureBrokerIsolated: Bool
+
+    var failure: String? {
+        guard surface == "settings-extensions" || surface == "settings-extensions-narrow" else {
+            return "unexpected-surface"
+        }
+        guard categoryCount == ExtensionsSettingsCategory.allCases.count else {
+            return "missing-registry-category-\(categoryCount)"
+        }
+        guard itemCount >= ExtensionsSettingsCategory.allCases.count else {
+            return "missing-fixture-entry-\(itemCount)"
+        }
+        guard invalidCount == 1 else { return "wrong-invalid-count-\(invalidCount)" }
+        guard fixtureUpdaterDisabled else { return "fixture-updater-started" }
+        guard fixtureBrokerIsolated else { return "fixture-broker-route-live" }
+        guard contentHeight >= 540 else { return "content-too-short-\(contentHeight)" }
+        if surface == "settings-extensions" {
+            guard contentWidth >= 1_050 else { return "wide-content-too-narrow-\(contentWidth)" }
+        } else {
+            guard (800...900).contains(contentWidth) else {
+                return "narrow-content-out-of-range-\(contentWidth)"
+            }
+        }
+
+        let identifiers = Set(accessibilityIdentifiers)
+        guard identifiers.contains("extensions.hub") else { return "missing-hub-ax" }
+        guard accessibilityLabels.contains(where: {
+            $0.localizedCaseInsensitiveContains("Search extensions")
+        }) else { return "missing-search-label-ax" }
+        if surface == "settings-extensions-narrow" {
+            guard accessibilityLabels.contains(where: {
+                $0.localizedCaseInsensitiveContains("Extension category")
+            }) else { return "missing-compact-picker-label-ax" }
+        }
+        let joined = accessibilityLabels.joined(separator: " ").lowercased()
+        guard !joined.contains("fixture-secret") else { return "secret-leaked-to-ax" }
+        return nil
+    }
+
+    var json: String? {
+        guard let data = try? JSONEncoder().encode(self) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+}
+
+@MainActor
+enum NativeVisualAccessibilitySnapshot {
+    struct Snapshot {
+        var identifiers = Set<String>()
+        var labels = Set<String>()
+    }
+
+    /// Read the mounted AppKit/SwiftUI AX graph, including SwiftUI's virtual
+    /// `NSAccessibilityProtocol` descendants. SwiftUI's bridge vends private
+    /// protocol-conforming objects rather than necessarily concrete
+    /// `NSAccessibilityElement` instances, and navigation-order children are
+    /// sometimes the first projection it materializes. The view hierarchy is a
+    /// fallback only to reach hosting containers; acceptance still requires the
+    /// identifiers and labels returned by mounted AX objects themselves.
+    static func capture(from root: NSView) -> Snapshot {
+        var snapshot = Snapshot()
+        var visited = Set<ObjectIdentifier>()
+        if let window = root.window {
+            walk(window, depth: 0, visited: &visited, snapshot: &snapshot)
+        }
+        walk(root, depth: 0, visited: &visited, snapshot: &snapshot)
+        if let descendant = NSAccessibility.unignoredDescendant(of: root) {
+            walk(descendant, depth: 0, visited: &visited, snapshot: &snapshot)
+        }
+        return snapshot
+    }
+
+    private static func walk(
+        _ value: Any,
+        depth: Int,
+        visited: inout Set<ObjectIdentifier>,
+        snapshot: inout Snapshot
+    ) {
+        guard depth < 40, visited.count < 4_000 else { return }
+        let object = value as AnyObject
+        guard visited.insert(ObjectIdentifier(object)).inserted else { return }
+
+        if let element = value as? any NSAccessibilityProtocol {
+            record(
+                identifier: element.accessibilityIdentifier(),
+                label: element.accessibilityLabel(),
+                in: &snapshot
+            )
+            let childGroups = [
+                element.accessibilityChildren() ?? [],
+                element.accessibilityChildrenInNavigationOrder() ?? [],
+                element.accessibilityContents() ?? [],
+            ]
+            for child in NSAccessibility.unignoredChildren(from: childGroups.flatMap { $0 }) {
+                walk(child, depth: depth + 1, visited: &visited, snapshot: &snapshot)
+            }
+        }
+        if let view = value as? NSView {
+            for subview in view.subviews {
+                walk(subview, depth: depth + 1, visited: &visited, snapshot: &snapshot)
+            }
+        }
+    }
+
+    private static func record(
+        identifier: String?,
+        label: String?,
+        in snapshot: inout Snapshot
+    ) {
+        if let identifier, !identifier.isEmpty { snapshot.identifiers.insert(identifier) }
+        if let label, !label.isEmpty { snapshot.labels.insert(label) }
+    }
+}
+
 /// A pixel-perfect fixture can still be unusable to VoiceOver if its custom
 /// terminal view exposes the raw PTY stream. Gate the real, laid-out AppKit
 /// surface before capture: ordinary terminal fixtures must contain their
@@ -3742,6 +4982,8 @@ enum NativeVisualTerminalAccessibilityGate {
             return ["swift test", "Test Suite 'KaisolaTests' passed", "git status --short"]
         case "terminal-scroll-output":
             return ["historical-anchor-"]
+        case "terminal-continuous-scroll":
+            return ["continuous-anchor-"]
         default:
             return nil
         }

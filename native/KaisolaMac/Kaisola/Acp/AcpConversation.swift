@@ -274,6 +274,7 @@ final class AcpConversation: ObservableObject {
     private let clientFactory: @MainActor () -> AcpClient
     private let command: String
     private let arguments: [String]
+    private let containment: CustomAdapterContainment?
     private let environment: [String: String]
     private let cwd: String
     private let mcpServers: [JSONValue]
@@ -315,6 +316,7 @@ final class AcpConversation: ObservableObject {
         title: String,
         command: String,
         arguments: [String],
+        containment: CustomAdapterContainment? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         cwd: String,
         mcpServers: [JSONValue] = [],
@@ -336,6 +338,7 @@ final class AcpConversation: ObservableObject {
         self.title = title
         self.command = command
         self.arguments = arguments
+        self.containment = containment
         self.environment = environment
         self.cwd = cwd
         self.mcpServers = mcpServers
@@ -387,13 +390,24 @@ final class AcpConversation: ObservableObject {
         }
         await client.configureFsGuard(sensitiveGlobs: sensitiveGlobs)
         do {
-            let info = try await client.start(
+            let launch = try containment.map {
+                try $0.prepare(environment: environment, cwd: cwd)
+            } ?? AcpAdapterLaunch(
                 command: command,
                 arguments: arguments,
                 environment: environment,
                 cwd: cwd,
+                access: .unrestricted,
+                sandboxProfile: nil
+            )
+            let info = try await client.start(
+                command: launch.command,
+                arguments: launch.arguments,
+                environment: launch.environment,
+                cwd: launch.cwd,
                 mcpServers: mcpServers,
-                resumeSessionID: providerSessionID ?? resumeSessionID
+                resumeSessionID: providerSessionID ?? resumeSessionID,
+                access: launch.access
             )
             providerSessionID = info.sessionID
             onProviderSessionID?(info.sessionID)

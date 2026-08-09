@@ -972,6 +972,65 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    func testTerminalWriteTimeoutDegradesOnlyThatTerminal() async throws {
+        let fixture = try VisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        await fixture.control.failNextWrite(to: "visual-terminal")
+
+        fixture.model.sendInput("uncertain", to: "visual-terminal")
+        await waitUntil {
+            fixture.model.isTerminalInputDegraded("visual-terminal")
+        }
+
+        XCTAssertTrue(fixture.model.connectionState.isConnected)
+        XCTAssertTrue(fixture.model.controlAvailable)
+        XCTAssertTrue(fixture.model.isOwned("visual-terminal"))
+        XCTAssertTrue(fixture.model.isOwned("visual-codex"))
+        let failedTerminalAttemptCount = await fixture.control.writeAttemptCount(for: "visual-terminal")
+        XCTAssertEqual(
+            failedTerminalAttemptCount,
+            1,
+            "a timed-out terminal.write has an unknown outcome and must never be replayed"
+        )
+
+        fixture.model.sendInput("must stay blocked", to: "visual-terminal")
+        await Task.yield()
+        let blockedTerminalAttemptCount = await fixture.control.writeAttemptCount(for: "visual-terminal")
+        XCTAssertEqual(
+            blockedTerminalAttemptCount,
+            1,
+            "later input must remain quarantined until the controller is explicitly re-established"
+        )
+
+        fixture.model.sendInput("still works", to: "visual-codex")
+        await waitUntil { await fixture.control.writes().count == 1 }
+
+        let successfulWrites = await fixture.control.writes()
+        XCTAssertEqual(successfulWrites, ["still works"])
+        XCTAssertFalse(fixture.model.isTerminalInputDegraded("visual-codex"))
+        XCTAssertTrue(fixture.model.isOwned("visual-codex"))
+
+        let controllerConnectionsBeforeRecovery = await fixture.control.connectionCount()
+        await fixture.model.recoverTerminalInput("visual-terminal")
+        XCTAssertFalse(fixture.model.isTerminalInputDegraded("visual-terminal"))
+        XCTAssertTrue(fixture.model.isOwned("visual-terminal"))
+        let targetedAttachCalls = await fixture.control.attachCalls()
+        XCTAssertEqual(targetedAttachCalls, ["visual-terminal"])
+        let controllerConnectionsAfterRecovery = await fixture.control.connectionCount()
+        XCTAssertEqual(
+            controllerConnectionsAfterRecovery,
+            controllerConnectionsBeforeRecovery,
+            "recovering one terminal must not reconnect the shared controller or observer"
+        )
+
+        fixture.model.sendInput("resumed", to: "visual-terminal")
+        await waitUntil { await fixture.control.writes().count == 2 }
+        let writesAfterRecovery = await fixture.control.writes()
+        XCTAssertEqual(writesAfterRecovery, ["still works", "resumed"])
+        await fixture.model.disconnect()
+    }
+
     func testInputToAnUnownedTerminalExplainsItselfInsteadOfVanishing() async throws {
         let fixture = try Fixture(failingConnectAttempts: Set(2...20))
         defer { fixture.cleanUp() }
@@ -1098,6 +1157,8 @@ private struct RecordedTerminalResize: Equatable, Sendable {
 private actor RecordingBrokerControlClient: BrokerControlServing {
     private var recordedResizes: [RecordedTerminalResize] = []
     private var recordedWrites: [String] = []
+    private var writeFailuresRemainingByTerminalID: [String: Int] = [:]
+    private var writeAttemptCountsByTerminalID: [String: Int] = [:]
     private var disconnectHandler: (@Sendable (any Error) -> Void)?
     private var connectCount = 0
     private var recordedAttaches: [String] = []
@@ -1136,6 +1197,11 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
         // Yield here so the test exercises AppModel's serializer rather than
         // accidentally relying on immediately completing actor calls.
         await Task.yield()
+        writeAttemptCountsByTerminalID[terminalID, default: 0] += 1
+        if writeFailuresRemainingByTerminalID[terminalID, default: 0] > 0 {
+            writeFailuresRemainingByTerminalID[terminalID, default: 0] -= 1
+            throw BrokerClientError.requestTimedOut
+        }
         recordedWrites.append(data)
     }
 
@@ -1152,6 +1218,12 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
 
     func resizeCalls() -> [RecordedTerminalResize] { recordedResizes }
     func writes() -> [String] { recordedWrites }
+    func failNextWrite(to terminalID: String) {
+        writeFailuresRemainingByTerminalID[terminalID, default: 0] += 1
+    }
+    func writeAttemptCount(for terminalID: String) -> Int {
+        writeAttemptCountsByTerminalID[terminalID, default: 0]
+    }
     func connectionCount() -> Int { connectCount }
     func attachCalls() -> [String] { recordedAttaches }
     func simulateDisconnect() { disconnectHandler?(BrokerClientError.connectionClosed) }

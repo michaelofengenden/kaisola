@@ -408,6 +408,18 @@ struct NativeSessionStore: Sendable {
         write(payload)
     }
 
+    /// Forget one launch suggestion without touching the folder or its project
+    /// record. The Run on picker uses this for history hygiene; it is not a
+    /// project deletion operation.
+    func removeRecentFolder(_ path: String) {
+        guard var payload = read() else { return }
+        let normalized = (path as NSString).standardizingPath
+        var recents = payload.recentFolders ?? []
+        recents.removeAll { ($0 as NSString).standardizingPath == normalized }
+        payload.recentFolders = recents
+        write(payload)
+    }
+
     func lastSelectedSessionID() -> String? {
         read()?.lastSelectedSessionID
     }

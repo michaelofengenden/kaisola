@@ -430,10 +430,17 @@ final class TerminalTranscriptTests: XCTestCase {
             warningMiB: 1_024
         ))
         XCTAssertEqual(TerminalHistoryStoragePolicy.budgetLabel(2_048), "2 GB")
+        // The warning still deletes nothing. It now names the broker's disk
+        // quota as the one thing that does, instead of promising history is
+        // never trimmed at all.
         XCTAssertTrue(TerminalHistoryStoragePolicy.help(
             diskBytes: 1_073_741_824,
             warningMiB: 1_024
-        ).contains("never deletes earlier output automatically"))
+        ).contains("crossing this warning deletes nothing"))
+        XCTAssertTrue(TerminalHistoryStoragePolicy.help(
+            diskBytes: 1_073_741_824,
+            warningMiB: 1_024
+        ).contains("disk quota"))
     }
 
     func testExportFileNameIsPortableAndNeverEmpty() {

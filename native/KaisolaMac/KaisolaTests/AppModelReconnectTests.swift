@@ -860,6 +860,105 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    func testOversizedTerminalPasteChunksOnUnicodeScalarBoundariesAndReportsAcknowledgedBytes() async throws {
+        let fixture = try GatedVisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        let payload = String(repeating: "aé🙂", count: 10_000)
+        XCTAssertGreaterThan(payload.utf8.count, AppModel.terminalWritePayloadByteLimit)
+
+        fixture.model.sendInput(payload, to: "visual-terminal")
+        await fixture.control.waitForAttemptCount(1)
+
+        let initialAttempts = await fixture.control.writeAttempts()
+        let firstAttempt = try XCTUnwrap(initialAttempts.first)
+        XCTAssertLessThanOrEqual(
+            firstAttempt.utf8.count,
+            AppModel.terminalWritePayloadByteLimit
+        )
+        XCTAssertEqual(
+            fixture.model.terminalPasteProgress(for: "visual-terminal"),
+            TerminalPasteProgress(sentBytes: 0, totalBytes: payload.utf8.count)
+        )
+
+        await fixture.control.resolveAttempt(0, with: .success)
+        await fixture.control.waitForAttemptCount(2)
+        await waitUntil {
+            fixture.model.terminalPasteProgress(for: "visual-terminal")?.sentBytes
+                == firstAttempt.utf8.count
+        }
+        let attemptsAfterFirstAcknowledgement = await fixture.control.writeAttempts()
+        let secondAttempt = attemptsAfterFirstAcknowledgement[1]
+        XCTAssertLessThanOrEqual(
+            secondAttempt.utf8.count,
+            AppModel.terminalWritePayloadByteLimit
+        )
+
+        await fixture.control.resolveAttempt(1, with: .success)
+        await waitUntil {
+            fixture.model.terminalPasteProgress(for: "visual-terminal") == nil
+        }
+        let attempts = await fixture.control.writeAttempts()
+        XCTAssertEqual(attempts.joined(), payload)
+        XCTAssertTrue(attempts.allSatisfy {
+            $0.utf8.count <= AppModel.terminalWritePayloadByteLimit
+        })
+        await fixture.model.disconnect()
+    }
+
+    func testOversizedBracketedPasteClosesEveryCancellableChunk() {
+        let opening = "\u{1B}[200~"
+        let closing = "\u{1B}[201~"
+        let body = String(
+            repeating: "aé🙂",
+            count: AppModel.terminalWritePayloadByteLimit / 4
+        )
+
+        let chunks = AppModel.terminalWriteChunks(opening + body + closing)
+
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertTrue(chunks.allSatisfy {
+            $0.hasPrefix(opening)
+                && $0.hasSuffix(closing)
+                && $0.utf8.count <= AppModel.terminalWritePayloadByteLimit
+        })
+        XCTAssertEqual(
+            chunks.map {
+                String($0.dropFirst(opening.count).dropLast(closing.count))
+            }.joined(),
+            body,
+            "Cancelling between chunks must not strand the terminal inside bracketed-paste mode."
+        )
+    }
+
+    func testCancellingOversizedTerminalPasteDropsOnlyUnsentChunks() async throws {
+        let fixture = try GatedVisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        let payload = String(
+            repeating: "x",
+            count: AppModel.terminalWritePayloadByteLimit * 2 + 1
+        )
+
+        fixture.model.sendInput(payload, to: "visual-terminal")
+        await fixture.control.waitForAttemptCount(1)
+        XCTAssertNotNil(fixture.model.terminalPasteProgress(for: "visual-terminal"))
+
+        fixture.model.cancelTerminalPaste(for: "visual-terminal")
+        XCTAssertNil(fixture.model.terminalPasteProgress(for: "visual-terminal"))
+        await fixture.control.resolveAttempt(0, with: .success)
+        await Task.yield()
+        fixture.model.sendInput("live", to: "visual-terminal")
+        await fixture.control.waitForAttemptCount(2)
+
+        let attempts = await fixture.control.writeAttempts()
+        XCTAssertEqual(attempts.count, 2)
+        XCTAssertEqual(attempts[0].utf8.count, AppModel.terminalWritePayloadByteLimit)
+        XCTAssertEqual(attempts[1], "live")
+        await fixture.control.resolveAttempt(1, with: .success)
+        await fixture.model.disconnect()
+    }
+
     func testStaleSurfaceCallbackCannotWriteAcrossVisualOwnershipFlap() async throws {
         let fixture = try VisualControlFixture()
         defer { fixture.cleanUp() }

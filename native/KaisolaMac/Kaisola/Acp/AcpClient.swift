@@ -1998,11 +1998,12 @@ actor AcpClient {
 
     /// Map a framing failure onto the client's own error vocabulary, so the chat
     /// shows a sentence instead of `BrokerWireError error 1`.
-    private static func protocolFailure(_ error: any Error) -> AcpClientError {
+    static func protocolFailure(_ error: any Error) -> AcpClientError {
         if let error = error as? AcpClientError { return error }
         switch error as? BrokerWireError {
         case .invalidUTF8: return .malformedFrame("the bytes are not valid UTF-8")
         case .incompleteFrame: return .malformedFrame("the message ended mid-frame")
+        case .invalidEnvelope: return .malformedFrame("the message envelope is invalid")
         case .frameTooLarge: return .frameTooLarge
         case nil: return .requestFailed(
             (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

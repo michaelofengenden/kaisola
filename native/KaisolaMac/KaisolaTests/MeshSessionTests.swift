@@ -304,3 +304,176 @@ final class MeshSessionTests: XCTestCase {
         return candidates.compactMap { $0 }.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 }
+
+extension MeshSessionTests {
+    private actor Gate {
+        private var isOpen = false
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        func wait() async {
+            guard !isOpen else { return }
+            await withCheckedContinuation { continuation = $0 }
+        }
+
+        func open() {
+            isOpen = true
+            continuation?.resume()
+            continuation = nil
+        }
+    }
+
+    @MainActor
+    func testStartPublishesExplicitTransitionAndCompletionStates() async {
+        let coordinator = MeshLifecycleCoordinator()
+        let gate = Gate()
+        let entered = expectation(description: "start operation entered")
+
+        coordinator.start(meshID: "mesh") {
+            entered.fulfill()
+            await gate.wait()
+            return .active
+        }
+
+        await fulfillment(of: [entered])
+        XCTAssertEqual(coordinator.state(for: "mesh"), .starting)
+
+        await gate.open()
+        await coordinator.waitForIdle(meshID: "mesh")
+        XCTAssertEqual(coordinator.state(for: "mesh"), .active)
+    }
+
+    @MainActor
+    func testSuspendCancelsInFlightStartAndStaleCompletionCannotWin() async {
+        let coordinator = MeshLifecycleCoordinator()
+        let gate = Gate()
+        let entered = expectation(description: "start operation entered")
+
+        coordinator.start(meshID: "mesh") {
+            entered.fulfill()
+            await gate.wait()
+            return .active
+        }
+        await fulfillment(of: [entered])
+
+        let completion = await coordinator.suspend(meshID: "mesh") {
+            .suspended
+        }
+        XCTAssertEqual(completion, .completed)
+        XCTAssertEqual(coordinator.state(for: "mesh"), .suspended)
+
+        await gate.open()
+        await Task.yield()
+        XCTAssertEqual(coordinator.state(for: "mesh"), .suspended)
+    }
+
+    @MainActor
+    func testDestroyMapsResultToRecoveryState() async {
+        enum Assessment: Equatable, Sendable {
+            case recoverableWork
+        }
+
+        let coordinator = MeshLifecycleCoordinator()
+        let outcome = await coordinator.destroy(
+            meshID: "mesh",
+            operation: { Assessment.recoverableWork },
+            resolvedState: { _ in .recoveryRequired }
+        )
+
+        XCTAssertEqual(outcome, .completed(.recoverableWork))
+        XCTAssertEqual(coordinator.state(for: "mesh"), .recoveryRequired)
+    }
+
+    @MainActor
+    func testCancelledDestroyCannotPublishItsResolvedState() async {
+        enum Assessment: Equatable, Sendable {
+            case safe
+        }
+
+        let coordinator = MeshLifecycleCoordinator()
+        let gate = Gate()
+        let entered = expectation(description: "destroy operation entered")
+        let outcomeTask = Task {
+            await coordinator.destroy(
+                meshID: "mesh",
+                operation: {
+                    entered.fulfill()
+                    await gate.wait()
+                    return Assessment.safe
+                },
+                resolvedState: { _ in .destroyed }
+            )
+        }
+
+        await fulfillment(of: [entered])
+        XCTAssertEqual(coordinator.state(for: "mesh"), .destroying)
+        coordinator.cancel(meshID: "mesh")
+        await gate.open()
+
+        let outcome = await outcomeTask.value
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(coordinator.state(for: "mesh"), .cancelled)
+    }
+
+    @MainActor
+    func testCancelAllFencesEveryOutstandingCompletion() async {
+        let coordinator = MeshLifecycleCoordinator()
+        let firstGate = Gate()
+        let secondGate = Gate()
+        let entered = expectation(description: "both starts entered")
+        entered.expectedFulfillmentCount = 2
+
+        coordinator.start(meshID: "first") {
+            entered.fulfill()
+            await firstGate.wait()
+            return .active
+        }
+        coordinator.start(meshID: "second") {
+            entered.fulfill()
+            await secondGate.wait()
+            return .active
+        }
+        await fulfillment(of: [entered])
+
+        coordinator.cancelAll()
+        XCTAssertEqual(coordinator.state(for: "first"), .cancelled)
+        XCTAssertEqual(coordinator.state(for: "second"), .cancelled)
+
+        await firstGate.open()
+        await secondGate.open()
+        await Task.yield()
+        XCTAssertEqual(coordinator.state(for: "first"), .cancelled)
+        XCTAssertEqual(coordinator.state(for: "second"), .cancelled)
+    }
+
+    @MainActor
+    func testForgottenIdentifierCanBeReusedWithoutOldTaskWinning() async {
+        let coordinator = MeshLifecycleCoordinator()
+        let oldGate = Gate()
+        let oldEntered = expectation(description: "old start entered")
+
+        coordinator.start(meshID: "reused") {
+            oldEntered.fulfill()
+            await oldGate.wait()
+            return .recoveryRequired
+        }
+        await fulfillment(of: [oldEntered])
+
+        coordinator.forget(meshID: "reused")
+        coordinator.start(meshID: "reused") { .active }
+        await coordinator.waitForIdle(meshID: "reused")
+        XCTAssertEqual(coordinator.state(for: "reused"), .active)
+
+        await oldGate.open()
+        await Task.yield()
+        XCTAssertEqual(coordinator.state(for: "reused"), .active)
+    }
+
+    @MainActor
+    func testPersistedLifecycleMappingIsStable() {
+        XCTAssertEqual(MeshLifecycleCoordinator.State(.provisioning), .starting)
+        XCTAssertEqual(MeshLifecycleCoordinator.State(.active), .active)
+        XCTAssertEqual(MeshLifecycleCoordinator.State(.suspended), .suspended)
+        XCTAssertEqual(MeshLifecycleCoordinator.State(.pendingDeletion), .destroying)
+        XCTAssertEqual(MeshLifecycleCoordinator.State(.recoveryRequired), .recoveryRequired)
+    }
+}

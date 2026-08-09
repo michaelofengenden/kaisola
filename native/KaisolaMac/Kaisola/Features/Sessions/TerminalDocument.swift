@@ -315,9 +315,18 @@ struct TerminalDocument: Equatable, Sendable {
         )
     }
 
+    /// Shown while the broker cannot read a terminal's retained spool. The
+    /// scrollback on screen stays where it is, so the wording says the history
+    /// is stale rather than gone, and the next reconnect or gap recovery
+    /// resubscribes on its own.
+    static func spoolReadDiagnostic(_ code: String) -> String {
+        "Could not read this terminal's saved history (\(code)). Showing the last output received; retrying."
+    }
+
     func applying(_ result: TerminalSubscriptionResult, sessionID: String) -> TerminalDocument {
         switch result {
         case let .snapshot(snapshot, resetReason):
+            let readDiagnostic = snapshot.readError.map(Self.spoolReadDiagnostic)
             // A cursor-based resubscribe returns only bytes after the cursor.
             // Preserve the already-rendered prefix when the broker proves the
             // suffix is exactly contiguous; reset snapshots still replace it.
@@ -333,7 +342,11 @@ struct TerminalDocument: Equatable, Sendable {
                     offset: snapshot.endOffset
                 )
                 document.exited = snapshot.exited
-                document.errorMessage = nil
+                // Only a failed read changes the retention verdict here: a
+                // healthy contiguous resubscribe is exactly as complete as the
+                // document already was.
+                document.truncated = truncated || snapshot.readError != nil
+                document.errorMessage = readDiagnostic
                 document.surfaceDelta = TerminalSurfaceDelta(
                     epoch: snapshot.streamEpoch,
                     startOffset: snapshot.startOffset,
@@ -343,13 +356,28 @@ struct TerminalDocument: Equatable, Sendable {
                 document.trimRetainedOutputIfNeeded()
                 return document
             }
+            // A spool the broker could not read is not an empty transcript.
+            // Replacing the rendered scrollback here is the destructive half
+            // of that confusion: a single transient EACCES on the spool file
+            // would wipe the session the user is looking at. Keep the last
+            // good frame and its cursor — the next contiguity failure routes
+            // through the ordinary gap recovery, which resubscribes — and
+            // carry a diagnostic that says the history is stale, not gone.
+            if let readDiagnostic, self.sessionID == sessionID {
+                var document = self
+                document.truncated = true
+                document.exited = snapshot.exited
+                document.errorMessage = readDiagnostic
+                document.surfaceDelta = nil
+                return document
+            }
             var document = TerminalDocument(
                 sessionID: sessionID,
                 output: snapshot.output,
                 cursor: TerminalCursor(streamEpoch: snapshot.streamEpoch, offset: snapshot.endOffset),
                 truncated: snapshot.truncated || resetReason != nil,
                 exited: snapshot.exited,
-                errorMessage: nil
+                errorMessage: readDiagnostic
             )
             document.trimRetainedOutputIfNeeded()
             return document

@@ -14,7 +14,10 @@ struct MeshView: View {
     @State private var diffColumnID: String?
     @State private var diffText = ""
     @State private var integrateColumnID: String?
-    @State private var integrationStatus: String?
+    @State private var integrationOutcome: MeshIntegrationOutcome?
+    /// The column the reported outcome belongs to, so "Try Again" and "Review
+    /// Diff" act on it rather than guessing from the message.
+    @State private var integratedColumnID: String?
     @FocusState private var composerFocused: Bool
     private let focusRequestGeneration: UInt64?
     private let onKeyboardFocus: (() -> Void)?
@@ -37,18 +40,8 @@ struct MeshView: View {
                 header
                 Divider()
             }
-            if let status = integrationStatus {
-                Text(status)
-                    .font(.caption)
-                    .foregroundStyle(
-                        isConflictStatus(status)
-                            ? KaisolaStatusTone.needsYou.foregroundColor
-                            : Color.secondary
-                    )
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 5)
+            if let outcome = integrationOutcome {
+                integrationStatusBar(outcome)
                 Divider()
             }
             if mesh.columns.isEmpty {
@@ -228,32 +221,69 @@ struct MeshView: View {
         mesh.columns.first { $0.conversation.pendingPermission != nil }?.id
     }
 
-    /// Fetch the column's worktree diff and graft it onto the base workspace.
-    /// Success and conflict/error alike surface in the status line under the
-    /// header. Runs on the main actor so the @State write is safe.
-    private func integrate(_ columnID: String) {
-        let name = mesh.columns.first { $0.id == columnID }?.agent.name ?? "column"
-        let base = mesh.baseDirectory
-        Task { @MainActor in
-            let patch = await mesh.diff(for: columnID)
-            guard !patch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                integrationStatus = "\(name): no changes to apply."
-                return
+    /// The integration status line. Tint, symbol, what VoiceOver says, and which
+    /// buttons appear all come from the typed outcome, so a permission,
+    /// repository, patch, or I/O failure stays as loud as a conflict no matter
+    /// how git worded it.
+    private func integrationStatusBar(_ outcome: MeshIntegrationOutcome) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Label(outcome.message, systemImage: outcome.symbol)
+                .font(.caption)
+                .foregroundStyle(outcome.severity.foregroundColor)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityLabel(outcome.accessibilityAnnouncement)
+            ForEach(outcome.recoveryActions) { action in
+                Button(action.title) { perform(action) }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+                    .help(action.help)
+                    .accessibilityLabel("\(action.title): \(action.help)")
             }
-            do {
-                try await Task.detached(priority: .userInitiated) {
-                    try GitService(repoRoot: base).applyPatch(patch)
-                }.value
-                integrationStatus = "Applied \(name)'s diff to \(base.lastPathComponent)."
-            } catch {
-                integrationStatus = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            }
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 5)
+        .accessibilityElement(children: .contain)
+    }
+
+    /// Run one of the outcome's offered recoveries against the column it came
+    /// from.
+    private func perform(_ action: MeshIntegrationOutcome.Recovery) {
+        switch action {
+        case .reviewDiff:
+            diffColumnID = integratedColumnID
+        case .retry:
+            if let columnID = integratedColumnID { integrate(columnID) }
+        case .revealDestination:
+            NSWorkspace.shared.activateFileViewerSelecting([mesh.baseDirectory])
+        case .dismiss:
+            integrationOutcome = nil
+            integratedColumnID = nil
         }
     }
 
-    private func isConflictStatus(_ status: String) -> Bool {
-        status.range(of: "conflict", options: .caseInsensitive) != nil
-            || status.range(of: "marker", options: .caseInsensitive) != nil
+    /// Graft the column's worktree diff onto the base workspace and keep the
+    /// typed outcome it reports. Runs on the main actor so the @State writes are
+    /// safe.
+    private func integrate(_ columnID: String) {
+        integratedColumnID = columnID
+        Task { @MainActor in
+            integrationOutcome = await mesh.integrate(columnID: columnID)
+        }
+    }
+}
+
+private extension MeshIntegrationOutcome.Severity {
+    /// The only place a severity becomes a colour. Each state also carries its
+    /// own symbol, so tint is reinforcement rather than the whole signal.
+    var foregroundColor: Color {
+        switch self {
+        case .success: KaisolaStatusTone.done.foregroundColor
+        case .informational: Color.secondary
+        case .warning: KaisolaStatusTone.needsYou.foregroundColor
+        case .failure: KaisolaStatusTone.failed.foregroundColor
+        }
     }
 }
 

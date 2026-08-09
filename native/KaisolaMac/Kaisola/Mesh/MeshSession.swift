@@ -3,6 +3,552 @@ import Darwin
 import Foundation
 import KaisolaCore
 
+/// Version 1 of the Mesh host hook lifecycle. Payloads are JSON objects whose
+/// keys are stable, whose user-controlled fields are bounded, and whose secret
+/// values are redacted before either preview or execution.
+enum MeshLifecycleHookEvent: String, Codable, CaseIterable, Equatable, Hashable, Sendable {
+    case beforeSubmit
+    case afterResponse
+    case compaction
+    case subagentStarted
+    case subagentStopped
+    case turnCompleted
+}
+
+/// A mesh-scoped hook observes the whole run. A column-scoped hook is invoked
+/// only for payloads carrying a concrete column identity.
+enum MeshLifecycleHookScope: String, Codable, Equatable, Hashable, Sendable {
+    case mesh
+    case column
+}
+
+/// Declared effects are audit metadata, not a capability grant. Version 1 does
+/// not pass host credentials or interpret hook output as a prompt mutation.
+enum MeshLifecycleHookSideEffect: String, Codable, CaseIterable, Equatable, Hashable, Sendable {
+    case none
+    case notification
+    case metrics
+    case workspaceRead
+    case workspaceWrite
+    case network
+}
+
+enum MeshLifecycleHookFailurePolicy: String, Codable, Equatable, Sendable {
+    /// Record the failure and continue the host lifecycle.
+    case `continue`
+    /// Refuse only a before-submit prompt. Post-submit lifecycle events can
+    /// never be configured to retroactively fail closed.
+    case failClosed
+}
+
+/// One external hook declaration. Executables are launched directly (never
+/// through a shell), receive one bounded JSON payload on stdin, inherit no host
+/// secrets, and are killed when their declared timeout expires.
+struct MeshLifecycleHookConfiguration: Codable, Equatable, Sendable {
+    static let apiVersion = 1
+    static let minimumTimeoutMilliseconds = 10
+    static let maximumTimeoutMilliseconds = 5_000
+
+    let apiVersion: Int
+    let id: String
+    let executable: String
+    let arguments: [String]
+    let events: Set<MeshLifecycleHookEvent>
+    let scope: MeshLifecycleHookScope
+    let sideEffects: Set<MeshLifecycleHookSideEffect>
+    let timeoutMilliseconds: Int
+    let failurePolicy: MeshLifecycleHookFailurePolicy
+    let enabled: Bool
+
+    init(
+        apiVersion: Int = Self.apiVersion,
+        id: String,
+        executable: String,
+        arguments: [String] = [],
+        events: Set<MeshLifecycleHookEvent>,
+        scope: MeshLifecycleHookScope,
+        sideEffects: Set<MeshLifecycleHookSideEffect>,
+        timeoutMilliseconds: Int = 1_000,
+        failurePolicy: MeshLifecycleHookFailurePolicy = .continue,
+        enabled: Bool = true
+    ) {
+        self.apiVersion = apiVersion
+        self.id = id
+        self.executable = executable
+        self.arguments = arguments
+        self.events = events
+        self.scope = scope
+        self.sideEffects = sideEffects
+        self.timeoutMilliseconds = timeoutMilliseconds
+        self.failurePolicy = failurePolicy
+        self.enabled = enabled
+    }
+
+    var validationErrors: [String] {
+        var errors: [String] = []
+        if apiVersion != Self.apiVersion {
+            errors.append("Unsupported hook API version \(apiVersion); expected \(Self.apiVersion).")
+        }
+        if id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || id.utf8.count > 128 {
+            errors.append("Hook id must contain 1–128 UTF-8 bytes.")
+        }
+        if !executable.hasPrefix("/") || executable.utf8.count > 4_096 {
+            errors.append("Hook executable must be a bounded absolute path.")
+        }
+        if arguments.count > 64 || arguments.contains(where: { $0.utf8.count > 4_096 }) {
+            errors.append("Hook arguments exceed the 64-item or 4 KiB per-item limit.")
+        }
+        if events.isEmpty { errors.append("Hook events cannot be empty.") }
+        if sideEffects.isEmpty {
+            errors.append("Hook side effects must be declared.")
+        } else if sideEffects.contains(.none), sideEffects.count != 1 {
+            errors.append("The none side effect cannot be combined with other effects.")
+        }
+        if !(Self.minimumTimeoutMilliseconds...Self.maximumTimeoutMilliseconds).contains(timeoutMilliseconds) {
+            errors.append("Hook timeout must be 10–5000 milliseconds.")
+        }
+        if failurePolicy == .failClosed,
+           (events.isEmpty || events.contains(where: { $0 != .beforeSubmit })) {
+            errors.append("Fail-closed hooks may subscribe only to beforeSubmit.")
+        }
+        return errors
+    }
+}
+
+/// The documented v1 stdin payload. `fields` is event-specific:
+/// - beforeSubmit: prompt
+/// - afterResponse: response, agentID, role
+/// - compaction: previousUsed, currentUsed, max
+/// - subagentStarted/subagentStopped: agentID, role
+/// - turnCompleted: agentID, role, response
+struct MeshLifecycleHookPayload: Codable, Equatable, Sendable {
+    static let apiVersion = 1
+    static let maximumEncodedBytes = 16_384
+    private static let maximumFieldBytes = 4_096
+    private static let maximumFields = 32
+
+    let apiVersion: Int
+    let event: MeshLifecycleHookEvent
+    let meshID: String
+    let projectID: String
+    let columnID: String?
+    let fields: [String: String]
+
+    init(
+        apiVersion: Int = Self.apiVersion,
+        event: MeshLifecycleHookEvent,
+        meshID: String,
+        projectID: String,
+        columnID: String? = nil,
+        fields: [String: String] = [:]
+    ) {
+        self.apiVersion = apiVersion
+        self.event = event
+        self.meshID = meshID
+        self.projectID = projectID
+        self.columnID = columnID
+        self.fields = fields
+    }
+
+    fileprivate func redactedAndBounded() -> Self {
+        var safeFields: [String: String] = [:]
+        var remaining = 12_000
+        for rawKey in fields.keys.sorted().prefix(Self.maximumFields) {
+            let key = Self.boundedUTF8(rawKey, maximumBytes: 128)
+            guard !key.isEmpty, remaining > 0 else { continue }
+            let sensitiveKey = key.lowercased().contains("secret")
+                || key.lowercased().contains("token")
+                || key.lowercased().contains("password")
+                || key.lowercased().contains("authorization")
+                || key.lowercased().replacingOccurrences(of: "_", with: "").contains("apikey")
+            let redacted = sensitiveKey ? "[redacted]" : Self.redact(fields[rawKey] ?? "")
+            let budget = min(Self.maximumFieldBytes, remaining)
+            let value = Self.boundedUTF8(redacted, maximumBytes: budget)
+            safeFields[key] = value
+            remaining -= key.utf8.count + value.utf8.count + 8
+        }
+        return Self(
+            apiVersion: apiVersion,
+            event: event,
+            meshID: Self.boundedUTF8(meshID, maximumBytes: 256),
+            projectID: Self.boundedUTF8(projectID, maximumBytes: 256),
+            columnID: columnID.map { Self.boundedUTF8($0, maximumBytes: 256) },
+            fields: safeFields
+        )
+    }
+
+    fileprivate static func encoded(_ payload: Self) -> Data {
+        var safe = payload.redactedAndBounded()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        while true {
+            let data = (try? encoder.encode(safe)) ?? Data("{}".utf8)
+            if data.count <= maximumEncodedBytes || safe.fields.isEmpty { return data }
+            var fields = safe.fields
+            if let last = fields.keys.sorted().last { fields.removeValue(forKey: last) }
+            safe = Self(
+                apiVersion: safe.apiVersion,
+                event: safe.event,
+                meshID: safe.meshID,
+                projectID: safe.projectID,
+                columnID: safe.columnID,
+                fields: fields
+            )
+        }
+    }
+
+    fileprivate static func redact(_ input: String) -> String {
+        var safe = boundedUTF8(input, maximumBytes: 16_384)
+        let replacements: [(String, String)] = [
+            (#"(?i)(bearer\s+)[A-Za-z0-9._~+\-/=]+"#, "$1[redacted]"),
+            (#"(?i)\b(?:sk|ghp|github_pat|xox[baprs]|AIza)[-_A-Za-z0-9]{8,}\b"#, "[redacted]"),
+            (#"(?i)((?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*)[^\s,;]+"#, "$1[redacted]"),
+        ]
+        for (pattern, replacement) in replacements {
+            safe = safe.replacingOccurrences(
+                of: pattern,
+                with: replacement,
+                options: .regularExpression
+            )
+        }
+        return safe
+    }
+
+    fileprivate static func boundedUTF8(_ input: String, maximumBytes: Int) -> String {
+        guard input.utf8.count > maximumBytes else { return input }
+        var bytes = Array(input.utf8.prefix(maximumBytes))
+        while !bytes.isEmpty {
+            if let value = String(bytes: bytes, encoding: .utf8) { return value }
+            bytes.removeLast()
+        }
+        return ""
+    }
+}
+
+struct MeshLifecycleHookExecutionOutput: Equatable, Sendable {
+    let exitStatus: Int32
+    let standardOutput: String
+    let standardError: String
+
+    init(exitStatus: Int32, standardOutput: String, standardError: String) {
+        self.exitStatus = exitStatus
+        self.standardOutput = standardOutput
+        self.standardError = standardError
+    }
+}
+
+struct MeshLifecycleHookReceipt: Codable, Equatable, Sendable {
+    enum Outcome: String, Codable, Equatable, Sendable {
+        case succeeded
+        case failed
+        case timedOut
+        case reentrant
+        case invalid
+    }
+
+    let hookID: String
+    let event: MeshLifecycleHookEvent
+    let outcome: Outcome
+    let message: String
+    let blocked: Bool
+}
+
+struct MeshLifecycleHookDecision: Equatable, Sendable {
+    let allowed: Bool
+    let receipts: [MeshLifecycleHookReceipt]
+}
+
+struct MeshLifecycleHookPreview: Equatable, Sendable {
+    let apiVersion: Int
+    let hookID: String
+    let event: MeshLifecycleHookEvent
+    let scope: MeshLifecycleHookScope
+    let sideEffects: Set<MeshLifecycleHookSideEffect>
+    let timeoutMilliseconds: Int
+    let failurePolicy: MeshLifecycleHookFailurePolicy
+    let encodedPayload: String
+    let validationErrors: [String]
+}
+
+/// Executes validated hook declarations in stable id order. The actor retains
+/// active hook ids across suspension points, preventing a hook-triggered host
+/// callback from recursively invoking the same integration.
+actor MeshLifecycleHookHost {
+    typealias Executor = @Sendable (
+        MeshLifecycleHookConfiguration,
+        Data
+    ) async throws -> MeshLifecycleHookExecutionOutput
+
+    private let configurations: [MeshLifecycleHookConfiguration]
+    private let executor: Executor
+    private var activeHookIDs: Set<String> = []
+
+    init(
+        configurations: [MeshLifecycleHookConfiguration],
+        executor: @escaping Executor = MeshLifecycleHookProcessExecutor.execute
+    ) {
+        self.configurations = configurations.sorted { $0.id < $1.id }
+        self.executor = executor
+    }
+
+    func preview(
+        configurationID: String,
+        payload: MeshLifecycleHookPayload
+    ) -> MeshLifecycleHookPreview {
+        guard let configuration = configurations.first(where: { $0.id == configurationID }) else {
+            return MeshLifecycleHookPreview(
+                apiVersion: MeshLifecycleHookConfiguration.apiVersion,
+                hookID: configurationID,
+                event: payload.event,
+                scope: .mesh,
+                sideEffects: [],
+                timeoutMilliseconds: 0,
+                failurePolicy: .continue,
+                encodedPayload: String(decoding: MeshLifecycleHookPayload.encoded(payload), as: UTF8.self),
+                validationErrors: ["Unknown hook id."]
+            )
+        }
+        return MeshLifecycleHookPreview(
+            apiVersion: configuration.apiVersion,
+            hookID: configuration.id,
+            event: payload.event,
+            scope: configuration.scope,
+            sideEffects: configuration.sideEffects,
+            timeoutMilliseconds: configuration.timeoutMilliseconds,
+            failurePolicy: configuration.failurePolicy,
+            encodedPayload: String(decoding: MeshLifecycleHookPayload.encoded(payload), as: UTF8.self),
+            validationErrors: configuration.validationErrors
+        )
+    }
+
+    func invoke(_ payload: MeshLifecycleHookPayload) async -> MeshLifecycleHookDecision {
+        let matching = configurations.filter { configuration in
+            configuration.enabled
+                && configuration.events.contains(payload.event)
+                && (configuration.scope == .mesh || payload.columnID != nil)
+        }
+        guard !matching.isEmpty else { return MeshLifecycleHookDecision(allowed: true, receipts: []) }
+        let encoded = MeshLifecycleHookPayload.encoded(payload)
+        var receipts: [MeshLifecycleHookReceipt] = []
+        var allowed = true
+        for configuration in matching {
+            let blocks = configuration.failurePolicy == .failClosed && payload.event == .beforeSubmit
+            let receipt: MeshLifecycleHookReceipt
+            let validationErrors = configuration.validationErrors
+            if !validationErrors.isEmpty {
+                receipt = Self.receipt(
+                    configuration: configuration,
+                    event: payload.event,
+                    outcome: .invalid,
+                    detail: validationErrors.joined(separator: " "),
+                    blocked: blocks
+                )
+            } else if activeHookIDs.contains(configuration.id) {
+                receipt = Self.receipt(
+                    configuration: configuration,
+                    event: payload.event,
+                    outcome: .reentrant,
+                    detail: "Recursive hook invocation was refused.",
+                    blocked: blocks
+                )
+            } else {
+                activeHookIDs.insert(configuration.id)
+                let result = await execute(configuration, payload: encoded)
+                activeHookIDs.remove(configuration.id)
+                switch result {
+                case let .completed(output) where output.exitStatus == 0:
+                    receipt = Self.receipt(
+                        configuration: configuration,
+                        event: payload.event,
+                        outcome: .succeeded,
+                        detail: Self.combinedOutput(output),
+                        blocked: false
+                    )
+                case let .completed(output):
+                    receipt = Self.receipt(
+                        configuration: configuration,
+                        event: payload.event,
+                        outcome: .failed,
+                        detail: "Exit \(output.exitStatus). \(Self.combinedOutput(output))",
+                        blocked: blocks
+                    )
+                case let .failed(message):
+                    receipt = Self.receipt(
+                        configuration: configuration,
+                        event: payload.event,
+                        outcome: .failed,
+                        detail: message,
+                        blocked: blocks
+                    )
+                case .timedOut:
+                    receipt = Self.receipt(
+                        configuration: configuration,
+                        event: payload.event,
+                        outcome: .timedOut,
+                        detail: "Timed out after \(configuration.timeoutMilliseconds) ms.",
+                        blocked: blocks
+                    )
+                }
+            }
+            receipts.append(receipt)
+            if receipt.blocked { allowed = false }
+        }
+        return MeshLifecycleHookDecision(allowed: allowed, receipts: receipts)
+    }
+
+    private enum TimedExecution: Sendable {
+        case completed(MeshLifecycleHookExecutionOutput)
+        case failed(String)
+        case timedOut
+    }
+
+    private func execute(
+        _ configuration: MeshLifecycleHookConfiguration,
+        payload: Data
+    ) async -> TimedExecution {
+        await withTaskGroup(of: TimedExecution.self) { group in
+            group.addTask { [executor] in
+                do { return .completed(try await executor(configuration, payload)) }
+                catch { return .failed(error.localizedDescription) }
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: .milliseconds(configuration.timeoutMilliseconds))
+                    return .timedOut
+                } catch {
+                    return .failed("Hook execution was cancelled.")
+                }
+            }
+            let first = await group.next() ?? .failed("Hook execution did not start.")
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private static func combinedOutput(_ output: MeshLifecycleHookExecutionOutput) -> String {
+        [output.standardOutput, output.standardError]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+    }
+
+    private static func receipt(
+        configuration: MeshLifecycleHookConfiguration,
+        event: MeshLifecycleHookEvent,
+        outcome: MeshLifecycleHookReceipt.Outcome,
+        detail: String,
+        blocked: Bool
+    ) -> MeshLifecycleHookReceipt {
+        let redacted = MeshLifecycleHookPayload.redact(detail)
+        let bounded = MeshLifecycleHookPayload.boundedUTF8(redacted, maximumBytes: 512)
+        return MeshLifecycleHookReceipt(
+            hookID: configuration.id,
+            event: event,
+            outcome: outcome,
+            message: bounded,
+            blocked: blocked
+        )
+    }
+}
+
+/// Direct-process executor used by the production hook host. Output is written
+/// to owner-only temporary files so a chatty hook cannot fill an unread pipe.
+private enum MeshLifecycleHookProcessExecutor {
+    private final class ProcessState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var process: Process?
+        private var cancellationRequested = false
+
+        func install(_ process: Process) {
+            lock.lock()
+            self.process = process
+            let shouldTerminate = cancellationRequested
+            lock.unlock()
+            if shouldTerminate, process.isRunning { process.terminate() }
+        }
+
+        func terminate() {
+            lock.lock()
+            cancellationRequested = true
+            let process = self.process
+            lock.unlock()
+            guard let process, process.isRunning else { return }
+            let pid = process.processIdentifier
+            process.terminate()
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+                self?.forceKillIfRunning(pid: pid)
+            }
+        }
+
+        private func forceKillIfRunning(pid: Int32) {
+            lock.lock()
+            let process = self.process
+            lock.unlock()
+            if process?.processIdentifier == pid, process?.isRunning == true {
+                _ = Darwin.kill(pid, SIGKILL)
+            }
+        }
+    }
+
+    static func execute(
+        _ configuration: MeshLifecycleHookConfiguration,
+        _ payload: Data
+    ) async throws -> MeshLifecycleHookExecutionOutput {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-hook-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stdoutURL = directory.appendingPathComponent("stdout")
+        let stderrURL = directory.appendingPathComponent("stderr")
+        FileManager.default.createFile(atPath: stdoutURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        FileManager.default.createFile(atPath: stderrURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        let state = ProcessState()
+
+        return try await withTaskCancellationHandler {
+            try await Task.detached(priority: .utility) {
+                let process = Process()
+                let input = Pipe()
+                let stdout = try FileHandle(forWritingTo: stdoutURL)
+                let stderr = try FileHandle(forWritingTo: stderrURL)
+                defer {
+                    try? stdout.close()
+                    try? stderr.close()
+                }
+                process.executableURL = URL(fileURLWithPath: configuration.executable)
+                process.arguments = configuration.arguments
+                process.environment = [
+                    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                    "LANG": "en_US.UTF-8",
+                    "KAISOLA_HOOK_API_VERSION": "\(MeshLifecycleHookConfiguration.apiVersion)",
+                ]
+                process.standardInput = input
+                process.standardOutput = stdout
+                process.standardError = stderr
+                try process.run()
+                state.install(process)
+                input.fileHandleForWriting.write(payload)
+                try? input.fileHandleForWriting.close()
+                process.waitUntilExit()
+                if Task.isCancelled { throw CancellationError() }
+                try? stdout.synchronize()
+                try? stderr.synchronize()
+                let stdoutData = (try? Data(contentsOf: stdoutURL, options: .mappedIfSafe)) ?? Data()
+                let stderrData = (try? Data(contentsOf: stderrURL, options: .mappedIfSafe)) ?? Data()
+                return MeshLifecycleHookExecutionOutput(
+                    exitStatus: process.terminationStatus,
+                    standardOutput: String(decoding: stdoutData.prefix(4_096), as: UTF8.self),
+                    standardError: String(decoding: stderrData.prefix(4_096), as: UTF8.self)
+                )
+            }.value
+        } onCancel: {
+            state.terminate()
+        }
+    }
+}
+
 /// How a Mesh fans work out. `.flat` (v1 default) sends the SAME prompt to every
 /// agent at once. `.staged` runs the scout → execute pipeline: one agent scouts
 /// the repo read-only and writes a numbered task contract, then the rest execute
@@ -93,6 +639,11 @@ final class MeshSession: ObservableObject, Identifiable {
     @Published private(set) var stagedQueuedPromptCount = 0
     @Published private(set) var stagedQueueIsRunning = false
     @Published private(set) var lifecycle: NativeMeshLifecycle
+    /// Bounded, user-visible audit trail for hook success/failure. Hook stdout
+    /// and stderr are redacted and capped before reaching this collection.
+    @Published private(set) var hookReceipts: [MeshLifecycleHookReceipt] = []
+    @Published private(set) var hookNotice: String?
+    @Published private(set) var hookSubmissionInProgress = false
     @Published var draft: String {
         didSet { onDraftChanged?(draft) }
     }
@@ -124,6 +675,9 @@ final class MeshSession: ObservableObject, Identifiable {
     private let fileManager: FileManager
     private let worktreeRoot: URL
     private let usageCenter: UsageCenter
+    private let hookHost: MeshLifecycleHookHost?
+    private var hookUsageByColumn: [String: Int] = [:]
+    private var hookStartedColumnIDs: Set<String> = []
     /// Relay each column's live conversation state through this Mesh object so
     /// parent project navigation can show accurate working activity.
     private var columnObservers = Set<AnyCancellable>()
@@ -190,7 +744,8 @@ final class MeshSession: ObservableObject, Identifiable {
         initialStagedPrompts: [String] = [],
         worktreeRoot: URL = NativePreviewPaths.meshWorktreesDirectory,
         fileManager: FileManager = .default,
-        usageCenter: UsageCenter = .shared
+        usageCenter: UsageCenter = .shared,
+        hookHost: MeshLifecycleHookHost? = nil
     ) {
         self.id = id
         self.baseDirectory = baseDirectory.standardizedFileURL
@@ -202,6 +757,7 @@ final class MeshSession: ObservableObject, Identifiable {
         self.worktreeRoot = worktreeRoot.standardizedFileURL
         self.fileManager = fileManager
         self.usageCenter = usageCenter
+        self.hookHost = hookHost
         self.stagedPromptQueue = initialStagedPrompts
         self.stagedQueuedPromptCount = initialStagedPrompts.count
     }
@@ -444,7 +1000,7 @@ final class MeshSession: ObservableObject, Identifiable {
         }
         for column in columns {
             guard !isSuspended, !isDestroyed, startupGeneration == generation else { return }
-            await column.conversation.start()
+            await startColumn(columnID: column.id)
         }
         lifecycle = provisioningColumns.isEmpty ? .active : .recoveryRequired
         onDescriptorChanged?()
@@ -681,7 +1237,12 @@ final class MeshSession: ObservableObject, Identifiable {
         cancelStageCoordinator()
         stage = "Interrupted"
         for column in columns {
+            let wasConnected = column.conversation.isConnected
             _ = await column.conversation.stop()
+            if wasConnected {
+                await runSubagentHook(.subagentStopped, column: column)
+                hookStartedColumnIDs.remove(column.id)
+            }
         }
         if lifecycle != .pendingDeletion {
             lifecycle = provisioningColumns.isEmpty ? .suspended : .recoveryRequired
@@ -953,7 +1514,8 @@ final class MeshSession: ObservableObject, Identifiable {
         conversation.$usage
             .compactMap { $0 }
             .sink { [weak self] usage in
-                self?.usageCenter.record(
+                guard let self else { return }
+                self.usageCenter.record(
                     chatID: columnID,
                     title: usageTitle,
                     agentID: agent.id,
@@ -962,12 +1524,37 @@ final class MeshSession: ObservableObject, Identifiable {
                     costAmount: usage.costAmount,
                     costCurrency: usage.costCurrency
                 )
+                let previous = self.hookUsageByColumn.updateValue(usage.used, forKey: columnID)
+                if let previous, usage.used < previous {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        _ = await self.invokeHook(.init(
+                            event: .compaction,
+                            meshID: self.id,
+                            projectID: self.projectID,
+                            columnID: columnID,
+                            fields: [
+                                "agentID": agent.id,
+                                "role": self.columns.first(where: { $0.id == columnID })?.role.rawValue ?? "unknown",
+                                "previousUsed": "\(previous)",
+                                "currentUsed": "\(usage.used)",
+                                "max": "\(usage.max)",
+                            ]
+                        ))
+                    }
+                }
             }
             .store(in: &columnObservers)
         conversation.$isRunning
             .scan((false, false)) { ($0.1, $1) }
             .filter { $0.0 && !$0.1 }
-            .sink { [weak self] _ in self?.usageCenter.recordTurn(chatID: columnID) }
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.usageCenter.recordTurn(chatID: columnID)
+                Task { @MainActor [weak self] in
+                    await self?.runColumnCompletionHooks(columnID: columnID)
+                }
+            }
             .store(in: &columnObservers)
         return conversation
     }
@@ -1009,6 +1596,129 @@ final class MeshSession: ObservableObject, Identifiable {
             provisioning: .recoveryRequired,
             workspaceKind: descriptor.workspaceKind
         )
+    }
+
+    /// The hook-aware UI/API submission path. The original prompt is not
+    /// removed from the draft or handed to an agent until every configured
+    /// fail-closed before-submit hook succeeds. Hook output is audit-only and
+    /// is never interpreted as replacement prompt text.
+    @discardableResult
+    func submit(_ text: String) async -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !hookSubmissionInProgress else { return false }
+        hookSubmissionInProgress = true
+        defer { hookSubmissionInProgress = false }
+        let decision = await invokeHook(.init(
+            event: .beforeSubmit,
+            meshID: id,
+            projectID: projectID,
+            fields: ["prompt": trimmed]
+        ))
+        guard decision.allowed else { return false }
+        switch (purpose, mode) {
+        case (.idea, _): return sendIdea(trimmed)
+        case (.build, .staged): return sendStaged(trimmed)
+        case (.build, .flat): return send(trimmed)
+        }
+    }
+
+    /// Safe approval harness: callers can render the exact redacted stdin JSON,
+    /// declared effects, timeout, and validation errors without launching the
+    /// executable or enabling the hook.
+    func previewHook(
+        configurationID: String,
+        event: MeshLifecycleHookEvent,
+        columnID: String? = nil,
+        fields: [String: String] = [:]
+    ) async -> MeshLifecycleHookPreview? {
+        guard let hookHost else { return nil }
+        return await hookHost.preview(
+            configurationID: configurationID,
+            payload: .init(
+                event: event,
+                meshID: id,
+                projectID: projectID,
+                columnID: columnID,
+                fields: fields
+            )
+        )
+    }
+
+    private func invokeHook(
+        _ payload: MeshLifecycleHookPayload
+    ) async -> MeshLifecycleHookDecision {
+        guard let hookHost else { return MeshLifecycleHookDecision(allowed: true, receipts: []) }
+        let decision = await hookHost.invoke(payload)
+        appendHookReceipts(decision.receipts)
+        return decision
+    }
+
+    private func appendHookReceipts(_ receipts: [MeshLifecycleHookReceipt]) {
+        guard !receipts.isEmpty else { return }
+        hookReceipts.append(contentsOf: receipts)
+        if hookReceipts.count > 64 {
+            hookReceipts.removeFirst(hookReceipts.count - 64)
+        }
+        if let failure = receipts.last(where: { $0.outcome != .succeeded }) {
+            let fallback = failure.outcome == .timedOut
+                ? "Lifecycle hook \(failure.hookID) timed out."
+                : "Lifecycle hook \(failure.hookID) failed."
+            hookNotice = failure.message.isEmpty ? fallback : failure.message
+        }
+    }
+
+    private func runColumnCompletionHooks(columnID: String) async {
+        guard let column = columns.first(where: { $0.id == columnID }) else { return }
+        let response = Self.lastMessageText(in: column.conversation.rows)
+        let common = [
+            "agentID": column.agent.id,
+            "role": column.role.rawValue,
+            "response": response,
+        ]
+        if !response.isEmpty {
+            _ = await invokeHook(.init(
+                event: .afterResponse,
+                meshID: id,
+                projectID: projectID,
+                columnID: columnID,
+                fields: common
+            ))
+        }
+        _ = await invokeHook(.init(
+            event: .turnCompleted,
+            meshID: id,
+            projectID: projectID,
+            columnID: columnID,
+            fields: common
+        ))
+    }
+
+    private func runSubagentHook(
+        _ event: MeshLifecycleHookEvent,
+        column: Column
+    ) async {
+        _ = await invokeHook(.init(
+            event: event,
+            meshID: id,
+            projectID: projectID,
+            columnID: column.id,
+            fields: [
+                "agentID": column.agent.id,
+                "role": column.role.rawValue,
+            ]
+        ))
+    }
+
+    /// Starts one lazily restored/focused column and emits subagentStarted once
+    /// only after its adapter actually connects. Multiple SwiftUI `.task`
+    /// callers safely collapse onto the conversation's idempotent start.
+    func startColumn(columnID: String) async {
+        guard let column = columns.first(where: { $0.id == columnID }) else { return }
+        await column.conversation.start()
+        if column.conversation.isConnected,
+           hookStartedColumnIDs.insert(column.id).inserted {
+            await runSubagentHook(.subagentStarted, column: column)
+        }
     }
 
     /// Fan the prompt out to every connected column (each queues if busy).

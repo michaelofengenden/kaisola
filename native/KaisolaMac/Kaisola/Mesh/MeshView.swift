@@ -430,8 +430,7 @@ struct MeshView: View {
                 deck: .focused,
                 focusedColumnID: focusedColumnID
             ) {
-                guard let column = mesh.columns.first(where: { $0.id == id }) else { continue }
-                await column.conversation.start()
+                await mesh.startColumn(columnID: id)
             }
         }
         .onChange(of: mesh.columns.map(\.id)) { _, ids in
@@ -531,6 +530,13 @@ struct MeshView: View {
                     .font(.caption)
                     .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
             }
+            if let notice = mesh.hookNotice {
+                Label(notice, systemImage: "bolt.trianglebadge.exclamationmark")
+                    .font(.caption)
+                    .lineLimit(1)
+                    .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                    .help(notice)
+            }
             Spacer()
             MeshStagedPromptQueueButton(mesh: mesh)
             if mesh.anyRunning {
@@ -566,10 +572,17 @@ struct MeshView: View {
                 }
                 .onSubmit(send)
             Button(action: send) {
-                Image(systemName: "arrow.up.circle.fill")
+                if mesh.hookSubmissionInProgress {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: "arrow.up.circle.fill")
+                }
             }
             .buttonStyle(.borderless)
-            .disabled(mesh.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            .disabled(
+                mesh.hookSubmissionInProgress
+                    || mesh.draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            )
             .help("Fan this prompt out to every column")
         }
         .padding(10)
@@ -585,14 +598,10 @@ struct MeshView: View {
 
     private func send() {
         let text = mesh.draft
-        let accepted: Bool
-        switch (mesh.purpose, mesh.mode) {
-        case (.idea, _): accepted = mesh.sendIdea(text)
-        case (.build, .staged): accepted = mesh.sendStaged(text)
-        case (.build, .flat): accepted = mesh.send(text)
-        }
-        if accepted {
-            mesh.draft = ""
+        Task { @MainActor in
+            if await mesh.submit(text), mesh.draft == text {
+                mesh.draft = ""
+            }
         }
     }
 
@@ -663,6 +672,7 @@ struct MeshView: View {
                             column: column,
                             viewState: transcriptStates.state(for: column.id),
                             enablesPermissionShortcuts: column.id == shortcutColumnID,
+                            start: { await mesh.startColumn(columnID: column.id) },
                             stop: { Task { await mesh.stopTurn(columnID: column.id) } },
                             showDiff: { diffSheet.open(columnID: column.id) },
                             integrate: { integrateColumnID = column.id }
@@ -965,6 +975,7 @@ struct MeshColumnOverviewStrip: View {
 private struct MeshColumnView: View {
     let column: MeshSession.Column
     let enablesPermissionShortcuts: Bool
+    let start: () async -> Void
     let stop: () -> Void
     let showDiff: () -> Void
     let integrate: () -> Void
@@ -977,12 +988,14 @@ private struct MeshColumnView: View {
         column: MeshSession.Column,
         viewState: MeshTranscriptViewState,
         enablesPermissionShortcuts: Bool,
+        start: @escaping () async -> Void,
         stop: @escaping () -> Void,
         showDiff: @escaping () -> Void,
         integrate: @escaping () -> Void
     ) {
         self.column = column
         self.enablesPermissionShortcuts = enablesPermissionShortcuts
+        self.start = start
         self.stop = stop
         self.showDiff = showDiff
         self.integrate = integrate
@@ -1155,7 +1168,7 @@ private struct MeshColumnView: View {
         .frame(maxWidth: .infinity)
         // MeshView starts every column, focused or not; this covers the column
         // that mounts before that task lands.
-        .task { await conversation.start() }
+        .task { await start() }
     }
 
     private var bottomID: String { "mesh-transcript-bottom-\(column.id)" }

@@ -112,6 +112,10 @@ extension BrokerControlServing {
 /// stays the final authority on every mutation.
 actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     typealias DisconnectHandler = @Sendable (any Error) -> Void
+    private struct PendingRequest {
+        let method: String
+        let continuation: CheckedContinuation<JSONValue, any Error>
+    }
     /// Compatibility values for a durable pre-fix broker. Older brokers merge
     /// their own launcher environment after receiving terminal.create; an
     /// outer Codex process can therefore leak NO_COLOR=1 into every nested CLI.
@@ -136,7 +140,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     private var ownerID = ""
     private var helloWaiter: CheckedContinuation<Void, any Error>?
     private var handshakeTimeoutTask: Task<Void, Never>?
-    private var pending: [String: CheckedContinuation<JSONValue, any Error>] = [:]
+    private var pending: [String: PendingRequest] = [:]
     private var requestTimeoutTasks: [String: Task<Void, Never>] = [:]
     private var readerTask: Task<Void, Never>?
     private var disconnectHandler: DisconnectHandler?
@@ -176,7 +180,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native"),
             "access": .string("controller"),
         ])
-        let encoded = try encode(frame)
+        let encoded = try encode(frame, purpose: .hello)
         return try await withCheckedThrowingContinuation { continuation in
             helloWaiter = continuation
             handshakeTimeoutTask?.cancel()
@@ -256,7 +260,15 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     func attach(projectID: String, terminalID: String) async throws {
-        _ = try await request(.attach, params: identity(projectID: projectID, terminalID: terminalID))
+        let result = try await request(
+            .attach,
+            params: identity(projectID: projectID, terminalID: terminalID)
+        )
+        guard let object = result.objectValue,
+              object["ok"]?.boolValue == true,
+              object["id"]?.stringValue == terminalID else {
+            throw BrokerClientError.requestFailed("terminal.attach")
+        }
     }
 
     func write(projectID: String, terminalID: String, data: String) async throws {
@@ -280,7 +292,15 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     func kill(projectID: String, terminalID: String) async throws {
-        _ = try await request(.kill, params: identity(projectID: projectID, terminalID: terminalID))
+        let result = try await request(
+            .kill,
+            params: identity(projectID: projectID, terminalID: terminalID)
+        )
+        guard let object = result.objectValue,
+              object["ok"]?.boolValue == true,
+              object["id"]?.stringValue == terminalID else {
+            throw BrokerClientError.requestFailed("terminal.kill")
+        }
     }
 
     /// Permanently ends an owned terminal and removes its retained broker
@@ -457,9 +477,9 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             "method": .string(method),
             "params": params,
         ])
-        let encoded = try encode(frame)
+        let encoded = try encode(frame, purpose: .request(method))
         return try await withCheckedThrowingContinuation { continuation in
-            pending[requestID] = continuation
+            pending[requestID] = PendingRequest(method: method, continuation: continuation)
             requestTimeoutTasks[requestID] = Task {
                 do {
                     try await Task.sleep(nanoseconds: operationTimeoutNanoseconds)
@@ -579,6 +599,9 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                 if data.isEmpty { continue }
                 var activeDecoder = decoder
                 try activeDecoder.consume(data) { data in
+                    _ = try BrokerWire.validateDecodedFrame(data) { id in
+                        pending[id]?.method
+                    }
                     let frame = try JSONDecoder().decode(JSONValue.self, from: data)
                     try handle(frame)
                 }
@@ -624,14 +647,16 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             helloWaiter?.resume(returning: ())
             helloWaiter = nil
         case "response":
-            guard let id = object["id"]?.stringValue, let continuation = pending.removeValue(forKey: id) else {
+            guard let id = object["id"]?.stringValue, let request = pending.removeValue(forKey: id) else {
                 return
             }
             requestTimeoutTasks.removeValue(forKey: id)?.cancel()
             if object["ok"]?.boolValue == true, let result = object["result"] {
-                continuation.resume(returning: result)
+                request.continuation.resume(returning: result)
             } else {
-                continuation.resume(throwing: BrokerClientError.requestFailed(object["message"]?.stringValue ?? "request"))
+                request.continuation.resume(
+                    throwing: BrokerClientError.requestFailed(object["message"]?.stringValue ?? "request")
+                )
             }
         case "event":
             // The controller connection carries no streams; events belong to
@@ -642,16 +667,20 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         }
     }
 
-    private func encode(_ frame: JSONValue) throws -> Data {
+    private func encode(_ frame: JSONValue, purpose: BrokerFramePurpose) throws -> Data {
         var data = try JSONEncoder().encode(frame)
-        guard data.count <= BrokerWire.maximumFrameBytes else { throw BrokerClientError.frameRejected }
+        do {
+            try BrokerWire.validateEncodedFrame(data, purpose: purpose)
+        } catch {
+            throw BrokerClientError.frameRejected
+        }
         data.append(0x0A)
         return data
     }
 
     private func failRequest(_ id: String, with error: any Error) {
         requestTimeoutTasks.removeValue(forKey: id)?.cancel()
-        pending.removeValue(forKey: id)?.resume(throwing: error)
+        pending.removeValue(forKey: id)?.continuation.resume(throwing: error)
     }
 
     private func failConnection(with error: any Error) {
@@ -661,7 +690,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         helloWaiter = nil
         for task in requestTimeoutTasks.values { task.cancel() }
         requestTimeoutTasks.removeAll()
-        for continuation in pending.values { continuation.resume(throwing: error) }
+        for request in pending.values { request.continuation.resume(throwing: error) }
         pending.removeAll()
         connected = false
         connectedFeatures = []

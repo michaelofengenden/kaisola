@@ -66,6 +66,7 @@ function startBroker() {
 }
 
 async function connectClient(config, access = 'controller') {
+  await waitFor(() => fs.existsSync(config.socketPath), 'broker socket')
   const socket = net.createConnection(config.socketPath)
   socket.setEncoding('utf8')
   let buffer = ''
@@ -105,6 +106,29 @@ async function connectClient(config, access = 'controller') {
   }
   return { socket, hello, request }
 }
+
+test('oversized small-method request is rejected before dispatch without poisoning the socket', async (t) => {
+  const fixture = startBroker()
+  t.after(() => {
+    try { fixture.child.kill('SIGKILL') } catch {}
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  })
+  await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
+
+  const controller = await connectClient(fixture.config)
+  const rejected = await controller.request('broker.status', {
+    padding: 'x'.repeat(70 * 1024),
+  })
+  assert.equal(rejected.ok, false)
+  assert.match(rejected.message, /broker request exceeds 65536 byte limit/)
+
+  const healthy = await controller.request('broker.status')
+  assert.equal(healthy.ok, true)
+  assert.equal(healthy.result.pid, fixture.child.pid)
+  assert.equal(fixture.child.exitCode, null)
+  controller.socket.destroy()
+})
 
 test('sealed broker identity is published and safe update commit rejects racing mutations', async (t) => {
   const fixture = startBroker()

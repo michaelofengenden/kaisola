@@ -9,6 +9,59 @@ import XCTest
 /// mutations the native app needs, every request carries the owner identity,
 /// and the connection refuses brokers that predate role enforcement.
 final class BrokerControlClientTests: XCTestCase {
+    func testOversizedWriteIsRejectedBeforeTransportSend() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        let framesBeforeWrite = await transport.sentFrames().count
+
+        do {
+            try await client.write(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                data: String(repeating: "x", count: BrokerWire.maximumEncodedBytes(for: .request("terminal.write")))
+            )
+            XCTFail("The request envelope must not widen the terminal.write byte contract.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .frameRejected)
+        }
+
+        let framesAfterWrite = await transport.sentFrames().count
+        XCTAssertEqual(framesAfterWrite, framesBeforeWrite)
+        await client.disconnect()
+    }
+
+    func testSmallMethodResponseIsRejectedBeforeJSONValueDecode() async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: .object([
+            "ok": .bool(true),
+            "padding": .string(String(repeating: "x", count: 300 * 1_024)),
+        ]))
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 500_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        do {
+            try await client.resize(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                columns: 120,
+                rows: 40
+            )
+            XCTFail("A terminal.resize response must use the small response contract.")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerWireError,
+                .frameTooLarge(maximum: BrokerWire.maximumEncodedBytes(for: .response("terminal.resize")))
+            )
+        }
+        await client.disconnect()
+    }
+
     func testResizeRequiresPositiveBrokerAcknowledgement() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: false)
         let client = BrokerControlClient(
@@ -152,6 +205,172 @@ final class BrokerControlClientTests: XCTestCase {
         // Every control method is one the observer policy explicitly forbids,
         // proving the two lanes partition the wire surface.
         XCTAssertTrue(controlMethods.isSubset(of: ObserveOnlyBrokerPolicy.forbiddenTerminalMethods))
+    }
+
+    func testKillPropagatesMissingAndSignalFailureResults() async throws {
+        for (name, result) in [
+            (
+                "missing",
+                JSONValue.object([
+                    "id": .string("terminal-one"),
+                    "ok": .bool(false),
+                    "code": .string("terminal_not_found"),
+                ])
+            ),
+            (
+                "signal refusal",
+                JSONValue.object([
+                    "id": .string("terminal-one"),
+                    "ok": .bool(false),
+                    "code": .string("terminal_kill_failed"),
+                ])
+            ),
+        ] {
+            try await assertKillFails(result: result, context: name)
+        }
+    }
+
+    func testKillFailsClosedOnMissingOrMismatchedTerminalIdentity() async throws {
+        for (name, result) in [
+            (
+                "missing identity",
+                JSONValue.object(["ok": .bool(true)])
+            ),
+            (
+                "mismatched identity",
+                JSONValue.object([
+                    "id": .string("terminal-two"),
+                    "ok": .bool(true),
+                ])
+            ),
+            (
+                "non-string identity",
+                JSONValue.object([
+                    "id": .integer(1),
+                    "ok": .bool(true),
+                ])
+            ),
+            (
+                "missing acknowledgement",
+                JSONValue.object(["id": .string("terminal-one")])
+            ),
+        ] {
+            try await assertKillFails(result: result, context: name)
+        }
+    }
+
+    func testKillAcceptsAlreadyExitedForTheExactTerminal() async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: .object([
+            "id": .string("terminal-one"),
+            "ok": .bool(true),
+            "alreadyExited": .bool(true),
+        ]))
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.kill(projectID: "project.one", terminalID: "terminal-one")
+
+        let frames = await transport.sentFrames()
+        let request = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(request["method"]?.stringValue, "terminal.kill")
+        XCTAssertEqual(request["params"]?.objectValue?["projectId"]?.stringValue, "project.one")
+        XCTAssertEqual(request["params"]?.objectValue?["id"]?.stringValue, "terminal-one")
+        await client.disconnect()
+    }
+
+    private func assertKillFails(result: JSONValue, context: String) async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: result)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        do {
+            try await client.kill(projectID: "project.one", terminalID: "terminal-one")
+            XCTFail("\(context) must not be reported as a successful terminal kill")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .requestFailed("terminal.kill"), context)
+        }
+        await client.disconnect()
+    }
+
+    func testAttachPropagatesMissingTerminalResult() async throws {
+        try await assertAttachFails(
+            result: .object([
+                "id": .string("terminal-one"),
+                "ok": .bool(false),
+                "code": .string("terminal_not_found"),
+            ]),
+            context: "missing terminal"
+        )
+    }
+
+    func testAttachFailsClosedOnInvalidAcknowledgementOrIdentity() async throws {
+        for (name, result) in [
+            (
+                "missing identity",
+                JSONValue.object(["ok": .bool(true)])
+            ),
+            (
+                "mismatched identity",
+                JSONValue.object([
+                    "id": .string("terminal-two"),
+                    "ok": .bool(true),
+                ])
+            ),
+            (
+                "non-string identity",
+                JSONValue.object([
+                    "id": .integer(1),
+                    "ok": .bool(true),
+                ])
+            ),
+            (
+                "missing acknowledgement",
+                JSONValue.object(["id": .string("terminal-one")])
+            ),
+        ] {
+            try await assertAttachFails(result: result, context: name)
+        }
+    }
+
+    func testAttachAcceptsExplicitExistingTerminalIdentity() async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: .object([
+            "id": .string("terminal-one"),
+            "ok": .bool(true),
+            "exited": .bool(false),
+        ]))
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.attach(projectID: "project.one", terminalID: "terminal-one")
+
+        let frames = await transport.sentFrames()
+        let request = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(request["method"]?.stringValue, "terminal.attach")
+        XCTAssertEqual(request["params"]?.objectValue?["projectId"]?.stringValue, "project.one")
+        XCTAssertEqual(request["params"]?.objectValue?["id"]?.stringValue, "terminal-one")
+        await client.disconnect()
+    }
+
+    private func assertAttachFails(result: JSONValue, context: String) async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: result)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        do {
+            try await client.attach(projectID: "project.one", terminalID: "terminal-one")
+            XCTFail("\(context) must not be reported as a successful terminal attach")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .requestFailed("terminal.attach"), context)
+        }
+        await client.disconnect()
     }
 
     func testNewTerminalsNeutralizeOuterCLILauncherColorState() {
@@ -416,6 +635,74 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
     }
 
     func disconnectPeer() {
+        deliver(nil)
+    }
+
+    func sentFrames() -> [JSONValue] { frames }
+
+    private func encoded(_ frame: JSONValue) throws -> Data {
+        var data = try JSONEncoder().encode(frame)
+        data.append(0x0A)
+        return data
+    }
+
+    private func deliver(_ data: Data?) {
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            incoming.append(data)
+        }
+    }
+}
+
+/// Dedicated fixture keeps nested result-shape tests independent from the
+/// shared controller fixture used by transport and resize contracts.
+private actor ScriptedControlResultBrokerTransport: BrokerByteTransport {
+    private let result: JSONValue
+    private var frames: [JSONValue] = []
+    private var incoming: [Data?] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+
+    init(result: JSONValue) {
+        self.result = result
+    }
+
+    func connect(path: String) async throws {}
+
+    func send(_ data: Data) async throws {
+        guard let newline = data.firstIndex(of: 0x0A) else {
+            throw BrokerClientError.malformedResponse
+        }
+        let frame = try JSONDecoder().decode(JSONValue.self, from: data[..<newline])
+        frames.append(frame)
+        guard let object = frame.objectValue,
+              let type = object["type"]?.stringValue else { return }
+        if type == "hello" {
+            deliver(try encoded(.object([
+                "type": .string("hello"),
+                "ok": .bool(true),
+                "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+                "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
+                "features": .array([.string(BrokerWire.terminalObserveFeature)]),
+            ])))
+            return
+        }
+        guard type == "request", let id = object["id"]?.stringValue else { return }
+        deliver(try encoded(.object([
+            "type": .string("response"),
+            "id": .string(id),
+            "ok": .bool(true),
+            "result": result,
+        ])))
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !incoming.isEmpty { return incoming.removeFirst() }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func close() async {
         deliver(nil)
     }
 

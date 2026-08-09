@@ -644,6 +644,215 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
+    func testTimedOutFirstRetirementIsQuarantinedWhileTwoHealthyDrainsRetire() async throws {
+        let home = try privateTemporaryDirectory()
+        let stuckDigest = String(repeating: "a", count: 64)
+        let oldDigest = String(repeating: "e", count: 64)
+        let laterDigest = String(repeating: "f", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let launcher = FakeBrokerHelperLauncher(implementationVersion: 2)
+        let locator = BrokerInfoLocator(userDataCandidates: [live.profile])
+        let cutoverCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted),
+            rollingUpdatesEnabled: true
+        )
+        _ = try await cutoverCoordinator.prepare()
+
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let cutoverRegistry = try store.load()
+        let cutoverTopology = try XCTUnwrap(cutoverRegistry.topology)
+        let old = try XCTUnwrap(cutoverTopology.draining.first)
+        let stuck = try makeLiveDrainingGeneration(
+            profile: live.profile,
+            template: old,
+            contentDigest: stuckDigest
+        )
+        let later = try makeLiveDrainingGeneration(
+            profile: live.profile,
+            template: old,
+            contentDigest: laterDigest
+        )
+        defer {
+            Darwin.close(stuck.descriptor)
+            Darwin.close(later.descriptor)
+        }
+        let rewritten = try store.save(
+            currentGenerationID: cutoverTopology.current.id,
+            generations: [
+                cutoverTopology.current,
+                stuck.generation,
+                old,
+                later.generation,
+            ],
+            expectedRevision: cutoverRegistry.revision
+        )
+        XCTAssertEqual(
+            rewritten.topology?.draining.map(\.id),
+            [stuckDigest, oldDigest, laterDigest]
+        )
+
+        let requester = FakeRollingBrokerUpgradeRequester(
+            upgradeDecision: .accepted,
+            retirementDecision: .accepted
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true,
+            retirementWaiter: { generation, profileRoot in
+                if generation.id == stuckDigest {
+                    throw BrokerStartupError.timedOut(nil)
+                }
+                let metadataURL = BrokerGenerationRegistryStore(profileRoot: profileRoot)
+                    .metadataURL(for: generation)
+                _ = metadataURL.path.withCString(Darwin.unlink)
+            }
+        )
+
+        // The first heartbeat records and bypasses the accepted-but-stuck
+        // generation, then commits at most one healthy retirement. The next
+        // heartbeat skips the bounded quarantine and reaches the second healthy
+        // generation instead of spending its whole budget on the same timeout.
+        _ = await coordinator.attemptUpgradeIfNeeded()
+        let firstSweepDiagnostics = await coordinator.retirementDiagnostics()
+        XCTAssertEqual(firstSweepDiagnostics.count, 1)
+        XCTAssertEqual(firstSweepDiagnostics.first?.generationID, stuckDigest)
+        XCTAssertEqual(firstSweepDiagnostics.first?.nextAttemptInSweeps, 2)
+        _ = await coordinator.attemptUpgradeIfNeeded()
+
+        let retired = try store.load()
+        XCTAssertEqual(retired.topology?.draining.map(\.id), [stuckDigest])
+        let retirementDigests = await requester.retirementContentDigests()
+        XCTAssertEqual(retirementDigests, [stuckDigest, oldDigest, laterDigest])
+        XCTAssertTrue(FileManager.default.fileExists(atPath: stuck.metadataURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.metadataURL(for: old).path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: later.metadataURL.path))
+
+        let diagnostics = await coordinator.retirementDiagnostics()
+        let diagnostic = try XCTUnwrap(diagnostics.first)
+        XCTAssertEqual(diagnostic.generationID, stuckDigest)
+        XCTAssertEqual(diagnostic.pid, stuck.generation.info.pid)
+        XCTAssertEqual(diagnostic.failureCount, 1)
+        XCTAssertEqual(diagnostic.reason, .shutdownTimedOut)
+        XCTAssertEqual(diagnostic.nextAttemptInSweeps, 1)
+        XCTAssertTrue(diagnostic.detail.contains(String(stuckDigest.prefix(12))))
+        XCTAssertTrue(diagnostic.detail.contains("timed out"))
+        XCTAssertTrue(diagnostic.detail.contains("failure count 1"))
+
+        // Repeated instant failures grow 2 → 4 → 8 → 16 sweeps, then stay
+        // capped. Advancing through sweep 31 reaches the fifth failure without
+        // letting the quarantine or its user-visible retry estimate grow
+        // without bound.
+        for _ in 0..<29 {
+            _ = await coordinator.attemptUpgradeIfNeeded()
+        }
+        let boundedDiagnostics = await coordinator.retirementDiagnostics()
+        let boundedDiagnostic = try XCTUnwrap(boundedDiagnostics.first)
+        XCTAssertEqual(boundedDiagnostic.failureCount, 5)
+        XCTAssertEqual(boundedDiagnostic.nextAttemptInSweeps, 16)
+        let boundedRetirementDigests = await requester.retirementContentDigests()
+        XCTAssertEqual(
+            boundedRetirementDigests,
+            [stuckDigest, oldDigest, laterDigest] + Array(repeating: stuckDigest, count: 4)
+        )
+        await launcher.close()
+    }
+
+    func testRetirementStopsBeforeLaterCandidateWhenRegistryIdentityChangesDuringWait() async throws {
+        let home = try privateTemporaryDirectory()
+        let changingDigest = String(repeating: "a", count: 64)
+        let oldDigest = String(repeating: "e", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let launcher = FakeBrokerHelperLauncher(implementationVersion: 2)
+        let locator = BrokerInfoLocator(userDataCandidates: [live.profile])
+        let cutoverCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted),
+            rollingUpdatesEnabled: true
+        )
+        _ = try await cutoverCoordinator.prepare()
+
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let cutoverRegistry = try store.load()
+        let cutoverTopology = try XCTUnwrap(cutoverRegistry.topology)
+        let old = try XCTUnwrap(cutoverTopology.draining.first)
+        let changing = try makeLiveDrainingGeneration(
+            profile: live.profile,
+            template: old,
+            contentDigest: changingDigest
+        )
+        defer { Darwin.close(changing.descriptor) }
+        let rewritten = try store.save(
+            currentGenerationID: cutoverTopology.current.id,
+            generations: [cutoverTopology.current, changing.generation, old],
+            expectedRevision: cutoverRegistry.revision
+        )
+        let changedInfo = BrokerInfo(
+            protocolVersion: changing.generation.info.protocolVersion,
+            securityEpoch: changing.generation.info.securityEpoch,
+            implementationVersion: changing.generation.info.implementationVersion,
+            packageSchema: changing.generation.info.packageSchema,
+            packageVersion: changing.generation.info.packageVersion,
+            contentDigest: changing.generation.info.contentDigest,
+            pid: changing.generation.info.pid,
+            socketPath: changing.generation.info.socketPath,
+            token: String(repeating: "c", count: 64),
+            startedAt: changing.generation.info.startedAt + 1,
+            version: changing.generation.info.version
+        )
+        let changedGeneration = BrokerGenerationRecord(
+            id: changing.generation.id,
+            role: .draining,
+            info: changedInfo,
+            packageRoot: changing.generation.packageRoot,
+            registeredAt: changing.generation.registeredAt
+        )
+        let requester = FakeRollingBrokerUpgradeRequester(
+            upgradeDecision: .accepted,
+            retirementDecision: .accepted
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true,
+            retirementWaiter: { generation, _ in
+                if generation.id == changingDigest {
+                    _ = try store.save(
+                        currentGenerationID: cutoverTopology.current.id,
+                        generations: [cutoverTopology.current, changedGeneration, old],
+                        expectedRevision: rewritten.revision
+                    )
+                    throw BrokerStartupError.timedOut(nil)
+                }
+            }
+        )
+
+        _ = await coordinator.attemptUpgradeIfNeeded()
+
+        let retained = try store.load()
+        XCTAssertEqual(retained.topology?.draining, [changedGeneration, old])
+        let retirementDigests = await requester.retirementContentDigests()
+        XCTAssertEqual(retirementDigests, [changingDigest])
+        let diagnostics = await coordinator.retirementDiagnostics()
+        XCTAssertTrue(diagnostics.isEmpty)
+        await launcher.close()
+    }
+
     func testRollbackRefusesOlderImplementationEvenWhenItsProcessIsLive() async throws {
         let home = try privateTemporaryDirectory()
         let oldDigest = String(repeating: "e", count: 64)
@@ -866,6 +1075,59 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         )
         return (profile, descriptor, info)
     }
+
+    private func makeLiveDrainingGeneration(
+        profile: URL,
+        template: BrokerGenerationRecord,
+        contentDigest: String
+    ) throws -> (
+        generation: BrokerGenerationRecord,
+        descriptor: Int32,
+        metadataURL: URL
+    ) {
+        let packageRoot = profile
+            .appendingPathComponent("broker-generations", isDirectory: true)
+            .appendingPathComponent(contentDigest, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: packageRoot,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let socket = profile
+            .appendingPathComponent("session-broker", isDirectory: true)
+            .appendingPathComponent(
+                BrokerLaunchConfiguration.generationSocketLeaf(
+                    userData: profile,
+                    contentDigest: contentDigest
+                )
+            )
+        let descriptor = try bindUnixSocket(at: socket)
+        let info = BrokerInfo(
+            protocolVersion: template.info.protocolVersion,
+            securityEpoch: template.info.securityEpoch,
+            implementationVersion: template.info.implementationVersion,
+            packageSchema: template.info.packageSchema,
+            packageVersion: template.info.packageVersion,
+            contentDigest: contentDigest,
+            pid: getpid(),
+            socketPath: socket.path,
+            token: template.info.token,
+            startedAt: template.info.startedAt,
+            version: template.info.version
+        )
+        let generation = BrokerGenerationRecord(
+            id: contentDigest,
+            role: .draining,
+            info: info,
+            packageRoot: packageRoot.path,
+            registeredAt: template.registeredAt
+        )
+        let metadataURL = BrokerGenerationRegistryStore(profileRoot: profile)
+            .metadataURL(for: generation)
+        try JSONEncoder().encode(info).write(to: metadataURL)
+        _ = chmod(metadataURL.path, 0o600)
+        return (generation, descriptor, metadataURL)
+    }
 }
 
 private actor FakeBrokerUpgradeRequester: BrokerUpgradeRequesting {
@@ -895,6 +1157,7 @@ private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
     private var upgrades = 0
     private var cancels = 0
     private var retirements = 0
+    private var retirementDigests: [String] = []
 
     init(
         upgradeDecision: BrokerUpgradeDecision,
@@ -934,6 +1197,7 @@ private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
         targetContentDigest: String
     ) async throws -> BrokerRetirementDecision {
         retirements += 1
+        retirementDigests.append(info.contentDigest ?? "legacy")
         let decision = info.contentDigest.flatMap { retirementDecisionsByDigest[$0] }
             ?? retirementDecision
         if decision == .accepted { onRetirement() }
@@ -943,6 +1207,7 @@ private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
     func upgradeCallCount() -> Int { upgrades }
     func cancelCallCount() -> Int { cancels }
     func retirementCallCount() -> Int { retirements }
+    func retirementContentDigests() -> [String] { retirementDigests }
 }
 
 private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {

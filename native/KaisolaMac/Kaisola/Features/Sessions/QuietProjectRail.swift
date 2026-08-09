@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import SwiftUI
 
@@ -61,10 +62,11 @@ struct QuietProjectRail: View {
     private let meshMenu: (MeshSession) -> AnyView
     private let deleteRecentlyClosed: (AppModel.RecentlyClosedSurface) -> Void
 
-    /// Time-in-state, not time-since-creation: rows report how long the surface
-    /// has been in the state it is showing.
+    /// Time-in-state, not time-since-creation. Only transitions observed by
+    /// this live window have a known age; restored first observations stay
+    /// explicitly unknown rather than being stamped as newly transitioned.
     @State private var clock = QuietStatusClock()
-    @State private var now = Date()
+    @State private var now = QuietStatusClock.Reading.now
     /// Held in `@State` so a parent re-render (which happens on every streamed
     /// terminal byte) cannot restart the timer before it ever fires.
     @State private var tick = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
@@ -120,7 +122,13 @@ struct QuietProjectRail: View {
                 model.moveProject(id: move.id, toIndex: move.toIndex)
             }
         }
-        .onReceive(tick) { now = $0 }
+        .onReceive(tick) { _ in now = .now }
+        .onReceive(NotificationCenter.default.publisher(for: .NSSystemClockDidChange)) { _ in
+            now = .now
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in
+            now = .now
+        }
     }
 
     private func group(_ project: AppModel.ProjectGroup, placement: QuietProjectPlacement) -> some View {
@@ -132,8 +140,15 @@ struct QuietProjectRail: View {
             placement: placement,
             now: now,
             orderStore: orderStore,
-            since: { clock.since(id: $0) },
-            note: { id, status in clock.note(id: id, status: status, at: Date()) },
+            clockEntry: { clock.entry(id: $0) },
+            note: { id, status in
+                let observedAt = QuietStatusClock.Reading.now
+                // `now` otherwise trails by up to one 30-second tick. Keep it
+                // aligned with a fresh observation so an ordinary transition
+                // begins at zero rather than briefly looking unavailable.
+                now = observedAt
+                clock.note(id: id, status: status, at: observedAt)
+            },
             selectSession: selectSession,
             launchMenu: launchMenu,
             projectMenu: projectMenu,
@@ -435,9 +450,9 @@ private struct QuietProjectGroup: View {
     let project: AppModel.ProjectGroup
     @Binding var isExpanded: Bool
     let placement: QuietProjectPlacement
-    let now: Date
+    let now: QuietStatusClock.Reading
     let orderStore: SessionOrderStore
-    let since: (String) -> Date?
+    let clockEntry: (String) -> QuietStatusClock.Entry?
     let note: (String, QuietSessionStatus) -> Void
     let selectSession: (BrokerTerminalRecord) -> Void
     let launchMenu: (AppModel.ProjectGroup) -> AnyView
@@ -861,6 +876,7 @@ private struct QuietProjectGroup: View {
         onScreen: [String]
     ) -> some View {
         let processName = model.meta(for: record.id)?.processName
+        let time = timeInState(record.id, status: status)
         return QuietSurfaceRowView(
             id: record.id,
             identity: QuietIdentity.identity(
@@ -874,7 +890,7 @@ private struct QuietProjectGroup: View {
                 ordinal: ordinal
             ),
             status: status,
-            timeLabel: timeLabel(record.id),
+            timeInState: time,
             isSelected: selected == record.id,
             isOnScreen: onScreen.contains(record.id),
             tooltip: tooltip(for: record),
@@ -886,12 +902,13 @@ private struct QuietProjectGroup: View {
     }
 
     private func chatRow(_ chat: AcpChatHandle, status: QuietSessionStatus, selected: String?, onScreen: [String]) -> some View {
-        QuietSurfaceRowView(
+        let time = timeInState(chat.id, status: status)
+        return QuietSurfaceRowView(
             id: chat.id,
             identity: QuietIdentity.identity(agentName: chat.agentID, processName: nil),
             title: chat.conversation.title,
             status: status,
-            timeLabel: timeLabel(chat.id),
+            timeInState: time,
             isSelected: selected == chat.id,
             isOnScreen: onScreen.contains(chat.id),
             tooltip: chatTooltip(chat),
@@ -903,12 +920,13 @@ private struct QuietProjectGroup: View {
     }
 
     private func meshRow(_ mesh: MeshSession, status: QuietSessionStatus, selected: String?, onScreen: [String]) -> some View {
-        QuietSurfaceRowView(
+        let time = timeInState(mesh.id, status: status)
+        return QuietSurfaceRowView(
             id: mesh.id,
             identity: .mesh,
             title: mesh.title,
             status: status,
-            timeLabel: timeLabel(mesh.id),
+            timeInState: time,
             isSelected: selected == mesh.id,
             isOnScreen: onScreen.contains(mesh.id),
             tooltip: mesh.stage == "Idle" ? "Mesh · Ready" : "Mesh · \(mesh.stage)",
@@ -921,9 +939,12 @@ private struct QuietProjectGroup: View {
 
     // MARK: Derivations
 
-    private func timeLabel(_ id: String) -> String {
-        guard let start = since(id) else { return "" }
-        return QuietTimeLabel.label(since: start, now: now)
+    private func timeInState(_ id: String, status: QuietSessionStatus) -> QuietTimeInStatePresentation {
+        QuietTimeInStatePresentation.make(
+            status: status,
+            entry: clockEntry(id),
+            now: now
+        )
     }
 
     /// Everything the rollup and the expanded rows both need, derived once per
@@ -1349,7 +1370,7 @@ private struct QuietSurfaceRowView: View {
     let identity: QuietIdentity
     let title: String
     let status: QuietSessionStatus
-    let timeLabel: String
+    let timeInState: QuietTimeInStatePresentation
     let isSelected: Bool
     /// On screen, but not the pane holding focus.
     var isOnScreen = false
@@ -1374,7 +1395,7 @@ private struct QuietSurfaceRowView: View {
             QuietRowBody(
                 identity: identity,
                 title: title,
-                timeLabel: timeLabel,
+                timeLabel: timeInState.compactLabel,
                 status: status,
                 isSelected: isSelected,
                 showsReveal: hovering,
@@ -1388,6 +1409,7 @@ private struct QuietSurfaceRowView: View {
         // System Events seeing a row with AXPress but no readable title.
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityLabel)
+        .accessibilityValue(QuietSurfaceRowSemantics.accessibilityValue(time: timeInState))
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
         .accessibilityIdentifier(id)
         .accessibilityAction { select() }
@@ -1396,19 +1418,15 @@ private struct QuietSurfaceRowView: View {
             groupHover(inside)
             withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
         }
-        .help(tooltip)
+        .help(QuietSurfaceRowSemantics.tooltip(base: tooltip, time: timeInState))
         .contextMenu { menu() }
         .listRowInsets(QuietRailMetrics.listRowBleed)
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
     }
 
-    /// A row with no time-in-state yet must not read as "…, idle, " — the
-    /// components are joined only when they carry something.
     private var accessibilityLabel: String {
-        [title, status.accessibilityWord ?? "idle", timeLabel]
-            .filter { !$0.isEmpty }
-            .joined(separator: ", ")
+        QuietSurfaceRowSemantics.accessibilityLabel(title: title, status: status)
     }
 
     /// ⌘-click opens the surface beside the current one instead of replacing

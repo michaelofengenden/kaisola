@@ -146,12 +146,12 @@ struct AcpComposerMenuView: View {
                 Spacer(minLength: 10)
                 Text(row.value)
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
                 Image(systemName: "chevron.right")
                     .font(.system(size: 9, weight: .semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .accessibilityHidden(true)
             }
             .padding(.horizontal, 9)
@@ -180,10 +180,10 @@ struct AcpComposerMenuView: View {
                 HStack(spacing: 6) {
                     Text("Advanced")
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     Image(systemName: advancedExpanded ? "chevron.down" : "chevron.up")
                         .font(.system(size: 8, weight: .semibold))
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.kaisolaTertiary)
                         .accessibilityHidden(true)
                     Spacer(minLength: 0)
                 }
@@ -201,7 +201,7 @@ struct AcpComposerMenuView: View {
                     ForEach(advancedLines, id: \.self) { line in
                         Text(line)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .fixedSize(horizontal: false, vertical: true)
                             .accessibilityIdentifier("acp.composer.menu.advancedLine")
                     }
@@ -218,12 +218,22 @@ struct AcpComposerMenuView: View {
         VStack(alignment: .leading, spacing: 1) {
             Text(panel.title)
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .padding(.horizontal, 9)
                 .padding(.top, 5)
                 .padding(.bottom, 4)
                 .accessibilityAddTraits(.isHeader)
                 .accessibilityIdentifier("acp.composer.menu.submenu.title")
+
+            if let note = panel.note {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 9)
+                    .padding(.bottom, 4)
+                    .accessibilityIdentifier("acp.composer.menu.submenu.note")
+            }
 
             if panel.showsSearch {
                 searchField
@@ -232,7 +242,7 @@ struct AcpComposerMenuView: View {
             if panel.options.isEmpty {
                 Text("Nothing to choose here yet.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.horizontal, 9)
                     .padding(.vertical, 6)
                     .accessibilityIdentifier("acp.composer.menu.submenu.empty")
@@ -277,7 +287,7 @@ struct AcpComposerMenuView: View {
         HStack(spacing: 6) {
             Image(systemName: "magnifyingglass")
                 .font(.caption)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.kaisolaTertiary)
                 .accessibilityHidden(true)
             TextField("Filter", text: $query)
                 .textFieldStyle(.plain)
@@ -304,7 +314,7 @@ struct AcpComposerMenuView: View {
                     if let caption = option.caption {
                         Text(caption)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .lineLimit(1)
                             .truncationMode(.middle)
                     }
@@ -313,11 +323,18 @@ struct AcpComposerMenuView: View {
                 if option.isSelected {
                     Image(systemName: "checkmark")
                         .font(.system(size: 11, weight: .medium))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .accessibilityHidden(true)
                 }
             }
-            .foregroundStyle(option.isEnabled ? AnyShapeStyle(.primary) : AnyShapeStyle(.tertiary))
+            // A disabled row takes the disabled rung rather than tertiary:
+            // tertiary now carries icon-only controls and is held to 3:1, which
+            // is not what an inactive option should read as.
+            .foregroundStyle(
+                option.isEnabled
+                    ? AnyShapeStyle(.primary)
+                    : AnyShapeStyle(Color.kaisolaDisabled)
+            )
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -349,7 +366,7 @@ struct AcpComposerMenuView: View {
             HStack(spacing: 6) {
                 Text("Manage agents…")
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Spacer(minLength: 0)
             }
             .padding(.horizontal, 9)

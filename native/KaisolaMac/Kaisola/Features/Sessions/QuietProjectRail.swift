@@ -340,6 +340,25 @@ enum QuietRowBudget {
     static let headerPlusTrailingInset: CGFloat = QuietRailMetrics.plusTrailingInset
     static var headerPlusReserved: CGFloat { headerPlusSlot + headerPlusTrailingInset }
 
+    /// How many leading characters two titles have to share before the rail
+    /// treats them as the same row at a glance.
+    ///
+    /// Measured rather than assumed. At the resting 210pt width with a "now"
+    /// time label the title lane is 103.5pt, and 103.5pt of the system font at
+    /// 13pt renders **13** characters of "Codex · MATLAB kernel bridge" — the
+    /// issue's own example, which is why three of those read as one row. The
+    /// 15-character floor `titleWidth`'s test holds is a floor for a *narrow*
+    /// sample; wide glyphs cost more. 12 sits under the measurement so a pair
+    /// the rail really does draw identically is always caught, and titles that
+    /// diverge inside the first dozen characters are left alone.
+    ///
+    /// Deliberately a count and not a `titleWidth` call: `QuietRailLabels` runs
+    /// on every body pass, including the ones a streaming agent triggers, and
+    /// it would otherwise re-measure every title against a font each time.
+    /// `QuietIdentityMarkTests` measures the real font against this constant so
+    /// the approximation cannot quietly drift past what the lane draws.
+    static let ambiguousTitleCharacters = 12
+
     /// - Parameters:
     ///   - sidebarWidth: the navigation column's width. Rows span it entirely;
     ///     see `QuietRailMetrics.listRowBleed`.
@@ -499,15 +518,31 @@ private struct QuietProjectGroup: View {
             visibleIDs: onScreen,
             focusedPaneID: model.focusedPaneID
         )
+        // What each row actually draws. A title is only ambiguous relative to
+        // the titles beside it, so this is decided once for the whole group
+        // rather than per row — and only while the group is showing its rows.
+        let labels = isExpanded ? labelMap(sessions: sessions, chats: chats, meshes: meshes) : [:]
 
         Group {
             header(statuses: statuses)
             if isExpanded {
                 ForEach(chats) { chat in
-                    chatRow(chat, status: statuses[chat.id] ?? .idle, selected: selected, onScreen: onScreen)
+                    chatRow(
+                        chat,
+                        status: statuses[chat.id] ?? .idle,
+                        selected: selected,
+                        onScreen: onScreen,
+                        labels: labels
+                    )
                 }
                 ForEach(meshes) { mesh in
-                    meshRow(mesh, status: statuses[mesh.id] ?? .idle, selected: selected, onScreen: onScreen)
+                    meshRow(
+                        mesh,
+                        status: statuses[mesh.id] ?? .idle,
+                        selected: selected,
+                        onScreen: onScreen,
+                        labels: labels
+                    )
                 }
                 ForEach(Array(sessions.enumerated()), id: \.element.id) { index, session in
                     sessionRow(
@@ -515,7 +550,8 @@ private struct QuietProjectGroup: View {
                         ordinal: index + 1,
                         status: statuses[session.id] ?? .idle,
                         selected: selected,
-                        onScreen: onScreen
+                        onScreen: onScreen,
+                        labels: labels
                     )
                 }
                 .onMove { indices, target in
@@ -853,26 +889,68 @@ private struct QuietProjectGroup: View {
         return ids.filter { model.isSurfaceVisible($0) }
     }
 
+    /// The title a session row carries on its own, before the group's other
+    /// titles get a say. Shared with `labelMap` so the string the labeller
+    /// reasoned about is exactly the string the row would have drawn.
+    private func sessionTitle(_ record: BrokerTerminalRecord, ordinal: Int) -> String {
+        QuietRailTitle.displayTitle(
+            rawTitle: model.sessionTitle(for: record),
+            projectName: project.name,
+            processName: model.meta(for: record.id)?.processName,
+            ordinal: ordinal
+        )
+    }
+
+    /// Every drawn title in the group, run through `QuietRailLabels` once and
+    /// handed back keyed by surface id.
+    ///
+    /// Chats, meshes and sessions are pooled on purpose: they share the one
+    /// 36pt column and the eye reads straight down it, so two rows of different
+    /// kinds that both render "Codex · MAT…" are the same complaint.
+    private func labelMap(
+        sessions: [BrokerTerminalRecord],
+        chats: [AcpChatHandle],
+        meshes: [MeshSession]
+    ) -> [String: QuietRailLabel] {
+        var ids: [String] = []
+        var titles: [String] = []
+        for chat in chats {
+            ids.append(chat.id)
+            titles.append(chat.conversation.title)
+        }
+        for mesh in meshes {
+            ids.append(mesh.id)
+            titles.append(mesh.title)
+        }
+        for (index, record) in sessions.enumerated() {
+            ids.append(record.id)
+            titles.append(sessionTitle(record, ordinal: index + 1))
+        }
+        var map: [String: QuietRailLabel] = [:]
+        for (id, label) in zip(ids, QuietRailLabels.labels(for: titles)) where map[id] == nil {
+            map[id] = label
+        }
+        return map
+    }
+
     private func sessionRow(
         _ record: BrokerTerminalRecord,
         ordinal: Int,
         status: QuietSessionStatus,
         selected: String?,
-        onScreen: [String]
+        onScreen: [String],
+        labels: [String: QuietRailLabel]
     ) -> some View {
         let processName = model.meta(for: record.id)?.processName
+        let title = sessionTitle(record, ordinal: ordinal)
         return QuietSurfaceRowView(
             id: record.id,
             identity: QuietIdentity.identity(
                 agentName: model.agentProfile(for: record.id)?.name,
                 processName: processName
             ),
-            title: QuietRailTitle.displayTitle(
-                rawTitle: model.sessionTitle(for: record),
-                projectName: project.name,
-                processName: processName,
-                ordinal: ordinal
-            ),
+            title: title,
+            label: labels[record.id] ?? .verbatim(title),
             status: status,
             timeLabel: timeLabel(record.id),
             isSelected: selected == record.id,
@@ -885,11 +963,18 @@ private struct QuietProjectGroup: View {
         )
     }
 
-    private func chatRow(_ chat: AcpChatHandle, status: QuietSessionStatus, selected: String?, onScreen: [String]) -> some View {
+    private func chatRow(
+        _ chat: AcpChatHandle,
+        status: QuietSessionStatus,
+        selected: String?,
+        onScreen: [String],
+        labels: [String: QuietRailLabel]
+    ) -> some View {
         QuietSurfaceRowView(
             id: chat.id,
             identity: QuietIdentity.identity(agentName: chat.agentID, processName: nil),
             title: chat.conversation.title,
+            label: labels[chat.id] ?? .verbatim(chat.conversation.title),
             status: status,
             timeLabel: timeLabel(chat.id),
             isSelected: selected == chat.id,
@@ -902,11 +987,18 @@ private struct QuietProjectGroup: View {
         )
     }
 
-    private func meshRow(_ mesh: MeshSession, status: QuietSessionStatus, selected: String?, onScreen: [String]) -> some View {
+    private func meshRow(
+        _ mesh: MeshSession,
+        status: QuietSessionStatus,
+        selected: String?,
+        onScreen: [String],
+        labels: [String: QuietRailLabel]
+    ) -> some View {
         QuietSurfaceRowView(
             id: mesh.id,
             identity: .mesh,
             title: mesh.title,
+            label: labels[mesh.id] ?? .verbatim(mesh.title),
             status: status,
             timeLabel: timeLabel(mesh.id),
             isSelected: selected == mesh.id,
@@ -1195,7 +1287,10 @@ private struct QuietSelectionPillView: View {
 /// whole rail.
 private struct QuietRowBody: View {
     let identity: QuietIdentity
-    let title: String
+    /// What this row draws, decided against every other title in the project
+    /// (`QuietRailLabels`) rather than in isolation. The whole title still
+    /// reaches hover and VoiceOver from `QuietSurfaceRowView`.
+    let label: QuietRailLabel
     let timeLabel: String
     let status: QuietSessionStatus
     let isSelected: Bool
@@ -1211,14 +1306,16 @@ private struct QuietRowBody: View {
         HStack(spacing: 0) {
             QuietIdentityMarkView(identity: identity)
                 .padding(.trailing, QuietRailMetrics.markGap)
-            Text(title)
+            Text(label.text)
                 .font(.system(size: QuietRailMetrics.titleText, weight: QuietRowEmphasis.weight(isSelected: isSelected)))
                 // Three steps: the row you are looking at is the user's accent
                 // colour, an ended row is tertiary, everything else is
                 // secondary regular.
                 .foregroundStyle(titleStyle)
                 .lineLimit(1)
-                .truncationMode(.tail)
+                // Tail everywhere except the rows a tail would render
+                // identically; see `QuietRailLabels`.
+                .truncationMode(label.truncation.textMode)
                 // The only compressible token in the row; without this it loses
                 // to its fixed-size siblings and truncates first.
                 .layoutPriority(1)
@@ -1347,7 +1444,12 @@ private struct QuietSurfaceRowView: View {
     /// can address a specific row without depending on its visible title.
     let id: String
     let identity: QuietIdentity
+    /// The whole title. Hover and VoiceOver read this one, whatever the row
+    /// ends up drawing.
     let title: String
+    /// What the row draws, once the project's other titles have been taken
+    /// into account.
+    let label: QuietRailLabel
     let status: QuietSessionStatus
     let timeLabel: String
     let isSelected: Bool
@@ -1373,7 +1475,7 @@ private struct QuietSurfaceRowView: View {
         Button(action: press) {
             QuietRowBody(
                 identity: identity,
-                title: title,
+                label: label,
                 timeLabel: timeLabel,
                 status: status,
                 isSelected: isSelected,
@@ -1396,7 +1498,7 @@ private struct QuietSurfaceRowView: View {
             groupHover(inside)
             withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
         }
-        .help(tooltip)
+        .help(helpText)
         .contextMenu { menu() }
         .listRowInsets(QuietRailMetrics.listRowBleed)
         .listRowSeparator(.hidden)
@@ -1405,10 +1507,22 @@ private struct QuietSurfaceRowView: View {
 
     /// A row with no time-in-state yet must not read as "…, idle, " — the
     /// components are joined only when they carry something.
+    ///
+    /// Always the *whole* title, never the drawn label: eliding a shared lead
+    /// is a scanning economy for the eye, and VoiceOver reads one row at a time
+    /// with no siblings in view to supply the missing words.
     private var accessibilityLabel: String {
         [title, status.accessibilityWord ?? "idle", timeLabel]
             .filter { !$0.isEmpty }
             .joined(separator: ", ")
+    }
+
+    /// A row drawing less than its whole title has to be able to say the rest
+    /// somewhere the pointer can reach it, so the title joins the tooltip —
+    /// but only for those rows. Every other row's tooltip is unchanged.
+    private var helpText: String {
+        guard label.elidesTitle else { return tooltip }
+        return tooltip.isEmpty ? title : "\(title) · \(tooltip)"
     }
 
     /// ⌘-click opens the surface beside the current one instead of replacing

@@ -24,6 +24,9 @@ const {
   MAX_FRAME,
   atomicJson,
   brokerMethodAllowedForAccess,
+  // Framing and queue accounting live in brokerWire so the observer layer can
+  // be exercised against the exact delivery verdict a real socket produces.
+  writeFrame: send,
 } = require('./ipc/brokerWire.cjs')
 
 const NO_CLIENT_EXIT_MS = process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_NO_CLIENT_EXIT_MS
@@ -131,18 +134,6 @@ function waitMilliseconds(milliseconds) {
     const timer = setTimeout(resolve, milliseconds)
     timer.unref?.()
   })
-}
-
-function send(socket, frame, { maxQueueBytes, force = false } = {}) {
-  if (!socket || socket.destroyed) return false
-  try {
-    const encoded = `${JSON.stringify(frame)}\n`
-    const frameBytes = Buffer.byteLength(encoded, 'utf8')
-    if (!force && Number.isFinite(maxQueueBytes) && socket.writableLength + frameBytes > maxQueueBytes) return false
-    return socket.write(encoded)
-  } catch {
-    return false // reconnect replays snapshots
-  }
 }
 
 const LEGACY_PROJECT_SCOPE = 'legacy'

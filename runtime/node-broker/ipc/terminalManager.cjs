@@ -397,6 +397,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     rec.observers = new TerminalObservers({
       terminalId: id,
       deliver: (subscriber, channel, payload, options) => send(subscriber, channel, payload, options),
+      onDrop: () => syncSpoolVisibility(rec),
     })
     terms.set(id, rec)
     return rec
@@ -455,6 +456,9 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
   rec.observers = new TerminalObservers({
     terminalId: id,
     deliver: (subscriber, channel, payload, options) => send(subscriber, channel, payload, options),
+    // A retired subscription changes the observer count, and the spool's RAM
+    // read cache is derived from it.
+    onDrop: () => syncSpoolVisibility(rec),
   })
   const broadcastAgentActivity = () => {
     send(rec.sender || rec.lastSender, 'terminal:agent-activity', {

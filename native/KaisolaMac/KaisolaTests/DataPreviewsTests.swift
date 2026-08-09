@@ -362,4 +362,155 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertEqual(jsonParseCount, 1)
         XCTAssertLessThan(jsonElapsed, .seconds(3.5))
     }
+
+    // MARK: - HTML JavaScript approval
+
+    private static let benignHTML = "<html><body><p>Weekly report</p></body></html>"
+    private static let scriptedHTML =
+        "<html><body><div id=\"root\"></div><script>exfiltrate()</script></body></html>"
+
+    private func htmlIdentity(
+        path: String = "/project/report.html",
+        modifiedAt seconds: TimeInterval = 10,
+        revision: Int = 1
+    ) -> PreviewParseIdentity {
+        PreviewParseIdentity(
+            path: path,
+            modificationDate: Date(timeIntervalSince1970: seconds),
+            revision: revision
+        )
+    }
+
+    /// Mounts a document the way the preview does — prepare, then approve.
+    private func approvedApproval(
+        for identity: PreviewParseIdentity,
+        source: String
+    ) -> HTMLScriptApproval {
+        var approval = HTMLScriptApproval()
+        approval.adopt(identity: identity, fingerprint: HTMLScriptApproval.fingerprint(source))
+        approval.allow(for: identity)
+        XCTAssertTrue(approval.allowsJavaScript(for: identity))
+        return approval
+    }
+
+    func testJavaScriptApprovalDoesNotSurviveExternalReplacementOfTheSameFile() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 1)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // An agent rewrites the file on disk: same path, later snapshot, and a
+        // revision bump from the reload the workspace watcher triggers.
+        let replaced = htmlIdentity(modifiedAt: 20, revision: 2)
+        XCTAssertFalse(approval.allowsJavaScript(for: replaced))
+
+        approval.adopt(
+            identity: replaced,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.scriptedHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: replaced))
+        XCTAssertFalse(approval.allowsJavaScript(for: approvedIdentity))
+    }
+
+    func testJavaScriptApprovalDoesNotSurviveAnInEditorSave() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 3)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // Saving from the built-in editor rewrites the file and bumps the
+        // preview revision, leaving the pane pointed at the same path.
+        let saved = htmlIdentity(modifiedAt: 40, revision: 4)
+        XCTAssertFalse(approval.allowsJavaScript(for: saved))
+
+        approval.adopt(
+            identity: saved,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.scriptedHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: saved))
+    }
+
+    func testJavaScriptApprovalDropsWhenContentChangesUnderOneModificationTimestamp() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 1)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // Filesystem timestamps are coarse enough that a fast rewrite can land
+        // on the same mtime. The revision still moves, and so do the bytes.
+        let rewritten = htmlIdentity(modifiedAt: 10, revision: 2)
+        XCTAssertFalse(approval.allowsJavaScript(for: rewritten))
+
+        approval.adopt(
+            identity: rewritten,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.scriptedHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: rewritten))
+    }
+
+    func testJavaScriptApprovalReturnsOnlyWhenAReloadProducedIdenticalBytes() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 1)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // A reload of unchanged content should not ask again, but the grant
+        // stays off until those bytes have actually proved identical.
+        let reloaded = htmlIdentity(modifiedAt: 20, revision: 2)
+        XCTAssertFalse(approval.allowsJavaScript(for: reloaded))
+
+        approval.adopt(
+            identity: reloaded,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertTrue(approval.allowsJavaScript(for: reloaded))
+    }
+
+    func testJavaScriptApprovalDoesNotFollowIdenticalContentToAnotherFile() {
+        let approvedIdentity = htmlIdentity(path: "/project/trusted.html")
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        let otherFile = htmlIdentity(path: "/project/copy.html", modifiedAt: 20, revision: 2)
+        approval.adopt(
+            identity: otherFile,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: otherFile))
+    }
+
+    func testRevokingJavaScriptClearsTheGrantForIdenticalContentToo() {
+        let approvedIdentity = htmlIdentity()
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        approval.revoke()
+        XCTAssertFalse(approval.allowsJavaScript(for: approvedIdentity))
+
+        let reloaded = htmlIdentity(modifiedAt: 20, revision: 2)
+        approval.adopt(
+            identity: reloaded,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: reloaded))
+    }
+
+    func testJavaScriptApprovalTakenBeforeFingerprintingCoversOnlyThatIdentity() {
+        // The preparing overlay normally blocks this, but a grant made without
+        // a known fingerprint must not outlive the document it was made for.
+        let approvedIdentity = htmlIdentity()
+        var approval = HTMLScriptApproval()
+        approval.allow(for: approvedIdentity)
+        XCTAssertTrue(approval.allowsJavaScript(for: approvedIdentity))
+
+        let reloaded = htmlIdentity(modifiedAt: 20, revision: 2)
+        approval.adopt(
+            identity: reloaded,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: reloaded))
+    }
+
+    func testHtmlPreviewPreparationCarriesReadinessAndFingerprintFromOnePass() async {
+        let cache = PreviewParseCache<HTMLPreviewPreparation>()
+        _ = await cache.value(for: Self.scriptedHTML, parse: HTMLPreviewPreparation.make)
+        let preparation = await cache.value(for: Self.scriptedHTML, parse: HTMLPreviewPreparation.make)
+        let parseCount = await cache.parseCount
+
+        XCTAssertEqual(parseCount, 1)
+        XCTAssertTrue(preparation.requiresJavaScriptPrompt)
+        XCTAssertEqual(preparation.fingerprint, HTMLScriptApproval.fingerprint(Self.scriptedHTML))
+        XCTAssertNotEqual(preparation.fingerprint, HTMLScriptApproval.fingerprint(Self.benignHTML))
+        XCTAssertFalse(HTMLPreviewPreparation.make(Self.benignHTML).requiresJavaScriptPrompt)
+    }
 }

@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import SwiftUI
 import WebKit
@@ -705,6 +706,79 @@ enum HTMLPreviewReadiness {
     }
 }
 
+/// Tracks the exact document an HTML preview's JavaScript opt-in applies to.
+///
+/// The path alone is not a document. A preview pane keeps the same path while
+/// the bytes behind it are replaced — an agent rewrites the file, the built-in
+/// editor saves over it, the changed-on-disk banner reloads it — so a grant
+/// tied to the path lets replaced content inherit permission the user gave to
+/// something else. The grant therefore names the parse identity it was made
+/// for, which changes on retarget, disk snapshot, and revision alike, and
+/// carries a fingerprint of the approved source so a reload that produced
+/// byte-identical content does not re-prompt.
+struct HTMLScriptApproval: Equatable {
+    private var mountedFingerprint: String?
+    private var approvedIdentity: PreviewParseIdentity?
+    private var approvedFingerprint: String?
+
+    init() {}
+
+    /// Scripts run only for the identity the user opted in for. Every other
+    /// identity — including the same file one revision later — reads as false
+    /// in the same body evaluation that mounts the new content.
+    func allowsJavaScript(for identity: PreviewParseIdentity) -> Bool {
+        approvedIdentity == identity
+    }
+
+    /// The user allowed scripts for what is on screen right now.
+    mutating func allow(for identity: PreviewParseIdentity) {
+        approvedIdentity = identity
+        approvedFingerprint = mountedFingerprint
+    }
+
+    mutating func revoke() {
+        approvedIdentity = nil
+        approvedFingerprint = nil
+    }
+
+    /// The preview finished preparing a document's source. A grant carries
+    /// over only when the same file came back with the same bytes. Anything
+    /// else — replaced content, a save, another file that happens to match —
+    /// drops the grant outright rather than parking it, so no later identity
+    /// can collide back into it.
+    mutating func adopt(identity: PreviewParseIdentity, fingerprint: String) {
+        mountedFingerprint = fingerprint
+        guard let approvedIdentity else { return }
+        guard approvedIdentity.path == identity.path, approvedFingerprint == fingerprint else {
+            revoke()
+            return
+        }
+        self.approvedIdentity = identity
+    }
+
+    /// Stable fingerprint of preview source text.
+    nonisolated static func fingerprint(_ source: String) -> String {
+        SHA256.hash(data: Data(source.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
+
+/// One pass over the HTML source: whether the page needs the script prompt,
+/// and the fingerprint that pins a grant to these exact bytes. Both ride the
+/// same cache entry so neither hashes a megabyte on the main actor.
+struct HTMLPreviewPreparation: Equatable, Sendable {
+    let requiresJavaScriptPrompt: Bool
+    let fingerprint: String
+
+    nonisolated static func make(_ source: String) -> HTMLPreviewPreparation {
+        HTMLPreviewPreparation(
+            requiresJavaScriptPrompt: HTMLPreviewReadiness.requiresJavaScriptPrompt(source),
+            fingerprint: HTMLScriptApproval.fingerprint(source)
+        )
+    }
+}
+
 private enum HTMLPreviewLoadState: Equatable {
     case loading
     case ready
@@ -724,12 +798,32 @@ struct HtmlFilePreview: View {
     let zoom: CGFloat
     let contentRevision: Int
 
-    @State private var readinessCache = PreviewParseCache<Bool>()
+    @State private var preparationCache = PreviewParseCache<HTMLPreviewPreparation>()
     @State private var requiresJavaScriptPrompt = false
     @State private var preparedIdentity: PreviewParseIdentity?
     @State private var reloadToken = 0
-    @State private var allowsJavaScript = false
+    @State private var scriptApproval = HTMLScriptApproval()
     @State private var loadState: HTMLPreviewLoadState = .loading
+
+    /// Derived rather than stored: the approval names one document, so content
+    /// swapped in behind the same path drops to false without waiting for an
+    /// effect to run.
+    private var allowsJavaScript: Bool {
+        scriptApproval.allowsJavaScript(for: identity)
+    }
+
+    private var javaScriptApprovalBinding: Binding<Bool> {
+        Binding(
+            get: { allowsJavaScript },
+            set: { isOn in
+                if isOn {
+                    scriptApproval.allow(for: identity)
+                } else {
+                    scriptApproval.revoke()
+                }
+            }
+        )
+    }
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -782,7 +876,7 @@ struct HtmlFilePreview: View {
                         .multilineTextAlignment(.center)
                         .frame(maxWidth: 260)
                     HStack(spacing: 8) {
-                        Button("Allow JavaScript") { allowsJavaScript = true }
+                        Button("Allow JavaScript") { scriptApproval.allow(for: identity) }
                             .buttonStyle(.borderedProminent)
                         Button("Open in Browser") { NSWorkspace.shared.open(fileURL) }
                             .buttonStyle(.bordered)
@@ -795,7 +889,7 @@ struct HtmlFilePreview: View {
             }
 
             Menu {
-                Toggle("Allow project JavaScript", isOn: $allowsJavaScript)
+                Toggle("Allow project JavaScript", isOn: javaScriptApprovalBinding)
                 Button("Reload") { reloadToken &+= 1 }
                 Divider()
                 Button("Open in Browser") { NSWorkspace.shared.open(fileURL) }
@@ -814,7 +908,7 @@ struct HtmlFilePreview: View {
         .background(Color(nsColor: .windowBackgroundColor))
         // Approval is deliberately one-file-at-a-time. Navigating from a
         // trusted document must never silently grant scripts to the next file.
-        .onChange(of: fileURL) { _, _ in allowsJavaScript = false }
+        .onChange(of: fileURL) { _, _ in scriptApproval.revoke() }
         .overlay {
             if preparedIdentity != identity {
                 ZStack {
@@ -826,12 +920,13 @@ struct HtmlFilePreview: View {
         }
         .task(id: identity) {
             let html = source
-            let readiness = await readinessCache.value(
+            let preparation = await preparationCache.value(
                 for: html,
-                parse: HTMLPreviewReadiness.requiresJavaScriptPrompt
+                parse: HTMLPreviewPreparation.make
             )
             guard !Task.isCancelled else { return }
-            requiresJavaScriptPrompt = readiness
+            requiresJavaScriptPrompt = preparation.requiresJavaScriptPrompt
+            scriptApproval.adopt(identity: identity, fingerprint: preparation.fingerprint)
             preparedIdentity = identity
         }
     }

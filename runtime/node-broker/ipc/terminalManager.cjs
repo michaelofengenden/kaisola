@@ -1237,13 +1237,30 @@ function kill(id) {
 function release(id) {
   cancelRelease(id)
   const r = terms.get(id)
-  if (r?.flushTimer) clearTimeout(r.flushTimer)
-  if (r?.agentQuietTimer) clearTimeout(r.agentQuietTimer)
+  if (!r) {
+    const deletion = TerminalSpool.cleanup(id, spoolDir)
+    return {
+      id,
+      ok: deletion.complete,
+      released: true,
+      deletion,
+      cleanup: deletion.complete ? null : { method: 'terminal.release', id },
+    }
+  }
+  if (r.flushTimer) clearTimeout(r.flushTimer)
+  if (r.agentQuietTimer) clearTimeout(r.agentQuietTimer)
   kill(id)
-  r?.spool.close({ remove: true })
+  const deletion = r.spool.close({ remove: true })
   terms.delete(id)
   // The record is gone, so its pty exit can no longer reach these resolvers.
-  if (r) rejectExitWaiters(takeExitWaiters(r), 'Terminal is no longer available.')
+  rejectExitWaiters(takeExitWaiters(r), 'Terminal is no longer available.')
+  return {
+    id,
+    ok: deletion.complete,
+    released: true,
+    deletion,
+    cleanup: deletion.complete ? null : { method: 'terminal.release', id },
+  }
 }
 
 /** Broker-owned close grace survives renderer crashes, appearance swaps, and

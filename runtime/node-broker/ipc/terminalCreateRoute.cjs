@@ -243,6 +243,13 @@ function terminalKillRoute({ manager, id, requireAllowed }) {
   return manager.kill(id)
 }
 
+/** Preserve the typed deletion receipt and cleanup action exactly. A released
+ * PTY may still have an artifact whose unlink needs another idempotent call. */
+function terminalReleaseRoute({ manager, id, requireAllowed }) {
+  requireAllowed(id)
+  return manager.release(id)
+}
+
 /** Attach is an ownership mutation, so absence must be decided explicitly
  * before setSender can make the caller believe it adopted a terminal. */
 function terminalAttachRoute({
@@ -380,6 +387,7 @@ module.exports = {
   terminalAttachRoute,
   terminalCreateRoute,
   terminalKillRoute,
+  terminalReleaseRoute,
   terminalResizeRoute,
   validatedTerminalGeometry,
   TERMINAL_CREATE_LIMITS,

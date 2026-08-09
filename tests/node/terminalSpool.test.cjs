@@ -149,6 +149,117 @@ test('late pty output after close({remove}) cannot resurrect the deleted spool f
   assert.equal(fs.existsSync(spool.file), false)
 })
 
+test('close({remove}) reports every artifact and retries transient unlink failures', (t) => {
+  const spool = fixture(t, { id: 'terminal-spool-delete-retry' })
+  spool.push('previous secret')
+  spool.flush()
+  fs.renameSync(spool.file, spool.prevFile)
+  fs.writeFileSync(spool.file, 'current secret', { mode: 0o600 })
+  spool.markExited({ exitCode: 0, signal: null })
+
+  const targets = new Set([spool.file, spool.prevFile, spool.metaFile])
+  const attempts = new Map()
+  const unlinkSync = fs.unlinkSync
+  fs.unlinkSync = (file) => {
+    if (targets.has(file)) {
+      const attempt = (attempts.get(file) || 0) + 1
+      attempts.set(file, attempt)
+      if (attempt === 1) {
+        const error = new Error('injected transient deletion failure')
+        error.code = 'EBUSY'
+        throw error
+      }
+    }
+    return unlinkSync(file)
+  }
+
+  let deletion
+  try {
+    deletion = spool.close({ remove: true })
+  } finally {
+    fs.unlinkSync = unlinkSync
+  }
+
+  assert.deepEqual(deletion, {
+    complete: true,
+    retryable: false,
+    artifacts: [
+      { name: 'current', status: 'deleted', attempts: 2 },
+      { name: 'previous', status: 'deleted', attempts: 2 },
+      { name: 'metadata', status: 'deleted', attempts: 2 },
+    ],
+  })
+  for (const file of targets) assert.equal(fs.existsSync(file), false)
+})
+
+test('failed deletion is explicit and a closed spool can retry without resurrection', (t) => {
+  const spool = fixture(t, { id: 'terminal-spool-delete-cleanup' })
+  spool.push('sensitive terminal bytes')
+  spool.flush()
+  const unlinkSync = fs.unlinkSync
+  fs.unlinkSync = (file) => {
+    if (file === spool.file) {
+      const error = new Error('injected persistent deletion failure')
+      error.code = 'EACCES'
+      throw error
+    }
+    return unlinkSync(file)
+  }
+
+  let first
+  try {
+    first = spool.close({ remove: true })
+  } finally {
+    fs.unlinkSync = unlinkSync
+  }
+
+  assert.equal(first.complete, false)
+  assert.equal(first.retryable, true)
+  assert.deepEqual(first.artifacts, [
+    { name: 'current', status: 'failed', code: 'EACCES', attempts: 1 },
+    { name: 'previous', status: 'absent', attempts: 1 },
+    { name: 'metadata', status: 'deleted', attempts: 1 },
+  ])
+  assert.equal(fs.readFileSync(spool.file, 'utf8'), 'sensitive terminal bytes')
+  assert.equal(JSON.stringify(first).includes(path.dirname(spool.file)), false)
+
+  const retry = spool.close({ remove: true })
+  assert.equal(retry.complete, true)
+  assert.deepEqual(retry.artifacts.map(({ name, status }) => ({ name, status })), [
+    { name: 'current', status: 'deleted' },
+    { name: 'previous', status: 'absent' },
+    { name: 'metadata', status: 'absent' },
+  ])
+  spool.push('late bytes after cleanup')
+  spool.flush()
+  assert.equal(fs.existsSync(spool.file), false)
+})
+
+test('standalone cleanup refuses an unsafe spool root without following it', (t) => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-cleanup-root-'))
+  const bystanderDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-cleanup-bystander-'))
+  const spoolRoot = path.join(parent, 'spool')
+  const sentinel = path.join(bystanderDir, 'private.txt')
+  fs.writeFileSync(sentinel, 'must survive cleanup')
+  fs.symlinkSync(bystanderDir, spoolRoot)
+  t.after(() => {
+    fs.rmSync(parent, { recursive: true, force: true })
+    fs.rmSync(bystanderDir, { recursive: true, force: true })
+  })
+
+  const deletion = TerminalSpool.cleanup('unsafe-cleanup', spoolRoot)
+  assert.equal(deletion.complete, false)
+  assert.equal(deletion.retryable, true)
+  assert.deepEqual(deletion.artifacts, [
+    { name: 'current', status: 'failed', code: 'ERR_KAISOLA_UNSAFE_SPOOL_DIR', attempts: 0 },
+    { name: 'previous', status: 'failed', code: 'ERR_KAISOLA_UNSAFE_SPOOL_DIR', attempts: 0 },
+    { name: 'metadata', status: 'failed', code: 'ERR_KAISOLA_UNSAFE_SPOOL_DIR', attempts: 0 },
+  ])
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'must survive cleanup')
+  assert.equal(fs.lstatSync(spoolRoot).isSymbolicLink(), true)
+  assert.equal(JSON.stringify(deletion).includes(parent), false)
+})
+
 test('exit evidence and the epoch boundary survive a fresh meta read', (t) => {
   const id = 'terminal-spool-exit-evidence'
   const spool = fixture(t, { id })

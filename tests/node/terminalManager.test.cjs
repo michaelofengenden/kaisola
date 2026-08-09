@@ -987,6 +987,63 @@ test('a terminal caps its exit waiters and answers every retained one on release
   assert.equal(__test.exitWaiterCount(id), 0)
 })
 
+test('release surfaces incomplete spool deletion and safely retries after record removal', (t) => {
+  const id = 'release-retries-spool-cleanup'
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  record.spool.push('terminal secret awaiting verified deletion')
+  record.spool.flush()
+  const target = record.spool.file
+
+  const unlinkSync = fs.unlinkSync
+  fs.unlinkSync = (file) => {
+    if (file === target) {
+      const error = new Error('injected persistent deletion failure')
+      error.code = 'EACCES'
+      throw error
+    }
+    return unlinkSync(file)
+  }
+
+  let first
+  try {
+    first = manager.release(id)
+  } finally {
+    fs.unlinkSync = unlinkSync
+  }
+
+  assert.equal(manager.has(id), false, 'the PTY record is never retained for cleanup')
+  assert.deepEqual(first, {
+    id,
+    ok: false,
+    released: true,
+    deletion: {
+      complete: false,
+      retryable: true,
+      artifacts: [
+        { name: 'current', status: 'failed', code: 'EACCES', attempts: 1 },
+        { name: 'previous', status: 'absent', attempts: 1 },
+        { name: 'metadata', status: 'deleted', attempts: 1 },
+      ],
+    },
+    cleanup: { method: 'terminal.release', id },
+  })
+  assert.equal(fs.readFileSync(target, 'utf8'), 'terminal secret awaiting verified deletion')
+
+  const retry = manager.release(id)
+  assert.equal(retry.ok, true)
+  assert.equal(retry.released, true)
+  assert.equal(retry.deletion.complete, true)
+  assert.equal(retry.cleanup, null)
+  assert.equal(manager.has(id), false)
+  assert.equal(fs.existsSync(target), false)
+})
+
 test('an exit wait accepts a bound and drops itself when the bound expires', { timeout: 10_000 }, async (t) => {
   const id = 'exit-wait-bound'
   assert.ok(manager.spawn({

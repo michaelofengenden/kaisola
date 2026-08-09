@@ -16,7 +16,7 @@ const {
   backgroundRejection,
   createBrokerRejectionSupervisor,
 } = require('./ipc/brokerRejectionPolicy.cjs')
-const { terminalAttachRoute, terminalCreateRoute, terminalKillRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
+const { terminalAttachRoute, terminalCreateRoute, terminalKillRoute, terminalReleaseRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalDetachOwnerRoute } = require('./ipc/terminalDetachOwnerRoute.cjs')
 const { BrokerMutationLedger, BrokerRequestGate, dispatchBrokerRequest } = require('./ipc/brokerRequestGate.cjs')
 const { collectBrokerInventorySnapshot } = require('./ipc/brokerInventorySnapshot.cjs')
@@ -612,10 +612,9 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.release': {
       const id = terminalId()
-      requireAllowed(id)
-      mgr.release(id)
+      const result = terminalReleaseRoute({ manager: mgr, id, requireAllowed })
       scheduleNoClientExit()
-      return { ok: true }
+      return result
     }
     case 'terminal.scheduleRelease': {
       const id = terminalId()

@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftTerm
 import XCTest
 @testable import Kaisola
@@ -10,6 +11,36 @@ import XCTest
 /// reach it without a mouse.
 @MainActor
 final class NativeTerminalInteractionTests: XCTestCase {
+    private enum RequiredFishCompatibilityError: Error, Equatable {
+        case missingRequiredFish
+        case missingExpectedFishVersion
+        case invalidFishExecutableName
+        case fishVersionMismatch(expected: String, actual: String)
+        case invalidRequiredFishConfiguration(String)
+        case fishVersionProbeFailed
+    }
+
+    private struct FishRuntime: Equatable {
+        let path: String
+        let version: String
+    }
+
+    private struct RequiredFishCompatibilityConfiguration: Codable, Equatable {
+        let schemaVersion: Int
+        let fishPath: String
+        let fishVersion: String
+
+        var environment: [String: String] {
+            [
+                "KAISOLA_REQUIRE_FISH_COMPATIBILITY": "1",
+                "KAISOLA_TEST_FISH": fishPath,
+                "KAISOLA_EXPECTED_FISH_VERSION": fishVersion,
+            ]
+        }
+    }
+
+    private static let requiredFishVersion = "4.8.1"
+
     private func osc133(_ value: String) -> String {
         "\u{1B}]133;\(value)\u{7}"
     }
@@ -365,32 +396,80 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertFalse(integration.contains("cmdline_url"))
     }
 
+    func testRequiredFishCompatibilityFailsClosedInsteadOfSkipping() throws {
+        let requiredEnvironment = [
+            "KAISOLA_REQUIRE_FISH_COMPATIBILITY": "1",
+            "KAISOLA_TEST_FISH": "/private/tmp/required/fish",
+            "KAISOLA_EXPECTED_FISH_VERSION": Self.requiredFishVersion,
+        ]
+
+        XCTAssertThrowsError(try Self.resolveFish(
+            environment: requiredEnvironment,
+            isExecutable: { _ in false },
+            versionReader: { _ in XCTFail("a missing executable must not be probed"); return "" }
+        )) { error in
+            XCTAssertEqual(error as? RequiredFishCompatibilityError, .missingRequiredFish)
+        }
+
+        XCTAssertThrowsError(try Self.resolveFish(
+            environment: requiredEnvironment,
+            isExecutable: { _ in true },
+            versionReader: { _ in "4.8.0" }
+        )) { error in
+            XCTAssertEqual(
+                error as? RequiredFishCompatibilityError,
+                .fishVersionMismatch(expected: Self.requiredFishVersion, actual: "4.8.0")
+            )
+        }
+
+        let unknownKey = Data(
+            """
+            {"schemaVersion":1,"fishPath":"/private/tmp/fish","fishVersion":"4.8.1",\
+            "unexpected":true}
+            """.utf8
+        )
+        XCTAssertThrowsError(try Self.decodeRequiredFishConfiguration(unknownKey))
+    }
+
     func testGeneratedFishIntegrationExecutesWhenFishRuntimeIsAvailable() throws {
-        guard let fishPath = ProcessInfo.processInfo.environment["KAISOLA_TEST_FISH"],
-              FileManager.default.isExecutableFile(atPath: fishPath) else {
+        let fileConfiguration = try Self.requiredFishCompatibilityConfiguration()
+        let effectiveEnvironment = fileConfiguration?.environment ?? ProcessInfo.processInfo.environment
+        let requiredCompatibility = effectiveEnvironment["KAISOLA_REQUIRE_FISH_COMPATIBILITY"] == "1"
+        guard let fish = try Self.resolveFish(environment: effectiveEnvironment) else {
             throw XCTSkip("Set KAISOLA_TEST_FISH to exercise the generated launcher with a real Fish runtime")
         }
-        guard URL(fileURLWithPath: fishPath).lastPathComponent == "fish" else {
-            XCTFail("KAISOLA_TEST_FISH must point to an executable named fish")
-            return
+        if requiredCompatibility {
+            XCTAssertEqual(fish.version, Self.requiredFishVersion)
         }
 
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("kaisola-semantic-fish-runtime-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(
+                "kaisola fish runtime 'quoted path' \(UUID().uuidString)",
+                isDirectory: true
+            )
         let userHome = root.appendingPathComponent("user", isDirectory: true)
         let integrationRoot = root.appendingPathComponent("integration", isDirectory: true)
-        try FileManager.default.createDirectory(at: userHome, withIntermediateDirectories: true)
+        let userConfigDirectory = userHome.appendingPathComponent(".config/fish", isDirectory: true)
+        try FileManager.default.createDirectory(at: userConfigDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        try Data(
+            """
+            set -gx KAISOLA_FISH_USER_CONFIG custom-config-ok
+            function fish_prompt
+                printf 'kaisola-custom-prompt> '
+            end
+            """.utf8
+        ).write(to: userConfigDirectory.appendingPathComponent("config.fish"))
 
         let installation = try NativeSemanticShellIntegration.installFish(
-            userShell: fishPath,
+            userShell: fish.path,
             directory: integrationRoot
         )
         let startupFile = installation.startupDirectory
             .appendingPathComponent("kaisola-integration.fish")
 
         let syntax = try run(
-            URL(fileURLWithPath: fishPath),
+            URL(fileURLWithPath: fish.path),
             arguments: ["-n", startupFile.path],
             home: userHome
         )
@@ -398,11 +477,21 @@ final class NativeTerminalInteractionTests: XCTestCase {
 
         let modern = try run(
             installation.launcher,
-            arguments: ["-N", "-ic", "printf modern-path-ok"],
+            arguments: [
+                "-ic",
+                "functions --query __kaisola_semantic_preexec; and exit 91; "
+                    + "bind --function-names | string match -q -- forward-char-passive; or exit 92; "
+                    + "/bin/sh -c 'exit 17'; set -l command_status $status; "
+                    + "printf 'modern-path-ok:%s modern-status-ok:%s\\n' "
+                    + "$KAISOLA_FISH_USER_CONFIG $command_status",
+            ],
             home: userHome
         )
         XCTAssertEqual(modern.status, 0, modern.errors)
-        XCTAssertTrue(modern.output.contains("modern-path-ok"), modern.output)
+        XCTAssertTrue(
+            modern.output.contains("modern-path-ok:custom-config-ok modern-status-ok:17"),
+            modern.output.debugDescription
+        )
 
         let generated = try String(contentsOf: startupFile, encoding: .utf8)
         let capabilityGate = "bind --function-names | string match -q -- forward-char-passive; and return 0"
@@ -422,13 +511,13 @@ final class NativeTerminalInteractionTests: XCTestCase {
             arguments: [
                 "-N",
                 "-ic",
-                "__kaisola_semantic_prompt_start; "
+                "functions --query __kaisola_semantic_preexec __kaisola_semantic_cancel; or exit 93; "
+                    + "__kaisola_semantic_prompt_start; "
                     + "__kaisola_semantic_command_start; "
                     + "__kaisola_semantic_preexec; "
-                    + "false; __kaisola_semantic_postexec; "
-                    + "functions --query __kaisola_semantic_cancel "
-                    + "__kaisola_semantic_posterror __kaisola_semantic_wrap_prompt; "
-                    + "and printf functions-ok",
+                    + "/bin/sh -c 'exit 17'; __kaisola_semantic_postexec; "
+                    + "__kaisola_semantic_command_start; emit fish_cancel; "
+                    + "printf 'fallback-path-ok cancel-path-ok\\n'",
             ],
             home: userHome
         )
@@ -436,8 +525,39 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertTrue(legacy.output.contains(osc133("A")), legacy.output.debugDescription)
         XCTAssertTrue(legacy.output.contains(osc133("B")), legacy.output.debugDescription)
         XCTAssertTrue(legacy.output.contains(osc133("C")), legacy.output.debugDescription)
-        XCTAssertTrue(legacy.output.contains(osc133("D;1")), legacy.output.debugDescription)
-        XCTAssertTrue(legacy.output.contains("functions-ok"), legacy.output)
+        XCTAssertTrue(legacy.output.contains(osc133("D;17")), legacy.output.debugDescription)
+        XCTAssertTrue(legacy.output.contains(osc133("D")), legacy.output.debugDescription)
+        XCTAssertTrue(legacy.output.contains("fallback-path-ok cancel-path-ok"), legacy.output)
+
+        let expectProgram = root.appendingPathComponent("resize-fish.exp")
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: "/usr/bin/expect"))
+        try Data(
+            #"""
+            #!/usr/bin/expect -f
+            set timeout 8
+            set launcher [lindex $argv 0]
+            set home [lindex $argv 1]
+            set env(HOME) $home
+            set env(XDG_CONFIG_HOME) "$home/.config"
+            set env(TERM) dumb
+            spawn -noecho $launcher -N -i
+            after 150
+            exec stty rows 41 columns 101 < $spawn_out(slave,name)
+            exec kill -WINCH [exp_pid]
+            after 150
+            send -- "printf 'resize-path-ok:%sx%s\\n' \$COLUMNS \$LINES\r"
+            expect -re {resize-path-ok:101x41}
+            send -- "exit\r"
+            expect eof
+            """#.utf8
+        ).write(to: expectProgram)
+        let resized = try run(
+            URL(fileURLWithPath: "/usr/bin/expect"),
+            arguments: [expectProgram.path, installation.launcher.path, userHome.path],
+            home: userHome
+        )
+        XCTAssertEqual(resized.status, 0, resized.errors)
+        XCTAssertTrue(resized.output.contains("resize-path-ok:101x41"), resized.output)
     }
 
     func testBashAndFishIntegrationsRejectWrongShellAndSymlinkRoot() throws {
@@ -473,6 +593,113 @@ final class NativeTerminalInteractionTests: XCTestCase {
         ))
     }
 
+    private static func requiredFishCompatibilityConfiguration()
+        throws -> RequiredFishCompatibilityConfiguration? {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // KaisolaTests
+            .deletingLastPathComponent()   // KaisolaMac
+            .appendingPathComponent(".artifacts/required-fish-compatibility.json")
+        var metadata = stat()
+        let status = url.path.withCString { Darwin.lstat($0, &metadata) }
+        if status != 0, errno == ENOENT { return nil }
+        guard status == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_uid == geteuid(),
+              (metadata.st_mode & 0o777) == 0o600,
+              (1 ... 16 * 1_024).contains(Int(metadata.st_size)) else {
+            throw RequiredFishCompatibilityError.invalidRequiredFishConfiguration(
+                "unsafe configuration file"
+            )
+        }
+        return try decodeRequiredFishConfiguration(Data(contentsOf: url))
+    }
+
+    private static func decodeRequiredFishConfiguration(
+        _ data: Data
+    ) throws -> RequiredFishCompatibilityConfiguration {
+        let object = try JSONSerialization.jsonObject(with: data)
+        guard let dictionary = object as? [String: Any],
+              Set(dictionary.keys) == Set(["schemaVersion", "fishPath", "fishVersion"]) else {
+            throw RequiredFishCompatibilityError.invalidRequiredFishConfiguration(
+                "unexpected configuration keys"
+            )
+        }
+        let configuration = try JSONDecoder().decode(
+            RequiredFishCompatibilityConfiguration.self,
+            from: data
+        )
+        guard configuration.schemaVersion == 1,
+              configuration.fishVersion == requiredFishVersion,
+              configuration.fishPath.hasPrefix("/"),
+              URL(fileURLWithPath: configuration.fishPath).lastPathComponent == "fish" else {
+            throw RequiredFishCompatibilityError.invalidRequiredFishConfiguration(
+                "invalid configuration values"
+            )
+        }
+        return configuration
+    }
+
+    private static func resolveFish(environment: [String: String]) throws -> FishRuntime? {
+        try resolveFish(
+            environment: environment,
+            isExecutable: FileManager.default.isExecutableFile(atPath:),
+            versionReader: fishVersion(at:)
+        )
+    }
+
+    private static func resolveFish(
+        environment: [String: String],
+        isExecutable: (String) -> Bool,
+        versionReader: (String) throws -> String
+    ) throws -> FishRuntime? {
+        let required = environment["KAISOLA_REQUIRE_FISH_COMPATIBILITY"] == "1"
+        guard let path = environment["KAISOLA_TEST_FISH"],
+              !path.isEmpty,
+              isExecutable(path) else {
+            if required { throw RequiredFishCompatibilityError.missingRequiredFish }
+            return nil
+        }
+        guard URL(fileURLWithPath: path).lastPathComponent == "fish" else {
+            throw RequiredFishCompatibilityError.invalidFishExecutableName
+        }
+        let actual = try versionReader(path)
+        if required {
+            guard let expected = environment["KAISOLA_EXPECTED_FISH_VERSION"],
+                  !expected.isEmpty else {
+                throw RequiredFishCompatibilityError.missingExpectedFishVersion
+            }
+            guard actual == expected else {
+                throw RequiredFishCompatibilityError.fishVersionMismatch(
+                    expected: expected,
+                    actual: actual
+                )
+            }
+        }
+        return FishRuntime(path: path, version: actual)
+    }
+
+    private static func fishVersion(at path: String) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["--version"]
+        process.standardInput = FileHandle.nullDevice
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let prefix = "fish, version "
+        let rendered = String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard process.terminationStatus == 0,
+              rendered.hasPrefix(prefix),
+              rendered.count > prefix.count else {
+            throw RequiredFishCompatibilityError.fishVersionProbeFailed
+        }
+        return String(rendered.dropFirst(prefix.count))
+    }
+
     private func run(
         _ executable: URL,
         arguments: [String],
@@ -483,6 +710,8 @@ final class NativeTerminalInteractionTests: XCTestCase {
         process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         environment["HOME"] = home.path
+        environment["XDG_CONFIG_HOME"] = home.appendingPathComponent(".config").path
+        environment["TERM"] = "xterm-256color"
         environment.removeValue(forKey: "BASH_ENV")
         environment.removeValue(forKey: "KAISOLA_BASH_LOGIN")
         environment.removeValue(forKey: "KAISOLA_BASH_STARTUP_ACTIVE")

@@ -337,17 +337,23 @@ final class BrokerControlClientTests: XCTestCase {
         XCTAssertEqual(idle?.agentActivity, .idle)
     }
 
-    func testCorruptStoreDegradesToEmptyRegistry() throws {
+    func testCorruptStoreDegradesToEmptyRegistryWithoutRotatingTheOwnerIdentity() throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-session-store-\(UUID().uuidString.prefix(8))")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: directory) }
+        defer {
+            SessionStoreQuarantineMonitor.shared.reset()
+            try? FileManager.default.removeItem(at: directory)
+        }
         let file = directory.appendingPathComponent("native-sessions.json")
         try Data("not json".utf8).write(to: file)
 
         let store = NativeSessionStore(fileURL: file)
         XCTAssertEqual(store.sessions(), [])
-        XCTAssertTrue(store.ownerID().hasPrefix("native-"))
+        // The registry degrades, the identity does not: a fresh owner id here
+        // would sever authority over still-live durable terminals (issue #477).
+        XCTAssertEqual(store.ownerID(), "")
+        XCTAssertEqual(store.archiveQuarantine()?.failure, .corrupt)
     }
 }
 

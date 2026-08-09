@@ -100,7 +100,9 @@ struct ClosedSession: Codable, Equatable, Sendable {
 
 /// Persists the app's broker owner identity and its owned-terminal registry in
 /// the native application-support directory (never Electron's). Writes are
-/// atomic; a corrupt file degrades to an empty registry rather than a crash.
+/// atomic; an archive this build cannot read degrades to an empty registry
+/// rather than a crash, and is quarantined rather than replaced — the identity
+/// in those bytes is the only proof of authority over live durable terminals.
 struct NativeSessionStore: Sendable {
     /// One coherent read of the navigation fields AppModel renders together.
     /// Keeping this as a value also prevents a project-open interaction from
@@ -113,6 +115,9 @@ struct NativeSessionStore: Sendable {
 
     private struct Payload: Codable {
         var ownerID: String
+        /// Archive format this payload was written in. Absent on records from
+        /// builds before the field existed, which are format 1 by definition.
+        var schemaVersion: Int?
         var sessions: [NativeOwnedSession]
         var projects: [OpenProject]?
         /// Recently closed project tabs, newest last, bounded — powers
@@ -148,6 +153,15 @@ struct NativeSessionStore: Sendable {
         let projectID: String
     }
 
+    /// What one look at the durable archive established. Absence is its own
+    /// case on purpose: a missing file is a first launch, while every failure
+    /// is a file that still holds this install's broker authority.
+    private enum ArchiveState {
+        case missing
+        case loaded(Payload)
+        case unreadable(SessionStoreArchiveFailure)
+    }
+
     /// Process-wide decoded-payload cache, keyed by archive URL.
     ///
     /// `NativeSessionStore` is a value type that callers construct ad hoc —
@@ -158,6 +172,9 @@ struct NativeSessionStore: Sendable {
     /// beside the file identity instead. Only this process writes
     /// `native-sessions.json` (the broker does not), so a write-through cache
     /// cannot go stale behind our back.
+    ///
+    /// Failed reads are never cached here — the quarantine ledger latches
+    /// those — so a cache hit always means "missing" or "decoded".
     private final class PayloadCache: @unchecked Sendable {
         static let shared = PayloadCache()
 
@@ -167,11 +184,12 @@ struct NativeSessionStore: Sendable {
         /// remembered as absent rather than re-probed on every read.
         private var loaded: Set<URL> = []
 
-        func cached(_ url: URL) -> Payload?? {
+        func cached(_ url: URL) -> ArchiveState? {
             lock.lock()
             defer { lock.unlock() }
             guard loaded.contains(url) else { return nil }
-            return .some(entries[url])
+            guard let payload = entries[url] else { return .missing }
+            return .loaded(payload)
         }
 
         func store(_ payload: Payload?, for url: URL) {
@@ -189,8 +207,25 @@ struct NativeSessionStore: Sendable {
         }
     }
 
+    /// Just enough of the archive to tell a readable format from a newer one,
+    /// decoded before the payload so a future format is refused rather than
+    /// half-understood.
+    private struct ArchiveHeader: Decodable {
+        var schemaVersion: Int?
+    }
+
+    /// Only the identity, for the salvage pass over bytes that no longer decode
+    /// as a whole payload.
+    private struct OwnerIDProbe: Decodable {
+        var ownerID: String?
+    }
+
     private static let decoder = JSONDecoder()
     private static let encoder = JSONEncoder()
+
+    /// Archive format this build writes and is willing to read. Bump it only
+    /// alongside a change older builds must not try to interpret.
+    static let archiveSchemaVersion = 1
 
     /// Undo-stack depth (⌘⌥T / ⌘⇧T). A pure UI convenience: the permanent
     /// closed-state markers (`closedTerminals`, `closedProjectIDs`) are what
@@ -207,13 +242,59 @@ struct NativeSessionStore: Sendable {
     /// Stable per-install controller identity: the broker's ownership and
     /// stale-write rules key on it, so reattach after relaunch must present
     /// the same value.
+    ///
+    /// Empty when the archive exists but could not be read. A fresh identity is
+    /// minted only for an archive that is genuinely absent or genuinely has no
+    /// identity in it — one damaged byte is not evidence that this install
+    /// never owned anything, and rotating on it severs authority over live
+    /// durable terminals for good.
     func ownerID() -> String {
-        if let payload = read(), !payload.ownerID.isEmpty { return payload.ownerID }
-        let fresh = "native-" + UUID().uuidString.lowercased()
-        var payload = read() ?? Payload(ownerID: fresh, sessions: [])
-        payload.ownerID = fresh
-        write(payload)
-        return fresh
+        resolvedOwnerID() ?? ""
+    }
+
+    /// The identity, or nil when the archive is quarantined and nothing could
+    /// be salvaged from it. Callers that can degrade (observe-only broker
+    /// lanes, device naming) should prefer this over the empty string.
+    func resolvedOwnerID() -> String? {
+        switch loadArchive() {
+        case .loaded(let payload) where !payload.ownerID.isEmpty:
+            return payload.ownerID
+        case .loaded(var payload):
+            // Decodable and identity-less: there is no authority to lose.
+            let fresh = Self.freshOwnerID()
+            payload.ownerID = fresh
+            write(payload)
+            return fresh
+        case .missing:
+            let fresh = Self.freshOwnerID()
+            write(Payload(ownerID: fresh, sessions: []))
+            return fresh
+        case .unreadable:
+            return recoverQuarantinedOwnerID()
+        }
+    }
+
+    /// The quarantine's report on this archive, or nil when it reads cleanly
+    /// (or is simply not there yet). Probing classifies the file on first call.
+    func archiveQuarantine() -> SessionStoreQuarantine? {
+        _ = loadArchive()
+        return SessionStoreQuarantineMonitor.shared.quarantine(for: fileURL)
+    }
+
+    private static func freshOwnerID() -> String {
+        "native-" + UUID().uuidString.lowercased()
+    }
+
+    /// The recovery half of the quarantine: the identity is the first field the
+    /// encoder writes, so a torn archive usually still carries it intact.
+    /// Re-adopting it is repair, not rotation — and it only runs once the
+    /// original bytes are safely copied aside, so nothing is traded away for it.
+    private func recoverQuarantinedOwnerID() -> String? {
+        guard let quarantine = SessionStoreQuarantineMonitor.shared.quarantine(for: fileURL),
+              let salvaged = quarantine.salvagedOwnerID,
+              quarantine.copyPath != nil else { return nil }
+        write(Payload(ownerID: salvaged, sessions: []), resolvingQuarantine: true)
+        return salvaged
     }
 
     func sessions() -> [NativeOwnedSession] {
@@ -593,14 +674,140 @@ struct NativeSessionStore: Sendable {
     }
 
     private func read() -> Payload? {
-        if let cached = PayloadCache.shared.cached(fileURL) { return cached }
-        let payload: Payload? = (try? Data(contentsOf: fileURL))
-            .flatMap { try? Self.decoder.decode(Payload.self, from: $0) }
-        PayloadCache.shared.store(payload, for: fileURL)
+        guard case .loaded(let payload) = loadArchive() else { return nil }
         return payload
     }
 
-    private func write(_ payload: Payload) {
+    /// One classified look at the archive. Every failure separates from absence
+    /// here, because absence is the only state that may be replaced with a
+    /// brand-new file.
+    private func loadArchive() -> ArchiveState {
+        if let quarantine = SessionStoreQuarantineMonitor.shared.quarantine(for: fileURL) {
+            return .unreadable(quarantine.failure)
+        }
+        if let cached = PayloadCache.shared.cached(fileURL) { return cached }
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            guard Self.isMissingFile(error) else {
+                // The bytes are there and unreachable (permissions, I/O). They
+                // cannot be copied aside, so leaving them alone is the whole of
+                // the quarantine.
+                return quarantine(.unreadable(Self.readReason(for: error)), bytes: nil)
+            }
+            PayloadCache.shared.store(nil, for: fileURL)
+            return .missing
+        }
+
+        guard let header = try? Self.decoder.decode(ArchiveHeader.self, from: data) else {
+            return quarantine(.corrupt, bytes: data)
+        }
+        let version = header.schemaVersion ?? Self.archiveSchemaVersion
+        guard version <= Self.archiveSchemaVersion else {
+            // A newer build's archive is not damaged, just unreadable here.
+            // Downgrading once must not cost the user their sessions when they
+            // upgrade back, so it stays exactly as it is.
+            return quarantine(
+                .futureVersion(found: version, supported: Self.archiveSchemaVersion),
+                bytes: nil
+            )
+        }
+        guard let payload = try? Self.decoder.decode(Payload.self, from: data) else {
+            return quarantine(.corrupt, bytes: data)
+        }
+        PayloadCache.shared.store(payload, for: fileURL)
+        return .loaded(payload)
+    }
+
+    /// Set the unreadable archive aside and latch the failure: until it is
+    /// resolved this store reads as empty, refuses every write, and — the point
+    /// of the exercise — refuses to mint a replacement owner identity over it.
+    private func quarantine(_ failure: SessionStoreArchiveFailure, bytes: Data?) -> ArchiveState {
+        let record = SessionStoreQuarantine(
+            path: fileURL.path,
+            failure: failure,
+            copyPath: bytes.flatMap { Self.copyAside($0, from: fileURL) },
+            salvagedOwnerID: bytes.flatMap { Self.salvageOwnerID(from: $0) }
+        )
+        SessionStoreQuarantineMonitor.shared.record(record, for: fileURL)
+        return .unreadable(failure)
+    }
+
+    /// Keep a copy of the bytes we refuse to interpret next to the archive, so
+    /// recovery logic — or a human with a text editor — can still get the owner
+    /// identity out of them later.
+    private static func copyAside(_ data: Data, from fileURL: URL) -> String? {
+        let stamp = Int64(Date().timeIntervalSince1970 * 1_000)
+        let target = fileURL.deletingLastPathComponent()
+            .appendingPathComponent("\(fileURL.lastPathComponent).corrupt-\(stamp)")
+        guard FileManager.default.createFile(
+            atPath: target.path,
+            contents: data,
+            attributes: [.posixPermissions: NSNumber(value: Int16(0o600))]
+        ) else { return nil }
+        return target.path
+    }
+
+    /// Pull the owner identity out of bytes that no longer decode as a payload.
+    /// The lenient decode covers a record whose contents went bad; the scan
+    /// covers the common torn write, where the file simply stops partway and
+    /// `ownerID` — the first field encoded — survived.
+    private static func salvageOwnerID(from data: Data) -> String? {
+        if let probe = try? decoder.decode(OwnerIDProbe.self, from: data),
+           let id = probe.ownerID, !id.isEmpty {
+            return id
+        }
+        guard let text = String(data: data.prefix(64 * 1_024), encoding: .utf8),
+              let key = text.range(of: "\"ownerID\"") else { return nil }
+        let afterKey = text[key.upperBound...]
+        guard let colon = afterKey.firstIndex(of: ":") else { return nil }
+        let value = afterKey[afterKey.index(after: colon)...]
+        guard let open = value.firstIndex(of: "\""),
+              value[..<open].allSatisfy(\.isWhitespace) else { return nil }
+        let start = value.index(after: open)
+        guard let close = value[start...].firstIndex(of: "\"") else { return nil }
+        let salvaged = String(value[start..<close])
+        // Owner ids are `native-<uuid>`, so any escape means this is not one.
+        guard !salvaged.isEmpty, !salvaged.contains("\\") else { return nil }
+        return salvaged
+    }
+
+    private static func isMissingFile(_ error: Error) -> Bool {
+        let cocoa = error as NSError
+        if cocoa.domain == NSCocoaErrorDomain,
+           cocoa.code == NSFileReadNoSuchFileError || cocoa.code == NSFileNoSuchFileError {
+            return true
+        }
+        let posix = cocoa.userInfo[NSUnderlyingErrorKey] as? NSError ?? cocoa
+        return posix.domain == NSPOSIXErrorDomain && Int32(posix.code) == ENOENT
+    }
+
+    /// One sentence naming the problem and the thing the user can change.
+    private static func readReason(for error: Error) -> String {
+        let cocoa = error as NSError
+        let posix = cocoa.userInfo[NSUnderlyingErrorKey] as? NSError ?? cocoa
+        switch (posix.domain, Int32(posix.code)) {
+        case (NSPOSIXErrorDomain, EACCES), (NSPOSIXErrorDomain, EPERM),
+             (NSCocoaErrorDomain, Int32(NSFileReadNoPermissionError)):
+            return "Kaisola is not allowed to read it right now."
+        default:
+            return "Reading it failed: \(cocoa.localizedDescription)"
+        }
+    }
+
+    private func write(_ payload: Payload, resolvingQuarantine: Bool = false) {
+        if resolvingQuarantine {
+            SessionStoreQuarantineMonitor.shared.clear(fileURL)
+        } else if SessionStoreQuarantineMonitor.shared.isQuarantined(fileURL) {
+            // The quarantined bytes are the only record of this install's
+            // broker authority. Overwriting them turns a failure someone could
+            // still recover from into a permanent one.
+            return
+        }
+        var payload = payload
+        payload.schemaVersion = Self.archiveSchemaVersion
         let directory = fileURL.deletingLastPathComponent()
         try? FileManager.default.createDirectory(
             at: directory,
@@ -631,6 +838,135 @@ struct NativeSessionStore: Sendable {
                 SessionStoreWriteFailure(path: fileURL.path, error: error)
             )
         }
+    }
+}
+
+/// Why an existing session archive could not be turned into a payload.
+///
+/// Absence is deliberately not one of these: a missing file is a first launch,
+/// while every case here is a file that still holds this install's broker owner
+/// identity and must survive untouched.
+enum SessionStoreArchiveFailure: Equatable, Sendable {
+    /// Bytes are there and do not decode — a torn write, or damaged storage.
+    case corrupt
+    /// The file is there and could not be read at all (permissions, I/O).
+    case unreadable(String)
+    /// Written by a newer build than this one knows how to interpret.
+    case futureVersion(found: Int, supported: Int)
+
+    var reason: String {
+        switch self {
+        case .corrupt:
+            return "The saved session file is damaged."
+        case .unreadable(let detail):
+            return "The saved session file could not be opened. \(detail)"
+        case .futureVersion(let found, let supported):
+            return "The saved session file is from a newer version of Kaisola "
+                + "(format \(found); this build reads \(supported))."
+        }
+    }
+}
+
+/// A session archive this process refuses to interpret or overwrite, plus what
+/// the salvage pass got out of it.
+struct SessionStoreQuarantine: Equatable, Sendable {
+    let path: String
+    let failure: SessionStoreArchiveFailure
+    /// Where the untouched bytes were copied, when they could be read at all.
+    let copyPath: String?
+    /// Owner identity recovered from those bytes, when one was still legible.
+    let salvagedOwnerID: String?
+
+    init(
+        path: String,
+        failure: SessionStoreArchiveFailure,
+        copyPath: String? = nil,
+        salvagedOwnerID: String? = nil
+    ) {
+        self.path = path
+        self.failure = failure
+        self.copyPath = copyPath
+        self.salvagedOwnerID = salvagedOwnerID
+    }
+
+    var message: String {
+        "Couldn't read your saved sessions. \(failure.reason) Kaisola left the file alone "
+            + "instead of replacing it, so this window starts empty."
+    }
+}
+
+/// Process-wide ledger of quarantined session archives.
+///
+/// The store is a value type constructed ad hoc, so the latch that keeps a
+/// damaged archive from being minted over lives here rather than in any one
+/// instance. One notice per archive: the failure is a property of the file, and
+/// every later read finds the same thing.
+final class SessionStoreQuarantineMonitor: @unchecked Sendable {
+    static let shared = SessionStoreQuarantineMonitor()
+
+    private let lock = NSLock()
+    private var quarantines: [URL: SessionStoreQuarantine] = [:]
+    private var observer: (@Sendable (SessionStoreQuarantine) -> Void)?
+
+    /// Replaces the default toast presentation. Tests use it to observe the
+    /// exact quarantine without a window.
+    func setObserver(_ observer: (@Sendable (SessionStoreQuarantine) -> Void)?) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.observer = observer
+    }
+
+    func quarantine(for url: URL) -> SessionStoreQuarantine? {
+        lock.lock()
+        defer { lock.unlock() }
+        return quarantines[url]
+    }
+
+    func isQuarantined(_ url: URL) -> Bool {
+        quarantine(for: url) != nil
+    }
+
+    /// The archive is readable again — recovery adopted the salvaged identity,
+    /// or the user replaced the file.
+    func clear(_ url: URL) {
+        lock.lock()
+        defer { lock.unlock() }
+        quarantines.removeValue(forKey: url)
+    }
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        quarantines.removeAll()
+        observer = nil
+    }
+
+    /// Returns whether this was the first quarantine for the archive, which is
+    /// the only one that surfaces.
+    @discardableResult
+    func record(_ quarantine: SessionStoreQuarantine, for url: URL) -> Bool {
+        lock.lock()
+        let isNew = quarantines[url] == nil
+        quarantines[url] = quarantine
+        let observer = self.observer
+        lock.unlock()
+
+        guard isNew else { return false }
+        FileHandle.standardError.write(Data(
+            ("KAISOLA_SESSION_STORE_QUARANTINED path=\(quarantine.path) "
+                + "reason=\(quarantine.failure.reason) "
+                + "copy=\(quarantine.copyPath ?? "none") "
+                + "salvagedOwner=\(quarantine.salvagedOwnerID ?? "none")\n").utf8
+        ))
+        if let observer {
+            observer(quarantine)
+        } else {
+            let message = quarantine.message
+            Task { @MainActor in
+                ToastCenter.shared.show(message, style: .error, duration: 8)
+            }
+        }
+        return true
     }
 }
 

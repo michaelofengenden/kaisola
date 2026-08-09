@@ -17,6 +17,7 @@ final class NativeSessionStoreTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        SessionStoreQuarantineMonitor.shared.reset()
         try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent())
     }
 
@@ -1632,6 +1633,163 @@ final class NativeSessionStoreTests: XCTestCase {
         )
     }
 
+    // MARK: - Unreadable archives (issue #477)
+
+    func testMissingArchiveStillMintsAStableIdentity() {
+        let owner = store.ownerID()
+        XCTAssertTrue(owner.hasPrefix("native-"))
+        XCTAssertNil(store.archiveQuarantine())
+        XCTAssertEqual(NativeSessionStore(fileURL: fileURL).ownerID(), owner)
+    }
+
+    func testCorruptArchiveIsQuarantinedInsteadOfMintingAFreshOwnerIdentity() throws {
+        let bytes = Data("{\"sessions\":[{\"id\":\"term-1\"".utf8)
+        let archiveURL = try writeArchive(bytes, named: "corrupt")
+        let observed = CollectedQuarantines()
+        SessionStoreQuarantineMonitor.shared.setObserver { observed.append($0) }
+        let corrupted = NativeSessionStore(fileURL: archiveURL)
+
+        XCTAssertEqual(
+            corrupted.ownerID(),
+            "",
+            "A damaged archive is not evidence that this install never owned anything"
+        )
+        XCTAssertEqual(corrupted.sessions(), [])
+        XCTAssertEqual(corrupted.archiveQuarantine()?.failure, .corrupt)
+
+        // Ordinary activity must not overwrite the quarantined bytes either.
+        corrupted.openProject(directory: "/tmp/after-corruption")
+        corrupted.upsert(NativeOwnedSession(
+            id: "term-after-corruption",
+            projectID: "nproj_after",
+            cwd: "/tmp",
+            title: "After",
+            createdAt: 1
+        ))
+        XCTAssertEqual(try Data(contentsOf: archiveURL), bytes)
+
+        let quarantine = try XCTUnwrap(observed.all().first)
+        XCTAssertEqual(quarantine.path, archiveURL.path)
+        XCTAssertNil(quarantine.salvagedOwnerID)
+        let copyPath = try XCTUnwrap(quarantine.copyPath)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: copyPath)), bytes)
+    }
+
+    func testTornArchiveSalvagesItsOwnerIdentityRatherThanRotatingIt() throws {
+        let owner = "native-8f2c1d40-torn"
+        let torn = Data("{\"ownerID\":\"\(owner)\",\"schemaVersion\":1,\"sessions\":[{\"id\"".utf8)
+        let archiveURL = try writeArchive(torn, named: "torn")
+        let recovered = NativeSessionStore(fileURL: archiveURL)
+
+        XCTAssertEqual(
+            recovered.ownerID(),
+            owner,
+            "Re-adopting the identity still in the bytes is repair, not rotation"
+        )
+        // The registry is genuinely lost; recoverOwnedSessions repopulates it
+        // from the broker under this same authority.
+        XCTAssertEqual(recovered.sessions(), [])
+        XCTAssertNil(
+            recovered.archiveQuarantine(),
+            "Salvaging the identity resolves the quarantine"
+        )
+        XCTAssertEqual(NativeSessionStore(fileURL: archiveURL).ownerID(), owner)
+
+        let copies = try FileManager.default
+            .contentsOfDirectory(atPath: archiveURL.deletingLastPathComponent().path)
+            .filter { $0.hasPrefix("torn.json.corrupt-") }
+        let copyPath = archiveURL.deletingLastPathComponent()
+            .appendingPathComponent(try XCTUnwrap(copies.first))
+        XCTAssertEqual(try Data(contentsOf: copyPath), torn)
+    }
+
+    func testFutureFormatArchiveIsLeftIntactAndRefusesIdentityRotation() throws {
+        let future = Data(
+            "{\"ownerID\":\"native-from-the-future\",\"schemaVersion\":999,\"sessions\":[]}".utf8
+        )
+        let archiveURL = try writeArchive(future, named: "future")
+        let downgraded = NativeSessionStore(fileURL: archiveURL)
+
+        XCTAssertEqual(downgraded.ownerID(), "")
+        XCTAssertEqual(
+            downgraded.archiveQuarantine()?.failure,
+            .futureVersion(found: 999, supported: NativeSessionStore.archiveSchemaVersion)
+        )
+        downgraded.openProject(directory: "/tmp/after-downgrade")
+        XCTAssertEqual(
+            try Data(contentsOf: archiveURL),
+            future,
+            "Upgrading back must find the newer archive exactly as it was left"
+        )
+    }
+
+    func testUnreadableArchiveIsQuarantinedWithoutRotatingTheIdentity() throws {
+        let readable = Data("{\"ownerID\":\"native-locked-away\",\"sessions\":[]}".utf8)
+        let archiveURL = try writeArchive(readable, named: "locked")
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o000],
+            ofItemAtPath: archiveURL.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: archiveURL.path
+            )
+        }
+        let blocked = NativeSessionStore(fileURL: archiveURL)
+
+        XCTAssertEqual(blocked.ownerID(), "")
+        let quarantine = try XCTUnwrap(blocked.archiveQuarantine())
+        if case .unreadable = quarantine.failure {} else {
+            XCTFail("Expected an unreadable archive, got \(quarantine.failure)")
+        }
+        // Nothing was read, so nothing could be copied aside — leaving the file
+        // untouched is the whole of the quarantine here.
+        XCTAssertNil(quarantine.copyPath)
+
+        blocked.upsert(NativeOwnedSession(
+            id: "term-blocked",
+            projectID: "nproj_blocked",
+            cwd: "/tmp",
+            title: "Blocked",
+            createdAt: 1
+        ))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: archiveURL.path
+        )
+        XCTAssertEqual(try Data(contentsOf: archiveURL), readable)
+    }
+
+    func testArchiveCarriesItsFormatVersionForwardOnEveryWrite() throws {
+        store.openProject(directory: "/tmp/stamped")
+        let object = try JSONSerialization.jsonObject(
+            with: try Data(contentsOf: fileURL)
+        ) as? [String: Any]
+        XCTAssertEqual(
+            object?["schemaVersion"] as? Int,
+            NativeSessionStore.archiveSchemaVersion
+        )
+    }
+
+    /// Writes bytes straight to disk so the store meets them cold: the decoded
+    /// payload cache is process-wide and keyed by URL.
+    private func writeArchive(_ data: Data, named name: String) throws -> URL {
+        let directory = fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let archiveURL = directory.appendingPathComponent("\(name).json")
+        try data.write(to: archiveURL)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: archiveURL.path
+        )
+        return archiveURL
+    }
+
     private func makeMeshPane(
         id: String,
         basePath: String,
@@ -1672,4 +1830,23 @@ final class NativeSessionStoreTests: XCTestCase {
         }
     }
 
+}
+
+/// Sink for quarantine notices, which arrive on whichever thread read the
+/// archive.
+private final class CollectedQuarantines: @unchecked Sendable {
+    private let lock = NSLock()
+    private var quarantines: [SessionStoreQuarantine] = []
+
+    func append(_ quarantine: SessionStoreQuarantine) {
+        lock.lock()
+        defer { lock.unlock() }
+        quarantines.append(quarantine)
+    }
+
+    func all() -> [SessionStoreQuarantine] {
+        lock.lock()
+        defer { lock.unlock() }
+        return quarantines
+    }
 }

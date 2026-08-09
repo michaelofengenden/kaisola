@@ -170,14 +170,8 @@ final class AcpProcessIntegrationTests: XCTestCase {
     }
 
     func testTransportTeardownDoesNotTouchAnUnownedDurableProcess() async throws {
-        let durable = Process()
-        durable.executableURL = URL(fileURLWithPath: "/bin/sleep")
-        durable.arguments = ["30"]
-        try durable.run()
-        defer {
-            if durable.isRunning { durable.terminate() }
-            durable.waitUntilExit()
-        }
+        let durable = try DetachedProcessFixture()
+        defer { _ = durable.forceCleanup() }
         let fixture = try OwnedProcessFixture()
         defer { fixture.forceCleanup() }
         let transport = AcpProcessTransport()
@@ -194,6 +188,9 @@ final class AcpProcessIntegrationTests: XCTestCase {
         let stopped = await fixture.waitUntilStopped(pids)
         XCTAssertTrue(stopped)
         XCTAssertTrue(durable.isRunning, "detached broker PTYs are outside ACP process ownership")
+        let cleanupStartedAt = ContinuousClock.now
+        XCTAssertTrue(durable.forceCleanup(), "durable fixture cleanup must be bounded and reap its child")
+        XCTAssertLessThan(cleanupStartedAt.duration(to: .now), .seconds(2))
     }
 
     func testSpawnsMockAgentAndStreamsARealTurn() async throws {
@@ -456,6 +453,96 @@ private struct OwnedProcessFixture: @unchecked Sendable {
 
 private enum OwnedProcessFixtureError: Error {
     case didNotPublishPIDs
+}
+
+/// A deliberately independent process group that models broker-owned durable
+/// work without relying on Foundation.Process's run-loop-based waitUntilExit().
+/// The test owns this fixture directly and always reaps it within a fixed bound.
+private final class DetachedProcessFixture: @unchecked Sendable {
+    let pid: pid_t
+
+    init() throws {
+        var attributes: posix_spawnattr_t?
+        guard posix_spawnattr_init(&attributes) == 0 else { throw POSIXError(.EIO) }
+        defer { posix_spawnattr_destroy(&attributes) }
+
+        var defaultSignals = sigset_t()
+        sigemptyset(&defaultSignals)
+        sigaddset(&defaultSignals, SIGTERM)
+        var signalMask = sigset_t()
+        sigemptyset(&signalMask)
+        let flags = Int16(
+            POSIX_SPAWN_SETPGROUP
+                | POSIX_SPAWN_CLOEXEC_DEFAULT
+                | POSIX_SPAWN_SETSIGDEF
+                | POSIX_SPAWN_SETSIGMASK
+        )
+        guard posix_spawnattr_setpgroup(&attributes, 0) == 0,
+              posix_spawnattr_setsigdefault(&attributes, &defaultSignals) == 0,
+              posix_spawnattr_setsigmask(&attributes, &signalMask) == 0,
+              posix_spawnattr_setflags(&attributes, flags) == 0 else {
+            throw POSIXError(.EIO)
+        }
+
+        let argv = [strdup("/bin/sleep"), strdup("30"), nil]
+        let environment = [UnsafeMutablePointer<CChar>?](arrayLiteral: nil)
+        defer { argv.dropLast().forEach { free($0) } }
+        var spawnedPID: pid_t = 0
+        let result = argv.withUnsafeBufferPointer { arguments in
+            environment.withUnsafeBufferPointer { variables in
+                posix_spawn(
+                    &spawnedPID,
+                    "/bin/sleep",
+                    nil,
+                    &attributes,
+                    UnsafeMutablePointer(mutating: arguments.baseAddress),
+                    UnsafeMutablePointer(mutating: variables.baseAddress)
+                )
+            }
+        }
+        guard result == 0, spawnedPID > 1 else {
+            throw POSIXError(POSIXErrorCode(rawValue: result) ?? .EIO)
+        }
+        pid = spawnedPID
+    }
+
+    var isRunning: Bool {
+        var status: Int32 = 0
+        let result = Darwin.waitpid(pid, &status, WNOHANG)
+        if result == 0 { return Darwin.kill(pid, 0) == 0 || errno == EPERM }
+        return false
+    }
+
+    @discardableResult
+    func forceCleanup() -> Bool {
+        if reapWithin(.zero) { return true }
+        signalOwnedGroup(SIGTERM)
+        if reapWithin(.milliseconds(300)) { return true }
+        signalOwnedGroup(SIGKILL)
+        return reapWithin(.milliseconds(500))
+    }
+
+    private func signalOwnedGroup(_ signal: Int32) {
+        // The unreaped leader keeps this PID from being reused. Group-signal
+        // only while it remains the independent group leader we spawned.
+        if Darwin.getpgid(pid) == pid {
+            _ = Darwin.kill(-pid, signal)
+        } else if Darwin.kill(pid, 0) == 0 || errno == EPERM {
+            _ = Darwin.kill(pid, signal)
+        }
+    }
+
+    private func reapWithin(_ timeout: Duration) -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        repeat {
+            var status: Int32 = 0
+            let result = Darwin.waitpid(pid, &status, WNOHANG)
+            if result == pid || (result < 0 && errno == ECHILD) { return true }
+            if result < 0 && errno != EINTR { return false }
+            if ContinuousClock.now >= deadline { return false }
+            usleep(10_000)
+        } while true
+    }
 }
 
 private final class IntegrationCollector: @unchecked Sendable {

@@ -665,6 +665,34 @@ final class AppModelReconnectTests: XCTestCase {
         XCTAssertEqual(restored?.rows, newestRows)
     }
 
+    func testTombstoneFailureIsCallerVisibleAndKeepsBufferedTailRetryable() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            transcriptTombstoneFailure: .commit
+        )
+        defer { fixture.cleanUp() }
+        let chatID = "failed-tombstone"
+        let durableRows: [AcpTranscriptRow] = [.message(id: "1", text: "durable")]
+        let newestRows: [AcpTranscriptRow] = [
+            .message(id: "1", text: "durable"),
+            .message(id: "2", text: "newest buffered tail"),
+        ]
+
+        await fixture.transcriptStore.scheduleSave(durableRows, for: chatID, now: 1)
+        await fixture.transcriptStore.flush()
+        await fixture.transcriptStore.scheduleSave(newestRows, for: chatID, now: 2)
+
+        let result = await fixture.model.deleteChat(chatID)
+        XCTAssertEqual(
+            result,
+            .failed(.database("injected transcript tombstone commit failure"))
+        )
+
+        await fixture.transcriptStore.flush()
+        let restored = await fixture.transcriptStore.entry(for: chatID)
+        XCTAssertEqual(restored?.rows, newestRows)
+    }
+
     func testTerminalResizeSendsOnlyLatestSettledGeometryAndDeduplicatesRepeats() async throws {
         let fixture = try VisualControlFixture()
         defer { fixture.cleanUp() }
@@ -1023,7 +1051,8 @@ private final class Fixture {
     init(
         failingConnectAttempts: Set<Int>,
         completedAtByTerminalID: [String: Int64] = [:],
-        transcriptRemovalFailure: AcpTranscriptStore.RemovalFailurePoint? = nil
+        transcriptRemovalFailure: AcpTranscriptStore.RemovalFailurePoint? = nil,
+        transcriptTombstoneFailure: AcpTranscriptStore.TombstoneFailurePoint? = nil
     ) throws {
         root = URL(fileURLWithPath: "/tmp/kaisola-app-model-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(
@@ -1040,7 +1069,10 @@ private final class Fixture {
         transcriptStore = AcpTranscriptStore(
             databaseURL: legacyTranscriptURL.deletingPathExtension().appendingPathExtension("sqlite3"),
             legacyJSONURL: legacyTranscriptURL,
-            injectedRemovalFailure: transcriptRemovalFailure
+            schedulesAutomaticFlush: transcriptRemovalFailure == nil
+                && transcriptTombstoneFailure == nil,
+            injectedRemovalFailure: transcriptRemovalFailure,
+            injectedTombstoneFailure: transcriptTombstoneFailure
         )
         workspaceStore = NativeWorkspaceStateStore(
             fileURL: root.appendingPathComponent("workspace-state-v1.json")

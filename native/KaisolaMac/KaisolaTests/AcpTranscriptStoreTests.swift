@@ -168,6 +168,64 @@ final class AcpTranscriptStoreTests: XCTestCase {
         }
     }
 
+    func testTombstoneFailuresPreserveExactPendingContentAndRetryAcrossRelaunch() async throws {
+        for failure in [
+            AcpTranscriptStore.TombstoneFailurePoint.open,
+            .commit,
+        ] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "kaisola-transcript-tombstone-failure-\(failure)-\(UUID().uuidString)",
+                isDirectory: true
+            )
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+            let store = AcpTranscriptStore(
+                databaseURL: databaseURL,
+                writerID: "writer-\(failure)",
+                schedulesAutomaticFlush: false,
+                injectedTombstoneFailure: failure
+            )
+            let chatID = "tombstone-failure-\(failure)"
+            let durableRows: [AcpTranscriptRow] = [
+                .message(id: "1", text: "previously durable"),
+            ]
+            let newestRows: [AcpTranscriptRow] = [
+                .message(id: "1", text: "previously durable"),
+                .message(id: "2", text: "newest buffered tail \(failure)"),
+            ]
+
+            await store.scheduleSave(durableRows, for: chatID, now: 1)
+            await store.flush()
+            await store.scheduleSave(newestRows, for: chatID, now: 2)
+            await store.scheduleDraft("newest draft \(failure)", for: chatID, now: 3)
+
+            let result = await store.tombstone(chatID: chatID)
+            let label = failure == .open ? "open" : "commit"
+            XCTAssertEqual(
+                result,
+                .failed(.database("injected transcript tombstone \(label) failure"))
+            )
+            let stateAfterFailure = await store.tombstoneState(chatID: chatID)
+            XCTAssertEqual(stateAfterFailure, .absent)
+
+            // The failed intent did not consume the pending snapshot. It can
+            // still land exactly, and a later one-shot retry can then delete it.
+            await store.flush()
+            let preservedRelaunch = AcpTranscriptStore(databaseURL: databaseURL)
+            let preserved = await preservedRelaunch.entry(for: chatID)
+            XCTAssertEqual(preserved?.rows, newestRows, "failed at \(failure)")
+            XCTAssertEqual(preserved?.draft, "newest draft \(failure)", "failed at \(failure)")
+
+            let retry = await store.tombstone(chatID: chatID)
+            XCTAssertEqual(retry, .recorded)
+            let removal = await store.remove(chatID: chatID)
+            XCTAssertEqual(removal, .removed)
+            let deletedRelaunch = AcpTranscriptStore(databaseURL: databaseURL)
+            let deleted = await deletedRelaunch.entry(for: chatID)
+            XCTAssertNil(deleted)
+        }
+    }
+
     func testLaunchVacuumResumesPhysicalDeletionAfterCrashFollowingTombstone() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-transcript-crash-\(UUID().uuidString)", isDirectory: true)
@@ -198,7 +256,8 @@ final class AcpTranscriptStoreTests: XCTestCase {
 
             // Crash injection point: the durable intent landed, but the
             // normal queued remove(chatID:) phase never ran.
-            try await store.tombstone(chatID: chatID)
+            let tombstoneResult = await store.tombstone(chatID: chatID)
+            XCTAssertEqual(tombstoneResult, .recorded)
             XCTAssertEqual(
                 try sqliteCount("SELECT COUNT(*) FROM transcript_rows", databaseURL: databaseURL),
                 2
@@ -269,7 +328,8 @@ final class AcpTranscriptStoreTests: XCTestCase {
             "Only the store holding a buffered snapshot should retain a writer lease"
         )
 
-        try await writerA.tombstone(chatID: chatID)
+        let tombstoneResult = await writerA.tombstone(chatID: chatID)
+        XCTAssertEqual(tombstoneResult, .recorded)
         await writerA.remove(chatID: chatID)
         await writerA.vacuumTombstones()
         XCTAssertEqual(
@@ -325,7 +385,8 @@ final class AcpTranscriptStoreTests: XCTestCase {
             for: chatID,
             now: 2
         )
-        try await writerA.tombstone(chatID: chatID)
+        let tombstoneResult = await writerA.tombstone(chatID: chatID)
+        XCTAssertEqual(tombstoneResult, .recorded)
         await writerA.remove(chatID: chatID)
 
         // Deterministic crash/suspension simulation: advance reclamation past
@@ -579,7 +640,8 @@ final class AcpTranscriptStoreTests: XCTestCase {
         let beforeDelete = await store.tombstoneState(chatID: "chat-live")
         XCTAssertEqual(beforeDelete, .absent)
 
-        try await store.tombstone(chatID: "chat-live")
+        let tombstoneResult = await store.tombstone(chatID: "chat-live")
+        XCTAssertEqual(tombstoneResult, .recorded)
         let afterDelete = await store.tombstoneState(chatID: "chat-live")
         XCTAssertEqual(afterDelete, .present)
         let neverSeen = await store.tombstoneState(chatID: "chat-never-seen")
@@ -608,7 +670,8 @@ final class AcpTranscriptStoreTests: XCTestCase {
     func testTombstoneLookupIsUnknownWhenTheDatabaseCannotBeRead() async throws {
         let (store, directory) = temporaryStore()
         defer { try? FileManager.default.removeItem(at: directory) }
-        try await store.tombstone(chatID: "chat-denied")
+        let tombstoneResult = await store.tombstone(chatID: "chat-denied")
+        XCTAssertEqual(tombstoneResult, .recorded)
         let readable = await store.tombstoneState(chatID: "chat-denied")
         XCTAssertEqual(readable, .present)
 
@@ -632,7 +695,8 @@ final class AcpTranscriptStoreTests: XCTestCase {
     func testTombstoneLookupIsUnknownWhileAnotherWriterHoldsTheDatabase() async throws {
         let (store, directory) = temporaryStore()
         defer { try? FileManager.default.removeItem(at: directory) }
-        try await store.tombstone(chatID: "chat-busy")
+        let tombstoneResult = await store.tombstone(chatID: "chat-busy")
+        XCTAssertEqual(tombstoneResult, .recorded)
 
         let blocker = try openSideConnection(to: store.databaseURL)
         defer { sqlite3_close_v2(blocker) }

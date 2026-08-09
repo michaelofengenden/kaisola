@@ -102,12 +102,22 @@ actor AcpTranscriptStore {
         case failed(StoreError)
     }
 
+    enum TombstoneResult: Equatable, Sendable {
+        case recorded
+        case failed(StoreError)
+    }
+
     /// Deterministic single-use failure seams for the removal transaction.
     /// Tests inject them through an isolated store instance; production stores
     /// always use the nil default.
     enum RemovalFailurePoint: Equatable, Sendable {
         case open
         case delete
+        case commit
+    }
+
+    enum TombstoneFailurePoint: Equatable, Sendable {
+        case open
         case commit
     }
 
@@ -215,6 +225,7 @@ actor AcpTranscriptStore {
     private var writerGeneration: Int64?
     private var writerLeaseExpiresAt: Int64 = 0
     private var injectedRemovalFailure: RemovalFailurePoint?
+    private var injectedTombstoneFailure: TombstoneFailurePoint?
 
     /// Compatibility initializer: callers hand us the v1 JSON path and the v2
     /// database is created beside it. The JSON remains untouched after a
@@ -226,6 +237,7 @@ actor AcpTranscriptStore {
         self.writerID = UUID().uuidString
         self.schedulesAutomaticFlush = true
         self.injectedRemovalFailure = nil
+        self.injectedTombstoneFailure = nil
     }
 
     init(
@@ -233,13 +245,15 @@ actor AcpTranscriptStore {
         legacyJSONURL: URL? = nil,
         writerID: String = UUID().uuidString,
         schedulesAutomaticFlush: Bool = true,
-        injectedRemovalFailure: RemovalFailurePoint? = nil
+        injectedRemovalFailure: RemovalFailurePoint? = nil,
+        injectedTombstoneFailure: TombstoneFailurePoint? = nil
     ) {
         self.databaseURL = databaseURL.standardizedFileURL
         self.legacyJSONURL = legacyJSONURL?.standardizedFileURL
         self.writerID = writerID
         self.schedulesAutomaticFlush = schedulesAutomaticFlush
         self.injectedRemovalFailure = injectedRemovalFailure
+        self.injectedTombstoneFailure = injectedTombstoneFailure
     }
 
     /// Explicit full-history compatibility read. Product restoration uses
@@ -524,44 +538,62 @@ actor AcpTranscriptStore {
 
     /// Written FIRST when a chat is deleted, before any in-memory removal, so
     /// every phase after it — and every other window sharing this database —
-    /// converges on "gone" even across a crash. Throws so the caller can
-    /// surface a failed delete instead of reporting success.
-    func tombstone(chatID: String) throws {
-        guard Self.validChatID(chatID) else { return }
-        pending.removeValue(forKey: chatID)
-        let database = try openDatabase()
+    /// converges on "gone" even across a crash. Pending content remains
+    /// untouched until that transaction commits, and the typed result prevents
+    /// callers from reporting success for an intent SQLite did not persist.
+    @discardableResult
+    func tombstone(chatID: String) -> TombstoneResult {
+        guard Self.validChatID(chatID) else {
+            return .failed(.database("invalid transcript chat identifier"))
+        }
+        let hasOtherPendingWrites = pending.keys.contains { $0 != chatID }
         let now = Self.timestamp(nil)
         var deletionGeneration: Int64 = 0
-        try transaction(database) {
-            try ensureDeletedChatsTable(database)
-            deletionGeneration = try nextDeletionGeneration(database)
-            try withStatement(
-                """
-                INSERT OR REPLACE INTO deleted_chats(chat_id, deleted_at, generation)
-                VALUES (?, ?, ?)
-                """,
-                database: database
+        do {
+            try consumeTombstoneFailure(.open)
+            let database = try openDatabase()
+            try transaction(
+                database,
+                beforeCommit: { try self.consumeTombstoneFailure(.commit) }
             ) {
-                try bind(chatID, at: 1, statement: $0, database: database)
-                try bind(now, at: 2, statement: $0, database: database)
-                try bind(deletionGeneration, at: 3, statement: $0, database: database)
-                try stepDone($0, database: database)
-            }
-            if pending.isEmpty {
-                try retireWriter(database)
-            } else {
-                try upsertWriterLease(
-                    acknowledgedGeneration: deletionGeneration,
-                    now: now,
+                try ensureDeletedChatsTable(database)
+                deletionGeneration = try nextDeletionGeneration(database)
+                try withStatement(
+                    """
+                    INSERT OR REPLACE INTO deleted_chats(chat_id, deleted_at, generation)
+                    VALUES (?, ?, ?)
+                    """,
                     database: database
-                )
+                ) {
+                    try bind(chatID, at: 1, statement: $0, database: database)
+                    try bind(now, at: 2, statement: $0, database: database)
+                    try bind(deletionGeneration, at: 3, statement: $0, database: database)
+                    try stepDone($0, database: database)
+                }
+                if hasOtherPendingWrites {
+                    try upsertWriterLease(
+                        acknowledgedGeneration: deletionGeneration,
+                        now: now,
+                        database: database
+                    )
+                } else {
+                    try retireWriter(database)
+                }
             }
-        }
-        writerGeneration = deletionGeneration
-        writerLeaseExpiresAt = pending.isEmpty ? 0 : Self.writerLeaseDeadline(after: now)
-        for chatID in pending.keys {
-            pending[chatID]?.writerGeneration = deletionGeneration
-            pending[chatID]?.heldContinuousFence = true
+            // This is the commit boundary: only now may the target's exact
+            // pending entry disappear from memory.
+            pending.removeValue(forKey: chatID)
+            writerGeneration = deletionGeneration
+            writerLeaseExpiresAt = hasOtherPendingWrites
+                ? Self.writerLeaseDeadline(after: now)
+                : 0
+            for pendingChatID in pending.keys {
+                pending[pendingChatID]?.writerGeneration = deletionGeneration
+                pending[pendingChatID]?.heldContinuousFence = true
+            }
+            return .recorded
+        } catch {
+            return .failed(Self.storeError(error))
         }
     }
 
@@ -1333,6 +1365,13 @@ actor AcpTranscriptStore {
         case .commit: label = "commit"
         }
         throw StoreError.database("injected transcript removal \(label) failure")
+    }
+
+    private func consumeTombstoneFailure(_ point: TombstoneFailurePoint) throws {
+        guard injectedTombstoneFailure == point else { return }
+        injectedTombstoneFailure = nil
+        let label = point == .open ? "open" : "commit"
+        throw StoreError.database("injected transcript tombstone \(label) failure")
     }
 
     private static func storeError(_ error: Error) -> StoreError {

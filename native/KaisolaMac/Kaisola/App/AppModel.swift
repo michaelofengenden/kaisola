@@ -3353,15 +3353,13 @@ final class AppModel: ObservableObject {
         // converges on, even across a crash. A failed write aborts the
         // delete instead of reporting success. If the app dies before this
         // lands, the delete simply didn't happen — never half-happened.
-        do {
-            try await transcriptStore.tombstone(chatID: chatID)
-        } catch {
+        let tombstoneResult = await transcriptStore.tombstone(chatID: chatID)
+        if case let .failed(error) = tombstoneResult {
             ToastCenter.shared.show(
                 "Couldn't delete the chat: \(error.kaisolaSafeDescription)",
                 style: .error
             )
-            return .failed(error as? AcpTranscriptStore.StoreError
-                ?? .database(error.localizedDescription))
+            return .failed(error)
         }
         let closingChat = chats.first(where: { $0.id == chatID })
         if let closingChat {

@@ -306,6 +306,13 @@ final class AppModel: ObservableObject {
     private var terminalInputQueues: [String: [PendingTerminalInput]] = [:]
     private var terminalInputDrainTasks: [String: Task<Void, Never>] = [:]
     private var terminalInputFailureNoticeAt: [String: Date] = [:]
+    /// A request-level terminal.write failure has an ambiguous outcome: the
+    /// PTY may have received the bytes before its reply timed out. Keep durable
+    /// ownership intact, but fail closed for input on only that terminal until
+    /// the controller is explicitly re-established. This must not collapse all
+    /// other owned surfaces into the global reconnect path.
+    @Published private(set) var terminalInputDegradedIDs: Set<String> = []
+    @Published private(set) var terminalInputRecoveringIDs: Set<String> = []
     /// Broker PTYs can emit hundreds of small packets in one display interval.
     /// Merge contiguous packets for 16 ms so a 64 MiB retained document is
     /// copied and published at most once per frame, while offsets and ordering
@@ -2014,6 +2021,14 @@ final class AppModel: ObservableObject {
 
     func isOwned(_ terminalID: String) -> Bool {
         ownedTerminalIDs.contains(terminalID)
+    }
+
+    func isTerminalInputDegraded(_ terminalID: String) -> Bool {
+        terminalInputDegradedIDs.contains(terminalID)
+    }
+
+    func isTerminalInputRecovering(_ terminalID: String) -> Bool {
+        terminalInputRecoveringIDs.contains(terminalID)
     }
 
     // MARK: - Project tabs
@@ -4950,6 +4965,8 @@ final class AppModel: ObservableObject {
             }
             refreshPersistedNavigationState(publish: false)
             ownedTerminalIDs.insert(terminalID)
+            terminalInputDegradedIDs.remove(terminalID)
+            terminalInputRecoveringIDs.remove(terminalID)
 
             // terminal.create already returned the authoritative identity. Put
             // it in the local inventory now so selection publishes a loading
@@ -5206,6 +5223,10 @@ final class AppModel: ObservableObject {
             reportTerminalInputFailure(terminalID)
             return
         }
+        guard !isTerminalInputDegraded(terminalID) else {
+            reportTerminalInputFailure(terminalID, scopedToTerminal: true)
+            return
+        }
         let projectID = record.projectID
         trackTerminalDraftInput(data, terminalID: terminalID)
         let opensAgentTurn = (
@@ -5227,6 +5248,54 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Revalidate only the affected terminal on the still-live controller
+    /// lane. A full reload would tear down observer subscriptions and briefly
+    /// interrupt every unrelated terminal, recreating the blast radius this
+    /// recovery state is designed to avoid.
+    func recoverTerminalInput(_ terminalID: String) async {
+        guard isTerminalInputDegraded(terminalID),
+              !isTerminalInputRecovering(terminalID),
+              controlAvailable,
+              isOwned(terminalID),
+              let record = sessions.first(where: { $0.id == terminalID && !$0.exited }) else {
+            return
+        }
+        let recoveryGeneration = connectionGeneration
+        terminalInputRecoveringIDs.insert(terminalID)
+        defer { terminalInputRecoveringIDs.remove(terminalID) }
+        do {
+            // Control requests are ordered on one socket. A successful attach
+            // therefore proves the broker has moved past the ambiguous write
+            // without replaying its bytes or disturbing observer streams.
+            try await controlClient.attach(
+                projectID: record.projectID,
+                terminalID: terminalID
+            )
+            guard recoveryGeneration == connectionGeneration,
+                  controlAvailable,
+                  isOwned(terminalID),
+                  sessions.contains(where: { $0.id == terminalID && !$0.exited }) else {
+                return
+            }
+            terminalInputDegradedIDs.remove(terminalID)
+            terminalInputFailureNoticeAt.removeValue(forKey: terminalID)
+            ToastCenter.shared.show("Terminal input restored.", style: .success)
+        } catch {
+            guard recoveryGeneration == connectionGeneration, controlAvailable else { return }
+            if Self.isControllerConnectionFailure(error) {
+                reportTerminalInputFailure(terminalID)
+                controlAvailable = false
+                ownedTerminalIDs = []
+                terminalInputDegradedIDs.removeAll()
+                terminalInputRecoveringIDs.removeAll()
+                connectionLost(error, generation: recoveryGeneration)
+            } else {
+                terminalInputFailureNoticeAt.removeValue(forKey: terminalID)
+                reportTerminalInputFailure(terminalID, scopedToTerminal: true)
+            }
+        }
+    }
+
     /// One consumer per PTY makes keyboard bytes FIFO by construction. The
     /// previous fire-and-forget Task per key depended on actor scheduling order
     /// and swallowed every mutation error.
@@ -5239,6 +5308,7 @@ final class AppModel: ObservableObject {
               !queue.isEmpty {
             let packet = queue.removeFirst()
             terminalInputQueues[terminalID] = queue
+            let writeGeneration = connectionGeneration
             do {
                 try await controlClient.write(
                     projectID: packet.projectID,
@@ -5254,11 +5324,24 @@ final class AppModel: ObservableObject {
                 }
             } catch {
                 terminalInputQueues.removeValue(forKey: terminalID)
-                reportTerminalInputFailure(terminalID)
-                guard controlAvailable else { return }
-                controlAvailable = false
-                ownedTerminalIDs = []
-                connectionLost(error, generation: connectionGeneration)
+                guard !Task.isCancelled,
+                      writeGeneration == connectionGeneration,
+                      controlAvailable else { return }
+                if Self.isControllerConnectionFailure(error) {
+                    reportTerminalInputFailure(terminalID)
+                    controlAvailable = false
+                    ownedTerminalIDs = []
+                    terminalInputDegradedIDs.removeAll()
+                    terminalInputRecoveringIDs.removeAll()
+                    connectionLost(error, generation: writeGeneration)
+                } else {
+                    // Never retry an ambiguous terminal.write. Request IDs are
+                    // correlation-only, so a timeout may mean the bytes were
+                    // applied and only the response was lost. Retrying could
+                    // duplicate text, Return, or Ctrl-C.
+                    terminalInputDegradedIDs.insert(terminalID)
+                    reportTerminalInputFailure(terminalID, scopedToTerminal: true)
+                }
                 return
             }
         }
@@ -5267,13 +5350,41 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func reportTerminalInputFailure(_ terminalID: String) {
+    private nonisolated static func isControllerConnectionFailure(_ error: any Error) -> Bool {
+        guard let error = error as? BrokerClientError else { return false }
+        switch error {
+        case .notConnected,
+             .connectionClosed,
+             .authenticationRejected,
+             .protocolMismatch,
+             .securityEpochMismatch,
+             .implementationMismatch,
+             .identityChanged,
+             .observeFeatureMissing,
+             .connectionTimedOut,
+             .socketFailure,
+             .socketPathTooLong:
+            return true
+        case .frameRejected,
+             .malformedResponse,
+             .requestTimedOut,
+             .requestFailed:
+            return false
+        }
+    }
+
+    private func reportTerminalInputFailure(
+        _ terminalID: String,
+        scopedToTerminal: Bool = false
+    ) {
         let now = Date()
         if let last = terminalInputFailureNoticeAt[terminalID],
            now.timeIntervalSince(last) < 2 { return }
         terminalInputFailureNoticeAt[terminalID] = now
         ToastCenter.shared.show(
-            "Terminal connection is recovering; input was not sent",
+            scopedToTerminal
+                ? "Input paused for this terminal; the last write could not be confirmed. Other sessions remain connected."
+                : "Terminal connection is recovering; input was not sent",
             style: .error,
             duration: 4
         )
@@ -5503,6 +5614,8 @@ final class AppModel: ObservableObject {
         terminalInputDrainTasks.removeValue(forKey: terminalID)?.cancel()
         terminalInputQueues.removeValue(forKey: terminalID)
         terminalInputFailureNoticeAt.removeValue(forKey: terminalID)
+        terminalInputDegradedIDs.remove(terminalID)
+        terminalInputRecoveringIDs.remove(terminalID)
         ownedTerminalIDs.remove(terminalID)
         companionControlledTerminalIDs.remove(terminalID)
         terminalSurfaceDocuments.removeValue(forKey: terminalID)
@@ -5880,11 +5993,15 @@ final class AppModel: ObservableObject {
     ) async {
         controlAvailable = false
         ownedTerminalIDs = []
+        terminalInputDegradedIDs = []
+        terminalInputRecoveringIDs = []
         await controlClient.setDisconnectHandler { [weak self] error in
             Task { @MainActor in
                 guard let self, self.controlAvailable else { return }
                 self.controlAvailable = false
                 self.ownedTerminalIDs = []
+                self.terminalInputDegradedIDs.removeAll()
+                self.terminalInputRecoveringIDs.removeAll()
                 for task in self.terminalResizeTasks.values { task.cancel() }
                 self.terminalResizeTasks.removeAll()
                 // The observer socket may still be streaming, but a full
@@ -6180,6 +6297,8 @@ final class AppModel: ObservableObject {
         terminalInputDrainTasks.removeAll()
         terminalInputQueues.removeAll()
         terminalInputFailureNoticeAt.removeAll()
+        terminalInputDegradedIDs.removeAll()
+        terminalInputRecoveringIDs.removeAll()
         cursorSaveTask?.cancel()
         cursorSaveTask = nil
         await controlClient.setDisconnectHandler(nil)

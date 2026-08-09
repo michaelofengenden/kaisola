@@ -219,6 +219,34 @@ jobs:
               KAISOLA_NATIVE_VISUAL_CAPTURE_PATH="$capture" \
               KAISOLA_NATIVE_VISUAL_FEED_BUILD_FLOOR=900000000 \
               "$@" 2>&1 | tee "$log"; then
+              if [[ "$surface" == terminal-ownership-flap ]]; then
+                node - "$log" <<'NODE'
+          const fs = require('node:fs')
+          const prefix = 'KAISOLA_NATIVE_VISUAL_OWNERSHIP_FLAP='
+          const line = fs.readFileSync(process.argv[2], 'utf8')
+            .split(/\r?\n/u)
+            .find((entry) => entry.startsWith(prefix))
+          if (!line) throw new Error('missing terminal ownership-flap receipt')
+          const receipt = JSON.parse(line.slice(prefix.length))
+          if (receipt.ok !== true
+              || receipt.bytes !== 5 * 1024 * 1024
+              || receipt.sameView !== true
+              || receipt.sameCoordinator !== true
+              || receipt.sameTerminal !== true
+              || receipt.mountedView !== true
+              || receipt.selectionStable !== true
+              || receipt.scrollStable !== true
+              || receipt.cursorStable !== true
+              || receipt.linkStable !== true
+              || receipt.liveFollowStable !== true
+              || receipt.revokedPresentationObserved !== true
+              || receipt.discardNoticeVisible !== true
+              || receipt.discardNoticeRedacted !== true
+              || receipt.additionalReplayStarts !== 0) {
+            throw new Error(`invalid terminal ownership-flap receipt: ${JSON.stringify(receipt)}`)
+          }
+          NODE
+              fi
               echo "KAISOLA_NATIVE_VISUAL_SURFACE_END=$surface"
             else
               local fixture_exit="$?"
@@ -282,7 +310,89 @@ jobs:
             ' "$ax_receipt"
           }
 
-          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-transcript account-picker attention-completed companion-control mixed permission palette preview preview-narrow preview-code-editor preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file workspace-move topbar topbar-attention mesh onboarding settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-extensions settings-extensions-narrow settings-models settings-shortcuts settings-account-recovery usage; do
+          optimized_source="$RUNNER_TEMP/kaisola-native-visual/Build/Products/LocalRelease/Kaisola.app"
+          optimized_app="$RUNNER_TEMP/Kaisola Continuous Scroll QA.app"
+          /usr/bin/ditto "$optimized_source" "$optimized_app"
+          optimized_binary="$optimized_app/Contents/MacOS/Kaisola"
+          optimized_info="$optimized_app/Contents/Info.plist"
+          optimized_binary_hash_before="$(shasum -a 256 "$optimized_binary" | awk '{print $1}')"
+          optimized_info_hash_before="$(shasum -a 256 "$optimized_info" | awk '{print $1}')"
+
+          assert_optimized_bundle_unchanged() {
+            test "$(shasum -a 256 "$optimized_binary" | awk '{print $1}')" \
+              = "$optimized_binary_hash_before"
+            test "$(shasum -a 256 "$optimized_info" | awk '{print $1}')" \
+              = "$optimized_info_hash_before"
+          }
+
+          run_optimized_continuous_fixture() {
+            local appearance="$1"
+            local capture="$2"
+            local log="$3"
+            local profile receipt
+            profile="$(mktemp -d "$fixture_profiles/optimized-$appearance.XXXXXX")"
+            mkdir -p "$profile/home" "$profile/tmp" "$profile/workspace"
+            echo "KAISOLA_NATIVE_VISUAL_SURFACE_BEGIN=optimized-$appearance-terminal-continuous-scroll"
+            /usr/bin/perl -e '
+              $seconds = shift @ARGV;
+              alarm $seconds;
+              exec @ARGV or die "exec failed: $!\n";
+            ' 25 /usr/bin/env \
+              HOME="$profile/home" \
+              CFFIXED_USER_HOME="$profile/home" \
+              TMPDIR="$profile/tmp" \
+              KAISOLA_NATIVE_VISUAL_FIXTURE=1 \
+              KAISOLA_NATIVE_VISUAL_SURFACE=terminal-continuous-scroll \
+              KAISOLA_NATIVE_VISUAL_APPEARANCE="$appearance" \
+              KAISOLA_NATIVE_VISUAL_WORKSPACE="$profile/workspace" \
+              KAISOLA_NATIVE_VISUAL_CAPTURE_PATH="$capture" \
+              KAISOLA_NATIVE_VISUAL_FEED_BUILD_FLOOR=900000000 \
+              "$optimized_binary" 2>&1 | tee "$log"
+            ! grep -F 'KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=FAIL' "$log"
+            receipt="$(sed -n 's/^KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=PASS //p' "$log" | tail -n 1)"
+            test -n "$receipt"
+            node -e '
+              const receipt = JSON.parse(process.argv[1]);
+              if (!receipt.optimizedBuild
+                  || receipt.scheduledHertz !== 120
+                  || receipt.sampleCount !== 120
+                  || receipt.sampleIntervalCount !== 119
+                  || !Array.isArray(receipt.sampleTimestampsMilliseconds)
+                  || receipt.sampleTimestampsMilliseconds.length !== 120
+                  || Math.abs(receipt.sampleTimestampsMilliseconds[0]) > 0.001
+                  || receipt.sampleTimestampsMilliseconds.some((timestamp, index, values) =>
+                    !Number.isFinite(timestamp) || (index > 0 && timestamp <= values[index - 1]))
+                  || Math.abs(receipt.sampleTimestampsMilliseconds.at(-1)
+                    - receipt.sampleDurationMilliseconds) > 0.001
+                  || receipt.measuredHertz < 80
+                  || receipt.measuredHertz > 145
+                  || receipt.sampleDurationMilliseconds < 800
+                  || receipt.sampleDurationMilliseconds > 1600
+                  || receipt.cadenceP95Milliseconds > 25
+                  || !receipt.viewIdentityPreserved
+                  || !receipt.coordinatorIdentityPreserved
+                  || !receipt.terminalEngineIdentityPreserved
+                  || !receipt.fixtureUpdaterDisabled
+                  || !receipt.fixtureBrokerIsolated
+                  || receipt.fixtureBuildNumber <= receipt.feedBuildFloor) {
+                throw new Error(`invalid optimized receipt: ${process.argv[1]}`);
+              }
+            ' "$receipt"
+            verify_capture "$capture" terminal-continuous-scroll
+            assert_optimized_bundle_unchanged
+            echo "KAISOLA_NATIVE_VISUAL_SURFACE_END=optimized-$appearance-terminal-continuous-scroll"
+          }
+
+          run_optimized_continuous_fixture \
+            light \
+            "$output/terminal-continuous-scroll.png" \
+            "$output/terminal-continuous-scroll.log"
+          run_optimized_continuous_fixture \
+            dark \
+            "$output/dark-terminal-continuous-scroll.png" \
+            "$output/dark-terminal-continuous-scroll.log"
+
+          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-ownership-flap terminal-transcript account-picker attention-completed companion-control mixed permission palette preview preview-narrow preview-code-editor preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file workspace-move topbar topbar-attention mesh onboarding settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-extensions settings-extensions-narrow settings-models settings-shortcuts settings-account-recovery usage; do
             capture="$output/$surface.png"
             log="$output/$surface.log"
             run_fixture "$surface" "$capture" "$log" "$binary"
@@ -305,6 +415,7 @@ jobs:
 
           test "$(shasum -a 256 "$binary" | awk '{print $1}')" = "$binary_hash_before"
           test "$(shasum -a 256 "$app/Contents/Info.plist" | awk '{print $1}')" = "$info_hash_before"
+          assert_optimized_bundle_unchanged
           broker_processes_after="$(
             ps -axo pid=,command= \
               | grep -E '[s]ession-broker\.cjs|[k]aisola-broker' \

@@ -26,8 +26,11 @@ final class NativeUpdateController: NSObject {
         self.init(bundle: .main)
     }
 
-    /// An installed visual fixture must never start Sparkle: doing so could
-    /// replace the evidence bundle and relaunch outside its isolated HOME.
+    /// Visual/resource fixtures exercise the installed application bundle in
+    /// place. Starting Sparkle there would allow a background update to replace
+    /// that evidence target and relaunch without the fixture's isolation
+    /// environment, so these processes receive an inert controller that never
+    /// constructs or starts an `SPUUpdater`.
     convenience init(isolatedFixture: Bool) {
         if isolatedFixture {
             self.init(disabledReason: "Updates are disabled in isolated fixtures.")

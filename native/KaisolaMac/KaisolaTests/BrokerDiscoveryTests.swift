@@ -135,6 +135,37 @@ final class BrokerDiscoveryTests: XCTestCase {
         XCTAssertFalse(report.checks.callbackCoverage)
     }
 
+    func testTerminalHistoryCadenceReceiptPinsTheLiveAppAndBroker() throws {
+        let frame = 1.0 / 60.0
+        let timestamps = (0...1_800).map { Double($0) * frame }
+        let report = try XCTUnwrap(NativeFrameCadenceReport.summarize(
+            workload: NativeTerminalHistoryFrameCadence.workloadID,
+            callbackTimestamps: timestamps,
+            nominalFrameDurations: Array(repeating: frame, count: timestamps.count)
+        ))
+        let data = try NativeTerminalHistoryFrameCadence.encodeReceipt(
+            report: report,
+            appPID: 111,
+            brokerPID: 222,
+            capturedAt: "2026-08-08T12:05:00.000Z"
+        )
+        let receipt = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+
+        XCTAssertEqual(receipt["workload"] as? String, NativeTerminalHistoryFrameCadence.workloadID)
+        XCTAssertEqual(receipt["appPid"] as? Int, 111)
+        XCTAssertEqual(receipt["brokerPid"] as? Int, 222)
+        XCTAssertEqual(receipt["capturedAt"] as? String, "2026-08-08T12:05:00.000Z")
+        XCTAssertEqual(receipt["pass"] as? Bool, true)
+        XCTAssertThrowsError(try NativeTerminalHistoryFrameCadence.encodeReceipt(
+            report: report,
+            appPID: 0,
+            brokerPID: 222,
+            capturedAt: "2026-08-08T12:05:00.000Z"
+        ))
+    }
+
     func testEachHistoricalAndCurrentProfileCanResolveTheLiveBroker() throws {
         for (index, name) in BrokerInfoLocator.installedProfileNames.enumerated() {
             // The shipping profile names intentionally differ only by case for

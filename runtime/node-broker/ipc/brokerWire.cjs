@@ -25,6 +25,11 @@ const TERMINAL_HISTORY_CONTINUOUS_FEATURE = 'terminal-history-continuous-v1'
 const OBSERVER_ROLE_FEATURE = 'observer-role-v1'
 const BROKER_UPDATE_FEATURE = 'broker-update-v1'
 const BROKER_ROLLING_UPDATE_FEATURE = 'broker-rolling-update-v1'
+// terminal:exit:<id> shipped as a bare exit code, so a signal-killed session
+// arrived as an ordinary numeric exit and the cause was lost. Clients that
+// declare this feature receive the same { exitCode, signal } record the
+// observer channel already carries.
+const TERMINAL_EXIT_STATUS_FEATURE = 'terminal-exit-status-v1'
 const FEATURES = Object.freeze([
   TERMINAL_OBSERVE_FEATURE,
   TERMINAL_HISTORY_FEATURE,
@@ -32,7 +37,9 @@ const FEATURES = Object.freeze([
   OBSERVER_ROLE_FEATURE,
   BROKER_UPDATE_FEATURE,
   BROKER_ROLLING_UPDATE_FEATURE,
+  TERMINAL_EXIT_STATUS_FEATURE,
 ])
+const TERMINAL_EXIT_CHANNEL_PREFIX = 'terminal:exit:'
 const OBSERVER_ACCESS = 'observer'
 const OBSERVER_METHODS = Object.freeze([
   'broker.status',
@@ -50,6 +57,29 @@ const OBSERVER_METHODS = Object.freeze([
 // a socket teardown + reconnect loop on the durability-critical reattach path.
 const MAX_FRAME = 56 * 1024 * 1024
 
+// Queue one newline-delimited frame on a client socket. `maxQueueBytes` drops
+// deltas a slow consumer has not drained; `force` bypasses that cap for the
+// recovery marker a paused subscriber must still receive.
+//
+// A forced frame reports delivery from whether the socket ACCEPTED it, not
+// from write()'s return value: Node returns false once the buffer passes the
+// high water mark, and a saturated buffer is exactly the state a recovery
+// marker is sent in. Reading that flow-control hint as loss would retire every
+// slow consumer whose marker is merely still queued. Only a socket that can no
+// longer carry bytes — destroyed, already ended, or throwing — loses one.
+function writeFrame(socket, frame, { maxQueueBytes, force = false } = {}) {
+  if (!socket || socket.destroyed || socket.writableEnded) return false
+  try {
+    const encoded = `${JSON.stringify(frame)}\n`
+    const frameBytes = Buffer.byteLength(encoded, 'utf8')
+    if (!force && Number.isFinite(maxQueueBytes) && socket.writableLength + frameBytes > maxQueueBytes) return false
+    const flushed = socket.write(encoded)
+    return force ? true : flushed
+  } catch {
+    return false // reconnect replays snapshots
+  }
+}
+
 function atomicJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   const tmp = `${file}.${process.pid}.tmp`
@@ -64,6 +94,30 @@ function observerMethodAllowed(method) {
 
 function brokerMethodAllowedForAccess(access, method) {
   return access !== OBSERVER_ACCESS || observerMethodAllowed(method)
+}
+
+/** A client names the event shapes it can decode in its `hello` frame. Only
+ * features this broker actually implements survive, so a client can never talk
+ * an older broker into emitting a shape it does not know how to build. A
+ * client that names nothing keeps every legacy shape. */
+function negotiateFeatures(requested) {
+  const negotiated = new Set()
+  if (!Array.isArray(requested)) return negotiated
+  for (const value of requested) {
+    const name = String(value ?? '')
+    if (FEATURES.includes(name)) negotiated.add(name)
+  }
+  return negotiated
+}
+
+/** Downgrade one outbound event to what this client negotiated. The manager
+ * always emits the structured exit status; a client predating
+ * terminal-exit-status-v1 still receives the bare code it parses. */
+function eventPayloadForFeatures(channel, payload, features) {
+  if (!String(channel ?? '').startsWith(TERMINAL_EXIT_CHANNEL_PREFIX)) return payload
+  if (features?.has(TERMINAL_EXIT_STATUS_FEATURE)) return payload
+  if (payload && typeof payload === 'object') return payload.exitCode ?? 0
+  return payload
 }
 
 function brokerVersionsCompatible({ protocol, securityEpoch, implementationVersion }) {
@@ -86,6 +140,8 @@ module.exports = {
   OBSERVER_ROLE_FEATURE,
   BROKER_UPDATE_FEATURE,
   BROKER_ROLLING_UPDATE_FEATURE,
+  TERMINAL_EXIT_STATUS_FEATURE,
+  TERMINAL_EXIT_CHANNEL_PREFIX,
   FEATURES,
   OBSERVER_ACCESS,
   OBSERVER_METHODS,
@@ -94,4 +150,7 @@ module.exports = {
   observerMethodAllowed,
   brokerMethodAllowedForAccess,
   brokerVersionsCompatible,
+  negotiateFeatures,
+  eventPayloadForFeatures,
+  writeFrame,
 }

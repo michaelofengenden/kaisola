@@ -44,6 +44,149 @@ enum AcpAttachment: Codable, Equatable, Sendable {
     }
 }
 
+/// Hard limits for adapter-originated permission asks. They are lower than the
+/// transport frame cap because a permission payload is retained, inspected,
+/// rendered, and held awaiting a human decision.
+struct AcpPermissionPayloadLimits: Sendable {
+    static let maximumAggregateBytes = 512 * 1_024
+    static let maximumAggregateNodes = 32_768
+    static let maximumNestingDepth = 64
+    static let maximumRawInputBytes = 256 * 1_024
+    static let maximumRawInputNodes = 16_384
+    static let maximumTitleBytes = 4 * 1_024
+    static let maximumKindBytes = 128
+    static let maximumSessionIDBytes = 1_024
+    static let maximumToolCallIDBytes = 1_024
+    static let maximumOptionCount = 64
+    static let maximumOptionIDBytes = 256
+    static let maximumOptionNameBytes = 1_024
+    static let maximumOptionKindBytes = 128
+    static let maximumPathCount = 256
+    static let maximumPathBytes = 4 * 1_024
+}
+
+enum AcpPermissionPayloadRejection: String, Equatable, Sendable {
+    case malformed
+    case aggregateBytes = "aggregate_bytes"
+    case complexity
+    case rawInputBytes = "raw_input_bytes"
+    case titleBytes = "title_bytes"
+    case kindBytes = "kind_bytes"
+    case sessionIDBytes = "session_id_bytes"
+    case toolCallIDBytes = "tool_call_id_bytes"
+    case optionCount = "option_count"
+    case optionIDBytes = "option_id_bytes"
+    case optionNameBytes = "option_name_bytes"
+    case optionKindBytes = "option_kind_bytes"
+    case pathCount = "path_count"
+    case pathBytes = "path_bytes"
+
+    var safeSummary: String {
+        switch self {
+        case .malformed: "Permission request fields are malformed."
+        case .aggregateBytes: "Permission request exceeds the aggregate byte limit."
+        case .complexity: "Permission request exceeds the structural complexity limit."
+        case .rawInputBytes: "Permission raw input exceeds its byte limit."
+        case .titleBytes: "Permission title exceeds its byte limit."
+        case .kindBytes: "Permission kind exceeds its byte limit."
+        case .sessionIDBytes: "Permission session identifier exceeds its byte limit."
+        case .toolCallIDBytes: "Permission tool-call identifier exceeds its byte limit."
+        case .optionCount: "Permission request has too many options."
+        case .optionIDBytes: "Permission option identifier exceeds its byte limit."
+        case .optionNameBytes: "Permission option name exceeds its byte limit."
+        case .optionKindBytes: "Permission option kind exceeds its byte limit."
+        case .pathCount: "Permission request has too many distinct paths."
+        case .pathBytes: "Permission path exceeds its byte limit."
+        }
+    }
+}
+
+struct AcpPermissionPayloadValidation: Equatable, Sendable {
+    let rejection: AcpPermissionPayloadRejection?
+    let aggregateBytes: Int
+    let inspectedNodes: Int
+}
+
+private enum AcpJSONBudgetFailure: Equatable {
+    case bytes
+    case complexity
+}
+
+/// Measures JSON without encoding or rendering it. Every visit is budgeted and
+/// traversal stops at the first over-limit node, so a huge rawInput cannot turn
+/// validation itself into an unbounded pre-scan.
+private struct AcpJSONBudgetScanner {
+    let maximumBytes: Int
+    let maximumNodes: Int
+    let maximumDepth: Int
+    private(set) var bytes = 0
+    private(set) var nodes = 0
+
+    mutating func scan(_ value: JSONValue, depth: Int = 0) -> AcpJSONBudgetFailure? {
+        guard depth <= maximumDepth else { return .complexity }
+        nodes += 1
+        guard nodes <= maximumNodes else { return .complexity }
+        switch value {
+        case .null:
+            return add(4)
+        case let .bool(value):
+            return add(value ? 4 : 5)
+        case let .integer(value):
+            return add(String(value).utf8.count)
+        case .number:
+            // A finite JSON number is far shorter; use a conservative constant
+            // so measurement never undercounts an encoder representation.
+            return add(32)
+        case let .string(value):
+            return add(jsonStringBytes(value))
+        case let .array(values):
+            if let failure = add(2 + max(0, values.count - 1)) { return failure }
+            for value in values {
+                if let failure = scan(value, depth: depth + 1) { return failure }
+            }
+            return nil
+        case let .object(values):
+            if let failure = add(2 + max(0, values.count - 1)) { return failure }
+            for (key, value) in values {
+                if let failure = add(jsonStringBytes(key) + 1) { return failure }
+                if let failure = scan(value, depth: depth + 1) { return failure }
+            }
+            return nil
+        }
+    }
+
+    private mutating func add(_ count: Int) -> AcpJSONBudgetFailure? {
+        guard count >= 0, bytes <= maximumBytes - min(count, maximumBytes + 1) else {
+            bytes = maximumBytes + 1
+            return .bytes
+        }
+        bytes += count
+        return bytes <= maximumBytes ? nil : .bytes
+    }
+
+    private func jsonStringBytes(_ value: String) -> Int {
+        var result = 2 // quotes
+        for scalar in value.unicodeScalars {
+            switch scalar.value {
+            case 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x22, 0x5C:
+                result += 2
+            case 0x00 ... 0x1F:
+                result += 6
+            case 0x00 ... 0x7F:
+                result += 1
+            case 0x80 ... 0x7FF:
+                result += 2
+            case 0x800 ... 0xFFFF:
+                result += 3
+            default:
+                result += 4
+            }
+            if result > maximumBytes { return maximumBytes + 1 }
+        }
+        return result
+    }
+}
+
 /// A native ACP client: spawns the adapter, runs the JSON-RPC handshake
 /// (initialize → session/new), sends prompts, and streams the agent's
 /// `session/update` notifications plus permission callbacks. Newline-delimited
@@ -509,11 +652,21 @@ actor AcpClient {
         Task { try? await transport.send(frame) }
     }
 
-    private func respondError(id: JSONValue, code: Int, message: String) {
+    private func respondError(
+        id: JSONValue,
+        code: Int,
+        message: String,
+        data: JSONValue? = nil
+    ) {
+        var error: [String: JSONValue] = [
+            "code": .integer(Int64(code)),
+            "message": .string(message),
+        ]
+        if let data { error["data"] = data }
         guard let frame = try? encode(.object([
             "jsonrpc": .string("2.0"),
             "id": id,
-            "error": .object(["code": .integer(Int64(code)), "message": .string(message)]),
+            "error": .object(error),
         ])) else { return }
         Task { try? await transport.send(frame) }
     }
@@ -824,18 +977,50 @@ actor AcpClient {
         }
     }
 
+    /// JSON-RPC 2.0 "Invalid params" — the answer an ask we cannot put in front
+    /// of a human has to carry.
+    private static let invalidParamsCode = -32602
+
     private func handlePermissionRequest(id: JSONValue?, params: JSONValue?) {
-        guard let id, let sessionID else { return }
+        // No id means the agent sent this as a notification; JSON-RPC forbids
+        // answering one, and there is no decision to route back.
+        guard let id else { return }
+        // Every remaining path must reply. Dropping a malformed ask left the
+        // adapter blocked forever on a decision the user was never shown.
+        guard let sessionID else {
+            respondError(
+                id: id,
+                code: Self.invalidParamsCode,
+                message: "session/request_permission arrived with no active session"
+            )
+            return
+        }
         permissionCounter += 1
         let localID = permissionCounter
         let toolCallID = params?.objectValue?["toolCall"]?.objectValue?["toolCallId"]?.stringValue
+        guard toolCallID?.utf8.count ?? 0 <= AcpPermissionPayloadLimits.maximumToolCallIDBytes else {
+            respondPermissionRequestError(id: id, rejection: .toolCallIDBytes)
+            return
+        }
         let priorContext = toolCallID.flatMap { toolCallReviewContexts[$0] }
+        let validation = Self.validatePermissionRequestPayload(params, priorContext: priorContext)
+        if let rejection = validation.rejection {
+            respondPermissionRequestError(id: id, rejection: rejection)
+            return
+        }
         guard let request = Self.parsePermissionRequest(
             localID: localID,
             sessionID: sessionID,
             params: params,
             priorContext: priorContext
-        ) else { return }
+        ) else {
+            respondError(
+                id: id,
+                code: Self.invalidParamsCode,
+                message: "session/request_permission needs object params with at least one option"
+            )
+            return
+        }
         activePermissionIDs.insert(localID)
         let generation = connectionGeneration
         activePermissionRequests[localID] = ActivePermissionRequest(
@@ -869,12 +1054,269 @@ actor AcpClient {
         }
     }
 
+    private func respondPermissionRequestError(
+        id: JSONValue,
+        rejection: AcpPermissionPayloadRejection
+    ) {
+        respondError(
+            id: id,
+            code: -32602,
+            message: "Permission request rejected",
+            data: .object([
+                "type": .string("permission_request_rejected"),
+                "reason": .string(rejection.rawValue),
+                "summary": .string(rejection.safeSummary),
+            ])
+        )
+    }
+
+    static func validatePermissionRequestPayload(
+        _ value: JSONValue?,
+        priorContext: AcpToolCallReviewContext? = nil
+    ) -> AcpPermissionPayloadValidation {
+        var inspectedNodes = 0
+        func rejected(
+            _ rejection: AcpPermissionPayloadRejection,
+            aggregateBytes: Int = 0
+        ) -> AcpPermissionPayloadValidation {
+            AcpPermissionPayloadValidation(
+                rejection: rejection,
+                aggregateBytes: aggregateBytes,
+                inspectedNodes: inspectedNodes
+            )
+        }
+
+        guard let params = value?.objectValue else { return rejected(.malformed) }
+        let toolCall: [String: JSONValue]?
+        if let candidate = params["toolCall"] {
+            guard let object = candidate.objectValue else { return rejected(.malformed) }
+            toolCall = object
+        } else {
+            toolCall = nil
+        }
+
+        let inheritsTitle = toolCall?["title"] == nil
+        let inheritsKind = toolCall?["kind"] == nil
+        let inheritsRawInput = toolCall?["rawInput"] == nil
+        let inheritsLocations = toolCall?["locations"] == nil
+        let inheritsDiffPaths = toolCall?["content"] == nil
+        let rawInput: JSONValue?
+        if let current = toolCall?["rawInput"] {
+            rawInput = current == .null ? nil : current
+        } else {
+            rawInput = priorContext?.rawInput
+        }
+
+        // Inspect arbitrary raw input before measuring the complete request.
+        // This stricter node budget bounds work even when the outer payload is
+        // still under its aggregate byte allowance.
+        if let rawInput {
+            var rawScanner = AcpJSONBudgetScanner(
+                maximumBytes: AcpPermissionPayloadLimits.maximumRawInputBytes,
+                maximumNodes: AcpPermissionPayloadLimits.maximumRawInputNodes,
+                maximumDepth: AcpPermissionPayloadLimits.maximumNestingDepth
+            )
+            if let failure = rawScanner.scan(rawInput) {
+                inspectedNodes += rawScanner.nodes
+                return rejected(failure == .bytes ? .rawInputBytes : .complexity)
+            }
+            inspectedNodes += rawScanner.nodes
+        }
+
+        var aggregateScanner = AcpJSONBudgetScanner(
+            maximumBytes: AcpPermissionPayloadLimits.maximumAggregateBytes,
+            maximumNodes: AcpPermissionPayloadLimits.maximumAggregateNodes,
+            maximumDepth: AcpPermissionPayloadLimits.maximumNestingDepth
+        )
+        guard let value else { return rejected(.malformed) }
+        if let failure = aggregateScanner.scan(value) {
+            inspectedNodes += aggregateScanner.nodes
+            return rejected(
+                failure == .bytes ? .aggregateBytes : .complexity,
+                aggregateBytes: aggregateScanner.bytes
+            )
+        }
+        func includeInherited(_ inherited: JSONValue?) -> AcpPermissionPayloadRejection? {
+            guard let inherited else { return nil }
+            if let failure = aggregateScanner.scan(inherited) {
+                return failure == .bytes ? .aggregateBytes : .complexity
+            }
+            return nil
+        }
+        if inheritsTitle,
+           let rejection = includeInherited(priorContext?.title.map(JSONValue.string)) {
+            inspectedNodes += aggregateScanner.nodes
+            return rejected(rejection, aggregateBytes: aggregateScanner.bytes)
+        }
+        if inheritsKind,
+           let rejection = includeInherited(priorContext?.kind.map(JSONValue.string)) {
+            inspectedNodes += aggregateScanner.nodes
+            return rejected(rejection, aggregateBytes: aggregateScanner.bytes)
+        }
+        if inheritsRawInput,
+           let rejection = includeInherited(priorContext?.rawInput) {
+            inspectedNodes += aggregateScanner.nodes
+            return rejected(rejection, aggregateBytes: aggregateScanner.bytes)
+        }
+        if inheritsLocations,
+           let rejection = includeInherited(.array((priorContext?.locationPaths ?? []).map(JSONValue.string))) {
+            inspectedNodes += aggregateScanner.nodes
+            return rejected(rejection, aggregateBytes: aggregateScanner.bytes)
+        }
+        if inheritsDiffPaths,
+           let rejection = includeInherited(.array((priorContext?.diffPaths ?? []).map(JSONValue.string))) {
+            inspectedNodes += aggregateScanner.nodes
+            return rejected(rejection, aggregateBytes: aggregateScanner.bytes)
+        }
+        inspectedNodes += aggregateScanner.nodes
+
+        func checkedString(
+            _ candidate: JSONValue?,
+            fallback: String?,
+            maximumBytes: Int,
+            rejection: AcpPermissionPayloadRejection
+        ) -> AcpPermissionPayloadRejection? {
+            let text: String?
+            if let candidate {
+                guard let decoded = candidate.stringValue else { return .malformed }
+                text = decoded
+            } else {
+                text = fallback
+            }
+            guard let text else { return nil }
+            return text.utf8.count <= maximumBytes ? nil : rejection
+        }
+
+        if let rejection = checkedString(
+            params["sessionId"],
+            fallback: nil,
+            maximumBytes: AcpPermissionPayloadLimits.maximumSessionIDBytes,
+            rejection: .sessionIDBytes
+        ) { return rejected(rejection, aggregateBytes: aggregateScanner.bytes) }
+        if let rejection = checkedString(
+            toolCall?["toolCallId"],
+            fallback: nil,
+            maximumBytes: AcpPermissionPayloadLimits.maximumToolCallIDBytes,
+            rejection: .toolCallIDBytes
+        ) { return rejected(rejection, aggregateBytes: aggregateScanner.bytes) }
+        if let rejection = checkedString(
+            toolCall?["title"],
+            fallback: priorContext?.title,
+            maximumBytes: AcpPermissionPayloadLimits.maximumTitleBytes,
+            rejection: .titleBytes
+        ) { return rejected(rejection, aggregateBytes: aggregateScanner.bytes) }
+        if let rejection = checkedString(
+            toolCall?["kind"],
+            fallback: priorContext?.kind,
+            maximumBytes: AcpPermissionPayloadLimits.maximumKindBytes,
+            rejection: .kindBytes
+        ) { return rejected(rejection, aggregateBytes: aggregateScanner.bytes) }
+
+        guard let options = params["options"]?.arrayValue,
+              !options.isEmpty else {
+            return rejected(.malformed, aggregateBytes: aggregateScanner.bytes)
+        }
+        guard options.count <= AcpPermissionPayloadLimits.maximumOptionCount else {
+            return rejected(.optionCount, aggregateBytes: aggregateScanner.bytes)
+        }
+        for value in options {
+            guard let option = value.objectValue,
+                  let optionID = option["optionId"]?.stringValue,
+                  !optionID.isEmpty else {
+                return rejected(.malformed, aggregateBytes: aggregateScanner.bytes)
+            }
+            guard optionID.utf8.count <= AcpPermissionPayloadLimits.maximumOptionIDBytes else {
+                return rejected(.optionIDBytes, aggregateBytes: aggregateScanner.bytes)
+            }
+            if let rejection = checkedString(
+                option["name"],
+                fallback: nil,
+                maximumBytes: AcpPermissionPayloadLimits.maximumOptionNameBytes,
+                rejection: .optionNameBytes
+            ) { return rejected(rejection, aggregateBytes: aggregateScanner.bytes) }
+            if let rejection = checkedString(
+                option["kind"],
+                fallback: nil,
+                maximumBytes: AcpPermissionPayloadLimits.maximumOptionKindBytes,
+                rejection: .optionKindBytes
+            ) { return rejected(rejection, aggregateBytes: aggregateScanner.bytes) }
+        }
+
+        var seenPaths = Set<String>()
+        func includePath(_ path: String) -> AcpPermissionPayloadRejection? {
+            guard !path.isEmpty else { return .malformed }
+            guard path.utf8.count <= AcpPermissionPayloadLimits.maximumPathBytes else {
+                return .pathBytes
+            }
+            guard seenPaths.insert(path).inserted else { return nil }
+            return seenPaths.count <= AcpPermissionPayloadLimits.maximumPathCount ? nil : .pathCount
+        }
+        if let locations = toolCall?["locations"] {
+            guard let array = locations.arrayValue else {
+                return rejected(.malformed, aggregateBytes: aggregateScanner.bytes)
+            }
+            for location in array {
+                guard let path = location.objectValue?["path"]?.stringValue else {
+                    return rejected(.malformed, aggregateBytes: aggregateScanner.bytes)
+                }
+                if let rejection = includePath(path) {
+                    return rejected(rejection, aggregateBytes: aggregateScanner.bytes)
+                }
+            }
+        } else {
+            for path in priorContext?.locationPaths ?? [] {
+                if let rejection = includePath(path) {
+                    return rejected(rejection, aggregateBytes: aggregateScanner.bytes)
+                }
+            }
+        }
+        if let content = toolCall?["content"] {
+            guard let array = content.arrayValue else {
+                return rejected(.malformed, aggregateBytes: aggregateScanner.bytes)
+            }
+            for item in array {
+                guard let object = item.objectValue else {
+                    return rejected(.malformed, aggregateBytes: aggregateScanner.bytes)
+                }
+                if let type = object["type"], type.stringValue == nil {
+                    return rejected(.malformed, aggregateBytes: aggregateScanner.bytes)
+                }
+                guard object["type"]?.stringValue == "diff" else { continue }
+                guard let path = object["path"]?.stringValue else {
+                    return rejected(.malformed, aggregateBytes: aggregateScanner.bytes)
+                }
+                if let rejection = includePath(path) {
+                    return rejected(rejection, aggregateBytes: aggregateScanner.bytes)
+                }
+            }
+        } else {
+            for path in priorContext?.diffPaths ?? [] {
+                if let rejection = includePath(path) {
+                    return rejected(rejection, aggregateBytes: aggregateScanner.bytes)
+                }
+            }
+        }
+
+        return AcpPermissionPayloadValidation(
+            rejection: nil,
+            aggregateBytes: aggregateScanner.bytes,
+            inspectedNodes: inspectedNodes
+        )
+    }
+
     /// Test-visible lifecycle count for the security metadata introduced at
     /// this boundary. It must describe active asks only, never request history.
     var retainedPermissionOptionSetCount: Int { activePermissionRequests.count }
 
     /// Decode the complete permission review payload, including ACP v1's
     /// arbitrary `rawInput`. Kept pure for wire-contract tests.
+    ///
+    /// Returns nil for an ask no user could answer — params that are not an
+    /// object, or an `options` list with nothing selectable in it. The caller
+    /// turns that into a JSON-RPC error, because a review card with no buttons
+    /// blocks the adapter just as thoroughly as no card at all. A missing
+    /// `toolCall` is NOT malformed: partial asks fall back to the disclosure an
+    /// earlier `session/update` already streamed.
     static func parsePermissionRequest(
         localID: Int,
         sessionID: String,
@@ -913,6 +1355,7 @@ actor AcpClient {
                 kind: o["kind"]?.stringValue ?? "other"
             )
         }
+        guard !options.isEmpty else { return nil }
         var seenPaths = Set<String>()
         let paths = (locationPaths + diffPaths).filter {
             !$0.isEmpty && seenPaths.insert($0).inserted

@@ -395,15 +395,15 @@ final class AcpClientTests: XCTestCase {
         await transport.emitPermission(
             wireID: wireID,
             title: "Invalid selections",
-            optionIDs: ["offered", ""]
+            optionIDs: ["offered"]
         )
         try await Self.until("the invalid-selection request surfaced") {
             events.permissionRequests.count == 1
         }
         let request = try XCTUnwrap(events.permissionRequests.first)
 
-        // Empty is rejected even when a malformed adapter offered it. An
-        // undisclosed nonempty id is rejected by the same exact-membership gate.
+        // Empty and undisclosed ids are rejected by the same exact-membership
+        // gate without consuming the valid request.
         await client.resolvePermission(id: request.id, optionID: "")
         await client.resolvePermission(id: request.id, optionID: "never-offered")
         let invalidResponseCount = await transport.permissionResponseCount(for: wireID)
@@ -480,6 +480,640 @@ final class AcpClientTests: XCTestCase {
         let retainedAfterCurrentResolution = await client.retainedPermissionOptionSetCount
         XCTAssertEqual(newSelectedOptionID, .string("shared-option"))
         XCTAssertEqual(retainedAfterCurrentResolution, 0)
+    }
+
+    func testPermissionAggregateByteBoundaryIsExactAndErrorIsTypedAndSafe() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let events = EventCollector()
+        await client.setEventHandler { events.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        let marker = "SENSITIVE_PERMISSION_MARKER"
+        let emptyPadding = Self.permissionParams(
+            title: marker,
+            extra: ["padding": .string("")]
+        )
+        let emptyMeasurement = AcpClient.validatePermissionRequestPayload(emptyPadding)
+        XCTAssertNil(emptyMeasurement.rejection)
+        let paddingCount = AcpPermissionPayloadLimits.maximumAggregateBytes
+            - emptyMeasurement.aggregateBytes
+        XCTAssertGreaterThan(paddingCount, 0)
+
+        let exact = Self.permissionParams(
+            title: marker,
+            extra: ["padding": .string(String(repeating: "p", count: paddingCount))]
+        )
+        let exactMeasurement = AcpClient.validatePermissionRequestPayload(exact)
+        XCTAssertNil(exactMeasurement.rejection)
+        XCTAssertEqual(
+            exactMeasurement.aggregateBytes,
+            AcpPermissionPayloadLimits.maximumAggregateBytes
+        )
+
+        let validWireID: Int64 = 48_201
+        await transport.emitPermission(wireID: validWireID, params: exact)
+        try await Self.until("the aggregate-limit request surfaced") {
+            events.permissionRequests.count == 1
+        }
+        let request = try XCTUnwrap(events.permissionRequests.first)
+        await client.resolvePermission(id: request.id, optionID: "allow")
+        try await Self.until("the aggregate-limit request resolved once") {
+            await transport.permissionResponseCount(for: validWireID) == 1
+        }
+
+        let oversized = Self.permissionParams(
+            title: marker,
+            extra: ["padding": .string(String(repeating: "p", count: paddingCount + 1))]
+        )
+        XCTAssertEqual(
+            AcpClient.validatePermissionRequestPayload(oversized).rejection,
+            .aggregateBytes
+        )
+        let rejectedWireID: Int64 = 48_202
+        await transport.emitPermission(wireID: rejectedWireID, params: oversized)
+        try await Self.until("the aggregate overflow was rejected") {
+            await transport.permissionError(for: rejectedWireID) != nil
+        }
+        let receivedError = await transport.permissionError(for: rejectedWireID)
+        let error = try XCTUnwrap(receivedError)
+        XCTAssertEqual(error.objectValue?["code"], .integer(-32602))
+        XCTAssertEqual(error.objectValue?["message"], .string("Permission request rejected"))
+        XCTAssertEqual(Self.permissionErrorReason(error), "aggregate_bytes")
+        let encodedError = try JSONEncoder().encode(error)
+        XCTAssertLessThanOrEqual(encodedError.count, 256)
+        XCTAssertFalse(String(decoding: encodedError, as: UTF8.self).contains(marker))
+        XCTAssertEqual(events.permissionRequests.count, 1, "an oversized ask must not emit a card")
+        let retainedAfterAggregateRejection = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterAggregateRejection, 0)
+    }
+
+    func testPermissionFieldLimitsUseUTF8BytesAtAndOverBoundary() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let events = EventCollector()
+        await client.setEventHandler { events.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        let exactTitle = String(
+            repeating: "é",
+            count: AcpPermissionPayloadLimits.maximumTitleBytes / "é".utf8.count
+        )
+        XCTAssertEqual(exactTitle.utf8.count, AcpPermissionPayloadLimits.maximumTitleBytes)
+        let titleWireID: Int64 = 48_203
+        await transport.emitPermission(
+            wireID: titleWireID,
+            params: Self.permissionParams(title: exactTitle)
+        )
+        try await Self.until("the maximum UTF-8 title surfaced") {
+            events.permissionRequests.count == 1
+        }
+        await client.resolvePermission(
+            id: try XCTUnwrap(events.permissionRequests.last).id,
+            optionID: "allow"
+        )
+        try await Self.until("the maximum UTF-8 title resolved") {
+            await transport.permissionResponseCount(for: titleWireID) == 1
+        }
+
+        let titleOverflowWireID: Int64 = 48_204
+        await transport.emitPermission(
+            wireID: titleOverflowWireID,
+            params: Self.permissionParams(title: exactTitle + "é")
+        )
+        try await Self.until("the UTF-8 title overflow was rejected") {
+            await transport.permissionError(for: titleOverflowWireID) != nil
+        }
+        let titleError = await transport.permissionError(for: titleOverflowWireID)
+        XCTAssertEqual(Self.permissionErrorReason(titleError), "title_bytes")
+
+        let exactRaw = String(
+            repeating: "r",
+            count: AcpPermissionPayloadLimits.maximumRawInputBytes - 2
+        )
+        let rawWireID: Int64 = 48_205
+        await transport.emitPermission(
+            wireID: rawWireID,
+            params: Self.permissionParams(rawInput: .string(exactRaw))
+        )
+        try await Self.until("the maximum raw input surfaced") {
+            events.permissionRequests.count == 2
+        }
+        await client.resolvePermission(
+            id: try XCTUnwrap(events.permissionRequests.last).id,
+            optionID: "allow"
+        )
+        try await Self.until("the maximum raw input resolved") {
+            await transport.permissionResponseCount(for: rawWireID) == 1
+        }
+
+        let rawOverflowWireID: Int64 = 48_206
+        await transport.emitPermission(
+            wireID: rawOverflowWireID,
+            params: Self.permissionParams(rawInput: .string(exactRaw + "r"))
+        )
+        try await Self.until("the raw-input byte overflow was rejected") {
+            await transport.permissionError(for: rawOverflowWireID) != nil
+        }
+        let rawInputError = await transport.permissionError(for: rawOverflowWireID)
+        XCTAssertEqual(Self.permissionErrorReason(rawInputError), "raw_input_bytes")
+
+        let exactKind = String(repeating: "k", count: AcpPermissionPayloadLimits.maximumKindBytes)
+        let kindWireID: Int64 = 48_207
+        await transport.emitPermission(
+            wireID: kindWireID,
+            params: Self.permissionParams(kind: exactKind)
+        )
+        try await Self.until("the maximum kind surfaced") {
+            events.permissionRequests.count == 3
+        }
+        await client.resolvePermission(
+            id: try XCTUnwrap(events.permissionRequests.last).id,
+            optionID: "allow"
+        )
+        try await Self.until("the maximum kind resolved") {
+            await transport.permissionResponseCount(for: kindWireID) == 1
+        }
+        let kindOverflowWireID: Int64 = 48_208
+        await transport.emitPermission(
+            wireID: kindOverflowWireID,
+            params: Self.permissionParams(kind: exactKind + "k")
+        )
+        try await Self.until("the kind byte overflow was rejected") {
+            await transport.permissionError(for: kindOverflowWireID) != nil
+        }
+        let kindError = await transport.permissionError(for: kindOverflowWireID)
+        XCTAssertEqual(Self.permissionErrorReason(kindError), "kind_bytes")
+
+        var exactSessionFields = try XCTUnwrap(Self.permissionParams().objectValue)
+        exactSessionFields["sessionId"] = .string(String(
+            repeating: "s",
+            count: AcpPermissionPayloadLimits.maximumSessionIDBytes
+        ))
+        let sessionWireID: Int64 = 48_241
+        await transport.emitPermission(wireID: sessionWireID, params: .object(exactSessionFields))
+        try await Self.until("the maximum session-id field surfaced") {
+            events.permissionRequests.count == 4
+        }
+        await client.resolvePermission(
+            id: try XCTUnwrap(events.permissionRequests.last).id,
+            optionID: "allow"
+        )
+        try await Self.until("the maximum session-id field resolved") {
+            await transport.permissionResponseCount(for: sessionWireID) == 1
+        }
+        exactSessionFields["sessionId"] = .string(String(
+            repeating: "s",
+            count: AcpPermissionPayloadLimits.maximumSessionIDBytes + 1
+        ))
+        let sessionOverflowWireID: Int64 = 48_242
+        await transport.emitPermission(
+            wireID: sessionOverflowWireID,
+            params: .object(exactSessionFields)
+        )
+        try await Self.until("the session-id byte overflow was rejected") {
+            await transport.permissionError(for: sessionOverflowWireID) != nil
+        }
+        let sessionIDError = await transport.permissionError(for: sessionOverflowWireID)
+        XCTAssertEqual(Self.permissionErrorReason(sessionIDError), "session_id_bytes")
+
+        var exactToolCallFields = try XCTUnwrap(Self.permissionParams().objectValue)
+        var exactToolCall = try XCTUnwrap(exactToolCallFields["toolCall"]?.objectValue)
+        exactToolCall["toolCallId"] = .string(String(
+            repeating: "t",
+            count: AcpPermissionPayloadLimits.maximumToolCallIDBytes
+        ))
+        exactToolCallFields["toolCall"] = .object(exactToolCall)
+        let toolCallWireID: Int64 = 48_243
+        await transport.emitPermission(wireID: toolCallWireID, params: .object(exactToolCallFields))
+        try await Self.until("the maximum tool-call-id field surfaced") {
+            events.permissionRequests.count == 5
+        }
+        await client.resolvePermission(
+            id: try XCTUnwrap(events.permissionRequests.last).id,
+            optionID: "allow"
+        )
+        try await Self.until("the maximum tool-call-id field resolved") {
+            await transport.permissionResponseCount(for: toolCallWireID) == 1
+        }
+        exactToolCall["toolCallId"] = .string(String(
+            repeating: "t",
+            count: AcpPermissionPayloadLimits.maximumToolCallIDBytes + 1
+        ))
+        exactToolCallFields["toolCall"] = .object(exactToolCall)
+        let toolCallOverflowWireID: Int64 = 48_244
+        await transport.emitPermission(
+            wireID: toolCallOverflowWireID,
+            params: .object(exactToolCallFields)
+        )
+        try await Self.until("the tool-call-id byte overflow was rejected") {
+            await transport.permissionError(for: toolCallOverflowWireID) != nil
+        }
+        let toolCallIDError = await transport.permissionError(for: toolCallOverflowWireID)
+        XCTAssertEqual(Self.permissionErrorReason(toolCallIDError), "tool_call_id_bytes")
+
+        XCTAssertEqual(events.permissionRequests.count, 5)
+        let retainedAfterFieldRejections = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterFieldRejections, 0)
+    }
+
+    func testPermissionOptionCountAndEveryOptionFieldAreBounded() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let events = EventCollector()
+        await client.setEventHandler { events.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        func option(id: String, name: String, kind: String) -> JSONValue {
+            .object([
+                "optionId": .string(id),
+                "name": .string(name),
+                "kind": .string(kind),
+            ])
+        }
+        var nextWireID: Int64 = 48_209
+        var expectedCards = 0
+        let boundaryOptions: [[JSONValue]] = [
+            (0 ..< AcpPermissionPayloadLimits.maximumOptionCount).map {
+                option(id: "option-\($0)", name: "Option \($0)", kind: "allow_once")
+            },
+            [option(
+                id: String(repeating: "i", count: AcpPermissionPayloadLimits.maximumOptionIDBytes),
+                name: "Allow",
+                kind: "allow_once"
+            )],
+            [option(
+                id: "allow-name",
+                name: String(repeating: "n", count: AcpPermissionPayloadLimits.maximumOptionNameBytes),
+                kind: "allow_once"
+            )],
+            [option(
+                id: "allow-kind",
+                name: "Allow",
+                kind: String(repeating: "k", count: AcpPermissionPayloadLimits.maximumOptionKindBytes)
+            )],
+        ]
+        for options in boundaryOptions {
+            let wireID = nextWireID
+            nextWireID += 1
+            expectedCards += 1
+            await transport.emitPermission(
+                wireID: wireID,
+                params: Self.permissionParams(options: options)
+            )
+            try await Self.until("option boundary request \(wireID) surfaced") {
+                events.permissionRequests.count == expectedCards
+            }
+            let request = try XCTUnwrap(events.permissionRequests.last)
+            await client.resolvePermission(id: request.id, optionID: request.options[0].id)
+            try await Self.until("option boundary request \(wireID) resolved") {
+                await transport.permissionResponseCount(for: wireID) == 1
+            }
+        }
+
+        let overLimitOptions: [(options: [JSONValue], reason: String)] = [
+            (
+                (0 ... AcpPermissionPayloadLimits.maximumOptionCount).map {
+                    option(id: "option-\($0)", name: "Option \($0)", kind: "allow_once")
+                },
+                "option_count"
+            ),
+            ([option(
+                id: String(repeating: "i", count: AcpPermissionPayloadLimits.maximumOptionIDBytes + 1),
+                name: "Allow",
+                kind: "allow_once"
+            )], "option_id_bytes"),
+            ([option(
+                id: "allow-name",
+                name: String(repeating: "n", count: AcpPermissionPayloadLimits.maximumOptionNameBytes + 1),
+                kind: "allow_once"
+            )], "option_name_bytes"),
+            ([option(
+                id: "allow-kind",
+                name: "Allow",
+                kind: String(repeating: "k", count: AcpPermissionPayloadLimits.maximumOptionKindBytes + 1)
+            )], "option_kind_bytes"),
+        ]
+        for testCase in overLimitOptions {
+            let wireID = nextWireID
+            nextWireID += 1
+            await transport.emitPermission(
+                wireID: wireID,
+                params: Self.permissionParams(options: testCase.options)
+            )
+            try await Self.until("option overflow \(wireID) was rejected") {
+                await transport.permissionError(for: wireID) != nil
+            }
+            let error = await transport.permissionError(for: wireID)
+            XCTAssertEqual(Self.permissionErrorReason(error), testCase.reason)
+        }
+        XCTAssertEqual(events.permissionRequests.count, expectedCards)
+        let retainedAfterOptionRejections = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterOptionRejections, 0)
+    }
+
+    func testPermissionPathsAreDeduplicatedThenCountedAndFieldBounded() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let events = EventCollector()
+        await client.setEventHandler { events.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        let duplicates = Array(repeating: "Sources/Duplicate.swift", count: 2_000)
+        let duplicateWireID: Int64 = 48_217
+        await transport.emitPermission(
+            wireID: duplicateWireID,
+            params: Self.permissionParams(locations: duplicates, diffPaths: duplicates)
+        )
+        try await Self.until("duplicate paths were deduplicated") {
+            events.permissionRequests.count == 1
+        }
+        let duplicateRequest = try XCTUnwrap(events.permissionRequests.last)
+        XCTAssertEqual(duplicateRequest.paths, ["Sources/Duplicate.swift"])
+        await client.resolvePermission(id: duplicateRequest.id, optionID: "allow")
+        try await Self.until("the duplicate-path request resolved") {
+            await transport.permissionResponseCount(for: duplicateWireID) == 1
+        }
+
+        let exactPaths = (0 ..< AcpPermissionPayloadLimits.maximumPathCount).map {
+            "Sources/P\($0).swift"
+        }
+        let pathCountWireID: Int64 = 48_218
+        await transport.emitPermission(
+            wireID: pathCountWireID,
+            params: Self.permissionParams(locations: exactPaths)
+        )
+        try await Self.until("the maximum distinct path count surfaced") {
+            events.permissionRequests.count == 2
+        }
+        let pathCountRequest = try XCTUnwrap(events.permissionRequests.last)
+        XCTAssertEqual(pathCountRequest.paths.count, AcpPermissionPayloadLimits.maximumPathCount)
+        await client.resolvePermission(id: pathCountRequest.id, optionID: "allow")
+        try await Self.until("the maximum distinct path request resolved") {
+            await transport.permissionResponseCount(for: pathCountWireID) == 1
+        }
+
+        let pathCountOverflowWireID: Int64 = 48_219
+        await transport.emitPermission(
+            wireID: pathCountOverflowWireID,
+            params: Self.permissionParams(locations: exactPaths + ["Sources/Overflow.swift"])
+        )
+        try await Self.until("the distinct path overflow was rejected") {
+            await transport.permissionError(for: pathCountOverflowWireID) != nil
+        }
+        let pathCountError = await transport.permissionError(for: pathCountOverflowWireID)
+        XCTAssertEqual(Self.permissionErrorReason(pathCountError), "path_count")
+
+        let exactPath = String(repeating: "p", count: AcpPermissionPayloadLimits.maximumPathBytes)
+        let pathBytesWireID: Int64 = 48_220
+        await transport.emitPermission(
+            wireID: pathBytesWireID,
+            params: Self.permissionParams(diffPaths: [exactPath])
+        )
+        try await Self.until("the maximum path field surfaced") {
+            events.permissionRequests.count == 3
+        }
+        let pathBytesRequest = try XCTUnwrap(events.permissionRequests.last)
+        await client.resolvePermission(id: pathBytesRequest.id, optionID: "allow")
+        try await Self.until("the maximum path field resolved") {
+            await transport.permissionResponseCount(for: pathBytesWireID) == 1
+        }
+
+        let pathBytesOverflowWireID: Int64 = 48_221
+        await transport.emitPermission(
+            wireID: pathBytesOverflowWireID,
+            params: Self.permissionParams(diffPaths: [exactPath + "p"])
+        )
+        try await Self.until("the path field overflow was rejected") {
+            await transport.permissionError(for: pathBytesOverflowWireID) != nil
+        }
+        let pathBytesError = await transport.permissionError(for: pathBytesOverflowWireID)
+        XCTAssertEqual(Self.permissionErrorReason(pathBytesError), "path_bytes")
+        XCTAssertEqual(events.permissionRequests.count, 3)
+        let retainedAfterPathRejections = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterPathRejections, 0)
+    }
+
+    func testPermissionRawInputComplexityStopsAtNodeBudget() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let events = EventCollector()
+        await client.setEventHandler { events.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        let exactRawInput = JSONValue.array(Array(
+            repeating: .null,
+            count: AcpPermissionPayloadLimits.maximumRawInputNodes - 1
+        ))
+        let exactWireID: Int64 = 48_222
+        await transport.emitPermission(
+            wireID: exactWireID,
+            params: Self.permissionParams(rawInput: exactRawInput)
+        )
+        try await Self.until("the maximum-node raw input surfaced") {
+            events.permissionRequests.count == 1
+        }
+        let exactRequest = try XCTUnwrap(events.permissionRequests.last)
+        await client.resolvePermission(id: exactRequest.id, optionID: "allow")
+        try await Self.until("the maximum-node raw input resolved") {
+            await transport.permissionResponseCount(for: exactWireID) == 1
+        }
+
+        let oversizedRawInput = JSONValue.array(Array(
+            repeating: .null,
+            count: AcpPermissionPayloadLimits.maximumRawInputNodes
+        ))
+        let oversizedParams = Self.permissionParams(rawInput: oversizedRawInput)
+        let validation = AcpClient.validatePermissionRequestPayload(oversizedParams)
+        XCTAssertEqual(validation.rejection, .complexity)
+        XCTAssertEqual(
+            validation.inspectedNodes,
+            AcpPermissionPayloadLimits.maximumRawInputNodes + 1,
+            "rawInput traversal must stop at the first node over budget"
+        )
+
+        let oversizedWireID: Int64 = 48_223
+        await transport.emitPermission(wireID: oversizedWireID, params: oversizedParams)
+        try await Self.until("the over-complex raw input was rejected") {
+            await transport.permissionError(for: oversizedWireID) != nil
+        }
+        let complexityError = await transport.permissionError(for: oversizedWireID)
+        XCTAssertEqual(Self.permissionErrorReason(complexityError), "complexity")
+        XCTAssertEqual(events.permissionRequests.count, 1)
+        let retainedAfterComplexityRejection = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterComplexityRejection, 0)
+    }
+
+    func testInheritedToolContextIsBoundedBeforePermissionEmission() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let events = EventCollector()
+        await client.setEventHandler { events.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        let rawToolCallID = "retained-raw"
+        await transport.emitSessionUpdate(.object([
+            "sessionUpdate": .string("tool_call"),
+            "toolCallId": .string(rawToolCallID),
+            "title": .string("Retained raw input"),
+            "kind": .string("execute"),
+            "rawInput": .array(Array(
+                repeating: .null,
+                count: AcpPermissionPayloadLimits.maximumRawInputNodes
+            )),
+        ]))
+        let rawWireID: Int64 = 48_245
+        await transport.emitPermission(wireID: rawWireID, params: .object([
+            "sessionId": .string("sess-1"),
+            "toolCall": .object(["toolCallId": .string(rawToolCallID)]),
+            "options": .array([.object(["optionId": .string("allow")])]),
+        ]))
+        try await Self.until("inherited raw input was rejected") {
+            await transport.permissionError(for: rawWireID) != nil
+        }
+        let rawError = await transport.permissionError(for: rawWireID)
+        XCTAssertEqual(Self.permissionErrorReason(rawError), "complexity")
+
+        let pathsToolCallID = "retained-paths"
+        let inheritedPaths = (0 ... AcpPermissionPayloadLimits.maximumPathCount).map {
+            JSONValue.object(["path": .string("Sources/Inherited\($0).swift")])
+        }
+        await transport.emitSessionUpdate(.object([
+            "sessionUpdate": .string("tool_call"),
+            "toolCallId": .string(pathsToolCallID),
+            "title": .string("Retained paths"),
+            "kind": .string("edit"),
+            "locations": .array(inheritedPaths),
+        ]))
+        let pathsWireID: Int64 = 48_246
+        await transport.emitPermission(wireID: pathsWireID, params: .object([
+            "sessionId": .string("sess-1"),
+            "toolCall": .object(["toolCallId": .string(pathsToolCallID)]),
+            "options": .array([.object(["optionId": .string("allow")])]),
+        ]))
+        try await Self.until("inherited path count was rejected") {
+            await transport.permissionError(for: pathsWireID) != nil
+        }
+        let pathsError = await transport.permissionError(for: pathsWireID)
+        XCTAssertEqual(Self.permissionErrorReason(pathsError), "path_count")
+        XCTAssertTrue(events.permissionRequests.isEmpty)
+        let retained = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retained, 0)
+    }
+
+    func testMalformedPermissionPayloadsNeverEmitCardsOrRetainMetadata() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let events = EventCollector()
+        await client.setEventHandler { events.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        let malformed: [JSONValue] = [
+            .string("not params"),
+            .object(["sessionId": .string("sess-1")]),
+            .object(["sessionId": .string("sess-1"), "options": .array([])]),
+            .object(["sessionId": .string("sess-1"), "options": .array([.string("bad")])]),
+            .object([
+                "sessionId": .string("sess-1"),
+                "options": .array([.object(["optionId": .string("")])]),
+            ]),
+            .object([
+                "sessionId": .string("sess-1"),
+                "options": .array([.object([
+                    "optionId": .string("allow"),
+                    "name": .integer(7),
+                ])]),
+            ]),
+            .object([
+                "sessionId": .string("sess-1"),
+                "options": .array([.object([
+                    "optionId": .string("allow"),
+                    "kind": .bool(true),
+                ])]),
+            ]),
+            .object([
+                "sessionId": .string("sess-1"),
+                "toolCall": .string("bad"),
+                "options": .array([.object(["optionId": .string("allow")])]),
+            ]),
+            .object([
+                "sessionId": .string("sess-1"),
+                "toolCall": .object(["locations": .string("bad")]),
+                "options": .array([.object(["optionId": .string("allow")])]),
+            ]),
+            .object([
+                "sessionId": .string("sess-1"),
+                "toolCall": .object(["locations": .array([.object([:])])]),
+                "options": .array([.object(["optionId": .string("allow")])]),
+            ]),
+            .object([
+                "sessionId": .string("sess-1"),
+                "toolCall": .object([
+                    "content": .array([.object(["type": .string("diff")])]),
+                ]),
+                "options": .array([.object(["optionId": .string("allow")])]),
+            ]),
+        ]
+        for (index, params) in malformed.enumerated() {
+            let wireID = Int64(48_224 + index)
+            await transport.emitPermission(wireID: wireID, params: params)
+            try await Self.until("malformed request \(index) was rejected") {
+                await transport.permissionError(for: wireID) != nil
+            }
+            let error = await transport.permissionError(for: wireID)
+            let replyCount = await transport.permissionReplyCount(for: wireID)
+            XCTAssertEqual(Self.permissionErrorReason(error), "malformed")
+            XCTAssertEqual(replyCount, 1)
+        }
+        XCTAssertTrue(events.permissionRequests.isEmpty)
+        let retainedAfterMalformedRequests = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterMalformedRequests, 0)
+
+        // Rejections retain no active state. A later healthy request still
+        // surfaces normally and remains governed by #481 membership.
+        let validWireID: Int64 = 48_240
+        await transport.emitPermission(
+            wireID: validWireID,
+            params: Self.permissionParams(options: [
+                .object(["optionId": .string("allow"), "kind": .string("allow_once")]),
+            ])
+        )
+        try await Self.until("a healthy sibling request surfaced") {
+            events.permissionRequests.count == 1
+        }
+        let validRequest = try XCTUnwrap(events.permissionRequests.first)
+        await client.resolvePermission(id: validRequest.id, optionID: "never-offered")
+        let invalidSelectionReplyCount = await transport.permissionReplyCount(for: validWireID)
+        XCTAssertEqual(invalidSelectionReplyCount, 0)
+        await client.resolvePermission(id: validRequest.id, optionID: "allow")
+        try await Self.until("the healthy sibling request resolved once") {
+            await transport.permissionResponseCount(for: validWireID) == 1
+        }
+        let validReplyCount = await transport.permissionReplyCount(for: validWireID)
+        let retainedAfterValidSibling = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(validReplyCount, 1)
+        XCTAssertEqual(retainedAfterValidSibling, 0)
     }
 
     @MainActor
@@ -1003,6 +1637,48 @@ final class AcpClientTests: XCTestCase {
         }
     }
 
+    private static func permissionParams(
+        title: String = "Review action",
+        kind: String = "execute",
+        rawInput: JSONValue? = nil,
+        locations: [String]? = nil,
+        diffPaths: [String]? = nil,
+        options: [JSONValue]? = nil,
+        extra: [String: JSONValue] = [:]
+    ) -> JSONValue {
+        var toolCall: [String: JSONValue] = [
+            "toolCallId": .string("permission-probe"),
+            "title": .string(title),
+            "kind": .string(kind),
+        ]
+        if let rawInput { toolCall["rawInput"] = rawInput }
+        if let locations {
+            toolCall["locations"] = .array(locations.map { .object(["path": .string($0)]) })
+        }
+        if let diffPaths {
+            toolCall["content"] = .array(diffPaths.map {
+                .object(["type": .string("diff"), "path": .string($0)])
+            })
+        }
+        var params: [String: JSONValue] = [
+            "sessionId": .string("sess-1"),
+            "toolCall": .object(toolCall),
+            "options": .array(options ?? [
+                .object([
+                    "optionId": .string("allow"),
+                    "name": .string("Allow"),
+                    "kind": .string("allow_once"),
+                ]),
+            ]),
+        ]
+        for (key, value) in extra { params[key] = value }
+        return .object(params)
+    }
+
+    private static func permissionErrorReason(_ error: JSONValue?) -> String? {
+        error?.objectValue?["data"]?.objectValue?["reason"]?.stringValue
+    }
+
     @MainActor
     func testConversationStopReturnsFinalDebouncedDraft() async {
         let key = "stop-draft-\(UUID().uuidString)"
@@ -1329,6 +2005,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var promptBlocks: [[JSONValue]] = []
     private var steerRequests: [JSONValue] = []
     private var permissionResponses: [Int64: [JSONValue]] = [:]
+    private var permissionErrors: [Int64: [JSONValue]] = [:]
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
@@ -1373,6 +2050,10 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func receivedSteerRequests() -> [JSONValue] { steerRequests }
     func permissionResponse(for wireID: Int64) -> JSONValue? { permissionResponses[wireID]?.last }
     func permissionResponseCount(for wireID: Int64) -> Int { permissionResponses[wireID]?.count ?? 0 }
+    func permissionError(for wireID: Int64) -> JSONValue? { permissionErrors[wireID]?.last }
+    func permissionReplyCount(for wireID: Int64) -> Int {
+        (permissionResponses[wireID]?.count ?? 0) + (permissionErrors[wireID]?.count ?? 0)
+    }
     func terminationCount() -> Int { terminations }
 
     func emitPermission(
@@ -1430,6 +2111,19 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         ]))
     }
 
+    func emitPermission(wireID: Int64, params: JSONValue) {
+        enqueue(.object([
+            "jsonrpc": .string("2.0"),
+            "id": .integer(wireID),
+            "method": .string("session/request_permission"),
+            "params": params,
+        ]))
+    }
+
+    func emitSessionUpdate(_ update: JSONValue) {
+        notify(update: update)
+    }
+
     func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
         started = true
     }
@@ -1441,6 +2135,12 @@ private actor ScriptedAcpTransport: AcpByteTransport {
            let wireID = id?.intValue,
            let result = object["result"] {
             permissionResponses[wireID, default: []].append(result)
+            return
+        }
+        if object["method"] == nil,
+           let wireID = id?.intValue,
+           let error = object["error"] {
+            permissionErrors[wireID, default: []].append(error)
             return
         }
         switch object["method"]?.stringValue {

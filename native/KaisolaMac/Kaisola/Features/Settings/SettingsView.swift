@@ -32,6 +32,44 @@ struct SettingsView: View {
     /// Identifiable wrapper so the confirmation presents via `.alert(item:)`.
     private struct RestartRequest: Identifiable { let id = UUID() }
 
+    enum SoftwareUpdateActionPresentation: Equatable {
+        case restart
+        case installing
+        case checking
+        case check(enabled: Bool)
+
+        static let installingAccessibilityLabel = "Installing update and restarting Kaisola"
+
+        static func resolve(
+            canInstall: Bool,
+            isInstalling: Bool,
+            isChecking: Bool,
+            canCheck: Bool,
+            sparkleIsPresenting: Bool
+        ) -> SoftwareUpdateActionPresentation {
+            // Installing wins even if an inconsistent caller also claims the
+            // ready action is available: fail closed against a second invocation.
+            if isInstalling { return .installing }
+            if canInstall { return .restart }
+            if isChecking { return .checking }
+            return .check(enabled: canCheck && !sparkleIsPresenting)
+        }
+    }
+
+    private struct SoftwareUpdateInstallingIndicator: View {
+        var body: some View {
+            HStack(spacing: 7) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Restarting…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(SoftwareUpdateActionPresentation.installingAccessibilityLabel)
+        }
+    }
+
     /// Names exactly what a relaunch costs. Terminals are called out as safe
     /// because they genuinely are — they live in the detached broker and resume
     /// from their byte cursor — and saying so is what makes the prompt
@@ -51,7 +89,12 @@ struct SettingsView: View {
             forInfoDictionaryKey: "CFBundleShortVersionString"
         ) as? String ?? "—"
         if let pending = updates.pendingUpdate {
-            return "Kaisola \(version) — \(pending.version) is downloaded and ready to install"
+            switch pending.phase {
+            case .ready:
+                return "Kaisola \(version) — \(pending.version) is downloaded and ready to install"
+            case .installing:
+                return "Kaisola \(version) — installing \(pending.version) and restarting…"
+            }
         }
         if let updateDetail {
             // An unavailable updater states its reason, not a channel name.
@@ -70,6 +113,19 @@ struct SettingsView: View {
             }
             return "Kaisola \(version)"
         }
+    }
+
+    private var softwareUpdateActionPresentation: SoftwareUpdateActionPresentation {
+        SoftwareUpdateActionPresentation.resolve(
+            canInstall: updates.canInstallPendingUpdate,
+            isInstalling: updates.isInstallingUpdate,
+            isChecking: {
+                if case .checking = updates.checkStatus { return true }
+                return false
+            }(),
+            canCheck: checkForUpdates != nil,
+            sparkleIsPresenting: updates.sparkleIsPresentingUpdate
+        )
     }
 
     private static func relative(_ date: Date) -> String {
@@ -144,6 +200,7 @@ struct SettingsView: View {
                 title: Text("Restart Kaisola to install?"),
                 message: Text(restartWarning),
                 primaryButton: .default(Text("Restart and Update")) {
+                    restartRequest = nil
                     UpdateCenter.shared.installAndRelaunch()
                 },
                 secondaryButton: .cancel(Text("Later"))
@@ -168,6 +225,11 @@ struct SettingsView: View {
         }
         .onChange(of: selectedSection) { _, section in
             sectionChanged?(section.rawValue)
+        }
+        .onChange(of: updates.canInstallPendingUpdate) { _, canInstall in
+            // `UpdateCenter` is app-global: if another window starts the
+            // install, dismiss this window's now-stale confirmation too.
+            if !canInstall { restartRequest = nil }
         }
     }
 
@@ -487,22 +549,24 @@ struct SettingsView: View {
                         detail: softwareUpdateDetail,
                         symbol: "app.badge.checkmark"
                     ) {
-                        if updates.pendingUpdate != nil {
+                        switch softwareUpdateActionPresentation {
+                        case .restart:
                             Button("Restart and Update") { restartRequest = RestartRequest() }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
-                        } else if case .checking = updates.checkStatus {
+                        case .installing:
+                            SoftwareUpdateInstallingIndicator()
+                        case .checking:
                             ProgressView()
                                 .controlSize(.small)
                                 .accessibilityLabel("Checking for updates")
-                        } else {
+                        case .check(let enabled):
                             // Steps aside while Sparkle's own window is up so
                             // the two UIs never fight over one check.
                             Button("Check Now") { checkForUpdates?() }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
-                                .disabled(checkForUpdates == nil
-                                          || updates.sparkleIsPresentingUpdate)
+                                .disabled(!enabled)
                         }
                     }
                     SettingsDivider()

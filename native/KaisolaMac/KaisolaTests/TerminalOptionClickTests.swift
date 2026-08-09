@@ -33,6 +33,8 @@ final class TerminalOptionClickTests: XCTestCase {
             font: .monospacedSystemFont(ofSize: 12, weight: .regular)
         )
         view.terminalDelegate = capture.coordinator
+        capture.coordinator.setInputAuthorized(true)
+        view.setInputAuthorized(true)
         view.getTerminal().resize(cols: 80, rows: 24)
         return view
     }

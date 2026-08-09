@@ -344,7 +344,9 @@ actor BrokerGenerationControlRouter: BrokerControlServing {
         to requestedTopology: BrokerGenerationTopology,
         ownerID: String
     ) async throws {
-        if topology == requestedTopology, clients[requestedTopology.current.id] != nil { return }
+        if topology == requestedTopology,
+           clients[requestedTopology.current.id] != nil,
+           !reportedDisconnect { return }
         await disconnect()
         await routes.configure(requestedTopology)
         topology = requestedTopology

@@ -21,6 +21,40 @@ enum CheckpointMenuAccessibility {
     }
 }
 
+/// One deterministic spoken contract for staged attachments. The chip owns
+/// the filename and size while its destructive child names the exact file it
+/// removes; focus routing never depends on a row index after the mutation.
+enum AcpAttachmentAccessibility {
+    enum FocusDestination: Equatable {
+        case removalButton(id: String)
+        case attachmentControl
+    }
+
+    static func chipLabel(name: String) -> String {
+        "Attachment \(name)"
+    }
+
+    static func chipValue(byteSize: Int) -> String {
+        "Size \(ByteCountFormatter.string(fromByteCount: Int64(byteSize), countStyle: .file))"
+    }
+
+    static func removalLabel(name: String) -> String {
+        "Remove attachment \(name)"
+    }
+
+    static func removalAnnouncement(name: String) -> String {
+        "Removed attachment \(name)"
+    }
+
+    static func focusDestination(removing id: String, orderedIDs: [String]) -> FocusDestination {
+        guard let index = orderedIDs.firstIndex(of: id),
+              orderedIDs.indices.contains(index + 1) else {
+            return .attachmentControl
+        }
+        return .removalButton(id: orderedIDs[index + 1])
+    }
+}
+
 /// The ACP conversation surface: streaming messages, thinking blocks,
 /// tool-call cards, a plan, a live permission prompt, model picker, usage, and
 /// a composer. Mirrors the Electron Assistant transcript.
@@ -45,6 +79,10 @@ struct AcpChatView: View {
     @State private var hasUnseenTranscriptUpdates = false
     @State private var transcriptConversationID: ObjectIdentifier?
     @FocusState private var composerFocused: Bool
+    @FocusState private var focusedAttachmentRemovalID: String?
+    @AccessibilityFocusState private var accessibilityFocusedAttachmentRemovalID: String?
+    @FocusState private var attachmentControlFocused: Bool
+    @AccessibilityFocusState private var attachmentControlAccessibilityFocused: Bool
     private let focusRequestGeneration: UInt64?
     private let onKeyboardFocus: (() -> Void)?
 
@@ -425,6 +463,8 @@ struct AcpChatView: View {
                 conversation: conversation,
                 draft: $draft,
                 focused: $composerFocused,
+                attachmentFocused: $attachmentControlFocused,
+                attachmentAccessibilityFocused: $attachmentControlAccessibilityFocused,
                 isNewConversation: showsEmptyState,
                 send: sendDraft,
                 onKeyboardFocus: onKeyboardFocus
@@ -488,16 +528,34 @@ struct AcpChatView: View {
                         Text(byteLabel(attachment.byteSize))
                             .font(.caption2).foregroundStyle(.secondary)
                         Button {
-                            conversation.removeAttachment(attachment.id)
+                            removeAttachment(attachment)
                         } label: {
                             Image(systemName: "xmark.circle.fill").font(.caption2)
                         }
                         .buttonStyle(.borderless)
                         .foregroundStyle(.secondary)
                         .help("Remove this attachment")
+                        .accessibilityLabel(
+                            AcpAttachmentAccessibility.removalLabel(name: attachment.name)
+                        )
+                        .accessibilityIdentifier("acp.attachment.remove.\(attachment.id)")
+                        .accessibilityFocused(
+                            $accessibilityFocusedAttachmentRemovalID,
+                            equals: attachment.id
+                        )
+                        .focusable()
+                        .focused($focusedAttachmentRemovalID, equals: attachment.id)
                     }
                     .padding(.horizontal, 8).padding(.vertical, 4)
                     .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel(
+                        AcpAttachmentAccessibility.chipLabel(name: attachment.name)
+                    )
+                    .accessibilityValue(
+                        AcpAttachmentAccessibility.chipValue(byteSize: attachment.byteSize)
+                    )
+                    .accessibilityIdentifier("acp.attachment.\(attachment.id)")
                 }
             }
             .padding(.horizontal, 2)
@@ -509,6 +567,46 @@ struct AcpChatView: View {
 
     private func byteLabel(_ bytes: Int) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    private func removeAttachment(_ attachment: AcpConversation.PendingAttachment) {
+        let focusDestination = AcpAttachmentAccessibility.focusDestination(
+            removing: attachment.id,
+            orderedIDs: conversation.pendingAttachments.map(\.id)
+        )
+        conversation.removeAttachment(attachment.id)
+        let announcement = AcpAttachmentAccessibility.removalAnnouncement(name: attachment.name)
+
+        // Wait until SwiftUI has removed the chip before assigning accessibility
+        // focus, otherwise the disappearing button can consume the request.
+        DispatchQueue.main.async {
+            switch focusDestination {
+            case .removalButton(let id):
+                attachmentControlFocused = false
+                attachmentControlAccessibilityFocused = false
+                focusedAttachmentRemovalID = id
+                accessibilityFocusedAttachmentRemovalID = id
+            case .attachmentControl:
+                focusedAttachmentRemovalID = nil
+                accessibilityFocusedAttachmentRemovalID = nil
+                // Removing the last chip also removes the strip that precedes
+                // the composer, which rebuilds the native menu control. Assign
+                // its focus on the following turn so the new control, rather
+                // than the disappearing hierarchy, consumes the request.
+                DispatchQueue.main.async {
+                    attachmentControlFocused = true
+                    attachmentControlAccessibilityFocused = true
+                }
+            }
+            NSAccessibility.post(
+                element: NSApplication.shared,
+                notification: .announcementRequested,
+                userInfo: [
+                    .announcement: announcement,
+                    .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+                ]
+            )
+        }
     }
 
     /// Stage files dropped onto the composer.

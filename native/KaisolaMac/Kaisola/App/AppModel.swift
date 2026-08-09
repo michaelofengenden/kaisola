@@ -341,6 +341,11 @@ final class AppModel: ObservableObject {
     var persistedOwnedSessions: [NativeOwnedSession] = []
     var persistedSessionAliases: [String: String] = [:]
     var persistedPinnedIDs: Set<String> = []
+    /// Set while the pin file on disk cannot be read. The last-known-good pin
+    /// set stays on screen for as long as this is non-nil, and only an explicit
+    /// reset clears the damaged file.
+    var pinsUnreadable: SessionPinStore.LoadFailure?
+    let pinStore: SessionPinStore
     private let adoptionStore: SessionAdoptionStore
     /// Projects already nudged about a stale instruction file this run —
     /// process-wide, because "once per run" must hold across windows and
@@ -362,6 +367,7 @@ final class AppModel: ObservableObject {
         workspaceStateStore: NativeWorkspaceStateStore = .live,
         transcriptStore: AcpTranscriptStore = .live,
         adoptionStore: SessionAdoptionStore = SessionAdoptionStore(),
+        pinStore: SessionPinStore = SessionPinStore(),
         usageCenter: UsageCenter = .shared,
         attentionCenter: AttentionCenter = .shared,
         reconnectBackoff: BrokerReconnectBackoff = BrokerReconnectBackoff(),
@@ -382,6 +388,7 @@ final class AppModel: ObservableObject {
         self.workspaceStateStore = workspaceStateStore
         self.transcriptStore = transcriptStore
         self.adoptionStore = adoptionStore
+        self.pinStore = pinStore
         self.usageCenter = usageCenter
         self.attentionCenter = attentionCenter
         self.reconnectBackoff = reconnectBackoff
@@ -405,7 +412,7 @@ final class AppModel: ObservableObject {
         persistedOpenProjects = navigation.projects
         persistedOwnedSessions = navigation.sessions
         persistedSessionAliases = navigation.sessionAliases
-        persistedPinnedIDs = SessionPinStore().pins()
+        reloadPersistedPins()
         sessionAdoptions = adoptionStore.adoptions()
     }
 
@@ -721,7 +728,7 @@ final class AppModel: ObservableObject {
         persistedOpenProjects = navigation.projects
         persistedOwnedSessions = navigation.sessions
         persistedSessionAliases = navigation.sessionAliases
-        persistedPinnedIDs = SessionPinStore().pins()
+        reloadPersistedPins()
         if publish { objectWillChange.send() }
     }
 

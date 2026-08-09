@@ -141,7 +141,11 @@ jobs:
             verify_capture "$capture" "$surface"
           done
 
-          for surface in terminal terminal-semantic mixed permission palette preview-code-editor workspace-move topbar-attention mesh onboarding settings-terminal settings-shortcuts; do
+          # settings-account-recovery is here as well as in the light pass
+          # because its migration notice is the one piece of small explanatory
+          # text whose palette flips with the appearance (issue #310). A light
+          # capture alone cannot show the dark pair.
+          for surface in terminal terminal-semantic mixed permission palette preview-code-editor workspace-move topbar-attention mesh onboarding settings-terminal settings-shortcuts settings-account-recovery; do
             capture="$output/dark-$surface.png"
             run_fixture "$surface" "$capture" \
               /usr/bin/env KAISOLA_NATIVE_VISUAL_APPEARANCE=dark "$binary"

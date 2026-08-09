@@ -44,9 +44,13 @@ struct BrokerHello: Equatable, Sendable {
 
 struct BrokerStatus: Equatable, Sendable {
     let terminals: [BrokerTerminalRecord]
+    /// Monotonic broker-wide mutation/activity fence sampled with this
+    /// inventory. Nil is reserved for pre-generation legacy brokers.
+    let activityEpoch: Int64?
 
-    init(terminals: [BrokerTerminalRecord]) {
+    init(terminals: [BrokerTerminalRecord], activityEpoch: Int64? = nil) {
         self.terminals = terminals
+        self.activityEpoch = activityEpoch
     }
 
     init(
@@ -90,6 +94,16 @@ struct BrokerStatus: Equatable, Sendable {
            statusObject["contentDigest"]?.stringValue != expectedHello.contentDigest {
             throw BrokerClientError.identityChanged
         }
+        let parsedActivityEpoch: Int64?
+        if statusObject["activityEpoch"] != nil {
+            guard let activityEpoch = statusObject["activityEpoch"]?.intValue,
+                  activityEpoch > 0 else {
+                throw BrokerClientError.malformedResponse
+            }
+            parsedActivityEpoch = activityEpoch
+        } else {
+            parsedActivityEpoch = nil
+        }
         guard let diagnosticValues = diagnostics.arrayValue,
               let liveValues = live.arrayValue else {
             throw BrokerClientError.malformedResponse
@@ -100,9 +114,31 @@ struct BrokerStatus: Equatable, Sendable {
                 return (id, value)
             }
         )
-        terminals = diagnosticValues.compactMap { value in
-            BrokerTerminalRecord(value: value, liveValue: value.objectValue?["id"]?.stringValue.flatMap { liveByID[$0] })
+        var decodedTerminals: [BrokerTerminalRecord] = []
+        decodedTerminals.reserveCapacity(diagnosticValues.count)
+        for (index, value) in diagnosticValues.enumerated() {
+            guard let terminal = BrokerTerminalRecord(
+                value: value,
+                liveValue: value.objectValue?["id"]?.stringValue.flatMap { liveByID[$0] }
+            ) else {
+                throw BrokerInventoryError.invalidDiagnosticRow(index: index)
+            }
+            decodedTerminals.append(terminal)
         }
+        terminals = decodedTerminals
+        activityEpoch = parsedActivityEpoch
+    }
+
+    static func validatedActivityEpoch(
+        status: JSONValue,
+        expectedHello: BrokerHello
+    ) throws -> Int64? {
+        try BrokerStatus(
+            status: status,
+            diagnostics: .array([]),
+            live: .array([]),
+            expectedHello: expectedHello
+        ).activityEpoch
     }
 }
 
@@ -435,7 +471,12 @@ struct BrokerEvent: Equatable, Sendable {
             guard let epoch = payload["streamEpoch"]?.stringValue,
                   let start = payload["startOffset"]?.intValue,
                   let end = payload["endOffset"]?.intValue,
-                  let data = payload["data"]?.stringValue else { return nil }
+                  let data = payload["data"]?.stringValue,
+                  Self.hasValidOutputRange(
+                      startOffset: start,
+                      endOffset: end,
+                      data: data
+                  ) else { return nil }
             kind = .output(epoch: epoch, startOffset: start, endOffset: end, data: data)
         case "terminal:observer-snapshot-required": kind = .snapshotRequired
         case "terminal:observer-exit": kind = .exit
@@ -451,6 +492,18 @@ struct BrokerEvent: Equatable, Sendable {
         self.projectID = projectID
         self.terminalID = terminalID
         self.kind = kind
+    }
+
+    private static func hasValidOutputRange(
+        startOffset: Int64,
+        endOffset: Int64,
+        data: String
+    ) -> Bool {
+        guard startOffset >= 0,
+              endOffset >= startOffset,
+              let byteCount = Int64(exactly: data.utf8.count) else { return false }
+        let (rangeByteCount, overflow) = endOffset.subtractingReportingOverflow(startOffset)
+        return !overflow && rangeByteCount == byteCount
     }
 }
 
@@ -488,6 +541,17 @@ enum BrokerClientError: Error, Equatable, LocalizedError {
         case .requestFailed: "The session service rejected a read-only request."
         case let .socketFailure(code): "The private terminal connection failed (\(code)); running sessions were not changed."
         case .socketPathTooLong: "The private terminal connection path is too long for macOS."
+        }
+    }
+}
+
+enum BrokerInventoryError: Error, Equatable, LocalizedError {
+    case invalidDiagnosticRow(index: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case let .invalidDiagnosticRow(index):
+            "The session service returned an invalid terminal inventory row at index \(index); running sessions were left untouched."
         }
     }
 }

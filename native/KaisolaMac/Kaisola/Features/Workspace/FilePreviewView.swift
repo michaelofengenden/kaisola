@@ -715,6 +715,22 @@ struct FilePreviewView: View {
                     Button("Actual Size") { documentZoom = 1 }.disabled(documentZoom == 1)
                 }
             }
+            Section("Extensions") {
+                Button("Manage Language Grammars…") {
+                    NSApp.sendAction(
+                        #selector(KaisolaMacAppDelegate.openGrammarSettings(_:)),
+                        to: nil,
+                        from: nil
+                    )
+                }
+                Button("Manage Preview Mappings…") {
+                    NSApp.sendAction(
+                        #selector(KaisolaMacAppDelegate.openPreviewMappingSettings(_:)),
+                        to: nil,
+                        from: nil
+                    )
+                }
+            }
             if isEditable {
                 Divider()
                 Button("Revert Changes") {

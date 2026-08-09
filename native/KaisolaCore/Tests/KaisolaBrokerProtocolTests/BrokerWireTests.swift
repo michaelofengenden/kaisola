@@ -24,6 +24,20 @@ final class BrokerWireTests: XCTestCase {
             "terminal.unsubscribe",
         ])
         XCTAssertEqual(BrokerWire.maximumFrameBytes, 56 * 1_024 * 1_024)
+        XCTAssertEqual(BrokerWire.terminalHistoryPageBytes, 4 * 1_024 * 1_024)
+        XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .hello), 64 * 1_024)
+        XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .request("terminal.write")), 1 * 1_024 * 1_024)
+        XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .request("terminal.create")), 256 * 1_024)
+        XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .request("broker.status")), 64 * 1_024)
+        XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .response("terminal.attach")), 50 * 1_024 * 1_024)
+        XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .response("terminal.history")), 26 * 1_024 * 1_024)
+        XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .response("broker.status")), 4 * 1_024 * 1_024)
+        XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .response("terminal.resize")), 256 * 1_024)
+        XCTAssertEqual(
+            BrokerWire.maximumEncodedBytes(for: .event("terminal:observer-output")),
+            512 * 1_024
+        )
+        XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .event("terminal:observer-exit")), 64 * 1_024)
     }
 
     func testCrossLanguageCompatibilityMatrix() throws {
@@ -133,6 +147,75 @@ final class BrokerWireTests: XCTestCase {
         _ = try partial.push(Data("{}".utf8))
         XCTAssertThrowsError(try partial.finish()) { error in
             XCTAssertEqual(error as? BrokerWireError, .incompleteFrame)
+        }
+    }
+
+    func testEnvelopeScannerFindsEscapedRoutingFieldsAfterNestedPayloads() throws {
+        let data = Data(
+            #"{"params":{"nested":[{"text":"} ] \" still data"}]},"m\u0065thod":"terminal.write","id":"request-1","type":"request"}"#.utf8
+        )
+
+        let envelope = try BrokerFrameEnvelope(data: data)
+
+        XCTAssertEqual(envelope.type, "request")
+        XCTAssertEqual(envelope.id, "request-1")
+        XCTAssertEqual(envelope.method, "terminal.write")
+        XCTAssertNil(envelope.channel)
+        XCTAssertEqual(
+            BrokerWire.purpose(for: envelope, responseMethod: { _ in nil }),
+            .request("terminal.write")
+        )
+    }
+
+    func testMethodLimitsApplyAtExactEncodedByteBoundary() throws {
+        let maximum = BrokerWire.maximumEncodedBytes(for: .request("broker.status"))
+        XCTAssertNoThrow(
+            try BrokerWire.validateEncodedFrame(
+                Data(repeating: 0x20, count: maximum),
+                purpose: .request("broker.status")
+            )
+        )
+        XCTAssertThrowsError(
+            try BrokerWire.validateEncodedFrame(
+                Data(repeating: 0x20, count: maximum + 1),
+                purpose: .request("broker.status")
+            )
+        ) { error in
+            XCTAssertEqual(error as? BrokerWireError, .frameTooLarge(maximum: maximum))
+        }
+    }
+
+    func testResponseMethodIsCorrelatedBeforeJSONDecoding() throws {
+        let padding = String(repeating: "x", count: 300 * 1_024)
+        let data = Data(#"{"result":{"padding":"\#(padding)"},"ok":true,"id":"request-2","type":"response"}"#.utf8)
+
+        XCTAssertThrowsError(
+            try BrokerWire.validateDecodedFrame(data) { id in
+                id == "request-2" ? "terminal.resize" : nil
+            }
+        ) { error in
+            XCTAssertEqual(
+                error as? BrokerWireError,
+                .frameTooLarge(maximum: BrokerWire.maximumEncodedBytes(for: .response("terminal.resize")))
+            )
+        }
+
+        XCTAssertNoThrow(
+            try BrokerWire.validateDecodedFrame(data) { id in
+                id == "request-2" ? "terminal.attach" : nil
+            }
+        )
+    }
+
+    func testUnknownAndMalformedEnvelopesFailClosedToSmallContract() throws {
+        let padding = String(repeating: "x", count: 70 * 1_024)
+        let unknown = Data(#"{"payload":"\#(padding)","type":"future"}"#.utf8)
+        XCTAssertThrowsError(try BrokerWire.validateDecodedFrame(unknown) { _ in nil }) { error in
+            XCTAssertEqual(error as? BrokerWireError, .frameTooLarge(maximum: 64 * 1_024))
+        }
+
+        XCTAssertThrowsError(try BrokerFrameEnvelope(data: Data(#"["not","an","object"]"#.utf8))) { error in
+            XCTAssertEqual(error as? BrokerWireError, .invalidEnvelope)
         }
     }
 }

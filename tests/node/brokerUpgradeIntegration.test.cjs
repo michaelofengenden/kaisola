@@ -26,7 +26,7 @@ async function waitFor(predicate, label, timeoutMs = 5_000) {
   throw new Error(`timed out waiting for ${label}`)
 }
 
-function startBroker() {
+function startBroker({ rejectionProbe = false } = {}) {
   const root = fs.mkdtempSync('/tmp/kaisola-broker-upgrade-')
   fs.chmodSync(root, 0o700)
   const brokerRoot = path.join(root, 'session-broker')
@@ -58,6 +58,7 @@ function startBroker() {
       ...process.env,
       NODE_ENV: 'test',
       KAISOLA_TEST_BROKER_NO_CLIENT_EXIT_MS: '100',
+      ...(rejectionProbe ? { KAISOLA_TEST_BROKER_REJECTION_PROBE: '1' } : {}),
     },
   })
   let stderr = ''
@@ -66,6 +67,7 @@ function startBroker() {
 }
 
 async function connectClient(config, access = 'controller') {
+  await waitFor(() => fs.existsSync(config.socketPath), 'broker socket')
   const socket = net.createConnection(config.socketPath)
   socket.setEncoding('utf8')
   let buffer = ''
@@ -105,6 +107,99 @@ async function connectClient(config, access = 'controller') {
   }
   return { socket, hello, request }
 }
+
+test('unhandled rejection policy preserves observation while fencing mutations', async (t) => {
+  const fixture = startBroker({ rejectionProbe: true })
+  t.after(() => {
+    try { fixture.child.kill('SIGKILL') } catch {}
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  })
+  await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
+  const controller = await connectClient(fixture.config)
+  const created = await controller.request('terminal.create', {
+    ownerId: '0',
+    projectId: 'rejection-policy',
+    id: 'preserved-after-rejection',
+    command: '/bin/cat',
+    args: [],
+    cwd: fixture.root,
+  })
+  assert.equal(created.ok, true)
+  assert.equal(created.result.ok, true)
+  const terminalPid = created.result.pid
+
+  process.kill(fixture.child.pid, 'SIGUSR1')
+  const background = await waitFor(async () => {
+    const status = await controller.request('broker.status', { ownerId: '0' })
+    return status.result?.health?.backgroundRejectionCount === 1 ? status.result.health : null
+  }, 'classified background rejection')
+  assert.deepEqual(background, {
+    state: 'healthy',
+    mutationFence: false,
+    backgroundRejectionCount: 1,
+    invariantFailureCount: 0,
+    lastBackgroundOperation: 'test-probe',
+  })
+  const stillWritable = await controller.request('terminal.write', {
+    ownerId: '0', projectId: 'rejection-policy', id: 'preserved-after-rejection', data: 'still-live\n',
+  })
+  assert.equal(stillWritable.result.ok, true)
+
+  process.kill(fixture.child.pid, 'SIGUSR2')
+  const degraded = await waitFor(async () => {
+    const status = await controller.request('broker.status', { ownerId: '0' })
+    return status.result?.health?.state === 'degraded' ? status.result.health : null
+  }, 'degraded broker health')
+  assert.deepEqual(degraded, {
+    state: 'degraded',
+    mutationFence: true,
+    backgroundRejectionCount: 1,
+    invariantFailureCount: 1,
+    lastBackgroundOperation: 'test-probe',
+  })
+
+  const blocked = await controller.request('terminal.write', {
+    ownerId: '0', projectId: 'rejection-policy', id: 'preserved-after-rejection', data: 'must-not-commit\n',
+  })
+  assert.equal(blocked.ok, false)
+  assert.match(blocked.message, /mutations are fenced after an invariant failure/)
+
+  const visible = await controller.request('terminal.list', { ownerId: '0' })
+  assert.equal(visible.ok, true)
+  assert.ok(visible.result.some((terminal) => terminal.id === 'preserved-after-rejection'))
+  assert.equal(fixture.child.exitCode, null)
+  assert.doesNotThrow(() => process.kill(terminalPid, 0))
+
+  const log = fs.readFileSync(fixture.config.logFile, 'utf8')
+  assert.match(log, /background rejection operation=test-probe/)
+  assert.match(log, /fatal rejection classification=unhandled mutations=fenced/)
+  assert.doesNotMatch(log, /rejection-probe-secret-marker/)
+  controller.socket.destroy()
+})
+
+test('oversized small-method request is rejected before dispatch without poisoning the socket', async (t) => {
+  const fixture = startBroker()
+  t.after(() => {
+    try { fixture.child.kill('SIGKILL') } catch {}
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  })
+  await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
+
+  const controller = await connectClient(fixture.config)
+  const rejected = await controller.request('broker.status', {
+    padding: 'x'.repeat(70 * 1024),
+  })
+  assert.equal(rejected.ok, false)
+  assert.match(rejected.message, /broker request exceeds 65536 byte limit/)
+
+  const healthy = await controller.request('broker.status')
+  assert.equal(healthy.ok, true)
+  assert.equal(healthy.result.pid, fixture.child.pid)
+  assert.equal(fixture.child.exitCode, null)
+  controller.socket.destroy()
+})
 
 test('sealed broker identity is published and safe update commit rejects racing mutations', async (t) => {
   const fixture = startBroker()

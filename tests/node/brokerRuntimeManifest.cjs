@@ -11,6 +11,7 @@ const guardTestFile = 'tests/node/brokerRuntimeManifest.test.cjs'
 // adding a broker-prefixed suite or a test that directly loads the Node broker
 // runtime makes the guard fail until the new path is reviewed and listed here.
 const brokerRuntimeTestFiles = Object.freeze([
+  'tests/node/brokerAuthorization.test.cjs',
   'tests/node/brokerCompatibility.test.cjs',
   'tests/node/brokerExitStatus.test.cjs',
   'tests/node/brokerFrameLimits.test.cjs',

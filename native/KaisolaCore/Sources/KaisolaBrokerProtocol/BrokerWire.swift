@@ -19,6 +19,7 @@ public enum BrokerWire {
     public static let brokerUpdateFeature = "broker-update-v1"
     public static let brokerRollingUpdateFeature = "broker-rolling-update-v1"
     public static let brokerInventoryFeature = "broker-inventory-v1"
+    public static let brokerAdministrationFeature = "broker-administration-v1"
     public static let observerMethods: Set<String> = [
         "broker.status",
         "broker.inventory",

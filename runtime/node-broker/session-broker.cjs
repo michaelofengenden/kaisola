@@ -26,13 +26,21 @@ const {
   SECURITY_EPOCH,
   BROKER_IMPLEMENTATION_VERSION,
   BROKER_PACKAGE_SCHEMA,
+  BROKER_ADMINISTRATION_FEATURE,
   FEATURES,
-  OBSERVER_ACCESS,
+  CONTROLLER_ACCESS,
+  ADMINISTRATOR_ACCESS,
   MAX_FRAME,
   inspectBrokerFrame,
   validateEncodedBrokerFrame,
   atomicJson,
+  administratorMethod,
+  brokerAccessSupported,
   brokerMethodAllowedForAccess,
+  brokerAccessGrantsAdministration,
+  brokerAccessGrantsGlobalObservation,
+  normalizeBrokerOwnerID,
+  brokerOwnerIDAllowedForAccess,
   negotiateFeatures,
   eventPayloadForFeatures,
   // Framing and queue accounting live in brokerWire so the observer layer can
@@ -168,13 +176,8 @@ function projectScope(value) {
   return scope
 }
 
-function ownerId(value) {
-  const id = String(value ?? '0').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80)
-  return id || '0'
-}
-
 function ownerKey(instanceId, rendererId, projectId) {
-  return `${instanceId}|${ownerId(rendererId)}|${projectScope(projectId)}`
+  return `${instanceId}|${normalizeBrokerOwnerID(rendererId)}|${projectScope(projectId)}`
 }
 
 function clearNoClientTimer() {
@@ -206,7 +209,7 @@ function scheduleNoClientExit() {
   noClientTimer.unref?.()
 }
 
-function brokerStatusSnapshot() {
+function brokerStatusSnapshot(terminals) {
   return {
     ok: true,
     protocol: PROTOCOL,
@@ -230,7 +233,7 @@ function brokerStatusSnapshot() {
     rendezvous: rendezvousStatus(),
     health: rejectionSupervisor.status(),
     authenticatedClientCount: clients.size,
-    terminals: mgr.diagnostics(),
+    terminals,
   }
 }
 
@@ -263,7 +266,12 @@ mgr.setActivitySink(() => noteActivity())
 
 async function dispatch(client, method, params = {}) {
   if (!brokerMethodAllowedForAccess(client.access, method)) {
-    throw new Error('observer access cannot invoke broker mutations')
+    throw new Error(client.access === CONTROLLER_ACCESS && administratorMethod(method)
+      ? 'controller access cannot invoke broker administration'
+      : 'observer access cannot invoke broker mutations')
+  }
+  if (!brokerOwnerIDAllowedForAccess(client.access, params.ownerId)) {
+    throw new Error('controller access requires a nonzero owner identity')
   }
   if (!rejectionSupervisor.allows(method)) {
     throw new Error('broker mutations are fenced after an invariant failure')
@@ -271,7 +279,8 @@ async function dispatch(client, method, params = {}) {
   if (updateCommitted && method !== 'broker.status') {
     throw new Error('broker helper update is already committed')
   }
-  const admin = String(params.ownerId ?? '0') === '0'
+  const admin = brokerAccessGrantsAdministration(client.access)
+  const globalObservation = brokerAccessGrantsGlobalObservation(client.access)
   const requestProject = projectScope(params.projectId)
   const owner = ownerKey(client.instanceId, params.ownerId, requestProject)
   const terminalId = () => String(params.id || '').slice(0, 240)
@@ -296,7 +305,7 @@ async function dispatch(client, method, params = {}) {
   const requireAllowed = (id, adopt = false) => {
     if (!allowed(id, adopt)) throw new Error('terminal access denied')
   }
-  const visibleRows = (rows) => admin ? rows : rows.filter((row) => terminalOwnerAllowed({
+  const visibleRows = (rows) => globalObservation ? rows : rows.filter((row) => terminalOwnerAllowed({
     recordOwner: row.owner,
     recordLastOwner: row.lastOwner,
     requestOwner: owner,
@@ -304,12 +313,12 @@ async function dispatch(client, method, params = {}) {
   }))
   switch (method) {
     case 'broker.status':
-      return brokerStatusSnapshot()
+      return brokerStatusSnapshot(visibleRows(mgr.diagnostics()))
     case 'broker.inventory':
       return collectBrokerInventorySnapshot({
         activityEpoch: () => activityEpoch,
         inFlightMutations: () => inFlightMutations,
-        status: brokerStatusSnapshot,
+        status: () => brokerStatusSnapshot(visibleRows(mgr.diagnostics())),
         diagnostics: () => visibleRows(mgr.diagnostics()),
         live: () => visibleRows(mgr.list()),
       })
@@ -616,16 +625,27 @@ function handleLine(client, line) {
       client.socket.destroy()
       return
     }
-    const prior = clients.get(instanceId)
-    if (prior && prior.socket !== client.socket) prior.socket.destroy()
-    const access = frame.access == null ? 'controller' : String(frame.access)
-    if (access !== 'controller' && access !== OBSERVER_ACCESS) {
+    const access = frame.access == null ? CONTROLLER_ACCESS : String(frame.access)
+    if (!brokerAccessSupported(access)) {
+      send(client.socket, { type: 'hello', ok: false, message: 'broker authentication failed' })
       client.socket.destroy()
       return
     }
+    const negotiatedFeatures = negotiateFeatures(frame.features)
+    if (access === ADMINISTRATOR_ACCESS
+        && !negotiatedFeatures.has(BROKER_ADMINISTRATION_FEATURE)) {
+      send(client.socket, { type: 'hello', ok: false, message: 'broker authentication failed' })
+      client.socket.destroy()
+      return
+    }
+    if (access !== ADMINISTRATOR_ACCESS) {
+      negotiatedFeatures.delete(BROKER_ADMINISTRATION_FEATURE)
+    }
+    const prior = clients.get(instanceId)
+    if (prior && prior.socket !== client.socket) prior.socket.destroy()
     client.instanceId = instanceId
     client.access = access
-    client.features = negotiateFeatures(frame.features)
+    client.features = negotiatedFeatures
     client.authenticated = true
     everConnected = true
     clients.set(instanceId, client)
@@ -673,7 +693,7 @@ function acceptClient(socket) {
     socket,
     authenticated: false,
     instanceId: null,
-    access: 'controller',
+    access: CONTROLLER_ACCESS,
     features: new Set(),
     buffer: '',
     decoder: new StringDecoder('utf8'),

@@ -12,6 +12,10 @@ const net = require('node:net')
 const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
+const {
+  backgroundRejection,
+  createBrokerRejectionSupervisor,
+} = require('./ipc/brokerRejectionPolicy.cjs')
 const { terminalCreateRoute } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
@@ -83,6 +87,8 @@ function log(message) {
     fs.appendFileSync(config.logFile, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 })
   } catch { /* diagnostics must never stop sessions */ }
 }
+
+const rejectionSupervisor = createBrokerRejectionSupervisor({ log })
 
 function tokenMatches(candidate) {
   const a = Buffer.from(String(candidate || ''))
@@ -225,6 +231,9 @@ async function dispatch(client, method, params = {}) {
   if (!brokerMethodAllowedForAccess(client.access, method)) {
     throw new Error('observer access cannot invoke broker mutations')
   }
+  if (!rejectionSupervisor.allows(method)) {
+    throw new Error('broker mutations are fenced after an invariant failure')
+  }
   if (updateCommitted && method !== 'broker.status') {
     throw new Error('broker helper update is already committed')
   }
@@ -276,6 +285,7 @@ async function dispatch(client, method, params = {}) {
         // Degraded means the live sockets and PTYs are fine but the info file
         // is stale or absent, so a restarted GUI cannot rendezvous yet.
         rendezvous: rendezvousStatus(),
+        health: rejectionSupervisor.status(),
         authenticatedClientCount: clients.size,
         terminals: mgr.diagnostics(),
       }
@@ -833,7 +843,15 @@ function gracefulExit(killSessions) {
 process.on('SIGTERM', () => gracefulExit(true))
 process.on('SIGINT', () => gracefulExit(true))
 process.on('uncaughtException', (error) => { log(`fatal ${error?.stack || error}`); gracefulExit(true) })
-process.on('unhandledRejection', (error) => { log(`rejection ${error?.stack || error}`) })
+process.on('unhandledRejection', (reason) => { rejectionSupervisor.handle(reason) })
+
+// Deterministic process-boundary fixture. Production never installs these
+// handlers; tests use one signal for a classified background failure and one
+// for an unclassified invariant failure after a live PTY already exists.
+if (process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_REJECTION_PROBE === '1') {
+  process.on('SIGUSR1', () => { void Promise.reject(backgroundRejection('test-probe')) })
+  process.on('SIGUSR2', () => { void Promise.reject(new Error('rejection-probe-secret-marker')) })
+}
 
 try {
   const lockFd = fs.openSync(config.lockFile, 'wx', 0o600)

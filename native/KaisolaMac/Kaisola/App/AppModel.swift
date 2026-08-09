@@ -2413,19 +2413,36 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func enqueueTranscriptRemoval(chatID: String) {
+    @discardableResult
+    func enqueueTranscriptRemoval(
+        chatID: String
+    ) -> Task<AcpTranscriptStore.RemovalResult, Never> {
         explicitlyClosedChatIDs.insert(chatID)
         let previous = transcriptPersistenceTask
         let transcriptStore = transcriptStore
         let usageCenter = usageCenter
-        transcriptPersistenceTask = Task {
+        let removalTask = Task {
             await previous?.value
             // Usage and transcript writes use separate coalescing queues during
             // normal streaming. On explicit close, drain usage first and make
             // the full transcript deletion the final actor operation.
             await usageCenter.flushPersistence()
-            await transcriptStore.remove(chatID: chatID)
+            return await transcriptStore.remove(chatID: chatID)
         }
+        transcriptPersistenceTask = Task {
+            _ = await removalTask.value
+        }
+        return removalTask
+    }
+
+    private func removeTranscripts(
+        chatIDs: [String]
+    ) async -> AcpTranscriptStore.RemovalResult {
+        for chatID in chatIDs {
+            let result = await enqueueTranscriptRemoval(chatID: chatID).value
+            if case .failed = result { return result }
+        }
+        return .removed
     }
 
     func flushTranscriptPersistence() async {
@@ -3329,7 +3346,8 @@ final class AppModel: ObservableObject {
     }
 
     /// The explicit permanent-delete boundary for a live chat.
-    func deleteChat(_ chatID: String) async {
+    @discardableResult
+    func deleteChat(_ chatID: String) async -> AcpTranscriptStore.RemovalResult {
         // Tombstone FIRST (§4e): the durable record of intent that every
         // later phase — and every other window sharing the database —
         // converges on, even across a crash. A failed write aborts the
@@ -3342,7 +3360,8 @@ final class AppModel: ObservableObject {
                 "Couldn't delete the chat: \(error.kaisolaSafeDescription)",
                 style: .error
             )
-            return
+            return .failed(error as? AcpTranscriptStore.StoreError
+                ?? .database(error.localizedDescription))
         }
         let closingChat = chats.first(where: { $0.id == chatID })
         if let closingChat {
@@ -3377,13 +3396,20 @@ final class AppModel: ObservableObject {
         // goes — the old forgetDurableChat gate could leave tombstoned
         // content on disk forever when usage bookkeeping said "shared".
         _ = forgetDurableChat
-        enqueueTranscriptRemoval(chatID: chatID)
+        let removalResult = await enqueueTranscriptRemoval(chatID: chatID).value
         enqueueDraftRemoval(chatID: chatID)
         // The workspace archive must reflect the deletion durably NOW, not
         // after a 220 ms debounce a crash can beat (§4e).
         if let projectID = closingChat?.projectID {
             Task { await persistWorkspaceStateImmediately(projectID: projectID) }
         }
+        if case let .failed(error) = removalResult {
+            ToastCenter.shared.show(
+                "Chat deletion is saved, but transcript removal will retry: \(error.kaisolaSafeDescription)",
+                style: .error
+            )
+        }
+        return removalResult
     }
 
     /// Stop the adapter without deleting the surface, transcript, or draft.
@@ -3671,7 +3697,12 @@ final class AppModel: ObservableObject {
             var layout = paneLayouts[projectID] ?? SessionPaneLayout()
             layout.remove(meshID)
             paneLayouts[projectID] = layout
-            for columnID in columnIDs { enqueueTranscriptRemoval(chatID: columnID) }
+            let transcriptRemoval = await removeTranscripts(chatIDs: columnIDs)
+            if case let .failed(error) = transcriptRemoval {
+                return .blocked(
+                    "Mesh cleanup is saved, but transcript removal will retry: \(error.kaisolaSafeDescription)"
+                )
+            }
             enqueueDraftRemoval(stableKey: "mesh|\(meshID)")
             await persistWorkspaceStateImmediately(projectID: projectID)
             return .closed
@@ -3831,9 +3862,14 @@ final class AppModel: ObservableObject {
             _ = removeRecentlyClosedPane(id: surfaceID)
             explicitlyClosedChatIDs.insert(surfaceID)
             usageCenter.remove(chatID: surfaceID)
-            enqueueTranscriptRemoval(chatID: surfaceID)
+            let transcriptRemoval = await enqueueTranscriptRemoval(chatID: surfaceID).value
             enqueueDraftRemoval(chatID: surfaceID)
             await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
+            if case let .failed(error) = transcriptRemoval {
+                return .blocked(
+                    "The deletion is saved, but transcript removal will retry: \(error.kaisolaSafeDescription)"
+                )
+            }
             ToastCenter.shared.show("Permanently deleted chat", style: .success)
             return .completed
         }
@@ -3852,7 +3888,12 @@ final class AppModel: ObservableObject {
         case .safe:
             // The user crossed the permanent-delete boundary. Remove column
             // data even if writing the final archive tombstone needs a retry.
-            for columnID in columnIDs { enqueueTranscriptRemoval(chatID: columnID) }
+            let transcriptRemoval = await removeTranscripts(chatIDs: columnIDs)
+            if case let .failed(error) = transcriptRemoval {
+                return .blocked(
+                    "Mesh cleanup is saved, but transcript removal will retry: \(error.kaisolaSafeDescription)"
+                )
+            }
             enqueueDraftRemoval(stableKey: "mesh|\(surfaceID)")
             do {
                 try await workspaceStateStore.removeMeshState(

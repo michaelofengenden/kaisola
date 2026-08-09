@@ -99,14 +99,73 @@ final class AcpTranscriptStoreTests: XCTestCase {
         XCTAssertEqual(restored.first?.id, "msg-0")
     }
 
-    func testRemoveClearsDurableTranscript() async {
+    func testRemoveClearsDurableTranscriptAndReportsSuccessAcrossRelaunch() async {
         let (store, directory) = temporaryStore()
         defer { try? FileManager.default.removeItem(at: directory) }
         await store.scheduleSave([.message(id: "1", text: "saved")], for: "chat-remove", now: 1)
         await store.flush()
-        await store.remove(chatID: "chat-remove")
-        let restoredRows = await store.rows(for: "chat-remove")
+        let result = await store.remove(chatID: "chat-remove")
+        XCTAssertEqual(result, .removed)
+
+        let reopened = AcpTranscriptStore(
+            fileURL: directory.appendingPathComponent("transcripts.json")
+        )
+        let restoredRows = await reopened.rows(for: "chat-remove")
         XCTAssertTrue(restoredRows.isEmpty)
+    }
+
+    func testRemoveFailuresRestoreExactNewestPendingTailForRetry() async throws {
+        for failure in [
+            AcpTranscriptStore.RemovalFailurePoint.open,
+            .delete,
+            .commit,
+        ] {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+                "kaisola-transcript-remove-failure-\(failure)-\(UUID().uuidString)",
+                isDirectory: true
+            )
+            defer { try? FileManager.default.removeItem(at: directory) }
+            let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+            let store = AcpTranscriptStore(
+                databaseURL: databaseURL,
+                writerID: "writer-\(failure)",
+                schedulesAutomaticFlush: false,
+                injectedRemovalFailure: failure
+            )
+            let chatID = "remove-failure-\(failure)"
+            let durableRows: [AcpTranscriptRow] = [
+                .message(id: "1", text: "previously durable"),
+            ]
+            let newestRows: [AcpTranscriptRow] = [
+                .message(id: "1", text: "previously durable"),
+                .message(id: "2", text: "newest buffered tail \(failure)"),
+            ]
+
+            await store.scheduleSave(durableRows, for: chatID, now: 1)
+            await store.flush()
+            await store.scheduleSave(newestRows, for: chatID, now: 2)
+            await store.scheduleDraft("newest draft \(failure)", for: chatID, now: 3)
+
+            let result = await store.remove(chatID: chatID)
+            let label: String
+            switch failure {
+            case .open: label = "open"
+            case .delete: label = "DELETE"
+            case .commit: label = "commit"
+            }
+            XCTAssertEqual(
+                result,
+                .failed(.database("injected transcript removal \(label) failure"))
+            )
+
+            // The one-shot injection is consumed. Flushing now must persist
+            // the exact rows and metadata that remove temporarily extracted.
+            await store.flush()
+            let reopened = AcpTranscriptStore(databaseURL: databaseURL)
+            let restored = await reopened.entry(for: chatID)
+            XCTAssertEqual(restored?.rows, newestRows, "failed at \(failure)")
+            XCTAssertEqual(restored?.draft, "newest draft \(failure)", "failed at \(failure)")
+        }
     }
 
     func testLaunchVacuumResumesPhysicalDeletionAfterCrashFollowingTombstone() async throws {

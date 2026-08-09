@@ -637,6 +637,34 @@ final class AppModelReconnectTests: XCTestCase {
         XCTAssertNil(entry)
     }
 
+    func testTranscriptRemovalFailureIsCallerVisibleAndKeepsNewestTailRetryable() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            transcriptRemovalFailure: .delete
+        )
+        defer { fixture.cleanUp() }
+        let chatID = "failed-explicit-removal"
+        let durableRows: [AcpTranscriptRow] = [.message(id: "1", text: "durable")]
+        let newestRows: [AcpTranscriptRow] = [
+            .message(id: "1", text: "durable"),
+            .message(id: "2", text: "newest buffered tail"),
+        ]
+
+        fixture.model.enqueueTranscriptSave(durableRows, chatID: chatID)
+        await fixture.model.flushTranscriptPersistence()
+        fixture.model.enqueueTranscriptSave(newestRows, chatID: chatID)
+
+        let result = await fixture.model.enqueueTranscriptRemoval(chatID: chatID).value
+        XCTAssertEqual(
+            result,
+            .failed(.database("injected transcript removal DELETE failure"))
+        )
+
+        await fixture.model.flushTranscriptPersistence()
+        let restored = await fixture.transcriptStore.entry(for: chatID)
+        XCTAssertEqual(restored?.rows, newestRows)
+    }
+
     func testTerminalResizeSendsOnlyLatestSettledGeometryAndDeduplicatesRepeats() async throws {
         let fixture = try VisualControlFixture()
         defer { fixture.cleanUp() }
@@ -994,7 +1022,8 @@ private final class Fixture {
 
     init(
         failingConnectAttempts: Set<Int>,
-        completedAtByTerminalID: [String: Int64] = [:]
+        completedAtByTerminalID: [String: Int64] = [:],
+        transcriptRemovalFailure: AcpTranscriptStore.RemovalFailurePoint? = nil
     ) throws {
         root = URL(fileURLWithPath: "/tmp/kaisola-app-model-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(
@@ -1007,8 +1036,11 @@ private final class Fixture {
             failingConnectAttempts: failingConnectAttempts,
             completedAtByTerminalID: completedAtByTerminalID
         )
+        let legacyTranscriptURL = root.appendingPathComponent("agent-chat-transcripts-v1.json")
         transcriptStore = AcpTranscriptStore(
-            fileURL: root.appendingPathComponent("agent-chat-transcripts-v1.json")
+            databaseURL: legacyTranscriptURL.deletingPathExtension().appendingPathExtension("sqlite3"),
+            legacyJSONURL: legacyTranscriptURL,
+            injectedRemovalFailure: transcriptRemovalFailure
         )
         workspaceStore = NativeWorkspaceStateStore(
             fileURL: root.appendingPathComponent("workspace-state-v1.json")

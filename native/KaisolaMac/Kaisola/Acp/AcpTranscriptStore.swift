@@ -90,11 +90,25 @@ actor AcpTranscriptStore {
         case unknown
     }
 
-    enum StoreError: Error, Equatable {
+    enum StoreError: Error, Equatable, Sendable {
         case database(String)
         case corruptLegacyArchive
         case legacyArchiveTooLarge(maxBytes: Int)
         case invalidSnapshot
+    }
+
+    enum RemovalResult: Equatable, Sendable {
+        case removed
+        case failed(StoreError)
+    }
+
+    /// Deterministic single-use failure seams for the removal transaction.
+    /// Tests inject them through an isolated store instance; production stores
+    /// always use the nil default.
+    enum RemovalFailurePoint: Equatable, Sendable {
+        case open
+        case delete
+        case commit
     }
 
     /// Disk is deliberately cheap to spend (2026-08-06 spec): retention is
@@ -200,6 +214,7 @@ actor AcpTranscriptStore {
     private let schedulesAutomaticFlush: Bool
     private var writerGeneration: Int64?
     private var writerLeaseExpiresAt: Int64 = 0
+    private var injectedRemovalFailure: RemovalFailurePoint?
 
     /// Compatibility initializer: callers hand us the v1 JSON path and the v2
     /// database is created beside it. The JSON remains untouched after a
@@ -210,18 +225,21 @@ actor AcpTranscriptStore {
         self.legacyJSONURL = legacy
         self.writerID = UUID().uuidString
         self.schedulesAutomaticFlush = true
+        self.injectedRemovalFailure = nil
     }
 
     init(
         databaseURL: URL,
         legacyJSONURL: URL? = nil,
         writerID: String = UUID().uuidString,
-        schedulesAutomaticFlush: Bool = true
+        schedulesAutomaticFlush: Bool = true,
+        injectedRemovalFailure: RemovalFailurePoint? = nil
     ) {
         self.databaseURL = databaseURL.standardizedFileURL
         self.legacyJSONURL = legacyJSONURL?.standardizedFileURL
         self.writerID = writerID
         self.schedulesAutomaticFlush = schedulesAutomaticFlush
+        self.injectedRemovalFailure = injectedRemovalFailure
     }
 
     /// Explicit full-history compatibility read. Product restoration uses
@@ -466,12 +484,20 @@ actor AcpTranscriptStore {
         }
     }
 
-    func remove(chatID: String) {
-        guard Self.validChatID(chatID) else { return }
-        pending.removeValue(forKey: chatID)
-        guard let database = try? openDatabase() else { return }
+    @discardableResult
+    func remove(chatID: String) -> RemovalResult {
+        guard Self.validChatID(chatID) else {
+            return .failed(.database("invalid transcript chat identifier"))
+        }
+        let removedPending = pending.removeValue(forKey: chatID)
         do {
-            try transaction(database) {
+            try consumeRemovalFailure(.open)
+            let database = try openDatabase()
+            try transaction(
+                database,
+                beforeCommit: { try self.consumeRemovalFailure(.commit) }
+            ) {
+                try consumeRemovalFailure(.delete)
                 try withStatement("DELETE FROM chats WHERE chat_id = ?", database: database) {
                     try bind(chatID, at: 1, statement: $0, database: database)
                     try stepDone($0, database: database)
@@ -484,8 +510,13 @@ actor AcpTranscriptStore {
                 try setMetadataValue("1", for: "v2_has_written", database: database)
             }
             if pending.isEmpty { writerLeaseExpiresAt = 0 }
+            return .removed
         } catch {
-            // Explicit removal remains retryable by the caller's durable model.
+            // Actor serialization means no newer write for this chat can land
+            // between removal and restoration. Put back the exact coalesced
+            // entry only after every open/DELETE/commit failure path.
+            if let removedPending { pending[chatID] = removedPending }
+            return .failed(Self.storeError(error))
         }
     }
 
@@ -1292,10 +1323,31 @@ actor AcpTranscriptStore {
         )
     }
 
-    private func transaction(_ database: SQLiteHandle, body: () throws -> Void) throws {
+    private func consumeRemovalFailure(_ point: RemovalFailurePoint) throws {
+        guard injectedRemovalFailure == point else { return }
+        injectedRemovalFailure = nil
+        let label: String
+        switch point {
+        case .open: label = "open"
+        case .delete: label = "DELETE"
+        case .commit: label = "commit"
+        }
+        throw StoreError.database("injected transcript removal \(label) failure")
+    }
+
+    private static func storeError(_ error: Error) -> StoreError {
+        error as? StoreError ?? .database(error.localizedDescription)
+    }
+
+    private func transaction(
+        _ database: SQLiteHandle,
+        beforeCommit: () throws -> Void = {},
+        body: () throws -> Void
+    ) throws {
         try execute("BEGIN IMMEDIATE", database: database)
         do {
             try body()
+            try beforeCommit()
             try execute("COMMIT", database: database)
         } catch {
             try? execute("ROLLBACK", database: database)

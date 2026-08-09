@@ -1081,8 +1081,14 @@ actor AcpClient {
     private func readLoop(sourceConnectionGeneration: UInt64) async {
         do {
             while !Task.isCancelled {
+                guard sourceConnectionGeneration == connectionGeneration else { return }
                 guard let data = try await transport.receive(maximumBytes: 256 * 1_024) else {
-                    guard sourceConnectionGeneration == connectionGeneration else { return }
+                    guard !Task.isCancelled else { return }
+                    // EOF is the transport connection closing. Reap the whole
+                    // adapter-owned process group before publishing the exit;
+                    // the adapter may have closed stdout while remaining alive.
+                    await transport.terminate()
+                    guard !Task.isCancelled else { return }
                     let code = await transport.exitCode() ?? 0
                     connectionGeneration &+= 1
                     cancelPermissionRequests()
@@ -1095,6 +1101,7 @@ actor AcpClient {
                     pending.removeAll()
                     return
                 }
+                guard sourceConnectionGeneration == connectionGeneration else { return }
                 if data.isEmpty { continue }
                 var active = decoder
                 try active.consume(data) { frame in
@@ -1105,8 +1112,10 @@ actor AcpClient {
                 decoder = active
             }
         } catch {
+            guard !Task.isCancelled,
+                  sourceConnectionGeneration == connectionGeneration else { return }
+            await transport.terminate()
             guard !Task.isCancelled else { return }
-            guard sourceConnectionGeneration == connectionGeneration else { return }
             connectionGeneration &+= 1
             cancelPermissionRequests()
             sessionID = nil
@@ -1145,7 +1154,20 @@ actor AcpClient {
                 handleSessionUpdate(update)
             }
         case "session/request_permission":
-            handlePermissionRequest(id: object["id"], params: object["params"])
+            let params = object["params"]
+            // Preserve the malformed-payload contract for non-object params;
+            // once params is an object, its session identity is mandatory and
+            // must belong to the reader generation that delivered the ask.
+            if let scopedParams = params?.objectValue,
+               !acceptsSessionScopedMessage(
+                   method: method,
+                   receivedSessionID: scopedParams["sessionId"]?.stringValue,
+                   sourceConnectionGeneration: sourceConnectionGeneration
+               ) {
+                if let id = object["id"] { respondStalePermissionSessionError(id: id) }
+                return
+            }
+            handlePermissionRequest(id: object["id"], params: params)
         case "fs/read_text_file":
             handleReadTextFile(id: object["id"], params: object["params"])
         case "fs/write_text_file":
@@ -1224,6 +1246,23 @@ actor AcpClient {
             "method": .string("session/update"),
             "params": .object(params),
         ]), sourceConnectionGeneration: sourceConnectionGeneration)
+    }
+
+    /// Deterministic adversarial seam for a permission request that was
+    /// decoded by a specific reader generation. This exercises the complete
+    /// request dispatch and wire-response path without scheduler timing.
+    func handlePermissionRequestForTesting(
+        wireID: Int64?,
+        params: JSONValue?,
+        sourceConnectionGeneration: UInt64
+    ) {
+        var message: [String: JSONValue] = [
+            "jsonrpc": .string("2.0"),
+            "method": .string("session/request_permission"),
+        ]
+        if let wireID { message["id"] = .integer(wireID) }
+        if let params { message["params"] = params }
+        handle(.object(message), sourceConnectionGeneration: sourceConnectionGeneration)
     }
 
     func connectionGenerationForTesting() -> UInt64 {
@@ -1548,6 +1587,19 @@ actor AcpClient {
                 "type": .string("permission_request_rejected"),
                 "reason": .string(rejection.rawValue),
                 "summary": .string(rejection.safeSummary),
+            ])
+        )
+    }
+
+    private func respondStalePermissionSessionError(id: JSONValue) {
+        respondError(
+            id: id,
+            code: Self.invalidParamsCode,
+            message: "Permission request rejected",
+            data: .object([
+                "type": .string("stale_session"),
+                "reason": .string("session_scope_mismatch"),
+                "summary": .string("Permission request does not belong to the active session."),
             ])
         )
     }

@@ -651,37 +651,55 @@ final class AcpClientTests: XCTestCase {
         let kindError = await transport.permissionError(for: kindOverflowWireID)
         XCTAssertEqual(Self.permissionErrorReason(kindError), "kind_bytes")
 
-        var exactSessionFields = try XCTUnwrap(Self.permissionParams().objectValue)
-        exactSessionFields["sessionId"] = .string(String(
+        let exactSessionID = String(
             repeating: "s",
             count: AcpPermissionPayloadLimits.maximumSessionIDBytes
-        ))
+        )
+        let oversizedSessionID = exactSessionID + "s"
+        let sessionTransport = ScriptedAcpTransport(
+            newSessionIDs: [exactSessionID, oversizedSessionID]
+        )
+        let sessionClient = AcpClient(transport: sessionTransport)
+        let sessionEvents = EventCollector()
+        await sessionClient.setEventHandler { sessionEvents.append($0) }
+        _ = try await sessionClient.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        var exactSessionFields = try XCTUnwrap(Self.permissionParams().objectValue)
+        exactSessionFields["sessionId"] = .string(exactSessionID)
         let sessionWireID: Int64 = 48_241
-        await transport.emitPermission(wireID: sessionWireID, params: .object(exactSessionFields))
+        await sessionTransport.emitPermission(
+            wireID: sessionWireID,
+            params: .object(exactSessionFields)
+        )
         try await Self.until("the maximum session-id field surfaced") {
-            events.permissionRequests.count == 4
+            sessionEvents.permissionRequests.count == 1
         }
-        await client.resolvePermission(
-            id: try XCTUnwrap(events.permissionRequests.last).id,
+        await sessionClient.resolvePermission(
+            id: try XCTUnwrap(sessionEvents.permissionRequests.last).id,
             optionID: "allow"
         )
         try await Self.until("the maximum session-id field resolved") {
-            await transport.permissionResponseCount(for: sessionWireID) == 1
+            await sessionTransport.permissionResponseCount(for: sessionWireID) == 1
         }
-        exactSessionFields["sessionId"] = .string(String(
-            repeating: "s",
-            count: AcpPermissionPayloadLimits.maximumSessionIDBytes + 1
-        ))
+        await sessionClient.stop()
+
+        _ = try await sessionClient.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        exactSessionFields["sessionId"] = .string(oversizedSessionID)
         let sessionOverflowWireID: Int64 = 48_242
-        await transport.emitPermission(
+        await sessionTransport.emitPermission(
             wireID: sessionOverflowWireID,
             params: .object(exactSessionFields)
         )
         try await Self.until("the session-id byte overflow was rejected") {
-            await transport.permissionError(for: sessionOverflowWireID) != nil
+            await sessionTransport.permissionError(for: sessionOverflowWireID) != nil
         }
-        let sessionIDError = await transport.permissionError(for: sessionOverflowWireID)
+        let sessionIDError = await sessionTransport.permissionError(for: sessionOverflowWireID)
         XCTAssertEqual(Self.permissionErrorReason(sessionIDError), "session_id_bytes")
+        XCTAssertEqual(sessionEvents.permissionRequests.count, 1)
+        await sessionClient.stop()
 
         var exactToolCallFields = try XCTUnwrap(Self.permissionParams().objectValue)
         var exactToolCall = try XCTUnwrap(exactToolCallFields["toolCall"]?.objectValue)
@@ -693,7 +711,7 @@ final class AcpClientTests: XCTestCase {
         let toolCallWireID: Int64 = 48_243
         await transport.emitPermission(wireID: toolCallWireID, params: .object(exactToolCallFields))
         try await Self.until("the maximum tool-call-id field surfaced") {
-            events.permissionRequests.count == 5
+            events.permissionRequests.count == 4
         }
         await client.resolvePermission(
             id: try XCTUnwrap(events.permissionRequests.last).id,
@@ -718,7 +736,7 @@ final class AcpClientTests: XCTestCase {
         let toolCallIDError = await transport.permissionError(for: toolCallOverflowWireID)
         XCTAssertEqual(Self.permissionErrorReason(toolCallIDError), "tool_call_id_bytes")
 
-        XCTAssertEqual(events.permissionRequests.count, 5)
+        XCTAssertEqual(events.permissionRequests.count, 4)
         let retainedAfterFieldRejections = await client.retainedPermissionOptionSetCount
         XCTAssertEqual(retainedAfterFieldRejections, 0)
     }
@@ -2050,6 +2068,156 @@ final class AcpClientTests: XCTestCase {
         XCTAssertEqual(diagnostics.tail.last?.expectedSessionIDBytes, "sess-1".utf8.count)
     }
 
+    func testPermissionRequestForWrongSessionIsRejectedBeforeCard() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        let sensitiveMarker = "retired-session-sensitive"
+        var missingSessionFields = try XCTUnwrap(Self.permissionParams().objectValue)
+        missingSessionFields.removeValue(forKey: "sessionId")
+        let cases: [(Int64, JSONValue, AcpSessionIdentityDiagnostic.Reason)] = [
+            (
+                48_501,
+                Self.permissionParams(extra: ["sessionId": .string(sensitiveMarker)]),
+                .identityMismatch
+            ),
+            (48_502, .object(missingSessionFields), .missingSessionID),
+            (
+                48_503,
+                Self.permissionParams(extra: ["sessionId": .integer(7)]),
+                .missingSessionID
+            ),
+        ]
+        for (wireID, params, _) in cases {
+            await transport.emitPermission(wireID: wireID, params: params)
+            try await Self.until("stale permission request \(wireID) was rejected") {
+                await transport.permissionError(for: wireID) != nil
+            }
+            let receivedError = await transport.permissionError(for: wireID)
+            let error = try XCTUnwrap(receivedError)
+            XCTAssertEqual(error.objectValue?["code"], .integer(-32602))
+            XCTAssertEqual(error.objectValue?["message"], .string("Permission request rejected"))
+            XCTAssertEqual(
+                error.objectValue?["data"]?.objectValue?["type"],
+                .string("stale_session")
+            )
+            XCTAssertEqual(
+                error.objectValue?["data"]?.objectValue?["reason"],
+                .string("session_scope_mismatch")
+            )
+            let encoded = try JSONEncoder().encode(error)
+            XCTAssertLessThanOrEqual(encoded.count, 256)
+            XCTAssertFalse(String(decoding: encoded, as: UTF8.self).contains(sensitiveMarker))
+            let replyCount = await transport.permissionReplyCount(for: wireID)
+            XCTAssertEqual(replyCount, 1)
+        }
+
+        XCTAssertTrue(collector.permissionRequests.isEmpty)
+        let retainedAfterStaleCases = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterStaleCases, 0)
+        var diagnostics = await client.sessionIdentityDiagnostics()
+        XCTAssertEqual(diagnostics.total, cases.count)
+        XCTAssertEqual(diagnostics.tail.map(\.reason), cases.map(\.2))
+        XCTAssertTrue(diagnostics.tail.allSatisfy { $0.method == "session/request_permission" })
+        XCTAssertFalse(String(describing: diagnostics).contains(sensitiveMarker))
+
+        // A healthy sibling still reaches the user. Rejecting another stale
+        // ask while it is active must not consume or replace its #481 metadata.
+        let validWireID: Int64 = 48_504
+        await transport.emitPermission(wireID: validWireID, params: Self.permissionParams())
+        try await Self.until("the healthy permission request surfaced") {
+            collector.permissionRequests.count == 1
+        }
+        let validRequest = try XCTUnwrap(collector.permissionRequests.first)
+        let retainedAfterValidRequest = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterValidRequest, 1)
+
+        let concurrentStaleWireID: Int64 = 48_505
+        await transport.emitPermission(
+            wireID: concurrentStaleWireID,
+            params: Self.permissionParams(extra: ["sessionId": .string("retired-concurrent")])
+        )
+        try await Self.until("the concurrent stale ask was rejected") {
+            await transport.permissionError(for: concurrentStaleWireID) != nil
+        }
+        XCTAssertEqual(collector.permissionRequests.count, 1)
+        let retainedAfterConcurrentStale = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterConcurrentStale, 1)
+
+        await client.resolvePermission(id: validRequest.id, optionID: "allow")
+        try await Self.until("the healthy permission request resolved once") {
+            await transport.permissionResponseCount(for: validWireID) == 1
+        }
+        let retainedAfterResolution = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterResolution, 0)
+        diagnostics = await client.sessionIdentityDiagnostics()
+        XCTAssertEqual(diagnostics.total, cases.count + 1)
+        XCTAssertEqual(diagnostics.tail.last?.reason, .identityMismatch)
+    }
+
+    func testRetiredGenerationPermissionCannotSurfaceWhenSessionIDIsReused() async throws {
+        let transport = ScriptedAcpTransport(newSessionIDs: ["sess-stable", "sess-stable"])
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        let retiredGeneration = await client.connectionGenerationForTesting()
+        await client.stop()
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+        let activeGeneration = await client.connectionGenerationForTesting()
+        XCTAssertNotEqual(retiredGeneration, activeGeneration)
+
+        let params = Self.permissionParams(extra: ["sessionId": .string("sess-stable")])
+        let staleWireID: Int64 = 48_506
+        await client.handlePermissionRequestForTesting(
+            wireID: staleWireID,
+            params: params,
+            sourceConnectionGeneration: retiredGeneration
+        )
+        try await Self.until("the retired-reader permission was rejected") {
+            await transport.permissionError(for: staleWireID) != nil
+        }
+        XCTAssertTrue(collector.permissionRequests.isEmpty)
+        let retainedAfterRetiredGeneration = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(retainedAfterRetiredGeneration, 0)
+        let diagnostics = await client.sessionIdentityDiagnostics()
+        XCTAssertEqual(diagnostics.total, 1)
+        XCTAssertEqual(diagnostics.tail.map(\.reason), [.staleConnectionGeneration])
+
+        let currentWireID: Int64 = 48_507
+        await client.handlePermissionRequestForTesting(
+            wireID: currentWireID,
+            params: params,
+            sourceConnectionGeneration: activeGeneration
+        )
+        try await Self.until("the current-generation permission surfaced") {
+            collector.permissionRequests.count == 1
+        }
+        let current = try XCTUnwrap(collector.permissionRequests.first)
+        await client.resolvePermission(id: current.id, optionID: "allow")
+        try await Self.until("the current-generation permission resolved") {
+            await transport.permissionResponseCount(for: currentWireID) == 1
+        }
+        let staleReplyCount = await transport.permissionReplyCount(for: staleWireID)
+        let currentReplyCount = await transport.permissionReplyCount(for: currentWireID)
+        let retainedAfterCurrentResolution = await client.retainedPermissionOptionSetCount
+        XCTAssertEqual(staleReplyCount, 1)
+        XCTAssertEqual(currentReplyCount, 1)
+        XCTAssertEqual(retainedAfterCurrentResolution, 0)
+    }
+
     func testRestartDropsPriorSessionOutputBeforeTheNewIdentityIsEstablished() async throws {
         let transport = ScriptedAcpTransport(
             newSessionIDs: ["sess-stable", "sess-stable"],
@@ -2346,6 +2514,8 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private let steerOutcome: String?
     private let steerErrorMessage: String?
     private let newSessionIDs: [String]
+    private var newSessionIndex = 0
+    private var currentSessionID = "sess-1"
     private let restartRaceStaleSessionID: String?
     private let loadRaceStaleSessionID: String?
     private let loadReplay: [(messageID: String?, text: String)]
@@ -2360,8 +2530,6 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
-    private var newSessionIndex = 0
-    private var currentSessionID = "sess-1"
 
     init(
         protocolVersion: Int64 = 1,

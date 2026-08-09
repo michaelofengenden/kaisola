@@ -130,6 +130,126 @@ final class CustomAgentStoreTests: XCTestCase {
         XCTAssertTrue(bounded.copyDetails.contains(longFirstLine))
     }
 
+    @MainActor
+    func testDisableChatPlanNamesPinnedRemovalAndActiveSessionImpact() async throws {
+        let manager = try makeInstallManager()
+        let spec = makeChatEnabledSpec()
+        _ = try await manager.install(
+            agentID: spec.id,
+            package: try XCTUnwrap(spec.acpPackage),
+            approval: try XCTUnwrap(spec.containmentApproval),
+            runner: fakeAdapterInstaller(version: "1.2.3")
+        )
+
+        let plan = CustomAgentChatDisablement(store: store, installs: manager).plan(for: spec)
+
+        XCTAssertEqual(plan.agentID, spec.id)
+        XCTAssertEqual(plan.pinnedInstall, "probe-acp v1.2.3")
+        XCTAssertTrue(plan.message.contains("Probe"), plan.message)
+        XCTAssertTrue(plan.message.contains("probe-acp v1.2.3"), plan.message)
+        XCTAssertTrue(plan.message.contains("removes"), plan.message)
+        XCTAssertTrue(plan.message.contains("Existing open chats"), plan.message)
+        XCTAssertTrue(plan.message.contains("new chats and reconnects"), plan.message)
+    }
+
+    @MainActor
+    func testDisableChatTransactionRemovesPinnedInstallAfterRegistryCommit() async throws {
+        let manager = try makeInstallManager()
+        let spec = makeChatEnabledSpec()
+        _ = try store.save([spec]).get()
+        _ = try await manager.install(
+            agentID: spec.id,
+            package: try XCTUnwrap(spec.acpPackage),
+            approval: try XCTUnwrap(spec.containmentApproval),
+            runner: fakeAdapterInstaller()
+        )
+        let installRoot = manager.installRoot(agentID: spec.id)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: installRoot.path))
+
+        let disabled = try CustomAgentChatDisablement(store: store, installs: manager)
+            .disable(agentID: spec.id, from: [spec])
+
+        let disabledSpec = try XCTUnwrap(disabled.first)
+        XCTAssertEqual(disabledSpec.id, spec.id)
+        XCTAssertEqual(disabledSpec.acpPackage, spec.acpPackage)
+        XCTAssertEqual(disabledSpec.credentials, spec.credentials)
+        XCTAssertEqual(disabledSpec.acpPrivileges, spec.acpPrivileges)
+        XCTAssertEqual(disabledSpec.chatEnabled, false)
+        XCTAssertEqual(try store.load().get(), disabled)
+        XCTAssertNil(manager.store.record(agentID: spec.id))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: installRoot.path))
+    }
+
+    @MainActor
+    func testDisableChatRegistryFailureRestoresExactInstallAndEnabledRoster() async throws {
+        let manager = try makeInstallManager()
+        let spec = makeChatEnabledSpec()
+        _ = try store.save([spec]).get()
+        _ = try await manager.install(
+            agentID: spec.id,
+            package: try XCTUnwrap(spec.acpPackage),
+            approval: try XCTUnwrap(spec.containmentApproval),
+            runner: fakeAdapterInstaller()
+        )
+        let installRoot = manager.installRoot(agentID: spec.id)
+        let exactRecord = try XCTUnwrap(manager.store.record(agentID: spec.id))
+        let exactTree = try XCTUnwrap(AdapterInstallManager.treeDigest(root: installRoot))
+        let failingStore = CustomAgentStore(fileURL: fileURL) { _, _ in
+            throw CocoaError(.fileWriteNoPermission)
+        }
+
+        XCTAssertThrowsError(
+            try CustomAgentChatDisablement(store: failingStore, installs: manager)
+                .disable(agentID: spec.id, from: [spec])
+        ) { error in
+            guard case .registryNotDisabled = error as? CustomAgentChatDisablement.Failure else {
+                return XCTFail("expected a typed registry failure, got \(error)")
+            }
+            XCTAssertTrue(error.localizedDescription.contains("Probe"), error.localizedDescription)
+            XCTAssertTrue(error.localizedDescription.contains("not disabled"), error.localizedDescription)
+        }
+
+        XCTAssertEqual(try store.load().get(), [spec])
+        XCTAssertEqual(manager.store.record(agentID: spec.id), exactRecord)
+        XCTAssertEqual(AdapterInstallManager.treeDigest(root: installRoot), exactTree)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: installRoot.path))
+    }
+
+    func testDisableChatFeedbackStaysOnItsAgentRowAndNamesAccessibleOutcome() throws {
+        let probe = CustomAgentChatDisablement.Plan(
+            agentID: "custom-probe",
+            agentName: "Probe",
+            pinnedInstall: "probe-acp v1.2.3"
+        )
+        let reviewer = CustomAgentChatDisablement.Plan(
+            agentID: "custom-reviewer",
+            agentName: "Reviewer",
+            pinnedInstall: nil
+        )
+        var feedback = CustomAdapterDisableFeedback()
+
+        feedback.recordCompletion(for: probe)
+        feedback.recordFailure(for: reviewer, diagnostic: "The registry is read-only.")
+
+        let completed = try XCTUnwrap(feedback.notice(for: probe.agentID))
+        XCTAssertEqual(completed.kind, .completed)
+        XCTAssertEqual(completed.title, "Chat disabled for Probe")
+        XCTAssertTrue(completed.detail.contains("probe-acp v1.2.3"), completed.detail)
+        XCTAssertEqual(
+            completed.accessibilityIdentifier,
+            "extensions.agent.custom-probe.disableChatOutcome"
+        )
+        XCTAssertEqual(completed.dismissLabel, "Dismiss Disable Chat result for Probe")
+
+        let failed = try XCTUnwrap(feedback.notice(for: reviewer.agentID))
+        XCTAssertEqual(failed.kind, .failed)
+        XCTAssertEqual(failed.title, "Chat could not be disabled for Reviewer")
+        XCTAssertEqual(failed.detail, "The registry is read-only.")
+        feedback.dismiss(agentID: probe.agentID)
+        XCTAssertNil(feedback.notice(for: probe.agentID))
+        XCTAssertNotNil(feedback.notice(for: reviewer.agentID))
+    }
+
     // MARK: - Round-trip
 
     func testSaveAllRoundTripAcrossInstances() {
@@ -453,6 +573,61 @@ final class CustomAgentStoreTests: XCTestCase {
 
     private func makeSpec(_ id: String, _ name: String) -> CustomAgentSpec {
         CustomAgentSpec(id: id, name: name, launchCommand: "cli", symbol: "terminal")
+    }
+
+    private func makeChatEnabledSpec() -> CustomAgentSpec {
+        CustomAgentSpec(
+            id: "custom-probe",
+            name: "Probe",
+            launchCommand: "probe",
+            symbol: "cpu",
+            acpPackage: "probe-acp",
+            credentials: "none",
+            chatEnabled: true,
+            acpPrivileges: []
+        )
+    }
+
+    private func makeInstallManager() throws -> AdapterInstallManager {
+        let directory = fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let canonicalDirectory: URL
+        if let resolved = realpath(directory.path, nil) {
+            canonicalDirectory = URL(fileURLWithPath: String(cString: resolved), isDirectory: true)
+            free(resolved)
+        } else {
+            canonicalDirectory = directory
+        }
+        return AdapterInstallManager(
+            store: .init(fileURL: canonicalDirectory.appendingPathComponent("adapter-installs.json")),
+            installsRoot: canonicalDirectory.appendingPathComponent("adapters", isDirectory: true)
+        )
+    }
+
+    private func fakeAdapterInstaller(
+        version: String = "1.0.0"
+    ) -> @Sendable (URL, String) async throws -> Void {
+        { root, package in
+            let bare = AdapterInstallManager.bareName(of: package)
+            let packageDirectory = root.appendingPathComponent(
+                "node_modules/\(bare)",
+                isDirectory: true
+            )
+            try FileManager.default.createDirectory(
+                at: packageDirectory,
+                withIntermediateDirectories: true
+            )
+            let lock = #"{"lockfileVersion":3,"packages":{"node_modules/probe-acp":{"version":"\#(version)"}}}"#
+            try Data(lock.utf8).write(to: root.appendingPathComponent("package-lock.json"))
+            try Data(#"{"name":"probe-acp","bin":{"adapter":"./cli.js"}}"#.utf8)
+                .write(to: packageDirectory.appendingPathComponent("package.json"))
+            let executable = packageDirectory.appendingPathComponent("cli.js")
+            try Data("#!/usr/bin/env node\n".utf8).write(to: executable)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: executable.path
+            )
+        }
     }
 
     // MARK: - asProfiles mapping

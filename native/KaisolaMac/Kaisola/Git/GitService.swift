@@ -1,11 +1,86 @@
 import Foundation
 
+/// How long a Git or GitHub CLI child may run before Kaisola stops it. A stuck
+/// filesystem, hook, credential helper, or SSH connection otherwise holds the
+/// operation open forever, and the Git panel serializes on `isBusy` — so one
+/// wedged read freezes every later Git action in that panel.
+///
+/// The budget is per operation class rather than one global number: a `git
+/// status` that has not answered in 30s is broken, while a push over a slow
+/// link or a `pre-commit` hook running a test suite is merely slow.
+enum GitDeadline: Equatable, Sendable {
+    /// Reads and index writes that touch only local disk.
+    case local
+    /// Local work that walks whole-history or whole-tree state, or that creates
+    /// and removes worktrees. Slow on a large repository, never on the network.
+    case bulk
+    /// Commands that run arbitrary user hooks (`pre-commit`, `commit-msg`). The
+    /// deadline here is a last-resort backstop, not a policy on hook length.
+    case hooked
+    /// Anything that can open a connection: fetch, pull, push, `gh`.
+    case network
+    /// An explicit budget in seconds, for a caller with its own policy.
+    case custom(TimeInterval)
+
+    var seconds: TimeInterval {
+        switch self {
+        case .local: 30
+        case .bulk: 120
+        case .hooked: 600
+        case .network: 300
+        case let .custom(value): value
+        }
+    }
+
+    /// The `git` subcommand inside an argument list, skipping the leading global
+    /// flags (`--no-optional-locks`). Also the label the panel shows when a
+    /// command is stopped, so the banner can name what timed out.
+    static func subcommand(of arguments: [String]) -> String? {
+        arguments.drop(while: { $0.hasPrefix("-") }).first
+    }
+
+    /// Classify a `git` invocation by its subcommand so a new call site gets a
+    /// sensible budget without having to remember to pass one. Unknown
+    /// subcommands fall back to `.local`: the shortest budget is the safe
+    /// default for a runner that only ever runs local reads and index writes.
+    static func forGitArguments(_ arguments: [String]) -> GitDeadline {
+        switch subcommand(of: arguments) {
+        case "fetch", "pull", "push", "clone", "ls-remote": .network
+        case "commit": .hooked
+        case "apply", "checkout", "ls-files", "rev-list", "stash", "worktree": .bulk
+        default: .local
+        }
+    }
+}
+
 /// Subprocess output capture that cannot deadlock when several Mesh columns
 /// launch git concurrently. Anonymous pipe descriptors can be inherited by a
 /// sibling child, preventing EOF forever; private regular files have no such
 /// lifetime coupling and also absorb verbose failures without back-pressure.
+///
+/// The wait is bounded on both sides: the child is stopped when it outlives its
+/// deadline, and when the surrounding Task is cancelled.
 enum GitProcessCapture {
-    static func run(_ process: Process) throws -> (out: Data, err: Data) {
+    /// The child was stopped rather than allowed to finish. Callers map this
+    /// onto `GitService.GitError` so the UI can tell "nothing responded" apart
+    /// from a command that genuinely failed.
+    enum Failure: Error, Equatable {
+        case timedOut(seconds: TimeInterval)
+        case cancelled
+    }
+
+    /// How often the wait wakes to notice cancellation and the deadline. Git
+    /// commands usually finish well inside one slice, so this costs nothing on
+    /// the normal path.
+    private static let pollInterval: TimeInterval = 0.05
+
+    /// The grace period between asking the process group to quit and killing it.
+    private static let terminationGrace: TimeInterval = 2
+
+    /// `deadline` defaults to the *shortest* budget: a caller that forgets to
+    /// classify its command fails fast instead of hanging, which is the failure
+    /// mode this whole type exists to prevent.
+    static func run(_ process: Process, deadline: GitDeadline = .local) throws -> (out: Data, err: Data) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-process-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -25,14 +100,54 @@ enum GitProcessCapture {
         }
         process.standardOutput = output
         process.standardError = errors
+        if Task.isCancelled { throw Failure.cancelled }
+        // waitUntilExit() has no deadline, so exit is observed through the
+        // termination handler instead and the wait below owns the timing.
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
         try process.run()
-        process.waitUntilExit()
+        try wait(for: process, exited: exited, budget: deadline.seconds)
         try? output.synchronize()
         try? errors.synchronize()
         return (
             (try? Data(contentsOf: outputURL)) ?? Data(),
             (try? Data(contentsOf: errorURL)) ?? Data()
         )
+    }
+
+    /// Block until the child exits, its budget runs out, or the surrounding Task
+    /// is cancelled. Polling in short slices is what makes the last two
+    /// observable at all while the child is still running.
+    private static func wait(for process: Process, exited: DispatchSemaphore, budget: TimeInterval) throws {
+        let expiry = Date().addingTimeInterval(budget)
+        while true {
+            if exited.wait(timeout: .now() + pollInterval) == .success { return }
+            if Task.isCancelled {
+                stop(process, exited: exited)
+                throw Failure.cancelled
+            }
+            if Date() >= expiry {
+                stop(process, exited: exited)
+                throw Failure.timedOut(seconds: budget)
+            }
+        }
+    }
+
+    /// Stop the child and everything it spawned. Git delegates to ssh, credential
+    /// helpers, pagers, and hooks; signalling only the direct child leaves those
+    /// running and still holding whatever wedged the command. Foundation gives
+    /// each child its own process group, so the group id is exactly "this
+    /// command's subtree" — the identity check below keeps a child that somehow
+    /// shares our group from turning this into a signal to Kaisola itself.
+    private static func stop(_ process: Process, exited: DispatchSemaphore) {
+        let pid = process.processIdentifier
+        guard pid > 0 else { return }
+        let group = getpgid(pid)
+        let isOwnGroup = group <= 0 || group == getpgid(0)
+        if isOwnGroup { kill(pid, SIGTERM) } else { killpg(group, SIGTERM) }
+        if exited.wait(timeout: .now() + terminationGrace) == .success { return }
+        if isOwnGroup { kill(pid, SIGKILL) } else { killpg(group, SIGKILL) }
+        _ = exited.wait(timeout: .now() + terminationGrace)
     }
 }
 
@@ -80,12 +195,38 @@ struct GitService: Sendable {
         case notARepository
         case commandFailed(String)
         case unsafePath
+        /// The command outlived its deadline and was stopped along with its
+        /// process group. Distinct from `commandFailed` because git never got to
+        /// say anything about the repository.
+        case timedOut(command: String, seconds: Int)
+        case cancelled
 
         var errorDescription: String? {
             switch self {
             case .notARepository: "This folder is not a git repository."
             case let .commandFailed(message): message
             case .unsafePath: "Refused an unsafe path argument."
+            case let .timedOut(command, seconds):
+                "\(command) did not respond within \(seconds)s and was stopped. Nothing was reported about the repository — try again."
+            case .cancelled: "The Git operation was cancelled."
+            }
+        }
+
+        /// A timeout says nothing about the repository, so running the same
+        /// command again is a reasonable next move. An ordinary failure has
+        /// already told the user what is wrong, and repeating it just repeats
+        /// the message.
+        var isRetryable: Bool {
+            if case .timedOut = self { return true }
+            return false
+        }
+
+        /// Map a stopped child onto the panel-facing error, tagging it with the
+        /// command so the banner can name what was stopped.
+        static func from(_ failure: GitProcessCapture.Failure, command: String) -> GitError {
+            switch failure {
+            case let .timedOut(seconds): .timedOut(command: command, seconds: Int(seconds.rounded()))
+            case .cancelled: .cancelled
             }
         }
     }
@@ -415,7 +556,10 @@ struct GitService: Sendable {
         process.currentDirectoryURL = repoRoot
         GitProcessEnvironment.configureNonInteractive(process)
         let capture: (out: Data, err: Data)
-        do { capture = try GitProcessCapture.run(process) }
+        do { capture = try GitProcessCapture.run(process, deadline: .forGitArguments(arguments)) }
+        catch let failure as GitProcessCapture.Failure {
+            throw GitError.from(failure, command: Self.commandLabel(arguments))
+        }
         catch { throw GitError.commandFailed(error.localizedDescription) }
         if process.terminationStatus != 0 {
             let message = String(data: capture.err, encoding: .utf8) ?? "git failed"
@@ -423,5 +567,13 @@ struct GitService: Sendable {
             throw GitError.commandFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         return String(data: capture.out, encoding: .utf8) ?? ""
+    }
+
+    /// "git status", "git push" — what a stopped command is called in the UI.
+    /// Only the subcommand is included: the arguments can carry paths, branch
+    /// names, and commit messages that do not belong in an error banner.
+    static func commandLabel(_ arguments: [String]) -> String {
+        guard let subcommand = GitDeadline.subcommand(of: arguments) else { return "git" }
+        return "git \(subcommand)"
     }
 }

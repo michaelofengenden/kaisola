@@ -27,7 +27,8 @@ test('selection is deterministic regardless of changed-file order and duplicates
     'scripts/native-mcp-registry.cjs',
   ])
   assert.deepEqual(forward.native.selectors, [
-    'CodeEditorViewTests', 'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+    'CodeEditorViewTests', 'DataPreviewsTests', 'PDFPreviewBudgetTests',
+    'SyntaxHighlighterTests', 'WorkspaceFilesTests',
   ])
   assert.deepEqual(forward.node.files, ['tests/node/nativeMcpRegistry.test.cjs'])
   assert.equal(forward.fallback, false)
@@ -140,7 +141,7 @@ test('extracted preview units retain the complete preview contract lane', () => 
 
   assert.equal(plan.native.mode, 'focused')
   assert.deepEqual(plan.native.selectors, [
-    'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+    'DataPreviewsTests', 'PDFPreviewBudgetTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
   ])
   assert.equal(plan.node.mode, 'none')
   assert.equal(plan.fallback, false)
@@ -220,7 +221,8 @@ test('CLI accepts explicit files and emits the same machine-readable plan', () =
   assert.equal(result.status, 0, result.stderr)
   const plan = JSON.parse(result.stdout)
   assert.deepEqual(plan.native.selectors, [
-    'CodeEditorViewTests', 'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+    'CodeEditorViewTests', 'DataPreviewsTests', 'PDFPreviewBudgetTests',
+    'SyntaxHighlighterTests', 'WorkspaceFilesTests',
   ])
   assert.equal(plan.node.mode, 'none')
 })
@@ -243,7 +245,7 @@ test('changed-file runner prints a plan without invoking xcodebuild in dry-run m
   ], { cwd: repoRoot, encoding: 'utf8' })
 
   assert.equal(result.status, 0, result.stderr)
-  assert.match(result.stdout, /Native tests \(focused\): CodeEditorViewTests, DataPreviewsTests, SyntaxHighlighterTests, WorkspaceFilesTests/u)
+  assert.match(result.stdout, /Native tests \(focused\): CodeEditorViewTests, DataPreviewsTests, PDFPreviewBudgetTests, SyntaxHighlighterTests, WorkspaceFilesTests/u)
   assert.match(result.stdout, /Dry run: no tests executed/u)
 })
 

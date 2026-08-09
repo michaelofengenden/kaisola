@@ -352,6 +352,12 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertFalse(NativePreviewSettings.shouldPersistChanges(environment: [
             "KAISOLA_NATIVE_RESOURCE_WORKLOAD": "one-window-streaming-terminal-fresh-broker",
         ]))
+        XCTAssertFalse(NativePreviewSettings.shouldPersistChanges(environment: [
+            "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1",
+        ]))
+        XCTAssertFalse(NativePreviewSettings.shouldPersistChanges(environment: [
+            "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "invalid",
+        ]))
         XCTAssertEqual(
             NativePreviewSettings.isolatedFixtureSuiteName(
                 environment: ["KAISOLA_NATIVE_VISUAL_FIXTURE": "1"],
@@ -365,6 +371,13 @@ final class NativePreviewSettingsTests: XCTestCase {
                 processIdentifier: 42
             ),
             "com.kaisola.mac.resource-fixture.42"
+        )
+        XCTAssertEqual(
+            NativePreviewSettings.isolatedFixtureSuiteName(
+                environment: ["KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1"],
+                processIdentifier: 42
+            ),
+            "com.kaisola.mac.pdf-preview-budget.42"
         )
         XCTAssertTrue(NativePreviewSettings.shouldPersistChanges(environment: [:]))
         XCTAssertNil(NativePreviewSettings.isolatedFixtureSuiteName(

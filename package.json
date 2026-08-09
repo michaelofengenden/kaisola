@@ -13,6 +13,7 @@
     "native:frame-trace": "node scripts/native-frame-trace-gate.cjs",
     "native:frame-cadence": "node scripts/native-frame-cadence-gate.cjs",
     "native:resource-fixture": "node scripts/native-resource-fixture-gate.cjs",
+    "native:pdf-preview-budget": "node scripts/native-pdf-preview-budget.cjs",
     "native:dev": "./scripts/native-dev.sh",
     "native:canary": "./scripts/native-canary.sh",
     "native:canary:archive": "./scripts/native-canary.sh --install-only --archive",

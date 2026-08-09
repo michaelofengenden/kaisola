@@ -490,7 +490,8 @@ enum KaisolaMacMain {
     static func main() {
         let environment = ProcessInfo.processInfo.environment
         if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
-            || environment["KAISOLA_NATIVE_RESOURCE_WORKLOAD"] != nil {
+            || environment["KAISOLA_NATIVE_RESOURCE_WORKLOAD"] != nil
+            || environment["KAISOLA_NATIVE_PDF_PREVIEW_BUDGET"] != nil {
             // Keep the quit policy process-local so fixture termination cannot
             // opt into saving windows in the production defaults domain. The
             // delegate callbacks below reject save/restore explicitly. Avoid
@@ -578,7 +579,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             signedOutNotice: notice
         )
     }()
-    private let updateController = NativeUpdateController()
+    // Installed visual/resource/PDF fixtures return before this property is
+    // touched. Keeping Sparkle lazy prevents a disposable copied app from
+    // checking, downloading, or installing an update before its isolated
+    // launch-mode guard runs.
+    private lazy var updateController = NativeUpdateController()
 
     /// The in-workspace settings sheet needs the updater's state without a
     /// delegate reference threaded through every view (spec §3c).
@@ -706,6 +711,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private let visualWorkspace = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_WORKSPACE"]
     private let visualDocument = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_DOCUMENT"]
     private let visualCapturePath = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_CAPTURE_PATH"]
+    private let pdfPreviewBudgetRequested = ProcessInfo.processInfo.environment[
+        "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET"
+    ] != nil
+    private let pdfPreviewBudget = PDFPreviewBudgetConfiguration.resolve()
+    private var pdfPreviewBudgetRunner: PDFPreviewBudgetRunner?
     private let resourceWorkloadRequested = ProcessInfo.processInfo.environment[
         "KAISOLA_NATIVE_RESOURCE_WORKLOAD"
     ] != nil
@@ -756,11 +766,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     /// modal "restore windows" prompt before `applicationDidFinishLaunching`,
     /// leaving a headless gate waiting forever.
     func applicationShouldRestoreApplicationState(_ sender: NSApplication) -> Bool {
-        !visualFixture && resourceWorkload == nil
+        !visualFixture && resourceWorkload == nil && !pdfPreviewBudgetRequested
     }
 
     func applicationShouldSaveApplicationState(_ sender: NSApplication) -> Bool {
-        !visualFixture && resourceWorkload == nil
+        !visualFixture && resourceWorkload == nil && !pdfPreviewBudgetRequested
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -771,6 +781,35 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         // a live workspace and starve process-based ACP/Mesh tests. Tests create
         // every AppModel/window they need explicitly.
         guard !NotificationBridge.isRunningUnderXCTest else { return }
+        // The installed PDF gate is a single private PDFKit surface. It uses
+        // isolated non-persistent settings, then returns before Sparkle,
+        // usage, Companion, broker, workspace, or PTY startup so the receipt
+        // measures only the optimized app and PDF preview path.
+        if pdfPreviewBudgetRequested {
+            guard let pdfPreviewBudget else {
+                print("\(PDFPreviewBudgetRunner.receiptPrefix)FAIL invalid-private-temporary-root-or-fixture")
+                try? FileHandle.standardOutput.synchronize()
+                NSApp.terminate(nil)
+                return
+            }
+            do {
+                try FileManager.default.createDirectory(
+                    at: pdfPreviewBudget.root,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+                _ = chmod(pdfPreviewBudget.root.path, 0o700)
+            } catch {
+                print("\(PDFPreviewBudgetRunner.receiptPrefix)FAIL private-root-create")
+                try? FileHandle.standardOutput.synchronize()
+                NSApp.terminate(nil)
+                return
+            }
+            let runner = PDFPreviewBudgetRunner(configuration: pdfPreviewBudget)
+            pdfPreviewBudgetRunner = runner
+            runner.start()
+            return
+        }
         // Memory pressure sheds every discretionary cache (2026-08-06 §2g).
         MemoryPressureResponder.shared.register(name: "terminal-surfaces") {
             TerminalSurfaceCache.shared.removeAll()

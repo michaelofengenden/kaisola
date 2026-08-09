@@ -68,7 +68,7 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
 ])
 
 const FILE_PREVIEW_TESTS = Object.freeze([
-  'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+  'DataPreviewsTests', 'PDFPreviewBudgetTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
 ])
 
 const CODE_EDITOR_TESTS = Object.freeze([
@@ -97,6 +97,7 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ]],
   ['native/KaisolaMac/Kaisola/App/KaisolaMacAppDelegate.swift', [
     'CommandRegistryTests', 'NativePreviewSettingsTests', 'NativeTerminalInteractionTests',
+    'PDFPreviewBudgetTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Palette/CommandPaletteView.swift', [
     'CommandRegistryTests', 'FuzzyMatchTests',
@@ -125,6 +126,9 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewContent.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewEditors.swift', FILE_PREVIEW_TESTS],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/PDFPreviewBudget.swift', [
+    'PDFPreviewBudgetTests', 'WorkspaceFilesTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewRecovery.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewTabs.swift', FILE_PREVIEW_TESTS],
   ['native/KaisolaMac/Kaisola/Features/Workspace/CodeEditorView.swift', CODE_EDITOR_TESTS],

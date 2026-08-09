@@ -105,6 +105,8 @@ test('restore spawn reuses retained bytes and appends new output', async (t) => 
     exited: false,
     exitStatus: null,
     agentBusy: false,
+    agentTurnOpen: false,
+    agentCompletionSignal: null,
     agentCompletedAt: null,
     agentRespondedAt: null,
   })
@@ -315,4 +317,111 @@ test('spool hot cache lives only while observed', async (t) => {
   assert.equal(record.spool.visible, true, 'a remaining observer keeps the cache')
   manager.unsubscribeSubscriberPrefix('window-b|')
   assert.equal(record.spool.visible, false)
+})
+
+test('agent silence relaxes the busy indicator but never completes the turn', async (t) => {
+  const id = 'agent-turn-silence-is-not-completion'
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  t.after(() => manager.release(id))
+
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  assert.equal(manager.agentTurn(id, true), true)
+  assert.equal(record.agentBusy, true)
+  assert.equal(record.agentTurnOpen, true)
+  assert.equal(manager.rollingUpdateReadiness().safe, false)
+
+  // Well past AGENT_QUIET_MS with the pty saying nothing at all.
+  t.mock.timers.tick(30_000)
+
+  // Degraded, not done: the indicator relaxes so the UI stops claiming live
+  // work, and the record still reports an open, unconfirmed turn.
+  assert.equal(record.agentBusy, false)
+  assert.equal(record.agentTurnOpen, true)
+  assert.equal(record.agentCompletionSignal, null)
+  assert.ok(Number.isSafeInteger(record.agentQuietSince))
+  assert.equal(manager.snapshot(id).agentCompletionSignal, null)
+
+  const quiet = manager.rollingUpdateReadiness()
+  assert.equal(quiet.safe, false, 'silence must not authorize a broker cutover')
+  assert.deepEqual(quiet.busyTerminalIds, [id])
+  assert.deepEqual(quiet.unconfirmedTurnIds, [id])
+  assert.ok(manager.upgradeReadiness().busyTerminalIds.includes(id))
+
+  // Only the explicit lifecycle signal closes the turn.
+  assert.equal(manager.agentTurn(id, false), true)
+  assert.equal(record.agentTurnOpen, false)
+  assert.equal(record.agentCompletionSignal, 'agent-turn')
+  const settled = manager.rollingUpdateReadiness()
+  assert.equal(settled.safe, true)
+  assert.deepEqual(settled.busyTerminalIds, [])
+  assert.deepEqual(settled.unconfirmedTurnIds, [])
+})
+
+test('a pty exit completes an open agent turn as an explicit signal', async (t) => {
+  const id = 'agent-turn-closed-by-exit'
+  const record = manager.spawn({
+    id,
+    command: '/bin/sh',
+    args: ['-c', 'exit 0'],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  t.after(() => manager.release(id))
+
+  assert.equal(manager.agentTurn(id, true), true)
+  await manager.waitForExit(id)
+
+  assert.equal(record.agentTurnOpen, false)
+  assert.equal(record.agentCompletionSignal, 'terminal-exit')
+  assert.equal(manager.rollingUpdateReadiness().safe, true)
+})
+
+test('a shell command-end mark completes an open agent turn', async (t) => {
+  const id = 'agent-turn-closed-by-shell-mark'
+  const record = manager.spawn({
+    id,
+    command: '/bin/sh',
+    args: ['-c', 'printf "\\033]133;D;0\\007"; sleep 5'],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(record)
+  t.after(() => manager.release(id))
+
+  assert.equal(manager.agentTurn(id, true), true)
+  for (let attempt = 0; attempt < 50 && record.agentTurnOpen; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20))
+  }
+
+  assert.equal(record.agentTurnOpen, false)
+  assert.equal(record.agentCompletionSignal, 'shell-command-end')
+  assert.equal(record.agentBusy, false)
+})
+
+test('a command-end mark split across two pty writes still counts', () => {
+  const record = { agentMarkCarry: '' }
+  assert.equal(__test.consumeCommandEndMark(record, 'building\r\n\u001b]13'), false)
+  assert.equal(__test.consumeCommandEndMark(record, '3;D;0'), true)
+  assert.equal(__test.consumeCommandEndMark(record, 'ordinary agent output'), false)
+})
+
+test('an unconfirmed turn keeps blocking retirement while a signalled one does not', () => {
+  const quiet = __test.summarizeUpgradeReadiness([
+    { id: 'quiet-agent', exited: false, agentBusy: false, agentTurnOpen: true },
+  ], 0)
+  assert.equal(quiet.busyAgentCount, 1)
+  assert.deepEqual(quiet.busyTerminalIds, ['quiet-agent'])
+  assert.equal(quiet.unconfirmedTurnCount, 1)
+  assert.equal(quiet.safe, false)
+
+  const signalled = __test.summarizeUpgradeReadiness([
+    { id: 'quiet-agent', exited: false, agentBusy: false, agentTurnOpen: false },
+  ], 0)
+  assert.equal(signalled.busyAgentCount, 0)
+  assert.equal(signalled.unconfirmedTurnCount, 0)
 })

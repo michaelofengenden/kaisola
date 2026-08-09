@@ -123,6 +123,23 @@ function reportActivity(kind, id = null) {
  *  launchd. terminalHandler registers/unregisters each spawned child. */
 const runChildren = new Set()
 
+// OSC 133 "D" is the shell's own end-of-command mark, emitted by the private
+// startup files Kaisola installs (see AppModel's semantic prompt integration).
+// It is a real lifecycle event from the process, not an inference from
+// quietness, so it is allowed to close an agent turn: the foreground command
+// the turn was opened for has returned to the prompt.
+const COMMAND_END_MARK = '\u001b]133;D'
+const MARK_CARRY = COMMAND_END_MARK.length - 1
+
+/** True when this chunk (joined to the carried tail of the previous one, so a
+ *  mark split across two pty writes still matches) reports a finished command.
+ *  The carry is only maintained while a turn is open — see p.onData. */
+function consumeCommandEndMark(record, data) {
+  const window = record.agentMarkCarry ? record.agentMarkCarry + data : data
+  record.agentMarkCarry = window.slice(-MARK_CARRY)
+  return window.includes(COMMAND_END_MARK)
+}
+
 function terminalEnv(extra) {
   const env = agentEnv({
     ...(extra || {}),
@@ -390,9 +407,13 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       detachedBytes: 0,
       exitedWhileDetached: false,
       agentBusy: false,
+      agentTurnOpen: false,
       agentCompletedAt: null,
+      agentCompletionSignal: null,
+      agentQuietSince: null,
       agentRespondedAt: null,
       agentQuietTimer: null,
+      agentMarkCarry: '',
     }
     rec.observers = new TerminalObservers({
       terminalId: id,
@@ -447,10 +468,17 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     exitedWhileDetached: false,
     // Agent activity is deliberately broker-owned: hidden Eco tabs retain no
     // xterm/React renderer, but their turn still settles and notifies the app.
+    // `agentBusy` is the indicator the UI spins on; `agentTurnOpen` is the
+    // process truth an update gate reads, and only an explicit completion
+    // signal ever clears it — see settleAgentTurn/markAgentQuiet below.
     agentBusy: false,
+    agentTurnOpen: false,
     agentCompletedAt: null,
+    agentCompletionSignal: null,
+    agentQuietSince: null,
     agentRespondedAt: null,
     agentQuietTimer: null,
+    agentMarkCarry: '', // straddle buffer for OSC 133 marks split across chunks
   }
   rec.observers = new TerminalObservers({
     terminalId: id,
@@ -461,6 +489,9 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       id,
       busy: rec.agentBusy,
       completedAt: rec.agentCompletedAt,
+      turnOpen: rec.agentTurnOpen,
+      completionSignal: rec.agentCompletionSignal,
+      quietSince: rec.agentQuietSince,
     })
     rec.observers.broadcast('terminal:observer-activity', {
       id,
@@ -468,32 +499,63 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       offset: rec.cursor.nextOffset,
       busy: rec.agentBusy,
       completedAt: rec.agentCompletedAt,
+      turnOpen: rec.agentTurnOpen,
+      completionSignal: rec.agentCompletionSignal,
+      quietSince: rec.agentQuietSince,
     }, { streamEpoch: rec.cursor.streamEpoch, endOffset: rec.cursor.nextOffset })
   }
-  const settleAgentTurn = () => {
+  /** The authoritative end of a turn. Only an explicit lifecycle signal gets
+   *  here: the controller's terminal.agentTurn(busy:false), the pty exiting, or
+   *  the shell's own OSC 133 command-end mark. Quietness never does. */
+  const settleAgentTurn = (signal) => {
     if (rec.agentQuietTimer) clearTimeout(rec.agentQuietTimer)
+    rec.agentQuietTimer = null
+    if (!rec.agentBusy && !rec.agentTurnOpen) return
+    rec.agentBusy = false
+    rec.agentTurnOpen = false
+    rec.agentQuietSince = null
+    rec.agentMarkCarry = ''
+    rec.agentCompletionSignal = signal
+    // A turn demoted by silence first already carries the moment output
+    // stopped; confirming it later must not move the timestamp the UI shows.
+    rec.agentCompletedAt = rec.agentCompletedAt ?? Date.now()
+    reportActivity('agent-settled', id)
+    broadcastAgentActivity()
+  }
+  /** Degraded fallback for agents that never signal an end of turn: after
+   *  AGENT_QUIET_MS the busy indicator relaxes so the UI stops claiming live
+   *  work, but the turn stays OPEN and unconfirmed. A quiet model or a slow
+   *  tool call is still work in progress, so this state keeps blocking every
+   *  update/retirement gate until a real completion signal arrives. */
+  const markAgentQuiet = () => {
     rec.agentQuietTimer = null
     if (!rec.agentBusy) return
     rec.agentBusy = false
-    rec.agentCompletedAt = Date.now()
-    reportActivity('agent-settled', id)
+    rec.agentQuietSince = Date.now()
+    rec.agentCompletedAt = rec.agentQuietSince
+    rec.agentCompletionSignal = null
+    reportActivity('agent-quiet', id)
     broadcastAgentActivity()
   }
   const armAgentQuiet = () => {
     if (!rec.agentBusy) return
     if (rec.agentQuietTimer) clearTimeout(rec.agentQuietTimer)
-    rec.agentQuietTimer = setTimeout(settleAgentTurn, AGENT_QUIET_MS)
+    rec.agentQuietTimer = setTimeout(markAgentQuiet, AGENT_QUIET_MS)
     rec.agentQuietTimer.unref?.()
   }
   rec.setAgentTurn = (busy) => {
     if (busy) {
       if (rec.agentQuietTimer) clearTimeout(rec.agentQuietTimer)
       rec.agentBusy = true
+      rec.agentTurnOpen = true
       rec.agentCompletedAt = null
+      rec.agentCompletionSignal = null
+      rec.agentQuietSince = null
+      rec.agentMarkCarry = ''
       reportActivity('agent-busy', id)
       broadcastAgentActivity()
       armAgentQuiet()
-    } else settleAgentTurn()
+    } else settleAgentTurn('agent-turn')
     return true
   }
   const flushPending = () => {
@@ -516,6 +578,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
         rec.agentRespondedAt = responseAt
       }
     }
+    if (rec.agentTurnOpen && consumeCommandEndMark(rec, data)) settleAgentTurn('shell-command-end')
     for (const piece of splitUtf8(data)) {
       const chunk = rec.cursor.append(piece)
       rec.observers.broadcast('terminal:observer-output', { id, ...chunk }, {
@@ -538,7 +601,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     rec.exitedWhileDetached = !rec.rendererVisible
     rec.exitStatus = { exitCode: exitCode ?? 0, signal: signal ?? null }
     if (!shuttingDown) rec.spool.markExited(rec.exitStatus)
-    settleAgentTurn()
+    settleAgentTurn('terminal-exit')
     send(rec.sender, `terminal:exit:${id}`, rec.exitStatus.exitCode)
     rec.observers.broadcast('terminal:observer-exit', {
       id,
@@ -706,6 +769,8 @@ function snapshot(id) {
     exited: r.exited,
     exitStatus: r.exitStatus,
     agentBusy: r.agentBusy,
+    agentTurnOpen: r.agentTurnOpen,
+    agentCompletionSignal: r.agentCompletionSignal,
     agentCompletedAt: r.agentCompletedAt,
     agentRespondedAt: r.agentRespondedAt,
   }
@@ -874,18 +939,23 @@ function untrackChild(child) {
 /**
  * Broker-authoritative update gate. UI visibility, cached inventory, and a
  * quiet timer are never treated as permission to replace the process: every
- * live PTY, every explicit agent turn, and every tracked non-PTY child must be
- * absent in this single event-loop snapshot.
+ * live PTY, every open agent turn, and every tracked non-PTY child must be
+ * absent in this single event-loop snapshot. A turn the silence fallback
+ * demoted still counts — it is reported separately as unconfirmed so a pending
+ * response names the terminals that never signalled an end of turn.
  */
 function summarizeUpgradeReadiness(records, childCount) {
   const liveTerminalIds = []
   const busyTerminalIds = []
+  const unconfirmedTurnIds = []
   for (const record of records) {
     if (!record.exited) liveTerminalIds.push(String(record.id))
-    if (record.agentBusy) busyTerminalIds.push(String(record.id))
+    if (record.agentBusy || record.agentTurnOpen) busyTerminalIds.push(String(record.id))
+    if (!record.agentBusy && record.agentTurnOpen) unconfirmedTurnIds.push(String(record.id))
   }
   liveTerminalIds.sort()
   busyTerminalIds.sort()
+  unconfirmedTurnIds.sort()
   const runningChildCount = Math.max(0, Number(childCount) || 0)
   return {
     safe: liveTerminalIds.length === 0 && busyTerminalIds.length === 0 && runningChildCount === 0,
@@ -893,6 +963,8 @@ function summarizeUpgradeReadiness(records, childCount) {
     liveTerminalIds,
     busyAgentCount: busyTerminalIds.length,
     busyTerminalIds,
+    unconfirmedTurnCount: unconfirmedTurnIds.length,
+    unconfirmedTurnIds,
     childTaskCount: runningChildCount,
   }
 }
@@ -902,8 +974,10 @@ function upgradeReadiness() {
 }
 
 /** Rolling cutover preserves live PTYs and tracked child processes in this
- * process. Only an explicitly working CLI agent blocks the stability window;
- * socket-request and lease races are fenced by the broker's activity epoch. */
+ * process. Only an open CLI agent turn blocks the stability window — including
+ * one that merely went quiet, because no completion signal arrived to prove the
+ * work finished; socket-request and lease races are fenced by the broker's
+ * activity epoch. */
 function rollingUpdateReadiness() {
   const summary = summarizeUpgradeReadiness(terms.values(), runChildren.size)
   return { ...summary, safe: summary.busyAgentCount === 0 }
@@ -956,7 +1030,7 @@ function list() {
     try {
       proc = r.pty.process || ''
     } catch { /* pty backend may refuse mid-teardown */ }
-    out.push({ id: r.id, pid: r.pty.pid, process: proc, cwd: r.cwd, cols: r.cols, rows: r.rows, owner: senderId(r.sender), lastOwner: senderId(r.lastSender), agentBusy: r.agentBusy, agentCompletedAt: r.agentCompletedAt, agentRespondedAt: r.agentRespondedAt })
+    out.push({ id: r.id, pid: r.pty.pid, process: proc, cwd: r.cwd, cols: r.cols, rows: r.rows, owner: senderId(r.sender), lastOwner: senderId(r.lastSender), agentBusy: r.agentBusy, agentTurnOpen: r.agentTurnOpen, agentCompletionSignal: r.agentCompletionSignal, agentCompletedAt: r.agentCompletedAt, agentRespondedAt: r.agentRespondedAt })
   }
   return out
 }
@@ -972,6 +1046,12 @@ function diagnostics() {
     exited: r.exited,
     owner: senderId(r.sender),
     lastOwner: senderId(r.lastSender),
+    // Surfaced in broker.status so an unconfirmed (silence-demoted) turn is
+    // legible to whoever is deciding whether this helper may be replaced.
+    agentBusy: r.agentBusy,
+    agentTurnOpen: r.agentTurnOpen,
+    agentCompletionSignal: r.agentCompletionSignal,
+    agentQuietSince: r.agentQuietSince,
     detachedAt: r.detachedAt,
     detachedBytes: r.detachedBytes,
     streamEpoch: r.cursor.streamEpoch,
@@ -981,4 +1061,4 @@ function diagnostics() {
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, parseLsofCwd, refreshTerminalCwds } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds } }

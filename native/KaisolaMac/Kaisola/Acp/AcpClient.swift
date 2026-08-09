@@ -544,6 +544,51 @@ struct AcpToolCallReviewContextStore: Sendable {
     }
 }
 
+enum AcpJSONRPCEnvelopeViolation: String, Equatable, Sendable {
+    case parseError = "parse_error"
+    case unsupportedBatch = "unsupported_batch"
+    case topLevelNotObject = "top_level_not_object"
+    case invalidVersion = "invalid_version"
+    case invalidID = "invalid_id"
+    case invalidMethod = "invalid_method"
+    case invalidParams = "invalid_params"
+    case mixedMessageShape = "mixed_message_shape"
+    case missingResponseID = "missing_response_id"
+    case invalidResponseShape = "invalid_response_shape"
+    case invalidErrorObject = "invalid_error_object"
+    case missingMessageShape = "missing_message_shape"
+}
+
+enum AcpJSONRPCInboundEnvelope: Equatable, Sendable {
+    enum ResponsePayload: Equatable, Sendable {
+        case result(JSONValue)
+        case error(message: String)
+    }
+
+    case request(method: String, id: JSONValue?, params: JSONValue?)
+    case response(id: JSONValue, payload: ResponsePayload)
+}
+
+enum AcpJSONRPCEnvelopeValidation: Equatable, Sendable {
+    case valid(AcpJSONRPCInboundEnvelope)
+    /// `replyID == nil` means the invalid value was response-shaped and must
+    /// not itself receive a response. `pendingRequestID` fails only a matching
+    /// client-owned integer request instead of leaving it to time out.
+    case invalid(
+        reason: AcpJSONRPCEnvelopeViolation,
+        replyID: JSONValue?,
+        pendingRequestID: Int?
+    )
+}
+
+private enum AcpJSONRPCReadLoopError: LocalizedError {
+    case violationLimitReached
+
+    var errorDescription: String? {
+        "The agent sent too many invalid JSON-RPC messages."
+    }
+}
+
 /// A native ACP client: spawns the adapter, runs the JSON-RPC handshake
 /// (initialize → session/new), sends prompts, and streams the agent's
 /// `session/update` notifications plus permission callbacks. Newline-delimited
@@ -574,6 +619,10 @@ actor AcpClient {
     private var sessionIdentityDiagnosticTail: [AcpSessionIdentityDiagnostic] = []
     private var sessionIdentityRejectionCount = 0
     static let maximumSessionIdentityDiagnostics = 32
+    private var inboundProtocolViolationTail: [AcpJSONRPCEnvelopeViolation] = []
+    private var inboundProtocolViolationCount = 0
+    static let maximumInboundProtocolViolations = 8
+    static let maximumInboundProtocolDiagnostics = 8
     private var capabilities = AcpAgentCapabilities()
     private var permissionCounter = 0
     private enum PermissionResolution: Sendable {
@@ -648,6 +697,8 @@ actor AcpClient {
         sessionID = nil
         activeSessionIdentity = nil
         restoringSessionIdentity = nil
+        inboundProtocolViolationTail.removeAll(keepingCapacity: true)
+        inboundProtocolViolationCount = 0
         cancelPermissionRequests()
         toolCallReviewContextStore.removeAll(keepingCapacity: true)
         workspaceRoot = (cwd as NSString).standardizingPath
@@ -1105,8 +1156,15 @@ actor AcpClient {
                 if data.isEmpty { continue }
                 var active = decoder
                 try active.consume(data) { frame in
-                    if let value = try? JSONDecoder().decode(JSONValue.self, from: frame) {
-                        handle(value, sourceConnectionGeneration: sourceConnectionGeneration)
+                    guard let value = try? JSONDecoder().decode(JSONValue.self, from: frame) else {
+                        respondError(id: .null, code: -32700, message: "Parse error")
+                        if recordInboundProtocolViolation(.parseError) {
+                            throw AcpJSONRPCReadLoopError.violationLimitReached
+                        }
+                        return
+                    }
+                    if handle(value, sourceConnectionGeneration: sourceConnectionGeneration) {
+                        throw AcpJSONRPCReadLoopError.violationLimitReached
                     }
                 }
                 decoder = active
@@ -1128,33 +1186,65 @@ actor AcpClient {
         }
     }
 
-    private func handle(_ message: JSONValue, sourceConnectionGeneration: UInt64) {
-        guard let object = message.objectValue else { return }
-        // Response to one of our requests.
-        if let id = object["id"]?.intValue.flatMap(Int.init(exactly:)), object["method"] == nil {
-            let continuation = pending.removeValue(forKey: id)
-            if let error = object["error"]?.objectValue {
-                continuation?.resume(throwing: AcpClientError.requestFailed(error["message"]?.stringValue ?? "request failed"))
-            } else {
-                continuation?.resume(returning: object["result"] ?? .null)
+    /// Returns true once the bounded invalid-envelope threshold is reached and
+    /// the reader must close the adapter connection.
+    @discardableResult
+    private func handle(_ message: JSONValue, sourceConnectionGeneration: UInt64) -> Bool {
+        switch Self.validateInboundEnvelope(message) {
+        case let .invalid(reason, replyID, pendingRequestID):
+            if let pendingRequestID {
+                failRequest(pendingRequestID, error: AcpClientError.malformedResponse)
             }
-            return
+            if let replyID {
+                let invalidParams = reason == .invalidParams
+                respondError(
+                    id: replyID,
+                    code: invalidParams ? -32602 : -32600,
+                    message: invalidParams ? "Invalid params" : "Invalid Request"
+                )
+            }
+            return recordInboundProtocolViolation(reason)
+
+        case let .valid(.response(idValue, payload)):
+            guard let id = idValue.intValue.flatMap(Int.init(exactly:)) else { return false }
+            let continuation = pending.removeValue(forKey: id)
+            switch payload {
+            case let .result(result):
+                continuation?.resume(returning: result)
+            case let .error(message):
+                continuation?.resume(throwing: AcpClientError.requestFailed(message))
+            }
+            return false
+
+        case let .valid(.request(method, id, params)):
+            return dispatchInboundRequest(
+                method: method,
+                id: id,
+                params: params,
+                sourceConnectionGeneration: sourceConnectionGeneration
+            )
         }
-        // A request or notification from the agent.
-        guard let method = object["method"]?.stringValue else { return }
+    }
+
+    @discardableResult
+    private func dispatchInboundRequest(
+        method: String,
+        id: JSONValue?,
+        params: JSONValue?,
+        sourceConnectionGeneration: UInt64
+    ) -> Bool {
         switch method {
         case "session/update":
-            let params = object["params"]?.objectValue
+            let params = params?.objectValue
             guard acceptsSessionScopedMessage(
                 method: method,
                 receivedSessionID: params?["sessionId"]?.stringValue,
                 sourceConnectionGeneration: sourceConnectionGeneration
-            ) else { return }
+            ) else { return false }
             if let update = params?["update"] {
                 handleSessionUpdate(update)
             }
         case "session/request_permission":
-            let params = object["params"]
             // Preserve the malformed-payload contract for non-object params;
             // once params is an object, its session identity is mandatory and
             // must belong to the reader generation that delivered the ask.
@@ -1164,22 +1254,130 @@ actor AcpClient {
                    receivedSessionID: scopedParams["sessionId"]?.stringValue,
                    sourceConnectionGeneration: sourceConnectionGeneration
                ) {
-                if let id = object["id"] { respondStalePermissionSessionError(id: id) }
-                return
+                if let id { respondStalePermissionSessionError(id: id) }
+                return false
             }
-            handlePermissionRequest(id: object["id"], params: params)
+            handlePermissionRequest(id: id, params: params)
         case "fs/read_text_file":
-            handleReadTextFile(id: object["id"], params: object["params"])
+            handleReadTextFile(id: id, params: params)
         case "fs/write_text_file":
-            handleWriteTextFile(id: object["id"], params: object["params"])
+            handleWriteTextFile(id: id, params: params)
         case "terminal/create", "terminal/output", "terminal/wait_for_exit", "terminal/kill", "terminal/release":
-            handleTerminalMethod(method, id: object["id"], params: object["params"])
+            handleTerminalMethod(method, id: id, params: params)
         default:
             // An unanswered request would hang the agent — fail it explicitly.
-            if let id = object["id"] {
+            if let id {
                 respondError(id: id, code: -32601, message: "Method not handled: \(method)")
             }
         }
+        return false
+    }
+
+    static func validateInboundEnvelope(_ message: JSONValue) -> AcpJSONRPCEnvelopeValidation {
+        guard let object = message.objectValue else {
+            // ACP stdio frames are individual requests, notifications, or
+            // responses. A top-level array is therefore not a valid ACP frame,
+            // even though generic JSON-RPC transports may negotiate batching.
+            let reason: AcpJSONRPCEnvelopeViolation = message.arrayValue == nil
+                ? .topLevelNotObject
+                : .unsupportedBatch
+            return .invalid(reason: reason, replyID: .null, pendingRequestID: nil)
+        }
+
+        let id = object["id"]
+        let methodValue = object["method"]
+        let hasResult = object["result"] != nil
+        let hasError = object["error"] != nil
+        let requestLike = methodValue != nil
+        let responseLike = !requestLike && (id != nil || hasResult || hasError)
+        let pendingRequestID = responseLike
+            ? id?.intValue.flatMap(Int.init(exactly:))
+            : nil
+        let invalidReplyID: JSONValue? = requestLike
+            ? (id.flatMap { isValidACPRequestID($0) ? $0 : nil } ?? .null)
+            : (responseLike ? nil : .null)
+
+        guard object["jsonrpc"] == .string("2.0") else {
+            return .invalid(
+                reason: .invalidVersion,
+                replyID: invalidReplyID,
+                pendingRequestID: pendingRequestID
+            )
+        }
+
+        if requestLike {
+            guard let method = methodValue?.stringValue else {
+                return .invalid(reason: .invalidMethod, replyID: invalidReplyID, pendingRequestID: nil)
+            }
+            if let id, !isValidACPRequestID(id) {
+                return .invalid(reason: .invalidID, replyID: .null, pendingRequestID: nil)
+            }
+            if let params = object["params"], params.objectValue == nil, params.arrayValue == nil {
+                return .invalid(reason: .invalidParams, replyID: invalidReplyID, pendingRequestID: nil)
+            }
+            guard !hasResult, !hasError else {
+                return .invalid(reason: .mixedMessageShape, replyID: invalidReplyID, pendingRequestID: nil)
+            }
+            return .valid(.request(method: method, id: id, params: object["params"]))
+        }
+
+        guard responseLike else {
+            return .invalid(reason: .missingMessageShape, replyID: .null, pendingRequestID: nil)
+        }
+        guard let id else {
+            return .invalid(reason: .missingResponseID, replyID: nil, pendingRequestID: nil)
+        }
+        guard isValidACPRequestID(id) else {
+            return .invalid(reason: .invalidID, replyID: nil, pendingRequestID: pendingRequestID)
+        }
+        guard hasResult != hasError else {
+            return .invalid(
+                reason: .invalidResponseShape,
+                replyID: nil,
+                pendingRequestID: pendingRequestID
+            )
+        }
+        if let result = object["result"] {
+            return .valid(.response(id: id, payload: .result(result)))
+        }
+        guard let error = object["error"]?.objectValue,
+              case .integer = error["code"],
+              let message = error["message"]?.stringValue else {
+            return .invalid(
+                reason: .invalidErrorObject,
+                replyID: nil,
+                pendingRequestID: pendingRequestID
+            )
+        }
+        return .valid(.response(id: id, payload: .error(message: message)))
+    }
+
+    private static func isValidACPRequestID(_ id: JSONValue) -> Bool {
+        switch id {
+        case .null, .integer, .string: true
+        case .bool, .number, .array, .object: false
+        }
+    }
+
+    private func recordInboundProtocolViolation(_ reason: AcpJSONRPCEnvelopeViolation) -> Bool {
+        if inboundProtocolViolationCount < Int.max {
+            inboundProtocolViolationCount += 1
+        }
+        inboundProtocolViolationTail.append(reason)
+        if inboundProtocolViolationTail.count > Self.maximumInboundProtocolDiagnostics {
+            inboundProtocolViolationTail.removeFirst(
+                inboundProtocolViolationTail.count - Self.maximumInboundProtocolDiagnostics
+            )
+        }
+        return inboundProtocolViolationCount >= Self.maximumInboundProtocolViolations
+    }
+
+    func inboundProtocolViolationCountForTesting() -> Int {
+        inboundProtocolViolationCount
+    }
+
+    func inboundProtocolViolationDiagnosticsForTesting() -> [AcpJSONRPCEnvelopeViolation] {
+        inboundProtocolViolationTail
     }
 
     /// Shared fail-closed boundary for ACP messages scoped to the current

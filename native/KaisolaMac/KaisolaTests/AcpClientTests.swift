@@ -1312,7 +1312,14 @@ final class AcpClientTests: XCTestCase {
             }
             let error = await transport.permissionError(for: wireID)
             let replyCount = await transport.permissionReplyCount(for: wireID)
-            XCTAssertEqual(Self.permissionErrorReason(error), "malformed")
+            if index == 0 {
+                // Scalar params fail at the JSON-RPC envelope boundary before
+                // permission-specific payload validation can run.
+                XCTAssertEqual(error?.objectValue?["code"]?.intValue, -32602)
+                XCTAssertEqual(error?.objectValue?["message"]?.stringValue, "Invalid params")
+            } else {
+                XCTAssertEqual(Self.permissionErrorReason(error), "malformed")
+            }
             XCTAssertEqual(replyCount, 1)
         }
         XCTAssertTrue(events.permissionRequests.isEmpty)
@@ -2308,6 +2315,250 @@ final class AcpClientTests: XCTestCase {
         await client.stop()
     }
 
+    func testInboundEnvelopeValidatorAcceptsCanonicalACPShapes() {
+        let valid: [JSONValue] = [
+            .object([
+                "jsonrpc": .string("2.0"),
+                "method": .string("session/update"),
+                "params": .object(["sessionId": .string("sess-1")]),
+            ]),
+            .object([
+                "jsonrpc": .string("2.0"),
+                "id": .string("request-string-id"),
+                "method": .string("custom/method"),
+                "params": .array([]),
+            ]),
+            .object([
+                "jsonrpc": .string("2.0"),
+                "id": .null,
+                "method": .string("custom/null-id"),
+            ]),
+            .object([
+                "jsonrpc": .string("2.0"),
+                "id": .integer(1),
+                "result": .null,
+            ]),
+            .object([
+                "jsonrpc": .string("2.0"),
+                "id": .string("response-string-id"),
+                "result": .object([:]),
+            ]),
+            .object([
+                "jsonrpc": .string("2.0"),
+                "id": .integer(2),
+                "error": .object([
+                    "code": .integer(-32602),
+                    "message": .string("Invalid params"),
+                    "data": .array([]),
+                ]),
+            ]),
+        ]
+
+        for message in valid {
+            guard case .valid = AcpClient.validateInboundEnvelope(message) else {
+                return XCTFail("expected a valid ACP JSON-RPC envelope: \(message)")
+            }
+        }
+    }
+
+    func testInboundEnvelopeValidatorRejectsAdversarialShapes() {
+        let invalid: [(JSONValue, AcpJSONRPCEnvelopeViolation)] = [
+            (.string("not an object"), .topLevelNotObject),
+            (.array([]), .unsupportedBatch),
+            (.object(["method": .string("missing/version")]), .invalidVersion),
+            (.object([
+                "jsonrpc": .string("1.0"),
+                "id": .integer(1),
+                "result": .null,
+            ]), .invalidVersion),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "id": .bool(true),
+                "method": .string("bad/id"),
+            ]), .invalidID),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "id": .number(1.0),
+                "method": .string("fractional/id-representation"),
+            ]), .invalidID),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "method": .integer(7),
+            ]), .invalidMethod),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "method": .string("scalar/params"),
+                "params": .string("not structured"),
+            ]), .invalidParams),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "method": .string("null/params"),
+                "params": .null,
+            ]), .invalidParams),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "method": .string("mixed/request-response"),
+                "result": .null,
+            ]), .mixedMessageShape),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "result": .null,
+            ]), .missingResponseID),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "id": .integer(3),
+            ]), .invalidResponseShape),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "id": .integer(4),
+                "result": .null,
+                "error": .object(["code": .integer(-32603), "message": .string("both")]),
+            ]), .invalidResponseShape),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "id": .integer(5),
+                "error": .object(["code": .number(-32603.0), "message": .string("wrong code type")]),
+            ]), .invalidErrorObject),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "id": .integer(6),
+                "error": .string("not an error object"),
+            ]), .invalidErrorObject),
+            (.object([
+                "jsonrpc": .string("2.0"),
+                "id": .integer(7),
+                "error": .object(["code": .integer(-32603)]),
+            ]), .invalidErrorObject),
+            (.object(["jsonrpc": .string("2.0")]), .missingMessageShape),
+        ]
+
+        for (message, expectedReason) in invalid {
+            guard case let .invalid(reason, _, _) = AcpClient.validateInboundEnvelope(message) else {
+                return XCTFail("expected an invalid ACP JSON-RPC envelope: \(message)")
+            }
+            XCTAssertEqual(reason, expectedReason, "unexpected rejection for \(message)")
+        }
+    }
+
+    func testMalformedResponseFailsPendingHandshakeWithoutWaitingForTimeout() async {
+        let transport = MalformedHandshakeAcpTransport()
+        let client = AcpClient(transport: transport)
+
+        do {
+            _ = try await client.start(
+                command: "mock",
+                arguments: [],
+                environment: [:],
+                cwd: "/tmp",
+                mcpServers: []
+            )
+            XCTFail("a response containing both result and error must fail closed")
+        } catch {
+            XCTAssertEqual(error as? AcpClientError, .malformedResponse)
+        }
+        let violationCount = await client.inboundProtocolViolationCountForTesting()
+        let diagnostics = await client.inboundProtocolViolationDiagnosticsForTesting()
+        XCTAssertEqual(violationCount, 1)
+        XCTAssertEqual(diagnostics, [.invalidResponseShape])
+    }
+
+    func testInvalidInboundMessagesReturnProtocolErrorsAndValidTrafficContinues() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            mcpServers: []
+        )
+
+        await transport.emitInbound(.object([
+            "jsonrpc": .string("1.0"),
+            "id": .string("bad-version-request"),
+            "method": .string("custom/method"),
+        ]))
+        await transport.emitRawFrame("{\"jsonrpc\":\"2.0\",broken}")
+        await transport.emitInbound(.array([
+            .object(["jsonrpc": .string("2.0"), "method": .string("batched/notification")]),
+        ]))
+        await transport.emitSessionUpdate(.object([
+            "sessionUpdate": .string("agent_message_chunk"),
+            "content": .object(["type": .string("text"), "text": .string("still healthy")]),
+        ]))
+
+        try await Self.until("three protocol errors and a later valid update") {
+            await transport.receivedProtocolResponses().count == 3
+                && collector.events.contains { event in
+                    if case let .turnItem(.message(_, text)) = event { return text == "still healthy" }
+                    return false
+                }
+        }
+        let responses = await transport.receivedProtocolResponses()
+        let codes = responses.compactMap {
+            $0.objectValue?["error"]?.objectValue?["code"]?.intValue
+        }.sorted()
+        XCTAssertEqual(codes, [-32700, -32600, -32600])
+        XCTAssertTrue(responses.contains {
+            $0.objectValue?["id"] == .string("bad-version-request")
+        })
+        let terminationCount = await transport.terminationCount()
+        let violationCount = await client.inboundProtocolViolationCountForTesting()
+        let diagnostics = await client.inboundProtocolViolationDiagnosticsForTesting()
+        XCTAssertEqual(terminationCount, 0)
+        XCTAssertEqual(violationCount, 3)
+        XCTAssertEqual(diagnostics, [.invalidVersion, .parseError, .unsupportedBatch])
+        await client.stop()
+    }
+
+    func testRepeatedInboundViolationsCloseAtExactBoundAndResetOnRestart() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            mcpServers: []
+        )
+
+        for index in 0 ..< AcpClient.maximumInboundProtocolViolations {
+            await transport.emitInbound(.string("hostile-value-\(index)"))
+        }
+        try await Self.until("the exact protocol-violation threshold to terminate") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { event in
+                    if case let .error(message) = event {
+                        return message == "The agent sent too many invalid JSON-RPC messages."
+                    }
+                    return false
+                }
+        }
+        let violationCount = await client.inboundProtocolViolationCountForTesting()
+        XCTAssertEqual(violationCount, AcpClient.maximumInboundProtocolViolations)
+        let diagnostics = await client.inboundProtocolViolationDiagnosticsForTesting()
+        XCTAssertEqual(diagnostics.count, AcpClient.maximumInboundProtocolDiagnostics)
+        XCTAssertTrue(diagnostics.allSatisfy { $0 == .topLevelNotObject })
+
+        let restarted = try await client.start(
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            mcpServers: []
+        )
+        XCTAssertEqual(restarted.sessionID, "sess-1")
+        let restartedViolationCount = await client.inboundProtocolViolationCountForTesting()
+        let restartedDiagnostics = await client.inboundProtocolViolationDiagnosticsForTesting()
+        XCTAssertEqual(restartedViolationCount, 0)
+        XCTAssertTrue(restartedDiagnostics.isEmpty)
+        await client.stop()
+    }
+
     func testHandshakeAndStreamedTurn() async throws {
         let transport = ScriptedAcpTransport()
         let client = AcpClient(transport: transport)
@@ -2481,6 +2732,54 @@ final class AcpClientTests: XCTestCase {
     }
 }
 
+/// Returns one syntactically decodable but ambiguous response so the client's
+/// pending-request failure path is exercised without modifying the healthy
+/// scripted transport's handshake behavior.
+private actor MalformedHandshakeAcpTransport: AcpByteTransport {
+    private var outbound: [Data] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+
+    func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {}
+
+    func send(_ data: Data) async throws {
+        let frame = data.last == 0x0A ? data.dropLast() : data[...]
+        guard let request = try? JSONDecoder().decode(JSONValue.self, from: Data(frame)).objectValue,
+              let id = request["id"] else { return }
+        enqueue(.object([
+            "jsonrpc": .string("2.0"),
+            "id": id,
+            "result": .object([:]),
+            "error": .object([
+                "code": .integer(-32603),
+                "message": .string("synthetic ambiguous response"),
+            ]),
+        ]))
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !outbound.isEmpty { return outbound.removeFirst() }
+        return await withCheckedContinuation { continuation in waiter = continuation }
+    }
+
+    func terminate() async {
+        waiter?.resume(returning: nil)
+        waiter = nil
+    }
+
+    func exitCode() async -> Int32? { 0 }
+
+    private func enqueue(_ value: JSONValue) {
+        guard var data = try? JSONEncoder().encode(value) else { return }
+        data.append(0x0A)
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            outbound.append(data)
+        }
+    }
+}
+
 private final class EventCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [AcpEvent] = []
@@ -2527,6 +2826,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var steerRequests: [JSONValue] = []
     private var permissionResponses: [Int64: [JSONValue]] = [:]
     private var permissionErrors: [Int64: [JSONValue]] = [:]
+    private var protocolResponses: [JSONValue] = []
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
@@ -2581,7 +2881,18 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func permissionReplyCount(for wireID: Int64) -> Int {
         (permissionResponses[wireID]?.count ?? 0) + (permissionErrors[wireID]?.count ?? 0)
     }
+    func receivedProtocolResponses() -> [JSONValue] { protocolResponses }
     func terminationCount() -> Int { terminations }
+
+    func emitInbound(_ value: JSONValue) {
+        enqueue(value)
+    }
+
+    func emitRawFrame(_ value: String) {
+        var data = Data(value.utf8)
+        data.append(0x0A)
+        enqueue(data)
+    }
 
     func emitPermission(
         wireID: Int64,
@@ -2666,16 +2977,14 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func send(_ data: Data) async throws {
         guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else { return }
         let id = object["id"]
-        if object["method"] == nil,
-           let wireID = id?.intValue,
-           let result = object["result"] {
-            permissionResponses[wireID, default: []].append(result)
-            return
-        }
-        if object["method"] == nil,
-           let wireID = id?.intValue,
-           let error = object["error"] {
-            permissionErrors[wireID, default: []].append(error)
+        if object["method"] == nil {
+            protocolResponses.append(.object(object))
+            if let wireID = id?.intValue, let result = object["result"] {
+                permissionResponses[wireID, default: []].append(result)
+            }
+            if let wireID = id?.intValue, let error = object["error"] {
+                permissionErrors[wireID, default: []].append(error)
+            }
             return
         }
         switch object["method"]?.stringValue {
@@ -2891,6 +3200,10 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private func enqueue(_ value: JSONValue) {
         guard var data = try? JSONEncoder().encode(value) else { return }
         data.append(0x0A)
+        enqueue(data)
+    }
+
+    private func enqueue(_ data: Data) {
         if let waiter {
             self.waiter = nil
             waiter.resume(returning: data)

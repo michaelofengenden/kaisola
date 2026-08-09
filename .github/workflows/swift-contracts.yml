@@ -66,6 +66,8 @@ jobs:
           KAISOLA_SKIP_NATIVE_REBUILD: '1'
       - name: Download checksum-pinned Node runtime
         run: node scripts/download-native-node-runtime.cjs arm64
+      - name: Test broker runtime durability manifest
+        run: node tests/node/brokerRuntimeManifest.cjs
       - name: Test native packaging, compatibility, and resource policies
         run: >-
           node --test
@@ -77,6 +79,7 @@ jobs:
           tests/node/nativeReleasePreflight.test.cjs
           tests/node/nativeResourceGate.test.cjs
           tests/node/nativeResourceFixtureGate.test.cjs
+          tests/node/nativePdfPreviewBudget.test.cjs
       - name: Test shared Swift contracts
         run: swift test --package-path native/KaisolaCore
       - name: Compile optimized iPhone app against KaisolaCore
@@ -136,6 +139,17 @@ jobs:
           npm run native:helper:probe --
           "$RUNNER_TEMP/kaisola-mac/Build/Products/LocalRelease/Kaisola.app/Contents/Resources/BrokerHelper"
           --require-signed-host
+      - name: Gate installed optimized PDF previews
+        if: ${{ !inputs.skip-macos-release-build }}
+        run: |
+          set -euo pipefail
+          installed_root="$RUNNER_TEMP/Applications"
+          installed_app="$installed_root/Kaisola PDF Budget QA.app"
+          mkdir -p "$installed_root"
+          ditto "$RUNNER_TEMP/kaisola-mac/Build/Products/LocalRelease/Kaisola.app" "$installed_app"
+          npm run native:pdf-preview-budget -- \
+            --app "$installed_app" \
+            --output "$RUNNER_TEMP/native-pdf-preview-budget.json"
       - name: Compile Kaisola macOS test bundle
         run: >-
           xcodebuild

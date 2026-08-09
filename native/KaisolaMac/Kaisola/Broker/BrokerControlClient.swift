@@ -112,6 +112,10 @@ extension BrokerControlServing {
 /// stays the final authority on every mutation.
 actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     typealias DisconnectHandler = @Sendable (any Error) -> Void
+    private struct PendingRequest {
+        let method: String
+        let continuation: CheckedContinuation<JSONValue, any Error>
+    }
     /// Compatibility values for a durable pre-fix broker. Older brokers merge
     /// their own launcher environment after receiving terminal.create; an
     /// outer Codex process can therefore leak NO_COLOR=1 into every nested CLI.
@@ -127,12 +131,11 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         "CODEX_THREAD_ID": .string(""),
     ]
 
-    /// The broker one in-flight handshake is opening. Two callers that name the
-    /// same broker share that handshake; a caller that names a different one is
-    /// refused rather than opening a second transport underneath the first.
-    private struct ConnectTarget: Equatable {
-        let socketPath: String
-        let token: String
+    /// The broker plus owner a controller connection speaks for. Reuse is only
+    /// safe for this exact identity. Concurrent callers naming the same broker
+    /// and owner share one handshake; any other identity is refused.
+    private struct ConnectionIdentity: Equatable {
+        let info: BrokerInfo
         let ownerID: String
     }
 
@@ -142,18 +145,20 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     private var decoder = BrokerLineFrameDecoder()
     private var connected = false
     private var connectedFeatures: Set<String> = []
-    private var ownerID = ""
-    private var connectInFlight: ConnectTarget?
+    private var connectedIdentity: ConnectionIdentity?
+    private var connectInFlight: ConnectionIdentity?
+    private var ownerID: String { connectedIdentity?.ownerID ?? "" }
     /// Every caller waiting on the single in-flight handshake, in arrival
     /// order. A list rather than one slot: the old single continuation was
     /// overwritten by a second concurrent connect, and the first caller then
     /// waited forever on a continuation nobody could resume.
     private var helloWaiters: [CheckedContinuation<Void, any Error>] = []
     private var handshakeTimeoutTask: Task<Void, Never>?
-    private var pending: [String: CheckedContinuation<JSONValue, any Error>] = [:]
+    private var pending: [String: PendingRequest] = [:]
     private var requestTimeoutTasks: [String: Task<Void, Never>] = [:]
     private var readerTask: Task<Void, Never>?
     private var disconnectHandler: DisconnectHandler?
+    private var connectionAbortInProgress = false
 
     init(
         transport: any BrokerByteTransport = UnixBrokerTransport(),
@@ -177,24 +182,28 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     var connectWaiterCount: Int { helloWaiters.count }
 
     func connect(to info: BrokerInfo, ownerID: String) async throws {
-        if connected { return }
         try info.validate()
         guard !ownerID.isEmpty else { throw BrokerClientError.requestFailed("controller owner id") }
-        let target = ConnectTarget(socketPath: info.socketPath, token: info.token, ownerID: ownerID)
+        let requested = ConnectionIdentity(info: info, ownerID: ownerID)
+        if let connectedIdentity {
+            // Reusing this lane for a different broker or owner would hand the
+            // caller a success it cannot act on: later mutations would still
+            // travel to the connection recorded here.
+            guard connectedIdentity == requested else { throw BrokerClientError.identityChanged }
+            if connected { return }
+        }
         if let connectInFlight {
             // Opening the socket and awaiting hello both suspend, so a second
             // caller can arrive mid-handshake. Same broker: wait on the one
             // already running. Different broker: refuse, because succeeding
             // here would hand the caller a connection to somebody else's.
-            guard connectInFlight == target else {
-                throw BrokerClientError.requestFailed("broker connect target")
-            }
+            guard connectInFlight == requested else { throw BrokerClientError.identityChanged }
             return try await withCheckedThrowingContinuation { continuation in
                 helloWaiters.append(continuation)
             }
         }
-        connectInFlight = target
-        self.ownerID = ownerID
+        connectedIdentity = requested
+        connectInFlight = requested
 
         let encoded: Data
         do {
@@ -210,7 +219,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                 "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native"),
                 "access": .string("controller"),
             ])
-            encoded = try encode(frame)
+            encoded = try encode(frame, purpose: .hello)
         } catch {
             // Callers that joined while the socket was opening fail with the
             // error this one saw instead of waiting on a handshake that will
@@ -299,7 +308,15 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     func attach(projectID: String, terminalID: String) async throws {
-        _ = try await request(.attach, params: identity(projectID: projectID, terminalID: terminalID))
+        let result = try await request(
+            .attach,
+            params: identity(projectID: projectID, terminalID: terminalID)
+        )
+        guard let object = result.objectValue,
+              object["ok"]?.boolValue == true,
+              object["id"]?.stringValue == terminalID else {
+            throw BrokerClientError.requestFailed("terminal.attach")
+        }
     }
 
     func write(projectID: String, terminalID: String, data: String) async throws {
@@ -323,7 +340,15 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     func kill(projectID: String, terminalID: String) async throws {
-        _ = try await request(.kill, params: identity(projectID: projectID, terminalID: terminalID))
+        let result = try await request(
+            .kill,
+            params: identity(projectID: projectID, terminalID: terminalID)
+        )
+        guard let object = result.objectValue,
+              object["ok"]?.boolValue == true,
+              object["id"]?.stringValue == terminalID else {
+            throw BrokerClientError.requestFailed("terminal.kill")
+        }
     }
 
     /// Permanently ends an owned terminal and removes its retained broker
@@ -342,7 +367,14 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.malformedResponse
         }
         params["busy"] = .bool(busy)
-        _ = try await request(.agentTurn, params: .object(params))
+        let result = try await request(.agentTurn, params: .object(params))
+        // The broker answers `{ok:false}` when the record is gone or predates
+        // activity tracking. Discarding that left the app believing a turn was
+        // protected while the broker still counted the terminal idle and
+        // eligible for rolling cutover, so the rejection has to travel.
+        guard result.objectValue?["ok"]?.boolValue == true else {
+            throw BrokerClientError.requestFailed("terminal.agentTurn")
+        }
     }
 
     func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {
@@ -500,9 +532,9 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             "method": .string(method),
             "params": params,
         ])
-        let encoded = try encode(frame)
+        let encoded = try encode(frame, purpose: .request(method))
         return try await withCheckedThrowingContinuation { continuation in
-            pending[requestID] = continuation
+            pending[requestID] = PendingRequest(method: method, continuation: continuation)
             requestTimeoutTasks[requestID] = Task {
                 do {
                     try await Task.sleep(nanoseconds: operationTimeoutNanoseconds)
@@ -514,7 +546,10 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             }
             Task {
                 do { try await transport.send(encoded) }
-                catch { failRequest(requestID, with: error) }
+                // A failed socket write is verified controller-connection
+                // loss, not a terminal rejection. Abort the lane so the
+                // router cannot reuse a poisoned child on reconnect.
+                catch { await abortConnection(with: error) }
             }
         }
     }
@@ -622,6 +657,9 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                 if data.isEmpty { continue }
                 var activeDecoder = decoder
                 try activeDecoder.consume(data) { data in
+                    _ = try BrokerWire.validateDecodedFrame(data) { id in
+                        pending[id]?.method
+                    }
                     let frame = try JSONDecoder().decode(JSONValue.self, from: data)
                     try handle(frame)
                 }
@@ -633,6 +671,12 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     private func abortConnection(with error: any Error) async {
+        // Closing the transport wakes the reader, which can observe the same
+        // failure. Settle and report the connection only once.
+        guard !connectionAbortInProgress,
+              connected || connectInFlight != nil || !helloWaiters.isEmpty || !pending.isEmpty else { return }
+        connectionAbortInProgress = true
+        defer { connectionAbortInProgress = false }
         await transport.close()
         readerTask = nil
         decoder = BrokerLineFrameDecoder()
@@ -666,14 +710,16 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             handshakeTimeoutTask = nil
             completeConnect()
         case "response":
-            guard let id = object["id"]?.stringValue, let continuation = pending.removeValue(forKey: id) else {
+            guard let id = object["id"]?.stringValue, let request = pending.removeValue(forKey: id) else {
                 return
             }
             requestTimeoutTasks.removeValue(forKey: id)?.cancel()
             if object["ok"]?.boolValue == true, let result = object["result"] {
-                continuation.resume(returning: result)
+                request.continuation.resume(returning: result)
             } else {
-                continuation.resume(throwing: BrokerClientError.requestFailed(object["message"]?.stringValue ?? "request"))
+                request.continuation.resume(
+                    throwing: BrokerClientError.requestFailed(object["message"]?.stringValue ?? "request")
+                )
             }
         case "event":
             // The controller connection carries no streams; events belong to
@@ -684,16 +730,20 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         }
     }
 
-    private func encode(_ frame: JSONValue) throws -> Data {
+    private func encode(_ frame: JSONValue, purpose: BrokerFramePurpose) throws -> Data {
         var data = try JSONEncoder().encode(frame)
-        guard data.count <= BrokerWire.maximumFrameBytes else { throw BrokerClientError.frameRejected }
+        do {
+            try BrokerWire.validateEncodedFrame(data, purpose: purpose)
+        } catch {
+            throw BrokerClientError.frameRejected
+        }
         data.append(0x0A)
         return data
     }
 
     private func failRequest(_ id: String, with error: any Error) {
         requestTimeoutTasks.removeValue(forKey: id)?.cancel()
-        pending.removeValue(forKey: id)?.resume(throwing: error)
+        pending.removeValue(forKey: id)?.continuation.resume(throwing: error)
     }
 
     /// Hands the settled handshake to everyone who coalesced onto it and closes
@@ -707,6 +757,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
 
     private func failConnect(with error: any Error) {
         connectInFlight = nil
+        connectedIdentity = nil
         let waiters = helloWaiters
         helloWaiters.removeAll()
         for waiter in waiters { waiter.resume(throwing: error) }
@@ -718,9 +769,12 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         failConnect(with: error)
         for task in requestTimeoutTasks.values { task.cancel() }
         requestTimeoutTasks.removeAll()
-        for continuation in pending.values { continuation.resume(throwing: error) }
+        for request in pending.values { request.continuation.resume(throwing: error) }
         pending.removeAll()
         connected = false
         connectedFeatures = []
+        // A dead lane holds no identity: the next connect is free to adopt a
+        // replacement broker or a new owner.
+        connectedIdentity = nil
     }
 }

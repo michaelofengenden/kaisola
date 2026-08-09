@@ -106,21 +106,27 @@ enum OnboardingReadiness {
         checksAutomatically: Bool,
         pendingVersion: String?
     ) -> OnboardingReadinessStatus {
-        if let pendingVersion {
-            return .init(
-                kind: .needsAction,
-                detail: "Kaisola \(pendingVersion) is ready to install from Settings."
-            )
-        }
         guard canConfigure else {
             return .init(
                 kind: .information,
                 detail: "Update controls become available in a signed Kaisola build."
             )
         }
+        if let pendingVersion {
+            return .init(
+                kind: .needsAction,
+                detail: "Kaisola \(pendingVersion) is ready to install from Settings."
+            )
+        }
         return checksAutomatically
             ? .init(kind: .ready, detail: "Kaisola will check for signed updates automatically.")
             : .init(kind: .needsAction, detail: "Automatic update checks are off.")
+    }
+
+    static func updateSettingsActionTitle(
+        for status: OnboardingReadinessStatus
+    ) -> String? {
+        status.kind == .needsAction ? "Update Settings" : nil
     }
 }
 
@@ -207,7 +213,7 @@ struct OnboardingView: View {
                             title: "Updates",
                             symbol: "arrow.triangle.2.circlepath",
                             status: updateStatus,
-                            actionTitle: updateStatus.kind == .ready ? nil : "Update Settings",
+                            actionTitle: OnboardingReadiness.updateSettingsActionTitle(for: updateStatus),
                             action: openUpdateSettings
                         )
                     }

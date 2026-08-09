@@ -144,6 +144,60 @@ final class OnboardingStateTests: XCTestCase {
         )
     }
 
+    func testUpdateSettingsActionOnlyAppearsForActionableUpdateStates() {
+        let unsigned = OnboardingReadiness.updates(
+            canConfigure: false,
+            checksAutomatically: false,
+            pendingVersion: nil
+        )
+        XCTAssertEqual(unsigned.kind, .information)
+        XCTAssertEqual(
+            unsigned.detail,
+            "Update controls become available in a signed Kaisola build."
+        )
+        XCTAssertNil(OnboardingReadiness.updateSettingsActionTitle(for: unsigned))
+
+        let unsignedWithStalePendingUpdate = OnboardingReadiness.updates(
+            canConfigure: false,
+            checksAutomatically: true,
+            pendingVersion: "2.0"
+        )
+        XCTAssertEqual(unsignedWithStalePendingUpdate, unsigned)
+        XCTAssertNil(
+            OnboardingReadiness.updateSettingsActionTitle(for: unsignedWithStalePendingUpdate)
+        )
+
+        let signedWithChecksOff = OnboardingReadiness.updates(
+            canConfigure: true,
+            checksAutomatically: false,
+            pendingVersion: nil
+        )
+        XCTAssertEqual(signedWithChecksOff.kind, .needsAction)
+        XCTAssertEqual(
+            OnboardingReadiness.updateSettingsActionTitle(for: signedWithChecksOff),
+            "Update Settings"
+        )
+
+        let pendingUpdate = OnboardingReadiness.updates(
+            canConfigure: true,
+            checksAutomatically: true,
+            pendingVersion: "2.0"
+        )
+        XCTAssertEqual(pendingUpdate.kind, .needsAction)
+        XCTAssertEqual(
+            OnboardingReadiness.updateSettingsActionTitle(for: pendingUpdate),
+            "Update Settings"
+        )
+
+        let signedAndReady = OnboardingReadiness.updates(
+            canConfigure: true,
+            checksAutomatically: true,
+            pendingVersion: nil
+        )
+        XCTAssertEqual(signedAndReady.kind, .ready)
+        XCTAssertNil(OnboardingReadiness.updateSettingsActionTitle(for: signedAndReady))
+    }
+
     func testHelpTargetsTheUserGuideInsteadOfDeveloperSetup() {
         XCTAssertEqual(
             KaisolaMacAppDelegate.userHelpURL?.path,

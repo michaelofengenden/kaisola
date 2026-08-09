@@ -485,7 +485,419 @@ enum McpConfigDiscovery {
     }
 }
 
+// MARK: - Provider-facing MCP tool schemas
+
+/// A tool rejected at the MCP -> provider boundary. The reason is deliberately
+/// short and free of server payloads so Settings can surface it without letting
+/// an untrusted schema flood the row or disclose arbitrary schema contents.
+struct McpDisabledTool: Equatable, Sendable {
+    let name: String
+    let reason: String
+}
+
+/// Resolves the local-reference subset emitted by Zod, Pydantic, and similar
+/// schema generators at Kaisola's owned `tools/list` boundary. The resulting
+/// provider-facing subset is explicit: every assertion we accept is preserved,
+/// while an unknown keyword, an unsafe reference, or an exhausted budget rejects
+/// only that tool. This is intentionally not a permissive JSON Schema converter;
+/// silently dropping an assertion would widen the tool's accepted input.
+enum McpToolSchemaNormalizer {
+    struct Limits: Equatable, Sendable {
+        var maximumInputBytes = 128 * 1_024
+        var maximumOutputBytes = 192 * 1_024
+        var maximumDepth = 48
+        var maximumNodes = 4_096
+    }
+
+    struct Result {
+        let usable: [[String: Any]]
+        let disabled: [McpDisabledTool]
+    }
+
+    private struct Rejection: Error {
+        let reason: String
+    }
+
+    private struct Context {
+        let root: [String: Any]
+        let limits: Limits
+        var visitedNodes = 0
+        var activeReferences: Set<String> = []
+
+        mutating func visit(depth: Int) throws {
+            guard depth <= limits.maximumDepth else {
+                throw Rejection(reason: "Schema depth budget exceeded.")
+            }
+            visitedNodes += 1
+            guard visitedNodes <= limits.maximumNodes else {
+                throw Rejection(reason: "Schema node budget exceeded.")
+            }
+        }
+
+        mutating func normalize(_ schema: [String: Any], depth: Int) throws -> [String: Any] {
+            try visit(depth: depth)
+            if let rawReference = schema["$ref"] {
+                guard let reference = rawReference as? String else {
+                    throw Rejection(reason: "Schema reference must be a string.")
+                }
+                let permittedSiblings: Set<String> = [
+                    "$ref", "$defs", "definitions", "$schema", "$comment",
+                    "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly",
+                ]
+                if let unsupported = schema.keys.sorted().first(where: { !permittedSiblings.contains($0) }) {
+                    throw Rejection(reason: boundedReason("Unsupported sibling of schema reference: \(unsupported)."))
+                }
+                let (target, canonicalReference) = try resolve(reference)
+                guard activeReferences.insert(canonicalReference).inserted else {
+                    throw Rejection(reason: "Schema reference cycle detected.")
+                }
+                defer { activeReferences.remove(canonicalReference) }
+                guard let targetSchema = target as? [String: Any] else {
+                    throw Rejection(reason: "Local schema reference must resolve to an object.")
+                }
+                var output = try normalize(targetSchema, depth: depth + 1)
+                for key in schema.keys.sorted() where McpToolSchemaNormalizer.annotationKeys.contains(key) {
+                    output[key] = try normalizeAnnotation(schema[key] as Any, key: key)
+                }
+                return output
+            }
+
+            var output: [String: Any] = [:]
+            for key in schema.keys.sorted() {
+                let value = schema[key] as Any
+                switch key {
+                case "$defs", "definitions", "$comment":
+                    // Definitions are non-assertive after all local references
+                    // have been inlined. Provider payloads do not need them.
+                    continue
+                case "$schema":
+                    guard let dialect = value as? String,
+                          McpToolSchemaNormalizer.acceptedDialects.contains(dialect) else {
+                        throw Rejection(reason: "Unsupported JSON Schema dialect.")
+                    }
+                case "title", "description", "format", "pattern", "contentEncoding", "contentMediaType":
+                    guard value is String else { throw invalidValue(key) }
+                    output[key] = value
+                case "default", "const":
+                    guard JSONSerialization.isValidJSONObject([value]) else { throw invalidValue(key) }
+                    output[key] = value
+                case "examples", "enum":
+                    guard let values = value as? [Any], !values.isEmpty,
+                          JSONSerialization.isValidJSONObject(values) else { throw invalidValue(key) }
+                    output[key] = values
+                case "deprecated", "readOnly", "writeOnly", "uniqueItems":
+                    guard value is Bool else { throw invalidValue(key) }
+                    output[key] = value
+                case "multipleOf", "maximum", "exclusiveMaximum", "minimum", "exclusiveMinimum",
+                     "maxLength", "minLength", "maxItems", "minItems", "maxProperties", "minProperties":
+                    guard McpToolSchemaNormalizer.isJSONNumber(value) else { throw invalidValue(key) }
+                    output[key] = value
+                case "type":
+                    output[key] = try normalizeType(value)
+                case "required":
+                    guard let names = value as? [String], Set(names).count == names.count else {
+                        throw invalidValue(key)
+                    }
+                    output[key] = names
+                case "properties":
+                    guard let properties = value as? [String: Any] else { throw invalidValue(key) }
+                    var normalized: [String: Any] = [:]
+                    for name in properties.keys.sorted() {
+                        guard let property = properties[name] as? [String: Any] else { throw invalidValue(key) }
+                        normalized[name] = try normalize(property, depth: depth + 1)
+                    }
+                    output[key] = normalized
+                case "additionalProperties":
+                    if value is Bool {
+                        output[key] = value
+                    } else if let nested = value as? [String: Any] {
+                        output[key] = try normalize(nested, depth: depth + 1)
+                    } else {
+                        throw invalidValue(key)
+                    }
+                case "items", "not":
+                    guard let nested = value as? [String: Any] else { throw invalidValue(key) }
+                    output[key] = try normalize(nested, depth: depth + 1)
+                case "anyOf", "oneOf", "allOf":
+                    guard let alternatives = value as? [Any], !alternatives.isEmpty else { throw invalidValue(key) }
+                    output[key] = try alternatives.map { alternative in
+                        guard let nested = alternative as? [String: Any] else { throw invalidValue(key) }
+                        return try normalize(nested, depth: depth + 1)
+                    }
+                default:
+                    throw Rejection(reason: boundedReason("Unsupported schema keyword: \(key)."))
+                }
+            }
+            return output
+        }
+
+        private mutating func normalizeAnnotation(_ value: Any, key: String) throws -> Any {
+            switch key {
+            case "title", "description":
+                guard value is String else { throw invalidValue(key) }
+            case "deprecated", "readOnly", "writeOnly":
+                guard value is Bool else { throw invalidValue(key) }
+            case "examples":
+                guard let examples = value as? [Any], JSONSerialization.isValidJSONObject(examples) else {
+                    throw invalidValue(key)
+                }
+            case "default":
+                guard JSONSerialization.isValidJSONObject([value]) else { throw invalidValue(key) }
+            default:
+                throw invalidValue(key)
+            }
+            return value
+        }
+
+        private mutating func normalizeType(_ value: Any) throws -> Any {
+            let accepted = McpToolSchemaNormalizer.acceptedTypes
+            if let type = value as? String, accepted.contains(type) { return type }
+            if let types = value as? [String], !types.isEmpty,
+               Set(types).count == types.count,
+               types.allSatisfy(accepted.contains) {
+                return types
+            }
+            throw invalidValue("type")
+        }
+
+        private func resolve(_ reference: String) throws -> (Any, String) {
+            guard reference == "#" || reference.hasPrefix("#/") else {
+                throw Rejection(reason: "Only local schema references are supported.")
+            }
+            guard let fragment = String(reference.dropFirst()).removingPercentEncoding else {
+                throw Rejection(reason: "Schema reference has invalid escaping.")
+            }
+            let rawTokens = fragment.isEmpty ? [] : fragment.dropFirst().split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+            let tokens = try rawTokens.map(McpToolSchemaNormalizer.decodePointerToken)
+            var value: Any = root
+            for token in tokens {
+                if let object = value as? [String: Any], let next = object[token] {
+                    value = next
+                } else if let array = value as? [Any],
+                          token == "0" || (!token.hasPrefix("0") && token.allSatisfy(\.isNumber)),
+                          let index = Int(token), array.indices.contains(index) {
+                    value = array[index]
+                } else {
+                    throw Rejection(reason: "Missing local schema reference.")
+                }
+            }
+            let canonicalData = try? JSONSerialization.data(withJSONObject: tokens, options: [.sortedKeys])
+            return (value, canonicalData?.base64EncodedString() ?? reference)
+        }
+    }
+
+    private static let annotationKeys: Set<String> = [
+        "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly",
+    ]
+    private static let acceptedTypes: Set<String> = [
+        "array", "boolean", "integer", "null", "number", "object", "string",
+    ]
+    private static let acceptedDialects: Set<String> = [
+        "https://json-schema.org/draft/2020-12/schema",
+        "https://json-schema.org/draft/2019-09/schema",
+        "http://json-schema.org/draft-07/schema#",
+        "https://json-schema.org/draft-07/schema",
+    ]
+
+    static func normalizeTools(_ tools: [Any], limits: Limits = Limits()) -> Result {
+        var usable: [[String: Any]] = []
+        var disabled: [McpDisabledTool] = []
+        for (index, rawTool) in tools.enumerated() {
+            let fallbackName = "Tool \(index + 1)"
+            guard var tool = rawTool as? [String: Any] else {
+                disabled.append(.init(name: fallbackName, reason: "Tool definition must be an object."))
+                continue
+            }
+            let name = boundedToolName(tool["name"] as? String, fallback: fallbackName)
+            do {
+                guard let rawName = tool["name"] as? String,
+                      !rawName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      rawName.count <= 128,
+                      !rawName.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) else {
+                    throw Rejection(reason: "Tool name is invalid.")
+                }
+                if let description = tool["description"], !(description is String) {
+                    throw Rejection(reason: "Tool description must be a string.")
+                }
+                guard let schema = tool["inputSchema"] as? [String: Any] else {
+                    throw Rejection(reason: "Tool input schema must be an object.")
+                }
+                let input = try stableData(schema)
+                guard input.count <= limits.maximumInputBytes else {
+                    throw Rejection(reason: "Schema byte budget exceeded.")
+                }
+                var context = Context(root: schema, limits: limits)
+                let normalized = try context.normalize(schema, depth: 0)
+                let output = try stableData(normalized)
+                guard output.count <= limits.maximumOutputBytes else {
+                    throw Rejection(reason: "Normalized schema byte budget exceeded.")
+                }
+                tool["inputSchema"] = normalized
+                usable.append(tool)
+            } catch let rejection as Rejection {
+                disabled.append(.init(name: name, reason: boundedReason(rejection.reason)))
+            } catch {
+                disabled.append(.init(name: name, reason: "Invalid tool input schema."))
+            }
+        }
+        return Result(usable: usable, disabled: disabled)
+    }
+
+    static func stableData(_ schema: [String: Any]) throws -> Data {
+        guard JSONSerialization.isValidJSONObject(schema) else {
+            throw Rejection(reason: "Tool input schema is not valid JSON.")
+        }
+        return try JSONSerialization.data(withJSONObject: schema, options: [.sortedKeys])
+    }
+
+    private static func decodePointerToken(_ token: String) throws -> String {
+        var output = ""
+        var index = token.startIndex
+        while index < token.endIndex {
+            if token[index] != "~" {
+                output.append(token[index])
+                index = token.index(after: index)
+                continue
+            }
+            let escape = token.index(after: index)
+            guard escape < token.endIndex else {
+                throw Rejection(reason: "Schema reference has invalid JSON Pointer escaping.")
+            }
+            switch token[escape] {
+            case "0": output.append("~")
+            case "1": output.append("/")
+            default: throw Rejection(reason: "Schema reference has invalid JSON Pointer escaping.")
+            }
+            index = token.index(after: escape)
+        }
+        return output
+    }
+
+    private static func invalidValue(_ key: String) -> Rejection {
+        Rejection(reason: boundedReason("Invalid value for schema keyword: \(key)."))
+    }
+
+    private static func isJSONNumber(_ value: Any) -> Bool {
+        guard value is NSNumber else { return false }
+        return !(value is Bool)
+    }
+
+    private static func boundedToolName(_ candidate: String?, fallback: String) -> String {
+        let clean = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return String((clean.isEmpty ? fallback : clean).prefix(80))
+    }
+
+    private static func boundedReason(_ reason: String) -> String {
+        let singleLine = reason.replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        return String(singleLine.prefix(160))
+    }
+}
+
 // MARK: - Non-executing health probe
+
+/// Authentication is independent of MCP reachability. In particular, a probe
+/// that times out or cannot interpret a server response has not proven that the
+/// user is signed out. Unknown reasons stay explicit so Settings can offer a
+/// safe follow-up without inventing an OAuth or credential-clearing side effect.
+enum McpAuthenticationState: Equatable, Sendable {
+    enum UnknownReason: String, CaseIterable, Sendable {
+        case timeout
+        case keychainDenied
+        case unsupported
+        case connectionFailure
+        case credentialRejected
+    }
+
+    case probing
+    case signedIn
+    case signedOut
+    case expired
+    case unknown(UnknownReason)
+
+    var presentation: McpAuthenticationPresentation {
+        switch self {
+        case .probing:
+            .init(copy: "Checking authentication", action: .none)
+        case .signedIn:
+            .init(copy: "Signed in", action: .none)
+        case .signedOut:
+            .init(copy: "Signed out", action: .reviewCredentialSetup)
+        case .expired:
+            .init(copy: "Credentials expired", action: .replaceExpiredCredential)
+        case .unknown(.timeout):
+            .init(copy: "Authentication unknown · server timed out", action: .retryProbe)
+        case .unknown(.keychainDenied):
+            .init(copy: "Authentication unknown · Keychain access denied", action: .reviewKeychainAccess)
+        case .unknown(.unsupported):
+            .init(copy: "Authentication unknown · status unsupported", action: .reviewCompatibility)
+        case .unknown(.connectionFailure):
+            .init(copy: "Authentication unknown · connection failed", action: .retryProbe)
+        case .unknown(.credentialRejected):
+            .init(copy: "Authentication unknown · credentials rejected", action: .reviewCredentialSetup)
+        }
+    }
+}
+
+/// User-directed follow-ups only. There is deliberately no launch-OAuth or
+/// clear-credential action: probes report evidence and leave configuration
+/// untouched. The current MCP architecture has neither an OAuth controller nor
+/// a Keychain-backed MCP credential provider.
+enum McpAuthenticationAction: Equatable, Sendable {
+    case none
+    case reviewCredentialSetup
+    case replaceExpiredCredential
+    case retryProbe
+    case reviewKeychainAccess
+    case reviewCompatibility
+
+    var title: String? {
+        switch self {
+        case .none: nil
+        case .reviewCredentialSetup: "Review credential setup"
+        case .replaceExpiredCredential: "Replace credentials"
+        case .retryProbe: "Check again"
+        case .reviewKeychainAccess: "Review Keychain access"
+        case .reviewCompatibility: "Review compatibility"
+        }
+    }
+
+    var launchesOAuth: Bool { false }
+    var clearsCredentials: Bool { false }
+}
+
+struct McpAuthenticationPresentation: Equatable, Sendable {
+    let copy: String
+    let action: McpAuthenticationAction
+}
+
+/// Evidence-only classification shared by the probe and focused tests. A bare
+/// 401 proves signed-out only when no credential was sent. A rejected credential
+/// is called expired solely when the challenge says so; otherwise it remains
+/// unknown rather than prompting a destructive login loop.
+enum McpAuthenticationPolicy {
+    static func hasConfiguredCredential(_ headers: [McpServerConfig.Pair]) -> Bool {
+        let credentialNames = Set(["authorization", "proxy-authorization", "x-api-key", "api-key"])
+        return headers.contains {
+            credentialNames.contains($0.name.lowercased())
+                && !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    static func stateForHTTPFailure(
+        statusCode: Int,
+        authenticateHeader: String?,
+        hasConfiguredCredential: Bool
+    ) -> McpAuthenticationState {
+        guard statusCode == 401 else { return .unknown(.unsupported) }
+        guard hasConfiguredCredential else { return .signedOut }
+        let challenge = authenticateHeader?.lowercased() ?? ""
+        if challenge.contains("expired") {
+            return .expired
+        }
+        return .unknown(.credentialRejected)
+    }
+}
 
 struct McpProbeResult: Equatable, Sendable {
     enum Status: String, Sendable {
@@ -497,10 +909,41 @@ struct McpProbeResult: Equatable, Sendable {
     let status: Status
     let verified: Bool
     let message: String
+    let authentication: McpAuthenticationState
     var serverName: String?
     var serverVersion: String?
     var toolCount: Int?
     var hasMoreTools = false
+    var disabledTools: [McpDisabledTool] = []
+
+    init(
+        status: Status,
+        verified: Bool,
+        message: String,
+        authentication: McpAuthenticationState = .unknown(.unsupported),
+        serverName: String? = nil,
+        serverVersion: String? = nil,
+        toolCount: Int? = nil,
+        hasMoreTools: Bool = false,
+        disabledTools: [McpDisabledTool] = []
+    ) {
+        self.status = status
+        self.verified = verified
+        self.message = message
+        self.authentication = authentication
+        self.serverName = serverName
+        self.serverVersion = serverVersion
+        self.toolCount = toolCount
+        self.hasMoreTools = hasMoreTools
+        self.disabledTools = disabledTools
+    }
+
+    static let probing = McpProbeResult(
+        status: .configured,
+        verified: false,
+        message: "Checking MCP server",
+        authentication: .probing
+    )
 }
 
 /// Pure MCP `initialize` revision negotiation: given the server's reply,
@@ -546,8 +989,14 @@ actor McpProbeService {
         let sessionID: String?
     }
 
-    private enum ProbeFailure: Error {
-        case message(String)
+    private struct ProbeFailure: Error {
+        let message: String
+        let authentication: McpAuthenticationState
+
+        init(_ message: String, authentication: McpAuthenticationState = .unknown(.unsupported)) {
+            self.message = message
+            self.authentication = authentication
+        }
     }
 
     private static let maximumResponseBytes = 200_000
@@ -604,16 +1053,16 @@ actor McpProbeService {
                 negotiatedVersion: nil,
                 allowEmpty: false
             )
-            guard let response = initialize.object else { throw ProbeFailure.message("Empty initialize response") }
+            guard let response = initialize.object else { throw ProbeFailure("Empty initialize response") }
             if let error = response["error"] as? [String: Any] {
-                throw ProbeFailure.message("Initialize failed: \(safeServerMessage(error["message"]))")
+                throw ProbeFailure("Initialize failed: \(safeServerMessage(error["message"]))")
             }
             guard let result = response["result"] as? [String: Any],
                   let negotiated = result["protocolVersion"] as? String else {
-                throw ProbeFailure.message("Malformed initialize response")
+                throw ProbeFailure("Malformed initialize response")
             }
             guard McpProtocolRevision.isAccepted(negotiated) else {
-                throw ProbeFailure.message("Unsupported protocol version \(safeInline(negotiated))")
+                throw ProbeFailure("Unsupported protocol version \(safeInline(negotiated))")
             }
             let info = result["serverInfo"] as? [String: Any]
             let serverName = safeOptionalInline(info?["name"] as? String)
@@ -639,6 +1088,7 @@ actor McpProbeService {
                     status: .ready,
                     verified: true,
                     message: "Ready · server declares no tools capability",
+                    authentication: authenticationAfterSuccessfulProbe(server),
                     serverName: serverName,
                     serverVersion: serverVersion
                 )
@@ -656,31 +1106,60 @@ actor McpProbeService {
                 negotiatedVersion: negotiated,
                 allowEmpty: false
             )
-            guard let toolsResponse = tools.object else { throw ProbeFailure.message("Empty tools response") }
+            guard let toolsResponse = tools.object else { throw ProbeFailure("Empty tools response") }
             if let error = toolsResponse["error"] as? [String: Any] {
-                throw ProbeFailure.message("Tool listing failed: \(safeServerMessage(error["message"]))")
+                throw ProbeFailure("Tool listing failed: \(safeServerMessage(error["message"]))")
             }
             guard let toolsResult = toolsResponse["result"] as? [String: Any],
                   let listedTools = toolsResult["tools"] as? [Any] else {
-                throw ProbeFailure.message("Malformed tools response")
+                throw ProbeFailure("Malformed tools response")
             }
             let hasMore = toolsResult["nextCursor"] is String
+            let normalized = McpToolSchemaNormalizer.normalizeTools(listedTools)
             return .init(
                 status: .ready,
                 verified: true,
-                message: hasMore ? "Ready · \(listedTools.count)+ tools" : "Ready · \(listedTools.count) tools",
+                message: toolSummary(
+                    usable: normalized.usable.count,
+                    advertised: listedTools.count,
+                    disabled: normalized.disabled,
+                    hasMore: hasMore
+                ),
+                authentication: authenticationAfterSuccessfulProbe(server),
                 serverName: serverName,
                 serverVersion: serverVersion,
-                toolCount: listedTools.count,
-                hasMoreTools: hasMore
+                toolCount: normalized.usable.count,
+                hasMoreTools: hasMore,
+                disabledTools: normalized.disabled
             )
-        } catch let ProbeFailure.message(message) {
-            return .init(status: .failed, verified: true, message: message)
+        } catch let failure as ProbeFailure {
+            return .init(
+                status: .failed,
+                verified: true,
+                message: failure.message,
+                authentication: failure.authentication
+            )
         } catch let error as URLError where error.code == .timedOut {
-            return .init(status: .failed, verified: true, message: "Timed out after 3.5 seconds")
+            return .init(
+                status: .failed,
+                verified: true,
+                message: "Timed out after 3.5 seconds",
+                authentication: .unknown(.timeout)
+            )
         } catch {
-            return .init(status: .failed, verified: true, message: "Connection failed")
+            return .init(
+                status: .failed,
+                verified: true,
+                message: "Connection failed",
+                authentication: .unknown(.connectionFailure)
+            )
         }
+    }
+
+    private func authenticationAfterSuccessfulProbe(_ server: McpServerConfig) -> McpAuthenticationState {
+        McpAuthenticationPolicy.hasConfiguredCredential(server.headerPairs)
+            ? .signedIn
+            : .unknown(.unsupported)
     }
 
     private func post(
@@ -704,25 +1183,32 @@ actor McpProbeService {
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw ProbeFailure.message("Non-HTTP response") }
+        guard let http = response as? HTTPURLResponse else { throw ProbeFailure("Non-HTTP response") }
         guard (200..<300).contains(http.statusCode) else {
-            throw ProbeFailure.message("Server returned HTTP \(http.statusCode)")
+            throw ProbeFailure(
+                "Server returned HTTP \(http.statusCode)",
+                authentication: McpAuthenticationPolicy.stateForHTTPFailure(
+                    statusCode: http.statusCode,
+                    authenticateHeader: http.value(forHTTPHeaderField: "WWW-Authenticate"),
+                    hasConfiguredCredential: McpAuthenticationPolicy.hasConfiguredCredential(configuredHeaders)
+                )
+            )
         }
-        guard data.count <= Self.maximumResponseBytes else { throw ProbeFailure.message("Response exceeded 200 KB") }
+        guard data.count <= Self.maximumResponseBytes else { throw ProbeFailure("Response exceeded 200 KB") }
         let sessionID = http.value(forHTTPHeaderField: "Mcp-Session-Id") ?? sessionID
         guard !data.isEmpty else {
             if allowEmpty { return RPCReply(object: nil, sessionID: sessionID) }
-            throw ProbeFailure.message("Empty server response")
+            throw ProbeFailure("Empty server response")
         }
         let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? ""
         let object: Any
         if contentType.localizedCaseInsensitiveContains("text/event-stream") {
-            guard let eventData = lastSSEData(in: data) else { throw ProbeFailure.message("Invalid SSE response") }
+            guard let eventData = lastSSEData(in: data) else { throw ProbeFailure("Invalid SSE response") }
             object = try JSONSerialization.jsonObject(with: eventData)
         } else {
             object = try JSONSerialization.jsonObject(with: data)
         }
-        guard let dictionary = object as? [String: Any] else { throw ProbeFailure.message("Non-object JSON response") }
+        guard let dictionary = object as? [String: Any] else { throw ProbeFailure("Non-object JSON response") }
         return RPCReply(object: dictionary, sessionID: sessionID)
     }
 
@@ -754,6 +1240,21 @@ actor McpProbeService {
 
     private func safeInline(_ value: String) -> String {
         String(value.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F }.prefix(160))
+    }
+
+    private func toolSummary(
+        usable: Int,
+        advertised: Int,
+        disabled: [McpDisabledTool],
+        hasMore: Bool
+    ) -> String {
+        guard let first = disabled.first else {
+            return hasMore ? "Ready · \(usable)+ tools" : "Ready · \(usable) tools"
+        }
+        let moreDisabled = disabled.count > 1 ? " +\(disabled.count - 1) more" : ""
+        let advertisedText = hasMore ? "\(advertised)+" : "\(advertised)"
+        let message = "Ready · \(usable) usable of \(advertisedText) tools · \(disabled.count) disabled (\(first.name): \(first.reason)\(moreDisabled))"
+        return String(message.prefix(240))
     }
 }
 

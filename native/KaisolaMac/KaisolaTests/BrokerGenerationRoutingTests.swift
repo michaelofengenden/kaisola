@@ -244,11 +244,67 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         XCTAssertEqual(repeated, [])
     }
 
+    func testControllerReconnectReplacesAChildThatReportedDisconnect() async throws {
+        let topology = BrokerGenerationTopology(
+            current: makeTopology().current,
+            draining: []
+        )
+        let routes = BrokerGenerationRouteTable()
+        let connectionID = "33333333-3333-4333-8333-333333333333"
+        let failed = RoutingControlClient(connectionInstanceID: connectionID)
+        let replacement = RoutingControlClient(connectionInstanceID: connectionID)
+        let queue = ControlClientQueue([failed, replacement])
+        let control = BrokerGenerationControlRouter(
+            routes: routes,
+            connectionInstanceID: connectionID,
+            factory: { _ in queue.next() }
+        )
+        let signal = RoutingDisconnectSignal()
+        await control.setDisconnectHandler { error in
+            Task { await signal.record(error) }
+        }
+
+        try await control.connect(to: topology, ownerID: "owner")
+        await failed.simulateDisconnect()
+        for _ in 0..<100 {
+            if await signal.count > 0 { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let disconnectCount = await signal.count
+        XCTAssertEqual(disconnectCount, 1)
+
+        try await control.connect(to: topology, ownerID: "owner")
+        _ = try await control.createTerminal(
+            projectID: "project",
+            terminalID: "replacement-terminal",
+            command: "/bin/sh",
+            arguments: [],
+            cwd: "/tmp",
+            columns: 80,
+            rows: 24
+        )
+
+        let failedConnectCount = await failed.connectCount()
+        let replacementConnectCount = await replacement.connectCount()
+        let replacementCalls = await replacement.calls()
+        XCTAssertEqual(failedConnectCount, 1)
+        XCTAssertEqual(replacementConnectCount, 1)
+        XCTAssertEqual(replacementCalls, ["create:replacement-terminal"])
+    }
+
     func testDiagnosticsNameAppCurrentAndEveryDrainingBrokerVersion() {
         let topology = makeTopology()
+        let retirement = BrokerRetirementDiagnostic(
+            generationID: topology.draining[0].id,
+            pid: topology.draining[0].info.pid,
+            failureCount: 2,
+            reason: .shutdownTimedOut,
+            nextAttemptInSweeps: 4
+        )
         let detail = BrokerGenerationDiagnostics.detail(
             appVersion: "1.1.8",
-            topology: topology
+            topology: topology,
+            retirementDiagnostics: [retirement]
         )
 
         XCTAssertTrue(detail.contains("App 1.1.8"))
@@ -256,6 +312,17 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         XCTAssertTrue(detail.contains("Draining brokers: routing-test"))
         XCTAssertEqual(detail.components(separatedBy: "package routing-test").count - 1, 2)
         XCTAssertEqual(detail.components(separatedBy: "implementation 2").count - 1, 2)
+        XCTAssertTrue(detail.contains("Retirement skipped"))
+        XCTAssertTrue(detail.contains("safe handoff timed out"))
+        XCTAssertTrue(detail.contains("failure count 2"))
+        XCTAssertTrue(detail.contains("retry in 4 heartbeats"))
+
+        let staleDetail = BrokerGenerationDiagnostics.detail(
+            appVersion: "1.1.8",
+            topology: .single(topology.current.info),
+            retirementDiagnostics: [retirement]
+        )
+        XCTAssertFalse(staleDetail.contains("Retirement skipped"))
     }
 
     private func makeTopology() -> BrokerGenerationTopology {
@@ -427,6 +494,7 @@ private actor RoutingControlClient: BrokerControlServing {
     nonisolated let connectionInstanceID: String
     private var recordedCalls: [String] = []
     private var recordedDisconnectCount = 0
+    private var recordedConnectCount = 0
     private var disconnectHandler: (@Sendable (any Error) -> Void)?
 
     init(connectionInstanceID: String) {
@@ -437,7 +505,9 @@ private actor RoutingControlClient: BrokerControlServing {
         disconnectHandler = handler
     }
 
-    func connect(to info: BrokerInfo, ownerID: String) async throws {}
+    func connect(to info: BrokerInfo, ownerID: String) async throws {
+        recordedConnectCount += 1
+    }
 
     func createTerminal(
         projectID: String,
@@ -495,5 +565,17 @@ private actor RoutingControlClient: BrokerControlServing {
     }
 
     func calls() -> [String] { recordedCalls }
+    func connectCount() -> Int { recordedConnectCount }
     func disconnectCount() -> Int { recordedDisconnectCount }
+    func simulateDisconnect() {
+        disconnectHandler?(BrokerClientError.connectionClosed)
+    }
+}
+
+private actor RoutingDisconnectSignal {
+    private(set) var count = 0
+
+    func record(_ error: any Error) {
+        count += 1
+    }
 }

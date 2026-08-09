@@ -1038,8 +1038,23 @@ final class AcpConversation: ObservableObject {
 
     // MARK: - Persistent draft
 
+    /// The legacy `UserDefaults` mirror of the composer draft. It predates the
+    /// workspace draft store and still backs `loadDraft`, so a permanent delete
+    /// that only clears the workspace store leaves the unsent text readable in
+    /// preferences forever.
+    static func legacyDraftDefaultsKey(for draftKey: String) -> String {
+        "chatDraft.\(draftKey)"
+    }
+
+    /// Erase the legacy defaults draft for a permanently deleted surface.
+    /// Static because the surface usually has no live conversation by then —
+    /// a Recently Closed chat or a destroyed Mesh column only leaves its id.
+    static func removeLegacyDraft(draftKey: String) {
+        UserDefaults.standard.removeObject(forKey: legacyDraftDefaultsKey(for: draftKey))
+    }
+
     private var draftDefaultsKey: String? {
-        draftStorageKey.map { "chatDraft.\($0)" }
+        draftStorageKey.map(Self.legacyDraftDefaultsKey(for:))
     }
 
     /// The composer draft persisted for this chat, or "" when none exists or the
@@ -1071,6 +1086,20 @@ final class AcpConversation: ObservableObject {
             self.pendingDraftPersistence = nil
             self.onDraftChanged?(pending)
         }
+    }
+
+    /// Drop the draft, its buffered write, and the key that names it. Called on
+    /// the permanent-delete boundary: clearing the stored text is not enough on
+    /// its own, because the composer tearing down one frame later can call
+    /// `saveDraft` and write the same plaintext straight back. Losing the key
+    /// makes every later save a no-op, exactly as for an unkeyed chat.
+    func forgetPersistentDraft() {
+        if let draftStorageKey { Self.removeLegacyDraft(draftKey: draftStorageKey) }
+        draftStorageKey = nil
+        restoredDraft = nil
+        pendingDraftPersistence = nil
+        draftPersistenceTask?.cancel()
+        draftPersistenceTask = nil
     }
 
     // MARK: - Test hooks

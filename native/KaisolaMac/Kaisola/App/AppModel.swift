@@ -270,6 +270,8 @@ final class AppModel: ObservableObject {
     private let transcriptStore: AcpTranscriptStore
     private let usageCenter: UsageCenter
     private let attentionCenter: AttentionCenter
+    private let chatDraftDefaults: UserDefaults
+    private let migratedChatDraftDefaults: UserDefaults?
     private let reconnectBackoff: BrokerReconnectBackoff
     private let sleep: @Sendable (UInt64) async throws -> Void
     private let jitter: @Sendable () -> Double
@@ -364,6 +366,10 @@ final class AppModel: ObservableObject {
         adoptionStore: SessionAdoptionStore = SessionAdoptionStore(),
         usageCenter: UsageCenter = .shared,
         attentionCenter: AttentionCenter = .shared,
+        chatDraftDefaults: UserDefaults = .standard,
+        migratedChatDraftDefaults: UserDefaults? = UserDefaults(
+            suiteName: KaisolaProductMigration.legacyBundleIdentifier
+        ),
         reconnectBackoff: BrokerReconnectBackoff = BrokerReconnectBackoff(),
         sleep: @escaping @Sendable (UInt64) async throws -> Void = {
             try await Task.sleep(nanoseconds: $0)
@@ -384,6 +390,8 @@ final class AppModel: ObservableObject {
         self.adoptionStore = adoptionStore
         self.usageCenter = usageCenter
         self.attentionCenter = attentionCenter
+        self.chatDraftDefaults = chatDraftDefaults
+        self.migratedChatDraftDefaults = migratedChatDraftDefaults
         self.reconnectBackoff = reconnectBackoff
         self.sleep = sleep
         self.jitter = jitter
@@ -2560,17 +2568,34 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func enqueueDraftRemoval(chatID: String) {
+    @discardableResult
+    private func enqueueDraftRemoval(chatID: String) -> Task<Void, Never> {
         enqueueDraftRemoval(stableKey: "chat|\(chatID)")
     }
 
-    private func enqueueDraftRemoval(stableKey: String) {
+    @discardableResult
+    private func enqueueDraftRemoval(stableKey: String) -> Task<Void, Never> {
         let previous = draftPersistenceTask
         let workspaceStateStore = workspaceStateStore
-        draftPersistenceTask = Task {
+        let removalTask = Task {
             await previous?.value
             try? await workspaceStateStore.removeDraft(stableKey: stableKey)
         }
+        draftPersistenceTask = removalTask
+        return removalTask
+    }
+
+    /// The durable deletion intent has already committed before this runs.
+    /// Serialize the workspace removal behind older saves, and synchronously
+    /// clear AcpConversation's current and migrated UserDefaults copies so no
+    /// superseded location can restore plaintext on relaunch.
+    private func removeChatDraftsAfterDeletionCommit(chatID: String) async {
+        AcpConversation.removePersistedDraft(
+            for: chatID,
+            currentDefaults: chatDraftDefaults,
+            migratedDefaults: migratedChatDraftDefaults
+        )
+        await enqueueDraftRemoval(chatID: chatID).value
     }
 
     private static func terminalDraftStableKey(_ terminalID: String) -> String {
@@ -3395,7 +3420,7 @@ final class AppModel: ObservableObject {
         // content on disk forever when usage bookkeeping said "shared".
         _ = forgetDurableChat
         let removalResult = await enqueueTranscriptRemoval(chatID: chatID).value
-        enqueueDraftRemoval(chatID: chatID)
+        await removeChatDraftsAfterDeletionCommit(chatID: chatID)
         // The workspace archive must reflect the deletion durably NOW, not
         // after a 220 ms debounce a crash can beat (§4e).
         if let projectID = closingChat?.projectID {
@@ -3861,7 +3886,7 @@ final class AppModel: ObservableObject {
             explicitlyClosedChatIDs.insert(surfaceID)
             usageCenter.remove(chatID: surfaceID)
             let transcriptRemoval = await enqueueTranscriptRemoval(chatID: surfaceID).value
-            enqueueDraftRemoval(chatID: surfaceID)
+            await removeChatDraftsAfterDeletionCommit(chatID: surfaceID)
             await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
             if case let .failed(error) = transcriptRemoval {
                 return .blocked(

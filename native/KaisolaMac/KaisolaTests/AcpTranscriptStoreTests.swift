@@ -107,6 +107,8 @@ final class AcpTranscriptStoreTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: directory) }
         let legacyURL = directory.appendingPathComponent("transcripts.json")
         let chatID = "crash-after-tombstone"
+        let secretMarker = "KAISOLA_TRANSCRIPT_SECRET_499_E7C6B3A1"
+        let secretMarkerData = Data(secretMarker.utf8)
         let databaseURL: URL
 
         do {
@@ -114,14 +116,18 @@ final class AcpTranscriptStoreTests: XCTestCase {
             databaseURL = store.databaseURL
             await store.scheduleSave(
                 [
-                    .user(id: "1", text: "sensitive prompt", failed: false),
+                    .user(id: "1", text: "sensitive prompt " + secretMarker, failed: false),
                     .message(id: "2", text: "sensitive response"),
                 ],
                 for: chatID,
                 now: 1
             )
-            await store.scheduleDraft("sensitive draft", for: chatID, now: 2)
+            await store.scheduleDraft("sensitive draft " + secretMarker, for: chatID, now: 2)
             await store.flush()
+            XCTAssertNotNil(
+                try Data(contentsOf: databaseURL).range(of: secretMarkerData),
+                "The forensic fixture must prove the raw marker reached SQLite before deletion"
+            )
 
             // Crash injection point: the durable intent landed, but the
             // normal queued remove(chatID:) phase never ran.
@@ -153,6 +159,10 @@ final class AcpTranscriptStoreTests: XCTestCase {
             try sqliteCount("SELECT COUNT(*) FROM deleted_chats", databaseURL: databaseURL),
             0,
             "Only a completed physical deletion may vacuum its tombstone"
+        )
+        XCTAssertNil(
+            try Data(contentsOf: databaseURL).range(of: secretMarkerData),
+            "Launch recovery must overwrite deleted transcript and draft content in SQLite pages"
         )
         let restored = await relaunched.entry(for: chatID)
         XCTAssertNil(restored)

@@ -522,6 +522,7 @@ actor AcpTranscriptStore {
             try secureDatabaseFile()
             try execute("PRAGMA foreign_keys = ON", database: database)
             try execute("PRAGMA trusted_schema = OFF", database: database)
+            try enableSecureDeletion(database)
             try execute("PRAGMA journal_mode = DELETE", database: database)
             try execute("PRAGMA synchronous = FULL", database: database)
             _ = sqlite3_busy_timeout(database.pointer, 3_000)
@@ -994,6 +995,17 @@ actor AcpTranscriptStore {
             let detail = message.map { String(cString: $0) } ?? Self.errorMessage(database.pointer)
             sqlite3_free(message)
             throw StoreError.database(detail)
+        }
+    }
+
+    private func enableSecureDeletion(_ database: SQLiteHandle) throws {
+        try execute("PRAGMA secure_delete = ON", database: database)
+        let isEnabled = try withStatement("PRAGMA secure_delete", database: database) { statement in
+            guard try stepRow(statement, database: database) else { return false }
+            return sqlite3_column_int(statement, 0) == 1
+        }
+        guard isEnabled else {
+            throw StoreError.database("SQLite secure-delete policy could not be enabled")
         }
     }
 

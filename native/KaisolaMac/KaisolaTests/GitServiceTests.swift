@@ -578,6 +578,68 @@ final class GitServiceTests: XCTestCase {
         XCTAssertFalse(status.isClean)
     }
 
+    func testStatusPreservesNULTerminatedHostilePathnamesAcrossPartialStaging() throws {
+        let hostilePaths = [
+            "space name.txt",
+            "tab\tname.txt",
+            "line\nbreak.txt",
+            "quote\"name.txt",
+            "back\\slash.txt",
+            "café_日本🙂.txt",
+        ]
+        for path in hostilePaths {
+            try write(path, "base\n")
+        }
+        try git(["add", "--"] + hostilePaths)
+        try git(["commit", "-q", "-m", "hostile path base"])
+
+        for path in hostilePaths {
+            try write(path, "staged\n")
+            try git(["add", "--", path])
+            try write(path, "staged\nunstaged\n")
+            try write("loose-\(path)", "untracked\n")
+        }
+
+        let status = try GitService(repoRoot: repo).status()
+
+        XCTAssertEqual(Set(status.staged.map(\.path)), Set(hostilePaths))
+        XCTAssertEqual(Set(status.unstaged.map(\.path)), Set(hostilePaths))
+        XCTAssertEqual(Set(status.untracked), Set(hostilePaths.map { "loose-\($0)" }))
+        XCTAssertEqual(status.stagedStats, .init(additions: 6, deletions: 6, textFiles: 6))
+        XCTAssertEqual(status.unstagedStats, .init(additions: 6, textFiles: 6))
+        XCTAssertEqual(status.combinedStats, .init(additions: 12, deletions: 6, textFiles: 6))
+    }
+
+    func testStatusParsesEveryUsedNULRecordAndCopySourcePath() {
+        let hash = String(repeating: "a", count: 40)
+        let output = [
+            "# branch.head feature/path",
+            "# branch.ab +2 -3",
+            "1 M. N... 100644 100644 100644 \(hash) \(hash) ordinary path",
+            "2 C. N... 100644 100644 100644 \(hash) \(hash) C100 copy\tdestination",
+            "copy\nsource",
+            "u UU N... 100644 100644 100644 100644 \(hash) \(hash) \(hash) conflict\\path",
+            "? loose\tpath",
+            "! ignored path",
+        ].joined(separator: "\0") + "\0"
+
+        let status = GitService.parseStatus(output)
+
+        XCTAssertEqual(status.branch, "feature/path")
+        XCTAssertEqual(status.ahead, 2)
+        XCTAssertEqual(status.behind, 3)
+        XCTAssertEqual(
+            status.staged,
+            [
+                .init(path: "ordinary path", code: "M"),
+                .init(path: "copy\tdestination", code: "C", originalPath: "copy\nsource"),
+                .init(path: "conflict\\path", code: "U"),
+            ]
+        )
+        XCTAssertEqual(status.unstaged, [.init(path: "conflict\\path", code: "U")])
+        XCTAssertEqual(status.untracked, ["loose\tpath"])
+    }
+
     func testStatusMatchesNumstatForPartiallyStagedNoNewlineEdits() throws {
         try write("partial.txt", "alpha\nkeep\nomega")
         try git(["add", "partial.txt"])
@@ -640,8 +702,8 @@ final class GitServiceTests: XCTestCase {
 
         let status = try GitService(repoRoot: repo).status()
 
-        XCTAssertEqual(status.staged, [.init(path: "new.txt", code: "R")])
-        XCTAssertEqual(status.unstaged, [.init(path: "new.txt", code: "M")])
+        XCTAssertEqual(status.staged, [.init(path: "new.txt", code: "R", originalPath: "old.txt")])
+        XCTAssertEqual(status.unstaged, [.init(path: "new.txt", code: "M", originalPath: "old.txt")])
         try assertStatsMatchGit(
             status.stagedStats,
             arguments: ["diff", "--cached", "--numstat", "--find-renames=50%"]
@@ -651,6 +713,29 @@ final class GitServiceTests: XCTestCase {
             status.combinedStats,
             arguments: ["diff", "HEAD", "--numstat", "--find-renames=50%"]
         )
+        XCTAssertEqual(status.stagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(status.unstagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(status.combinedStats, .init(additions: 2, deletions: 2, textFiles: 1))
+    }
+
+    func testStatusPreservesHostileRenameSourceDestinationAndStats() throws {
+        let source = "old path\tline\n\"café\\.txt"
+        let destination = "new path\tline\n\"日本\\.txt"
+        try write(source, (1 ... 10).map { "line \($0)" }.joined(separator: "\n") + "\n")
+        try git(["add", "--", source])
+        try git(["commit", "-q", "-m", "rename base"])
+        try git(["mv", "--", source, destination])
+        try write(destination, "STAGED\n" + (2 ... 10).map { "line \($0)" }.joined(separator: "\n") + "\n")
+        try git(["add", "-A"])
+        try write(
+            destination,
+            "STAGED\n" + (2 ... 9).map { "line \($0)" }.joined(separator: "\n") + "\nUNSTAGED\n"
+        )
+
+        let status = try GitService(repoRoot: repo).status()
+
+        XCTAssertEqual(status.staged, [.init(path: destination, code: "R", originalPath: source)])
+        XCTAssertEqual(status.unstaged, [.init(path: destination, code: "M", originalPath: source)])
         XCTAssertEqual(status.stagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
         XCTAssertEqual(status.unstagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
         XCTAssertEqual(status.combinedStats, .init(additions: 2, deletions: 2, textFiles: 1))

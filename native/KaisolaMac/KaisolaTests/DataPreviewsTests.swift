@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -138,6 +139,43 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertFalse(result.truncation.rowsWereTruncated)
         XCTAssertFalse(result.truncation.columnsWereTruncated)
         XCTAssertNil(result.truncation.notice)
+    }
+
+    // MARK: - CSV cell inspection
+
+    func testCsvCellInspectionPreservesTheCompleteAccessibleValue() {
+        let value = String(repeating: "long-value-", count: 100) + "終"
+        let inspection = CsvCellInspection(rowIndex: 7, columnIndex: 3, value: value)
+
+        XCTAssertEqual(inspection.value, value)
+        XCTAssertEqual(inspection.accessibilityLabel, "Row 8, column 4")
+        XCTAssertEqual(inspection.accessibilityValue, value)
+        XCTAssertEqual(
+            inspection.accessibilityHint,
+            "Press Return to inspect the complete value and copy it."
+        )
+        XCTAssertEqual(
+            CsvCellInspection(rowIndex: 8, columnIndex: 4, value: "").accessibilityValue,
+            "Empty cell"
+        )
+    }
+
+    func testCsvCellInspectionIdentityUsesCoordinatesRatherThanTruncatedText() {
+        let original = CsvCellInspection(rowIndex: 2, columnIndex: 5, value: "before")
+        let updated = CsvCellInspection(rowIndex: 2, columnIndex: 5, value: "after")
+        let neighbor = CsvCellInspection(rowIndex: 2, columnIndex: 6, value: "before")
+
+        XCTAssertEqual(original.id, updated.id)
+        XCTAssertNotEqual(original.id, neighbor.id)
+    }
+
+    func testCsvCellClipboardCopiesTheCompleteValueToAnIsolatedPasteboard() {
+        let pasteboard = NSPasteboard(name: .init("kaisola-csv-cell-inspection-tests"))
+        defer { pasteboard.clearContents() }
+        let value = "first line\nsecond\tcolumn\nUnicode: café 終"
+
+        XCTAssertTrue(CsvCellClipboard.copy(value, to: pasteboard))
+        XCTAssertEqual(pasteboard.string(forType: .string), value)
     }
 
     // MARK: - Delimiter detection

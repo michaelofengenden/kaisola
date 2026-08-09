@@ -271,6 +271,47 @@ struct CsvPreviewModel: Equatable, Sendable {
     }
 }
 
+/// Stable, lossless metadata for one visible CSV cell. The coordinate-based
+/// identity keeps duplicate values distinct and remains stable while a value is
+/// disclosed; the full source value never depends on the table's visual
+/// truncation.
+struct CsvCellInspection: Equatable, Sendable, Identifiable {
+    struct ID: Hashable, Sendable {
+        let rowIndex: Int
+        let columnIndex: Int
+    }
+
+    let id: ID
+    let value: String
+
+    init(rowIndex: Int, columnIndex: Int, value: String) {
+        id = ID(rowIndex: rowIndex, columnIndex: columnIndex)
+        self.value = value
+    }
+
+    var accessibilityLabel: String {
+        "Row \(id.rowIndex + 1), column \(id.columnIndex + 1)"
+    }
+
+    var accessibilityValue: String {
+        value.isEmpty ? "Empty cell" : value
+    }
+
+    var accessibilityHint: String {
+        "Press Return to inspect the complete value and copy it."
+    }
+}
+
+/// A small seam keeps exact-value clipboard behavior deterministic in tests and
+/// lets the UI surface pasteboard refusal instead of claiming a copy succeeded.
+enum CsvCellClipboard {
+    @discardableResult
+    static func copy(_ value: String, to pasteboard: NSPasteboard = .general) -> Bool {
+        pasteboard.clearContents()
+        return pasteboard.setString(value, forType: .string)
+    }
+}
+
 /// A scrollable table for CSV/TSV text. The first row is styled as a header;
 /// cells are monospaced 12pt with fixed per-column widths so columns align
 /// across a vertically lazy list. Delimiter is auto-detected.
@@ -281,6 +322,8 @@ struct CsvPreview: View {
     @State private var cache = PreviewParseCache<CsvPreviewModel>()
     @State private var model: CsvPreviewModel?
     @State private var preparedIdentity: PreviewParseIdentity?
+    @State private var inspectedCell: CsvCellInspection?
+    @FocusState private var focusedCellID: CsvCellInspection.ID?
 
     private static let cellFont = Font.system(size: 12, design: .monospaced)
 
@@ -295,6 +338,10 @@ struct CsvPreview: View {
             }
         }
         .task(id: identity) {
+            // A retargeted preview must never keep disclosing a value from the
+            // previous document while its replacement is parsing.
+            inspectedCell = nil
+            focusedCellID = nil
             let source = text
             let parsed = await cache.value(for: source, parse: CsvPreviewModel.make)
             guard !Task.isCancelled else { return }
@@ -317,7 +364,12 @@ struct CsvPreview: View {
                 ScrollView([.horizontal, .vertical]) {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(model.rows.enumerated()), id: \.offset) { index, row in
-                            rowView(row, columnWidths: model.columnWidths, isHeader: index == 0)
+                            rowView(
+                                row,
+                                rowIndex: index,
+                                columnWidths: model.columnWidths,
+                                isHeader: index == 0
+                            )
                             Divider()
                         }
                     }
@@ -327,31 +379,131 @@ struct CsvPreview: View {
         }
     }
 
-    private func rowView(_ row: [String], columnWidths: [CGFloat], isHeader: Bool) -> some View {
+    private func rowView(
+        _ row: [String],
+        rowIndex: Int,
+        columnWidths: [CGFloat],
+        isHeader: Bool
+    ) -> some View {
         HStack(spacing: 0) {
             ForEach(Array(columnWidths.enumerated()), id: \.offset) { column, width in
-                cell(column < row.count ? row[column] : "", width: width, isHeader: isHeader)
+                cell(
+                    CsvCellInspection(
+                        rowIndex: rowIndex,
+                        columnIndex: column,
+                        value: column < row.count ? row[column] : ""
+                    ),
+                    width: width,
+                    isHeader: isHeader
+                )
             }
         }
         .background(isHeader ? Color.secondary.opacity(0.15) : Color.clear)
     }
 
-    private func cell(_ value: String, width: CGFloat, isHeader: Bool) -> some View {
-        Text(value)
-            .font(Self.cellFont)
-            .fontWeight(isHeader ? .semibold : .regular)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .textSelection(.enabled)
-            .padding(.horizontal, CsvPreviewModel.cellPadding)
-            .padding(.vertical, 5)
-            .frame(width: width, alignment: .leading)
-            // A trailing hairline as a column separator; an overlay matches the
-            // cell's height exactly, avoiding the ambiguity a bare Divider has
-            // inside an HStack.
-            .overlay(alignment: .trailing) {
-                Rectangle().fill(Color.primary.opacity(0.08)).frame(width: 1)
+    private func cell(
+        _ inspection: CsvCellInspection,
+        width: CGFloat,
+        isHeader: Bool
+    ) -> some View {
+        Button {
+            inspectedCell = inspection
+        } label: {
+            Text(inspection.value)
+                .font(Self.cellFont)
+                .fontWeight(isHeader ? .semibold : .regular)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .padding(.horizontal, CsvPreviewModel.cellPadding)
+                .padding(.vertical, 5)
+                .frame(width: width, alignment: .leading)
+                .contentShape(Rectangle())
+                // A trailing hairline as a column separator; an overlay matches
+                // the cell's height exactly, avoiding the ambiguity a bare
+                // Divider has inside an HStack.
+                .overlay(alignment: .trailing) {
+                    Rectangle().fill(Color.primary.opacity(0.08)).frame(width: 1)
+                }
+                .overlay {
+                    if focusedCellID == inspection.id {
+                        RoundedRectangle(cornerRadius: 2)
+                            .stroke(Color.accentColor, lineWidth: 2)
+                            .padding(1)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .focused($focusedCellID, equals: inspection.id)
+        .help("Inspect complete cell value")
+        .accessibilityLabel(inspection.accessibilityLabel)
+        .accessibilityValue(inspection.accessibilityValue)
+        .accessibilityHint(inspection.accessibilityHint)
+        .accessibilityAction(named: Text("Copy Cell")) {
+            copyCell(inspection)
+        }
+        .contextMenu {
+            Button("Copy Cell") { copyCell(inspection) }
+        }
+        .popover(isPresented: inspectionBinding(for: inspection), arrowEdge: .bottom) {
+            cellInspector(inspection)
+        }
+    }
+
+    private func inspectionBinding(for inspection: CsvCellInspection) -> Binding<Bool> {
+        Binding(
+            get: { inspectedCell?.id == inspection.id },
+            set: { isPresented in
+                if !isPresented, inspectedCell?.id == inspection.id {
+                    inspectedCell = nil
+                }
             }
+        )
+    }
+
+    private func cellInspector(_ inspection: CsvCellInspection) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Complete Cell Value")
+                        .font(.headline)
+                    Text(inspection.accessibilityLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Copy Cell") { copyCell(inspection) }
+                    .keyboardShortcut("c", modifiers: .command)
+                Button("Done") { inspectedCell = nil }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(12)
+            Divider()
+            ScrollView([.horizontal, .vertical]) {
+                if inspection.value.isEmpty {
+                    Text("Empty cell")
+                        .foregroundStyle(.secondary)
+                        .padding(12)
+                } else {
+                    Text(inspection.value)
+                        .font(Self.cellFont)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: true, vertical: true)
+                        .padding(12)
+                        .accessibilityLabel("Complete cell value")
+                        .accessibilityValue(inspection.value)
+                }
+            }
+            .frame(minWidth: 360, idealWidth: 520, maxWidth: 640)
+            .frame(minHeight: 160, idealHeight: 280, maxHeight: 420)
+        }
+    }
+
+    private func copyCell(_ inspection: CsvCellInspection) {
+        if CsvCellClipboard.copy(inspection.value) {
+            ToastCenter.shared.show("Copied cell", style: .success)
+        } else {
+            ToastCenter.shared.show("Could not copy cell", style: .error)
+        }
     }
 
     private func truncationNotice(_ notice: String) -> some View {

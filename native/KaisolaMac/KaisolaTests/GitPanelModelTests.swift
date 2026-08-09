@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -431,6 +432,165 @@ final class GitPanelModelTests: XCTestCase {
         ))
     }
 
+    // MARK: - Recovering from a confirm that stopped part way
+
+    /// Confirming is three side effects in a row and only the last can simply be
+    /// run again. Each completed phase is recorded and named, so a run that
+    /// forked a branch or pushed it before failing says so instead of collapsing
+    /// into one generic operation error.
+    func testCompletedPhasesNameEverySideEffectTheRunLeftBehind() {
+        let nothing = PRExecutionProgress()
+        XCTAssertFalse(nothing.hasSideEffects)
+        XCTAssertEqual(nothing.completedPhases, [])
+        XCTAssertNil(nothing.recoveryNote)
+
+        var forked = PRExecutionProgress()
+        forked.createdBranch = "kaisola/pr-branch"
+        XCTAssertTrue(forked.hasSideEffects)
+        XCTAssertEqual(forked.completedPhases, ["Created branch kaisola/pr-branch"])
+        XCTAssertEqual(
+            forked.recoveryNote,
+            "Created branch kaisola/pr-branch. The pull request was not opened."
+        )
+
+        var pushed = forked
+        pushed.pushedBranch = "kaisola/pr-branch"
+        pushed.pushedHeadOID = String(repeating: "a", count: 40)
+        pushed.remoteBranchURL = "https://github.com/acme/widget/tree/kaisola/pr-branch"
+        XCTAssertEqual(pushed.completedPhases, [
+            "Created branch kaisola/pr-branch",
+            "Pushed kaisola/pr-branch to the remote",
+        ])
+        XCTAssertEqual(
+            pushed.recoveryNote,
+            "Created branch kaisola/pr-branch. Pushed kaisola/pr-branch to the remote. "
+                + "The pull request was not opened."
+        )
+    }
+
+    /// Retry resumes rather than restarts: a phase that already landed is
+    /// skipped (a second `checkout -b` only fails), but a push is skipped only
+    /// while the remote already has that branch at this exact commit.
+    func testRetrySkipsCompletedPhasesButNeverASupersededPush() throws {
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "a", count: 40),
+            requestedBranchName: "kaisola/pr-branch", commitSubjects: ["work"], changedFileCount: 1
+        )
+
+        var progress = PRExecutionProgress()
+        XCTAssertTrue(progress.needsBranchCreation(for: plan))
+        XCTAssertTrue(progress.needsPush(for: plan))
+        XCTAssertEqual(
+            progress.remainingWork(for: plan),
+            "create branch kaisola/pr-branch, then push kaisola/pr-branch to origin, "
+                + "then open the pull request against main"
+        )
+
+        progress.createdBranch = "kaisola/pr-branch"
+        XCTAssertFalse(progress.needsBranchCreation(for: plan))
+        XCTAssertTrue(progress.needsPush(for: plan))
+        XCTAssertEqual(
+            progress.remainingWork(for: plan),
+            "push kaisola/pr-branch to origin, then open the pull request against main"
+        )
+
+        progress.pushedBranch = "kaisola/pr-branch"
+        progress.pushedHeadOID = plan.headOID
+        XCTAssertFalse(progress.needsPush(for: plan))
+        XCTAssertEqual(progress.remainingWork(for: plan), "open the pull request against main")
+
+        // The same branch name at a newer commit is not the branch that was
+        // pushed: skipping the push there would open a pull request missing the
+        // work the review promised.
+        var moved = plan
+        moved.headOID = String(repeating: "b", count: 40)
+        XCTAssertTrue(progress.needsPush(for: moved))
+    }
+
+    /// "Review Again" after a half-finished run keeps the completed phases the
+    /// fresh plan still stands on, and forgets the ones it does not.
+    func testProgressCarriedIntoAFreshPlanKeepsOnlyWhatStillHolds() throws {
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "kaisola/pr-branch", isDefault: false, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "c", count: 40),
+            requestedBranchName: "", commitSubjects: ["work"], changedFileCount: 1
+        )
+        var progress = PRExecutionProgress()
+        progress.createdBranch = "kaisola/pr-branch"
+        progress.pushedBranch = "kaisola/pr-branch"
+        progress.pushedHeadOID = plan.headOID
+        progress.remoteBranchURL = "https://github.com/acme/widget/tree/kaisola/pr-branch"
+
+        let sameCommit = progress.carriedForward(into: plan)
+        XCTAssertEqual(sameCommit, progress, "a re-review of the same commit still knows the branch is pushed")
+
+        // A commit landed and the user reviewed again: the branch is still
+        // theirs, but what sits on the remote no longer covers this plan.
+        var newer = plan
+        newer.headOID = String(repeating: "d", count: 40)
+        let carried = progress.carriedForward(into: newer)
+        XCTAssertEqual(carried.createdBranch, "kaisola/pr-branch")
+        XCTAssertNil(carried.pushedBranch)
+        XCTAssertNil(carried.pushedHeadOID)
+        XCTAssertNil(carried.remoteBranchURL)
+        XCTAssertTrue(carried.needsPush(for: newer))
+
+        // A plan for a different branch keeps none of it.
+        var other = plan
+        other.headBranch = "kaisola/other"
+        XCTAssertEqual(progress.carriedForward(into: other), PRExecutionProgress())
+    }
+
+    /// The fork a half-finished confirm made is the plan running, not the
+    /// repository drifting away from it. Reading it as staleness is exactly what
+    /// left the user on a new branch with no way to retry.
+    func testAForkThisPlanItselfMadeDoesNotCountAsStaleness() throws {
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "8", count: 40),
+            requestedBranchName: "kaisola/pr-branch", commitSubjects: ["work"], changedFileCount: 1
+        )
+        let oid = String(repeating: "8", count: 40)
+        XCTAssertTrue(plan.createsBranch)
+
+        // Before the fork runs, standing on the head branch is somebody else's
+        // checkout and must still be refused.
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: oid, currentBranch: plan.headBranch
+        ))
+        XCTAssertTrue(GitPRPlanner.isStale(
+            plan: plan, currentHeadOID: oid, currentBranch: plan.headBranch
+        ))
+
+        // Once this plan's own fork landed, that branch IS where the retry must
+        // be standing.
+        XCTAssertNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: oid, currentBranch: plan.headBranch,
+            completedBranchCreation: true
+        ))
+        XCTAssertFalse(GitPRPlanner.isStale(
+            plan: plan, currentHeadOID: oid, currentBranch: plan.headBranch,
+            completedBranchCreation: true
+        ))
+
+        // It licenses that branch and nothing else: going back to the base, or
+        // off to a third branch, still refuses.
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: oid, currentBranch: plan.baseBranch,
+            completedBranchCreation: true
+        ))
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: oid, currentBranch: "someone/else",
+            completedBranchCreation: true
+        ))
+        // And a moved HEAD is still a moved HEAD.
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: String(repeating: "9", count: 40),
+            currentBranch: plan.headBranch, completedBranchCreation: true
+        ))
+    }
+
     // MARK: - Live model behavior
 
     /// The first click must assemble a review and execute NOTHING: no fork, no
@@ -491,6 +651,96 @@ final class GitPanelModelTests: XCTestCase {
         let sawStage = pump(until: { model.status?.staged.isEmpty == false }, timeout: 12)
         XCTAssertTrue(sawStage, "an external `git add` must refresh the panel through the watcher")
         XCTAssertEqual(model.status?.staged.map(\.path), ["b.txt"])
+    }
+
+    @MainActor
+    func testExternalStagePublishesFileStateAndAllCountersAtomically() throws {
+        try write("tracked.txt", "one\ntwo\n")
+        try git(["add", "tracked.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("tracked.txt", "ONE\ntwo\n")
+        try git(["add", "tracked.txt"])
+        try write("tracked.txt", "ONE\nTWO\n")
+
+        let model = GitPanelModel(repoRoot: repo)
+        var published: [GitService.Status] = []
+        let observation = model.$status.compactMap { $0 }.sink { published.append($0) }
+        defer { observation.cancel() }
+        model.startWatching()
+        defer { model.stopWatching() }
+        XCTAssertTrue(pump(until: { model.status != nil }, timeout: 10))
+        let before = try XCTUnwrap(model.status)
+        XCTAssertEqual(before.stagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(before.unstagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(before.combinedStats, .init(additions: 2, deletions: 2, textFiles: 1))
+
+        try git(["add", "tracked.txt"])
+        XCTAssertTrue(
+            pump(until: {
+                model.status?.stagedStats == .init(additions: 2, deletions: 2, textFiles: 1)
+                    && model.status?.unstaged.isEmpty == true
+            }, timeout: 12),
+            "the Git-directory watcher should publish the externally staged snapshot"
+        )
+        let after = try XCTUnwrap(model.status)
+        XCTAssertEqual(after.staged.map(\.path), ["tracked.txt"])
+        XCTAssertTrue(after.unstaged.isEmpty)
+        XCTAssertEqual(after.unstagedStats, .empty)
+        XCTAssertEqual(after.combinedStats, .init(additions: 2, deletions: 2, textFiles: 1))
+        XCTAssertTrue(
+            published.allSatisfy { $0 == before || $0 == after },
+            "status lists and all counters must move as one published value"
+        )
+    }
+
+    func testBinaryStatsRenderingNeverInventsLineCounts() {
+        XCTAssertEqual(
+            GitStatsRendering.summary(.init(binaryFiles: 1)),
+            "1 binary"
+        )
+        XCTAssertEqual(
+            GitStatsRendering.summary(.init(additions: 3, deletions: 2, textFiles: 1, binaryFiles: 1)),
+            "+3 −2 · 1 binary"
+        )
+        XCTAssertNil(GitStatsRendering.summary(.empty))
+    }
+
+    @MainActor
+    func testRejectingCommitMessageHookKeepsDraftAndStagedIndexVisible() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let headBeforeCommit = try gitOutput(["rev-parse", "HEAD"])
+        try write("pending.txt", "keep staged\n")
+        try git(["add", "pending.txt"])
+        try installCommitMessageHook(
+            """
+            #!/bin/sh
+            printf '%s\n' 'panel hook stdout'
+            printf '%s\n' 'panel hook stderr' >&2
+            exit 41
+            """
+        )
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.refresh()
+        XCTAssertTrue(pump(until: { model.status?.staged.map(\.path) == ["pending.txt"] }, timeout: 10))
+        model.commitMessage = "keep my draft"
+        model.commit()
+        XCTAssertTrue(pump(until: { model.errorMessage != nil && !model.isBusy }, timeout: 10))
+
+        XCTAssertEqual(model.commitMessage, "keep my draft")
+        XCTAssertEqual(model.status?.staged.map(\.path), ["pending.txt"])
+        XCTAssertFalse(model.errorIsRetryable)
+        XCTAssertTrue(model.errorMessage?.contains("git commit exited with status 1") == true)
+        XCTAssertTrue(model.errorMessage?.contains("panel hook stdout") == true)
+        XCTAssertTrue(model.errorMessage?.contains("panel hook stderr") == true)
+        XCTAssertEqual(try gitOutput(["rev-parse", "HEAD"]), headBeforeCommit)
+        XCTAssertEqual(
+            try gitOutput(["diff", "--cached", "--name-only"])
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "pending.txt"
+        )
     }
 
     /// The review card must self-invalidate: a background refresh (an external
@@ -604,7 +854,240 @@ final class GitPanelModelTests: XCTestCase {
         )
     }
 
+    // MARK: - Commit gating (Return must not bypass the disabled button)
+
+    /// Return in the message field calls `commit()` directly, so `commit()` —
+    /// not the button's `.disabled` modifier — is what has to refuse an invalid
+    /// commit. HEAD alone cannot prove this: `GitService.commit` rejects a blank
+    /// message itself, so an ungated submit leaves HEAD where it was and only
+    /// shows up as a failed git run. What each case asserts instead is that no
+    /// git operation ever *starts*: `perform` flips `isBusy` synchronously, so
+    /// an ungated `commit()` is observable the instant it returns.
+    @MainActor
+    func testReturnDoesNotCommitWhenTheCommitButtonWouldBeDisabled() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("b.txt", "two\n")
+        try git(["add", "b.txt"])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.refresh()
+        XCTAssertTrue(pump(until: { model.status != nil && !model.isBusy }, timeout: 10))
+        XCTAssertEqual(model.status?.staged.map(\.path), ["b.txt"])
+
+        // Blank message, with a file staged.
+        model.commitMessage = ""
+        XCTAssertFalse(model.canCommit)
+        model.commit()
+        XCTAssertFalse(model.isBusy, "a blank-message Return must not start a git commit")
+
+        // Whitespace-only message (spaces, a tab, a newline).
+        model.commitMessage = "  \t \n "
+        XCTAssertFalse(model.canCommit)
+        model.commit()
+        XCTAssertFalse(model.isBusy, "a whitespace-only Return must not start a git commit")
+
+        // A perfectly good message, but nothing staged.
+        try git(["reset", "-q"])
+        model.refresh()
+        XCTAssertTrue(pump(until: { model.status?.staged.isEmpty == true && !model.isBusy }, timeout: 10))
+        model.commitMessage = "a perfectly good message"
+        XCTAssertFalse(model.canCommit)
+        model.commit()
+        XCTAssertFalse(model.isBusy, "Return with nothing staged must not start a git commit")
+
+        // None of the three reached git: no failure surfaced, HEAD never moved.
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(commitCount(), "1")
+    }
+
+    /// The busy case: a git operation already in flight must swallow a Return so
+    /// a second git process cannot overlap the first, and the typed message has
+    /// to survive the swallowed submit.
+    @MainActor
+    func testReturnIsIgnoredWhileAnotherGitOperationIsInFlight() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("b.txt", "two\n")
+        try git(["add", "b.txt"])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.refresh()
+        XCTAssertTrue(pump(until: { model.status?.staged.isEmpty == false && !model.isBusy }, timeout: 10))
+
+        model.commitMessage = "valid message"
+        XCTAssertTrue(model.canCommit)
+
+        // An unrelated operation takes the model busy, synchronously.
+        model.loadLog()
+        XCTAssertTrue(model.isBusy)
+        XCTAssertFalse(model.canCommit, "a busy model must report Commit as disabled")
+
+        model.commit()
+        XCTAssertTrue(pump(until: { !model.isBusy }, timeout: 10))
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(commitCount(), "1", "a Return during a busy op must not commit")
+        XCTAssertEqual(model.commitMessage, "valid message", "a swallowed submit must keep the message")
+    }
+
+    /// The guard must not over-block: a valid keyboard submission still commits,
+    /// clears the field, and the service trims the padding off the subject.
+    @MainActor
+    func testValidKeyboardSubmissionCommitsTheStagedFiles() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("b.txt", "two\n")
+        try git(["add", "b.txt"])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.refresh()
+        XCTAssertTrue(pump(until: { model.status?.staged.isEmpty == false && !model.isBusy }, timeout: 10))
+
+        model.commitMessage = "  a real commit message  "
+        XCTAssertTrue(model.canCommit, "a staged file plus a real message must enable Return and the button")
+
+        model.commit()  // exactly what the field's .onSubmit does
+        XCTAssertTrue(
+            pump(until: { model.commitMessage.isEmpty && !model.isBusy }, timeout: 10),
+            "the commit should complete, error: \(model.errorMessage ?? "none")"
+        )
+        XCTAssertNil(model.errorMessage)
+        XCTAssertEqual(commitCount(), "2")
+        XCTAssertEqual(
+            (try? gitOutput(["log", "-1", "--pretty=%s"]))?.trimmingCharacters(in: .whitespacesAndNewlines),
+            "a real commit message"
+        )
+        XCTAssertEqual(model.status?.staged.map(\.path), [], "the commit clears the staged list")
+    }
+
+    /// `canCommit` is the shared gate, so it must read exactly like the Commit
+    /// button's old enabled condition, and `commitHelp` must say which of the
+    /// three blockers is the live one.
+    @MainActor
+    func testCanCommitMatchesTheButtonStateAndExplainsWhyItIsDisabled() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+
+        let model = GitPanelModel(repoRoot: repo)
+
+        // No status loaded yet: nothing is known to be staged, so no commit.
+        XCTAssertNil(model.status)
+        model.commitMessage = "message"
+        XCTAssertFalse(model.canCommit)
+
+        model.refresh()
+        XCTAssertTrue(pump(until: { model.status != nil && !model.isBusy }, timeout: 10))
+        XCTAssertFalse(model.canCommit, "nothing staged")
+        XCTAssertEqual(model.commitHelp, "Stage at least one file before committing")
+
+        try write("b.txt", "two\n")
+        try git(["add", "b.txt"])
+        model.refresh()
+        XCTAssertTrue(pump(until: { model.status?.staged.isEmpty == false && !model.isBusy }, timeout: 10))
+
+        model.commitMessage = ""
+        XCTAssertFalse(model.canCommit)
+        XCTAssertEqual(model.commitHelp, "Enter a commit message")
+
+        model.commitMessage = " \n\t "
+        XCTAssertFalse(model.canCommit, "whitespace-only is not a commit message")
+        XCTAssertEqual(model.commitHelp, "Enter a commit message")
+
+        model.commitMessage = "real"
+        XCTAssertTrue(model.canCommit)
+        XCTAssertEqual(model.commitHelp, "Commit the staged files")
+    }
+
+    /// The half-finished confirm, end to end. On the default branch with a
+    /// remote nothing can reach, the fork lands and the push fails: the panel
+    /// must name the branch it created, keep the review card usable, and let a
+    /// retry resume at the push instead of being refused as stale or forking a
+    /// second branch.
+    @MainActor
+    func testAConfirmThatFailsMidwayReportsWhatItDidAndStaysRetryable() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let baseOID = try gitOutput(["rev-parse", "HEAD"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        try write("b.txt", "two\n")
+        try git(["add", "b.txt"])
+        try git(["commit", "-q", "-m", "feature work"])
+        // A web destination whose push cannot connect: port 1 refuses instantly,
+        // so the confirm fails at the push and never leaves this machine.
+        try git(["remote", "add", "origin", "ssh://git@127.0.0.1:1/acme/widget.git"])
+        // `main` is the default branch and the PR base, so the plan forks first.
+        try git(["update-ref", "refs/remotes/origin/main", baseOID])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.preparePR()
+        XCTAssertTrue(pump(until: { model.prPlan != nil || model.errorMessage != nil }, timeout: 10))
+        let plan = try XCTUnwrap(model.prPlan, "expected a plan, error: \(model.errorMessage ?? "none")")
+        XCTAssertTrue(plan.createsBranch)
+        XCTAssertEqual(plan.headBranch, "kaisola/pr-branch")
+
+        model.confirmPR()
+        XCTAssertTrue(pump(until: { model.errorMessage != nil }, timeout: 30), "the push should fail")
+
+        // The fork happened, and the panel says so.
+        XCTAssertEqual(model.prProgress.createdBranch, "kaisola/pr-branch")
+        XCTAssertNil(model.prProgress.pushedBranch, "the push is what failed")
+        XCTAssertEqual(model.prProgress.completedPhases, ["Created branch kaisola/pr-branch"])
+        XCTAssertEqual(
+            model.prState,
+            "Created branch kaisola/pr-branch. The pull request was not opened."
+        )
+        XCTAssertNotNil(model.prPlan, "the review card stays so the run can be finished")
+        XCTAssertEqual(
+            try gitOutput(["rev-parse", "--abbrev-ref", "HEAD"])
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "kaisola/pr-branch"
+        )
+
+        // A background refresh must not read this plan's own fork as the
+        // repository moving past it — that would disable the retry.
+        model.refresh()
+        XCTAssertTrue(pump(until: { !model.isBusy && model.status != nil }, timeout: 10))
+        XCTAssertFalse(model.prPlanStale, "the fork this very plan made is not staleness")
+
+        // Retry resumes at the push: not refused as stale, and no second fork.
+        model.confirmPR()
+        XCTAssertTrue(pump(until: { model.errorMessage != nil }, timeout: 30))
+        let retryError = model.errorMessage ?? ""
+        XCTAssertFalse(
+            retryError.contains("Review it again"),
+            "a retry must not be refused as stale: \(retryError)"
+        )
+        XCTAssertFalse(
+            retryError.contains("already exists"),
+            "a retry must not fork the branch a second time: \(retryError)"
+        )
+        XCTAssertEqual(
+            try gitOutput(["branch", "--format=%(refname:short)"]).split(separator: "\n").sorted(),
+            ["kaisola/pr-branch", "main"]
+        )
+
+        // Dismissing the review must not take the record with it: the branch is
+        // still there, so the note that explains it stays too.
+        model.cancelPR()
+        XCTAssertNil(model.prPlan)
+        XCTAssertEqual(
+            model.prState,
+            "Created branch kaisola/pr-branch. The pull request was not opened."
+        )
+    }
+
     // MARK: - helpers
+
+    /// Commits on HEAD, as a string — the cheapest proof that no commit landed.
+    @MainActor
+    private func commitCount() -> String {
+        ((try? gitOutput(["rev-list", "--count", "HEAD"])) ?? "?")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
 
     private func waitSeconds(_ decision: GitRefreshPolicy.Decision) -> TimeInterval {
         guard case let .wait(seconds) = decision else {
@@ -628,6 +1111,12 @@ final class GitPanelModelTests: XCTestCase {
 
     private func write(_ name: String, _ contents: String) throws {
         try contents.write(to: repo.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
+    private func installCommitMessageHook(_ script: String) throws {
+        let hook = repo.appendingPathComponent(".git/hooks/commit-msg")
+        try script.write(to: hook, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
     }
 
     @discardableResult

@@ -150,6 +150,24 @@ final class GitPRTests: XCTestCase {
         )
     }
 
+    /// A confirm that pushed but never opened the pull request has to show the
+    /// user where their work went, so the pushed branch resolves to its own page
+    /// on the reviewed remote.
+    func testBranchWebURLPointsAtThePushedBranchOnTheReviewedRemote() throws {
+        try git(["remote", "add", "origin", "git@github.com:acme/widget.git"])
+        let destination = GitService(repoRoot: repo).prDestination()
+        XCTAssertEqual(
+            GitService.branchWebURL(destination: destination, headBranch: "kaisola/pr-branch"),
+            "https://github.com/acme/widget/tree/kaisola/pr-branch"
+        )
+        // Nothing to link to without a web remote, or without a branch.
+        XCTAssertNil(GitService.branchWebURL(destination: destination, headBranch: ""))
+        XCTAssertNil(GitService.branchWebURL(
+            destination: .unavailable(baseBranch: "main"),
+            headBranch: "kaisola/pr-branch"
+        ))
+    }
+
     func testPushUsesTheReviewedRemoteNameInsteadOfAnImplicitUpstream() throws {
         try write("a.txt", "hello\n")
         try git(["add", "a.txt"])
@@ -266,7 +284,180 @@ final class GitPRTests: XCTestCase {
         )
     }
 
+    /// `gh` shares stdout between the pull request URL and whatever else it feels
+    /// like printing, so only a URL on the reviewed repository's own host and
+    /// `<owner>/<repo>/pull/<number>` path may become a destination.
+    func testOnlyAPullRequestURLOnTheReviewedRepositoryIsAccepted() {
+        let repository = "https://github.com/acme/widget"
+
+        XCTAssertEqual(
+            GitService.pullRequestURL(
+                inGhOutput: "https://github.com/acme/widget/pull/42\n",
+                repositoryURL: repository
+            ),
+            "https://github.com/acme/widget/pull/42"
+        )
+        // The PR URL is not always the last http line: upgrade notices follow it.
+        XCTAssertEqual(
+            GitService.pullRequestURL(
+                inGhOutput: """
+                Warning: 2 uncommitted changes
+                https://github.com/acme/widget/pull/42
+
+                A new release of gh is available: 2.40.0 → 2.42.0
+                https://github.com/cli/cli/releases/tag/v2.42.0
+
+                """,
+                repositoryURL: repository
+            ),
+            "https://github.com/acme/widget/pull/42"
+        )
+        // Prose around the URL, and a differently cased owner/repo, still resolve.
+        XCTAssertEqual(
+            GitService.pullRequestURL(
+                inGhOutput: "Opened (https://github.com/Acme/Widget/pull/7).",
+                repositoryURL: repository
+            ),
+            "https://github.com/acme/widget/pull/7"
+        )
+
+        // Nothing usable: silence, prose, another host, another repo, a look-alike
+        // host, plain http, a non-numeric id, or a path that is not a PR.
+        for output in [
+            "",
+            "\n\n",
+            "Creating pull request for feature/review into main\n",
+            "https://evil.example.com/acme/widget/pull/42\n",
+            "https://github.com/other/repo/pull/42\n",
+            "https://github.com.evil.example.com/acme/widget/pull/42\n",
+            "http://github.com/acme/widget/pull/42\n",
+            "https://github.com/acme/widget/pull/not-a-number\n",
+            "https://github.com/acme/widget/pulls\n",
+            "https://github.com/acme/widget/pull/42/files\n",
+            "javascript:alert(1)\n",
+        ] {
+            XCTAssertNil(
+                GitService.pullRequestURL(inGhOutput: output, repositoryURL: repository),
+                "accepted an unusable gh output: \(output.debugDescription)"
+            )
+        }
+
+        // Two different pull requests in one run: we cannot tell which was opened.
+        XCTAssertNil(GitService.pullRequestURL(
+            inGhOutput: "https://github.com/acme/widget/pull/42\nhttps://github.com/acme/widget/pull/43\n",
+            repositoryURL: repository
+        ))
+        // The same one twice is not ambiguous.
+        XCTAssertEqual(
+            GitService.pullRequestURL(
+                inGhOutput: "https://github.com/acme/widget/pull/42\nhttps://github.com/acme/widget/pull/42\n",
+                repositoryURL: repository
+            ),
+            "https://github.com/acme/widget/pull/42"
+        )
+    }
+
+    /// A `gh` that exits 0 after printing the PR URL amid noise still yields one
+    /// exact destination, rebuilt from the reviewed repository.
+    func testCreatePullRequestKeepsOnlyTheReviewedRepositoryURL() throws {
+        try write("a.txt", "hello\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "init"])
+
+        // The shape gh actually prints: the PR URL, then an upgrade notice whose
+        // own release URL is the last http line in the run.
+        let gh = try stubGh(stdout: """
+        Warning: 2 uncommitted changes
+        https://github.com/acme/widget/pull/42
+
+        A new release of gh is available: 2.40.0 → 2.42.0
+        https://github.com/cli/cli/releases/tag/v2.42.0
+        """)
+
+        XCTAssertEqual(
+            try GitService(repoRoot: repo).createPullRequest(
+                title: "Reviewed title",
+                body: "Reviewed body",
+                baseBranch: "main",
+                headBranch: "feature/review",
+                repositoryURL: "https://github.com/acme/widget",
+                ghPath: gh
+            ),
+            .opened(url: "https://github.com/acme/widget/pull/42")
+        )
+    }
+
+    /// `gh` exiting 0 means the pull request exists, so silence or a URL we cannot
+    /// pin to the reviewed repository is a partial success with a place to look —
+    /// never an unvalidated destination and never a swallowed pull request.
+    func testCreatePullRequestReportsPartialSuccessWhenNoTrustworthyURLComesBack() throws {
+        try write("a.txt", "hello\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "init"])
+
+        let service = GitService(repoRoot: repo)
+        let recovery = "https://github.com/acme/widget/pulls?q=is:pr%20head:feature/review"
+        for stdout in [
+            "",
+            "Creating pull request for feature/review into main in acme/widget",
+            "https://phish.example.com/acme/widget/pull/42",
+            "https://github.com/acme/widget/pull/42\nhttps://github.com/acme/widget/pull/43",
+        ] {
+            let outcome = try service.createPullRequest(
+                title: "Reviewed title",
+                body: "Reviewed body",
+                baseBranch: "main",
+                headBranch: "feature/review",
+                repositoryURL: "https://github.com/acme/widget",
+                ghPath: try stubGh(stdout: stdout)
+            )
+            XCTAssertEqual(
+                outcome,
+                .openedWithoutURL(recoveryURL: recovery),
+                "unexpected outcome for gh output \(stdout.debugDescription)"
+            )
+            // Recovery has to be somewhere a browser can actually go.
+            if case let .openedWithoutURL(url) = outcome {
+                XCTAssertNotNil(URL(string: url))
+            }
+        }
+    }
+
+    /// A failing `gh` is still an error, not a partial success: nothing was opened.
+    func testCreatePullRequestStillThrowsWhenGhFails() throws {
+        try write("a.txt", "hello\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "init"])
+
+        XCTAssertThrowsError(
+            try GitService(repoRoot: repo).createPullRequest(
+                title: "Reviewed title",
+                body: "Reviewed body",
+                baseBranch: "main",
+                headBranch: "feature/review",
+                repositoryURL: "https://github.com/acme/widget",
+                ghPath: try stubGh(stdout: "", status: 1)
+            )
+        )
+    }
+
     // MARK: helpers
+
+    /// A stand-in for the GitHub CLI that prints `stdout` verbatim and exits with
+    /// `status`, so the PR flow can be exercised end to end without a real `gh`,
+    /// an account, or a network.
+    private func stubGh(stdout: String, status: Int32 = 0) throws -> String {
+        let script = repo.appendingPathComponent("stub-gh-\(UUID().uuidString.prefix(8))")
+        try """
+        #!/bin/sh
+        cat <<'KAISOLA_STUB_EOF'
+        \(stdout)
+        KAISOLA_STUB_EOF
+        exit \(status)
+        """.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        return script.path
+    }
 
     private func write(_ name: String, _ contents: String) throws {
         try contents.write(to: repo.appendingPathComponent(name), atomically: true, encoding: .utf8)

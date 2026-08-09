@@ -1,3 +1,4 @@
+import Foundation
 import SQLite3
 import XCTest
 @testable import Kaisola
@@ -19,6 +20,44 @@ final class AcpTranscriptStoreTests: XCTestCase {
         var handle: OpaquePointer?
         XCTAssertEqual(sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
         return try XCTUnwrap(handle)
+    }
+
+    private func sqliteCount(_ sql: String, databaseURL: URL) throws -> Int {
+        var handle: OpaquePointer?
+        let openResult = sqlite3_open_v2(
+            databaseURL.path,
+            &handle,
+            SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX,
+            nil
+        )
+        guard openResult == SQLITE_OK, let database = handle else {
+            if let handle { sqlite3_close_v2(handle) }
+            throw NSError(
+                domain: "AcpTranscriptStoreTests.SQLite",
+                code: Int(openResult),
+                userInfo: [NSLocalizedDescriptionKey: "Could not open transcript database"]
+            )
+        }
+        defer { sqlite3_close_v2(database) }
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK,
+              let statement else {
+            throw NSError(
+                domain: "AcpTranscriptStoreTests.SQLite",
+                code: Int(sqlite3_errcode(database)),
+                userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(database))]
+            )
+        }
+        defer { sqlite3_finalize(statement) }
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw NSError(
+                domain: "AcpTranscriptStoreTests.SQLite",
+                code: Int(sqlite3_errcode(database)),
+                userInfo: [NSLocalizedDescriptionKey: String(cString: sqlite3_errmsg(database))]
+            )
+        }
+        return Int(sqlite3_column_int64(statement, 0))
     }
 
     func testLiveStoreUsesAnXCTestIsolatedRoot() {
@@ -68,6 +107,63 @@ final class AcpTranscriptStoreTests: XCTestCase {
         await store.remove(chatID: "chat-remove")
         let restoredRows = await store.rows(for: "chat-remove")
         XCTAssertTrue(restoredRows.isEmpty)
+    }
+
+    func testLaunchVacuumResumesPhysicalDeletionAfterCrashFollowingTombstone() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-crash-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let legacyURL = directory.appendingPathComponent("transcripts.json")
+        let chatID = "crash-after-tombstone"
+        let databaseURL: URL
+
+        do {
+            let store = AcpTranscriptStore(fileURL: legacyURL)
+            databaseURL = store.databaseURL
+            await store.scheduleSave(
+                [
+                    .user(id: "1", text: "sensitive prompt", failed: false),
+                    .message(id: "2", text: "sensitive response"),
+                ],
+                for: chatID,
+                now: 1
+            )
+            await store.scheduleDraft("sensitive draft", for: chatID, now: 2)
+            await store.flush()
+
+            // Crash injection point: the durable intent landed, but the
+            // normal queued remove(chatID:) phase never ran.
+            try await store.tombstone(chatID: chatID)
+            XCTAssertEqual(
+                try sqliteCount("SELECT COUNT(*) FROM transcript_rows", databaseURL: databaseURL),
+                2
+            )
+            XCTAssertEqual(
+                try sqliteCount("SELECT COUNT(*) FROM deleted_chats", databaseURL: databaseURL),
+                1
+            )
+        }
+
+        let relaunched = AcpTranscriptStore(fileURL: legacyURL)
+        await relaunched.vacuumTombstones()
+
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM transcript_rows", databaseURL: databaseURL),
+            0,
+            "Launch recovery must physically remove retained transcript rows"
+        )
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM chats", databaseURL: databaseURL),
+            0,
+            "Chat metadata and sensitive draft bytes must be removed with the transcript"
+        )
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM deleted_chats", databaseURL: databaseURL),
+            0,
+            "Only a completed physical deletion may vacuum its tombstone"
+        )
+        let restored = await relaunched.entry(for: chatID)
+        XCTAssertNil(restored)
     }
 
     func testUsagePersistsBesideRowsAndSurvivesLaterTranscriptSave() async throws {

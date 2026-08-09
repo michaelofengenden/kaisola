@@ -961,6 +961,7 @@ enum MarkdownTableNavigation {
 /// painted by the layout manager, so neither ever reaches the text storage.
 struct MarkdownDocumentView: View {
     @Binding var source: String
+    let baseline: String
     let documentURL: URL
     let workspaceRoot: URL?
     let imageRevision: Int
@@ -977,6 +978,7 @@ struct MarkdownDocumentView: View {
     var body: some View {
         MarkdownRenderedEditor(
             text: $source,
+            baseline: baseline,
             markdownURL: documentURL,
             workspaceRoot: workspaceRoot,
             zoom: $zoom,

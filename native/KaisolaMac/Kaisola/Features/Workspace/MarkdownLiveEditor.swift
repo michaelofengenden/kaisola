@@ -10,6 +10,298 @@ import Foundation
 /// of them rewrite it. That is the property the block editor was originally
 /// built to guarantee, and it is the one this surface has to keep.
 
+// MARK: - Hybrid review diff
+
+/// A bounded, presentation-only line diff for an editable Markdown document.
+///
+/// The edited source is carried through byte-for-byte. Markers point into that
+/// exact UTF-16 string and never own a rewritten copy, so the gutter cannot
+/// become another serialization path for tables, code fences, or links.
+struct MarkdownHybridDiffPlan: Equatable, Sendable {
+    enum MarkerKind: Equatable, Sendable {
+        case addition
+        case changed
+        case deletion
+    }
+
+    enum InspectionPresentation: Equatable, Sendable {
+        case plainText
+    }
+
+    struct Marker: Equatable, Sendable {
+        let kind: MarkerKind
+        let oldText: String?
+        let newText: String?
+        /// Content range in the edited source, excluding the line terminator.
+        /// A deletion is a zero-length anchor at the nearest surviving line.
+        let editedRange: NSRange
+        let inspectionText: String
+        let inspectionPresentation: InspectionPresentation
+        let inspectionAllowsLinkActivation: Bool
+    }
+
+    static let maximumComparedLines = AcpDiff.lineDiffCap
+    static let maximumMarkers = 500
+
+    let editedSource: String
+    let markers: [Marker]
+    let isTruncated: Bool
+
+    nonisolated static func build(baseline: String, edited: String) -> Self {
+        let oldLines = sourceLines(in: baseline)
+        let newLines = sourceLines(in: edited)
+        let truncated = oldLines.count > maximumComparedLines
+            || newLines.count > maximumComparedLines
+        let boundedOld = Array(oldLines.prefix(maximumComparedLines))
+        let boundedNew = Array(newLines.prefix(maximumComparedLines))
+        let diff = AcpDiff.lines(
+            old: boundedOld.map(\.text).joined(separator: "\n"),
+            new: boundedNew.map(\.text).joined(separator: "\n")
+        )
+
+        var markers: [Marker] = []
+        var oldIndex = 0
+        var newIndex = 0
+        var index = 0
+
+        func append(_ marker: Marker) {
+            guard markers.count < maximumMarkers else { return }
+            markers.append(marker)
+        }
+
+        while index < diff.count, markers.count < maximumMarkers {
+            switch diff[index].kind {
+            case .context:
+                oldIndex += 1
+                newIndex += 1
+                index += 1
+            case .added:
+                guard newIndex < boundedNew.count else {
+                    index += 1
+                    continue
+                }
+                let line = boundedNew[newIndex]
+                append(marker(kind: .addition, old: nil, new: line))
+                newIndex += 1
+                index += 1
+            case .removed:
+                var removed: [SourceLine] = []
+                while index < diff.count, diff[index].kind == .removed,
+                      oldIndex < boundedOld.count {
+                    removed.append(boundedOld[oldIndex])
+                    oldIndex += 1
+                    index += 1
+                }
+                var added: [SourceLine] = []
+                while index < diff.count, diff[index].kind == .added,
+                      newIndex < boundedNew.count {
+                    added.append(boundedNew[newIndex])
+                    newIndex += 1
+                    index += 1
+                }
+
+                let paired = min(removed.count, added.count)
+                for pairIndex in 0..<paired {
+                    append(marker(
+                        kind: .changed,
+                        old: removed[pairIndex],
+                        new: added[pairIndex]
+                    ))
+                }
+                for line in removed.dropFirst(paired) {
+                    let anchor = newIndex < boundedNew.count
+                        ? boundedNew[newIndex].range.location
+                        : (edited as NSString).length
+                    append(Marker(
+                        kind: .deletion,
+                        oldText: line.text,
+                        newText: nil,
+                        editedRange: NSRange(location: anchor, length: 0),
+                        inspectionText: line.text,
+                        inspectionPresentation: .plainText,
+                        inspectionAllowsLinkActivation: false
+                    ))
+                }
+                for line in added.dropFirst(paired) {
+                    append(marker(kind: .addition, old: nil, new: line))
+                }
+            }
+        }
+
+        return Self(
+            editedSource: edited,
+            markers: markers,
+            isTruncated: truncated || markers.count == maximumMarkers
+        )
+    }
+
+    private struct SourceLine: Equatable, Sendable {
+        let text: String
+        let range: NSRange
+    }
+
+    nonisolated private static func sourceLines(in source: String) -> [SourceLine] {
+        guard !source.isEmpty else { return [] }
+        let nsSource = source as NSString
+        var result: [SourceLine] = []
+        var location = 0
+        while location < nsSource.length {
+            let full = nsSource.lineRange(for: NSRange(location: location, length: 0))
+            var end = NSMaxRange(full)
+            while end > full.location {
+                let value = nsSource.character(at: end - 1)
+                guard value == 0x0A || value == 0x0D else { break }
+                end -= 1
+            }
+            let range = NSRange(location: full.location, length: end - full.location)
+            result.append(SourceLine(text: nsSource.substring(with: range), range: range))
+            location = NSMaxRange(full)
+        }
+        return result
+    }
+
+    nonisolated private static func marker(
+        kind: MarkerKind,
+        old: SourceLine?,
+        new: SourceLine?
+    ) -> Marker {
+        let oldText = old?.text
+        let newText = new?.text
+        let inspection: String
+        switch kind {
+        case .addition:
+            inspection = newText ?? ""
+        case .deletion:
+            inspection = oldText ?? ""
+        case .changed:
+            inspection = "Before:\n\(oldText ?? "")\n\nAfter:\n\(newText ?? "")"
+        }
+        return Marker(
+            kind: kind,
+            oldText: oldText,
+            newText: newText,
+            editedRange: new?.range ?? NSRange(location: 0, length: 0),
+            inspectionText: inspection,
+            inspectionPresentation: .plainText,
+            inspectionAllowsLinkActivation: false
+        )
+    }
+}
+
+/// Clickable vertical ruler for hybrid review. It reads layout geometry from
+/// the editor but owns no text, so opening a deleted line cannot accidentally
+/// activate a Markdown link or mutate the draft.
+@MainActor
+final class MarkdownHybridDiffRulerView: NSRulerView {
+    private weak var markdownTextView: NSTextView?
+    private var diffMarkers: [MarkdownHybridDiffPlan.Marker] = []
+    private var markerRects: [NSRect] = []
+    private var inspectionPopover: NSPopover?
+
+    init(scrollView: NSScrollView, textView: NSTextView) {
+        markdownTextView = textView
+        super.init(scrollView: scrollView, orientation: .verticalRuler)
+        clientView = textView
+        ruleThickness = 0
+        setAccessibilityLabel("Markdown change gutter")
+        toolTip = "Click a marker to inspect the exact changed source"
+    }
+
+    @available(*, unavailable)
+    required init(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func apply(_ markers: [MarkdownHybridDiffPlan.Marker]) {
+        diffMarkers = markers
+        ruleThickness = markers.isEmpty ? 0 : 14
+        scrollView?.tile()
+        needsDisplay = true
+    }
+
+    override func drawHashMarksAndLabels(in rect: NSRect) {
+        super.drawHashMarksAndLabels(in: rect)
+        markerRects = diffMarkers.map(markerRect)
+        for (marker, markerRect) in zip(diffMarkers, markerRects) {
+            color(for: marker.kind).setFill()
+            NSBezierPath(roundedRect: markerRect, xRadius: 2, yRadius: 2).fill()
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        guard let index = markerRects.firstIndex(where: {
+            $0.insetBy(dx: -2, dy: -4).contains(point)
+        }), diffMarkers.indices.contains(index) else {
+            super.mouseDown(with: event)
+            return
+        }
+        showInspection(for: diffMarkers[index], relativeTo: markerRects[index])
+    }
+
+    private func markerRect(_ marker: MarkdownHybridDiffPlan.Marker) -> NSRect {
+        guard let textView = markdownTextView,
+              let layoutManager = textView.layoutManager,
+              let textContainer = textView.textContainer,
+              !textView.string.isEmpty else {
+            return NSRect(x: 2, y: 4, width: 10, height: 8)
+        }
+        let stringLength = (textView.string as NSString).length
+        let characterIndex = min(max(0, marker.editedRange.location), max(0, stringLength - 1))
+        let characterRange = NSRange(
+            location: characterIndex,
+            length: min(max(marker.editedRange.length, 1), stringLength - characterIndex)
+        )
+        let glyphRange = layoutManager.glyphRange(
+            forCharacterRange: characterRange,
+            actualCharacterRange: nil
+        )
+        var textRect = layoutManager.boundingRect(forGlyphRange: glyphRange, in: textContainer)
+        textRect.origin.x += textView.textContainerOrigin.x
+        textRect.origin.y += textView.textContainerOrigin.y
+        let local = convert(textRect, from: textView)
+        return NSRect(
+            x: 2,
+            y: local.minY,
+            width: 10,
+            height: max(4, min(14, local.height))
+        )
+    }
+
+    private func color(for kind: MarkdownHybridDiffPlan.MarkerKind) -> NSColor {
+        switch kind {
+        case .addition: .systemGreen
+        case .changed: .systemOrange
+        case .deletion: .systemRed
+        }
+    }
+
+    private func showInspection(
+        for marker: MarkdownHybridDiffPlan.Marker,
+        relativeTo rect: NSRect
+    ) {
+        inspectionPopover?.close()
+        let scrollView = NSTextView.scrollableTextView()
+        guard let textView = scrollView.documentView as? NSTextView else { return }
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.isAutomaticLinkDetectionEnabled = false
+        textView.font = .monospacedSystemFont(ofSize: 12, weight: .regular)
+        textView.string = marker.inspectionText
+        textView.setAccessibilityLabel("Changed Markdown source")
+
+        let controller = NSViewController()
+        controller.view = scrollView
+        let popover = NSPopover()
+        popover.behavior = .transient
+        popover.contentViewController = controller
+        popover.contentSize = NSSize(width: 440, height: 180)
+        popover.show(relativeTo: rect, of: self, preferredEdge: .maxX)
+        inspectionPopover = popover
+    }
+}
+
 // MARK: - Inline images
 
 /// One image reference the live editor draws in place of its Markdown source.

@@ -81,7 +81,7 @@ struct CompanionSettingsTab: View {
                                     .font(.callout.weight(.medium))
                                 Text("Scan on iPhone, or copy the code into kaisola.com/app.")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                             }
                             Spacer()
                             if host.pairingCode == nil {
@@ -125,7 +125,7 @@ struct CompanionSettingsTab: View {
                                     .font(.headline)
                                 Text("The same four phrases must appear on both devices.")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                                 Text(phrase.sas.words.joined(separator: "   "))
                                     .font(.body.monospaced().weight(.semibold))
                                     .textSelection(.enabled)
@@ -146,7 +146,7 @@ struct CompanionSettingsTab: View {
                     if host.pairedDevices.isEmpty {
                         Text("No devices are paired with this Mac.")
                             .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(14)
                     } else {

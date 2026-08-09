@@ -97,6 +97,21 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertTrue(conversation.transcriptRetentionStatus.isTruncated)
     }
 
+    func testPersistenceHealthAndRetryActionRemainAttachedToConversation() {
+        let conversation = makeConversation()
+        var retryCount = 0
+        conversation.onRetryTranscriptPersistence = { retryCount += 1 }
+        let failure = AcpTranscriptStore.PersistenceFailure(
+            attemptCount: 3,
+            maximumAttempts: 3
+        )
+
+        conversation.applyTranscriptPersistenceHealth(.failed(failure))
+        XCTAssertEqual(conversation.transcriptPersistenceHealth, .failed(failure))
+        conversation.retryTranscriptPersistence()
+        XCTAssertEqual(retryCount, 1)
+    }
+
     func testVisibleLimitIsSettableToDriveTheView() {
         let conversation = makeConversation()
         conversation.seedRowsForTesting(Self.messageRows(count: 500))

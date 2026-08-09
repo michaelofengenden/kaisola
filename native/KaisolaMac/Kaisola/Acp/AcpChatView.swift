@@ -79,6 +79,10 @@ struct AcpChatView: View {
                 transcriptRetentionNotice
                 Divider()
             }
+            if conversation.transcriptPersistenceHealth.needsAttention {
+                transcriptPersistenceNotice
+                Divider()
+            }
             if showsEmptyState {
                 emptyState
             } else {
@@ -159,6 +163,73 @@ struct AcpChatView: View {
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Saved chat history truncated")
         .accessibilityValue("\(status.truncatedRowCount) rows and \(bytes) removed after this chat reached its disk quota")
+    }
+
+    private var transcriptPersistenceNotice: some View {
+        let health = conversation.transcriptPersistenceHealth
+        let detail: String
+        let canRetry: Bool
+        switch health {
+        case .healthy:
+            detail = ""
+            canRetry = false
+        case let .retrying(attempt, maximumAttempts):
+            detail = "Saving the latest transcript failed. Retry \(attempt) of \(maximumAttempts) is pending; keep this chat open."
+            canRetry = false
+        case let .failed(failure):
+            detail = "\(failure.detail) \(failure.guidance)"
+            canRetry = true
+        }
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            if canRetry {
+                Button("Retry") { conversation.retryTranscriptPersistence() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
+            Button("Export Recovery Copy") { exportTranscriptRecoveryCopy() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.08))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("acp.transcriptPersistenceWarning")
+        .accessibilityLabel("Transcript is not saved")
+        .accessibilityValue(detail)
+    }
+
+    @MainActor
+    private func exportTranscriptRecoveryCopy() {
+        let panel = NSSavePanel()
+        panel.title = "Export Chat Transcript Recovery Copy"
+        panel.prompt = "Export"
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = AcpTranscriptRecoveryExport.suggestedFileName(
+            for: conversation.title
+        )
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try AcpTranscriptRecoveryExport.data(
+                title: conversation.title,
+                startOrdinal: conversation.loadedRowStartOrdinal,
+                rows: conversation.rows
+            )
+            try data.write(to: url, options: .atomic)
+        } catch {
+            ToastCenter.shared.show(
+                "Could not export the transcript recovery copy: \(error.localizedDescription)",
+                style: .error
+            )
+        }
     }
 
     private var standardHeader: some View {
@@ -1410,6 +1481,46 @@ struct AcpPermissionBar: View {
                 .textSelection(.enabled)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+enum AcpTranscriptRecoveryExport {
+    struct Document: Codable, Equatable, Sendable {
+        var formatVersion: Int
+        var title: String
+        var startOrdinal: Int64
+        var isCompleteTranscript: Bool
+        var rows: [AcpTranscriptRow]
+
+        init(title: String, startOrdinal: Int64, rows: [AcpTranscriptRow]) {
+            let boundedStartOrdinal = max(0, startOrdinal)
+            self.formatVersion = 1
+            self.title = title
+            self.startOrdinal = boundedStartOrdinal
+            self.isCompleteTranscript = boundedStartOrdinal == 0
+            self.rows = rows
+        }
+    }
+
+    static func data(title: String, startOrdinal: Int64, rows: [AcpTranscriptRow]) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(Document(
+            title: title,
+            startOrdinal: startOrdinal,
+            rows: rows
+        ))
+    }
+
+    static func suggestedFileName(for title: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let stem = title.lowercased().unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(String(scalar)) : "-"
+        }
+        let compact = String(stem)
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .joined(separator: "-")
+        return "\(compact.isEmpty ? "chat" : compact)-transcript-recovery.json"
     }
 }
 

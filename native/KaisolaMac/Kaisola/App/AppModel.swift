@@ -419,6 +419,17 @@ final class AppModel: ObservableObject {
         persistedPinnedIDs = SessionPinStore().pins()
         sessionAdoptions = adoptionStore.adoptions()
         observeChatAccountAvailability()
+        transcriptPersistenceHealthTask = Task { [weak self, transcriptStore] in
+            let updates = await transcriptStore.persistenceHealthUpdates()
+            for await update in updates {
+                guard !Task.isCancelled else { return }
+                self?.applyTranscriptPersistenceHealth(update)
+            }
+        }
+    }
+
+    deinit {
+        transcriptPersistenceHealthTask?.cancel()
     }
 
     /// Keeps each chat's usage observers alive only while that chat exists.
@@ -433,6 +444,7 @@ final class AppModel: ObservableObject {
     /// Serializes transcript actor enqueues so an immediate quit cannot overtake
     /// the final streaming row or an explicit chat removal.
     private var transcriptPersistenceTask: Task<Void, Never>?
+    private var transcriptPersistenceHealthTask: Task<Void, Never>?
     /// A closed chat is a tombstone for as long as buffered ACP events can
     /// still drain while the child process stops; those must not be allowed to
     /// enqueue a transcript write after the explicit deletion. Bounded by
@@ -2467,6 +2479,18 @@ final class AppModel: ObservableObject {
         await transcriptStore.flush()
     }
 
+    private func applyTranscriptPersistenceHealth(
+        _ update: AcpTranscriptStore.PersistenceHealthUpdate
+    ) {
+        chats.first(where: { $0.id == update.chatID })?
+            .conversation.applyTranscriptPersistenceHealth(update.health)
+    }
+
+    private func retryTranscriptPersistence(chatID: String) {
+        let transcriptStore = transcriptStore
+        Task { await transcriptStore.retryPersistence(chatID: chatID) }
+    }
+
     /// Chats whose unreadable history has already been reported. One notice
     /// per chat per launch: restoration, a Recently Closed reopen, and an
     /// account or model switch can all read the same damaged transcript.
@@ -3273,6 +3297,14 @@ final class AppModel: ObservableObject {
                 startOrdinal: startOrdinal,
                 chatID: chatID
             )
+        }
+        conversation.onRetryTranscriptPersistence = { [weak self] in
+            self?.retryTranscriptPersistence(chatID: chatID)
+        }
+        let healthStore = transcriptStore
+        Task { [weak conversation] in
+            let health = await healthStore.persistenceHealth(for: chatID)
+            conversation?.applyTranscriptPersistenceHealth(health)
         }
         let pageStore = transcriptStore
         conversation.loadEarlierRows = { beforeOrdinal, limit in

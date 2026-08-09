@@ -131,6 +131,10 @@ final class AcpConversation: ObservableObject {
     /// quota. It survives relaunch and remains visible instead of making the
     /// retained tail look like the complete transcript.
     @Published private(set) var transcriptRetentionStatus: AcpTranscriptStore.RetentionStatus
+    /// Remains non-healthy while the newest visible snapshot has not reached
+    /// SQLite. Unlike a transient toast, the chat surface keeps this state in
+    /// view until persistence succeeds or the chat is explicitly removed.
+    @Published private(set) var transcriptPersistenceHealth: AcpTranscriptStore.PersistenceHealth = .healthy
     /// Advances for both appended rows and in-place streaming updates. Views
     /// must follow this rather than `rows.count`: an agent can stream thousands
     /// of chunks into one existing Markdown row without changing the count.
@@ -229,6 +233,7 @@ final class AcpConversation: ObservableObject {
     /// Persistence hooks are injected by AppModel so this reusable conversation
     /// stays independent of the concrete disk stores used by the native shell.
     var onTranscriptChanged: ((_ rows: [AcpTranscriptRow], _ startOrdinal: Int64) -> Void)?
+    var onRetryTranscriptPersistence: (() -> Void)?
     /// Bounded page loader injected by AppModel (or MeshSession) so this
     /// presentation model remains independent of the concrete SQLite store.
     var loadEarlierRows: ((_ beforeOrdinal: Int64, _ limit: Int) async -> AcpTranscriptStore.Page?)?
@@ -1107,6 +1112,14 @@ final class AcpConversation: ObservableObject {
         loadedRowStartOrdinal = 0
         unloadedEarlierRowCount = 0
         rows = newRows
+    }
+
+    func applyTranscriptPersistenceHealth(_ health: AcpTranscriptStore.PersistenceHealth) {
+        transcriptPersistenceHealth = health
+    }
+
+    func retryTranscriptPersistence() {
+        onRetryTranscriptPersistence?()
     }
 
     /// Test-only: seed the never-dispatched recovery FIFO without spawning an

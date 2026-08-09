@@ -53,6 +53,52 @@ actor AcpTranscriptStore {
         var isTruncated: Bool { truncatedRowCount > 0 || truncatedByteCount > 0 }
     }
 
+    /// User-visible state for the coalesced snapshot currently waiting to
+    /// reach SQLite. A terminal failure remains published until a successful
+    /// explicit retry or deletion proves the in-memory-only copy is no longer
+    /// at risk.
+    struct PersistenceFailure: Equatable, Sendable {
+        var attemptCount: Int
+        var maximumAttempts: Int
+
+        var detail: String {
+            "Kaisola could not save the latest transcript after \(attemptCount) attempts."
+        }
+
+        var guidance: String {
+            "Retry after checking available disk space and file access, or export the recovery snapshot before closing this chat."
+        }
+    }
+
+    enum PersistenceHealth: Equatable, Sendable {
+        case healthy
+        case retrying(attempt: Int, maximumAttempts: Int)
+        case failed(PersistenceFailure)
+
+        var failure: PersistenceFailure? {
+            guard case let .failed(failure) = self else { return nil }
+            return failure
+        }
+
+        var needsAttention: Bool { self != .healthy }
+    }
+
+    struct PersistenceHealthUpdate: Equatable, Sendable {
+        var chatID: String
+        var health: PersistenceHealth
+    }
+
+    /// Exact loaded transcript snapshot retained in the failed write queue.
+    /// A non-zero start ordinal explicitly discloses that older durable pages
+    /// were not loaded when this recovery copy was captured.
+    struct RecoverySnapshot: Equatable, Sendable {
+        var chatID: String
+        var startOrdinal: Int64
+        var rows: [AcpTranscriptRow]
+
+        var isCompleteTranscript: Bool { startOrdinal == 0 }
+    }
+
     struct Entry: Codable, Equatable, Sendable {
         var rows: [AcpTranscriptRow]
         var updatedAt: Int64
@@ -212,6 +258,7 @@ actor AcpTranscriptStore {
     static let maximumAttachmentCount = 8
     static let maximumAttachmentBytes = 20 * 1_048_576
     static let maximumLegacyArchiveBytes = 512 * 1_048_576
+    static let maximumPersistenceAttempts = 3
     /// A crashed or suspended writer can delay reclamation only for this
     /// bounded interval. Resuming after expiry is still safe: buffered writes
     /// retain their captured deletion generation and fail closed if it moved.
@@ -329,6 +376,12 @@ actor AcpTranscriptStore {
     private var writerLeaseExpiresAt: Int64 = 0
     private var injectedRemovalFailure: RemovalFailurePoint?
     private var injectedTombstoneFailure: TombstoneFailurePoint?
+    private var injectedFlushFailureCount: Int
+    private var persistenceAttempts: [String: Int] = [:]
+    private var persistenceHealthByChatID: [String: PersistenceHealth] = [:]
+    private var persistenceHealthContinuations: [
+        UUID: AsyncStream<PersistenceHealthUpdate>.Continuation
+    ] = [:]
 
     /// Compatibility initializer: callers hand us the v1 JSON path and the v2
     /// database is created beside it. The JSON remains untouched after a
@@ -342,6 +395,7 @@ actor AcpTranscriptStore {
         self.retentionPolicy = .production
         self.injectedRemovalFailure = nil
         self.injectedTombstoneFailure = nil
+        self.injectedFlushFailureCount = 0
     }
 
     init(
@@ -351,6 +405,7 @@ actor AcpTranscriptStore {
         schedulesAutomaticFlush: Bool = true,
         injectedRemovalFailure: RemovalFailurePoint? = nil,
         injectedTombstoneFailure: TombstoneFailurePoint? = nil,
+        injectedFlushFailureCount: Int = 0,
         retentionPolicy: RetentionPolicy = .production
     ) {
         self.databaseURL = databaseURL.standardizedFileURL
@@ -360,6 +415,7 @@ actor AcpTranscriptStore {
         self.retentionPolicy = retentionPolicy
         self.injectedRemovalFailure = injectedRemovalFailure
         self.injectedTombstoneFailure = injectedTombstoneFailure
+        self.injectedFlushFailureCount = max(0, injectedFlushFailureCount)
     }
 
     /// Explicit full-history compatibility read. Product restoration uses
@@ -438,6 +494,73 @@ actor AcpTranscriptStore {
     /// also exactly while its writes are refused.
     func hasUnreadableHistory(chatID: String) -> Bool {
         unreadableChatIDs.contains(chatID)
+    }
+
+    func persistenceHealth(for chatID: String) -> PersistenceHealth {
+        persistenceHealthByChatID[chatID] ?? .healthy
+    }
+
+    func persistenceHealthUpdates() -> AsyncStream<PersistenceHealthUpdate> {
+        let id = UUID()
+        let (stream, continuation) = AsyncStream<PersistenceHealthUpdate>.makeStream(
+            bufferingPolicy: .bufferingNewest(256)
+        )
+        persistenceHealthContinuations[id] = continuation
+        for chatID in persistenceHealthByChatID.keys.sorted() {
+            guard let health = persistenceHealthByChatID[chatID] else { continue }
+            continuation.yield(PersistenceHealthUpdate(chatID: chatID, health: health))
+        }
+        continuation.onTermination = { [weak self] _ in
+            Task { await self?.removePersistenceHealthContinuation(id) }
+        }
+        return stream
+    }
+
+    func recoverySnapshot(for chatID: String) -> RecoverySnapshot? {
+        guard let rowWrite = pending[chatID]?.rows else { return nil }
+        return RecoverySnapshot(
+            chatID: chatID,
+            startOrdinal: rowWrite.startOrdinal,
+            rows: rowWrite.rows
+        )
+    }
+
+    /// The warning is the circuit breaker: ordinary stream updates and
+    /// lifecycle flushes cannot silently become attempt four. Only the user's
+    /// Retry action resets the count and immediately makes one new attempt.
+    func retryPersistence(chatID: String) {
+        guard pending[chatID] != nil else {
+            clearPersistenceHealth(chatID: chatID)
+            return
+        }
+        persistenceAttempts[chatID] = 0
+        flush(chatIDs: [chatID])
+    }
+
+    private func removePersistenceHealthContinuation(_ id: UUID) {
+        persistenceHealthContinuations.removeValue(forKey: id)
+    }
+
+    private func publishPersistenceHealth(
+        _ health: PersistenceHealth,
+        chatID: String
+    ) {
+        if health == .healthy {
+            persistenceHealthByChatID.removeValue(forKey: chatID)
+        } else {
+            persistenceHealthByChatID[chatID] = health
+        }
+        let update = PersistenceHealthUpdate(chatID: chatID, health: health)
+        for continuation in persistenceHealthContinuations.values {
+            continuation.yield(update)
+        }
+    }
+
+    private func clearPersistenceHealth(chatID: String) {
+        let hadState = persistenceAttempts.removeValue(forKey: chatID) != nil
+            || persistenceHealthByChatID[chatID] != nil
+        guard hadState else { return }
+        publishPersistenceHealth(.healthy, chatID: chatID)
     }
 
     private static func failure(for error: Error, databasePath: String) -> RestorationFailure {
@@ -622,7 +745,10 @@ actor AcpTranscriptStore {
     }
 
     private func scheduleFlush() {
-        guard schedulesAutomaticFlush else { return }
+        guard schedulesAutomaticFlush,
+              pending.keys.contains(where: {
+                  persistenceAttempts[$0, default: 0] < Self.maximumPersistenceAttempts
+              }) else { return }
         flushTask?.cancel()
         flushTask = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(350))
@@ -697,6 +823,7 @@ actor AcpTranscriptStore {
             // Explicit destruction is the one write an unreadable chat still
             // accepts. End the refusal only after the deletion commits.
             unreadableChatIDs.remove(chatID)
+            clearPersistenceHealth(chatID: chatID)
             return .removed
         } catch {
             // Actor serialization means no newer write for this chat can land
@@ -757,6 +884,7 @@ actor AcpTranscriptStore {
             // pending entry disappear from memory.
             pending.removeValue(forKey: chatID)
             unreadableChatIDs.remove(chatID)
+            clearPersistenceHealth(chatID: chatID)
             writerGeneration = deletionGeneration
             writerLeaseExpiresAt = hasOtherPendingWrites
                 ? Self.writerLeaseDeadline(after: now)
@@ -835,11 +963,21 @@ actor AcpTranscriptStore {
     }
 
     func flush() {
+        flush(chatIDs: nil)
+    }
+
+    private func flush(chatIDs: Set<String>?) {
         flushTask = nil
         guard !pending.isEmpty else { return }
-        let writes = pending
-        pending.removeAll()
+        let eligibleChatIDs = Set(pending.keys.filter { chatID in
+            (chatIDs == nil || chatIDs?.contains(chatID) == true)
+                && persistenceAttempts[chatID, default: 0] < Self.maximumPersistenceAttempts
+        })
+        guard !eligibleChatIDs.isEmpty else { return }
+        let writes = pending.filter { eligibleChatIDs.contains($0.key) }
+        for chatID in eligibleChatIDs { pending.removeValue(forKey: chatID) }
         do {
+            try consumeFlushFailure()
             let database = try openDatabase()
             let now = Self.timestamp(nil)
             var completedGeneration: Int64 = 0
@@ -881,6 +1019,9 @@ actor AcpTranscriptStore {
             writerLeaseExpiresAt = 0
             retentionCheckedChatIDs.formUnion(writes.keys)
             try secureDatabaseFile()
+            for chatID in writes.keys {
+                clearPersistenceHealth(chatID: chatID)
+            }
         } catch {
             // Retain the exact coalesced snapshots. A later stream update or an
             // explicit lifecycle flush retries them instead of silently losing
@@ -888,6 +1029,31 @@ actor AcpTranscriptStore {
             for (chatID, write) in writes where pending[chatID] == nil {
                 pending[chatID] = write
             }
+            for chatID in writes.keys {
+                let attempt = min(
+                    Self.maximumPersistenceAttempts,
+                    persistenceAttempts[chatID, default: 0] + 1
+                )
+                persistenceAttempts[chatID] = attempt
+                if attempt == Self.maximumPersistenceAttempts {
+                    publishPersistenceHealth(
+                        .failed(PersistenceFailure(
+                            attemptCount: attempt,
+                            maximumAttempts: Self.maximumPersistenceAttempts
+                        )),
+                        chatID: chatID
+                    )
+                } else {
+                    publishPersistenceHealth(
+                        .retrying(
+                            attempt: attempt,
+                            maximumAttempts: Self.maximumPersistenceAttempts
+                        ),
+                        chatID: chatID
+                    )
+                }
+            }
+            scheduleFlush()
         }
     }
 
@@ -1939,6 +2105,12 @@ actor AcpTranscriptStore {
         injectedTombstoneFailure = nil
         let label = point == .open ? "open" : "commit"
         throw StoreError.database("injected transcript tombstone \(label) failure")
+    }
+
+    private func consumeFlushFailure() throws {
+        guard injectedFlushFailureCount > 0 else { return }
+        injectedFlushFailureCount -= 1
+        throw StoreError.database("injected transcript flush failure")
     }
 
     private static func storeError(_ error: Error) -> StoreError {

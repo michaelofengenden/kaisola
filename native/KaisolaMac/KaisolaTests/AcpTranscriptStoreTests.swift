@@ -1222,4 +1222,113 @@ final class AcpTranscriptStoreTests: XCTestCase {
         let stillRefusing = await relaunched.hasUnreadableHistory(chatID: "chat-doomed")
         XCTAssertFalse(stillRefusing)
     }
+
+    // MARK: - Persistent write health
+
+    func testFlushPublishesBoundedFailureAndKeepsExactRecoverySnapshot() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-health-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = AcpTranscriptStore(
+            databaseURL: directory.appendingPathComponent("transcripts.sqlite3"),
+            schedulesAutomaticFlush: false,
+            injectedFlushFailureCount: AcpTranscriptStore.maximumPersistenceAttempts
+        )
+        let updates = await store.persistenceHealthUpdates()
+        let recorder = Task { () -> [AcpTranscriptStore.PersistenceHealthUpdate] in
+            var recorded: [AcpTranscriptStore.PersistenceHealthUpdate] = []
+            for await update in updates {
+                recorded.append(update)
+                if recorded.count == 4 { return recorded }
+            }
+            return recorded
+        }
+        let first = AcpTranscriptRow.user(id: "1", text: "keep me", failed: false)
+        let newest = AcpTranscriptRow.message(id: "2", text: "newest exact snapshot")
+
+        await store.scheduleSave([first], for: "chat-health", startOrdinal: 0, now: 1)
+        await store.flush()
+        let firstHealth = await store.persistenceHealth(for: "chat-health")
+        XCTAssertEqual(
+            firstHealth,
+            .retrying(attempt: 1, maximumAttempts: AcpTranscriptStore.maximumPersistenceAttempts)
+        )
+
+        // A stream update during the retry window must replace the older
+        // snapshot without resetting the bounded failure count.
+        await store.scheduleSave([first, newest], for: "chat-health", startOrdinal: 0, now: 2)
+        await store.flush()
+        let secondHealth = await store.persistenceHealth(for: "chat-health")
+        XCTAssertEqual(
+            secondHealth,
+            .retrying(attempt: 2, maximumAttempts: AcpTranscriptStore.maximumPersistenceAttempts)
+        )
+        await store.flush()
+
+        let terminalHealth = await store.persistenceHealth(for: "chat-health")
+        let failure = try XCTUnwrap(terminalHealth.failure)
+        XCTAssertEqual(failure.attemptCount, AcpTranscriptStore.maximumPersistenceAttempts)
+        XCTAssertEqual(failure.maximumAttempts, AcpTranscriptStore.maximumPersistenceAttempts)
+        XCTAssertTrue(failure.guidance.contains("Retry"))
+        XCTAssertTrue(failure.guidance.contains("export"))
+        let snapshot = await store.recoverySnapshot(for: "chat-health")
+        XCTAssertEqual(
+            snapshot,
+            AcpTranscriptStore.RecoverySnapshot(
+                chatID: "chat-health",
+                startOrdinal: 0,
+                rows: [first, newest]
+            )
+        )
+
+        // A lifecycle flush is not a hidden fourth retry. Only the explicit
+        // recovery action re-arms the bounded circuit.
+        await store.flush()
+        let healthAfterExtraFlush = await store.persistenceHealth(for: "chat-health")
+        let rowsAfterExtraFlush = await store.rows(for: "chat-health")
+        XCTAssertNotNil(healthAfterExtraFlush.failure)
+        XCTAssertTrue(rowsAfterExtraFlush.isEmpty)
+
+        await store.retryPersistence(chatID: "chat-health")
+        let recoveredHealth = await store.persistenceHealth(for: "chat-health")
+        let recoveredRows = await store.rows(for: "chat-health")
+        let recoveredSnapshot = await store.recoverySnapshot(for: "chat-health")
+        XCTAssertEqual(recoveredHealth, .healthy)
+        XCTAssertEqual(recoveredRows, [first, newest])
+        XCTAssertNil(recoveredSnapshot)
+
+        let recorded = await recorder.value
+        XCTAssertEqual(recorded.map(\.chatID), Array(repeating: "chat-health", count: 4))
+        XCTAssertEqual(
+            recorded.map(\.health),
+            [
+                .retrying(attempt: 1, maximumAttempts: 3),
+                .retrying(attempt: 2, maximumAttempts: 3),
+                .failed(failure),
+                .healthy,
+            ]
+        )
+    }
+
+    func testRecoveryExportRoundTripsRowsAndDisclosesPartialSnapshot() throws {
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "1", text: "question", failed: false),
+            .message(id: "2", text: "answer"),
+        ]
+        let data = try AcpTranscriptRecoveryExport.data(
+            title: "Agent / Project",
+            startOrdinal: 75,
+            rows: rows
+        )
+        let decoded = try JSONDecoder().decode(AcpTranscriptRecoveryExport.Document.self, from: data)
+
+        XCTAssertEqual(decoded.title, "Agent / Project")
+        XCTAssertEqual(decoded.startOrdinal, 75)
+        XCTAssertEqual(decoded.rows, rows)
+        XCTAssertFalse(decoded.isCompleteTranscript)
+        XCTAssertEqual(
+            AcpTranscriptRecoveryExport.suggestedFileName(for: "Agent / Project"),
+            "agent-project-transcript-recovery.json"
+        )
+    }
 }

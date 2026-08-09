@@ -779,6 +779,82 @@ struct HTMLPreviewPreparation: Equatable, Sendable {
     }
 }
 
+/// User-facing disclosure derived from the same effective local-file boundary
+/// passed to WebKit. Keeping these together prevents the approval copy from
+/// claiming a narrower or broader scope than the page actually receives.
+struct HTMLJavaScriptSecurityScope: Equatable, Sendable {
+    struct Disclosure: Equatable, Sendable, Identifiable {
+        enum ID: String, Hashable, Sendable {
+            case localFiles
+            case network
+            case storage
+            case navigation
+        }
+
+        let id: ID
+        let title: String
+        let detail: String
+        let systemImage: String
+    }
+
+    static let revokeActionTitle = "Revoke JavaScript"
+
+    let fileURL: URL
+    let readAccessRoot: URL?
+
+    var effectiveReadAccessRoot: URL {
+        let fallback = fileURL.deletingLastPathComponent()
+        guard let candidate = readAccessRoot?.standardizedFileURL,
+              WorkspacePreviewLinkPolicy.isContained(fileURL, in: candidate) else {
+            return fallback
+        }
+        return candidate
+    }
+
+    var approvalSummary: String {
+        "Approval applies only to \(fileName) at its current contents."
+    }
+
+    var enabledNotice: String {
+        "JavaScript is enabled for \(fileName) only."
+    }
+
+    var disclosures: [Disclosure] {
+        [
+            Disclosure(
+                id: .localFiles,
+                title: "Local files",
+                detail: "Scripts can read this file and other files inside "
+                    + "\(effectiveReadAccessRoot.path).",
+                systemImage: "folder"
+            ),
+            Disclosure(
+                id: .network,
+                title: "Network",
+                detail: "Scripts can contact network hosts permitted by the page and WebKit.",
+                systemImage: "network"
+            ),
+            Disclosure(
+                id: .storage,
+                title: "Temporary storage",
+                detail: "Website data is temporary and is not persisted by this preview.",
+                systemImage: "internaldrive"
+            ),
+            Disclosure(
+                id: .navigation,
+                title: "External navigation",
+                detail: "Only clicked HTTP or HTTPS links open in your browser; off-project "
+                    + "redirects and custom schemes stay blocked.",
+                systemImage: "arrow.up.right.square"
+            ),
+        ]
+    }
+
+    private var fileName: String {
+        fileURL.lastPathComponent.isEmpty ? "this file" : fileURL.lastPathComponent
+    }
+}
+
 private enum HTMLPreviewLoadState: Equatable {
     case loading
     case ready
@@ -804,6 +880,7 @@ struct HtmlFilePreview: View {
     @State private var reloadToken = 0
     @State private var scriptApproval = HTMLScriptApproval()
     @State private var loadState: HTMLPreviewLoadState = .loading
+    @State private var showsJavaScriptReview = false
 
     /// Derived rather than stored: the approval names one document, so content
     /// swapped in behind the same path drops to false without waiting for an
@@ -812,17 +889,8 @@ struct HtmlFilePreview: View {
         scriptApproval.allowsJavaScript(for: identity)
     }
 
-    private var javaScriptApprovalBinding: Binding<Bool> {
-        Binding(
-            get: { allowsJavaScript },
-            set: { isOn in
-                if isOn {
-                    scriptApproval.allow(for: identity)
-                } else {
-                    scriptApproval.revoke()
-                }
-            }
-        )
+    private var javaScriptSecurityScope: HTMLJavaScriptSecurityScope {
+        HTMLJavaScriptSecurityScope(fileURL: fileURL, readAccessRoot: readAccessRoot)
     }
 
     var body: some View {
@@ -863,21 +931,35 @@ struct HtmlFilePreview: View {
                 }
             }
 
-            if !allowsJavaScript, requiresJavaScriptPrompt {
+            if !allowsJavaScript, requiresJavaScriptPrompt || showsJavaScriptReview {
                 VStack(spacing: 10) {
                     Image(systemName: "curlybraces.square")
                         .font(.system(size: 23, weight: .medium))
                         .foregroundStyle(Color.accentColor)
-                    Text("This page needs JavaScript")
+                        .accessibilityHidden(true)
+                    Text(requiresJavaScriptPrompt
+                        ? "This page needs JavaScript"
+                        : "Review JavaScript Access")
                         .font(.headline)
-                    Text("Project scripts stay off until you allow them for this preview.")
+                    Text("Review what project-controlled code can access before allowing it.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
-                        .frame(maxWidth: 260)
+                    Text(javaScriptSecurityScope.approvalSummary)
+                        .font(.caption.weight(.semibold))
+                    HTMLJavaScriptSecurityDisclosureView(scope: javaScriptSecurityScope)
                     HStack(spacing: 8) {
-                        Button("Allow JavaScript") { scriptApproval.allow(for: identity) }
-                            .buttonStyle(.borderedProminent)
+                        Button("Allow JavaScript") {
+                            scriptApproval.allow(for: identity)
+                            showsJavaScriptReview = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                        if showsJavaScriptReview, !requiresJavaScriptPrompt {
+                            Button("Cancel") { showsJavaScriptReview = false }
+                                .buttonStyle(.bordered)
+                                .keyboardShortcut(.cancelAction)
+                        }
                         Button("Open in Browser") { NSWorkspace.shared.open(fileURL) }
                             .buttonStyle(.bordered)
                     }
@@ -888,8 +970,20 @@ struct HtmlFilePreview: View {
                 .background(.regularMaterial)
             }
 
+            if allowsJavaScript {
+                javaScriptEnabledBanner
+                    .padding(8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+            }
+
             Menu {
-                Toggle("Allow project JavaScript", isOn: javaScriptApprovalBinding)
+                if allowsJavaScript {
+                    Button(HTMLJavaScriptSecurityScope.revokeActionTitle, role: .destructive) {
+                        scriptApproval.revoke()
+                    }
+                } else {
+                    Button("Review JavaScript Access…") { showsJavaScriptReview = true }
+                }
                 Button("Reload") { reloadToken &+= 1 }
                 Divider()
                 Button("Open in Browser") { NSWorkspace.shared.open(fileURL) }
@@ -908,7 +1002,11 @@ struct HtmlFilePreview: View {
         .background(Color(nsColor: .windowBackgroundColor))
         // Approval is deliberately one-file-at-a-time. Navigating from a
         // trusted document must never silently grant scripts to the next file.
-        .onChange(of: fileURL) { _, _ in scriptApproval.revoke() }
+        .onChange(of: fileURL) { _, _ in
+            showsJavaScriptReview = false
+            scriptApproval.revoke()
+        }
+        .onChange(of: identity) { _, _ in showsJavaScriptReview = false }
         .overlay {
             if preparedIdentity != identity {
                 ZStack {
@@ -929,6 +1027,57 @@ struct HtmlFilePreview: View {
             scriptApproval.adopt(identity: identity, fingerprint: preparation.fingerprint)
             preparedIdentity = identity
         }
+    }
+
+    private var javaScriptEnabledBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "curlybraces.square.fill")
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            Text(javaScriptSecurityScope.enabledNotice)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+            Button(HTMLJavaScriptSecurityScope.revokeActionTitle) {
+                scriptApproval.revoke()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityHint("Stops project scripts and reloads this preview")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.10)))
+    }
+}
+
+private struct HTMLJavaScriptSecurityDisclosureView: View {
+    let scope: HTMLJavaScriptSecurityScope
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 9) {
+                ForEach(scope.disclosures) { disclosure in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: disclosure.systemImage)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 16)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(disclosure.title)
+                                .font(.caption.weight(.medium))
+                            Text(disclosure.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: 460, maxHeight: 240)
     }
 }
 
@@ -998,10 +1147,10 @@ private struct ConfinedFileWebView: NSViewRepresentable {
     }
 
     private var effectiveReadAccessRoot: URL {
-        let fallback = fileURL.deletingLastPathComponent()
-        guard let candidate = readAccessRoot?.standardizedFileURL,
-              WorkspacePreviewLinkPolicy.isContained(fileURL, in: candidate) else { return fallback }
-        return candidate
+        HTMLJavaScriptSecurityScope(
+            fileURL: fileURL,
+            readAccessRoot: readAccessRoot
+        ).effectiveReadAccessRoot
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {

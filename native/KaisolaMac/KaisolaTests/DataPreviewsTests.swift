@@ -513,4 +513,47 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertNotEqual(preparation.fingerprint, HTMLScriptApproval.fingerprint(Self.benignHTML))
         XCTAssertFalse(HTMLPreviewPreparation.make(Self.benignHTML).requiresJavaScriptPrompt)
     }
+
+    func testHtmlJavaScriptSecurityScopeExplainsEveryCapabilityBeforeApproval() {
+        let project = URL(fileURLWithPath: "/tmp/kaisola-html-security/project", isDirectory: true)
+        let file = project.appendingPathComponent("reports/status.html")
+        let scope = HTMLJavaScriptSecurityScope(fileURL: file, readAccessRoot: project)
+        let disclosures = Dictionary(uniqueKeysWithValues: scope.disclosures.map { ($0.id, $0.detail) })
+
+        XCTAssertEqual(scope.effectiveReadAccessRoot, project.standardizedFileURL)
+        XCTAssertEqual(
+            disclosures[.localFiles],
+            "Scripts can read this file and other files inside \(project.path)."
+        )
+        XCTAssertEqual(
+            disclosures[.network],
+            "Scripts can contact network hosts permitted by the page and WebKit."
+        )
+        XCTAssertEqual(
+            disclosures[.storage],
+            "Website data is temporary and is not persisted by this preview."
+        )
+        XCTAssertEqual(
+            disclosures[.navigation],
+            "Only clicked HTTP or HTTPS links open in your browser; off-project redirects and custom schemes stay blocked."
+        )
+        XCTAssertEqual(
+            scope.approvalSummary,
+            "Approval applies only to status.html at its current contents."
+        )
+        XCTAssertEqual(scope.enabledNotice, "JavaScript is enabled for status.html only.")
+        XCTAssertEqual(HTMLJavaScriptSecurityScope.revokeActionTitle, "Revoke JavaScript")
+    }
+
+    func testHtmlJavaScriptSecurityScopeNeverOverclaimsAnUnrelatedReadRoot() {
+        let requestedRoot = URL(fileURLWithPath: "/tmp/kaisola-html-security/project")
+        let file = URL(fileURLWithPath: "/tmp/kaisola-html-security/project-copy/status.html")
+        let scope = HTMLJavaScriptSecurityScope(fileURL: file, readAccessRoot: requestedRoot)
+
+        XCTAssertEqual(scope.effectiveReadAccessRoot, file.deletingLastPathComponent())
+        XCTAssertEqual(
+            scope.disclosures.first(where: { $0.id == .localFiles })?.detail,
+            "Scripts can read this file and other files inside /tmp/kaisola-html-security/project-copy."
+        )
+    }
 }

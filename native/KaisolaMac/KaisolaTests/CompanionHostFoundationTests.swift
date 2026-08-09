@@ -378,6 +378,24 @@ final class CompanionHostFoundationTests: XCTestCase {
         XCTAssertEqual(presentation.title, "Single-use pairing code")
     }
 
+    func testPairingCodePresentationExplainsQRCodeFailureWithoutHidingManualFallback() {
+        let code = #"{"pairingNonce":"manual-fallback"}"#
+        let presentation = CompanionPairingCodePresentation(code: code)
+
+        XCTAssertNil(presentation.qrFallbackMessage(qrCodeAvailable: true))
+        XCTAssertEqual(
+            presentation.qrFallbackMessage(qrCodeAvailable: false),
+            "QR code unavailable. Copy or select the pairing code instead."
+        )
+        XCTAssertEqual(presentation.displayValue, code)
+        XCTAssertEqual(presentation.copyValue, code)
+        XCTAssertTrue(
+            CompanionPairingOfferAccessibility.qrFallback.hasPrefix(
+                CompanionPairingOfferAccessibility.group + "."
+            )
+        )
+    }
+
     func testPairingOfferControlsUseOneStableAccessibilityGroup() {
         let identifiers = CompanionPairingOfferAccessibility.allControlIdentifiers
 

@@ -10,12 +10,19 @@ struct CompanionPairingCodePresentation: Equatable, Sendable {
     var displayValue: String { code }
     var copyValue: String { code }
     var accessibilityValue: String { code }
+
+    func qrFallbackMessage(qrCodeAvailable: Bool) -> String? {
+        qrCodeAvailable
+            ? nil
+            : "QR code unavailable. Copy or select the pairing code instead."
+    }
 }
 
 enum CompanionPairingOfferAccessibility {
     static let group = "companion.pairing-offer"
     static let code = group + ".code"
     static let qrCode = group + ".qr-code"
+    static let qrFallback = group + ".qr-fallback"
     static let copy = group + ".copy"
     static let cancel = group + ".cancel"
     static let allControlIdentifiers = [code, qrCode, copy, cancel]
@@ -134,9 +141,10 @@ struct CompanionSettingsTab: View {
 
                             if let code = host.pairingCode {
                                 let presentation = CompanionPairingCodePresentation(code: code)
+                                let qrCodeImage = CompanionQRCode.image(for: code)
                                 Divider().opacity(0.45)
                                 VStack(spacing: 12) {
-                                    if let image = CompanionQRCode.image(for: code) {
+                                    if let image = qrCodeImage {
                                         Image(nsImage: image)
                                             .interpolation(.none)
                                             .resizable()
@@ -144,6 +152,17 @@ struct CompanionSettingsTab: View {
                                             .accessibilityLabel("Companion pairing QR code")
                                             .accessibilityIdentifier(
                                                 CompanionPairingOfferAccessibility.qrCode
+                                            )
+                                    }
+
+                                    if let message = presentation.qrFallbackMessage(
+                                        qrCodeAvailable: qrCodeImage != nil
+                                    ) {
+                                        Text(message)
+                                            .font(.caption)
+                                            .multilineTextAlignment(.center)
+                                            .accessibilityIdentifier(
+                                                CompanionPairingOfferAccessibility.qrFallback
                                             )
                                     }
 

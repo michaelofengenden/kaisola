@@ -2057,6 +2057,13 @@ final class AppModel: ObservableObject {
 
     var recentFolders: [String] { sessionStore.recentFolders() }
 
+    /// Remove a launch-history suggestion only. Open projects, files, and Git
+    /// worktrees remain untouched.
+    func removeRecentFolder(_ path: String) {
+        sessionStore.removeRecentFolder(path)
+        objectWillChange.send()
+    }
+
     func isOwned(_ terminalID: String) -> Bool {
         ownedTerminalIDs.contains(terminalID)
     }

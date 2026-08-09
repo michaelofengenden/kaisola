@@ -7,6 +7,17 @@ const os = require('node:os')
 const path = require('node:path')
 const realManager = require('../../runtime/node-broker/ipc/terminalManager.cjs')
 const { TerminalSpool } = require('../../runtime/node-broker/ipc/terminalSpool.cjs')
+const { TERMINAL_CREATE_LIMITS } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+
+const {
+  argumentCount: MAX_ARGUMENT_COUNT,
+  argumentBytes: MAX_ARGUMENT_BYTES,
+  argumentsBytes: MAX_ARGUMENTS_BYTES,
+  environmentEntries: MAX_ENVIRONMENT_ENTRIES,
+  environmentKeyBytes: MAX_ENVIRONMENT_KEY_BYTES,
+  environmentValueBytes: MAX_ENVIRONMENT_VALUE_BYTES,
+  environmentBytes: MAX_ENVIRONMENT_BYTES,
+} = TERMINAL_CREATE_LIMITS
 
 const managerSpoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-create-route-'))
 realManager.configureStorage(managerSpoolDir)
@@ -90,6 +101,367 @@ test('terminal create route always returns recovered null for a plain spawn', ()
 
   assert.equal(manager.calls[0].restore, false)
   assert.equal(response.recovered, null)
+})
+
+test('terminal create route preserves safe multibyte arguments and environment', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const manager = fakeManager()
+  const args = ['--title', 'Café 🧪', '日本語']
+  const env = { LANG: '日本語.UTF-8', EMPTY: '' }
+
+  const response = terminalCreateRoute({
+    manager,
+    params: { id: 'safe-multibyte-payload', args, env },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => {},
+  })
+
+  assert.equal(response.ok, true)
+  assert.deepEqual(manager.calls[0].args, args)
+  assert.deepEqual(manager.calls[0].env, env)
+})
+
+test('terminal create route rejects invalid argument shapes before spawn', async (t) => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const fixtures = [
+    {
+      name: 'arguments must be an array',
+      args: '--flag',
+      expected: {
+        ok: false,
+        code: 'terminal_create_payload_type',
+        message: 'terminal arguments must be an array',
+        scope: 'arguments',
+        expected: 'array',
+      },
+    },
+    {
+      name: 'each argument must be a string',
+      args: ['--flag', 42],
+      expected: {
+        ok: false,
+        code: 'terminal_create_payload_type',
+        message: 'terminal argument 1 must be a string',
+        scope: 'arguments',
+        expected: 'string',
+        index: 1,
+      },
+    },
+  ]
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, () => {
+      const manager = fakeManager()
+      manager.has = () => false
+      const response = terminalCreateRoute({
+        manager,
+        params: { id: `invalid-${fixture.name}`, args: fixture.args },
+        owner: 'instance|owner|project',
+        clientInstanceId: 'instance',
+        requireAllowed: () => assert.fail('invalid payload must not authorize'),
+      })
+
+      assert.deepEqual(response, fixture.expected)
+      assert.equal(manager.calls.length, 0)
+    })
+  }
+})
+
+test('terminal create route rejects argument count above the documented maximum', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const manager = fakeManager()
+  manager.has = () => false
+  const args = Array.from({ length: MAX_ARGUMENT_COUNT + 1 }, (_, index) => `arg-${index}`)
+
+  const response = terminalCreateRoute({
+    manager,
+    params: { id: 'too-many-arguments', args },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => assert.fail('oversized payload must not authorize'),
+  })
+
+  assert.deepEqual(response, {
+    ok: false,
+    code: 'terminal_create_payload_limit',
+    message: 'terminal arguments exceed 200 entries',
+    scope: 'arguments',
+    limit: 'entryCount',
+    maxCount: MAX_ARGUMENT_COUNT,
+    actualCount: MAX_ARGUMENT_COUNT + 1,
+  })
+  assert.equal(manager.calls.length, 0)
+})
+
+test('terminal create route measures each argument in UTF-8 bytes', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const boundaryManager = fakeManager()
+  const boundary = 'é'.repeat(MAX_ARGUMENT_BYTES / 2)
+  const accepted = terminalCreateRoute({
+    manager: boundaryManager,
+    params: { id: 'argument-byte-boundary', args: [boundary] },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => {},
+  })
+  assert.equal(accepted.ok, true)
+  assert.equal(Buffer.byteLength(boundary), MAX_ARGUMENT_BYTES)
+
+  const rejectedManager = fakeManager()
+  rejectedManager.has = () => false
+  const oversized = `${boundary}é`
+  const rejected = terminalCreateRoute({
+    manager: rejectedManager,
+    params: { id: 'argument-byte-overflow', args: [oversized] },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => assert.fail('oversized payload must not authorize'),
+  })
+  assert.deepEqual(rejected, {
+    ok: false,
+    code: 'terminal_create_payload_limit',
+    message: 'terminal argument 0 exceeds 16384 UTF-8 bytes',
+    scope: 'arguments',
+    limit: 'itemBytes',
+    index: 0,
+    maxBytes: MAX_ARGUMENT_BYTES,
+    actualBytes: MAX_ARGUMENT_BYTES + 2,
+  })
+  assert.equal(rejectedManager.calls.length, 0)
+})
+
+test('terminal create route bounds aggregate argument bytes', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const boundaryManager = fakeManager()
+  const boundaryArgs = Array.from({ length: 16 }, () => 'a'.repeat(MAX_ARGUMENT_BYTES))
+  assert.equal(
+    boundaryArgs.reduce((total, argument) => total + Buffer.byteLength(argument), 0),
+    MAX_ARGUMENTS_BYTES,
+  )
+  const accepted = terminalCreateRoute({
+    manager: boundaryManager,
+    params: { id: 'aggregate-argument-boundary', args: boundaryArgs },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => {},
+  })
+  assert.equal(accepted.ok, true)
+
+  const manager = fakeManager()
+  manager.has = () => false
+  const args = Array.from({ length: 17 }, () => 'a'.repeat(MAX_ARGUMENT_BYTES))
+  const actualBytes = args.reduce((total, argument) => total + Buffer.byteLength(argument), 0)
+  assert.ok(actualBytes > MAX_ARGUMENTS_BYTES)
+
+  const response = terminalCreateRoute({
+    manager,
+    params: { id: 'aggregate-argument-overflow', args },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => assert.fail('oversized payload must not authorize'),
+  })
+
+  assert.deepEqual(response, {
+    ok: false,
+    code: 'terminal_create_payload_limit',
+    message: 'terminal arguments exceed 262144 total UTF-8 bytes',
+    scope: 'arguments',
+    limit: 'totalBytes',
+    maxBytes: MAX_ARGUMENTS_BYTES,
+    actualBytes,
+  })
+  assert.equal(manager.calls.length, 0)
+})
+
+test('terminal create route rejects invalid environment shapes before spawn', async (t) => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const fixtures = [
+    {
+      name: 'environment must be an object',
+      env: [],
+      expected: {
+        ok: false,
+        code: 'terminal_create_payload_type',
+        message: 'terminal environment must be an object of string values',
+        scope: 'environment',
+        expected: 'object',
+      },
+    },
+    {
+      name: 'environment values must be strings',
+      env: { SAFE: 'yes', TOKEN: 42 },
+      expected: {
+        ok: false,
+        code: 'terminal_create_payload_type',
+        message: 'terminal environment value 1 must be a string',
+        scope: 'environment',
+        expected: 'string',
+        index: 1,
+      },
+    },
+  ]
+
+  for (const fixture of fixtures) {
+    await t.test(fixture.name, () => {
+      const manager = fakeManager()
+      manager.has = () => false
+      const response = terminalCreateRoute({
+        manager,
+        params: { id: `invalid-${fixture.name}`, env: fixture.env },
+        owner: 'instance|owner|project',
+        clientInstanceId: 'instance',
+        requireAllowed: () => assert.fail('invalid payload must not authorize'),
+      })
+
+      assert.deepEqual(response, fixture.expected)
+      assert.equal(manager.calls.length, 0)
+    })
+  }
+})
+
+test('terminal create route bounds environment entry count', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const manager = fakeManager()
+  manager.has = () => false
+  const env = Object.fromEntries(
+    Array.from({ length: MAX_ENVIRONMENT_ENTRIES + 1 }, (_, index) => [`KEY_${index}`, 'value']),
+  )
+
+  const response = terminalCreateRoute({
+    manager,
+    params: { id: 'environment-entry-overflow', env },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => assert.fail('oversized payload must not authorize'),
+  })
+
+  assert.deepEqual(response, {
+    ok: false,
+    code: 'terminal_create_payload_limit',
+    message: 'terminal environment exceeds 256 entries',
+    scope: 'environment',
+    limit: 'entryCount',
+    maxCount: MAX_ENVIRONMENT_ENTRIES,
+    actualCount: MAX_ENVIRONMENT_ENTRIES + 1,
+  })
+  assert.equal(manager.calls.length, 0)
+})
+
+test('terminal create route measures environment keys and values in UTF-8 bytes', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const safeKey = '界'.repeat(341)
+  const safeValue = '🙂'.repeat(MAX_ENVIRONMENT_VALUE_BYTES / 4)
+  assert.ok(Buffer.byteLength(safeKey) <= MAX_ENVIRONMENT_KEY_BYTES)
+  assert.equal(Buffer.byteLength(safeValue), MAX_ENVIRONMENT_VALUE_BYTES)
+
+  const boundaryManager = fakeManager()
+  const accepted = terminalCreateRoute({
+    manager: boundaryManager,
+    params: { id: 'environment-byte-boundary', env: { [safeKey]: safeValue } },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => {},
+  })
+  assert.equal(accepted.ok, true)
+
+  const keyManager = fakeManager()
+  keyManager.has = () => false
+  const oversizedKey = `${safeKey}界`
+  const rejectedKey = terminalCreateRoute({
+    manager: keyManager,
+    params: { id: 'environment-key-overflow', env: { [oversizedKey]: 'value' } },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => assert.fail('oversized payload must not authorize'),
+  })
+  assert.deepEqual(rejectedKey, {
+    ok: false,
+    code: 'terminal_create_payload_limit',
+    message: 'terminal environment key 0 exceeds 1024 UTF-8 bytes',
+    scope: 'environment',
+    limit: 'keyBytes',
+    index: 0,
+    maxBytes: MAX_ENVIRONMENT_KEY_BYTES,
+    actualBytes: Buffer.byteLength(oversizedKey),
+  })
+
+  const valueManager = fakeManager()
+  valueManager.has = () => false
+  const oversizedValue = `${safeValue}🙂`
+  const rejectedValue = terminalCreateRoute({
+    manager: valueManager,
+    params: { id: 'environment-value-overflow', env: { KEY: oversizedValue } },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => assert.fail('oversized payload must not authorize'),
+  })
+  assert.deepEqual(rejectedValue, {
+    ok: false,
+    code: 'terminal_create_payload_limit',
+    message: 'terminal environment value 0 exceeds 65536 UTF-8 bytes',
+    scope: 'environment',
+    limit: 'valueBytes',
+    index: 0,
+    maxBytes: MAX_ENVIRONMENT_VALUE_BYTES,
+    actualBytes: MAX_ENVIRONMENT_VALUE_BYTES + 4,
+  })
+  assert.equal(keyManager.calls.length, 0)
+  assert.equal(valueManager.calls.length, 0)
+})
+
+test('terminal create route bounds aggregate environment bytes', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const boundaryManager = fakeManager()
+  const boundaryEnv = {
+    K0: 'v'.repeat(MAX_ENVIRONMENT_VALUE_BYTES),
+    K1: 'v'.repeat(MAX_ENVIRONMENT_VALUE_BYTES),
+    K2: 'v'.repeat(MAX_ENVIRONMENT_VALUE_BYTES),
+    K3: 'v'.repeat(MAX_ENVIRONMENT_VALUE_BYTES - 8),
+  }
+  const boundaryBytes = Object.entries(boundaryEnv).reduce(
+    (total, [key, value]) => total + Buffer.byteLength(key) + Buffer.byteLength(value),
+    0,
+  )
+  assert.equal(boundaryBytes, MAX_ENVIRONMENT_BYTES)
+  const accepted = terminalCreateRoute({
+    manager: boundaryManager,
+    params: { id: 'aggregate-environment-boundary', env: boundaryEnv },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => {},
+  })
+  assert.equal(accepted.ok, true)
+
+  const manager = fakeManager()
+  manager.has = () => false
+  const env = Object.fromEntries(
+    Array.from({ length: 5 }, (_, index) => [`K${index}`, 'v'.repeat(60 * 1024)]),
+  )
+  const actualBytes = Object.entries(env).reduce(
+    (total, [key, value]) => total + Buffer.byteLength(key) + Buffer.byteLength(value),
+    0,
+  )
+  assert.ok(actualBytes > MAX_ENVIRONMENT_BYTES)
+
+  const response = terminalCreateRoute({
+    manager,
+    params: { id: 'aggregate-environment-overflow', env },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => assert.fail('oversized payload must not authorize'),
+  })
+
+  assert.deepEqual(response, {
+    ok: false,
+    code: 'terminal_create_payload_limit',
+    message: 'terminal environment exceeds 262144 total UTF-8 bytes',
+    scope: 'environment',
+    limit: 'totalBytes',
+    maxBytes: MAX_ENVIRONMENT_BYTES,
+    actualBytes,
+  })
+  assert.equal(manager.calls.length, 0)
 })
 
 test('terminal create route preserves an id at the 240-character boundary', () => {

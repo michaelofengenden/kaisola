@@ -3,6 +3,183 @@
 const os = require('node:os')
 
 const MAX_TERMINAL_ID_LENGTH = 240
+const TERMINAL_CREATE_LIMITS = Object.freeze({
+  argumentCount: 200,
+  argumentBytes: 16 * 1024,
+  argumentsBytes: 256 * 1024,
+  environmentEntries: 256,
+  environmentKeyBytes: 1024,
+  environmentValueBytes: 64 * 1024,
+  environmentBytes: 256 * 1024,
+})
+
+function payloadTypeError(message, scope, expected, index) {
+  return {
+    ok: false,
+    code: 'terminal_create_payload_type',
+    message,
+    scope,
+    expected,
+    ...(index == null ? {} : { index }),
+  }
+}
+
+function payloadCountError(message, scope, maxCount, actualCount) {
+  return {
+    ok: false,
+    code: 'terminal_create_payload_limit',
+    message,
+    scope,
+    limit: 'entryCount',
+    maxCount,
+    actualCount,
+  }
+}
+
+function payloadByteError(message, scope, limit, maxBytes, actualBytes, index) {
+  return {
+    ok: false,
+    code: 'terminal_create_payload_limit',
+    message,
+    scope,
+    limit,
+    ...(index == null ? {} : { index }),
+    maxBytes,
+    actualBytes,
+  }
+}
+
+/** Validate before ownership lookup or node-pty spawn. Byte ceilings count the
+ * exact UTF-8 content bytes supplied by the client, not JavaScript characters
+ * or JSON framing, so multibyte input cannot evade the documented limits. */
+function validatedArguments(raw) {
+  if (raw === undefined) return { ok: true, value: undefined }
+  if (!Array.isArray(raw)) {
+    return payloadTypeError(
+      'terminal arguments must be an array',
+      'arguments',
+      'array',
+    )
+  }
+  if (raw.length > TERMINAL_CREATE_LIMITS.argumentCount) {
+    return payloadCountError(
+      `terminal arguments exceed ${TERMINAL_CREATE_LIMITS.argumentCount} entries`,
+      'arguments',
+      TERMINAL_CREATE_LIMITS.argumentCount,
+      raw.length,
+    )
+  }
+
+  let totalBytes = 0
+  for (let index = 0; index < raw.length; index += 1) {
+    const argument = raw[index]
+    if (typeof argument !== 'string') {
+      return payloadTypeError(
+        `terminal argument ${index} must be a string`,
+        'arguments',
+        'string',
+        index,
+      )
+    }
+    const actualBytes = Buffer.byteLength(argument)
+    if (actualBytes > TERMINAL_CREATE_LIMITS.argumentBytes) {
+      return payloadByteError(
+        `terminal argument ${index} exceeds ${TERMINAL_CREATE_LIMITS.argumentBytes} UTF-8 bytes`,
+        'arguments',
+        'itemBytes',
+        TERMINAL_CREATE_LIMITS.argumentBytes,
+        actualBytes,
+        index,
+      )
+    }
+    totalBytes += actualBytes
+  }
+  if (totalBytes > TERMINAL_CREATE_LIMITS.argumentsBytes) {
+    return payloadByteError(
+      `terminal arguments exceed ${TERMINAL_CREATE_LIMITS.argumentsBytes} total UTF-8 bytes`,
+      'arguments',
+      'totalBytes',
+      TERMINAL_CREATE_LIMITS.argumentsBytes,
+      totalBytes,
+    )
+  }
+  return { ok: true, value: raw }
+}
+
+function validatedEnvironment(raw) {
+  if (raw === undefined) return { ok: true, value: undefined }
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+    return payloadTypeError(
+      'terminal environment must be an object of string values',
+      'environment',
+      'object',
+    )
+  }
+  const prototype = Object.getPrototypeOf(raw)
+  if (prototype !== Object.prototype && prototype !== null) {
+    return payloadTypeError(
+      'terminal environment must be an object of string values',
+      'environment',
+      'object',
+    )
+  }
+
+  const entries = Object.entries(raw)
+  if (entries.length > TERMINAL_CREATE_LIMITS.environmentEntries) {
+    return payloadCountError(
+      `terminal environment exceeds ${TERMINAL_CREATE_LIMITS.environmentEntries} entries`,
+      'environment',
+      TERMINAL_CREATE_LIMITS.environmentEntries,
+      entries.length,
+    )
+  }
+
+  let totalBytes = 0
+  for (let index = 0; index < entries.length; index += 1) {
+    const [key, value] = entries[index]
+    if (typeof value !== 'string') {
+      return payloadTypeError(
+        `terminal environment value ${index} must be a string`,
+        'environment',
+        'string',
+        index,
+      )
+    }
+    const keyBytes = Buffer.byteLength(key)
+    if (keyBytes > TERMINAL_CREATE_LIMITS.environmentKeyBytes) {
+      return payloadByteError(
+        `terminal environment key ${index} exceeds ${TERMINAL_CREATE_LIMITS.environmentKeyBytes} UTF-8 bytes`,
+        'environment',
+        'keyBytes',
+        TERMINAL_CREATE_LIMITS.environmentKeyBytes,
+        keyBytes,
+        index,
+      )
+    }
+    const valueBytes = Buffer.byteLength(value)
+    if (valueBytes > TERMINAL_CREATE_LIMITS.environmentValueBytes) {
+      return payloadByteError(
+        `terminal environment value ${index} exceeds ${TERMINAL_CREATE_LIMITS.environmentValueBytes} UTF-8 bytes`,
+        'environment',
+        'valueBytes',
+        TERMINAL_CREATE_LIMITS.environmentValueBytes,
+        valueBytes,
+        index,
+      )
+    }
+    totalBytes += keyBytes + valueBytes
+  }
+  if (totalBytes > TERMINAL_CREATE_LIMITS.environmentBytes) {
+    return payloadByteError(
+      `terminal environment exceeds ${TERMINAL_CREATE_LIMITS.environmentBytes} total UTF-8 bytes`,
+      'environment',
+      'totalBytes',
+      TERMINAL_CREATE_LIMITS.environmentBytes,
+      totalBytes,
+    )
+  }
+  return { ok: true, value: raw }
+}
 
 /** The authenticated `terminal.create` operation after access selection. Kept
  * separate from the executable broker so the additive resurrection wire can
@@ -27,6 +204,10 @@ function terminalCreateRoute({
       actualLength: id.length,
     }
   }
+  const args = validatedArguments(params.args)
+  if (!args.ok) return args
+  const env = validatedEnvironment(params.env)
+  if (!env.ok) return env
   if (manager.has(id)) requireAllowed(id, true)
 
   const existed = manager.isLive(id)
@@ -46,9 +227,9 @@ function terminalCreateRoute({
   const rec = manager.spawn({
     id,
     command: typeof params.command === 'string' ? params.command : undefined,
-    args: Array.isArray(params.args) ? params.args.map(String).slice(0, 200) : undefined,
+    args: args.value,
     cwd: typeof params.cwd === 'string' ? params.cwd : os.homedir(),
-    env: params.env && typeof params.env === 'object' ? params.env : undefined,
+    env: env.value,
     outputByteLimit: Number.isFinite(Number(params.outputByteLimit))
       ? Math.max(0, Math.min(Math.floor(Number(params.outputByteLimit)), 8 * 1024 * 1024))
       : undefined,
@@ -78,4 +259,4 @@ function terminalCreateRoute({
   }
 }
 
-module.exports = { terminalCreateRoute }
+module.exports = { terminalCreateRoute, TERMINAL_CREATE_LIMITS }

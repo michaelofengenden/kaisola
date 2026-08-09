@@ -9,6 +9,24 @@ import XCTest
 /// checked.
 @MainActor
 final class NativePreviewSettingsTests: XCTestCase {
+    func testIsolatedFixtureUpdaterNeverStartsSparkle() {
+        let controller = NativeUpdateController(isolatedFixture: true)
+        XCTAssertFalse(controller.startedUpdater)
+        XCTAssertEqual(
+            controller.availability,
+            .unavailable("Updates are disabled in isolated fixtures.")
+        )
+    }
+
+    func testBrokerFreeFixturePreparerCannotDiscoverOrLaunchABroker() async {
+        do {
+            _ = try await BrokerFreeFixturePreparer().prepare()
+            XCTFail("A broker-free fixture preparer must never return a broker.")
+        } catch {
+            XCTAssertEqual(error as? BrokerDiscoveryError, .notRunning)
+        }
+    }
+
     func testIsolatedFixturesNeverLaunchAutomaticProviderUsageProbes() {
         XCTAssertFalse(RootShellView.shouldAutomaticallyRefreshPlanUsage(
             environment: ["KAISOLA_NATIVE_VISUAL_FIXTURE": "1"]
@@ -133,6 +151,151 @@ final class NativePreviewSettingsTests: XCTestCase {
             NativeVisualTerminalAccessibilityGate.expectedMarkers(for: "terminal-scroll-output"),
             ["historical-anchor-"]
         )
+        XCTAssertEqual(
+            NativeVisualTerminalAccessibilityGate.expectedMarkers(for: "terminal-continuous-scroll"),
+            ["continuous-anchor-"]
+        )
+    }
+
+    func testOptimizedContinuousScrollReceiptIsMachineReadableAndFailClosed() throws {
+        let receipt = VisualTerminalContinuousScrollReceipt(
+            optimizedBuild: true,
+            scheduledHertz: 120,
+            measuredHertz: 120,
+            sampleCount: 120,
+            sampleIntervalCount: 119,
+            sampleTimestampsMilliseconds: (0..<120).map { Double($0) * 1_000 / 120 },
+            sampleDurationMilliseconds: Double(119) * 1_000 / 120,
+            cadenceP95Milliseconds: 9.2,
+            handledSampleCount: 120,
+            momentumSampleCount: 48,
+            distinctOriginCount: 120,
+            maximumAnchorStep: 1,
+            maximumContinuityError: 0,
+            processingP95Milliseconds: 2.5,
+            scrollbarMaximumError: 0,
+            topRubberBand: true,
+            bottomRubberBand: true,
+            edgesSettled: true,
+            selectionPreserved: true,
+            linkPreserved: true,
+            semanticPromptPreserved: true,
+            promptNavigationCoherent: true,
+            keyboardPagingCoherent: true,
+            accessibilityPagingCoherent: true,
+            accessibilityActionsExposed: true,
+            scrollerFramePreserved: true,
+            alternateScreenPreserved: true,
+            appMouseRoutingPreserved: true,
+            liveBottomCoherent: true,
+            viewIdentityPreserved: true,
+            coordinatorIdentityPreserved: true,
+            terminalEngineIdentityPreserved: true,
+            finalFractionalViewport: true,
+            fixtureUpdaterDisabled: true,
+            fixtureBrokerIsolated: true,
+            fixtureBuildNumber: 900_000_001,
+            feedBuildFloor: 900_000_000,
+            cursorBefore: 1_000,
+            cursorAfter: 2_000,
+            expectedCursorAfter: 2_000,
+            finalMarkerPresent: true
+        )
+
+        XCTAssertNil(receipt.failure)
+        let json = try XCTUnwrap(receipt.json)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                VisualTerminalContinuousScrollReceipt.self,
+                from: Data(json.utf8)
+            ),
+            receipt
+        )
+
+        func mutated(_ key: String, to value: Any) throws -> VisualTerminalContinuousScrollReceipt {
+            var object = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+            )
+            object[key] = value
+            return try JSONDecoder().decode(
+                VisualTerminalContinuousScrollReceipt.self,
+                from: JSONSerialization.data(withJSONObject: object)
+            )
+        }
+
+        XCTAssertEqual(
+            try mutated("measuredHertz", to: 60).failure,
+            "measured-cadence-out-of-range-60.0"
+        )
+        XCTAssertEqual(
+            try mutated("maximumContinuityError", to: 0.5).failure,
+            "continuity-error-0.5"
+        )
+        XCTAssertEqual(
+            try mutated("processingP95Milliseconds", to: 12.6).failure,
+            "processing-over-budget-12.6"
+        )
+        XCTAssertEqual(
+            try mutated("viewIdentityPreserved", to: false).failure,
+            "view-identity-changed"
+        )
+        XCTAssertEqual(
+            try mutated("fixtureUpdaterDisabled", to: false).failure,
+            "fixture-updater-started"
+        )
+        XCTAssertEqual(
+            try mutated("fixtureBrokerIsolated", to: false).failure,
+            "fixture-broker-route-live"
+        )
+        XCTAssertEqual(
+            try mutated("fixtureBuildNumber", to: receipt.feedBuildFloor).failure,
+            "fixture-build-not-above-feed-900000000-900000000"
+        )
+
+        let debugReceipt = VisualTerminalContinuousScrollReceipt(
+            optimizedBuild: false,
+            scheduledHertz: receipt.scheduledHertz,
+            measuredHertz: receipt.measuredHertz,
+            sampleCount: receipt.sampleCount,
+            sampleIntervalCount: receipt.sampleIntervalCount,
+            sampleTimestampsMilliseconds: receipt.sampleTimestampsMilliseconds,
+            sampleDurationMilliseconds: receipt.sampleDurationMilliseconds,
+            cadenceP95Milliseconds: receipt.cadenceP95Milliseconds,
+            handledSampleCount: receipt.handledSampleCount,
+            momentumSampleCount: receipt.momentumSampleCount,
+            distinctOriginCount: receipt.distinctOriginCount,
+            maximumAnchorStep: receipt.maximumAnchorStep,
+            maximumContinuityError: receipt.maximumContinuityError,
+            processingP95Milliseconds: receipt.processingP95Milliseconds,
+            scrollbarMaximumError: receipt.scrollbarMaximumError,
+            topRubberBand: receipt.topRubberBand,
+            bottomRubberBand: receipt.bottomRubberBand,
+            edgesSettled: receipt.edgesSettled,
+            selectionPreserved: receipt.selectionPreserved,
+            linkPreserved: receipt.linkPreserved,
+            semanticPromptPreserved: receipt.semanticPromptPreserved,
+            promptNavigationCoherent: receipt.promptNavigationCoherent,
+            keyboardPagingCoherent: receipt.keyboardPagingCoherent,
+            accessibilityPagingCoherent: receipt.accessibilityPagingCoherent,
+            accessibilityActionsExposed: receipt.accessibilityActionsExposed,
+            scrollerFramePreserved: receipt.scrollerFramePreserved,
+            alternateScreenPreserved: receipt.alternateScreenPreserved,
+            appMouseRoutingPreserved: receipt.appMouseRoutingPreserved,
+            liveBottomCoherent: receipt.liveBottomCoherent,
+            viewIdentityPreserved: receipt.viewIdentityPreserved,
+            coordinatorIdentityPreserved: receipt.coordinatorIdentityPreserved,
+            terminalEngineIdentityPreserved: receipt.terminalEngineIdentityPreserved,
+            finalFractionalViewport: receipt.finalFractionalViewport,
+            fixtureUpdaterDisabled: receipt.fixtureUpdaterDisabled,
+            fixtureBrokerIsolated: receipt.fixtureBrokerIsolated,
+            fixtureBuildNumber: receipt.fixtureBuildNumber,
+            feedBuildFloor: receipt.feedBuildFloor,
+            cursorBefore: receipt.cursorBefore,
+            cursorAfter: receipt.cursorAfter,
+            expectedCursorAfter: receipt.expectedCursorAfter,
+            finalMarkerPresent: receipt.finalMarkerPresent
+        )
+        XCTAssertEqual(debugReceipt.failure, "not-optimized")
     }
 
     func testVisualTerminalAccessibilityGateRejectsRawControlsMissingTextAndOverflow() {
@@ -352,6 +515,12 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertFalse(NativePreviewSettings.shouldPersistChanges(environment: [
             "KAISOLA_NATIVE_RESOURCE_WORKLOAD": "one-window-streaming-terminal-fresh-broker",
         ]))
+        XCTAssertFalse(NativePreviewSettings.shouldPersistChanges(environment: [
+            "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1",
+        ]))
+        XCTAssertFalse(NativePreviewSettings.shouldPersistChanges(environment: [
+            "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "invalid",
+        ]))
         XCTAssertEqual(
             NativePreviewSettings.isolatedFixtureSuiteName(
                 environment: ["KAISOLA_NATIVE_VISUAL_FIXTURE": "1"],
@@ -365,6 +534,13 @@ final class NativePreviewSettingsTests: XCTestCase {
                 processIdentifier: 42
             ),
             "com.kaisola.mac.resource-fixture.42"
+        )
+        XCTAssertEqual(
+            NativePreviewSettings.isolatedFixtureSuiteName(
+                environment: ["KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1"],
+                processIdentifier: 42
+            ),
+            "com.kaisola.mac.pdf-preview-budget.42"
         )
         XCTAssertTrue(NativePreviewSettings.shouldPersistChanges(environment: [:]))
         XCTAssertNil(NativePreviewSettings.isolatedFixtureSuiteName(

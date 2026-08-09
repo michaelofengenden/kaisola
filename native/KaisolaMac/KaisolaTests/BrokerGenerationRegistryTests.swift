@@ -31,6 +31,7 @@ final class BrokerGenerationRegistryTests: XCTestCase {
             now: 10
         )
         XCTAssertEqual(first.revision, 1)
+        XCTAssertEqual(first.topology?.registryTopologyVersion, first.revision)
         XCTAssertEqual(first.topology?.current.id, oldDigest)
         XCTAssertTrue(first.topology?.draining.isEmpty == true)
         let permissions = try FileManager.default.attributesOfItem(
@@ -61,6 +62,7 @@ final class BrokerGenerationRegistryTests: XCTestCase {
             now: 12
         )
         XCTAssertEqual(second.revision, 2)
+        XCTAssertEqual(second.topology?.registryTopologyVersion, second.revision)
         XCTAssertEqual(second.generations.map(\.id), [newDigest, oldDigest])
         XCTAssertEqual(second.topology?.current.role, .current)
         XCTAssertEqual(second.topology?.draining.map(\.role), [.draining])

@@ -22,6 +22,19 @@ struct BrokerGenerationRecord: Codable, Equatable, Sendable {
 struct BrokerGenerationTopology: Equatable, Sendable {
     let current: BrokerGenerationRecord
     let draining: [BrokerGenerationRecord]
+    /// Registry CAS revision that published this exact generation set. Legacy
+    /// single-broker discovery derives a stable version from broker identity.
+    let registryTopologyVersion: Int64
+
+    init(
+        current: BrokerGenerationRecord,
+        draining: [BrokerGenerationRecord],
+        registryTopologyVersion: Int64 = 1
+    ) {
+        self.current = current
+        self.draining = draining
+        self.registryTopologyVersion = registryTopologyVersion
+    }
 
     var all: [BrokerGenerationRecord] { [current] + draining }
 
@@ -35,7 +48,8 @@ struct BrokerGenerationTopology: Equatable, Sendable {
                 packageRoot: nil,
                 registeredAt: max(1, info.startedAt)
             ),
-            draining: []
+            draining: [],
+            registryTopologyVersion: max(1, info.startedAt)
         )
     }
 }
@@ -67,7 +81,8 @@ struct BrokerGenerationRegistry: Codable, Equatable, Sendable {
         }
         return BrokerGenerationTopology(
             current: current,
-            draining: generations.filter { $0.id != currentGenerationID }
+            draining: generations.filter { $0.id != currentGenerationID },
+            registryTopologyVersion: revision
         )
     }
 

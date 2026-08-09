@@ -6,21 +6,44 @@ struct CompanionTerminalStreamHead: Equatable, Sendable {
     let endOffset: Int64
 }
 
+/// The authenticated caller resolves account membership and hidden-session
+/// policy to raw local session IDs. Applying that allowlist here keeps rejected
+/// drafts and their terminal routing metadata outside the Codable projection.
+struct CompanionProjectionScope: Equatable, Sendable {
+    let capabilities: Set<CompanionCapability>
+    let visibleSessionIDs: Set<String>
+}
+
 /// Converts the already-sanitized local session index into the phone's typed
 /// projection. No cwd, file path, prompt, terminal bytes, environment, or
 /// credential field exists in this construction path.
 enum CompanionProjectionBuilder {
     static let maximumProjects = 128
-    static let maximumSessions = 256
+    static let maximumSessions = 128
+    /// Leaves half of the protocol's 1 MiB frame available for the encrypted
+    /// envelope and future protocol metadata. The structural caps below are
+    /// covered at their worst-case UTF-8 sizes by a serialization test.
+    static let maximumEncodedBytes = 512 * 1_024
 
     static func build(
         drafts: [RememberedSessionDraft],
         terminalStreams: [String: CompanionTerminalStreamHead] = [:],
+        scope: CompanionProjectionScope? = nil,
         revision: Int,
         nowMilliseconds: Int64
     ) -> CompanionProjection {
+        let visibleDrafts: [RememberedSessionDraft]
+        if let scope {
+            visibleDrafts = scope.capabilities.contains(.observe)
+                ? drafts.filter { scope.visibleSessionIDs.contains($0.id) }
+                : []
+        } else {
+            // Preserve the current local publisher until authenticated,
+            // per-device account scoping is wired by its owning host lane.
+            visibleDrafts = drafts
+        }
         var newestByID: [String: RememberedSessionDraft] = [:]
-        for draft in drafts {
+        for draft in visibleDrafts {
             let id = portableID(draft.id, domain: "session", maximum: 240)
             if let current = newestByID[id],
                (current.lastActivityAt ?? current.createdAt ?? 0) >=
@@ -164,10 +187,27 @@ enum CompanionProjectionBuilder {
     private static func redactLocalDetails(_ value: String) -> String {
         var result = value
         let replacements: [(String, String)] = [
-            (#"(?i)\b(api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|password|secret)\s*[:=]\s*[^\s,;]+"#, "$1=[redacted]"),
-            (#"(?i)\b(?:sk-[A-Za-z0-9_-]{12,}|gh[opsu]_[A-Za-z0-9_]{12,}|xox[abprs]-[A-Za-z0-9-]{12,})\b"#, "[redacted]"),
-            (#"(?i)(?:/Users/[^/\s]+|/home/[^/\s]+|[A-Z]:\\Users\\[^\\\s]+)(?:[/\\][^\s,;]*)?"#, "[local path]"),
-            (#"(?i)(?:/private/(?:var|tmp)|/var|/tmp)(?:/[^\s,;]*)+"#, "[local path]"),
+            (
+                #"(?i)\b(?:authorization|proxy-authorization)\s*[:=]\s*(?:(?:bearer|basic)\s+)?[^\s,;]+"#,
+                "Authorization=[redacted]"
+            ),
+            (
+                #"(?i)\b(api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|password|secret)\s*[:=]\s*[^\s,;]+"#,
+                "$1=[redacted]"
+            ),
+            (
+                #"(?i)\b(?:export\s+)?([A-Z_][A-Z0-9_]*)\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"#,
+                "$1=[redacted]"
+            ),
+            (
+                #"(?i)\b(?:sk-[A-Za-z0-9_-]{12,}|gh[opsu]_[A-Za-z0-9_]{12,}|xox[abprs]-[A-Za-z0-9-]{12,})\b"#,
+                "[redacted]"
+            ),
+            (#"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^@\s/]+@"#, "$1[redacted]@"),
+            (
+                #"(?i)(?:file://)?(?:/(?:Users|home|private|var|tmp|Volumes|etc|opt|usr|Library|System)(?:/[^\s,;]*)?|~(?:[/\\][^\s,;]*)+|[A-Z]:\\Users\\[^\\\s]+(?:\\[^\s,;]*)?)"#,
+                "[local path]"
+            ),
         ]
         for (pattern, replacement) in replacements {
             guard let expression = try? NSRegularExpression(pattern: pattern) else { continue }
@@ -193,11 +233,13 @@ final class CompanionProjectionRevisions {
     func next(
         drafts: [RememberedSessionDraft],
         terminalStreams: [String: CompanionTerminalStreamHead] = [:],
+        scope: CompanionProjectionScope? = nil,
         nowMilliseconds: Int64
     ) -> CompanionProjection? {
         var candidate = CompanionProjectionBuilder.build(
             drafts: drafts,
             terminalStreams: terminalStreams,
+            scope: scope,
             revision: revision + 1,
             nowMilliseconds: nowMilliseconds
         )

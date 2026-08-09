@@ -2003,6 +2003,143 @@ final class AcpClientTests: XCTestCase {
         XCTAssertEqual(staleMethods, ["session/load", "session/new"])
     }
 
+    func testSessionUpdatesRequireTheExactActiveIdentityAndBoundDiagnostics() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        await transport.emitSessionUpdateWithoutSessionID(.object([
+            "sessionUpdate": .string("agent_message_chunk"),
+            "content": .object(["type": .string("text"), "text": .string("missing identity")]),
+        ]))
+        for index in 0 ..< 39 {
+            await transport.emitSessionUpdate(.object([
+                "sessionUpdate": .string("agent_message_chunk"),
+                "content": .object([
+                    "type": .string("text"),
+                    "text": .string("stale \(index)"),
+                ]),
+            ]), sessionID: "old-\(index)")
+        }
+        await transport.emitSessionUpdate(.object([
+            "sessionUpdate": .string("agent_message_chunk"),
+            "content": .object(["type": .string("text"), "text": .string("current")]),
+        ]), sessionID: "sess-1")
+
+        // A request/response after the notifications is a deterministic FIFO
+        // barrier: no scheduler timing or sleep is needed before assertions.
+        await client.setConfigOption(id: "reasoning_effort", value: "high")
+
+        let messages = collector.events.compactMap { event -> String? in
+            if case let .turnItem(.message(_, text)) = event { return text }
+            return nil
+        }
+        XCTAssertEqual(messages, ["current"])
+        let diagnostics = await client.sessionIdentityDiagnostics()
+        XCTAssertEqual(diagnostics.total, 40)
+        XCTAssertEqual(diagnostics.tail.count, AcpClient.maximumSessionIdentityDiagnostics)
+        XCTAssertTrue(diagnostics.tail.allSatisfy { $0.method == "session/update" })
+        XCTAssertTrue(diagnostics.tail.allSatisfy { $0.reason == .identityMismatch })
+        XCTAssertEqual(diagnostics.tail.first?.receivedSessionIDBytes, "old-7".utf8.count)
+        XCTAssertEqual(diagnostics.tail.last?.receivedSessionIDBytes, "old-38".utf8.count)
+        XCTAssertEqual(diagnostics.tail.last?.expectedSessionIDBytes, "sess-1".utf8.count)
+    }
+
+    func testRestartDropsPriorSessionOutputBeforeTheNewIdentityIsEstablished() async throws {
+        let transport = ScriptedAcpTransport(
+            newSessionIDs: ["sess-stable", "sess-stable"],
+            restartRaceStaleSessionID: "sess-stable"
+        )
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        let first = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        XCTAssertEqual(first.sessionID, "sess-stable")
+        let retiredGeneration = await client.connectionGenerationForTesting()
+        await client.stop()
+
+        let second = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        XCTAssertEqual(second.sessionID, "sess-stable")
+        let activeGeneration = await client.connectionGenerationForTesting()
+        XCTAssertNotEqual(retiredGeneration, activeGeneration)
+        await client.handleSessionUpdateForTesting(
+            sessionID: "sess-stable",
+            update: .object([
+                "sessionUpdate": .string("agent_message_chunk"),
+                "content": .object([
+                    "type": .string("text"),
+                    "text": .string("late retired-reader output"),
+                ]),
+            ]),
+            sourceConnectionGeneration: retiredGeneration
+        )
+        await client.handleSessionUpdateForTesting(sessionID: "sess-stable", update: .object([
+            "sessionUpdate": .string("agent_message_chunk"),
+            "content": .object(["type": .string("text"), "text": .string("current restart output")]),
+        ]), sourceConnectionGeneration: activeGeneration)
+
+        let messages = collector.events.compactMap { event -> String? in
+            if case let .turnItem(.message(_, text)) = event { return text }
+            return nil
+        }
+        XCTAssertEqual(messages, ["current restart output"])
+        let diagnostics = await client.sessionIdentityDiagnostics()
+        XCTAssertEqual(diagnostics.total, 2)
+        XCTAssertEqual(
+            diagnostics.tail.map(\.reason),
+            [.noActiveSession, .staleConnectionGeneration]
+        )
+        XCTAssertEqual(diagnostics.tail.first?.receivedSessionIDBytes, "sess-stable".utf8.count)
+        XCTAssertNil(diagnostics.tail.first?.expectedSessionIDBytes)
+        XCTAssertEqual(diagnostics.tail.last?.connectionGeneration, activeGeneration)
+        XCTAssertEqual(diagnostics.tail.last?.receivedSessionIDBytes, "sess-stable".utf8.count)
+        XCTAssertNil(diagnostics.tail.last?.expectedSessionIDBytes)
+        await client.stop()
+    }
+
+    func testLoadReplayAcceptsOnlyThePendingRestoredIdentityBeforeResponse() async throws {
+        let transport = ScriptedAcpTransport(
+            loadRaceStaleSessionID: "sess-pruned",
+            loadReplay: [(messageID: "m-current", text: "current restored history")]
+        )
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+
+        let info = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp",
+            mcpServers: [], resumeSessionID: "sess-persisted"
+        )
+        XCTAssertEqual(info.sessionID, "sess-persisted")
+
+        // The scripted load emits both notifications before its response, so
+        // start() returning is the deterministic review/mutation race barrier.
+        let replay = collector.events.compactMap { event -> String? in
+            switch event {
+            case let .turnItem(.message(_, text)), let .turnItem(.userMessage(_, text)):
+                return text
+            default:
+                return nil
+            }
+        }
+        XCTAssertEqual(replay, ["current restored history"])
+        let diagnostics = await client.sessionIdentityDiagnostics()
+        XCTAssertEqual(diagnostics.total, 1)
+        XCTAssertEqual(diagnostics.tail.map(\.reason), [.identityMismatch])
+        XCTAssertEqual(diagnostics.tail.first?.receivedSessionIDBytes, "sess-pruned".utf8.count)
+        XCTAssertEqual(diagnostics.tail.first?.expectedSessionIDBytes, "sess-persisted".utf8.count)
+        await client.stop()
+    }
+
     func testHandshakeAndStreamedTurn() async throws {
         let transport = ScriptedAcpTransport()
         let client = AcpClient(transport: transport)
@@ -2208,6 +2345,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private let steeringSupported: Bool
     private let steerOutcome: String?
     private let steerErrorMessage: String?
+    private let newSessionIDs: [String]
+    private let restartRaceStaleSessionID: String?
+    private let loadRaceStaleSessionID: String?
     private let loadReplay: [(messageID: String?, text: String)]
     private var sessionMcpServers: [JSONValue] = []
     private var sessionMcpAttempts: [[JSONValue]] = []
@@ -2220,6 +2360,8 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
+    private var newSessionIndex = 0
+    private var currentSessionID = "sess-1"
 
     init(
         protocolVersion: Int64 = 1,
@@ -2235,6 +2377,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         steeringSupported: Bool = true,
         steerOutcome: String? = "injected",
         steerErrorMessage: String? = nil,
+        newSessionIDs: [String] = ["sess-1"],
+        restartRaceStaleSessionID: String? = nil,
+        loadRaceStaleSessionID: String? = nil,
         loadReplay: [(messageID: String?, text: String)] = []
     ) {
         self.protocolVersion = protocolVersion
@@ -2250,6 +2395,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         self.steeringSupported = steeringSupported
         self.steerOutcome = steerOutcome
         self.steerErrorMessage = steerErrorMessage
+        self.newSessionIDs = newSessionIDs.isEmpty ? ["sess-1"] : newSessionIDs
+        self.restartRaceStaleSessionID = restartRaceStaleSessionID
+        self.loadRaceStaleSessionID = loadRaceStaleSessionID
         self.loadReplay = loadReplay
     }
 
@@ -2331,8 +2479,16 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         ]))
     }
 
-    func emitSessionUpdate(_ update: JSONValue) {
-        notify(update: update)
+    func emitSessionUpdate(_ update: JSONValue, sessionID: String = "sess-1") {
+        notify(update: update, sessionID: sessionID)
+    }
+
+    func emitSessionUpdateWithoutSessionID(_ update: JSONValue) {
+        enqueue(.object([
+            "jsonrpc": .string("2.0"),
+            "method": .string("session/update"),
+            "params": .object(["update": update]),
+        ]))
     }
 
     func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
@@ -2384,8 +2540,21 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                 replyError(id: id, message: "Invalid params: unsupported MCP server")
                 return
             }
+            let sessionIndex = min(newSessionIndex, newSessionIDs.count - 1)
+            let newSessionID = newSessionIDs[sessionIndex]
+            if newSessionIndex > 0, let restartRaceStaleSessionID {
+                notify(update: .object([
+                    "sessionUpdate": .string("agent_message_chunk"),
+                    "content": .object([
+                        "type": .string("text"),
+                        "text": .string("stale restart output"),
+                    ]),
+                ]), sessionID: restartRaceStaleSessionID)
+            }
+            newSessionIndex += 1
+            currentSessionID = newSessionID
             reply(id: id, result: .object([
-                "sessionId": .string("sess-1"),
+                "sessionId": .string(newSessionID),
                 // Flat models shape (exercises the fallback parse path).
                 "models": .array([
                     .object(["modelId": .string("opus"), "name": .string("Opus")]),
@@ -2419,9 +2588,19 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                 replyError(id: id, message: "Unknown session")
             } else {
                 let restoredID = object["params"]?.objectValue?["sessionId"]?.stringValue ?? "sess-restored"
+                currentSessionID = restoredID
                 // Both shipping adapters replay a loaded thread's whole history
                 // as `session/update`s BEFORE answering the load.
                 if method == "session/load" {
+                    if let loadRaceStaleSessionID {
+                        notify(update: .object([
+                            "sessionUpdate": .string("agent_message_chunk"),
+                            "content": .object([
+                                "type": .string("text"),
+                                "text": .string("stale restored history"),
+                            ]),
+                        ]), sessionID: loadRaceStaleSessionID)
+                    }
                     for entry in loadReplay {
                         var update: [String: JSONValue] = [
                             "sessionUpdate": .string("user_message_chunk"),
@@ -2433,7 +2612,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                         if let messageID = entry.messageID {
                             update["messageId"] = .string(messageID)
                         }
-                        notify(update: .object(update))
+                        notify(update: .object(update), sessionID: restoredID)
                     }
                 }
                 reply(id: id, result: .object(["sessionId": .string(restoredID)]))
@@ -2530,11 +2709,14 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         ]))
     }
 
-    private func notify(update: JSONValue) {
+    private func notify(update: JSONValue, sessionID: String? = nil) {
         enqueue(.object([
             "jsonrpc": .string("2.0"),
             "method": .string("session/update"),
-            "params": .object(["sessionId": .string("sess-1"), "update": update]),
+            "params": .object([
+                "sessionId": .string(sessionID ?? currentSessionID),
+                "update": update,
+            ]),
         ]))
     }
 

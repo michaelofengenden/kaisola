@@ -104,6 +104,26 @@ enum AcpPermissionPayloadRejection: String, Equatable, Sendable {
     }
 }
 
+/// A bounded, non-sensitive receipt for an inbound ACP message that named no
+/// active session (or named the wrong one). Raw session identifiers are never
+/// retained: their byte counts are enough to distinguish malformed, stale,
+/// and adversarially oversized traffic without copying attacker-controlled
+/// identity strings into diagnostics.
+struct AcpSessionIdentityDiagnostic: Equatable, Sendable {
+    enum Reason: String, Equatable, Sendable {
+        case staleConnectionGeneration = "stale_connection_generation"
+        case missingSessionID = "missing_session_id"
+        case noActiveSession = "no_active_session"
+        case identityMismatch = "identity_mismatch"
+    }
+
+    let method: String
+    let reason: Reason
+    let connectionGeneration: UInt64
+    let receivedSessionIDBytes: Int?
+    let expectedSessionIDBytes: Int?
+}
+
 struct AcpPermissionPayloadValidation: Equatable, Sendable {
     let rejection: AcpPermissionPayloadRejection?
     let aggregateBytes: Int
@@ -542,6 +562,18 @@ actor AcpClient {
     /// permission task could write its JSON-RPC response into the next adapter.
     private var connectionGeneration: UInt64 = 0
     private var sessionID: String?
+    private struct ScopedSessionIdentity: Sendable {
+        let sessionID: String
+        let connectionGeneration: UInt64
+    }
+    /// The established identity for normal notifications in this connection.
+    private var activeSessionIdentity: ScopedSessionIdentity?
+    /// `session/load` must replay notifications before its response, so a load
+    /// temporarily authorizes only the exact requested identity and generation.
+    private var restoringSessionIdentity: ScopedSessionIdentity?
+    private var sessionIdentityDiagnosticTail: [AcpSessionIdentityDiagnostic] = []
+    private var sessionIdentityRejectionCount = 0
+    static let maximumSessionIdentityDiagnostics = 32
     private var capabilities = AcpAgentCapabilities()
     private var permissionCounter = 0
     private enum PermissionResolution: Sendable {
@@ -611,14 +643,17 @@ actor AcpClient {
         resumeSessionID: String? = nil
     ) async throws -> AcpSessionInfo {
         connectionGeneration &+= 1
+        let startGeneration = connectionGeneration
         decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
         sessionID = nil
+        activeSessionIdentity = nil
+        restoringSessionIdentity = nil
         cancelPermissionRequests()
         toolCallReviewContextStore.removeAll(keepingCapacity: true)
         workspaceRoot = (cwd as NSString).standardizingPath
         do {
             try await transport.start(command: command, arguments: arguments, environment: environment, cwd: cwd)
-            readerTask = Task { await readLoop() }
+            readerTask = Task { await readLoop(sourceConnectionGeneration: startGeneration) }
 
             let initResult = try await request("initialize", params: .object([
             "protocolVersion": .integer(Int64(AcpWire.protocolVersion)),
@@ -641,6 +676,18 @@ actor AcpClient {
 
             let sessionServers = sessionMcpServers(mcpServers)
             func openSession(_ method: String, priorID: String? = nil) async throws -> JSONValue {
+                if let priorID {
+                    restoringSessionIdentity = ScopedSessionIdentity(
+                        sessionID: priorID,
+                        connectionGeneration: startGeneration
+                    )
+                }
+                defer {
+                    if restoringSessionIdentity?.connectionGeneration == startGeneration,
+                       restoringSessionIdentity?.sessionID == priorID {
+                        restoringSessionIdentity = nil
+                    }
+                }
                 func parameters(servers: [JSONValue]) -> JSONValue {
                     var values: [String: JSONValue] = [
                         "cwd": .string(cwd),
@@ -682,7 +729,14 @@ actor AcpClient {
                   let sessionID = object["sessionId"]?.stringValue ?? resumedID else {
                 throw AcpClientError.malformedResponse
             }
+            guard connectionGeneration == startGeneration else {
+                throw AcpClientError.notRunning
+            }
             self.sessionID = sessionID
+            activeSessionIdentity = ScopedSessionIdentity(
+                sessionID: sessionID,
+                connectionGeneration: startGeneration
+            )
         // Adapters vary: some return a flat `models: [...]` + top-level
         // `currentModelId`; the standard (and our mock) nests them under
         // `models: { availableModels, currentModelId }`. Handle both.
@@ -911,6 +965,8 @@ actor AcpClient {
         for continuation in pending.values { continuation.resume(throwing: AcpClientError.notRunning) }
         pending.removeAll()
         sessionID = nil
+        activeSessionIdentity = nil
+        restoringSessionIdentity = nil
         workspaceRoot = nil
         capabilities = AcpAgentCapabilities()
         toolCallReviewContextStore.removeAll(keepingCapacity: true)
@@ -1022,14 +1078,17 @@ actor AcpClient {
 
     // MARK: - Read loop
 
-    private func readLoop() async {
+    private func readLoop(sourceConnectionGeneration: UInt64) async {
         do {
             while !Task.isCancelled {
                 guard let data = try await transport.receive(maximumBytes: 256 * 1_024) else {
+                    guard sourceConnectionGeneration == connectionGeneration else { return }
                     let code = await transport.exitCode() ?? 0
                     connectionGeneration &+= 1
                     cancelPermissionRequests()
                     sessionID = nil
+                    activeSessionIdentity = nil
+                    restoringSessionIdentity = nil
                     workspaceRoot = nil
                     eventHandler?(.exited(code: code))
                     for continuation in pending.values { continuation.resume(throwing: AcpClientError.adapterExited(code: code)) }
@@ -1040,16 +1099,19 @@ actor AcpClient {
                 var active = decoder
                 try active.consume(data) { frame in
                     if let value = try? JSONDecoder().decode(JSONValue.self, from: frame) {
-                        handle(value)
+                        handle(value, sourceConnectionGeneration: sourceConnectionGeneration)
                     }
                 }
                 decoder = active
             }
         } catch {
             guard !Task.isCancelled else { return }
+            guard sourceConnectionGeneration == connectionGeneration else { return }
             connectionGeneration &+= 1
             cancelPermissionRequests()
             sessionID = nil
+            activeSessionIdentity = nil
+            restoringSessionIdentity = nil
             workspaceRoot = nil
             for continuation in pending.values { continuation.resume(throwing: error) }
             pending.removeAll()
@@ -1057,7 +1119,7 @@ actor AcpClient {
         }
     }
 
-    private func handle(_ message: JSONValue) {
+    private func handle(_ message: JSONValue, sourceConnectionGeneration: UInt64) {
         guard let object = message.objectValue else { return }
         // Response to one of our requests.
         if let id = object["id"]?.intValue.flatMap(Int.init(exactly:)), object["method"] == nil {
@@ -1073,7 +1135,13 @@ actor AcpClient {
         guard let method = object["method"]?.stringValue else { return }
         switch method {
         case "session/update":
-            if let update = object["params"]?.objectValue?["update"] {
+            let params = object["params"]?.objectValue
+            guard acceptsSessionScopedMessage(
+                method: method,
+                receivedSessionID: params?["sessionId"]?.stringValue,
+                sourceConnectionGeneration: sourceConnectionGeneration
+            ) else { return }
+            if let update = params?["update"] {
                 handleSessionUpdate(update)
             }
         case "session/request_permission":
@@ -1090,6 +1158,76 @@ actor AcpClient {
                 respondError(id: id, code: -32601, message: "Method not handled: \(method)")
             }
         }
+    }
+
+    /// Shared fail-closed boundary for ACP messages scoped to the current
+    /// session. Permission requests use the same contract in the next stacked
+    /// change, while notifications simply drop after recording the receipt.
+    func acceptsSessionScopedMessage(
+        method: String,
+        receivedSessionID: String?,
+        sourceConnectionGeneration: UInt64
+    ) -> Bool {
+        let expected = [activeSessionIdentity, restoringSessionIdentity]
+            .compactMap { $0 }
+            .first { $0.connectionGeneration == sourceConnectionGeneration }
+        let reason: AcpSessionIdentityDiagnostic.Reason?
+        if sourceConnectionGeneration != connectionGeneration {
+            reason = .staleConnectionGeneration
+        } else if receivedSessionID == nil {
+            reason = .missingSessionID
+        } else if expected == nil {
+            reason = .noActiveSession
+        } else if receivedSessionID != expected?.sessionID {
+            reason = .identityMismatch
+        } else {
+            reason = nil
+        }
+        guard let reason else { return true }
+
+        if sessionIdentityRejectionCount < Int.max {
+            sessionIdentityRejectionCount += 1
+        }
+        sessionIdentityDiagnosticTail.append(AcpSessionIdentityDiagnostic(
+            method: method,
+            reason: reason,
+            connectionGeneration: connectionGeneration,
+            receivedSessionIDBytes: receivedSessionID?.utf8.count,
+            expectedSessionIDBytes: expected?.sessionID.utf8.count
+        ))
+        if sessionIdentityDiagnosticTail.count > Self.maximumSessionIdentityDiagnostics {
+            sessionIdentityDiagnosticTail.removeFirst(
+                sessionIdentityDiagnosticTail.count - Self.maximumSessionIdentityDiagnostics
+            )
+        }
+        return false
+    }
+
+    /// Test/diagnostic receipt. The tail is bounded and intentionally contains
+    /// lengths rather than raw adapter-provided session identifiers.
+    func sessionIdentityDiagnostics() -> (total: Int, tail: [AcpSessionIdentityDiagnostic]) {
+        (sessionIdentityRejectionCount, sessionIdentityDiagnosticTail)
+    }
+
+    /// Deterministic adversarial seam for proving that a late frame from a
+    /// retired reader cannot become current merely because an adapter reused
+    /// the same opaque session id after restart.
+    func handleSessionUpdateForTesting(
+        sessionID: String?,
+        update: JSONValue,
+        sourceConnectionGeneration: UInt64
+    ) {
+        var params: [String: JSONValue] = ["update": update]
+        if let sessionID { params["sessionId"] = .string(sessionID) }
+        handle(.object([
+            "jsonrpc": .string("2.0"),
+            "method": .string("session/update"),
+            "params": .object(params),
+        ]), sourceConnectionGeneration: sourceConnectionGeneration)
+    }
+
+    func connectionGenerationForTesting() -> UInt64 {
+        connectionGeneration
     }
 
     // MARK: - Agent-requested terminals

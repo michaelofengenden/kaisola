@@ -3,7 +3,12 @@
 const crypto = require('node:crypto')
 const net = require('node:net')
 const { StringDecoder } = require('node:string_decoder')
-const { MAX_FRAME } = require('./brokerWire.cjs')
+const {
+  MAX_FRAME,
+  encodeBrokerFrame,
+  inspectBrokerFrame,
+  validateEncodedBrokerFrame,
+} = require('./brokerWire.cjs')
 
 const CONNECT_TIMEOUT_MS = 8_000
 
@@ -37,8 +42,8 @@ function requestBrokerControl(info, {
       if (error) reject(error)
       else resolve(value)
     }
-    const send = (frame) => {
-      try { socket.write(`${JSON.stringify(frame)}\n`) } catch (error) { finish(error) }
+    const send = (frame, frameMethod) => {
+      try { socket.write(encodeBrokerFrame(frame, { method: frameMethod })) } catch (error) { finish(error) }
     }
 
     socket.setNoDelay?.(true)
@@ -61,7 +66,14 @@ function requestBrokerControl(info, {
         buffer = buffer.slice(newline + 1)
         if (!line) continue
         let frame
-        try { frame = JSON.parse(line) } catch {
+        try {
+          const envelope = inspectBrokerFrame(line)
+          validateEncodedBrokerFrame(line, {
+            envelope,
+            method: envelope.type === 'response' ? method : undefined,
+          })
+          frame = JSON.parse(line)
+        } catch {
           finish(new Error('session broker sent malformed control data'))
           return
         }
@@ -72,7 +84,7 @@ function requestBrokerControl(info, {
             return
           }
           authenticated = true
-          send({ type: 'request', id: requestId, method, params: {} })
+          send({ type: 'request', id: requestId, method, params: {} }, method)
           continue
         }
         if (frame?.type !== 'response' || frame.id !== requestId) continue

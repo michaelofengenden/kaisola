@@ -122,6 +122,55 @@ final class BrokerControlClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testRequestSendFailureAbortsControllerExactlyOnce() async throws {
+        let transport = ScriptedControlBrokerTransport(
+            resizeAccepted: true,
+            failFirstRequestSend: true
+        )
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        let signal = DisconnectSignal()
+        await client.setDisconnectHandler { error in
+            Task { await signal.record(error) }
+        }
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        do {
+            try await client.resize(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                columns: 120,
+                rows: 40
+            )
+            XCTFail("A failed socket send must invalidate the controller lane.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .connectionClosed)
+        }
+
+        for _ in 0..<100 {
+            if await signal.count > 0 { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        let disconnectCount = await signal.count
+        XCTAssertEqual(disconnectCount, 1)
+
+        do {
+            try await client.resize(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                columns: 132,
+                rows: 44
+            )
+            XCTFail("A failed controller must be reconnected before accepting another request.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .notConnected)
+        }
+        await client.disconnect()
+    }
+
     func testExplicitControllerDisconnectDoesNotReportConnectionLoss() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
         let client = BrokerControlClient(
@@ -410,13 +459,19 @@ private actor DisconnectSignal {
 private actor ScriptedControlBrokerTransport: BrokerByteTransport {
     private let resizeAccepted: Bool
     private let agentTurnAccepted: Bool
+    private var failFirstRequestSend: Bool
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []
     private var waiter: CheckedContinuation<Data?, Never>?
 
-    init(resizeAccepted: Bool, agentTurnAccepted: Bool = true) {
+    init(
+        resizeAccepted: Bool,
+        agentTurnAccepted: Bool = true,
+        failFirstRequestSend: Bool = false
+    ) {
         self.resizeAccepted = resizeAccepted
         self.agentTurnAccepted = agentTurnAccepted
+        self.failFirstRequestSend = failFirstRequestSend
     }
 
     func connect(path: String) async throws {}
@@ -438,6 +493,10 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
                 "features": .array([.string(BrokerWire.terminalObserveFeature)]),
             ])))
             return
+        }
+        if failFirstRequestSend {
+            failFirstRequestSend = false
+            throw BrokerClientError.connectionClosed
         }
         guard type == "request", let id = object["id"]?.stringValue else { return }
         let result: JSONValue

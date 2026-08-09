@@ -824,6 +824,7 @@ final class MeshSession: ObservableObject, Identifiable {
             title: agent.name,
             command: adapter.command,
             arguments: adapter.arguments,
+            containment: adapter.containment,
             environment: environment,
             cwd: cwd,
             mcpServers: mcp,

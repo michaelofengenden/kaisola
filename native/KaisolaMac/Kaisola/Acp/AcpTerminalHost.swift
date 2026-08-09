@@ -11,21 +11,36 @@ actor AcpTerminalHost {
         let signal: String?
     }
 
+    /// Direct-child lifetime and output-pipe lifetime are independent: a
+    /// background grandchild can inherit stdout/stderr after the shell exits.
+    /// Exposing that distinction prevents a terminal from looking silently
+    /// hung while its descendants are still able to append output.
+    enum OutputState: String, Equatable, Sendable {
+        case running
+        case pipeClosed = "pipe_closed"
+        case drainingDescendants = "draining_descendants"
+        case complete
+        case descendantTimeout = "descendant_timeout"
+    }
+
     struct Snapshot: Equatable, Sendable {
         let output: String
         let truncated: Bool
         let exitStatus: ExitStatus?
+        let outputState: OutputState
         let outputBufferStats: OutputBufferStats
 
         init(
             output: String,
             truncated: Bool,
             exitStatus: ExitStatus?,
+            outputState: OutputState? = nil,
             outputBufferStats: OutputBufferStats = .empty
         ) {
             self.output = output
             self.truncated = truncated
             self.exitStatus = exitStatus
+            self.outputState = outputState ?? (exitStatus == nil ? .running : .complete)
             self.outputBufferStats = outputBufferStats
         }
     }
@@ -61,6 +76,10 @@ actor AcpTerminalHost {
     static let outputStreamBufferedChunkLimit = 64
     static let outputStreamBufferedByteCeiling =
         outputStreamChunkByteLimit * outputStreamBufferedChunkLimit
+    /// A descendant holding inherited stdout/stderr must not retain an ACP
+    /// terminal forever. At the deadline the read end is closed for real;
+    /// waiters resolve only after the bounded stream drains and reaches EOF.
+    static let defaultDescendantPipeDrainTimeoutNanoseconds: UInt64 = 10_000_000_000
     private static let signalNames: [Int32: String] = [
         SIGHUP: "SIGHUP", SIGINT: "SIGINT", SIGQUIT: "SIGQUIT", SIGKILL: "SIGKILL",
         SIGTERM: "SIGTERM", SIGPIPE: "SIGPIPE", SIGSEGV: "SIGSEGV", SIGABRT: "SIGABRT",
@@ -325,12 +344,15 @@ actor AcpTerminalHost {
 
     private final class Entry {
         let process: Process
+        let outputReadHandle: FileHandle
         var buffer: SegmentedOutputTail
         var exitStatus: ExitStatus?
-        /// Exit reported by the termination handler, held until the pipe drains
-        /// so `wait_for_exit` can never resolve ahead of the final output.
-        var pendingExit: ExitStatus?
-        var eofReached = false
+        /// Direct-child exit is recorded separately from pipe EOF because a
+        /// descendant may keep the inherited write end alive.
+        var directChildExit: ExitStatus?
+        var outputState: OutputState = .running
+        var pipeEOFReached = false
+        var pipeDrainTimeoutTask: Task<Void, Never>?
         var released = false
         var waiters: [CheckedContinuation<ExitStatus, Never>] = []
         let outputStreamBuffer: OutputStreamBuffer
@@ -338,8 +360,14 @@ actor AcpTerminalHost {
         /// no longer be part of the contiguous retained suffix.
         var minimumRetainedSequence: UInt64 = 0
 
-        init(process: Process, byteLimit: Int, outputStreamBuffer: OutputStreamBuffer) {
+        init(
+            process: Process,
+            outputReadHandle: FileHandle,
+            byteLimit: Int,
+            outputStreamBuffer: OutputStreamBuffer
+        ) {
             self.process = process
+            self.outputReadHandle = outputReadHandle
             self.buffer = SegmentedOutputTail(byteLimit: byteLimit)
             self.outputStreamBuffer = outputStreamBuffer
         }
@@ -347,6 +375,14 @@ actor AcpTerminalHost {
 
     private var entries: [String: Entry] = [:]
     private var counter = 0
+    private let descendantPipeDrainTimeoutNanoseconds: UInt64
+
+    init(
+        descendantPipeDrainTimeoutNanoseconds: UInt64 =
+            AcpTerminalHost.defaultDescendantPipeDrainTimeoutNanoseconds
+    ) {
+        self.descendantPipeDrainTimeoutNanoseconds = descendantPipeDrainTimeoutNanoseconds
+    }
 
     /// Spawn a command. `env` pairs overlay the app environment; a relative or
     /// missing cwd is the caller's responsibility (the client confines it to the
@@ -379,6 +415,7 @@ actor AcpTerminalHost {
         let requestedLimit = outputByteLimit ?? Self.defaultOutputByteLimit
         let entry = Entry(
             process: process,
+            outputReadHandle: pipe.fileHandleForReading,
             byteLimit: min(max(1, requestedLimit), Self.maxOutputByteLimit),
             outputStreamBuffer: outputStreamBuffer
         )
@@ -393,6 +430,7 @@ actor AcpTerminalHost {
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
+                try? handle.close()
                 outputStreamBuffer.finish()
                 return
             }
@@ -410,17 +448,13 @@ actor AcpTerminalHost {
                 ? ExitStatus(exitCode: nil, signal: Self.signalNames[finished.terminationStatus] ?? "SIG\(finished.terminationStatus)")
                 : ExitStatus(exitCode: finished.terminationStatus, signal: nil)
             Task { await self.recordExit(id: id, status: status) }
-            // If a grandchild keeps the pipe open past exit, don't hold exit
-            // waiters hostage — force completion after a grace period.
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                Task { await self.forceEOF(id: id) }
-            }
         }
 
         do {
             try process.run()
         } catch {
             pipe.fileHandleForReading.readabilityHandler = nil
+            try? pipe.fileHandleForReading.close()
             outputStreamBuffer.finish()
             entries[id] = nil
             throw error
@@ -433,8 +467,9 @@ actor AcpTerminalHost {
         let bufferState = reconcileStreamOverflow(entry)
         return Snapshot(
             output: String(decoding: entry.buffer.materialized(), as: UTF8.self),
-            truncated: entry.buffer.truncated,
+            truncated: entry.buffer.truncated || entry.outputState == .descendantTimeout,
             exitStatus: entry.exitStatus,
+            outputState: entry.outputState,
             outputBufferStats: bufferState.stats
         )
     }
@@ -463,7 +498,13 @@ actor AcpTerminalHost {
         entry.released = true
         if entry.exitStatus == nil, entry.process.isRunning {
             kill(id)
+        } else if entry.exitStatus == nil, entry.directChildExit != nil {
+            closeLingeringDescendantPipe(id: id, timedOut: false)
         } else {
+            entry.pipeDrainTimeoutTask?.cancel()
+            entry.outputReadHandle.readabilityHandler = nil
+            try? entry.outputReadHandle.close()
+            entry.outputStreamBuffer.finish()
             entries[id] = nil
         }
     }
@@ -496,29 +537,63 @@ actor AcpTerminalHost {
         return state
     }
 
-    /// Exit lands here first; it only becomes visible once the pipe reached
-    /// EOF, so `terminal/output` after `wait_for_exit` always sees full output.
+    /// Direct-child exit lands here first. It only becomes the terminal's final
+    /// status once the independently-owned output pipe reaches real EOF.
     private func recordExit(id: String, status: ExitStatus) {
         guard let entry = entries[id] else { return }
-        entry.pendingExit = status
-        if entry.eofReached { finish(id: id, entry: entry) }
+        entry.directChildExit = status
+        if entry.pipeEOFReached {
+            entry.outputState = .complete
+            finish(id: id, entry: entry)
+            return
+        }
+
+        entry.outputState = .drainingDescendants
+        if entry.released {
+            closeLingeringDescendantPipe(id: id, timedOut: false)
+            return
+        }
+        entry.pipeDrainTimeoutTask?.cancel()
+        let timeout = descendantPipeDrainTimeoutNanoseconds
+        entry.pipeDrainTimeoutTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: timeout)
+            } catch {
+                return
+            }
+            await self?.closeLingeringDescendantPipe(id: id, timedOut: true)
+        }
     }
 
     private func markEOF(id: String) {
         guard let entry = entries[id] else { return }
-        entry.eofReached = true
-        if entry.pendingExit != nil { finish(id: id, entry: entry) }
+        entry.pipeEOFReached = true
+        entry.pipeDrainTimeoutTask?.cancel()
+        entry.pipeDrainTimeoutTask = nil
+        if entry.outputState != .descendantTimeout {
+            entry.outputState = entry.directChildExit == nil ? .pipeClosed : .complete
+        }
+        if entry.directChildExit != nil { finish(id: id, entry: entry) }
     }
 
-    /// The grace-period fallback for grandchildren that hold the pipe open.
-    private func forceEOF(id: String) {
-        guard let entry = entries[id], entry.exitStatus == nil, entry.pendingExit != nil else { return }
-        entry.eofReached = true
-        finish(id: id, entry: entry)
+    /// Bound a descendant-held pipe by actually closing the read end. Merely
+    /// pretending EOF would leave the readability callback able to append
+    /// after `wait_for_exit` resolves. Finishing the stream here makes its
+    /// single consumer the final ordering barrier.
+    private func closeLingeringDescendantPipe(id: String, timedOut: Bool) {
+        guard let entry = entries[id], entry.exitStatus == nil,
+              entry.directChildExit != nil, !entry.pipeEOFReached else { return }
+        entry.pipeDrainTimeoutTask?.cancel()
+        entry.pipeDrainTimeoutTask = nil
+        if timedOut { entry.outputState = .descendantTimeout }
+        entry.outputReadHandle.readabilityHandler = nil
+        try? entry.outputReadHandle.close()
+        entry.outputStreamBuffer.finish()
     }
 
     private func finish(id: String, entry: Entry) {
-        guard entry.exitStatus == nil, let status = entry.pendingExit else { return }
+        guard entry.exitStatus == nil, entry.pipeEOFReached,
+              let status = entry.directChildExit else { return }
         entry.exitStatus = status
         for waiter in entry.waiters { waiter.resume(returning: status) }
         entry.waiters.removeAll()

@@ -611,6 +611,7 @@ actor AcpClient {
                     var result: [String: JSONValue] = [
                         "output": .string(snapshot.output),
                         "truncated": .bool(snapshot.truncated),
+                        "outputState": .string(snapshot.outputState.rawValue),
                     ]
                     if let status = snapshot.exitStatus { result["exitStatus"] = Self.encode(status) }
                     respond(id: id, result: .object(result))
@@ -619,7 +620,11 @@ actor AcpClient {
                           let status = await terminalHost.waitForExit(terminalID) else {
                         throw AcpClientError.requestFailed("unknown terminal")
                     }
-                    respond(id: id, result: .object(["exitStatus": Self.encode(status)]))
+                    var result: [String: JSONValue] = ["exitStatus": Self.encode(status)]
+                    if let snapshot = await terminalHost.output(terminalID) {
+                        result["outputState"] = .string(snapshot.outputState.rawValue)
+                    }
+                    respond(id: id, result: .object(result))
                 case "terminal/kill":
                     guard let terminalID = object["terminalId"]?.stringValue else {
                         throw AcpClientError.requestFailed("terminal/kill requires terminalId")

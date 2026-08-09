@@ -142,6 +142,165 @@ final class AcpTerminalHostTests: XCTestCase {
                       "output must be fully drained before exit resolves")
         XCTAssertEqual(snapshot?.truncated, false)
         XCTAssertEqual(snapshot?.exitStatus?.exitCode, 3)
+        XCTAssertEqual(snapshot?.outputState, .complete)
+    }
+
+    func testGrandchildOutputAfterTheOldGracePeriodPrecedesWaitResolution() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-terminal-grandchild-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gateURL = directory.appendingPathComponent("write-now")
+        let host = AcpTerminalHost(descendantPipeDrainTimeoutNanoseconds: 5_000_000_000)
+        let id = try await host.create(
+            command: "/bin/sh",
+            args: [
+                "-c",
+                "(i=0; while [ ! -e \"$KAISOLA_WRITE_GATE\" ] && [ $i -lt 600 ]; do sleep 0.01; i=$((i + 1)); done; if [ -e \"$KAISOLA_WRITE_GATE\" ]; then printf grandchild-final; fi) & printf 'direct-child|'",
+            ],
+            env: ["KAISOLA_WRITE_GATE": gateURL.path],
+            cwd: directory.path,
+            outputByteLimit: nil
+        )
+        let receipt = TerminalExitReceipt()
+        let waiter = Task {
+            let status = await host.waitForExit(id)
+            await receipt.record(status)
+            return status
+        }
+
+        let drainDeadline = Date().addingTimeInterval(2)
+        while Date() < drainDeadline {
+            let snapshot = await host.output(id)
+            if snapshot?.outputState == .drainingDescendants,
+               snapshot?.output == "direct-child|" {
+                break
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let draining = await host.output(id)
+        XCTAssertEqual(draining?.outputState, .drainingDescendants)
+        XCTAssertNil(draining?.exitStatus, "direct-child exit alone must not resolve the terminal")
+        XCTAssertEqual(draining?.output, "direct-child|")
+
+        // Cross the old synthetic-EOF deadline while the real grandchild still
+        // owns the pipe. The waiter must remain unresolved until that child is
+        // explicitly allowed to publish its final bytes and close the pipe.
+        try await Task.sleep(nanoseconds: 2_200_000_000)
+        let prematurelyResolved = await receipt.value()
+        XCTAssertNil(prematurelyResolved)
+        try Data().write(to: gateURL)
+
+        let completionDeadline = Date().addingTimeInterval(3)
+        while await receipt.value() == nil, Date() < completionDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let status = await waiter.value
+        let completed = await host.output(id)
+        XCTAssertEqual(status?.exitCode, 0)
+        XCTAssertEqual(completed?.outputState, .complete)
+        XCTAssertEqual(completed?.output, "direct-child|grandchild-final")
+        XCTAssertFalse(completed?.truncated ?? true)
+
+        // Resolution is the append barrier: no later poll can observe growth.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let stableOutput = await host.output(id)?.output
+        XCTAssertEqual(stableOutput, completed?.output)
+        await host.release(id)
+    }
+
+    func testLingeringDescendantTimeoutClosesThePipeAndReportsBoundedLoss() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-terminal-timeout-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gateURL = directory.appendingPathComponent("write-after-timeout")
+        let descendantDoneURL = directory.appendingPathComponent("descendant-done")
+        let host = AcpTerminalHost(descendantPipeDrainTimeoutNanoseconds: 150_000_000)
+        let clock = ContinuousClock()
+        let started = clock.now
+        let id = try await host.create(
+            command: "/bin/sh",
+            args: [
+                "-c",
+                "(trap '' PIPE; i=0; while [ ! -e \"$KAISOLA_WRITE_GATE\" ] && [ $i -lt 600 ]; do sleep 0.01; i=$((i + 1)); done; if [ -e \"$KAISOLA_WRITE_GATE\" ]; then printf should-not-append 2>/dev/null || :; fi; : > \"$KAISOLA_DESCENDANT_DONE\") & printf bounded-prefix",
+            ],
+            env: [
+                "KAISOLA_WRITE_GATE": gateURL.path,
+                "KAISOLA_DESCENDANT_DONE": descendantDoneURL.path,
+            ],
+            cwd: directory.path,
+            outputByteLimit: nil
+        )
+        let status = await host.waitForExit(id)
+        let elapsed = started.duration(to: clock.now)
+        let timedOut = await host.output(id)
+
+        XCTAssertEqual(status?.exitCode, 0)
+        XCTAssertLessThan(elapsed, .seconds(2), "a descendant-held pipe must have a bounded wait")
+        XCTAssertEqual(timedOut?.outputState, .descendantTimeout)
+        XCTAssertEqual(timedOut?.output, "bounded-prefix")
+        XCTAssertTrue(timedOut?.truncated == true, "timeout must visibly disclose possible lost output")
+
+        try Data().write(to: gateURL)
+        let descendantDeadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: descendantDoneURL.path),
+              Date() < descendantDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: descendantDoneURL.path))
+        let afterLateWrite = await host.output(id)
+        XCTAssertEqual(afterLateWrite?.output, timedOut?.output)
+        XCTAssertEqual(afterLateWrite?.outputState, .descendantTimeout)
+        await host.release(id)
+        let released = await host.output(id)
+        XCTAssertNil(released)
+    }
+
+    func testReleaseClosesALingeringDescendantPipeImmediately() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-terminal-release-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gateURL = directory.appendingPathComponent("finish-descendant")
+        let descendantDoneURL = directory.appendingPathComponent("descendant-done")
+        let host = AcpTerminalHost(descendantPipeDrainTimeoutNanoseconds: 30_000_000_000)
+        let id = try await host.create(
+            command: "/bin/sh",
+            args: [
+                "-c",
+                "(trap '' PIPE; i=0; while [ ! -e \"$KAISOLA_WRITE_GATE\" ] && [ $i -lt 600 ]; do sleep 0.01; i=$((i + 1)); done; printf released-late 2>/dev/null || :; : > \"$KAISOLA_DESCENDANT_DONE\") & printf released-prefix",
+            ],
+            env: [
+                "KAISOLA_WRITE_GATE": gateURL.path,
+                "KAISOLA_DESCENDANT_DONE": descendantDoneURL.path,
+            ],
+            cwd: directory.path,
+            outputByteLimit: nil
+        )
+
+        let drainDeadline = Date().addingTimeInterval(2)
+        while await host.output(id)?.outputState != .drainingDescendants,
+              Date() < drainDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let draining = await host.output(id)
+        XCTAssertEqual(draining?.outputState, .drainingDescendants)
+        await host.release(id)
+
+        let releaseDeadline = Date().addingTimeInterval(2)
+        while await host.output(id) != nil, Date() < releaseDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let released = await host.output(id)
+        XCTAssertNil(released)
+        try Data().write(to: gateURL)
+        let descendantDeadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: descendantDoneURL.path),
+              Date() < descendantDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: descendantDoneURL.path))
     }
 
     func testAdapterProvidedLimitIsClampedToTheApplicationMaximum() async throws {
@@ -247,5 +406,17 @@ final class AcpTerminalHostTests: XCTestCase {
             snapshot = await host.output(id)
         }
         XCTAssertTrue(snapshot?.output.contains("overlay-works") == true)
+    }
+}
+
+private actor TerminalExitReceipt {
+    private var recorded: AcpTerminalHost.ExitStatus?
+
+    func record(_ status: AcpTerminalHost.ExitStatus?) {
+        recorded = status
+    }
+
+    func value() -> AcpTerminalHost.ExitStatus? {
+        recorded
     }
 }

@@ -824,6 +824,7 @@ final class MeshSession: ObservableObject, Identifiable {
             title: agent.name,
             command: adapter.command,
             arguments: adapter.arguments,
+            containment: adapter.containment,
             environment: environment,
             cwd: cwd,
             mcpServers: mcp,
@@ -1262,6 +1263,28 @@ final class MeshSession: ObservableObject, Identifiable {
         }.value
     }
 
+    /// Graft a column's worktree diff onto the base project and report what
+    /// happened as a value. Success, "there was nothing to apply", a conflicted
+    /// graft, and an outright failure are four cases the caller can switch on;
+    /// the view never has to read English out of an error to decide how loud to
+    /// be about it.
+    func integrate(columnID: String) async -> MeshIntegrationOutcome {
+        let name = columns.first { $0.id == columnID }?.agent.name ?? "column"
+        let base = baseDirectory
+        let patch = await diff(for: columnID)
+        guard !patch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .noChanges(agent: name)
+        }
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try GitService(repoRoot: base).applyPatch(patch)
+            }.value
+            return .applied(agent: name, destination: base.lastPathComponent)
+        } catch {
+            return .from(applyError: error, agent: name)
+        }
+    }
+
     /// Per-worktree review lines for judging the run: files changed + rough +/-
     /// line counts, parsed from each editing column's diff against HEAD. Read-only
     /// columns (scout, ideator) have no worktree and are skipped.
@@ -1397,5 +1420,195 @@ enum MeshDiffStats {
         }
         let noun = files == 1 ? "file" : "files"
         return "\(files) \(noun) changed, +\(added) -\(removed)"
+    }
+}
+
+/// What one integration attempt did, carried as a value instead of a sentence.
+/// Success, "there was nothing to apply", a conflicted graft, and an outright
+/// failure are four cases; severity, symbol, the VoiceOver announcement and the
+/// offered recovery are all computed from the case. The message is display text
+/// only, so a permission or I/O failure keeps its weight no matter how git
+/// happened to word it. Kept free of the main actor so tests can build outcomes
+/// directly.
+enum MeshIntegrationOutcome: Equatable, Sendable {
+    case applied(agent: String, destination: String)
+    case noChanges(agent: String)
+    case conflicted(agent: String, paths: [String])
+    case failed(agent: String, reason: Reason)
+
+    /// Why an integration failed, mirroring `GitService.PatchApplyFailure`
+    /// without its conflict/empty cases — those are outcomes of their own above.
+    /// `detail` is git's own words, shown but never inspected.
+    enum Reason: Equatable, Sendable {
+        case notARepository
+        case permissionDenied(detail: String)
+        case patchRejected(detail: String)
+        case io(detail: String)
+        case gitFailed(detail: String)
+
+        var detail: String {
+            switch self {
+            case .notARepository: ""
+            case let .permissionDenied(detail), let .patchRejected(detail),
+                 let .io(detail), let .gitFailed(detail): detail
+            }
+        }
+
+        /// Shown when git said nothing useful, so the line is never blank.
+        var headline: String {
+            switch self {
+            case .notARepository: "the destination folder is not a git repository."
+            case .permissionDenied: "the destination folder is not writable."
+            case .patchRejected: "git refused this diff and left the project unchanged."
+            case .io: "the integration could not run."
+            case .gitFailed: "git apply failed."
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .notARepository: "questionmark.folder"
+            case .permissionDenied: "lock.fill"
+            case .patchRejected: "xmark.circle.fill"
+            case .io: "externaldrive.badge.exclamationmark"
+            case .gitFailed: "exclamationmark.octagon.fill"
+            }
+        }
+    }
+
+    /// How loud the status line should be. Views map this to a tint; nothing
+    /// maps a message to a tint.
+    enum Severity: Equatable, Sendable {
+        case success
+        case informational
+        case warning
+        case failure
+
+        /// Spoken first, so VoiceOver carries the urgency that the tint carries
+        /// visually.
+        var spokenLabel: String {
+            switch self {
+            case .success: "Integration succeeded"
+            case .informational: "Integration notice"
+            case .warning: "Integration needs you"
+            case .failure: "Integration failed"
+            }
+        }
+    }
+
+    /// The recovery a given outcome earns. Buttons come from this list, so a
+    /// failure always offers a way forward and a success does not offer a
+    /// pointless retry.
+    enum Recovery: String, Equatable, Sendable, Identifiable {
+        case reviewDiff
+        case retry
+        case revealDestination
+        case dismiss
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .reviewDiff: "Review Diff"
+            case .retry: "Try Again"
+            case .revealDestination: "Reveal in Finder"
+            case .dismiss: "Dismiss"
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .reviewDiff: "doc.text.magnifyingglass"
+            case .retry: "arrow.clockwise"
+            case .revealDestination: "folder"
+            case .dismiss: "xmark"
+            }
+        }
+
+        var help: String {
+            switch self {
+            case .reviewDiff: "Re-read this column's worktree diff"
+            case .retry: "Attempt the integration again"
+            case .revealDestination: "Open the base project in Finder"
+            case .dismiss: "Hide this integration status"
+            }
+        }
+    }
+
+    var severity: Severity {
+        switch self {
+        case .applied: .success
+        case .noChanges: .informational
+        case .conflicted: .warning
+        case .failed: .failure
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .applied: "checkmark.circle.fill"
+        case .noChanges: "tray"
+        case .conflicted: "exclamationmark.triangle.fill"
+        case let .failed(_, reason): reason.symbol
+        }
+    }
+
+    var message: String {
+        switch self {
+        case let .applied(agent, destination):
+            "Applied \(agent)'s diff to \(destination)."
+        case let .noChanges(agent):
+            "\(agent): no changes to apply."
+        case let .conflicted(agent, paths):
+            "\(agent): applied with conflicts in \(GitService.PatchApplyFailure.naming(paths)). Resolve the git markers (<<<<<<< / ======= / >>>>>>>) left in those files."
+        case let .failed(agent, reason):
+            "\(agent): \(reason.detail.isEmpty ? reason.headline : reason.detail)"
+        }
+    }
+
+    var accessibilityAnnouncement: String {
+        "\(severity.spokenLabel). \(message)"
+    }
+
+    var recoveryActions: [Recovery] {
+        switch self {
+        case .applied, .noChanges:
+            [.dismiss]
+        case .conflicted:
+            [.revealDestination, .dismiss]
+        case let .failed(_, reason):
+            switch reason {
+            case .notARepository: [.revealDestination, .dismiss]
+            case .permissionDenied: [.revealDestination, .retry, .dismiss]
+            case .patchRejected: [.reviewDiff, .retry, .dismiss]
+            case .io, .gitFailed: [.retry, .dismiss]
+            }
+        }
+    }
+
+    /// Narrow a thrown apply error to an outcome. Everything is decided by the
+    /// typed case; the error's text only ever becomes display detail. An error
+    /// from outside `GitService` is a genuine unknown and stays a failure.
+    static func from(applyError: Error, agent: String) -> MeshIntegrationOutcome {
+        guard let failure = applyError as? GitService.PatchApplyFailure else {
+            return .failed(agent: agent, reason: .gitFailed(detail: applyError.localizedDescription))
+        }
+        let detail = failure.errorDescription ?? ""
+        switch failure {
+        case .emptyPatch:
+            return .noChanges(agent: agent)
+        case let .conflicted(paths, _):
+            return .conflicted(agent: agent, paths: paths)
+        case .notARepository:
+            return .failed(agent: agent, reason: .notARepository)
+        case .permissionDenied:
+            return .failed(agent: agent, reason: .permissionDenied(detail: detail))
+        case .patchRejected:
+            return .failed(agent: agent, reason: .patchRejected(detail: detail))
+        case .io:
+            return .failed(agent: agent, reason: .io(detail: detail))
+        case .gitFailed:
+            return .failed(agent: agent, reason: .gitFailed(detail: detail))
+        }
     }
 }

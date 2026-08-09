@@ -126,7 +126,7 @@ struct WorkspaceRestorationNoticeView: View {
                     .font(.callout.weight(.semibold))
                 Text(notice.message)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 8) {
                     Button("Retry Restore") {
@@ -152,7 +152,7 @@ struct WorkspaceRestorationNoticeView: View {
                     } else if notice.retryCount > 0 {
                         Text("Retried \(notice.retryCount)×")
                             .font(.caption2)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                     }
                 }
                 .padding(.top, 2)

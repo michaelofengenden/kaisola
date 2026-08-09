@@ -94,7 +94,7 @@ struct ExtensionsSettingsHub: View {
     private var searchHeader: some View {
         HStack(spacing: 10) {
             Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityHidden(true)
             TextField("Search agents, servers, themes, grammars, and previews", text: $query)
                 .textFieldStyle(.plain)
@@ -109,7 +109,7 @@ struct ExtensionsSettingsHub: View {
                     Image(systemName: "xmark.circle.fill")
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityLabel("Clear extension search")
             }
             Button("Search") { searchFocused = true }
@@ -145,7 +145,7 @@ struct ExtensionsSettingsHub: View {
         HStack(spacing: 10) {
             Text("Showing")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             Picker("Extension category", selection: $selectedCategory) {
                 Text("All Extensions").tag(nil as ExtensionsSettingsCategory?)
                 ForEach(ExtensionsSettingsCategory.allCases) { category in
@@ -157,7 +157,7 @@ struct ExtensionsSettingsHub: View {
             Spacer()
             Text(scopeSummary)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .lineLimit(1)
         }
         .padding(.horizontal, 16)
@@ -189,11 +189,11 @@ struct ExtensionsSettingsHub: View {
                 } else {
                     Text("\(categoryItems.count)")
                         .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.kaisolaTertiary)
                 }
             }
             .font(.callout.weight(selected ? .semibold : .regular))
-            .foregroundStyle(selected ? Color.primary : .secondary)
+            .foregroundStyle(selected ? Color.primary : .kaisolaSecondary)
             .padding(.horizontal, 10)
             .frame(height: 34)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -215,7 +215,7 @@ struct ExtensionsSettingsHub: View {
             Label("Current project", systemImage: "folder")
         }
         .font(.caption2)
-        .foregroundStyle(.tertiary)
+        .foregroundStyle(.kaisolaTertiary)
         .padding(.horizontal, 10)
         .padding(.bottom, 4)
         .accessibilityElement(children: .combine)
@@ -235,7 +235,7 @@ struct ExtensionsSettingsHub: View {
         if isLoading {
             VStack(spacing: 10) {
                 ProgressView()
-                Text("Loading extensions…").foregroundStyle(.secondary)
+                Text("Loading extensions…").foregroundStyle(.kaisolaSecondary)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .accessibilityElement(children: .combine)
@@ -267,7 +267,7 @@ struct ExtensionsSettingsHub: View {
                             Text(title).font(.title3.weight(.semibold))
                             Text("Every row uses the same status, source, version and integrity, scope, and update vocabulary.")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                         }
                         Spacer()
                         if case let .content(invalidCount) = state, invalidCount > 0 {
@@ -413,7 +413,7 @@ private struct ExtensionCategoryIntro: View {
                  ? "Changes apply only to \(workspace?.lastPathComponent ?? "the current project")."
                  : "Changes apply across Kaisola.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
         }
         .accessibilityIdentifier("extensions.category-intro.\(category.rawValue)")
     }
@@ -433,7 +433,7 @@ private struct ExtensionCategoryHeader: View {
                      ? "Project scope · \(workspace?.lastPathComponent ?? "open a project")"
                      : "App-wide scope")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             Spacer()
         }
@@ -451,7 +451,7 @@ struct ExtensionRegistryRow<Trailing: View>: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .top, spacing: 10) {
                 Image(systemName: item.category.symbol)
-                    .foregroundStyle(item.status.isEnabled ? Color.accentColor : .secondary)
+                    .foregroundStyle(item.status.isEnabled ? Color.accentColor : .kaisolaSecondary)
                     .frame(width: 19)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
@@ -459,7 +459,7 @@ struct ExtensionRegistryRow<Trailing: View>: View {
                     if !item.detail.isEmpty {
                         Text(item.detail)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .lineLimit(2)
                     }
                 }
@@ -517,10 +517,10 @@ struct ExtensionMetadataGrid: View {
         VStack(alignment: .leading, spacing: 1) {
             Text(label.uppercased())
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             Text(value)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .lineLimit(2)
         }
     }
@@ -554,12 +554,12 @@ private struct ExtensionsEmptyState: View {
         VStack(spacing: 8) {
             Image(systemName: symbol)
                 .font(.system(size: 26))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityHidden(true)
             Text(title).font(.headline)
             Text(detail)
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, minHeight: 180)
@@ -603,7 +603,7 @@ private struct TerminalThemesExtensionEditor: View {
                     if specs.isEmpty {
                         Text("No custom themes yet. Import a JSON palette to add one.")
                             .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .accessibilityIdentifier("extensions.themes.empty")
                     }
                     ForEach(specs) { spec in
@@ -723,7 +723,7 @@ private struct LanguageGrammarsExtensionEditor: View {
                     if specs.isEmpty {
                         Text("No custom grammars. Built-in languages keep working as usual.")
                             .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .accessibilityIdentifier("extensions.grammars.empty")
                     }
                     ForEach(specs) { spec in
@@ -763,7 +763,7 @@ private struct LanguageGrammarsExtensionEditor: View {
                         .disabled(!canAdd)
                     Text("A grammar is data only. Invalid expressions stay listed but disabled with the exact reason.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
             }
             .formStyle(.grouped)
@@ -843,7 +843,7 @@ private struct PreviewMappingsExtensionEditor: View {
                     if specs.isEmpty {
                         Text("No custom preview mappings. Built-in file classifications still run first.")
                             .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .accessibilityIdentifier("extensions.previews.empty")
                     }
                     ForEach(specs) { spec in
@@ -878,7 +878,7 @@ private struct PreviewMappingsExtensionEditor: View {
                         .disabled(!canAdd)
                     Text("Mappings can select text previews only. Images, PDFs, documents, binary sniffing, and size limits cannot be overridden.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
             }
             .formStyle(.grouped)

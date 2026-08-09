@@ -228,7 +228,7 @@ struct AcpComposerMenuView: View {
             if let note = panel.note {
                 Text(note)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .padding(.horizontal, 9)
                     .padding(.bottom, 4)

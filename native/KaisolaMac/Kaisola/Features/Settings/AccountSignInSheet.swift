@@ -24,7 +24,7 @@ struct AccountSignInSheet: View {
                     .font(.headline)
                 Text("\(profile.provider.displayName) · \(profile.directory)")
                     .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
@@ -37,7 +37,7 @@ struct AccountSignInSheet: View {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("Paste the code from the browser")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     HStack(spacing: 8) {
                         TextField("Authorization code", text: $code)
                             .textFieldStyle(.roundedBorder)
@@ -56,7 +56,7 @@ struct AccountSignInSheet: View {
                 ScrollView {
                     Text(controller.transcript.isEmpty ? "Starting…" : controller.transcript)
                         .font(.caption.monospaced())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }

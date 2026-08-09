@@ -22,6 +22,30 @@ final class CustomAgentStoreTests: XCTestCase {
         AgentRegistry.customStoreOverride = nil   // never leak the seam
     }
 
+    func testCustomAgentIconPickerNamesItsPurposeChoicesAndCurrentValue() {
+        XCTAssertEqual(
+            CustomAgentSymbolAccessibility.choices.map(\.symbolName),
+            ["terminal", "cpu", "bolt", "ant", "bird", "cloud"]
+        )
+        XCTAssertEqual(
+            CustomAgentSymbolAccessibility.choices.map(\.name),
+            ["Terminal", "Processor", "Lightning bolt", "Ant", "Bird", "Cloud"]
+        )
+        XCTAssertEqual(
+            CustomAgentSymbolAccessibility.pickerLabel(agentName: "Aider"),
+            "Icon for Aider"
+        )
+        XCTAssertEqual(
+            CustomAgentSymbolAccessibility.currentValue(symbolName: "cpu"),
+            "Processor"
+        )
+        XCTAssertEqual(
+            CustomAgentSymbolAccessibility.currentValue(symbolName: "unknown"),
+            "Unknown icon"
+        )
+        XCTAssertEqual(Set(CustomAgentSymbolAccessibility.choices.map(\.name)).count, 6)
+    }
+
     // MARK: - Round-trip
 
     func testSaveAllRoundTripAcrossInstances() {

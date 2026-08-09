@@ -9,6 +9,35 @@ extension Notification.Name {
     static let kaisolaAgentsChanged = Notification.Name("kaisolaAgentsChanged")
 }
 
+struct CustomAgentSymbolChoice: Equatable, Identifiable, Sendable {
+    let symbolName: String
+    let name: String
+
+    var id: String { symbolName }
+}
+
+/// One source of truth for the compact symbol menu's visible glyphs and spoken
+/// names. Keeping this outside the view makes it impossible for a new icon to
+/// silently ship without a human-readable VoiceOver name.
+enum CustomAgentSymbolAccessibility {
+    static let choices: [CustomAgentSymbolChoice] = [
+        CustomAgentSymbolChoice(symbolName: "terminal", name: "Terminal"),
+        CustomAgentSymbolChoice(symbolName: "cpu", name: "Processor"),
+        CustomAgentSymbolChoice(symbolName: "bolt", name: "Lightning bolt"),
+        CustomAgentSymbolChoice(symbolName: "ant", name: "Ant"),
+        CustomAgentSymbolChoice(symbolName: "bird", name: "Bird"),
+        CustomAgentSymbolChoice(symbolName: "cloud", name: "Cloud"),
+    ]
+
+    static func pickerLabel(agentName: String) -> String {
+        "Icon for \(agentName)"
+    }
+
+    static func currentValue(symbolName: String) -> String {
+        choices.first { $0.symbolName == symbolName }?.name ?? "Unknown icon"
+    }
+}
+
 /// Settings ▸ Agents section for user-registered terminal agents (Electron
 /// Settings ▸ Agents parity): list existing custom agents — name, launch
 /// command, an SF-symbol picker, delete — plus an add row. Every mutation
@@ -20,7 +49,7 @@ struct CustomAgentsSection: View {
     var highlightedID: String? = nil
     private let store = CustomAgentStore()
     /// A small, curated set so every custom agent gets a recognizable glyph.
-    private let symbolChoices = ["terminal", "cpu", "bolt", "ant", "bird", "cloud"]
+    private let symbolChoices = CustomAgentSymbolAccessibility.choices
     private let cap = 12
 
     @State private var specs: [CustomAgentSpec] = []
@@ -61,14 +90,30 @@ struct CustomAgentsSection: View {
                                 .lineLimit(1).truncationMode(.middle)
                         }
                         Spacer()
-                        Picker("", selection: symbolBinding(index)) {
-                            ForEach(symbolChoices, id: \.self) { name in
-                                Image(systemName: name).tag(name)
+                        Picker(
+                            CustomAgentSymbolAccessibility.pickerLabel(agentName: spec.name),
+                            selection: symbolBinding(index)
+                        ) {
+                            ForEach(symbolChoices) { choice in
+                                Image(systemName: choice.symbolName)
+                                    .accessibilityLabel(choice.name)
+                                    .tag(choice.symbolName)
                             }
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
                         .frame(width: 64)
+                        .accessibilityLabel(
+                            CustomAgentSymbolAccessibility.pickerLabel(agentName: spec.name)
+                        )
+                        .accessibilityValue(
+                            CustomAgentSymbolAccessibility.currentValue(symbolName: spec.symbol)
+                        )
+                        .accessibilityIdentifier("extensions.agent.\(spec.id).icon")
+                        .help(
+                            "\(CustomAgentSymbolAccessibility.pickerLabel(agentName: spec.name)): "
+                                + CustomAgentSymbolAccessibility.currentValue(symbolName: spec.symbol)
+                        )
                         Button(role: .destructive) { pendingDeleteID = spec.id } label: {
                             Image(systemName: "trash")
                         }
@@ -158,7 +203,7 @@ struct CustomAgentsSection: View {
             id: CustomAgentStore.slugify(name, existing: Set(specs.map(\.id))),
             name: name,
             launchCommand: command,
-            symbol: symbolChoices.first ?? "terminal",
+            symbol: symbolChoices.first?.symbolName ?? "terminal",
             acpPrivileges: []
         )
         specs.append(added)

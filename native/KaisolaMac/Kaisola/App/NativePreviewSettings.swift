@@ -296,12 +296,19 @@ enum ProviderRouting {
         guard value.count <= maximumBaseURLLength,
               !value.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
               !value.unicodeScalars.contains(where: CharacterSet.whitespacesAndNewlines.contains),
+              !value.contains("\\"),
               let components = URLComponents(string: value),
               components.url != nil,
               let scheme = components.scheme?.lowercased(),
               ["http", "https"].contains(scheme),
               let host = components.host?.lowercased(),
-              !host.isEmpty
+              !host.isEmpty,
+              // `URLComponents` percent-decodes `host`, so `%09` slips a
+              // separator past the raw-text checks above and leaves this base URL
+              // meaning one host here and another to a WHATWG parser. Same
+              // host-confusion class as the backslash introducer.
+              !host.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+              !host.unicodeScalars.contains(where: CharacterSet.whitespacesAndNewlines.contains)
         else {
             return "Enter a complete http:// or https:// URL."
         }

@@ -201,6 +201,54 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertTrue(McpConfigStore.jsonValues([insecure, credentialed]).isEmpty)
     }
 
+    /// GHSA-7p8r-x3mc-p8w7. A stored URL is read back by `URLComponents` here,
+    /// by WHATWG `new URL` in `scripts/native-mcp-registry.cjs`, and by whatever
+    /// RFC 3986 parser the agent links. These spellings name a different host to
+    /// each of them, so none of them may be allowed to pick one.
+    func testAmbiguousRemoteURLsNeverReachSessionWire() {
+        let ambiguous = [
+            "https:\\\\evil.test/mcp",
+            "https:/\\evil.test/mcp",
+            "https:\\/evil.test/mcp",
+            "https://good.test\\@evil.test/mcp",
+            "https://good.test\\.evil.test/mcp",
+            "https://good.test/schema\\..\\evil.test",
+            "https://good.test%09.evil.test/mcp",
+        ]
+        let servers = ambiguous.enumerated().map { index, url in
+            McpServerConfig(name: "probe\(index)", kind: .http, url: url)
+        }
+        for (url, server) in zip(ambiguous, servers) {
+            XCTAssertEqual(
+                server.validationError,
+                "Remote MCP servers must use a valid HTTPS URL.",
+                "accepted \(url)"
+            )
+        }
+        XCTAssertTrue(McpConfigStore.jsonValues(servers).isEmpty)
+    }
+
+    /// The guard above rejects a spelling, not a destination: ordinary public
+    /// hosts, loopback, IPv6 literals, a private-CA endpoint on its own port,
+    /// and a percent-encoded backslash in the path all stay usable.
+    func testOrdinaryRemoteURLsStillReachSessionWire() {
+        let ordinary = [
+            "https://api.example.test/v1",
+            "https://localhost:8443/mcp",
+            "https://127.0.0.1:8443/mcp",
+            "https://[::1]:8443/mcp",
+            "https://mcp.internal.corp.test:8443/mcp",
+            "https://good.test/a%5Cb",
+        ]
+        let servers = ordinary.enumerated().map { index, url in
+            McpServerConfig(name: "ok\(index)", kind: .http, url: url)
+        }
+        for (url, server) in zip(ordinary, servers) {
+            XCTAssertNil(server.validationError, "rejected \(url)")
+        }
+        XCTAssertEqual(McpConfigStore.jsonValues(servers).count, ordinary.count)
+    }
+
     func testInvalidStdioCommandNeverReachesSessionWire() {
         let empty = McpServerConfig(name: "bad", kind: .stdio, command: "  ")
         let multiline = McpServerConfig(name: "bad2", kind: .stdio, command: "sh\necho")
@@ -297,6 +345,17 @@ final class McpConfigStoreTests: XCTestCase {
         )
 
         XCTAssertTrue(McpConfigDiscovery.scan(homeDirectory: home).isEmpty)
+    }
+
+    func testDiscoveryDropsAmbiguousRemoteURLs() throws {
+        let home = root.appendingPathComponent("confused-home", isDirectory: true)
+        try write(
+            #"{"mcpServers":{"trap":{"url":"https://good.test%09.evil.test/mcp"},"keep":{"url":"https://mcp.internal.corp.test:8443/mcp"}}}"#,
+            relativePath: ".cursor/mcp.json",
+            home: home
+        )
+
+        XCTAssertEqual(McpConfigDiscovery.scan(homeDirectory: home).map { $0.config.name }, ["keep"])
     }
 
     func testImportIsExplicitDisabledCollisionSafeAndBounded() {

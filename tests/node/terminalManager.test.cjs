@@ -24,6 +24,58 @@ after(() => {
   fs.rmSync(managerSpoolDir, { recursive: true, force: true })
 })
 
+test('process-wide terminal capacity is validated and enforced before pty spawn', (t) => {
+  assert.throws(
+    () => manager.configureCapacity(0),
+    /maximum live terminals must be an integer from 1 to 512/,
+  )
+  assert.throws(() => manager.configureCapacity(513), RangeError)
+  assert.throws(() => manager.configureCapacity('64'), RangeError)
+
+  manager.configureCapacity(1)
+  const firstID = 'capacity-first-terminal'
+  const secondID = 'capacity-second-terminal'
+  t.after(() => {
+    manager.release(firstID)
+    manager.release(secondID)
+    manager.configureCapacity(manager.DEFAULT_MAX_LIVE_TERMINALS)
+  })
+
+  const first = manager.spawn({
+    id: firstID,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  })
+  assert.ok(first)
+  assert.equal(manager.spawn({ id: firstID, command: '/bin/false' }), first)
+  assert.deepEqual(manager.capacity(), {
+    liveTerminalCount: 1,
+    maximumLiveTerminals: 1,
+    availableTerminalSlots: 0,
+  })
+  assert.throws(
+    () => manager.spawn({
+      id: secondID,
+      command: '/bin/cat',
+      args: [],
+      cwd: managerSpoolDir,
+    }),
+    (error) => error.code === 'TERMINAL_CAPACITY_EXCEEDED'
+      && error.liveTerminalCount === 1
+      && error.maximumLiveTerminals === 1,
+  )
+  assert.equal(manager.has(secondID), false)
+
+  manager.release(firstID)
+  assert.ok(manager.spawn({
+    id: secondID,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+})
+
 test('terminal resize commits geometry only after node-pty accepts it', () => {
   const calls = []
   const record = {

@@ -3,6 +3,40 @@ import XCTest
 @testable import Kaisola
 
 final class BrokerLaunchConfigurationTests: XCTestCase {
+    func testLaunchConfigurationSealsABoundedProcessWideTerminalLimit() throws {
+        let home = URL(fileURLWithPath: "/tmp/kaisola-launch-home")
+        let userData = home.appendingPathComponent("Kaisola", isDirectory: true)
+        let broker = userData.appendingPathComponent("session-broker", isDirectory: true)
+        let launchURL = broker.appendingPathComponent("launch-native-capacity.json")
+
+        for maximum in [1, 64, BrokerLaunchConfiguration.maximumConfigurableLiveTerminals] {
+            let configuration = configuration(
+                userData: userData,
+                broker: broker,
+                maximumLiveTerminals: maximum
+            )
+            XCTAssertNoThrow(try configuration.validate(
+                configurationURL: launchURL,
+                homeDirectory: home
+            ))
+            let encoded = try JSONEncoder().encode(configuration)
+            let object = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+            )
+            XCTAssertEqual(object["maximumLiveTerminals"] as? Int, maximum)
+        }
+
+        for invalid in [0, BrokerLaunchConfiguration.maximumConfigurableLiveTerminals + 1] {
+            XCTAssertThrowsError(try configuration(
+                userData: userData,
+                broker: broker,
+                maximumLiveTerminals: invalid
+            ).validate(configurationURL: launchURL, homeDirectory: home)) { error in
+                XCTAssertEqual(error as? BrokerLaunchConfigurationError, .invalidConfiguration)
+            }
+        }
+    }
+
     func testLaunchConfigurationAcceptsOnlyExactPrivateBrokerLayout() throws {
         let home = URL(fileURLWithPath: "/tmp/kaisola-launch-home")
         let userData = home.appendingPathComponent("Library/Application Support/Kaisola", isDirectory: true)
@@ -25,6 +59,7 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
             lockFile: valid.lockFile,
             storageDir: valid.storageDir,
             logFile: valid.logFile,
+            maximumLiveTerminals: valid.maximumLiveTerminals,
             startedAt: valid.startedAt,
             version: valid.version,
             smoke: false
@@ -53,6 +88,7 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
             lockFile: valid.lockFile,
             storageDir: valid.storageDir,
             logFile: valid.logFile,
+            maximumLiveTerminals: valid.maximumLiveTerminals,
             startedAt: valid.startedAt,
             version: valid.version,
             smoke: true
@@ -84,6 +120,7 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
             lockFile: broker.appendingPathComponent("broker.lock").path,
             storageDir: userData.appendingPathComponent("terminal-cache").path,
             logFile: broker.appendingPathComponent("broker.log").path,
+            maximumLiveTerminals: nil,
             startedAt: current.startedAt,
             version: current.version,
             smoke: false
@@ -95,7 +132,11 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
         ))
     }
 
-    private func configuration(userData: URL, broker: URL) -> BrokerLaunchConfiguration {
+    private func configuration(
+        userData: URL,
+        broker: URL,
+        maximumLiveTerminals: Int? = BrokerLaunchConfiguration.defaultMaximumLiveTerminals
+    ) -> BrokerLaunchConfiguration {
         let digest = String(repeating: "a", count: 64)
         let metadata = broker.appendingPathComponent(
             BrokerLaunchConfiguration.generationMetadataDirectoryName,
@@ -123,6 +164,7 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
             lockFile: metadata.appendingPathComponent("\(digest).lock").path,
             storageDir: userData.appendingPathComponent("terminal-cache").path,
             logFile: metadata.appendingPathComponent("\(digest).log").path,
+            maximumLiveTerminals: maximumLiveTerminals,
             startedAt: 1,
             version: "native-test",
             smoke: false

@@ -320,8 +320,15 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             params["restore"] = .bool(true)
         }
         let result = try await request(.create, params: .object(params))
-        guard let object = result.objectValue,
-              object["ok"]?.boolValue != false else {
+        guard let object = result.objectValue else {
+            throw BrokerClientError.requestFailed("terminal.create")
+        }
+        if object["ok"]?.boolValue == false {
+            if object["code"]?.stringValue == "terminal_capacity_exceeded",
+               let maximum = object["maximumLiveTerminals"]?.intValue.flatMap(Int.init(exactly:)),
+               (1...BrokerWire.maximumConfigurableLiveTerminals).contains(maximum) {
+                throw BrokerClientError.terminalCapacityExceeded(maximum: maximum)
+            }
             throw BrokerClientError.requestFailed("terminal.create")
         }
         let pid = object["pid"]?.intValue.flatMap(Int32.init(exactly:))

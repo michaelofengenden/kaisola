@@ -21,6 +21,8 @@ public enum BrokerWire {
     public static let brokerMutationIdempotencyFeature = "broker-mutation-idempotency-v1"
     public static let brokerInventoryFeature = "broker-inventory-v1"
     public static let brokerAdministrationFeature = "broker-administration-v1"
+    public static let defaultMaximumLiveTerminals = 64
+    public static let maximumConfigurableLiveTerminals = 512
     public static let observerMethods: Set<String> = [
         "broker.status",
         "broker.inventory",

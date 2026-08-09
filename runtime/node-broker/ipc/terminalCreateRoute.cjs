@@ -326,20 +326,35 @@ function terminalCreateRoute({
       return { ok: false, message: 'terminal restore denied: project mismatch' }
     }
   }
-  const rec = manager.spawn({
-    id,
-    command: typeof params.command === 'string' ? params.command : undefined,
-    args: args.value,
-    cwd: typeof params.cwd === 'string' ? params.cwd : os.homedir(),
-    env: env.value,
-    outputByteLimit: Number.isFinite(Number(params.outputByteLimit))
-      ? Math.max(0, Math.min(Math.floor(Number(params.outputByteLimit)), 8 * 1024 * 1024))
-      : undefined,
-    cols: geometry.value.cols,
-    rows: geometry.value.rows,
-    sender: owner,
-    restore,
-  })
+  let rec
+  try {
+    rec = manager.spawn({
+      id,
+      command: typeof params.command === 'string' ? params.command : undefined,
+      args: args.value,
+      cwd: typeof params.cwd === 'string' ? params.cwd : os.homedir(),
+      env: env.value,
+      outputByteLimit: Number.isFinite(Number(params.outputByteLimit))
+        ? Math.max(0, Math.min(Math.floor(Number(params.outputByteLimit)), 8 * 1024 * 1024))
+        : undefined,
+      cols: geometry.value.cols,
+      rows: geometry.value.rows,
+      sender: owner,
+      restore,
+    })
+  } catch (error) {
+    if (error?.code !== 'TERMINAL_CAPACITY_EXCEEDED'
+        || !Number.isSafeInteger(error.maximumLiveTerminals)
+        || error.maximumLiveTerminals < 1) {
+      throw error
+    }
+    return {
+      ok: false,
+      code: 'terminal_capacity_exceeded',
+      message: 'broker terminal capacity reached',
+      maximumLiveTerminals: error.maximumLiveTerminals,
+    }
+  }
   if (!rec) {
     return manager.available()
       ? { ok: false, message: 'could not start terminal' }

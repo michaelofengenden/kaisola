@@ -309,6 +309,43 @@ final class BrokerControlClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testCreateSurfacesTypedTerminalCapacityWithoutRawBrokerDetails() async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: .object([
+            "ok": .bool(false),
+            "code": .string("terminal_capacity_exceeded"),
+            "message": .string("broker terminal capacity reached"),
+            "maximumLiveTerminals": .integer(64),
+        ]))
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: primaryControlBrokerInfo, ownerID: "native-test")
+
+        do {
+            _ = try await client.createTerminal(
+                projectID: "project.one",
+                terminalID: "terminal-capacity-rejected",
+                command: "/bin/zsh",
+                arguments: [],
+                cwd: "/tmp",
+                columns: 80,
+                rows: 24
+            )
+            XCTFail("A typed process-wide capacity result must reject terminal creation.")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerClientError,
+                .terminalCapacityExceeded(maximum: 64)
+            )
+            XCTAssertEqual(
+                error.localizedDescription,
+                "The session service is already running its limit of 64 terminals. Close one and try again."
+            )
+        }
+        await client.disconnect()
+    }
+
     func testHandshakeRejectsEveryImmutableBrokerIdentityMismatch() async throws {
         let mismatches: [(field: String, value: JSONValue, error: BrokerClientError)] = [
             ("protocol", .integer(Int64(BrokerWire.protocolVersion + 1)), .protocolMismatch),

@@ -88,6 +88,12 @@ function readLaunch() {
   for (const key of ['socketPath', 'infoFile', 'lockFile', 'storageDir', 'logFile']) {
     if (!path.isAbsolute(String(config[key] || ''))) throw new Error(`invalid ${key}`)
   }
+  if (config.maximumLiveTerminals != null
+      && (!Number.isSafeInteger(config.maximumLiveTerminals)
+        || config.maximumLiveTerminals < 1
+        || config.maximumLiveTerminals > mgr.MAX_CONFIGURABLE_LIVE_TERMINALS)) {
+    throw new Error('invalid maximumLiveTerminals')
+  }
   return config
 }
 
@@ -95,6 +101,7 @@ const config = readLaunch()
 const smoke = config.smoke === true
 process.umask(0o077)
 mgr.configureStorage(config.storageDir)
+mgr.configureCapacity(config.maximumLiveTerminals ?? mgr.DEFAULT_MAX_LIVE_TERMINALS)
 
 function log(message) {
   try {
@@ -245,7 +252,7 @@ function scheduleNoClientExit() {
   noClientTimer.unref?.()
 }
 
-function brokerStatusSnapshot(terminals) {
+function brokerStatusSnapshot(terminals, terminalCapacity = null) {
   return {
     ok: true,
     protocol: PROTOCOL,
@@ -269,6 +276,7 @@ function brokerStatusSnapshot(terminals) {
     rendezvous: rendezvousStatus(),
     health: rejectionSupervisor.status(),
     authenticatedClientCount: clients.size,
+    ...(terminalCapacity == null ? {} : { terminalCapacity }),
     terminals,
   }
 }
@@ -349,12 +357,18 @@ async function dispatch(client, method, params = {}) {
   }))
   switch (method) {
     case 'broker.status':
-      return brokerStatusSnapshot(visibleRows(mgr.diagnostics()))
+      return brokerStatusSnapshot(
+        visibleRows(mgr.diagnostics()),
+        globalObservation ? mgr.capacity() : null,
+      )
     case 'broker.inventory':
       return collectBrokerInventorySnapshot({
         activityEpoch: () => activityEpoch,
         inFlightMutations: () => inFlightMutations,
-        status: () => brokerStatusSnapshot(visibleRows(mgr.diagnostics())),
+        status: () => brokerStatusSnapshot(
+          visibleRows(mgr.diagnostics()),
+          globalObservation ? mgr.capacity() : null,
+        ),
         diagnostics: () => visibleRows(mgr.diagnostics()),
         live: () => visibleRows(mgr.list()),
       })

@@ -28,6 +28,8 @@ const BROKER_ROLLING_UPDATE_FEATURE = 'broker-rolling-update-v1'
 const BROKER_MUTATION_IDEMPOTENCY_FEATURE = 'broker-mutation-idempotency-v1'
 const BROKER_INVENTORY_FEATURE = 'broker-inventory-v1'
 const BROKER_ADMINISTRATION_FEATURE = 'broker-administration-v1'
+const DEFAULT_MAX_LIVE_TERMINALS = 64
+const MAX_CONFIGURABLE_LIVE_TERMINALS = 512
 // terminal:exit:<id> shipped as a bare exit code, so a signal-killed session
 // arrived as an ordinary numeric exit and the cause was lost. Clients that
 // declare this feature receive the same { exitCode, signal } record the
@@ -358,6 +360,8 @@ module.exports = {
   BROKER_MUTATION_IDEMPOTENCY_FEATURE,
   BROKER_INVENTORY_FEATURE,
   BROKER_ADMINISTRATION_FEATURE,
+  DEFAULT_MAX_LIVE_TERMINALS,
+  MAX_CONFIGURABLE_LIVE_TERMINALS,
   TERMINAL_EXIT_STATUS_FEATURE,
   TERMINAL_EXIT_CHANNEL_PREFIX,
   FEATURES,

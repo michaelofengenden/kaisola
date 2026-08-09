@@ -5620,6 +5620,7 @@ final class AppModel: ObservableObject {
         case .frameRejected,
              .malformedResponse,
              .requestTimedOut,
+             .terminalCapacityExceeded,
              .requestFailed:
             return false
         }

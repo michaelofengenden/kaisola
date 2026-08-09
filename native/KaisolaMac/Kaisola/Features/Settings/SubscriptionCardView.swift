@@ -35,7 +35,7 @@ struct SubscriptionCardView: View {
             } else if let message = usage?.message, !message.isEmpty {
                 Label(message, systemImage: "exclamationmark.circle")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(2)
             }
         }
@@ -172,11 +172,11 @@ struct SubscriptionCardView: View {
         } else if usage == nil {
             Text("Checking this account…")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
         } else {
             Text("Not signed in")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
         }
     }
 
@@ -233,7 +233,7 @@ struct SubscriptionUsageMeter: View {
         HStack(spacing: 7) {
             Text(window.label)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .lineLimit(1)
                 .frame(width: Self.labelWidth, alignment: .leading)
 
@@ -267,7 +267,7 @@ struct SubscriptionUsageMeter: View {
             // The bar flexes instead; it has a floor of its own.
             Text(resetCaption ?? "")
                 .font(.caption2.monospacedDigit())
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.kaisolaTertiary)
                 .lineLimit(1)
                 .frame(width: Self.resetWidth, alignment: .trailing)
                 .help(resetDescription ?? "")

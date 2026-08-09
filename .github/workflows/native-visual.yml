@@ -18,9 +18,18 @@ concurrency:
 jobs:
   capture:
     runs-on: macos-15
-    timeout-minutes: 25
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install exact helper dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+        env:
+          KAISOLA_SKIP_NATIVE_REBUILD: '1'
 
       - name: Resolve native app version
         run: >-
@@ -28,27 +37,53 @@ jobs:
           "require('fs').appendFileSync(process.env.GITHUB_ENV,
           'KAISOLA_VISUAL_VERSION=' + require('./package.json').version + '\\n')"
 
-      - name: Build native visual fixture
+      - name: Prepare pinned runtime for optimized visual fixture
+        run: node scripts/download-native-node-runtime.cjs arm64
+
+      - name: Build optimized native visual fixture
         run: >-
           xcodebuild
           -project native/KaisolaMac/KaisolaMac.xcodeproj
           -scheme Kaisola
-          -configuration Debug
-          -destination 'platform=macOS'
+          -configuration LocalRelease
+          -destination 'platform=macOS,arch=arm64'
           -derivedDataPath "$RUNNER_TEMP/kaisola-native-visual"
           MARKETING_VERSION="$KAISOLA_VISUAL_VERSION"
-          CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER"
+          CURRENT_PROJECT_VERSION=900000025
+          PRODUCT_BUNDLE_IDENTIFIER=com.kaisola.mac.visual.extensions-hub
+          ARCHS=arm64
+          ONLY_ACTIVE_ARCH=YES
           CODE_SIGNING_ALLOWED=NO
           build
+
+      - name: Build exact-PID accessibility gate
+        run: >-
+          xcrun swiftc
+          scripts/native-visual-ax-gate.swift
+          -o "$RUNNER_TEMP/native-visual-ax-gate"
 
       - name: Capture workspace, document, Mesh, Settings, and Usage states
         shell: bash
         run: |
           set -euo pipefail
-          app="$RUNNER_TEMP/kaisola-native-visual/Build/Products/Debug/Kaisola.app"
+          source_app="$RUNNER_TEMP/kaisola-native-visual/Build/Products/LocalRelease/Kaisola.app"
+          app="$RUNNER_TEMP/Kaisola Extensions Hub QA.app"
+          /usr/bin/ditto "$source_app" "$app"
           binary="$app/Contents/MacOS/Kaisola"
           output="$RUNNER_TEMP/kaisola-native-screenshots"
+          fixture_profiles="$RUNNER_TEMP/kaisola-native-visual-profiles"
+          ax_gate="$RUNNER_TEMP/native-visual-ax-gate"
           mkdir -p "$output"
+          mkdir -p "$fixture_profiles"
+          binary_hash_before="$(shasum -a 256 "$binary" | awk '{print $1}')"
+          info_hash_before="$(shasum -a 256 "$app/Contents/Info.plist" | awk '{print $1}')"
+          fixture_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")"
+          test "$fixture_build" -gt 900000000
+          broker_processes_before="$(
+            ps -axo pid=,command= \
+              | grep -E '[s]ession-broker\.cjs|[k]aisola-broker' \
+              || true
+          )"
 
           verify_capture() {
             local capture="$1"
@@ -98,7 +133,20 @@ jobs:
             elif [[ "$surface" == onboarding ]]; then
               test "$width" -ge 700
               test "$height" -ge 500
-            elif [[ "$surface" == settings || "$surface" == settings-terminal || "$surface" == settings-terminal-history || "$surface" == settings-terminal-interaction || "$surface" == settings-companion || "$surface" == settings-mcp || "$surface" == settings-models || "$surface" == settings-shortcuts || "$surface" == settings-account-recovery || "$surface" == usage ]]; then
+            elif [[ "$surface" == settings-ideal ]]; then
+              # The ideal Settings window is 1100x800 of content. A headless
+              # WindowServer scales large windows down the same way it does the
+              # workspace ones, so this holds it clearly above the minimum
+              # fixture rather than pinning a scaled pixel size.
+              test "$width" -ge 800
+              test "$height" -ge 600
+            elif [[ "$surface" == settings-extensions ]]; then
+              test "$width" -ge 1000
+              test "$height" -ge 660
+            elif [[ "$surface" == settings-extensions-narrow ]]; then
+              test "$width" -ge 800
+              test "$height" -ge 540
+            elif [[ "$surface" == settings || "$surface" == settings-minimum || "$surface" == settings-terminal || "$surface" == settings-terminal-history || "$surface" == settings-terminal-interaction || "$surface" == settings-companion || "$surface" == settings-mcp || "$surface" == settings-models || "$surface" == settings-shortcuts || "$surface" == settings-account-recovery || "$surface" == usage ]]; then
               test "$width" -ge 800
               test "$height" -ge 540
             else
@@ -110,47 +158,295 @@ jobs:
           run_fixture() {
             local surface="$1"
             local capture="$2"
-            shift 2
+            local log="$3"
+            local profile
+            shift 3
+            profile="$(mktemp -d "$fixture_profiles/$surface.XXXXXX")"
+            mkdir -p \
+              "$profile/home" \
+              "$profile/tmp" \
+              "$profile/workspace" \
+              "$profile/config" \
+              "$profile/cache" \
+              "$profile/data"
             echo "KAISOLA_NATIVE_VISUAL_SURFACE_BEGIN=$surface"
             # Each fixture normally captures and exits in under eight seconds.
             # Keep a broken AppKit sheet or framework callback from hiding the
             # responsible surface until the job-wide 25-minute timeout. POSIX
             # preserves alarm(2) across exec, including env -> Kaisola.
-            if /usr/bin/perl -e '
+            if [[ "$surface" == settings-extensions || "$surface" == settings-extensions-narrow ]]; then
+              local fixture_pid ax_pid fixture_exit ax_exit ax_log
+              ax_log="${log%.log}.ax.log"
+              /usr/bin/perl -e '
+                $seconds = shift @ARGV;
+                alarm $seconds;
+                exec @ARGV or die "exec failed: $!\n";
+              ' 20 /usr/bin/env \
+                HOME="$profile/home" \
+                CFFIXED_USER_HOME="$profile/home" \
+                TMPDIR="$profile/tmp" \
+                XDG_CONFIG_HOME="$profile/config" \
+                XDG_CACHE_HOME="$profile/cache" \
+                XDG_DATA_HOME="$profile/data" \
+                KAISOLA_NATIVE_VISUAL_FIXTURE=1 \
+                KAISOLA_NATIVE_VISUAL_SURFACE="$surface" \
+                KAISOLA_NATIVE_VISUAL_WORKSPACE="$profile/workspace" \
+                KAISOLA_NATIVE_VISUAL_CAPTURE_PATH="$capture" \
+                KAISOLA_NATIVE_VISUAL_FEED_BUILD_FLOOR=900000000 \
+                "$@" > "$log" 2>&1 &
+              fixture_pid="$!"
+              "$ax_gate" "$fixture_pid" "$surface" > "$ax_log" 2>&1 &
+              ax_pid="$!"
+              fixture_exit=0
+              ax_exit=0
+              wait "$fixture_pid" || fixture_exit="$?"
+              wait "$ax_pid" || ax_exit="$?"
+              cat "$ax_log"
+              cat "$log"
+              if [[ "$fixture_exit" -eq 0 && "$ax_exit" -eq 0 ]]; then
+                echo "KAISOLA_NATIVE_VISUAL_SURFACE_END=$surface"
+              else
+                echo "KAISOLA_NATIVE_VISUAL_SURFACE_FAIL=$surface fixture=$fixture_exit ax=$ax_exit" >&2
+                return 1
+              fi
+            elif /usr/bin/perl -e '
               $seconds = shift @ARGV;
               alarm $seconds;
               exec @ARGV or die "exec failed: $!\n";
             ' 20 /usr/bin/env \
+              HOME="$profile/home" \
+              CFFIXED_USER_HOME="$profile/home" \
+              TMPDIR="$profile/tmp" \
+              XDG_CONFIG_HOME="$profile/config" \
+              XDG_CACHE_HOME="$profile/cache" \
+              XDG_DATA_HOME="$profile/data" \
               KAISOLA_NATIVE_VISUAL_FIXTURE=1 \
               KAISOLA_NATIVE_VISUAL_SURFACE="$surface" \
-              KAISOLA_NATIVE_VISUAL_WORKSPACE="$GITHUB_WORKSPACE" \
+              KAISOLA_NATIVE_VISUAL_WORKSPACE="$profile/workspace" \
               KAISOLA_NATIVE_VISUAL_CAPTURE_PATH="$capture" \
-              "$@"; then
+              KAISOLA_NATIVE_VISUAL_FEED_BUILD_FLOOR=900000000 \
+              "$@" 2>&1 | tee "$log"; then
+              if [[ "$surface" == terminal-ownership-flap ]]; then
+                node - "$log" <<'NODE'
+          const fs = require('node:fs')
+          const prefix = 'KAISOLA_NATIVE_VISUAL_OWNERSHIP_FLAP='
+          const line = fs.readFileSync(process.argv[2], 'utf8')
+            .split(/\r?\n/u)
+            .find((entry) => entry.startsWith(prefix))
+          if (!line) throw new Error('missing terminal ownership-flap receipt')
+          const receipt = JSON.parse(line.slice(prefix.length))
+          if (receipt.ok !== true
+              || receipt.bytes !== 5 * 1024 * 1024
+              || receipt.sameView !== true
+              || receipt.sameCoordinator !== true
+              || receipt.sameTerminal !== true
+              || receipt.mountedView !== true
+              || receipt.selectionStable !== true
+              || receipt.scrollStable !== true
+              || receipt.cursorStable !== true
+              || receipt.linkStable !== true
+              || receipt.liveFollowStable !== true
+              || receipt.revokedPresentationObserved !== true
+              || receipt.discardNoticeVisible !== true
+              || receipt.discardNoticeRedacted !== true
+              || receipt.additionalReplayStarts !== 0) {
+            throw new Error(`invalid terminal ownership-flap receipt: ${JSON.stringify(receipt)}`)
+          }
+          NODE
+              fi
               echo "KAISOLA_NATIVE_VISUAL_SURFACE_END=$surface"
             else
-              local status="$?"
-              echo "KAISOLA_NATIVE_VISUAL_SURFACE_FAIL=$surface status=$status" >&2
-              return "$status"
+              local fixture_exit="$?"
+              echo "KAISOLA_NATIVE_VISUAL_SURFACE_FAIL=$surface status=$fixture_exit" >&2
+              return "$fixture_exit"
             fi
           }
 
-          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-transcript account-picker attention-completed companion-control mixed permission palette preview preview-narrow preview-code-editor preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file workspace-move topbar topbar-attention mesh onboarding settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-models settings-shortcuts settings-account-recovery usage; do
+          verify_extensions_receipt() {
+            local surface="$1"
+            local log="$2"
+            local receipt ax_log ax_receipt
+            ! grep -F 'KAISOLA_NATIVE_EXTENSIONS_SETTINGS=FAIL' "$log"
+            grep -Fq "KAISOLA_NATIVE_EXTENSIONS_SETTINGS=PASS surface=$surface" "$log"
+            receipt="$(sed -n 's/^KAISOLA_NATIVE_EXTENSIONS_SETTINGS=\({.*}\)$/\1/p' "$log" | tail -n 1)"
+            test -n "$receipt"
+            node -e '
+              const receipt = JSON.parse(process.argv[1]);
+              if (!["settings-extensions", "settings-extensions-narrow"].includes(receipt.surface)
+                  || receipt.categoryCount !== 5
+                  || receipt.itemCount < 5
+                  || receipt.invalidCount !== 1
+                  || !receipt.fixtureUpdaterDisabled
+                  || !receipt.fixtureBrokerIsolated
+                  || receipt.contentHeight < 540
+                  || (receipt.surface === "settings-extensions" && receipt.contentWidth < 1050)
+                  || (receipt.surface === "settings-extensions-narrow"
+                    && (receipt.contentWidth < 800 || receipt.contentWidth > 900))
+                  || !receipt.accessibilityIdentifiers.includes("extensions.hub")
+                  || !receipt.accessibilityLabels.some(label =>
+                    label.toLocaleLowerCase().includes("search extensions"))
+                  || (receipt.surface === "settings-extensions-narrow"
+                    && !receipt.accessibilityLabels.some(label =>
+                      label.toLocaleLowerCase().includes("extension category")))
+                  || receipt.accessibilityLabels.join(" ").toLocaleLowerCase().includes("fixture-secret")) {
+                throw new Error(`invalid extensions receipt: ${process.argv[1]}`);
+              }
+            ' "$receipt"
+            ax_log="${log%.log}.ax.log"
+            ! grep -F 'KAISOLA_NATIVE_EXTENSIONS_AX=FAIL' "$ax_log"
+            grep -Fq "KAISOLA_NATIVE_EXTENSIONS_AX=PASS surface=$surface" "$ax_log"
+            ax_receipt="$(sed -n 's/^KAISOLA_NATIVE_EXTENSIONS_AX=\({.*}\)$/\1/p' "$ax_log" | tail -n 1)"
+            test -n "$ax_receipt"
+            node -e '
+              const receipt = JSON.parse(process.argv[1]);
+              const wide = receipt.surface === "settings-extensions";
+              if (receipt.windowCount !== 1
+                  || receipt.elementCount < 40
+                  || receipt.categoryLabels.length !== 5
+                  || receipt.itemIdentifierCount !== 5
+                  || !receipt.validationIdentifierPresent
+                  || receipt.searchRole !== "AXTextField"
+                  || receipt.commonMetadataFields.length !== 4
+                  || !receipt.secretFree
+                  || (wide && (receipt.categoryNavigationRoles.length !== 5
+                    || receipt.categoryNavigationRoles.some(role => role !== "AXButton")))
+                  || (!wide && (receipt.categoryNavigationRoles.length !== 1
+                    || receipt.categoryNavigationRoles[0] !== "AXPopUpButton"))) {
+                throw new Error(`invalid external AX receipt: ${process.argv[1]}`);
+              }
+            ' "$ax_receipt"
+          }
+
+          optimized_source="$RUNNER_TEMP/kaisola-native-visual/Build/Products/LocalRelease/Kaisola.app"
+          optimized_app="$RUNNER_TEMP/Kaisola Continuous Scroll QA.app"
+          /usr/bin/ditto "$optimized_source" "$optimized_app"
+          optimized_binary="$optimized_app/Contents/MacOS/Kaisola"
+          optimized_info="$optimized_app/Contents/Info.plist"
+          optimized_binary_hash_before="$(shasum -a 256 "$optimized_binary" | awk '{print $1}')"
+          optimized_info_hash_before="$(shasum -a 256 "$optimized_info" | awk '{print $1}')"
+
+          assert_optimized_bundle_unchanged() {
+            test "$(shasum -a 256 "$optimized_binary" | awk '{print $1}')" \
+              = "$optimized_binary_hash_before"
+            test "$(shasum -a 256 "$optimized_info" | awk '{print $1}')" \
+              = "$optimized_info_hash_before"
+          }
+
+          run_optimized_continuous_fixture() {
+            local appearance="$1"
+            local capture="$2"
+            local log="$3"
+            local profile receipt
+            profile="$(mktemp -d "$fixture_profiles/optimized-$appearance.XXXXXX")"
+            mkdir -p "$profile/home" "$profile/tmp" "$profile/workspace"
+            echo "KAISOLA_NATIVE_VISUAL_SURFACE_BEGIN=optimized-$appearance-terminal-continuous-scroll"
+            /usr/bin/perl -e '
+              $seconds = shift @ARGV;
+              alarm $seconds;
+              exec @ARGV or die "exec failed: $!\n";
+            ' 25 /usr/bin/env \
+              HOME="$profile/home" \
+              CFFIXED_USER_HOME="$profile/home" \
+              TMPDIR="$profile/tmp" \
+              KAISOLA_NATIVE_VISUAL_FIXTURE=1 \
+              KAISOLA_NATIVE_VISUAL_SURFACE=terminal-continuous-scroll \
+              KAISOLA_NATIVE_VISUAL_APPEARANCE="$appearance" \
+              KAISOLA_NATIVE_VISUAL_WORKSPACE="$profile/workspace" \
+              KAISOLA_NATIVE_VISUAL_CAPTURE_PATH="$capture" \
+              KAISOLA_NATIVE_VISUAL_FEED_BUILD_FLOOR=900000000 \
+              "$optimized_binary" 2>&1 | tee "$log"
+            ! grep -F 'KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=FAIL' "$log"
+            receipt="$(sed -n 's/^KAISOLA_NATIVE_VISUAL_TERMINAL_CONTINUOUS_SCROLL=PASS //p' "$log" | tail -n 1)"
+            test -n "$receipt"
+            node -e '
+              const receipt = JSON.parse(process.argv[1]);
+              if (!receipt.optimizedBuild
+                  || receipt.scheduledHertz !== 120
+                  || receipt.sampleCount !== 120
+                  || receipt.sampleIntervalCount !== 119
+                  || !Array.isArray(receipt.sampleTimestampsMilliseconds)
+                  || receipt.sampleTimestampsMilliseconds.length !== 120
+                  || Math.abs(receipt.sampleTimestampsMilliseconds[0]) > 0.001
+                  || receipt.sampleTimestampsMilliseconds.some((timestamp, index, values) =>
+                    !Number.isFinite(timestamp) || (index > 0 && timestamp <= values[index - 1]))
+                  || Math.abs(receipt.sampleTimestampsMilliseconds.at(-1)
+                    - receipt.sampleDurationMilliseconds) > 0.001
+                  || receipt.measuredHertz < 80
+                  || receipt.measuredHertz > 145
+                  || receipt.sampleDurationMilliseconds < 800
+                  || receipt.sampleDurationMilliseconds > 1600
+                  || receipt.cadenceP95Milliseconds > 25
+                  || !receipt.viewIdentityPreserved
+                  || !receipt.coordinatorIdentityPreserved
+                  || !receipt.terminalEngineIdentityPreserved
+                  || !receipt.fixtureUpdaterDisabled
+                  || !receipt.fixtureBrokerIsolated
+                  || receipt.fixtureBuildNumber <= receipt.feedBuildFloor) {
+                throw new Error(`invalid optimized receipt: ${process.argv[1]}`);
+              }
+            ' "$receipt"
+            verify_capture "$capture" terminal-continuous-scroll
+            assert_optimized_bundle_unchanged
+            echo "KAISOLA_NATIVE_VISUAL_SURFACE_END=optimized-$appearance-terminal-continuous-scroll"
+          }
+
+          run_optimized_continuous_fixture \
+            light \
+            "$output/terminal-continuous-scroll.png" \
+            "$output/terminal-continuous-scroll.log"
+          run_optimized_continuous_fixture \
+            dark \
+            "$output/dark-terminal-continuous-scroll.png" \
+            "$output/dark-terminal-continuous-scroll.log"
+
+          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-ownership-flap terminal-transcript account-picker attention-completed companion-control mixed permission palette preview preview-narrow preview-code-editor preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file workspace-move topbar topbar-attention mesh onboarding settings settings-minimum settings-ideal settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-extensions settings-extensions-narrow settings-models settings-shortcuts settings-account-recovery usage; do
             capture="$output/$surface.png"
+            log="$output/$surface.log"
+            run_fixture "$surface" "$capture" "$log" "$binary"
+            verify_capture "$capture" "$surface"
+            if [[ "$surface" == settings-extensions || "$surface" == settings-extensions-narrow ]]; then
+              verify_extensions_receipt "$surface" "$log"
+            fi
+          done
+
+          # settings-account-recovery is included because its migration notice
+          # uses an appearance-specific warning palette (issue #310).
+          for surface in terminal terminal-semantic mixed permission palette preview-code-editor workspace-move topbar-attention mesh onboarding settings-minimum settings-ideal settings-terminal settings-extensions settings-shortcuts settings-account-recovery; do
+            capture="$output/dark-$surface.png"
+            log="$output/dark-$surface.log"
+            run_fixture "$surface" "$capture" "$log" \
+              /usr/bin/env KAISOLA_NATIVE_VISUAL_APPEARANCE=dark "$binary"
+            verify_capture "$capture" "$surface"
+            if [[ "$surface" == settings-extensions ]]; then
+              verify_extensions_receipt "$surface" "$log"
+            fi
+          done
+
+          # The traffic-light clearance, the sidebar hairline and a 30pt mark
+          # are all decided at one pixel per point. This runner already renders
+          # near 1x, but the fixture states the scale instead of inheriting it,
+          # so the same inspection holds on a Retina host.
+          for surface in settings-minimum settings-ideal; do
+            capture="$output/nonretina-$surface.png"
             run_fixture "$surface" "$capture" \
-              "$binary" -ApplePersistenceIgnoreState YES
+              /usr/bin/env KAISOLA_NATIVE_VISUAL_SCALE=1 "$binary"
             verify_capture "$capture" "$surface"
           done
 
-          # settings-account-recovery is here as well as in the light pass
-          # because its migration notice is the one piece of small explanatory
-          # text whose palette flips with the appearance (issue #310). A light
-          # capture alone cannot show the dark pair.
-          for surface in terminal terminal-semantic mixed permission palette preview-code-editor workspace-move topbar-attention mesh onboarding settings-terminal settings-shortcuts settings-account-recovery; do
-            capture="$output/dark-$surface.png"
-            run_fixture "$surface" "$capture" \
-              /usr/bin/env KAISOLA_NATIVE_VISUAL_APPEARANCE=dark "$binary"
-            verify_capture "$capture" "$surface"
-          done
+          test "$(shasum -a 256 "$binary" | awk '{print $1}')" = "$binary_hash_before"
+          test "$(shasum -a 256 "$app/Contents/Info.plist" | awk '{print $1}')" = "$info_hash_before"
+          assert_optimized_bundle_unchanged
+          broker_processes_after="$(
+            ps -axo pid=,command= \
+              | grep -E '[s]ession-broker\.cjs|[k]aisola-broker' \
+              || true
+          )"
+          test "$broker_processes_after" = "$broker_processes_before"
+          if find "$fixture_profiles" -type f -name broker.json -print -quit | grep -q .; then
+            echo "KAISOLA_NATIVE_VISUAL_ISOLATION=FAIL broker-metadata-created" >&2
+            exit 1
+          fi
+          echo "KAISOLA_NATIVE_VISUAL_ISOLATION=PASS bundle-hashes=true broker-free=true optimized=true build=$fixture_build"
 
           # Dimension and file-size checks cannot distinguish a real capture
           # from an all-transparent material-backed sheet. Sample visible

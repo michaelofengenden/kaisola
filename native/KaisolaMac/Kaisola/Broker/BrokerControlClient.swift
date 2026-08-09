@@ -20,6 +20,18 @@ enum ControlBrokerMethod: String, CaseIterable, Sendable {
     case controlLease = "terminal.controlLease"
 }
 
+enum TerminalWriteError: Error, Equatable, LocalizedError {
+    case ended
+    case missing
+
+    var errorDescription: String? {
+        switch self {
+        case .ended: "This terminal has ended and cannot accept input."
+        case .missing: "This terminal is no longer available."
+        }
+    }
+}
+
 struct TerminalCreation: Equatable, Sendable {
     let terminalID: String
     let projectID: String
@@ -112,6 +124,11 @@ extension BrokerControlServing {
 /// stays the final authority on every mutation.
 actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     typealias DisconnectHandler = @Sendable (any Error) -> Void
+    private enum ConnectionAccess: String, Equatable {
+        case controller
+        case administrator
+    }
+
     private struct PendingRequest {
         let method: String
         let continuation: CheckedContinuation<JSONValue, any Error>
@@ -137,6 +154,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     private struct ConnectionIdentity: Equatable {
         let info: BrokerInfo
         let ownerID: String
+        let access: ConnectionAccess
     }
 
     private let transport: any BrokerByteTransport
@@ -182,9 +200,29 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     var connectWaiterCount: Int { helloWaiters.count }
 
     func connect(to info: BrokerInfo, ownerID: String) async throws {
+        try await connect(to: info, ownerID: ownerID, access: .controller)
+    }
+
+    /// Administrative control is a distinct authenticated lane. Keeping this
+    /// internal lets the upgrade coordinator request it without exposing it
+    /// through the ordinary terminal-control protocol.
+    func connectForAdministration(to info: BrokerInfo) async throws {
+        try await connect(to: info, ownerID: "0", access: .administrator)
+    }
+
+    private func connect(
+        to info: BrokerInfo,
+        ownerID: String,
+        access: ConnectionAccess
+    ) async throws {
         try info.validate()
-        guard !ownerID.isEmpty else { throw BrokerClientError.requestFailed("controller owner id") }
-        let requested = ConnectionIdentity(info: info, ownerID: ownerID)
+        let ownerIDIsValid = access == .administrator
+            ? ownerID == "0"
+            : !ownerID.isEmpty && ownerID != "0"
+        guard ownerIDIsValid else {
+            throw BrokerClientError.requestFailed("controller owner id")
+        }
+        let requested = ConnectionIdentity(info: info, ownerID: ownerID, access: access)
         if let connectedIdentity {
             // Reusing this lane for a different broker or owner would hand the
             // caller a success it cannot act on: later mutations would still
@@ -208,6 +246,9 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         let encoded: Data
         do {
             try await transport.connect(path: info.socketPath)
+            let requestedFeatures: [JSONValue] = access == .administrator
+                ? [.string(BrokerWire.brokerAdministrationFeature)]
+                : []
             let frame: JSONValue = .object([
                 "type": .string("hello"),
                 "protocol": .integer(Int64(BrokerWire.protocolVersion)),
@@ -217,7 +258,8 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                 // is authorized by project capability rather than instance.
                 "instanceId": .string(connectionInstanceID),
                 "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native"),
-                "access": .string("controller"),
+                "access": .string(access.rawValue),
+                "features": .array(requestedFeatures),
             ])
             encoded = try encode(frame, purpose: .hello)
         } catch {
@@ -324,7 +366,20 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.malformedResponse
         }
         params["data"] = .string(data)
-        _ = try await request(.write, params: .object(params))
+        let result = try await request(.write, params: .object(params))
+        guard let object = result.objectValue,
+              let accepted = object["ok"]?.boolValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        guard accepted else {
+            if object["message"]?.stringValue == "terminal already ended" {
+                throw TerminalWriteError.ended
+            }
+            if object["message"] == nil {
+                throw TerminalWriteError.missing
+            }
+            throw BrokerClientError.requestFailed("terminal.write")
+        }
     }
 
     func resize(projectID: String, terminalID: String, columns: Int, rows: Int) async throws {
@@ -399,7 +454,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.requestFailed("broker helper identity")
         }
         do {
-            try await connect(to: info, ownerID: "0")
+            try await connectForAdministration(to: info)
             guard connectedFeatures.contains(BrokerWire.brokerUpdateFeature) else {
                 throw BrokerClientError.requestFailed("broker sealed update capability")
             }
@@ -442,7 +497,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.requestFailed("broker helper identity")
         }
         do {
-            try await connect(to: info, ownerID: "0")
+            try await connectForAdministration(to: info)
             let result = try await request(
                 "broker.cancelRollingUpdate",
                 params: .object([
@@ -472,7 +527,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.requestFailed("broker helper identity")
         }
         do {
-            try await connect(to: info, ownerID: "0")
+            try await connectForAdministration(to: info)
             let status = try await request(
                 "broker.status",
                 params: .object(["ownerId": .string("0")])
@@ -690,12 +745,42 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         }
         switch type {
         case "hello":
+            guard let info = connectInFlight?.info else { throw BrokerClientError.notConnected }
             guard object["ok"]?.boolValue == true else { throw BrokerClientError.authenticationRejected }
-            guard object["protocol"]?.intValue == Int64(BrokerWire.protocolVersion) else {
+            guard object["protocol"]?.intValue == Int64(info.protocolVersion) else {
                 throw BrokerClientError.protocolMismatch
             }
-            guard object["securityEpoch"]?.intValue == Int64(BrokerWire.securityEpoch) else {
+            guard object["securityEpoch"]?.intValue == Int64(info.securityEpoch) else {
                 throw BrokerClientError.securityEpochMismatch
+            }
+            let advertisedImplementation = object["implementationVersion"]?.intValue
+                .flatMap(Int.init(exactly:))
+            guard BrokerWire.accepts(
+                protocolVersion: info.protocolVersion,
+                securityEpoch: info.securityEpoch,
+                implementationVersion: advertisedImplementation
+            ) else {
+                throw BrokerClientError.implementationMismatch
+            }
+            let implementationVersion = advertisedImplementation ?? 1
+            let packageSchema = object["packageSchema"]?.intValue.flatMap(Int.init(exactly:))
+            let packageVersion = object["packageVersion"]?.stringValue
+            let contentDigest = object["contentDigest"]?.stringValue
+            if let contentDigest,
+               !BrokerHelperPackageVerification.isLowercaseSHA256(contentDigest) {
+                throw BrokerClientError.identityChanged
+            }
+            // The socket path selected the peer and the token authenticated it;
+            // every non-secret immutable field echoed by hello must still bind
+            // that endpoint to the exact BrokerInfo reviewed before connect.
+            guard object["pid"]?.intValue == Int64(info.pid),
+                  object["startedAt"]?.intValue == info.startedAt,
+                  object["version"]?.stringValue == info.version,
+                  info.implementationVersion == nil || info.implementationVersion == implementationVersion,
+                  info.packageSchema == nil || info.packageSchema == packageSchema,
+                  info.packageVersion == nil || info.packageVersion == packageVersion,
+                  info.contentDigest == nil || info.contentDigest == contentDigest else {
+                throw BrokerClientError.identityChanged
             }
             // Control requires a broker modern enough to advertise observation:
             // the same generation that enforces roles server-side. Older live
@@ -703,6 +788,21 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             let features = Set(object["features"]?.arrayValue?.compactMap(\.stringValue) ?? [])
             guard features.contains(BrokerWire.terminalObserveFeature) else {
                 throw BrokerClientError.observeFeatureMissing
+            }
+            guard let expectedIdentity = connectInFlight ?? connectedIdentity,
+                  object["access"]?.stringValue == expectedIdentity.access.rawValue else {
+                throw BrokerClientError.authenticationRejected
+            }
+            let negotiatedFeatures = Set(
+                object["negotiatedFeatures"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            )
+            if expectedIdentity.access == .administrator {
+                guard features.contains(BrokerWire.brokerAdministrationFeature),
+                      negotiatedFeatures.contains(BrokerWire.brokerAdministrationFeature) else {
+                    throw BrokerClientError.authenticationRejected
+                }
+            } else if negotiatedFeatures.contains(BrokerWire.brokerAdministrationFeature) {
+                throw BrokerClientError.authenticationRejected
             }
             connected = true
             connectedFeatures = features

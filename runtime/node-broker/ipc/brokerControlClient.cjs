@@ -53,6 +53,7 @@ function requestBrokerControl(info, {
       token: info.token,
       instanceId: crypto.randomUUID(),
       appVersion,
+      access: 'observer',
     }))
     socket.on('data', (chunk) => {
       buffer += decoder.write(chunk)
@@ -79,12 +80,17 @@ function requestBrokerControl(info, {
         }
         if (!authenticated) {
           if (frame?.type !== 'hello') continue
-          if (!frame.ok || frame.protocol !== protocol) {
+          if (!frame.ok || frame.protocol !== protocol || frame.access !== 'observer') {
             finish(new Error(frame?.message || 'session broker authentication failed'))
             return
           }
           authenticated = true
-          send({ type: 'request', id: requestId, method, params: {} }, method)
+          send({
+            type: 'request',
+            id: requestId,
+            method,
+            params: { ownerId: '0' },
+          }, method)
           continue
         }
         if (frame?.type !== 'response' || frame.id !== requestId) continue

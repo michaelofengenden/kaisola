@@ -5,6 +5,7 @@ const assert = require('node:assert/strict')
 const {
   MAX_FRAME,
   TERMINAL_HISTORY_PAGE_BYTES,
+  BROKER_INVENTORY_RESPONSE_BYTES,
   HELLO_FRAME_BYTES,
   DEFAULT_REQUEST_FRAME_BYTES,
   DEFAULT_RESPONSE_FRAME_BYTES,
@@ -18,6 +19,7 @@ const {
 test('method frame limits stay below the global transport ceiling', () => {
   assert.equal(MAX_FRAME, 56 * 1024 * 1024)
   assert.equal(TERMINAL_HISTORY_PAGE_BYTES, 4 * 1024 * 1024)
+  assert.equal(BROKER_INVENTORY_RESPONSE_BYTES, 12 * 1024 * 1024)
   assert.equal(HELLO_FRAME_BYTES, 64 * 1024)
   assert.equal(DEFAULT_REQUEST_FRAME_BYTES, 64 * 1024)
   assert.equal(DEFAULT_RESPONSE_FRAME_BYTES, 256 * 1024)
@@ -27,6 +29,7 @@ test('method frame limits stay below the global transport ceiling', () => {
   assert.equal(maximumEncodedFrameBytes({ type: 'response', method: 'terminal.attach' }), 50 * 1024 * 1024)
   assert.equal(maximumEncodedFrameBytes({ type: 'response', method: 'terminal.history' }), 26 * 1024 * 1024)
   assert.equal(maximumEncodedFrameBytes({ type: 'response', method: 'broker.status' }), 4 * 1024 * 1024)
+  assert.equal(maximumEncodedFrameBytes({ type: 'response', method: 'broker.inventory' }), 12 * 1024 * 1024)
   assert.equal(maximumEncodedFrameBytes({ type: 'response', method: 'terminal.resize' }), 256 * 1024)
   assert.equal(maximumEncodedFrameBytes({ type: 'event', channel: 'terminal:observer-output' }), 512 * 1024)
   assert.equal(maximumEncodedFrameBytes({ type: 'event', channel: 'terminal:observer-exit' }), 64 * 1024)

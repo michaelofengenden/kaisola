@@ -15,8 +15,11 @@ final class BrokerWireTests: XCTestCase {
         XCTAssertEqual(BrokerWire.observerRoleFeature, "observer-role-v1")
         XCTAssertEqual(BrokerWire.brokerUpdateFeature, "broker-update-v1")
         XCTAssertEqual(BrokerWire.brokerRollingUpdateFeature, "broker-rolling-update-v1")
+        XCTAssertEqual(BrokerWire.brokerInventoryFeature, "broker-inventory-v1")
+        XCTAssertEqual(BrokerWire.brokerAdministrationFeature, "broker-administration-v1")
         XCTAssertEqual(BrokerWire.observerMethods, [
             "broker.status",
+            "broker.inventory",
             "terminal.list",
             "terminal.diagnostics",
             "terminal.history",
@@ -32,6 +35,7 @@ final class BrokerWireTests: XCTestCase {
         XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .response("terminal.attach")), 50 * 1_024 * 1_024)
         XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .response("terminal.history")), 26 * 1_024 * 1_024)
         XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .response("broker.status")), 4 * 1_024 * 1_024)
+        XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .response("broker.inventory")), 12 * 1_024 * 1_024)
         XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .response("terminal.resize")), 256 * 1_024)
         XCTAssertEqual(
             BrokerWire.maximumEncodedBytes(for: .event("terminal:observer-output")),

@@ -655,12 +655,9 @@ final class AcpClientTests: XCTestCase {
             return false
         })
 
-        // set_config_option round-trips the adapter's normalized option set.
-        await client.setConfigOption(id: "reasoning_effort", value: "high")
-        XCTAssertTrue(collector.events.contains { event in
-            if case let .configOptions(options) = event { return options.first?.currentValue == "high" }
-            return false
-        })
+        // set_config_option returns the adapter-confirmed normalized option set.
+        let confirmed = try await client.setConfigOption(id: "reasoning_effort", value: "high")
+        XCTAssertEqual(confirmed.first?.currentValue, "high")
     }
 
     @MainActor

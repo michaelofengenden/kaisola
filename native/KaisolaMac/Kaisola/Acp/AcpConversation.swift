@@ -144,6 +144,10 @@ final class AcpConversation: ObservableObject {
     @Published private(set) var modes: [AcpSessionInfo.Mode] = []
     @Published private(set) var currentModeID: String?
     @Published private(set) var configOptions: [AcpConfigOption] = []
+    /// The one adapter-owned setting currently awaiting confirmation. Keeping
+    /// the prior value visible until this clears prevents a rejected effort
+    /// level from masquerading as the value the next prompt will use.
+    @Published private(set) var pendingConfigOptionID: String?
     @Published private(set) var commands: [AcpCommand] = []
     /// Whether this adapter advertised `_session/steering` at `initialize`.
     /// Reset on every connect so a swapped agent can never inherit the previous
@@ -299,6 +303,11 @@ final class AcpConversation: ObservableObject {
     private var attachmentCounter = 0
     private var draftPersistenceTask: Task<Void, Never>?
     private var pendingDraftPersistence: String?
+    /// Fences a late setting response after stop, restart, or adapter exit.
+    private var configOptionRequestGeneration: UInt64 = 0
+    /// Lets a later successful retry clear only the failure this setting path
+    /// published, without erasing an unrelated turn or reconnect notice.
+    private var lastConfigOptionFailureMessage: String?
     /// ACP adapters may issue several permission requests before the user has
     /// answered the first. Keep one visible request and preserve the remainder
     /// in arrival order instead of replacing the on-screen card.
@@ -373,6 +382,7 @@ final class AcpConversation: ObservableObject {
     func start(resumeQueuedPrompts: Bool = false) async {
         guard !hasStarted else { return }
         hasStarted = true
+        invalidateConfigOptionRequest()
         // One ordered pipe from the client's (off-main) event handler to the
         // MainActor consumer: yields preserve order, and a single draining task
         // consumes them serially. The handler captures the continuation (not
@@ -405,6 +415,7 @@ final class AcpConversation: ObservableObject {
             supportsSteering = info.supportsSteering
             isConnected = true
             statusMessage = nil
+            lastConfigOptionFailureMessage = nil
             // Only entries still in `queued` are known never to have been
             // dispatched. An explicit adapter restart resumes them; ordinary
             // app restoration leaves them paused until the user chooses Resume
@@ -431,6 +442,7 @@ final class AcpConversation: ObservableObject {
     /// offered back through ACP load/resume negotiation when supported.
     func restart() async {
         guard canRestart else { return }
+        invalidateConfigOptionRequest()
         isReconnecting = true
         statusMessage = "Restarting agent…"
         eventContinuation?.finish()
@@ -774,13 +786,46 @@ final class AcpConversation: ObservableObject {
         Task { await client.setMode(id) }
     }
 
-    /// Set an adapter config option (effort level etc.); the client re-emits the
-    /// adapter's normalized option set, which `consume` applies.
+    /// Set an adapter config option (effort level etc.) transactionally.
+    ///
+    /// The adapter's last confirmed value remains on screen while the request
+    /// is in flight. Only the returned option set may replace it; a rejection
+    /// leaves the draft, transcript, running turn, and confirmed value intact.
+    /// One request at a time also makes response order unambiguous.
     func selectConfigOption(_ id: String, value: String) {
-        if let index = configOptions.firstIndex(where: { $0.id == id }) {
-            configOptions[index].currentValue = value   // optimistic
+        guard isConnected, pendingConfigOptionID == nil,
+              let option = configOptions.first(where: { $0.id == id }),
+              option.currentValue != value,
+              let choice = option.choices.first(where: { $0.value == value }) else { return }
+
+        configOptionRequestGeneration &+= 1
+        let generation = configOptionRequestGeneration
+        pendingConfigOptionID = id
+        let requestClient = client
+        Task { [weak self] in
+            do {
+                let confirmed = try await requestClient.setConfigOption(id: id, value: value)
+                guard let self, self.configOptionRequestGeneration == generation else { return }
+                self.pendingConfigOptionID = nil
+                self.configOptions = confirmed
+                if self.statusMessage == self.lastConfigOptionFailureMessage {
+                    self.statusMessage = nil
+                }
+                self.lastConfigOptionFailureMessage = nil
+            } catch {
+                guard let self, self.configOptionRequestGeneration == generation else { return }
+                self.pendingConfigOptionID = nil
+                let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                let message = "Couldn’t change \(option.name) to \(choice.name). \(detail)"
+                self.lastConfigOptionFailureMessage = message
+                self.statusMessage = message
+            }
         }
-        Task { await client.setConfigOption(id: id, value: value) }
+    }
+
+    private func invalidateConfigOptionRequest() {
+        configOptionRequestGeneration &+= 1
+        pendingConfigOptionID = nil
     }
 
     func answerPermission(_ optionID: String) {
@@ -908,6 +953,7 @@ final class AcpConversation: ObservableObject {
     /// debounced composer value lets the window owner durably save it before
     /// AppKit receives the quit reply.
     func stop() async -> String? {
+        invalidateConfigOptionRequest()
         draftPersistenceTask?.cancel()
         draftPersistenceTask = nil
         let finalDraft = pendingDraftPersistence
@@ -1218,6 +1264,7 @@ final class AcpConversation: ObservableObject {
             // Leave the queue intact on error — auto-dispatching into a failing
             // agent would loop; the user can retry or clear it.
         case let .exited(code):
+            invalidateConfigOptionRequest()
             flushPendingChunk()
             isConnected = false
             isRunning = false

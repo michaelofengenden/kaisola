@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import Kaisola
 
@@ -612,6 +613,123 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertEqual(store.profiles().map(\.label), ["Work"])
     }
 
+    func testUsageAccountStoreRemovesTemporaryFileWhenInstallationFails() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("usage-accounts.json")
+        let store = UsageAccountStore(
+            fileURL: fileURL,
+            installTemporary: { temporary, destination in
+                XCTAssertEqual(destination, fileURL)
+                XCTAssertTrue(
+                    FileManager.default.fileExists(atPath: temporary.path),
+                    "fault injection must happen after the exact temporary file exists"
+                )
+                throw UsageAccountInstallFailure.injected
+            }
+        )
+
+        XCTAssertNil(store.add(
+            provider: .codex,
+            label: "Failure fixture",
+            directory: "~/.codex-failure-fixture"
+        ))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+
+        let prefix = ".\(fileURL.lastPathComponent)."
+        let entries = try FileManager.default.contentsOfDirectory(atPath: directory.path)
+        let orphanedTemporaryFiles = entries.filter { name in
+            guard name.hasPrefix(prefix) else { return false }
+            return UUID(uuidString: String(name.dropFirst(prefix.count))) != nil
+        }
+        XCTAssertEqual(orphanedTemporaryFiles, [])
+    }
+
+    func testUsageAccountStoreKeepsEveryAccountWhenIndependentInstancesWriteAtOnce() {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("usage-accounts.json")
+        let writers = 12
+
+        // Twelve windows adding at the same moment, each through its own store
+        // value the way a second Settings window would.
+        let adding = DispatchGroup()
+        let added = UsageAccountConcurrencyProbe()
+        for index in 0..<writers {
+            DispatchQueue.global().async(group: adding) {
+                let profile = UsageAccountStore(fileURL: fileURL).add(
+                    provider: .claude,
+                    label: "Account \(index)",
+                    directory: "~/.claude-account-\(index)"
+                )
+                if let profile { added.record(profile.id) }
+            }
+        }
+        XCTAssertEqual(adding.wait(timeout: .now() + 30), .success)
+
+        let store = UsageAccountStore(fileURL: fileURL)
+        XCTAssertEqual(added.ids.count, writers, "every add reported success")
+        XCTAssertEqual(
+            Set(store.profiles().map(\.label)),
+            Set((0..<writers).map { "Account \($0)" }),
+            "a concurrent add must not erase an account it never saw"
+        )
+
+        // The same in the other direction: overlapping removals must not
+        // resurrect an account another window already deleted.
+        let removing = DispatchGroup()
+        for id in added.ids {
+            DispatchQueue.global().async(group: removing) {
+                _ = UsageAccountStore(fileURL: fileURL).remove(id: id)
+            }
+        }
+        XCTAssertEqual(removing.wait(timeout: .now() + 30), .success)
+        XCTAssertEqual(store.profiles(), [])
+    }
+
+    func testUsageAccountStoreAddWaitsWhileAnotherWriterHoldsTheRegistryLock() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-profiles-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("usage-accounts.json")
+        let store = UsageAccountStore(fileURL: fileURL)
+
+        // Stand in for a window that is mid-write: hold the registry's advisory
+        // lock exactly as a mutation does, so the add below has to wait on it.
+        let descriptor = open(store.lockURL.path, O_RDWR | O_CREAT, 0o600)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        XCTAssertEqual(flock(descriptor, LOCK_EX | LOCK_NB), 0)
+
+        let started = DispatchSemaphore(value: 0)
+        let finished = DispatchSemaphore(value: 0)
+        let probe = UsageAccountConcurrencyProbe()
+        DispatchQueue.global().async {
+            started.signal()
+            let profile = UsageAccountStore(fileURL: fileURL).add(
+                provider: .claude,
+                label: "Second window",
+                directory: "~/.claude-second"
+            )
+            if let profile { probe.record(profile.id) }
+            probe.markFinished()
+            finished.signal()
+        }
+
+        XCTAssertEqual(started.wait(timeout: .now() + 5), .success)
+        Thread.sleep(forTimeInterval: 0.4)
+        XCTAssertFalse(probe.isFinished, "an add must not land while another writer holds the lock")
+
+        XCTAssertEqual(flock(descriptor, LOCK_UN), 0)
+        Darwin.close(descriptor)
+
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success)
+        XCTAssertEqual(probe.ids.count, 1, "the waiting add lands once the lock is free")
+        XCTAssertEqual(store.profiles().map(\.label), ["Second window"])
+    }
+
     func testUsageAccountStoreSuggestedDirectoriesMatchProviderIsolation() {
         XCTAssertEqual(
             UsageAccountStore.suggestedDirectory(provider: .claude, label: "Research Team"),
@@ -858,6 +976,34 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertEqual(reading?.level, .critical)
         XCTAssertEqual(reading?.accessibilityLabel, "Claude plan usage, 91 percent of 5-hour used")
         XCTAssertEqual(reading?.help, "Claude · 5-hour 91% used — open Usage settings")
+    }
+}
+
+private enum UsageAccountInstallFailure: Error {
+    case injected
+}
+
+/// Collects what background writers did to the account registry, so the
+/// concurrency tests can assert from the main thread without racing them.
+private final class UsageAccountConcurrencyProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [String] = []
+    private var finished = false
+
+    var ids: [String] {
+        lock.withLock { recorded }
+    }
+
+    var isFinished: Bool {
+        lock.withLock { finished }
+    }
+
+    func record(_ id: String) {
+        lock.withLock { recorded.append(id) }
+    }
+
+    func markFinished() {
+        lock.withLock { finished = true }
     }
 }
 

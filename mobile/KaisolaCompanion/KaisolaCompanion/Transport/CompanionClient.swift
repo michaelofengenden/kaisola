@@ -4,11 +4,13 @@ import Foundation
 
 enum CompanionCommandError: LocalizedError, Equatable {
     case unavailable
+    case capabilityDenied
     case timedOut
 
     var errorDescription: String? {
         switch self {
         case .unavailable: "The Mac disconnected before confirming this action. It was not retried."
+        case .capabilityDenied: "This action is not enabled for this iPhone. Refresh access on the Mac and try again."
         case .timedOut: "The Mac did not confirm this action in time. It was not retried."
         }
     }
@@ -24,6 +26,7 @@ final class CompanionClient: ObservableObject {
     @Published private(set) var sas: CompanionSAS?
     @Published private(set) var lastError: String?
     @Published private(set) var pairedDesktop: CompanionPairedDesktop?
+    @Published private(set) var grantedCapabilities: Set<CompanionCapability> = []
 
     var onEnvelope: ((SessionAuthority, CompanionEnvelope) -> Void)?
     var onTransportState: ((SessionAuthority?, CompanionTransportState) -> Void)?
@@ -62,7 +65,11 @@ final class CompanionClient: ObservableObject {
     private var activeStreamSubscriptions: Set<StreamSubscription> = []
     private var streamSubscriptionTasks: [StreamSubscription: Task<Void, Never>] = [:]
     private var streamSubscriptionGenerations: [StreamSubscription: Int] = [:]
-    private var pendingCommands: [String: CheckedContinuation<CompanionReceiptBody, Error>] = [:]
+    private struct PendingCommand {
+        let capability: CompanionCapability
+        let continuation: CheckedContinuation<CompanionReceiptBody, Error>
+    }
+    private var pendingCommands: [String: PendingCommand] = [:]
     private var commandTimeouts: [String: Task<Void, Never>] = [:]
     private var sessionGeneration: UInt64 = 0
 
@@ -85,6 +92,7 @@ final class CompanionClient: ObservableObject {
             if state != .live {
                 self.resetActiveStreamSubscriptions()
                 self.failPendingCommands(with: CompanionCommandError.unavailable)
+                self.replaceGrantedCapabilities([])
             }
             if state == .handshaking, case .resume = self.mode {
                 do { try self.startHandshake() } catch { self.fail(error) }
@@ -181,7 +189,8 @@ final class CompanionClient: ObservableObject {
             // down. Skipping that no-op removes the recurring “already
             // unsubscribed” receipt while keeping real teardown exact.
             guard wasActive else { return }
-            guard transport.state == .live else { return }
+            guard transport.state == .live,
+                  grantedCapabilities.contains(.observe) else { return }
             try sendStreamSubscription(subscription, subscribed: false)
         }
     }
@@ -189,6 +198,7 @@ final class CompanionClient: ObservableObject {
     private func startStreamSubscription(_ subscription: StreamSubscription) {
         guard transport.state == .live,
               let sessionAuthority = currentSessionAuthority,
+              grantedCapabilities.contains(.observe),
               desiredStreamSubscriptions.contains(subscription),
               !activeStreamSubscriptions.contains(subscription),
               streamSubscriptionTasks[subscription] == nil else { return }
@@ -302,6 +312,13 @@ final class CompanionClient: ObservableObject {
         timeout: Duration = .seconds(15)
     ) async throws -> CompanionReceiptBody {
         guard transport.state == .live else { throw CompanionCommandError.unavailable }
+        guard CompanionCapabilityPolicy.allowsCommand(
+            type: type,
+            claimedCapability: capability,
+            grantedCapabilities: grantedCapabilities
+        ) else {
+            throw CompanionCommandError.capabilityDenied
+        }
         let commandId = "cmd-\(UUID().uuidString.lowercased())"
         let body = CompanionCommandBody(
             type: type,
@@ -314,7 +331,10 @@ final class CompanionClient: ObservableObject {
         )
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
-                pendingCommands[commandId] = continuation
+                pendingCommands[commandId] = PendingCommand(
+                    capability: capability,
+                    continuation: continuation
+                )
                 commandTimeouts[commandId] = Task { @MainActor [weak self] in
                     try? await Task.sleep(for: timeout)
                     guard !Task.isCancelled else { return }
@@ -386,6 +406,7 @@ final class CompanionClient: ObservableObject {
         sessionId = nil
         localSASConfirmed = false
         remoteSASConfirmed = false
+        replaceGrantedCapabilities([])
         // Each connection learns its epoch afresh from the first inbound frame.
         liveEpoch = nil
 
@@ -628,9 +649,12 @@ final class CompanionClient: ObservableObject {
         // First inbound frame on this connection tells us the desktop's current
         // epoch. Adopt it for outbound commands and only now fire the deferred
         // stream subscriptions, so they can never carry a stale (rejected) epoch.
-        if liveEpoch == nil {
+        let isFirstApplicationFrame = liveEpoch == nil
+        if isFirstApplicationFrame {
+            guard envelope.kind == .hello else {
+                throw CompanionCryptoError.authenticationFailed
+            }
             liveEpoch = envelope.epoch
-            flushDesiredStreamSubscriptions()
         }
         if envelope.kind == .hello {
             let hello = try envelope.body.decode(CompanionHelloBody.self)
@@ -643,7 +667,7 @@ final class CompanionClient: ObservableObject {
             if let transportHint = hello.transportHint {
                 try transportHint.validate()
             }
-            if let authority = currentSessionAuthority { onCapabilities?(authority, granted) }
+            replaceGrantedCapabilities(granted)
             if let current = pairedDesktop {
                 let updated = CompanionPairedDesktop(
                     desktopId: current.desktopId,
@@ -659,6 +683,7 @@ final class CompanionClient: ObservableObject {
                     onPairedDesktop?(authority, updated)
                 }
             }
+            if isFirstApplicationFrame { flushDesiredStreamSubscriptions() }
         } else if envelope.kind == .receipt {
             let receipt = try envelope.body.decode(CompanionReceiptBody.self)
             finishCommand(receipt.commandId, result: .success(receipt))
@@ -691,6 +716,7 @@ final class CompanionClient: ObservableObject {
     private func clearSessionAuthority() {
         sessionGeneration &+= 1
         failPendingCommands(with: CompanionCommandError.unavailable)
+        grantedCapabilities.removeAll()
         desiredStreamSubscriptions.removeAll()
         resetActiveStreamSubscriptions()
         ackCursor = nil
@@ -710,17 +736,32 @@ final class CompanionClient: ObservableObject {
     }
 
     private func finishCommand(_ commandId: String, result: Result<CompanionReceiptBody, Error>) {
-        guard let continuation = pendingCommands.removeValue(forKey: commandId) else { return }
+        guard let pending = pendingCommands.removeValue(forKey: commandId) else { return }
         commandTimeouts.removeValue(forKey: commandId)?.cancel()
         switch result {
-        case let .success(receipt): continuation.resume(returning: receipt)
-        case let .failure(error): continuation.resume(throwing: error)
+        case let .success(receipt): pending.continuation.resume(returning: receipt)
+        case let .failure(error): pending.continuation.resume(throwing: error)
         }
     }
 
     private func failPendingCommands(with error: Error) {
         for commandId in Array(pendingCommands.keys) {
             finishCommand(commandId, result: .failure(error))
+        }
+    }
+
+    private func replaceGrantedCapabilities(
+        _ capabilities: Set<CompanionCapability>
+    ) {
+        let removed = grantedCapabilities.subtracting(capabilities)
+        grantedCapabilities = capabilities
+        if let authority = currentSessionAuthority {
+            onCapabilities?(authority, capabilities)
+        }
+        guard !removed.isEmpty else { return }
+        for (commandId, pending) in Array(pendingCommands)
+        where removed.contains(pending.capability) {
+            finishCommand(commandId, result: .failure(CompanionCommandError.capabilityDenied))
         }
     }
 

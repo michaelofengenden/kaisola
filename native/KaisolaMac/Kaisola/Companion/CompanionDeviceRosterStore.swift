@@ -158,6 +158,26 @@ actor CompanionDeviceRosterStore {
         catch { devicesByID[id] = previous; throw error }
     }
 
+    @discardableResult
+    func updateCapabilities(
+        _ capabilities: [CompanionCapability],
+        for id: String
+    ) throws -> CompanionPairedDeviceRecord {
+        guard var record = devicesByID[id] else {
+            throw CompanionDeviceRosterError.unknownDevice
+        }
+        let previous = record
+        record.capabilities = capabilities
+        record = try Self.normalizedRecord(record, accountScope: accountScope)
+        devicesByID[id] = record
+        do { try persist() }
+        catch {
+            devicesByID[id] = previous
+            throw error
+        }
+        return record
+    }
+
     /// Resume authorization and last-seen persistence are one actor-isolated
     /// operation. A revocation cannot slip between a successful markSeen and a
     /// second lookup that falls back to a stale in-memory handshake record.

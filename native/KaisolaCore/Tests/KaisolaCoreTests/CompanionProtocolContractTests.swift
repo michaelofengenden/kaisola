@@ -16,6 +16,177 @@ final class CompanionProtocolContractTests: XCTestCase {
         "terminal-control-receipt",
     ]
 
+    func testCapabilityPolicyCoversEveryCommandSnapshotEventAndProjectionField() {
+        let fullGrant = Set(CompanionCapability.allCases)
+        for (type, required) in CompanionEnvelope.commandCapabilities {
+            XCTAssertTrue(
+                CompanionCapabilityPolicy.allowsCommand(
+                    type: type,
+                    claimedCapability: required,
+                    grantedCapabilities: fullGrant
+                ),
+                "\(type) must be accepted with its declared capability"
+            )
+            let lowerGrant = fullGrant.subtracting([required])
+            XCTAssertFalse(
+                CompanionCapabilityPolicy.allowsCommand(
+                    type: type,
+                    claimedCapability: required,
+                    grantedCapabilities: lowerGrant
+                ),
+                "\(type) must be rejected without \(required.rawValue)"
+            )
+        }
+        XCTAssertFalse(CompanionCapabilityPolicy.allowsCommand(
+            type: "terminal.write",
+            claimedCapability: .agentControl,
+            grantedCapabilities: fullGrant
+        ))
+        XCTAssertFalse(CompanionCapabilityPolicy.allowsCommand(
+            type: "unknown.command",
+            claimedCapability: .observe,
+            grantedCapabilities: fullGrant
+        ))
+
+        for type in CompanionCapabilityPolicy.snapshotCapabilities.keys {
+            XCTAssertTrue(CompanionCapabilityPolicy.allowsOutbound(
+                kind: .snapshot,
+                bodyType: type,
+                grantedCapabilities: [.observe]
+            ))
+            XCTAssertFalse(CompanionCapabilityPolicy.allowsOutbound(
+                kind: .snapshot,
+                bodyType: type,
+                grantedCapabilities: []
+            ))
+        }
+        for type in CompanionCapabilityPolicy.eventCapabilities.keys {
+            XCTAssertTrue(CompanionCapabilityPolicy.allowsOutbound(
+                kind: .event,
+                bodyType: type,
+                grantedCapabilities: [.observe]
+            ))
+            XCTAssertFalse(CompanionCapabilityPolicy.allowsOutbound(
+                kind: .event,
+                bodyType: type,
+                grantedCapabilities: []
+            ))
+        }
+
+        XCTAssertEqual(CompanionCapabilityPolicy.projectionFields["projection"], [
+            "projectionKind", "revision", "generatedAt", "freshness",
+            "projects", "sessions", "attention", "permissions", "board",
+        ])
+        XCTAssertEqual(CompanionCapabilityPolicy.projectionFields["project"], [
+            "id", "name", "connection", "lastContactAt", "counts",
+        ])
+        XCTAssertEqual(CompanionCapabilityPolicy.projectionFields["projectCounts"], [
+            "running", "waiting", "done", "failed",
+        ])
+        XCTAssertEqual(CompanionCapabilityPolicy.projectionFields["session"], [
+            "id", "projectId", "kind", "title", "status", "needsYou", "unread",
+            "updatedAt", "completedAt", "provider", "startedAt",
+            "terminalStreamEpoch", "terminalEndOffset",
+        ])
+        XCTAssertEqual(CompanionCapabilityPolicy.projectionFields["attention"], [
+            "id", "projectId", "sessionId", "kind", "title", "detail", "createdAt", "severity",
+        ])
+        XCTAssertEqual(CompanionCapabilityPolicy.projectionFields["permission"], [
+            "permId", "projectId", "sessionId", "agent", "title", "kind", "requestedAt",
+            "options", "diffs", "revision", "completeness",
+        ])
+        XCTAssertEqual(CompanionCapabilityPolicy.projectionFields["permissionOption"], [
+            "id", "label",
+        ])
+        XCTAssertEqual(CompanionCapabilityPolicy.projectionFields["permissionDiff"], [
+            "relativePath", "oldText", "newText",
+        ])
+        XCTAssertEqual(CompanionCapabilityPolicy.projectionFields["board"], ["columns"])
+        XCTAssertEqual(CompanionCapabilityPolicy.projectionFields["boardColumn"], [
+            "id", "title", "sourceLabel", "count", "cards",
+        ])
+        XCTAssertEqual(CompanionCapabilityPolicy.projectionFields["boardCard"], [
+            "id", "type", "projectId", "title", "status", "needsYou", "updatedAt", "provider",
+        ])
+    }
+
+    func testCapabilityPolicySanitizesProjectionBeforeTransport() throws {
+        let projection = CompanionProjection(
+            projectionKind: "kaisola.companion.projection",
+            revision: 7,
+            generatedAt: 100,
+            freshness: "live",
+            projects: [CompanionProject(
+                id: "project-1",
+                name: "Kaisola",
+                repo: "/Users/private/secret",
+                branch: "private-branch",
+                connection: "live",
+                lastContactAt: 100,
+                counts: .zero,
+                windowId: "window-private",
+                windowName: "Private Window"
+            )],
+            sessions: [CompanionSession(
+                id: "session-1",
+                projectId: "project-1",
+                kind: .agent,
+                title: "Agent",
+                status: .running,
+                updatedAt: 100,
+                provider: "Codex",
+                model: "private-model",
+                mode: "private-mode",
+                branch: "private-branch",
+                summary: "private-summary",
+                turns: [CompanionTurn(role: .assistant, text: "private-turn")],
+                terminalLines: ["private-line"],
+                terminalOutput: "private-output",
+                windowId: "window-private"
+            )],
+            attention: [],
+            permissions: [],
+            board: CompanionBoard(columns: [CompanionBoardColumn(
+                id: "running",
+                title: "Running",
+                count: 1,
+                cards: [CompanionBoardCard(
+                    id: "session-1",
+                    type: "session",
+                    projectId: "project-1",
+                    title: "Agent",
+                    status: .running,
+                    needsYou: false,
+                    updatedAt: 100,
+                    provider: "Codex",
+                    summary: "private-board-summary"
+                )]
+            )])
+        )
+
+        XCTAssertNil(CompanionCapabilityPolicy.sanitizedProjection(
+            projection,
+            grantedCapabilities: []
+        ))
+        let sanitized = try XCTUnwrap(CompanionCapabilityPolicy.sanitizedProjection(
+            projection,
+            grantedCapabilities: [.observe]
+        ))
+        XCTAssertNil(sanitized.projects[0].repo)
+        XCTAssertNil(sanitized.projects[0].branch)
+        XCTAssertNil(sanitized.projects[0].windowId)
+        XCTAssertNil(sanitized.projects[0].windowName)
+        XCTAssertNil(sanitized.sessions[0].model)
+        XCTAssertNil(sanitized.sessions[0].mode)
+        XCTAssertNil(sanitized.sessions[0].branch)
+        XCTAssertNil(sanitized.sessions[0].summary)
+        XCTAssertNil(sanitized.sessions[0].turns)
+        XCTAssertNil(sanitized.sessions[0].terminalLines)
+        XCTAssertNil(sanitized.sessions[0].terminalOutput)
+        XCTAssertNil(sanitized.sessions[0].windowId)
+        XCTAssertNil(sanitized.board.columns[0].cards[0].summary)
+    }
+
     func testCheckedInNodeFixturesRoundTripWithoutSemanticDrift() throws {
         for name in validEnvelopeFixtures {
             let original = try fixtureData(name)

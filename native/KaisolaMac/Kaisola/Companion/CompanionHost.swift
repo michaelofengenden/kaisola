@@ -102,6 +102,12 @@ final class CompanionHost: ObservableObject {
         let tokenProvider: CompanionLinkClient.TokenProvider
     }
 
+    private struct ConnectionCapabilityAuthority: Equatable {
+        let deviceID: String
+        let capabilities: Set<CompanionCapability>
+        let generation: UInt64
+    }
+
     static let shared = CompanionHost()
     private static let enabledDefaultsKey = "companion.nativeHostEnabled"
 
@@ -132,6 +138,9 @@ final class CompanionHost: ObservableObject {
     private var activeAccountScope: CompanionAccountScope?
     private var connections: [String: any CompanionHostConnection] = [:]
     private var deviceConnections: [String: String] = [:]
+    private var connectionAuthorities: [String: ConnectionCapabilityAuthority] = [:]
+    private var pendingCapabilityUpdates: [String: Set<CompanionCapability>] = [:]
+    private var nextAuthorityGeneration: UInt64 = 1
     private var liveConnectionIDs: Set<String> = []
     private var synchronizationTasks: [String: Task<Bool, Never>] = [:]
     private var synchronizationTokens: [String: UUID] = [:]
@@ -390,7 +399,10 @@ final class CompanionHost: ObservableObject {
         }
     }
 
-    func createPairingOffer(allowsTerminalControl: Bool) async throws {
+    func createPairingOffer(
+        allowsAgentControl: Bool,
+        allowsTerminalControl: Bool
+    ) async throws {
         guard case let .ready(port) = state, let coordinator,
               let accountScope = activeAccountScope else {
             throw CompanionWireError.connectionUnavailable
@@ -404,9 +416,10 @@ final class CompanionHost: ObservableObject {
             }
         }
         pairingPhrase = nil
-        let capabilities: [CompanionCapability] = allowsTerminalControl
-            ? [.observe, .terminalControl]
-            : [.observe]
+        var selected: Set<CompanionCapability> = [.observe]
+        if allowsAgentControl { selected.insert(.agentControl) }
+        if allowsTerminalControl { selected.insert(.terminalControl) }
+        let capabilities = CompanionCapability.allCases.filter(selected.contains)
         let payload = try await coordinator.createOffer(
             listenerPort: port,
             requestedCapabilities: capabilities,
@@ -462,9 +475,12 @@ final class CompanionHost: ObservableObject {
         let generation = hostGeneration
         let streamHub = terminalStreamHubInstance
         let terminalControl = self.terminalControl
-        // Seal authority before the first await. This is the revocation
-        // linearization point for both transports and every queued command.
+        // Seal both revocation and capability authority before the first await.
+        // This is the linearization point for every transport and queued command.
         var revokedConnectionIDs = Set(revocationFence.revoke(deviceID: deviceID))
+        revokedConnectionIDs.formUnion(connectionAuthorities.compactMap { connectionID, authority in
+            authority.deviceID == deviceID ? connectionID : nil
+        })
         if let mapped = deviceConnections.removeValue(forKey: deviceID) {
             revokedConnectionIDs.insert(mapped)
         }
@@ -475,6 +491,7 @@ final class CompanionHost: ObservableObject {
             synchronizationTasks.removeValue(forKey: connectionID)?.cancel()
             synchronizationTokens.removeValue(forKey: connectionID)
             liveConnectionIDs.remove(connectionID)
+            connectionAuthorities.removeValue(forKey: connectionID)
         }
         let revokedConnections = revokedConnectionIDs.compactMap { connectionID in
             connections.removeValue(forKey: connectionID).map { (connectionID, $0) }
@@ -490,6 +507,120 @@ final class CompanionHost: ObservableObject {
             await connection.close(reason: "device_revoked")
         }
         await refreshDevices(using: roster, generation: generation)
+    }
+
+    /// Persist a new per-device grant and apply it to every authenticated route.
+    /// Removed authority is fenced synchronously before any actor or transport
+    /// await. Added authority is exposed only after the connection has adopted
+    /// it and delivered a replacement desktop hello.
+    func updateCapabilities(
+        deviceID: String,
+        capabilities: [CompanionCapability]
+    ) async throws {
+        guard let roster else { throw CompanionWireError.connectionUnavailable }
+        let hostGeneration = self.hostGeneration
+        let streamHub = terminalStreamHubInstance
+        let terminalControl = self.terminalControl
+        let desired = Set(capabilities)
+        guard desired.contains(.observe), desired.count == capabilities.count,
+              pendingCapabilityUpdates[deviceID] == nil else {
+            throw CompanionWireError.connectionUnavailable
+        }
+        pendingCapabilityUpdates[deviceID] = desired
+        defer {
+            if isCurrentHost(hostGeneration), pendingCapabilityUpdates[deviceID] == desired {
+                pendingCapabilityUpdates.removeValue(forKey: deviceID)
+            }
+        }
+
+        let initialAuthorities = connectionAuthorities.filter {
+            $0.value.deviceID == deviceID
+        }
+        for (connectionID, authority) in initialAuthorities {
+            let generation = issueAuthorityGeneration()
+            connectionAuthorities[connectionID] = ConnectionCapabilityAuthority(
+                deviceID: deviceID,
+                capabilities: authority.capabilities.intersection(desired),
+                generation: generation
+            )
+        }
+        commandRouter.invalidate(deviceID: deviceID)
+
+        for (connectionID, authority) in initialAuthorities
+        where authority.capabilities.contains(.terminalControl)
+            && !desired.contains(.terminalControl) {
+            await terminalControl?.releaseConnection(connectionID)
+            guard isCurrentHost(hostGeneration), self.roster === roster else {
+                throw CompanionWireError.connectionUnavailable
+            }
+        }
+
+        let record: CompanionPairedDeviceRecord
+        do {
+            record = try await roster.updateCapabilities(capabilities, for: deviceID)
+        } catch {
+            guard isCurrentHost(hostGeneration), self.roster === roster else {
+                throw CompanionWireError.connectionUnavailable
+            }
+            // We cannot safely re-widen a session after persistence failed: it
+            // may already have observed the provisional narrowing. Seal every
+            // route for this device and let a later reconnect read the durable
+            // roster rather than guessing which actor write completed.
+            await closeConnections(deviceID: deviceID, reason: "capability_persist_failed")
+            throw error
+        }
+        guard isCurrentHost(hostGeneration), self.roster === roster else {
+            throw CompanionWireError.connectionUnavailable
+        }
+        let stored = Set(record.capabilities)
+        var connectionIDs = Set(connectionAuthorities.compactMap { connectionID, authority in
+            authority.deviceID == deviceID ? connectionID : nil
+        })
+        if let connectionID = deviceConnections[deviceID] {
+            connectionIDs.insert(connectionID)
+        }
+
+        for connectionID in connectionIDs {
+            if let authority = connectionAuthorities[connectionID],
+               authority.deviceID == deviceID {
+                let generation = issueAuthorityGeneration()
+                connectionAuthorities[connectionID] = ConnectionCapabilityAuthority(
+                    deviceID: deviceID,
+                    capabilities: authority.capabilities.intersection(stored),
+                    generation: generation
+                )
+            }
+            guard let connection = connections[connectionID] else { continue }
+            do {
+                let effective = Set(try await connection.updateCapabilities(record.capabilities))
+                guard isCurrentHost(hostGeneration), self.roster === roster,
+                      connections[connectionID] != nil,
+                      let current = connectionAuthorities[connectionID],
+                      current.deviceID == deviceID else {
+                    continue
+                }
+                let generation = issueAuthorityGeneration()
+                connectionAuthorities[connectionID] = ConnectionCapabilityAuthority(
+                    deviceID: deviceID,
+                    capabilities: effective.intersection(stored),
+                    generation: generation
+                )
+            } catch {
+                guard isCurrentHost(hostGeneration), self.roster === roster else {
+                    throw CompanionWireError.connectionUnavailable
+                }
+                retireAuthority(connectionID: connectionID, deviceID: deviceID)
+                connections.removeValue(forKey: connectionID)
+                revocationFence.invalidate(connectionID: connectionID)
+                liveConnectionIDs.remove(connectionID)
+                deviceConnections = deviceConnections.filter { $0.value != connectionID }
+                connectedDeviceIDs.remove(deviceID)
+                await streamHub?.releaseConnection(connectionID)
+                await terminalControl?.releaseConnection(connectionID)
+                await connection.close(reason: "capability_update_failed")
+            }
+        }
+        await refreshDevices(using: roster, generation: hostGeneration)
     }
 
     /// Accept a whole-app snapshot from the AppDelegate's window registry.
@@ -635,6 +766,12 @@ final class CompanionHost: ObservableObject {
         connections.removeAll()
         revocationFence.resetForAccountChange()
         deviceConnections.removeAll()
+        for deviceID in Set(connectionAuthorities.values.map(\.deviceID)) {
+            commandRouter.invalidate(deviceID: deviceID)
+        }
+        connectionAuthorities.removeAll()
+        pendingCapabilityUpdates.removeAll()
+        nextAuthorityGeneration = 1
         liveConnectionIDs.removeAll()
         terminalRecordsByKey.removeAll()
         connectionEpoch = "epoch-\(UUID().uuidString.lowercased())"
@@ -777,6 +914,7 @@ final class CompanionHost: ObservableObject {
                let previous = connections.removeValue(forKey: previousID) {
                 let streamHub = terminalStreamHubInstance
                 let terminalControl = self.terminalControl
+                retireAuthority(connectionID: previousID, deviceID: device.deviceId)
                 revocationFence.invalidate(connectionID: previousID)
                 synchronizationTasks.removeValue(forKey: previousID)?.cancel()
                 synchronizationTokens.removeValue(forKey: previousID)
@@ -792,9 +930,9 @@ final class CompanionHost: ObservableObject {
             pairingCode = nil
             pairingPhrase = nil
             Task { await refreshDevices(using: roster, generation: generation) }
-        case let .live(device, _, resumeCursor):
+        case let .live(device, capabilities, resumeCursor):
             guard let connection = connections[connectionID] else { break }
-            guard let authority = revocationFence.token(
+            guard let revocationAuthority = revocationFence.token(
                     connectionID: connectionID,
                     deviceID: device.deviceId
                   ) else {
@@ -802,6 +940,16 @@ final class CompanionHost: ObservableObject {
                 Task { await connection.close(reason: "device_revoked") }
                 break
             }
+            let authorityGeneration = issueAuthorityGeneration()
+            let granted = Set(capabilities)
+            let authorized = pendingCapabilityUpdates[device.deviceId]
+                .map { granted.intersection($0) } ?? granted
+            let capabilityAuthority = ConnectionCapabilityAuthority(
+                deviceID: device.deviceId,
+                capabilities: authorized,
+                generation: authorityGeneration
+            )
+            connectionAuthorities[connectionID] = capabilityAuthority
             connectedDeviceIDs.insert(device.deviceId)
             synchronizationTasks[connectionID]?.cancel()
             let synchronizationToken = UUID()
@@ -813,7 +961,7 @@ final class CompanionHost: ObservableObject {
                     deviceID: device.deviceId,
                     resumeCursor: resumeCursor,
                     connection: connection,
-                    authority: authority,
+                    authority: revocationAuthority,
                     generation: generation
                 )
             }
@@ -826,12 +974,13 @@ final class CompanionHost: ObservableObject {
                 self.synchronizationTokens.removeValue(forKey: connectionID)
                 guard synchronized, self.isCurrentHost(generation),
                       self.connections[connectionID] != nil,
-                      self.revocationFence.isAuthorized(authority) else { return }
+                      self.revocationFence.isAuthorized(revocationAuthority),
+                      self.connectionAuthorities[connectionID] == capabilityAuthority else { return }
                 self.liveConnectionIDs.insert(connectionID)
             }
         case let .envelope(envelope, device):
             guard let connection = connections[connectionID],
-                  let authority = revocationFence.token(
+                  let revocationAuthority = revocationFence.token(
                     connectionID: connectionID,
                     deviceID: device.deviceId
                   ) else { break }
@@ -853,17 +1002,29 @@ final class CompanionHost: ObservableObject {
                    await synchronization.value == false { return }
                 guard isCurrentHost(generation),
                       connections[connectionID] != nil,
-                      revocationFence.isAuthorized(authority) else { return }
+                      revocationFence.isAuthorized(revocationAuthority),
+                      let capabilityAuthority = connectionAuthorities[connectionID],
+                      capabilityAuthority.deviceID == device.deviceId else { return }
                 do {
                     let command = try envelope.body.decode(CompanionCommandBody.self)
                     let receipt = try await commandRouter.route(
                         envelope,
                         device: device,
+                        effectiveCapabilities: capabilityAuthority.capabilities,
+                        authorityGeneration: capabilityAuthority.generation,
+                        authorityIsCurrent: { [weak self] in
+                            guard let self else { return false }
+                            return self.isCurrentHost(generation)
+                                && self.connections[connectionID] != nil
+                                && self.deviceConnections[device.deviceId] == connectionID
+                                && self.connectionAuthorities[connectionID] == capabilityAuthority
+                                && self.revocationFence.isAuthorized(revocationAuthority)
+                        },
                         projection: projectionRevisions.current,
                         isAuthorized: { [weak self] in
                             guard let self else { return false }
                             return self.isCurrentHost(generation)
-                                && self.revocationFence.isAuthorized(authority)
+                                && self.revocationFence.isAuthorized(revocationAuthority)
                         },
                         acknowledgeAttention: { portableSessionID in
                             guard let entry = AttentionCenter.shared.entries.first(where: {
@@ -882,7 +1043,7 @@ final class CompanionHost: ObservableObject {
                                 command,
                                 deviceID: device.deviceId,
                                 connectionID: connectionID,
-                                authority: authority,
+                                authority: revocationAuthority,
                                 generation: generation,
                                 streamHub: streamHub,
                                 terminalControl: terminalControl
@@ -890,8 +1051,9 @@ final class CompanionHost: ObservableObject {
                         }
                     )
                     guard self.isCurrentHost(generation),
-                          self.revocationFence.isAuthorized(authority),
-                          self.connections[connectionID] != nil else { return }
+                          self.revocationFence.isAuthorized(revocationAuthority),
+                          self.connections[connectionID] != nil,
+                          self.connectionAuthorities[connectionID] == capabilityAuthority else { return }
                     try await connection.sendReceipt(
                         receipt,
                         sequence: eventLog.currentSequence,
@@ -904,8 +1066,9 @@ final class CompanionHost: ObservableObject {
                            command: command
                        ) {
                         guard self.isCurrentHost(generation),
-                              self.revocationFence.isAuthorized(authority),
-                              self.connections[connectionID] != nil else { return }
+                              self.revocationFence.isAuthorized(revocationAuthority),
+                              self.connections[connectionID] != nil,
+                              self.connectionAuthorities[connectionID] == capabilityAuthority else { return }
                         let record = try eventLog.append(
                             kind: .event,
                             id: "terminal-snapshot-\(UUID().uuidString.lowercased())",
@@ -914,8 +1077,9 @@ final class CompanionHost: ObservableObject {
                             audience: [connectionID]
                         )
                         guard self.isCurrentHost(generation),
-                              self.revocationFence.isAuthorized(authority),
-                              self.connections[connectionID] != nil else { return }
+                              self.revocationFence.isAuthorized(revocationAuthority),
+                              self.connections[connectionID] != nil,
+                              self.connectionAuthorities[connectionID] == capabilityAuthority else { return }
                         try await send(record, to: connection)
                     }
                 } catch {
@@ -931,6 +1095,12 @@ final class CompanionHost: ObservableObject {
             connections.removeValue(forKey: connectionID)
             revocationFence.invalidate(connectionID: connectionID)
             liveConnectionIDs.remove(connectionID)
+            if let authority = connectionAuthorities[connectionID] {
+                retireAuthority(
+                    connectionID: connectionID,
+                    deviceID: authority.deviceID
+                )
+            }
             let disconnectedDeviceIDs = deviceConnections.compactMap { entry in
                 entry.value == connectionID ? entry.key : nil
             }
@@ -1088,13 +1258,19 @@ final class CompanionHost: ObservableObject {
     private func appendProjection(
         _ projection: CompanionProjection
     ) throws -> CompanionOutboundRecord {
-        try eventLog.append(
+        guard let sanitized = CompanionCapabilityPolicy.sanitizedProjection(
+            projection,
+            grantedCapabilities: [.observe]
+        ) else {
+            throw CompanionProtocolError.invalidBody("snapshot.projects projection")
+        }
+        return try eventLog.append(
             kind: .snapshot,
-            id: "snapshot-\(projection.revision)-\(UUID().uuidString.lowercased())",
+            id: "snapshot-\(sanitized.revision)-\(UUID().uuidString.lowercased())",
             body: CompanionBody(CompanionSnapshotBody(
                 type: "snapshot.projects",
-                revision: projection.revision,
-                projection: projection
+                revision: sanitized.revision,
+                projection: sanitized
             )),
             sentAt: Self.nowMilliseconds()
         )
@@ -1129,6 +1305,10 @@ final class CompanionHost: ObservableObject {
                     synchronizedThrough = currentSequence
                 case let .snapshotRequired(_, currentSequence):
                     guard let projection = projectionRevisions.current else { return true }
+                    guard let sanitized = CompanionCapabilityPolicy.sanitizedProjection(
+                        projection,
+                        grantedCapabilities: [.observe]
+                    ) else { return false }
                     let record = CompanionOutboundRecord(
                         kind: .snapshot,
                         sequence: currentSequence,
@@ -1136,8 +1316,8 @@ final class CompanionHost: ObservableObject {
                         sentAt: Self.nowMilliseconds(),
                         body: try CompanionBody(CompanionSnapshotBody(
                             type: "snapshot.projects",
-                            revision: projection.revision,
-                            projection: projection
+                            revision: sanitized.revision,
+                            projection: sanitized
                         )),
                         audience: nil
                     )
@@ -1159,6 +1339,10 @@ final class CompanionHost: ObservableObject {
             if let projection = projectionRevisions.current,
                isCurrentHost(generation),
                revocationFence.isAuthorized(authority) {
+                guard let sanitized = CompanionCapabilityPolicy.sanitizedProjection(
+                    projection,
+                    grantedCapabilities: [.observe]
+                ) else { return false }
                 let sequence = eventLog.currentSequence
                 try await send(CompanionOutboundRecord(
                     kind: .snapshot,
@@ -1167,8 +1351,8 @@ final class CompanionHost: ObservableObject {
                     sentAt: Self.nowMilliseconds(),
                     body: try CompanionBody(CompanionSnapshotBody(
                         type: "snapshot.projects",
-                        revision: projection.revision,
-                        projection: projection
+                        revision: sanitized.revision,
+                        projection: sanitized
                     )),
                     audience: nil
                 ), to: connection)
@@ -1213,6 +1397,12 @@ final class CompanionHost: ObservableObject {
             connections.removeValue(forKey: connectionID)
             revocationFence.invalidate(connectionID: connectionID)
             liveConnectionIDs.remove(connectionID)
+            if let authority = connectionAuthorities[connectionID] {
+                retireAuthority(
+                    connectionID: connectionID,
+                    deviceID: authority.deviceID
+                )
+            }
             deviceConnections = deviceConnections.filter { $0.value != connectionID }
             await terminalControl?.releaseConnection(connectionID)
         }
@@ -1225,6 +1415,46 @@ final class CompanionHost: ObservableObject {
         guard hostGeneration == generation else { return false }
         guard let accountScope else { return true }
         return activeAccountScope == accountScope
+    }
+
+    private func issueAuthorityGeneration() -> UInt64 {
+        let generation = nextAuthorityGeneration
+        nextAuthorityGeneration &+= 1
+        if nextAuthorityGeneration == 0 { nextAuthorityGeneration = 1 }
+        return generation
+    }
+
+    private func retireAuthority(connectionID: String, deviceID: String) {
+        connectionAuthorities.removeValue(forKey: connectionID)
+        commandRouter.invalidate(deviceID: deviceID)
+    }
+
+    private func closeConnections(deviceID: String, reason: String) async {
+        var connectionIDs = Set(connectionAuthorities.compactMap { connectionID, authority in
+            authority.deviceID == deviceID ? connectionID : nil
+        })
+        if let connectionID = deviceConnections.removeValue(forKey: deviceID) {
+            connectionIDs.insert(connectionID)
+        }
+        let streamHub = terminalStreamHubInstance
+        let terminalControl = self.terminalControl
+        var retiringConnections: [(String, any CompanionHostConnection)] = []
+        for connectionID in connectionIDs {
+            if let connection = connections.removeValue(forKey: connectionID) {
+                retiringConnections.append((connectionID, connection))
+            }
+            revocationFence.invalidate(connectionID: connectionID)
+            synchronizationTasks.removeValue(forKey: connectionID)?.cancel()
+            synchronizationTokens.removeValue(forKey: connectionID)
+            liveConnectionIDs.remove(connectionID)
+            retireAuthority(connectionID: connectionID, deviceID: deviceID)
+        }
+        connectedDeviceIDs.remove(deviceID)
+        for (connectionID, connection) in retiringConnections {
+            await streamHub?.releaseConnection(connectionID)
+            await terminalControl?.releaseConnection(connectionID)
+            await connection.close(reason: reason)
+        }
     }
 
     private func adopt(listenerState: CompanionListener.State) {

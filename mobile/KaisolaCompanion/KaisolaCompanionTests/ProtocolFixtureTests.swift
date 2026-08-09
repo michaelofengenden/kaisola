@@ -508,6 +508,24 @@ final class ProtocolFixtureTests: XCTestCase {
         XCTAssertTrue(store.canControlAgents)
         XCTAssertTrue(store.canControlTerminals)
 
+        let downgradedHello = try CompanionEnvelope(
+            kind: .hello,
+            desktopId: "desktop-fixture",
+            deviceId: "device-fixture",
+            connectionId: "connection-fixture",
+            epoch: "desktop-epoch-7",
+            seq: 0,
+            id: "hello-desktop-downgraded",
+            sentAt: 1_784_250_001_001,
+            body: CompanionBody(CompanionHelloBody(
+                role: .desktop,
+                capabilities: [.observe]
+            ))
+        )
+        XCTAssertFalse(try store.apply(downgradedHello))
+        XCTAssertFalse(store.canControlAgents)
+        XCTAssertFalse(store.canControlTerminals)
+
         XCTAssertFalse(try store.apply(CompanionProtocolCodec.decode(fixtureData("command-receipt"))))
         XCTAssertNil(store.previewReceipt, "subscribe/control receipts must not become global banners")
     }
@@ -957,6 +975,9 @@ final class ProtocolFixtureTests: XCTestCase {
         let eventTypes: [String]
         let snapshotTypes: [String]
         let commandCapabilities: [String: String]
+        let snapshotCapabilities: [String: String]
+        let eventCapabilities: [String: String]
+        let projectionFields: [String: [String]]
         let receiptStatuses: [String]
     }
 
@@ -993,5 +1014,23 @@ final class ProtocolFixtureTests: XCTestCase {
         XCTAssertEqual(
             swiftCommandCapabilities, tables.commandCapabilities,
             "CompanionEnvelope.commandCapabilities drifted from protocolTables.json")
+
+        let swiftSnapshotCapabilities = Dictionary(uniqueKeysWithValues:
+            CompanionCapabilityPolicy.snapshotCapabilities.map { ($0.key, $0.value.rawValue) })
+        XCTAssertEqual(
+            swiftSnapshotCapabilities, tables.snapshotCapabilities,
+            "Companion snapshot capability policy drifted from protocolTables.json")
+        let swiftEventCapabilities = Dictionary(uniqueKeysWithValues:
+            CompanionCapabilityPolicy.eventCapabilities.map { ($0.key, $0.value.rawValue) })
+        XCTAssertEqual(
+            swiftEventCapabilities, tables.eventCapabilities,
+            "Companion event capability policy drifted from protocolTables.json")
+        let swiftProjectionFields = CompanionCapabilityPolicy.projectionFields.mapValues {
+            $0.sorted()
+        }
+        XCTAssertEqual(
+            swiftProjectionFields,
+            tables.projectionFields.mapValues { $0.sorted() },
+            "Companion projection field policy drifted from protocolTables.json")
     }
 }

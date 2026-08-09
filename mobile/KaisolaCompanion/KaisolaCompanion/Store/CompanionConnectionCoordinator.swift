@@ -828,6 +828,14 @@ final class CompanionConnectionCoordinator: ObservableObject {
     private func handlePaired(_ desktop: CompanionPairedDesktop) {
         guard let accountScope = activeAccountScope,
               desktop.accountScope == accountScope else { return }
+        let previous = Set(pairedDesktop?.capabilities ?? [])
+        let current = Set(desktop.capabilities)
+        if previous.contains(.terminalControl), !current.contains(.terminalControl) {
+            clearLocalTerminalControls()
+        }
+        if !previous.subtracting(current).intersection([.agentControl, .terminalControl]).isEmpty {
+            controlAuthorization.lock()
+        }
         pairingTimeoutTask?.cancel()
         pairingTimeoutTask = nil
         activePairingNonce = nil

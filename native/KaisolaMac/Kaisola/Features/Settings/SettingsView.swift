@@ -1270,11 +1270,27 @@ private struct TerminalColorCard: View {
     }
 }
 
+struct TerminalPalettePreviewAccessibility: Equatable {
+    static let identifier = "settings.terminal.palette-preview"
+
+    let themeTitle: String
+
+    var label: String {
+        "Terminal palette preview, \(themeTitle) theme. "
+            + "Foreground text: home path. "
+            + "Background: terminal canvas. "
+            + "Cursor: block cursor. "
+            + "ANSI green: percent prompt. "
+            + "ANSI blue: codex command."
+    }
+}
+
 private struct TerminalPalettePreview: View {
     let definition: ThemeDefinition
     let light: Bool
     var body: some View {
         let palette = light ? definition.light : definition.dark
+        let accessibility = TerminalPalettePreviewAccessibility(themeTitle: definition.title)
         HStack(spacing: 10) {
             Text("~/Kaisola")
                 .foregroundStyle(Color(nsColor: palette.foreground).opacity(0.65))
@@ -1292,7 +1308,9 @@ private struct TerminalPalettePreview: View {
         .frame(height: 44)
         .background(Color(nsColor: palette.background), in: RoundedRectangle(cornerRadius: 9))
         .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.quaternary))
-        .accessibilityHidden(true)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibility.label)
+        .accessibilityIdentifier(TerminalPalettePreviewAccessibility.identifier)
     }
 
 }

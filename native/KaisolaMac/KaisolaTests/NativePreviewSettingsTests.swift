@@ -9,6 +9,32 @@ import XCTest
 /// checked.
 @MainActor
 final class NativePreviewSettingsTests: XCTestCase {
+    func testTerminalPaletteAccessibilitySummaryNamesThemeAndEveryVisualRole() {
+        let summary = TerminalPalettePreviewAccessibility(themeTitle: "Kaisola")
+
+        XCTAssertEqual(
+            summary.label,
+            "Terminal palette preview, Kaisola theme. "
+                + "Foreground text: home path. "
+                + "Background: terminal canvas. "
+                + "Cursor: block cursor. "
+                + "ANSI green: percent prompt. "
+                + "ANSI blue: codex command."
+        )
+        XCTAssertEqual(
+            TerminalPalettePreviewAccessibility.identifier,
+            "settings.terminal.palette-preview"
+        )
+    }
+
+    func testTerminalPaletteAccessibilitySummaryUsesTheSelectedThemeTitle() {
+        XCTAssertTrue(
+            TerminalPalettePreviewAccessibility(themeTitle: "Solar Echo")
+                .label
+                .hasPrefix("Terminal palette preview, Solar Echo theme.")
+        )
+    }
+
     func testIsolatedFixtureUpdaterNeverStartsSparkle() {
         let controller = NativeUpdateController(isolatedFixture: true)
         XCTAssertFalse(controller.startedUpdater)

@@ -62,6 +62,14 @@ test('frame trace CLI keeps a bounded steady interval and absolute limits', () =
   assert.equal(options.steadyStartSeconds, 10)
   assert.equal(options.steadyEndSeconds, 20)
   assert.equal(options.maximumHitchRateMsPerSecond, 10)
+  assert.equal(parseArguments([
+    '--trace', '/tmp/native.trace', '--label', 'native-streaming', '--output', '/tmp/report.json',
+    '--target-pid', '123',
+  ]).targetPid, 123)
+  assert.throws(() => parseArguments([
+    '--trace', '/tmp/native.trace', '--label', 'native-streaming', '--output', '/tmp/report.json',
+    '--target-pid', '0',
+  ]), /positive integer/)
   assert.throws(() => parseArguments([
     '--trace', '/tmp/native.trace', '--label', 'native-streaming', '--output', '/tmp/report.json',
     '--steady-start-s', '20', '--steady-end-s', '10',

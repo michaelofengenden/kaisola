@@ -63,6 +63,10 @@ test('frame cadence receipt validation rejects threshold and pass drift', () => 
   assert.throws(() => validateReport({ ...passingReport(), pass: false }), /inconsistent/)
   assert.throws(() => validateReport({
     ...passingReport(),
+    deadlineLossRateMsPerSecond: 11,
+  }), /check is inconsistent/)
+  assert.throws(() => validateReport({
+    ...passingReport(),
     maximumIntervalMs: 10,
     p95IntervalMs: 20,
   }), /relationships/)

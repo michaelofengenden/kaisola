@@ -73,6 +73,9 @@ struct GitService: Sendable {
     struct Entry: Equatable, Identifiable, Sendable {
         let path: String
         let code: String
+        /// Where a rename or copy came from. Git reports it as a separate
+        /// record, and it is the only way to explain an `R`/`C` row.
+        var originalPath: String?
         var id: String { path }
     }
 
@@ -97,8 +100,12 @@ struct GitService: Sendable {
     /// read is itself a git-directory write — which the live watcher would report
     /// back as a change, refreshing again. Git ships this flag for exactly this
     /// class of caller.
+    ///
+    /// `-z` is not optional: without it git escapes any path holding a tab,
+    /// newline, quote, backslash or non-ASCII byte into a quoted C string, and
+    /// the escaped text is not a path we can stage, diff or restore.
     func status() throws -> Status {
-        let output = try run(["--no-optional-locks", "status", "--porcelain=v2", "--branch"])
+        let output = try run(["--no-optional-locks", "status", "--porcelain=v2", "--branch", "-z"])
         return Self.parseStatus(output)
     }
 
@@ -366,33 +373,74 @@ struct GitService: Sendable {
 
     // MARK: - Parsing
 
+    /// Parse `git status --porcelain=v2 --branch -z`. Records are NUL
+    /// terminated, so a path is whatever remains after the record's fixed
+    /// fields — spaces, tabs and newlines inside it are just path bytes.
     static func parseStatus(_ output: String) -> Status {
         var status = Status(branch: nil, ahead: 0, behind: 0, staged: [], unstaged: [], untracked: [])
-        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
-            if line.hasPrefix("# branch.head ") {
-                status.branch = String(line.dropFirst("# branch.head ".count))
-            } else if line.hasPrefix("# branch.ab ") {
-                let fields = line.dropFirst("# branch.ab ".count).split(separator: " ")
+        let records = output.split(separator: "\0", omittingEmptySubsequences: true)
+        var index = records.startIndex
+        while index < records.endIndex {
+            let record = records[index]
+            index += 1
+            if record.hasPrefix("# branch.head ") {
+                status.branch = String(record.dropFirst("# branch.head ".count))
+            } else if record.hasPrefix("# branch.ab ") {
+                let fields = record.dropFirst("# branch.ab ".count).split(separator: " ")
                 for field in fields {
                     if field.hasPrefix("+") { status.ahead = Int(field.dropFirst()) ?? 0 }
                     if field.hasPrefix("-") { status.behind = Int(field.dropFirst()) ?? 0 }
                 }
-            } else if line.hasPrefix("1 ") || line.hasPrefix("2 ") {
-                // "1 XY ... path"  or renamed "2 XY ... path\tsrc"
-                let fields = line.split(separator: " ", maxSplits: 8, omittingEmptySubsequences: false)
-                guard fields.count >= 9 else { continue }
-                let xy = String(fields[1])
-                let pathField = fields[8...].joined(separator: " ")
-                let path = String(pathField.split(separator: "\t").first ?? Substring(pathField))
-                let x = xy.first.map(String.init) ?? "."
-                let y = xy.dropFirst().first.map(String.init) ?? "."
-                if x != "." { status.staged.append(Entry(path: path, code: x)) }
-                if y != "." { status.unstaged.append(Entry(path: path, code: y)) }
-            } else if line.hasPrefix("? ") {
-                status.untracked.append(String(line.dropFirst(2)))
+            } else if record.hasPrefix("? ") {
+                status.untracked.append(String(record.dropFirst(2)))
+            } else if record.hasPrefix("1 ") || record.hasPrefix("2 ") || record.hasPrefix("u ") {
+                // Fields ahead of the path: 8 for an ordinary change, 9 for a
+                // rename/copy (it carries a similarity score), 10 for an
+                // unmerged entry (three stages of mode and object id).
+                let isRenameOrCopy = record.hasPrefix("2 ")
+                let leadingFields = record.hasPrefix("1 ") ? 8 : (isRenameOrCopy ? 9 : 10)
+                // A rename/copy always spends the next record on its source
+                // path, so consume it before anything can bail out — leaving it
+                // behind would let a path be read as a record of its own.
+                var originalPath: String?
+                if isRenameOrCopy, index < records.endIndex {
+                    originalPath = String(records[index])
+                    index += 1
+                }
+                guard let change = changeRecord(record, leadingFields: leadingFields) else { continue }
+                let path = String(change.path)
+                let x = String(change.xy.first ?? ".")
+                let y = String(change.xy.dropFirst().first ?? ".")
+                if x != "." { status.staged.append(Entry(path: path, code: x, originalPath: source(x, originalPath))) }
+                if y != "." { status.unstaged.append(Entry(path: path, code: y, originalPath: source(y, originalPath))) }
             }
         }
         return status
+    }
+
+    /// Split a changed-entry record into its status code and its path. The path
+    /// is everything past `leadingFields` space-separated fields; splitting the
+    /// whole record on spaces would corrupt any path containing one.
+    private static func changeRecord(
+        _ record: Substring,
+        leadingFields: Int
+    ) -> (xy: Substring, path: Substring)? {
+        var cursor = record.startIndex
+        var xy: Substring?
+        for field in 0 ..< leadingFields {
+            guard let space = record[cursor...].firstIndex(of: " ") else { return nil }
+            if field == 1 { xy = record[cursor ..< space] }
+            cursor = record.index(after: space)
+        }
+        let path = record[cursor...]
+        guard let xy, xy.count == 2, !path.isEmpty else { return nil }
+        return (xy, path)
+    }
+
+    /// A rename source belongs only to the side that actually renamed. `RM`
+    /// means the index renamed the file and the worktree then modified it.
+    private static func source(_ code: String, _ originalPath: String?) -> String? {
+        code == "R" || code == "C" ? originalPath : nil
     }
 
     // MARK: - Process
@@ -422,6 +470,9 @@ struct GitService: Sendable {
             if message.contains("not a git repository") { throw GitError.notARepository }
             throw GitError.commandFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        return String(data: capture.out, encoding: .utf8) ?? ""
+        // Paths are bytes, not text, and `-z` hands them over unescaped. A
+        // strict decode would return nothing at all for the whole status when a
+        // single filename is not UTF-8; substituting keeps every other row.
+        return String(decoding: capture.out, as: UTF8.self)
     }
 }

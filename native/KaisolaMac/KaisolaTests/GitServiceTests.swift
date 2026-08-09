@@ -423,7 +423,129 @@ final class GitServiceTests: XCTestCase {
         }
     }
 
+    // MARK: porcelain v2 -z records
+
+    func testParseStatusKeepsPathsHoldingSpacesTabsNewlinesQuotesAndNonASCII() {
+        let output = porcelainV2([
+            "# branch.oid 1111111111111111111111111111111111111111",
+            "# branch.head main",
+            "# branch.ab +2 -1",
+            "1 .M N... 100644 100644 100644 aaaa bbbb with space.txt",
+            "1 M. N... 100644 100644 100644 aaaa bbbb with\ttab.txt",
+            "1 .M N... 100644 100644 100644 aaaa bbbb with\nnewline.txt",
+            "1 A. N... 000000 100644 100644 0000 cccc with\"quote\".txt",
+            "1 .M N... 100644 100644 100644 aaaa bbbb with\\backslash.txt",
+            "? café ünïcode.txt",
+            "? untracked with\ttab.txt",
+        ])
+
+        let status = GitService.parseStatus(output)
+        XCTAssertEqual(status.branch, "main")
+        XCTAssertEqual(status.ahead, 2)
+        XCTAssertEqual(status.behind, 1)
+        XCTAssertEqual(status.staged.map(\.path), ["with\ttab.txt", "with\"quote\".txt"])
+        XCTAssertEqual(status.staged.map(\.code), ["M", "A"])
+        XCTAssertEqual(
+            status.unstaged.map(\.path),
+            ["with space.txt", "with\nnewline.txt", "with\\backslash.txt"]
+        )
+        XCTAssertEqual(status.untracked, ["café ünïcode.txt", "untracked with\ttab.txt"])
+    }
+
+    func testParseStatusReadsRenameAndCopySourcePaths() {
+        let output = porcelainV2([
+            "# branch.head main",
+            "2 R. N... 100644 100644 100644 aaaa bbbb R100 renamed\tnew.txt",
+            "old name.txt",
+            "2 RM N... 100644 100644 100644 aaaa bbbb R087 moved dir/file.txt",
+            "old dir/file.txt",
+            "2 C. N... 100644 100644 100644 aaaa bbbb C100 copy dest.txt",
+            "copy source.txt",
+        ])
+
+        let status = GitService.parseStatus(output)
+        XCTAssertEqual(
+            status.staged,
+            [
+                GitService.Entry(path: "renamed\tnew.txt", code: "R", originalPath: "old name.txt"),
+                GitService.Entry(path: "moved dir/file.txt", code: "R", originalPath: "old dir/file.txt"),
+                GitService.Entry(path: "copy dest.txt", code: "C", originalPath: "copy source.txt"),
+            ]
+        )
+        // The worktree modification of a renamed file is not itself a rename,
+        // and a source record must never surface as an entry of its own.
+        XCTAssertEqual(
+            status.unstaged,
+            [GitService.Entry(path: "moved dir/file.txt", code: "M", originalPath: nil)]
+        )
+        XCTAssertTrue(status.untracked.isEmpty)
+    }
+
+    func testParseStatusReportsUnmergedEntries() {
+        let output = porcelainV2([
+            "# branch.head main",
+            "u UU N... 100644 100644 100644 100644 aaaa bbbb cccc conflict me.txt",
+        ])
+
+        let status = GitService.parseStatus(output)
+        XCTAssertFalse(status.isClean)
+        XCTAssertEqual(status.staged, [GitService.Entry(path: "conflict me.txt", code: "U")])
+        XCTAssertEqual(status.unstaged, [GitService.Entry(path: "conflict me.txt", code: "U")])
+    }
+
+    func testStatusReadsRealPathsHoldingSpacesTabsNewlinesQuotesAndNonASCII() throws {
+        let awkward = [
+            "with space.txt",
+            "with\ttab.txt",
+            "with\nnewline.txt",
+            "with\"quote\".txt",
+            "with\\backslash.txt",
+            "café ünïcode.txt",
+        ]
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        for name in awkward { try write(name, "content\n") }
+
+        let service = GitService(repoRoot: repo)
+        XCTAssertEqual(Set(try service.status().untracked), Set(awkward))
+
+        try git(["add", "--", "."])
+        let staged = try service.status()
+        XCTAssertEqual(Set(staged.staged.map(\.path)), Set(awkward))
+        XCTAssertTrue(staged.untracked.isEmpty)
+
+        // The parsed path has to be the real one: git must accept it back.
+        for name in awkward {
+            XCTAssertFalse(try service.diff(path: name, staged: true).isEmpty, name)
+        }
+    }
+
+    func testStatusReportsRenameWithItsSourcePath() throws {
+        let source = "docs/first note.txt"
+        let destination = "docs/second\tnote.txt"
+        try FileManager.default.createDirectory(
+            at: repo.appendingPathComponent("docs", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try write(source, "keep this content identical so git scores a rename\n")
+        try git(["add", "--", source])
+        try git(["commit", "-q", "-m", "base"])
+        try git(["mv", "--", source, destination])
+
+        let staged = try GitService(repoRoot: repo).status().staged
+        XCTAssertEqual(staged.count, 1)
+        XCTAssertEqual(staged.first?.path, destination)
+        XCTAssertEqual(staged.first?.code, "R")
+        XCTAssertEqual(staged.first?.originalPath, source)
+    }
+
     // MARK: helpers
+
+    /// Porcelain v2 `-z` output: one NUL after every record, nothing escaped.
+    private func porcelainV2(_ records: [String]) -> String {
+        records.map { $0 + "\u{0}" }.joined()
+    }
 
     private func write(_ name: String, _ contents: String) throws {
         try contents.write(to: repo.appendingPathComponent(name), atomically: true, encoding: .utf8)

@@ -179,7 +179,7 @@ struct AcpChatView: View {
                 isPresented: Binding(get: { restoreTarget != nil }, set: { if !$0 { restoreTarget = nil } })
             ) {
                 Button("Restore Files", role: .destructive) {
-                    if let restoreTarget { conversation.restoreCheckpoint(restoreTarget.id) }
+                    if let restoreTarget { conversation.restoreCheckpoint(restoreTarget) }
                     restoreTarget = nil
                 }
                 Button("Cancel", role: .cancel) { restoreTarget = nil }

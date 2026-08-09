@@ -774,6 +774,292 @@ final class AcpClientTests: XCTestCase {
         conversation.removeQueued(id)
         XCTAssertTrue(conversation.queued.isEmpty)
     }
+
+    @MainActor
+    func testConversationCheckpointEvictionDropsOnlyTheExactTypedOwnerRef() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-checkpoint-menu-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        @discardableResult
+        func git(_ arguments: [String]) throws -> Int32 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = arguments
+            process.currentDirectoryURL = workspace
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        }
+
+        func refExists(_ ref: String) -> Bool {
+            (try? git(["show-ref", "--verify", "--quiet", ref])) == 0
+        }
+
+        XCTAssertEqual(try git(["init", "-q", "-b", "main"]), 0)
+        XCTAssertEqual(try git(["config", "user.email", "test@example.com"]), 0)
+        XCTAssertEqual(try git(["config", "user.name", "Test"]), 0)
+        try "base\n".write(
+            to: workspace.appendingPathComponent("file.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertEqual(try git(["add", "file.txt"]), 0)
+        XCTAssertEqual(try git(["commit", "-q", "-m", "base"]), 0)
+        try "dirty\n".write(
+            to: workspace.appendingPathComponent("file.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let transport = ScriptedAcpTransport()
+        let conversation = AcpConversation(
+            title: "Checkpoint eviction",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: workspace.path,
+            client: AcpClient(transport: transport),
+            draftKey: "durable-chat",
+            checkpointIncarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
+        )
+        await conversation.start()
+
+        var first: AcpConversation.TurnCheckpoint?
+        for turn in 1...21 {
+            XCTAssertTrue(conversation.send("turn \(turn)"))
+            try await Self.until("checkpoint for turn \(turn)", timeout: 15) {
+                !conversation.isRunning && conversation.checkpoints.last?.turn == turn
+            }
+            if turn == 1 { first = conversation.checkpoints.first }
+        }
+
+        let evicted = try XCTUnwrap(first)
+        XCTAssertEqual(conversation.checkpoints.count, 20)
+        XCTAssertFalse(conversation.checkpoints.contains(where: { $0.id == evicted.id }))
+        let retained = try XCTUnwrap(conversation.checkpoints.last)
+        try await Self.until("the evicted checkpoint ref to be deleted") {
+            !refExists(evicted.checkpoint.keepAliveRef)
+        }
+        XCTAssertTrue(refExists(retained.checkpoint.keepAliveRef))
+        _ = await conversation.stop()
+    }
+
+    // MARK: - Malformed permission asks
+
+    /// A permission request that lands between `session/new` and its reply has
+    /// no session to belong to. Silence there wedges the adapter on a decision
+    /// no review card can present, so it gets invalid-params instead.
+    func testPermissionRequestWithNoSessionIsAnsweredWithInvalidParams() async throws {
+        let transport = PermissionProbeTransport(preSessionPermissionID: .string("pre-session"))
+        let client = AcpClient(transport: transport)
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        let error = try await Self.errorResponse(from: transport, id: .string("pre-session"))
+        XCTAssertEqual(error["code"]?.intValue, -32602)
+        XCTAssertEqual(error["message"]?.stringValue?.isEmpty, false)
+    }
+
+    /// `params` that are not an object at all: nothing to decode, still owed a
+    /// response.
+    func testPermissionRequestWithNonObjectParamsIsAnsweredWithInvalidParams() async throws {
+        let transport = PermissionProbeTransport()
+        let client = AcpClient(transport: transport)
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.requestPermission(id: .string("bad-params"), params: .string("not an object"))
+
+        let error = try await Self.errorResponse(from: transport, id: .string("bad-params"))
+        XCTAssertEqual(error["code"]?.intValue, -32602)
+    }
+
+    /// Options with no `optionId` leave the card with nothing to click, which
+    /// blocks the adapter exactly like a dropped ask.
+    func testPermissionRequestWithNoUsableOptionIsAnsweredWithInvalidParams() async throws {
+        let transport = PermissionProbeTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { event in collector.append(event) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.requestPermission(id: .string("no-options"), params: .object([
+            "sessionId": .string("sess-1"),
+            "toolCall": .object([
+                "toolCallId": .string("t-1"),
+                "title": .string("Delete the checkout"),
+                "kind": .string("execute"),
+            ]),
+            // Present but unusable: no `optionId` on either entry.
+            "options": .array([
+                .object(["name": .string("Allow once")]),
+                .string("reject"),
+            ]),
+        ]))
+
+        let error = try await Self.errorResponse(from: transport, id: .string("no-options"))
+        XCTAssertEqual(error["code"]?.intValue, -32602)
+        XCTAssertTrue(
+            Self.permissionRequests(collector).isEmpty,
+            "an unanswerable ask must not reach the review card"
+        )
+    }
+
+    /// A missing `toolCall` is legal — partial asks fall back to whatever an
+    /// earlier `session/update` disclosed — so this one must still reach the
+    /// user and still be answered with the ACP `selected` outcome.
+    func testPermissionRequestWithoutAToolCallStillReachesTheUserAndIsAnswered() async throws {
+        let transport = PermissionProbeTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { event in collector.append(event) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.requestPermission(id: .string("no-tool-call"), params: .object([
+            "sessionId": .string("sess-1"),
+            "options": .array([
+                .object([
+                    "optionId": .string("allow"),
+                    "name": .string("Allow once"),
+                    "kind": .string("allow_once"),
+                ]),
+            ]),
+        ]))
+        try await Self.untilPermissions(collector, reach: 1)
+
+        let request = try XCTUnwrap(Self.permissionRequests(collector).first)
+        XCTAssertEqual(request.title, "Permission requested")
+        XCTAssertEqual(request.kind, "other")
+        await client.resolvePermission(id: request.id, optionID: "allow")
+
+        let result = try await Self.resultResponse(from: transport, id: .string("no-tool-call"))
+        XCTAssertEqual(
+            result["outcome"]?.objectValue?["outcome"]?.stringValue, "selected"
+        )
+        XCTAssertEqual(result["outcome"]?.objectValue?["optionId"]?.stringValue, "allow")
+    }
+
+    /// `rawInput` is arbitrary JSON in ACP v1. A bare string is kept for
+    /// disclosure and an explicit null is dropped; neither shape may cost the
+    /// adapter its response.
+    func testPermissionRequestWithMalformedRawInputIsSurfacedAndAnswered() async throws {
+        let transport = PermissionProbeTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { event in collector.append(event) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        func ask(id: String, rawInput: JSONValue) -> JSONValue {
+            .object([
+                "sessionId": .string("sess-1"),
+                "toolCall": .object([
+                    "toolCallId": .string(id),
+                    "title": .string("Run a command"),
+                    "kind": .string("execute"),
+                    "rawInput": rawInput,
+                ]),
+                "options": .array([
+                    .object([
+                        "optionId": .string("allow"),
+                        "name": .string("Allow once"),
+                        "kind": .string("allow_once"),
+                    ]),
+                ]),
+            ])
+        }
+        await transport.requestPermission(
+            id: .string("string-raw-input"), params: ask(id: "t-2", rawInput: .string("rm -rf ~/.ssh"))
+        )
+        await transport.requestPermission(
+            id: .string("null-raw-input"), params: ask(id: "t-3", rawInput: .null)
+        )
+        try await Self.untilPermissions(collector, reach: 2)
+
+        let asks = Self.permissionRequests(collector)
+        XCTAssertEqual(asks[0].rawInput, .string("rm -rf ~/.ssh"))
+        XCTAssertNil(asks[1].rawInput)
+
+        await client.cancelPermission(id: asks[0].id)
+        await client.resolvePermission(id: asks[1].id, optionID: "allow")
+
+        let cancelled = try await Self.resultResponse(from: transport, id: .string("string-raw-input"))
+        XCTAssertEqual(cancelled["outcome"]?.objectValue?["outcome"]?.stringValue, "cancelled")
+        let selected = try await Self.resultResponse(from: transport, id: .string("null-raw-input"))
+        XCTAssertEqual(selected["outcome"]?.objectValue?["outcome"]?.stringValue, "selected")
+    }
+
+    private static func permissionRequests(_ collector: EventCollector) -> [AcpPermissionRequest] {
+        collector.events.compactMap {
+            if case let .permission(request) = $0 { return request } else { return nil }
+        }
+    }
+
+    /// Wait for the review card to be offered `count` asks.
+    private static func untilPermissions(
+        _ collector: EventCollector,
+        reach count: Int,
+        timeout: TimeInterval = 5
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while permissionRequests(collector).count < count {
+            if Date() > deadline {
+                return XCTFail("timed out waiting for \(count) permission ask(s)")
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private struct MissingPermissionResponse: Error {}
+
+    /// The `error` object the client wrote for `id`, once it has written one.
+    private static func errorResponse(
+        from transport: PermissionProbeTransport,
+        id: JSONValue,
+        timeout: TimeInterval = 5
+    ) async throws -> [String: JSONValue] {
+        let response = try await responseFrame(from: transport, id: id, timeout: timeout)
+        XCTAssertNil(response["result"], "a malformed ask must not be answered with a result")
+        return try XCTUnwrap(response["error"]?.objectValue)
+    }
+
+    /// The `result` object the client wrote for `id`, once it has written one.
+    private static func resultResponse(
+        from transport: PermissionProbeTransport,
+        id: JSONValue,
+        timeout: TimeInterval = 5
+    ) async throws -> [String: JSONValue] {
+        let response = try await responseFrame(from: transport, id: id, timeout: timeout)
+        XCTAssertNil(response["error"])
+        return try XCTUnwrap(response["result"]?.objectValue)
+    }
+
+    private static func responseFrame(
+        from transport: PermissionProbeTransport,
+        id: JSONValue,
+        timeout: TimeInterval
+    ) async throws -> [String: JSONValue] {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            if let response = await transport.response(for: id)?.objectValue { return response }
+            if Date() > deadline {
+                XCTFail("the client never answered permission request \(id)")
+                throw MissingPermissionResponse()
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
 }
 
 private final class EventCollector: @unchecked Sendable {
@@ -781,6 +1067,101 @@ private final class EventCollector: @unchecked Sendable {
     private var storage: [AcpEvent] = []
     func append(_ event: AcpEvent) { lock.lock(); storage.append(event); lock.unlock() }
     var events: [AcpEvent] { lock.lock(); defer { lock.unlock() }; return storage }
+}
+
+/// A transport that answers the handshake and then hands the test direct
+/// control over `session/request_permission`, keeping every frame the client
+/// writes back so a malformed ask can be checked for the reply it still owes.
+private actor PermissionProbeTransport: AcpByteTransport {
+    private var outbound: [Data] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+    private var clientFrames: [JSONValue] = []
+    /// Sent between the `session/new` request and its reply — the one window
+    /// where the client is live but has no session id yet.
+    private let preSessionPermissionID: JSONValue?
+
+    init(preSessionPermissionID: JSONValue? = nil) {
+        self.preSessionPermissionID = preSessionPermissionID
+    }
+
+    private static let allowOnce: JSONValue = .array([
+        .object([
+            "optionId": .string("allow"),
+            "name": .string("Allow once"),
+            "kind": .string("allow_once"),
+        ]),
+    ])
+
+    /// The response frame the client wrote for `id`, if it wrote one. Responses
+    /// carry no `method`, which is what separates them from the client's own
+    /// requests.
+    func response(for id: JSONValue) -> JSONValue? {
+        clientFrames.first {
+            $0.objectValue?["id"] == id && $0.objectValue?["method"] == nil
+        }
+    }
+
+    func requestPermission(id: JSONValue, params: JSONValue) {
+        enqueue(.object([
+            "jsonrpc": .string("2.0"),
+            "id": id,
+            "method": .string("session/request_permission"),
+            "params": params,
+        ]))
+    }
+
+    func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {}
+
+    func send(_ data: Data) async throws {
+        let frame = data.last == 0x0A ? data.dropLast() : data
+        guard let value = try? JSONDecoder().decode(JSONValue.self, from: frame),
+              let object = value.objectValue else { return }
+        clientFrames.append(value)
+        switch object["method"]?.stringValue {
+        case "initialize":
+            reply(id: object["id"], result: .object([
+                "protocolVersion": .integer(Int64(AcpWire.protocolVersion)),
+            ]))
+        case "session/new":
+            if let preSessionPermissionID {
+                requestPermission(
+                    id: preSessionPermissionID,
+                    params: .object(["options": Self.allowOnce])
+                )
+            }
+            reply(id: object["id"], result: .object(["sessionId": .string("sess-1")]))
+        default:
+            break
+        }
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !outbound.isEmpty { return outbound.removeFirst() }
+        return await withCheckedContinuation { continuation in waiter = continuation }
+    }
+
+    func terminate() async {
+        waiter?.resume(returning: nil)
+        waiter = nil
+    }
+
+    func exitCode() async -> Int32? { 0 }
+
+    private func reply(id: JSONValue?, result: JSONValue) {
+        guard let id else { return }
+        enqueue(.object(["jsonrpc": .string("2.0"), "id": id, "result": result]))
+    }
+
+    private func enqueue(_ value: JSONValue) {
+        guard var data = try? JSONEncoder().encode(value) else { return }
+        data.append(0x0A)
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            outbound.append(data)
+        }
+    }
 }
 
 /// A transport that answers the ACP handshake and, on a prompt, streams a

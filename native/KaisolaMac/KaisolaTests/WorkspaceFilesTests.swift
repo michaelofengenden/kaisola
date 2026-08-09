@@ -514,6 +514,118 @@ final class WorkspaceFilesTests: XCTestCase {
         }
     }
 
+    /// `root/<name>/notes.md` plus a same-shaped decoy outside the project, so
+    /// a redirected operation lands somewhere the assertions can see it.
+    private func swapFixture(named name: String) throws -> (live: URL, decoy: URL) {
+        let live = root.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: live, withIntermediateDirectories: true)
+        try "real".write(to: live.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+
+        let decoy = root.deletingLastPathComponent()
+            .appendingPathComponent("kaisola-decoy-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: decoy) }
+        try FileManager.default.createDirectory(at: decoy, withIntermediateDirectories: true)
+        try "decoy".write(to: decoy.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+        return (live, decoy)
+    }
+
+    /// The race itself: a validated directory moves aside and a symbolic link
+    /// out of the project takes its place. Returns the directory's new home.
+    private func swapForLink(_ directory: URL, to decoy: URL) throws -> URL {
+        let relocated = directory.deletingLastPathComponent()
+            .appendingPathComponent(directory.lastPathComponent + "-moved", isDirectory: true)
+        try FileManager.default.moveItem(at: directory, to: relocated)
+        try FileManager.default.createSymbolicLink(at: directory, withDestinationURL: decoy)
+        return relocated
+    }
+
+    func testWorkspaceRenameFollowsTheVerifiedParentWhenItIsSwappedForALink() throws {
+        let fixture = try swapFixture(named: "live")
+        let move = try WorkspaceFileOperations.renameMove(
+            item: fixture.live.appendingPathComponent("notes.md"),
+            to: "renamed.md",
+            workspaceRoot: root
+        )
+        let parent = try WorkspaceFileOperations.openDirectory(fixture.live, workspaceRoot: root)
+        defer { parent.close() }
+
+        let relocated = try swapForLink(fixture.live, to: fixture.decoy)
+        try WorkspaceFileOperations.commitMove(move, from: parent, to: parent)
+
+        XCTAssertEqual(
+            try String(contentsOf: relocated.appendingPathComponent("renamed.md"), encoding: .utf8),
+            "real"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: fixture.decoy.appendingPathComponent("notes.md"), encoding: .utf8),
+            "decoy"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: fixture.decoy.appendingPathComponent("renamed.md").path
+            )
+        )
+    }
+
+    func testWorkspaceMoveFollowsTheVerifiedDestinationWhenItIsSwappedForALink() throws {
+        let fixture = try swapFixture(named: "inbox")
+        let source = root.appendingPathComponent("README.md")
+        let move = try WorkspaceFileOperations.movePlan(
+            item: source,
+            to: fixture.live.appendingPathComponent("README.md"),
+            workspaceRoot: root
+        )
+        let sourceParent = try WorkspaceFileOperations.openDirectory(root, workspaceRoot: root)
+        defer { sourceParent.close() }
+        let destinationParent = try WorkspaceFileOperations.openDirectory(
+            fixture.live,
+            workspaceRoot: root
+        )
+        defer { destinationParent.close() }
+
+        let relocated = try swapForLink(fixture.live, to: fixture.decoy)
+        try WorkspaceFileOperations.commitMove(move, from: sourceParent, to: destinationParent)
+
+        XCTAssertEqual(
+            try String(contentsOf: relocated.appendingPathComponent("README.md"), encoding: .utf8),
+            "hello"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: fixture.decoy.appendingPathComponent("README.md").path
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    func testWorkspaceTrashTargetsTheVerifiedItemWhenItsParentIsSwappedForALink() throws {
+        let fixture = try swapFixture(named: "outbox")
+        let candidate = try WorkspaceFileOperations.trashCandidate(
+            item: fixture.live.appendingPathComponent("notes.md"),
+            workspaceRoot: root
+        )
+        let parent = try WorkspaceFileOperations.openDirectory(
+            candidate.deletingLastPathComponent(),
+            workspaceRoot: root
+        )
+        defer { parent.close() }
+
+        let relocated = try swapForLink(fixture.live, to: fixture.decoy)
+        let target = try WorkspaceFileOperations.trashTarget(for: candidate, in: parent)
+
+        // The validated path itself now resolves into the decoy: that redirect
+        // is exactly what a path-based trashItem would have followed.
+        XCTAssertEqual(
+            candidate.resolvingSymlinksInPath().path,
+            fixture.decoy.appendingPathComponent("notes.md").resolvingSymlinksInPath().path
+        )
+        XCTAssertEqual(
+            target.resolvingSymlinksInPath().path,
+            relocated.appendingPathComponent("notes.md").resolvingSymlinksInPath().path
+        )
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "real")
+    }
+
     func testMoveDestinationListIsBoundedAndOmitsCurrentParentAndSourceSubtree() throws {
         let docs = root.appendingPathComponent("docs", isDirectory: true)
         let nested = docs.appendingPathComponent("nested", isDirectory: true)

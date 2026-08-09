@@ -31,6 +31,7 @@ enum CompanionPairingOfferAccessibility {
 struct CompanionSettingsTab: View {
     @ObservedObject private var host = CompanionHost.shared
     @StateObject private var offerActivation = CompanionPairingOfferActivation()
+    @StateObject private var confirmationActivation = CompanionPairingConfirmationActivation()
     @State private var allowsAgentControl = false
     @State private var allowsTerminalControl = false
     @State private var operationError: String?
@@ -242,11 +243,27 @@ struct CompanionSettingsTab: View {
                                     .font(.body.monospaced().weight(.semibold))
                                     .textSelection(.enabled)
                                 HStack {
-                                    Button("They Differ") { host.cancelPairing() }
+                                    Button("They Differ", action: cancelPairing)
                                         .buttonStyle(.bordered)
+                                        .disabled(confirmationActivation.isConfirming)
                                     Spacer()
-                                    Button("They Match") { confirmPairing() }
-                                        .buttonStyle(.borderedProminent)
+                                    Button { confirmPairing() } label: {
+                                        if confirmationActivation.isConfirming {
+                                            HStack(spacing: 5) {
+                                                ProgressView().controlSize(.mini)
+                                                Text(CompanionPairingConfirmationActivation.progressLabel)
+                                            }
+                                        } else {
+                                            Text("They Match")
+                                        }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(confirmationActivation.isConfirming)
+                                    .accessibilityLabel(
+                                        confirmationActivation.isConfirming
+                                            ? CompanionPairingConfirmationActivation.progressLabel
+                                            : "They Match"
+                                    )
                                 }
                             }
                             .padding(14)
@@ -334,6 +351,10 @@ struct CompanionSettingsTab: View {
             // user can no longer press.
             if case .ready = state { return }
             offerActivation.discard()
+            confirmationActivation.discard()
+        }
+        .onChange(of: host.pairingPhrase?.pairingID) { _, pairingID in
+            confirmationActivation.reconcile(pairingID: pairingID)
         }
         .confirmationDialog(
             "Revoke \(pendingRevocation?.displayName ?? "Device")?",
@@ -415,14 +436,27 @@ struct CompanionSettingsTab: View {
 
     private func cancelPairing() {
         offerActivation.discard()
+        confirmationActivation.discard()
         host.cancelPairing()
     }
 
     private func confirmPairing() {
+        guard let phrase = host.pairingPhrase,
+              let attempt = confirmationActivation.begin(pairingID: phrase.pairingID)
+        else { return }
         operationError = nil
         Task {
-            do { try await host.confirmPairing() }
-            catch { operationError = error.localizedDescription }
+            do {
+                try await host.confirmPairing()
+                confirmationActivation.submitted(
+                    attempt,
+                    currentPairingID: host.pairingPhrase?.pairingID
+                )
+            } catch {
+                guard confirmationActivation.fail(attempt) else { return }
+                host.cancelPairing()
+                operationError = CompanionPairingConfirmationActivation.failureMessage(error)
+            }
         }
     }
 
@@ -509,6 +543,98 @@ final class CompanionPairingOfferActivation: ObservableObject {
     func discard() {
         attempt = nil
         isCreating = false
+    }
+}
+
+/// Serializes the local SAS decision and keeps both phrase controls inert until
+/// that exact pairing either authenticates, disappears, or fails.
+///
+/// Sending the Mac's confirmation is not the same as completing the handshake:
+/// the phone may not have submitted its decision yet. The pairing identity is
+/// therefore part of the in-flight token, preventing a late task from clearing
+/// or cancelling a newer phrase.
+@MainActor
+final class CompanionPairingConfirmationActivation: ObservableObject {
+    static let progressLabel = "Confirming pairing"
+
+    struct Attempt: Equatable, Sendable {
+        let id: UUID
+        let pairingID: String
+    }
+
+    private enum Phase {
+        case idle
+        case submitting(Attempt)
+        case awaitingPeer(Attempt)
+    }
+
+    @Published private(set) var isConfirming = false
+
+    private var phase = Phase.idle
+
+    func begin(pairingID: String) -> Attempt? {
+        guard !isConfirming, !pairingID.isEmpty else { return nil }
+        let attempt = Attempt(id: UUID(), pairingID: pairingID)
+        phase = .submitting(attempt)
+        isConfirming = true
+        return attempt
+    }
+
+    /// Records that the local decision was sent. The controls stay gated while
+    /// the same phrase awaits its peer; an already-settled phrase releases them.
+    @discardableResult
+    func submitted(_ attempt: Attempt, currentPairingID: String?) -> Bool {
+        guard case let .submitting(current) = phase, current == attempt else { return false }
+        guard currentPairingID == attempt.pairingID else {
+            reset()
+            return false
+        }
+        phase = .awaitingPeer(attempt)
+        return true
+    }
+
+    /// Releases only the attempt that still owns the failure. A stale task can
+    /// never cancel a replacement pairing that has claimed a different token.
+    @discardableResult
+    func fail(_ attempt: Attempt) -> Bool {
+        guard activeAttempt == attempt else { return false }
+        reset()
+        return true
+    }
+
+    /// Pairing identity can disappear before an awaited task reports failure.
+    /// Keep a submitting attempt until that task settles, but release a
+    /// peer-waiting attempt as soon as its exact phrase completes or vanishes.
+    func reconcile(pairingID: String?) {
+        switch phase {
+        case .idle:
+            return
+        case let .submitting(attempt):
+            if let pairingID, pairingID != attempt.pairingID { reset() }
+        case let .awaitingPeer(attempt):
+            if pairingID != attempt.pairingID { reset() }
+        }
+    }
+
+    func discard() {
+        reset()
+    }
+
+    static func failureMessage(_ error: any Error) -> String {
+        "Pairing confirmation failed: \(error.localizedDescription) "
+            + "Create a new pairing code to try again."
+    }
+
+    private var activeAttempt: Attempt? {
+        switch phase {
+        case .idle: nil
+        case let .submitting(attempt), let .awaitingPeer(attempt): attempt
+        }
+    }
+
+    private func reset() {
+        phase = .idle
+        isConfirming = false
     }
 }
 

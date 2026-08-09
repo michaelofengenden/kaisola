@@ -408,6 +408,100 @@ final class CompanionHostFoundationTests: XCTestCase {
         XCTAssertTrue(source.contains("CompanionPairingOfferActivation.progressLabel"))
     }
 
+    func testPairingConfirmationRendersOneGatedProgressAndFailureRestartState() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Kaisola/Features/Settings/CompanionSettingsTab.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains(
+            "@StateObject private var confirmationActivation = CompanionPairingConfirmationActivation()"
+        ))
+        XCTAssertEqual(
+            source.components(separatedBy: ".disabled(confirmationActivation.isConfirming)").count - 1,
+            2,
+            "both phrase decisions must become inert while one confirmation owns the slot"
+        )
+        XCTAssertTrue(source.contains(
+            "Text(CompanionPairingConfirmationActivation.progressLabel)"
+        ))
+        XCTAssertTrue(source.contains(
+            "let attempt = confirmationActivation.begin(pairingID: phrase.pairingID)"
+        ))
+        XCTAssertTrue(source.contains(
+            "operationError = CompanionPairingConfirmationActivation.failureMessage(error)"
+        ))
+        XCTAssertTrue(source.contains(
+            "guard confirmationActivation.fail(attempt) else { return }\n"
+                + "                host.cancelPairing()\n"
+                + "                operationError = CompanionPairingConfirmationActivation.failureMessage(error)"
+        ))
+    }
+
+    @MainActor
+    func testPairingConfirmationStaysGatedUntilTheExactPairingSettles() throws {
+        let activation = CompanionPairingConfirmationActivation()
+        let attempt = try XCTUnwrap(activation.begin(pairingID: "pairing-1"))
+
+        XCTAssertTrue(activation.isConfirming)
+        XCTAssertNil(activation.begin(pairingID: "pairing-1"))
+        XCTAssertTrue(activation.submitted(
+            attempt,
+            currentPairingID: "pairing-1"
+        ))
+        XCTAssertTrue(
+            activation.isConfirming,
+            "sending the local SAS decision is not success until the phone settles the same pairing"
+        )
+        XCTAssertNil(activation.begin(pairingID: "pairing-1"))
+
+        activation.reconcile(pairingID: "pairing-1")
+        XCTAssertTrue(activation.isConfirming)
+        activation.reconcile(pairingID: nil)
+        XCTAssertFalse(activation.isConfirming)
+    }
+
+    @MainActor
+    func testPairingConfirmationFailureCannotCancelANewerPairing() throws {
+        let activation = CompanionPairingConfirmationActivation()
+        XCTAssertNil(activation.begin(pairingID: ""))
+        let stale = try XCTUnwrap(activation.begin(pairingID: "pairing-old"))
+
+        activation.reconcile(pairingID: "pairing-new")
+        XCTAssertFalse(activation.isConfirming)
+        let current = try XCTUnwrap(activation.begin(pairingID: "pairing-new"))
+        XCTAssertFalse(activation.fail(stale))
+        XCTAssertTrue(activation.isConfirming)
+
+        // A disconnect can clear the phrase before confirmPairing() reports
+        // failure. Keep ownership during submission so that failure still
+        // restores a clear new-offer state instead of disappearing silently.
+        activation.reconcile(pairingID: nil)
+        XCTAssertTrue(activation.isConfirming)
+        XCTAssertTrue(activation.fail(current))
+        XCTAssertFalse(activation.isConfirming)
+        XCTAssertFalse(activation.fail(current))
+    }
+
+    @MainActor
+    func testPairingConfirmationFailureMessageExplainsTheRestart() {
+        let error = NSError(
+            domain: "pairing-fixture",
+            code: 7,
+            userInfo: [NSLocalizedDescriptionKey: "Handshake timed out."]
+        )
+        XCTAssertEqual(
+            CompanionPairingConfirmationActivation.failureMessage(error),
+            "Pairing confirmation failed: Handshake timed out. Create a new pairing code to try again."
+        )
+        XCTAssertEqual(
+            CompanionPairingConfirmationActivation.progressLabel,
+            "Confirming pairing"
+        )
+    }
+
     func testPairingCodePresentationPreservesTheExactDisplayedAndCopiedValue() {
         let code = #"{"accountScope":"acct-1","pairingNonce":"aB-_09","type":"kaisola-companion-pairing"}"#
         let presentation = CompanionPairingCodePresentation(code: code)

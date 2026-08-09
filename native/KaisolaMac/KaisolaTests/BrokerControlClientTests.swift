@@ -9,6 +9,59 @@ import XCTest
 /// mutations the native app needs, every request carries the owner identity,
 /// and the connection refuses brokers that predate role enforcement.
 final class BrokerControlClientTests: XCTestCase {
+    func testOversizedWriteIsRejectedBeforeTransportSend() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        let framesBeforeWrite = await transport.sentFrames().count
+
+        do {
+            try await client.write(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                data: String(repeating: "x", count: BrokerWire.maximumEncodedBytes(for: .request("terminal.write")))
+            )
+            XCTFail("The request envelope must not widen the terminal.write byte contract.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .frameRejected)
+        }
+
+        let framesAfterWrite = await transport.sentFrames().count
+        XCTAssertEqual(framesAfterWrite, framesBeforeWrite)
+        await client.disconnect()
+    }
+
+    func testSmallMethodResponseIsRejectedBeforeJSONValueDecode() async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: .object([
+            "ok": .bool(true),
+            "padding": .string(String(repeating: "x", count: 300 * 1_024)),
+        ]))
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 500_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        do {
+            try await client.resize(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                columns: 120,
+                rows: 40
+            )
+            XCTFail("A terminal.resize response must use the small response contract.")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerWireError,
+                .frameTooLarge(maximum: BrokerWire.maximumEncodedBytes(for: .response("terminal.resize")))
+            )
+        }
+        await client.disconnect()
+    }
+
     func testResizeRequiresPositiveBrokerAcknowledgement() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: false)
         let client = BrokerControlClient(
@@ -52,6 +105,52 @@ final class BrokerControlClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testAgentTurnRequiresPositiveBrokerAcknowledgement() async throws {
+        let transport = ScriptedControlBrokerTransport(
+            resizeAccepted: true,
+            agentTurnAccepted: false
+        )
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        do {
+            try await client.setAgentTurn(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                busy: true
+            )
+            XCTFail("A refused turn leaves the broker eligible for rolling cutover.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .requestFailed("terminal.agentTurn"))
+        }
+        await client.disconnect()
+    }
+
+    func testAgentTurnAcceptsExplicitPositiveBrokerAcknowledgement() async throws {
+        let transport = ScriptedControlBrokerTransport(
+            resizeAccepted: true,
+            agentTurnAccepted: true
+        )
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.setAgentTurn(
+            projectID: "project.one",
+            terminalID: "terminal-one",
+            busy: true
+        )
+        let frames = await transport.sentFrames()
+        let request = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(request["method"]?.stringValue, "terminal.agentTurn")
+        XCTAssertEqual(request["params"]?.objectValue?["busy"]?.boolValue, true)
+        await client.disconnect()
+    }
+
     func testControllerLaneReportsUnexpectedPeerDisconnect() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
         let client = BrokerControlClient(
@@ -76,6 +175,55 @@ final class BrokerControlClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testRequestSendFailureAbortsControllerExactlyOnce() async throws {
+        let transport = ScriptedControlBrokerTransport(
+            resizeAccepted: true,
+            failFirstRequestSend: true
+        )
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        let signal = DisconnectSignal()
+        await client.setDisconnectHandler { error in
+            Task { await signal.record(error) }
+        }
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        do {
+            try await client.resize(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                columns: 120,
+                rows: 40
+            )
+            XCTFail("A failed socket send must invalidate the controller lane.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .connectionClosed)
+        }
+
+        for _ in 0..<100 {
+            if await signal.count > 0 { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        try await Task.sleep(nanoseconds: 10_000_000)
+        let disconnectCount = await signal.count
+        XCTAssertEqual(disconnectCount, 1)
+
+        do {
+            try await client.resize(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                columns: 132,
+                rows: 44
+            )
+            XCTFail("A failed controller must be reconnected before accepting another request.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .notConnected)
+        }
+        await client.disconnect()
+    }
+
     func testExplicitControllerDisconnectDoesNotReportConnectionLoss() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
         let client = BrokerControlClient(
@@ -92,6 +240,153 @@ final class BrokerControlClientTests: XCTestCase {
         try await Task.sleep(nanoseconds: 10_000_000)
         let disconnectCount = await signal.count
         XCTAssertEqual(disconnectCount, 0, "App quit/reload must not schedule a recovery reconnect.")
+    }
+
+    /// Two callers asking for the same broker at once must share one handshake.
+    /// The old single-slot waiter let the second connect overwrite the first
+    /// caller's continuation, and that caller then waited forever.
+    func testConcurrentConnectsToOneBrokerShareASingleHandshake() async throws {
+        let transport = GatedControlBrokerTransport()
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 2_000_000_000
+        )
+        let outcomes = ConnectOutcomes()
+        let info = controlBrokerInfo
+
+        let first = Task { [client] in
+            do {
+                try await client.connect(to: info, ownerID: "native-test")
+                await outcomes.record("first", failure: nil)
+            } catch {
+                await outcomes.record("first", failure: error)
+            }
+        }
+        defer { first.cancel() }
+        try await waitUntil("the first connect reaches the socket") {
+            await transport.connectAttemptCount == 1
+        }
+
+        let second = Task { [client] in
+            do {
+                try await client.connect(to: info, ownerID: "native-test")
+                await outcomes.record("second", failure: nil)
+            } catch {
+                await outcomes.record("second", failure: error)
+            }
+        }
+        defer { second.cancel() }
+        try await waitUntil("the second connect coalesces onto the first") {
+            await client.connectWaiterCount == 1
+        }
+
+        await transport.openConnectGate()
+        try await waitUntil("both callers are answered") { await outcomes.count == 2 }
+
+        let firstFailure = await outcomes.failure(for: "first")
+        let secondFailure = await outcomes.failure(for: "second")
+        let connectAttempts = await transport.connectAttemptCount
+        let helloFrames = await transport.helloFrameCount()
+        let parkedWaiters = await client.connectWaiterCount
+        XCTAssertNil(firstFailure)
+        XCTAssertNil(secondFailure)
+        XCTAssertEqual(connectAttempts, 1, "A coalesced connect must not open a second transport.")
+        XCTAssertEqual(
+            helloFrames,
+            1,
+            "Both callers must ride one handshake, not race two on a shared decoder."
+        )
+        XCTAssertEqual(
+            parkedWaiters,
+            0,
+            "Every coalesced caller must be resumed; none may be left parked."
+        )
+        await client.disconnect()
+    }
+
+    /// A concurrent connect naming a different broker is refused outright. It
+    /// must not open a second socket, and the handshake already in flight must
+    /// still answer its own caller.
+    func testConcurrentConnectToADifferentBrokerIsRefused() async throws {
+        let transport = GatedControlBrokerTransport()
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 2_000_000_000
+        )
+        let outcomes = ConnectOutcomes()
+        let info = controlBrokerInfo
+        let other = otherControlBrokerInfo
+
+        let first = Task { [client] in
+            do {
+                try await client.connect(to: info, ownerID: "native-test")
+                await outcomes.record("first", failure: nil)
+            } catch {
+                await outcomes.record("first", failure: error)
+            }
+        }
+        defer { first.cancel() }
+        try await waitUntil("the first connect reaches the socket") {
+            await transport.connectAttemptCount == 1
+        }
+
+        let second = Task { [client] in
+            do {
+                try await client.connect(to: other, ownerID: "native-test")
+                await outcomes.record("second", failure: nil)
+            } catch {
+                await outcomes.record("second", failure: error)
+            }
+        }
+        defer { second.cancel() }
+        try await waitUntil("the mismatched connect is answered") {
+            await outcomes.count == 1
+        }
+        let refusal = await outcomes.failure(for: "second")
+        XCTAssertEqual(
+            refusal as? BrokerClientError,
+            .identityChanged,
+            "A connect to another broker must be refused, not raced onto this one."
+        )
+
+        await transport.openConnectGate()
+        try await waitUntil("the original caller is answered") { await outcomes.count == 2 }
+        let firstFailure = await outcomes.failure(for: "first")
+        let paths = await transport.connectedPaths()
+        let helloFrames = await transport.helloFrameCount()
+        let parkedWaiters = await client.connectWaiterCount
+        XCTAssertNil(firstFailure, "The in-flight handshake must still answer its own caller.")
+        XCTAssertEqual(paths, [info.socketPath])
+        XCTAssertEqual(helloFrames, 1)
+        XCTAssertEqual(parkedWaiters, 0)
+        await client.disconnect()
+    }
+
+    /// Polls a condition instead of sleeping a fixed span, so a regression
+    /// fails the assertion rather than hanging the suite.
+    private func waitUntil(
+        _ description: String,
+        timeoutNanoseconds: UInt64 = 2_000_000_000,
+        _ condition: () async -> Bool
+    ) async throws {
+        let deadline = DispatchTime.now().uptimeNanoseconds + timeoutNanoseconds
+        while DispatchTime.now().uptimeNanoseconds < deadline {
+            if await condition() { return }
+            try await Task.sleep(nanoseconds: 2_000_000)
+        }
+        XCTFail("Timed out waiting for \(description).")
+    }
+
+    private var otherControlBrokerInfo: BrokerInfo {
+        BrokerInfo(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            pid: 12_346,
+            socketPath: "/tmp/kaisola-controller-test-other.sock",
+            token: String(repeating: "b", count: 64),
+            startedAt: 1_784_250_002_000,
+            version: "test"
+        )
     }
 
     func testUnixTransportShutdownWakesBlockedReceive() async throws {
@@ -116,6 +411,84 @@ final class BrokerControlClientTests: XCTestCase {
         XCTAssertTrue(didUnblock)
     }
 
+    func testReconnectToAReplacementBrokerIsRejectedWhileTheLaneIsLive() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        do {
+            try await client.connect(to: replacementBrokerInfo, ownerID: "native-test")
+            XCTFail("A live controller lane must not answer for a different broker.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
+        let helloCount = await transport.sentFrames()
+            .filter { $0.objectValue?["type"]?.stringValue == "hello" }
+            .count
+        XCTAssertEqual(helloCount, 1, "The rejected reconnect must not reshape the live handshake.")
+        await client.disconnect()
+    }
+
+    func testReconnectUnderADifferentOwnerIsRejectedWhileTheLaneIsLive() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-one")
+
+        do {
+            try await client.connect(to: controlBrokerInfo, ownerID: "native-two")
+            XCTFail("Silent reuse would keep writing as the previous owner.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
+        // The lane still speaks for the owner it connected as, which is exactly
+        // why the caller must never be told the new owner was adopted.
+        try await client.write(projectID: "project.one", terminalID: "terminal-one", data: "ls\n")
+        let frames = await transport.sentFrames()
+        let write = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(write["method"]?.stringValue, "terminal.write")
+        XCTAssertEqual(write["params"]?.objectValue?["ownerId"]?.stringValue, "native-one")
+        await client.disconnect()
+    }
+
+    func testReconnectWithTheSameIdentityReusesTheLiveConnection() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        let helloCount = await transport.sentFrames()
+            .filter { $0.objectValue?["type"]?.stringValue == "hello" }
+            .count
+        XCTAssertEqual(helloCount, 1)
+        await client.disconnect()
+    }
+
+    func testDisconnectReleasesTheIdentitySoAReplacementBrokerCanBeAdopted() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-one")
+        await client.disconnect()
+
+        try await client.connect(to: replacementBrokerInfo, ownerID: "native-two")
+        try await client.write(projectID: "project.one", terminalID: "terminal-one", data: "ls\n")
+        let frames = await transport.sentFrames()
+        let write = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(write["params"]?.objectValue?["ownerId"]?.stringValue, "native-two")
+        await client.disconnect()
+    }
+
     private var controlBrokerInfo: BrokerInfo {
         BrokerInfo(
             protocolVersion: BrokerWire.protocolVersion,
@@ -124,6 +497,19 @@ final class BrokerControlClientTests: XCTestCase {
             socketPath: "/tmp/kaisola-controller-test.sock",
             token: String(repeating: "a", count: 64),
             startedAt: 1_784_250_001_000,
+            version: "test"
+        )
+    }
+
+    /// A broker that replaced the one above: new process, new socket, new token.
+    private var replacementBrokerInfo: BrokerInfo {
+        BrokerInfo(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            pid: 12_346,
+            socketPath: "/tmp/kaisola-controller-test-next.sock",
+            token: String(repeating: "b", count: 64),
+            startedAt: 1_784_250_009_000,
             version: "test"
         )
     }
@@ -152,6 +538,172 @@ final class BrokerControlClientTests: XCTestCase {
         // Every control method is one the observer policy explicitly forbids,
         // proving the two lanes partition the wire surface.
         XCTAssertTrue(controlMethods.isSubset(of: ObserveOnlyBrokerPolicy.forbiddenTerminalMethods))
+    }
+
+    func testKillPropagatesMissingAndSignalFailureResults() async throws {
+        for (name, result) in [
+            (
+                "missing",
+                JSONValue.object([
+                    "id": .string("terminal-one"),
+                    "ok": .bool(false),
+                    "code": .string("terminal_not_found"),
+                ])
+            ),
+            (
+                "signal refusal",
+                JSONValue.object([
+                    "id": .string("terminal-one"),
+                    "ok": .bool(false),
+                    "code": .string("terminal_kill_failed"),
+                ])
+            ),
+        ] {
+            try await assertKillFails(result: result, context: name)
+        }
+    }
+
+    func testKillFailsClosedOnMissingOrMismatchedTerminalIdentity() async throws {
+        for (name, result) in [
+            (
+                "missing identity",
+                JSONValue.object(["ok": .bool(true)])
+            ),
+            (
+                "mismatched identity",
+                JSONValue.object([
+                    "id": .string("terminal-two"),
+                    "ok": .bool(true),
+                ])
+            ),
+            (
+                "non-string identity",
+                JSONValue.object([
+                    "id": .integer(1),
+                    "ok": .bool(true),
+                ])
+            ),
+            (
+                "missing acknowledgement",
+                JSONValue.object(["id": .string("terminal-one")])
+            ),
+        ] {
+            try await assertKillFails(result: result, context: name)
+        }
+    }
+
+    func testKillAcceptsAlreadyExitedForTheExactTerminal() async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: .object([
+            "id": .string("terminal-one"),
+            "ok": .bool(true),
+            "alreadyExited": .bool(true),
+        ]))
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.kill(projectID: "project.one", terminalID: "terminal-one")
+
+        let frames = await transport.sentFrames()
+        let request = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(request["method"]?.stringValue, "terminal.kill")
+        XCTAssertEqual(request["params"]?.objectValue?["projectId"]?.stringValue, "project.one")
+        XCTAssertEqual(request["params"]?.objectValue?["id"]?.stringValue, "terminal-one")
+        await client.disconnect()
+    }
+
+    private func assertKillFails(result: JSONValue, context: String) async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: result)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        do {
+            try await client.kill(projectID: "project.one", terminalID: "terminal-one")
+            XCTFail("\(context) must not be reported as a successful terminal kill")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .requestFailed("terminal.kill"), context)
+        }
+        await client.disconnect()
+    }
+
+    func testAttachPropagatesMissingTerminalResult() async throws {
+        try await assertAttachFails(
+            result: .object([
+                "id": .string("terminal-one"),
+                "ok": .bool(false),
+                "code": .string("terminal_not_found"),
+            ]),
+            context: "missing terminal"
+        )
+    }
+
+    func testAttachFailsClosedOnInvalidAcknowledgementOrIdentity() async throws {
+        for (name, result) in [
+            (
+                "missing identity",
+                JSONValue.object(["ok": .bool(true)])
+            ),
+            (
+                "mismatched identity",
+                JSONValue.object([
+                    "id": .string("terminal-two"),
+                    "ok": .bool(true),
+                ])
+            ),
+            (
+                "non-string identity",
+                JSONValue.object([
+                    "id": .integer(1),
+                    "ok": .bool(true),
+                ])
+            ),
+            (
+                "missing acknowledgement",
+                JSONValue.object(["id": .string("terminal-one")])
+            ),
+        ] {
+            try await assertAttachFails(result: result, context: name)
+        }
+    }
+
+    func testAttachAcceptsExplicitExistingTerminalIdentity() async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: .object([
+            "id": .string("terminal-one"),
+            "ok": .bool(true),
+            "exited": .bool(false),
+        ]))
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.attach(projectID: "project.one", terminalID: "terminal-one")
+
+        let frames = await transport.sentFrames()
+        let request = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(request["method"]?.stringValue, "terminal.attach")
+        XCTAssertEqual(request["params"]?.objectValue?["projectId"]?.stringValue, "project.one")
+        XCTAssertEqual(request["params"]?.objectValue?["id"]?.stringValue, "terminal-one")
+        await client.disconnect()
+    }
+
+    private func assertAttachFails(result: JSONValue, context: String) async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: result)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        do {
+            try await client.attach(projectID: "project.one", terminalID: "terminal-one")
+            XCTFail("\(context) must not be reported as a successful terminal attach")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .requestFailed("terminal.attach"), context)
+        }
+        await client.disconnect()
     }
 
     func testNewTerminalsNeutralizeOuterCLILauncherColorState() {
@@ -351,6 +903,92 @@ final class BrokerControlClientTests: XCTestCase {
     }
 }
 
+private actor ConnectOutcomes {
+    private var failures: [String: (any Error)?] = [:]
+
+    var count: Int { failures.count }
+
+    func record(_ label: String, failure: (any Error)?) {
+        failures[label] = failure
+    }
+
+    func failure(for label: String) -> (any Error)? {
+        failures[label] ?? nil
+    }
+}
+
+/// A broker double whose socket open parks until the test opens the gate, so a
+/// second connect is guaranteed to arrive while the first handshake is still in
+/// flight. Otherwise it answers hello exactly like the scripted double.
+private actor GatedControlBrokerTransport: BrokerByteTransport {
+    private(set) var connectAttemptCount = 0
+    private var paths: [String] = []
+    private var gateOpen = false
+    private var gateWaiters: [CheckedContinuation<Void, Never>] = []
+    private var frames: [JSONValue] = []
+    private var incoming: [Data?] = []
+    private var receiveWaiters: [CheckedContinuation<Data?, Never>] = []
+
+    func connect(path: String) async throws {
+        connectAttemptCount += 1
+        paths.append(path)
+        if gateOpen { return }
+        await withCheckedContinuation { continuation in
+            gateWaiters.append(continuation)
+        }
+    }
+
+    func openConnectGate() {
+        gateOpen = true
+        let parked = gateWaiters
+        gateWaiters.removeAll()
+        for continuation in parked { continuation.resume() }
+    }
+
+    func send(_ data: Data) async throws {
+        guard let newline = data.firstIndex(of: 0x0A) else {
+            throw BrokerClientError.malformedResponse
+        }
+        let frame = try JSONDecoder().decode(JSONValue.self, from: data[..<newline])
+        frames.append(frame)
+        guard frame.objectValue?["type"]?.stringValue == "hello" else { return }
+        var reply = try JSONEncoder().encode(JSONValue.object([
+            "type": .string("hello"),
+            "ok": .bool(true),
+            "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+            "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
+            "features": .array([.string(BrokerWire.terminalObserveFeature)]),
+        ]))
+        reply.append(0x0A)
+        deliver(reply)
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !incoming.isEmpty { return incoming.removeFirst() }
+        return await withCheckedContinuation { continuation in
+            receiveWaiters.append(continuation)
+        }
+    }
+
+    func close() async {
+        deliver(nil)
+    }
+
+    func connectedPaths() -> [String] { paths }
+
+    func helloFrameCount() -> Int {
+        frames.filter { $0.objectValue?["type"]?.stringValue == "hello" }.count
+    }
+
+    private func deliver(_ data: Data?) {
+        if receiveWaiters.isEmpty {
+            incoming.append(data)
+        } else {
+            receiveWaiters.removeFirst().resume(returning: data)
+        }
+    }
+}
+
 private actor DisconnectSignal {
     private(set) var count = 0
     private(set) var lastDescription: String?
@@ -363,12 +1001,105 @@ private actor DisconnectSignal {
 
 private actor ScriptedControlBrokerTransport: BrokerByteTransport {
     private let resizeAccepted: Bool
+    private let agentTurnAccepted: Bool
+    private var failFirstRequestSend: Bool
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []
     private var waiter: CheckedContinuation<Data?, Never>?
 
-    init(resizeAccepted: Bool) {
+    init(
+        resizeAccepted: Bool,
+        agentTurnAccepted: Bool = true,
+        failFirstRequestSend: Bool = false
+    ) {
         self.resizeAccepted = resizeAccepted
+        self.agentTurnAccepted = agentTurnAccepted
+        self.failFirstRequestSend = failFirstRequestSend
+    }
+
+    func connect(path: String) async throws {}
+
+    func send(_ data: Data) async throws {
+        guard let newline = data.firstIndex(of: 0x0A) else {
+            throw BrokerClientError.malformedResponse
+        }
+        let frame = try JSONDecoder().decode(JSONValue.self, from: data[..<newline])
+        frames.append(frame)
+        guard let object = frame.objectValue,
+              let type = object["type"]?.stringValue else { return }
+        if type == "hello" {
+            deliver(try encoded(.object([
+                "type": .string("hello"),
+                "ok": .bool(true),
+                "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+                "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
+                "features": .array([.string(BrokerWire.terminalObserveFeature)]),
+            ])))
+            return
+        }
+        if failFirstRequestSend {
+            failFirstRequestSend = false
+            throw BrokerClientError.connectionClosed
+        }
+        guard type == "request", let id = object["id"]?.stringValue else { return }
+        let result: JSONValue
+        switch object["method"]?.stringValue {
+        case "terminal.resize":
+            result = .object(["ok": .bool(resizeAccepted)])
+        case "terminal.agentTurn":
+            result = .object(["ok": .bool(agentTurnAccepted)])
+        default:
+            result = .object(["ok": .bool(true)])
+        }
+        deliver(try encoded(.object([
+            "type": .string("response"),
+            "id": .string(id),
+            "ok": .bool(true),
+            "result": result,
+        ])))
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !incoming.isEmpty { return incoming.removeFirst() }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func close() async {
+        deliver(nil)
+    }
+
+    func disconnectPeer() {
+        deliver(nil)
+    }
+
+    func sentFrames() -> [JSONValue] { frames }
+
+    private func encoded(_ frame: JSONValue) throws -> Data {
+        var data = try JSONEncoder().encode(frame)
+        data.append(0x0A)
+        return data
+    }
+
+    private func deliver(_ data: Data?) {
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            incoming.append(data)
+        }
+    }
+}
+
+/// Dedicated fixture keeps nested result-shape tests independent from the
+/// shared controller fixture used by transport and resize contracts.
+private actor ScriptedControlResultBrokerTransport: BrokerByteTransport {
+    private let result: JSONValue
+    private var frames: [JSONValue] = []
+    private var incoming: [Data?] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+
+    init(result: JSONValue) {
+        self.result = result
     }
 
     func connect(path: String) async throws {}
@@ -392,12 +1123,6 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
             return
         }
         guard type == "request", let id = object["id"]?.stringValue else { return }
-        let result: JSONValue
-        if object["method"]?.stringValue == "terminal.resize" {
-            result = .object(["ok": .bool(resizeAccepted)])
-        } else {
-            result = .object(["ok": .bool(true)])
-        }
         deliver(try encoded(.object([
             "type": .string("response"),
             "id": .string(id),
@@ -412,10 +1137,6 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
     }
 
     func close() async {
-        deliver(nil)
-    }
-
-    func disconnectPeer() {
         deliver(nil)
     }
 

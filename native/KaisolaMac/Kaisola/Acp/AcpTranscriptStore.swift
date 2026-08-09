@@ -17,6 +17,193 @@ struct AcpPersistedUsage: Codable, Equatable, Sendable {
     var costCurrency: String?
 }
 
+/// Privacy-bounded, deterministic Markdown rendering for a transcript export.
+/// Visible user/assistant prose and plans remain Markdown. Hidden reasoning,
+/// raw tool results, diffs, terminal output, and attachment payloads never enter
+/// the document; their visible summaries or explicit omission markers do.
+enum AcpTranscriptMarkdownExport {
+    struct Request: Equatable, Sendable {
+        var title: String
+        var agentID: String
+        var agentName: String?
+        var modelID: String?
+        var exportedAt: Date
+    }
+
+    struct Receipt: Equatable, Sendable {
+        var rowCount: Int
+        var startOrdinal: Int64
+        var byteCount: Int
+        var includedPendingChanges: Bool
+    }
+
+    static func markdown(
+        request: Request,
+        updatedAt: Date?,
+        startOrdinal: Int64,
+        rows: [AcpTranscriptRow],
+        attachments: [AcpAttachment],
+        retentionStatus: AcpTranscriptStore.RetentionStatus
+    ) -> String {
+        var sections: [String] = []
+        sections.append("# \(singleLine(request.title))")
+        var metadata = [
+            "- Exported: \(timestamp(request.exportedAt))",
+            "- Agent: \(agentLabel(request))",
+        ]
+        if let updatedAt { metadata.insert("- Last updated: \(timestamp(updatedAt))", at: 1) }
+        if let modelID = normalized(request.modelID) { metadata.append("- Model: \(singleLine(modelID))") }
+        metadata.append("- Stored range starts at ordinal: \(max(0, startOrdinal))")
+        sections.append(metadata.joined(separator: "\n"))
+
+        if retentionStatus.isTruncated {
+            sections.append(
+                "> [Earlier retained history truncated: \(retentionStatus.truncatedRowCount) rows, "
+                    + "\(retentionStatus.truncatedByteCount) bytes]"
+            )
+        } else if startOrdinal > 0 {
+            sections.append("> [Earlier transcript rows are outside this retained export range]"
+            )
+        }
+
+        var hiddenReasoningCount = 0
+        for row in rows {
+            switch row {
+            case let .user(_, text, failed):
+                let state = failed ? " (send failed)" : ""
+                var section = "## User\(state)\n\n\(visibleBody(text))"
+                if namesAttachment(in: text) {
+                    section += "\n\n> [Attachment payload omitted; the transcript retains filename(s) only]"
+                }
+                sections.append(section)
+            case let .message(_, text):
+                sections.append("## Assistant\n\n\(visibleBody(text))")
+            case .thought:
+                hiddenReasoningCount += 1
+            case let .tool(call):
+                sections.append(toolSummary(call))
+            case let .plan(_, entries):
+                sections.append(planSummary(entries))
+            }
+        }
+        if hiddenReasoningCount > 0 {
+            sections.append(
+                "> [\(hiddenReasoningCount) hidden reasoning "
+                    + "\(hiddenReasoningCount == 1 ? "row" : "rows") omitted]"
+            )
+        }
+        if !attachments.isEmpty {
+            let markers = attachments.map { attachment -> String in
+                switch attachment {
+                case let .image(_, mimeType, name):
+                    return "- [Binary image omitted: \(singleLine(name)) (\(singleLine(mimeType)))]"
+                case let .textFile(_, _, name):
+                    return "- [Embedded text attachment omitted: \(singleLine(name))]"
+                }
+            }
+            sections.append("## Attachments\n\n" + markers.joined(separator: "\n"))
+        }
+        return sections.joined(separator: "\n\n") + "\n"
+    }
+
+    static func lastAssistantResponse(in rows: [AcpTranscriptRow]) -> String? {
+        rows.reversed().compactMap { row -> String? in
+            guard case let .message(_, text) = row, !text.isEmpty else { return nil }
+            return text
+        }.first
+    }
+
+    static func suggestedFileName(for title: String) -> String {
+        sanitizedStem(title) + "-transcript.md"
+    }
+
+    private static func toolSummary(_ call: AcpToolCall) -> String {
+        var textCount = 0
+        var diffCount = 0
+        var terminalCount = 0
+        for content in call.content {
+            switch content {
+            case .text: textCount += 1
+            case .diff: diffCount += 1
+            case .terminal: terminalCount += 1
+            }
+        }
+        var lines = [
+            "## Tool result summary",
+            "",
+            "- Tool: \(singleLine(call.title))",
+            "- Kind: \(singleLine(call.kind))",
+            "- Status: \(call.status.rawValue)",
+        ]
+        let artifacts = [
+            countLabel(textCount, singular: "text block", plural: "text blocks"),
+            countLabel(diffCount, singular: "diff", plural: "diffs"),
+            countLabel(terminalCount, singular: "terminal", plural: "terminals"),
+        ].compactMap { $0 }
+        if !artifacts.isEmpty {
+            lines.append("- Result artifacts omitted: " + artifacts.joined(separator: ", "))
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static func planSummary(_ entries: [AcpPlanEntry]) -> String {
+        let lines = entries.map { entry in
+            let checked = entry.status.lowercased() == "completed" ? "x" : " "
+            return "- [\(checked)] \(singleLine(entry.content)) "
+                + "(\(singleLine(entry.priority)); \(singleLine(entry.status)))"
+        }
+        return "## Plan\n\n" + (lines.isEmpty ? "- [No plan entries]" : lines.joined(separator: "\n"))
+    }
+
+    private static func visibleBody(_ text: String) -> String {
+        text.isEmpty ? "[Empty visible message]" : text
+    }
+
+    private static func namesAttachment(in text: String) -> Bool {
+        text.split(separator: "\n", omittingEmptySubsequences: false).contains { line in
+            line.hasPrefix("📎 ")
+        }
+    }
+
+    private static func agentLabel(_ request: Request) -> String {
+        let id = singleLine(request.agentID)
+        guard let name = normalized(request.agentName) else { return id }
+        return "\(singleLine(name)) (\(id))"
+    }
+
+    private static func normalized(_ value: String?) -> String? {
+        guard let value else { return nil }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
+    }
+
+    private static func singleLine(_ value: String) -> String {
+        let joined = value.split(whereSeparator: \.isNewline).joined(separator: " ")
+        let controls = CharacterSet.controlCharacters
+        return String(joined.unicodeScalars.filter { !controls.contains($0) })
+    }
+
+    private static func timestamp(_ date: Date) -> String {
+        ISO8601DateFormatter().string(from: date)
+    }
+
+    private static func countLabel(_ count: Int, singular: String, plural: String) -> String? {
+        guard count > 0 else { return nil }
+        return "\(count) \(count == 1 ? singular : plural)"
+    }
+
+    private static func sanitizedStem(_ title: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let stem = title.lowercased().unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(String(scalar)) : "-"
+        }
+        let compact = String(stem)
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .joined(separator: "-")
+        return compact.isEmpty ? "chat" : compact
+    }
+}
+
 /// Mode-0600, actor-serialized transcript persistence for native ACP cards.
 /// Provider `session/resume` restores the agent's internal context; this store
 /// restores what the user can see immediately without decoding an unbounded
@@ -522,6 +709,68 @@ actor AcpTranscriptStore {
             chatID: chatID,
             startOrdinal: rowWrite.startOrdinal,
             rows: rowWrite.rows
+        )
+    }
+
+    /// Write a complete retained transcript straight from this store actor to
+    /// disk. The UI receives only the small receipt, so a paged chat never has
+    /// to materialize its older rows on the main actor. A terminal persistence
+    /// failure keeps its exact queued snapshot authoritative: durable rows
+    /// before that snapshot are joined with the pending tail for recovery.
+    func exportMarkdown(
+        for chatID: String,
+        request: AcpTranscriptMarkdownExport.Request,
+        to destination: URL
+    ) throws -> AcpTranscriptMarkdownExport.Receipt {
+        guard Self.validChatID(chatID), destination.isFileURL else {
+            throw StoreError.database("Transcript export destination is invalid")
+        }
+        let pendingWrite = pending[chatID]
+        let database = try openDatabase()
+        try ensureRetentionPolicyApplied(chatID: chatID, database: database)
+        let storedMetadata = try readMetadata(chatID: chatID, database: database)
+        var ordinalRows = try readAllOrdinalRows(chatID: chatID, database: database)
+
+        if let rowWrite = pendingWrite?.rows {
+            ordinalRows.removeAll { $0.ordinal >= rowWrite.startOrdinal }
+            ordinalRows.append(contentsOf: rowWrite.rows.enumerated().map { offset, row in
+                (ordinal: rowWrite.startOrdinal + Int64(offset), row: row)
+            })
+        }
+        guard storedMetadata != nil || pendingWrite != nil || !ordinalRows.isEmpty else {
+            throw StoreError.database("No transcript is available to export")
+        }
+
+        let attachments: [AcpAttachment]
+        switch pendingWrite?.attachments {
+        case let .set(value): attachments = value ?? []
+        case .unchanged, nil: attachments = storedMetadata?.attachments ?? []
+        }
+        let updatedAtMilliseconds = max(
+            storedMetadata?.updatedAt ?? 0,
+            pendingWrite?.updatedAt ?? 0
+        )
+        let markdown = AcpTranscriptMarkdownExport.markdown(
+            request: request,
+            updatedAt: updatedAtMilliseconds > 0
+                ? Date(timeIntervalSince1970: Double(updatedAtMilliseconds) / 1_000)
+                : nil,
+            startOrdinal: ordinalRows.first?.ordinal ?? pendingWrite?.rows?.startOrdinal ?? 0,
+            rows: ordinalRows.map(\.row),
+            attachments: attachments,
+            retentionStatus: storedMetadata?.retentionStatus ?? .empty
+        )
+        let data = Data(markdown.utf8)
+        try data.write(to: destination, options: .atomic)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: destination.path
+        )
+        return AcpTranscriptMarkdownExport.Receipt(
+            rowCount: ordinalRows.count,
+            startOrdinal: ordinalRows.first?.ordinal ?? pendingWrite?.rows?.startOrdinal ?? 0,
+            byteCount: data.count,
+            includedPendingChanges: pendingWrite != nil
         )
     }
 
@@ -1856,21 +2105,28 @@ actor AcpTranscriptStore {
     }
 
     private func readAllRows(chatID: String, database: SQLiteHandle) throws -> [AcpTranscriptRow] {
+        try readAllOrdinalRows(chatID: chatID, database: database).map(\.row)
+    }
+
+    private func readAllOrdinalRows(
+        chatID: String,
+        database: SQLiteHandle
+    ) throws -> [(ordinal: Int64, row: AcpTranscriptRow)] {
         try withStatement(
-            "SELECT row_json FROM transcript_rows WHERE chat_id = ? ORDER BY ordinal ASC",
+            "SELECT ordinal, row_json FROM transcript_rows WHERE chat_id = ? ORDER BY ordinal ASC",
             database: database
         ) { statement in
             try bind(chatID, at: 1, statement: statement, database: database)
-            var rows: [AcpTranscriptRow] = []
+            var rows: [(ordinal: Int64, row: AcpTranscriptRow)] = []
             while true {
                 let result = sqlite3_step(statement)
                 if result == SQLITE_DONE { return rows }
                 guard result == SQLITE_ROW,
-                      let data = Self.columnData(statement, column: 0),
+                      let data = Self.columnData(statement, column: 1),
                       let row = try? decoder.decode(AcpTranscriptRow.self, from: data) else {
                     throw StoreError.corruptRecord("stored transcript row could not be decoded")
                 }
-                rows.append(row)
+                rows.append((sqlite3_column_int64(statement, 0), row))
             }
         }
     }

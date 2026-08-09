@@ -26,6 +26,7 @@ struct AcpChatView: View {
     @State private var transcriptIsAtBottom = true
     @State private var hasUnseenTranscriptUpdates = false
     @State private var transcriptConversationID: ObjectIdentifier?
+    @State private var isExportingTranscript = false
     @FocusState private var composerFocused: Bool
     private let focusRequestGeneration: UInt64?
     private let onKeyboardFocus: (() -> Void)?
@@ -320,6 +321,65 @@ struct AcpChatView: View {
                     .foregroundStyle(.secondary)
                     .help("Cumulative cost reported by this agent session")
                     .accessibilityLabel("Session cost \(cost)")
+            }
+        }
+        Menu {
+            Button("Copy Last Response") { copyLastResponse() }
+                .disabled(conversation.lastAssistantResponse == nil)
+            Button("Export/Open as Markdown…") { exportAndOpenMarkdown() }
+                .disabled(
+                    isExportingTranscript
+                        || (conversation.rows.isEmpty && conversation.hiddenEarlierCount == 0)
+                )
+        } label: {
+            if isExportingTranscript {
+                ProgressView().controlSize(.mini)
+            } else {
+                Image(systemName: "square.and.arrow.up")
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Copy or export this conversation")
+        .accessibilityLabel("Conversation export actions")
+        .accessibilityIdentifier("acp.transcriptExportMenu")
+    }
+
+    @MainActor
+    private func copyLastResponse() {
+        guard let response = conversation.lastAssistantResponse else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(response, forType: .string) else {
+            ToastCenter.shared.show("Could not copy the last response.", style: .error)
+            return
+        }
+        ToastCenter.shared.show("Last response copied.", style: .success)
+    }
+
+    @MainActor
+    private func exportAndOpenMarkdown() {
+        let panel = NSSavePanel()
+        panel.title = "Export and Open Chat as Markdown"
+        panel.prompt = "Export & Open"
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = AcpTranscriptMarkdownExport.suggestedFileName(
+            for: conversation.title
+        )
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        isExportingTranscript = true
+        Task { @MainActor in
+            defer { isExportingTranscript = false }
+            do {
+                _ = try await conversation.exportTranscriptMarkdown(to: destination)
+                guard NSWorkspace.shared.open(destination) else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
+            } catch {
+                ToastCenter.shared.show(
+                    "Could not export the chat as Markdown: \(error.localizedDescription)",
+                    style: .error
+                )
             }
         }
     }

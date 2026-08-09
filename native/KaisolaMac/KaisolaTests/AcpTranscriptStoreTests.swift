@@ -1331,4 +1331,190 @@ final class AcpTranscriptStoreTests: XCTestCase {
             "agent-project-transcript-recovery.json"
         )
     }
+
+    func testMarkdownFormatterPreservesVisibleMarkdownAndOmitsPrivateArtifacts() throws {
+        let rows: [AcpTranscriptRow] = [
+            .user(
+                id: "1",
+                text: "Please review:\n```swift\nlet answer = 42\n```\n📎 screenshot.png",
+                failed: false
+            ),
+            .message(id: "2", text: "Done.\n\n```diff\n-old\n+new\n```"),
+            .thought(id: "3", text: "HIDDEN_REASONING_SECRET"),
+            .tool(AcpToolCall(
+                id: "tool-1",
+                title: "Read config",
+                kind: "read",
+                status: .completed,
+                content: [
+                    .text("API_KEY=TOOL_RESULT_SECRET"),
+                    .diff(path: "secrets.env", oldText: "OLD_SECRET", newText: "NEW_SECRET"),
+                    .terminal(id: "terminal-secret"),
+                ],
+                locations: ["/private/secret/path"]
+            )),
+            .plan(id: "plan-1", entries: [
+                .init(id: "step-1", content: "Ship it", priority: "high", status: "completed"),
+            ]),
+        ]
+        let markdown = AcpTranscriptMarkdownExport.markdown(
+            request: .init(
+                title: "Agent / Project",
+                agentID: "test-agent",
+                agentName: "Test Agent",
+                modelID: "model-1",
+                exportedAt: Date(timeIntervalSince1970: 1_700_000_000)
+            ),
+            updatedAt: Date(timeIntervalSince1970: 1_690_000_000),
+            startOrdinal: 0,
+            rows: rows,
+            attachments: [
+                .image(
+                    data: Data("BINARY_ATTACHMENT_SECRET".utf8),
+                    mimeType: "image/png",
+                    name: "screenshot.png"
+                ),
+                .textFile(
+                    path: "/private/notes.txt",
+                    contents: "TEXT_ATTACHMENT_SECRET",
+                    name: "notes.txt"
+                ),
+            ],
+            retentionStatus: .init(truncatedRowCount: 3, truncatedByteCount: 256)
+        )
+
+        XCTAssertTrue(markdown.contains("# Agent / Project"))
+        XCTAssertTrue(markdown.contains("- Exported: 2023-11-14T22:13:20Z"))
+        XCTAssertTrue(markdown.contains("- Agent: Test Agent (test-agent)"))
+        XCTAssertTrue(markdown.contains("- Model: model-1"))
+        XCTAssertTrue(markdown.contains("```swift\nlet answer = 42\n```"))
+        XCTAssertTrue(markdown.contains("```diff\n-old\n+new\n```"))
+        XCTAssertTrue(markdown.contains("- Tool: Read config"))
+        XCTAssertTrue(markdown.contains("- Result artifacts omitted: 1 text block, 1 diff, 1 terminal"))
+        XCTAssertTrue(markdown.contains("- [x] Ship it (high; completed)"))
+        XCTAssertTrue(markdown.contains("[Binary image omitted: screenshot.png (image/png)]"))
+        XCTAssertTrue(markdown.contains("[Embedded text attachment omitted: notes.txt]"))
+        XCTAssertTrue(markdown.contains("[Attachment payload omitted; the transcript retains filename(s) only]"))
+        XCTAssertTrue(markdown.contains("[1 hidden reasoning row omitted]"))
+        XCTAssertTrue(markdown.contains("[Earlier retained history truncated: 3 rows, 256 bytes]"))
+        XCTAssertFalse(markdown.contains("HIDDEN_REASONING_SECRET"))
+        XCTAssertFalse(markdown.contains("TOOL_RESULT_SECRET"))
+        XCTAssertFalse(markdown.contains("OLD_SECRET"))
+        XCTAssertFalse(markdown.contains("NEW_SECRET"))
+        XCTAssertFalse(markdown.contains("terminal-secret"))
+        XCTAssertFalse(markdown.contains("/private/secret/path"))
+        XCTAssertFalse(markdown.contains("BINARY_ATTACHMENT_SECRET"))
+        XCTAssertFalse(markdown.contains("TEXT_ATTACHMENT_SECRET"))
+        XCTAssertEqual(
+            AcpTranscriptMarkdownExport.lastAssistantResponse(in: rows),
+            "Done.\n\n```diff\n-old\n+new\n```"
+        )
+        XCTAssertEqual(
+            AcpTranscriptMarkdownExport.suggestedFileName(for: "Agent / Project"),
+            "agent-project-transcript.md"
+        )
+    }
+
+    func testMarkdownExportReadsTheCompletePagedTranscriptDirectlyToDisk() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rows = (0 ..< 250).map { AcpTranscriptRow.message(id: "\($0)", text: "response-\($0)") }
+        await store.scheduleSave(rows, for: "chat-export", now: 1_700_000_000)
+        await store.scheduleAttachments([
+            .image(data: Data([0, 1, 2]), mimeType: "image/png", name: "diagram.png"),
+        ], for: "chat-export", now: 1_700_000_001)
+        await store.flush()
+
+        let restorationOutcome = await store.restoration(for: "chat-export", tailLimit: 20)
+        let restoration = try XCTUnwrap(restorationOutcome.restoration)
+        XCTAssertEqual(restoration.page.rows.count, 20)
+        XCTAssertEqual(restoration.page.earlierRowCount, 230)
+
+        let destination = directory.appendingPathComponent("complete.md")
+        let receipt = try await store.exportMarkdown(
+            for: "chat-export",
+            request: .init(
+                title: "Paged chat",
+                agentID: "codex",
+                agentName: "Codex",
+                modelID: "gpt-test",
+                exportedAt: Date(timeIntervalSince1970: 1_700_000_100)
+            ),
+            to: destination
+        )
+        let markdown = try String(contentsOf: destination, encoding: .utf8)
+        let permissions = try FileManager.default.attributesOfItem(atPath: destination.path)[.posixPermissions] as? Int
+
+        XCTAssertEqual(receipt.rowCount, 250)
+        XCTAssertEqual(receipt.startOrdinal, 0)
+        XCTAssertFalse(receipt.includedPendingChanges)
+        XCTAssertTrue(markdown.contains("response-0"))
+        XCTAssertTrue(markdown.contains("response-249"))
+        XCTAssertTrue(markdown.contains("[Binary image omitted: diagram.png (image/png)]"))
+        XCTAssertEqual(permissions.map { $0 & 0o777 }, 0o600)
+    }
+
+    func testMarkdownExportIncludesTheExactTerminalFailureSnapshot() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-export-health-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let store = AcpTranscriptStore(
+            databaseURL: directory.appendingPathComponent("transcripts.sqlite3"),
+            schedulesAutomaticFlush: false,
+            injectedFlushFailureCount: AcpTranscriptStore.maximumPersistenceAttempts
+        )
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "1", text: "question", failed: false),
+            .message(id: "2", text: "newest unsaved response"),
+        ]
+        await store.scheduleSave(rows, for: "chat-failed", startOrdinal: 0, now: 12)
+        await store.flush()
+        let retryingHealth = await store.persistenceHealth(for: "chat-failed")
+        XCTAssertEqual(
+            retryingHealth,
+            .retrying(attempt: 1, maximumAttempts: AcpTranscriptStore.maximumPersistenceAttempts)
+        )
+        let retryingDestination = directory.appendingPathComponent("retrying.md")
+        _ = try await store.exportMarkdown(
+            for: "chat-failed",
+            request: .init(
+                title: "Unsaved chat",
+                agentID: "claude",
+                agentName: "Claude",
+                modelID: nil,
+                exportedAt: Date(timeIntervalSince1970: 19)
+            ),
+            to: retryingDestination
+        )
+        let healthAfterRetryingExport = await store.persistenceHealth(for: "chat-failed")
+        XCTAssertEqual(
+            healthAfterRetryingExport,
+            retryingHealth,
+            "export must not consume an automatic persistence retry"
+        )
+        for _ in 1 ..< AcpTranscriptStore.maximumPersistenceAttempts { await store.flush() }
+        let failedHealth = await store.persistenceHealth(for: "chat-failed")
+        XCTAssertNotNil(failedHealth.failure)
+
+        let destination = directory.appendingPathComponent("recovery.md")
+        let receipt = try await store.exportMarkdown(
+            for: "chat-failed",
+            request: .init(
+                title: "Unsaved chat",
+                agentID: "claude",
+                agentName: "Claude",
+                modelID: nil,
+                exportedAt: Date(timeIntervalSince1970: 20)
+            ),
+            to: destination
+        )
+        let markdown = try String(contentsOf: destination, encoding: .utf8)
+
+        XCTAssertTrue(receipt.includedPendingChanges)
+        XCTAssertEqual(receipt.rowCount, 2)
+        XCTAssertTrue(markdown.contains("question"))
+        XCTAssertTrue(markdown.contains("newest unsaved response"))
+        let healthAfterExport = await store.persistenceHealth(for: "chat-failed")
+        XCTAssertNotNil(healthAfterExport.failure)
+    }
 }

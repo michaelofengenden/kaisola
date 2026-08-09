@@ -3228,6 +3228,9 @@ final class AppModel: ObservableObject {
             arguments: adapter.arguments,
             environment: environment,
             cwd: directory.path,
+            transcriptAgentID: agent.id,
+            transcriptAgentName: agent.name,
+            transcriptModelID: modelOverride,
             mcpServers: McpConfigStore.jsonValues(mcp),
             sensitiveGlobs: NativePreviewSettings.shared.sensitiveGlobs,
             draftKey: chatID,
@@ -3300,6 +3303,14 @@ final class AppModel: ObservableObject {
         }
         conversation.onRetryTranscriptPersistence = { [weak self] in
             self?.retryTranscriptPersistence(chatID: chatID)
+        }
+        let exportStore = transcriptStore
+        conversation.onExportTranscriptMarkdown = { request, destination in
+            try await exportStore.exportMarkdown(
+                for: chatID,
+                request: request,
+                to: destination
+            )
         }
         let healthStore = transcriptStore
         Task { [weak conversation] in

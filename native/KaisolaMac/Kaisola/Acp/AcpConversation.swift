@@ -234,6 +234,13 @@ final class AcpConversation: ObservableObject {
     /// stays independent of the concrete disk stores used by the native shell.
     var onTranscriptChanged: ((_ rows: [AcpTranscriptRow], _ startOrdinal: Int64) -> Void)?
     var onRetryTranscriptPersistence: (() -> Void)?
+    /// The owner writes a complete retained Markdown export from its transcript
+    /// actor. Keeping the hook async means older pages never pass through this
+    /// MainActor presentation model merely to reach disk.
+    var onExportTranscriptMarkdown: ((
+        _ request: AcpTranscriptMarkdownExport.Request,
+        _ destination: URL
+    ) async throws -> AcpTranscriptMarkdownExport.Receipt)?
     /// Bounded page loader injected by AppModel (or MeshSession) so this
     /// presentation model remains independent of the concrete SQLite store.
     var loadEarlierRows: ((_ beforeOrdinal: Int64, _ limit: Int) async -> AcpTranscriptStore.Page?)?
@@ -285,6 +292,9 @@ final class AcpConversation: ObservableObject {
     private let arguments: [String]
     private let environment: [String: String]
     private let cwd: String
+    private let transcriptAgentID: String
+    private let transcriptAgentName: String?
+    private let transcriptModelID: String?
     private let mcpServers: [JSONValue]
     private let ruleStore: PermissionRuleStore
     private let sensitiveGlobs: [String]
@@ -326,6 +336,9 @@ final class AcpConversation: ObservableObject {
         arguments: [String],
         environment: [String: String] = ProcessInfo.processInfo.environment,
         cwd: String,
+        transcriptAgentID: String = "unknown-agent",
+        transcriptAgentName: String? = nil,
+        transcriptModelID: String? = nil,
         mcpServers: [JSONValue] = [],
         client: AcpClient? = nil,
         clientFactory: (@MainActor () -> AcpClient)? = nil,
@@ -348,6 +361,9 @@ final class AcpConversation: ObservableObject {
         self.arguments = arguments
         self.environment = environment
         self.cwd = cwd
+        self.transcriptAgentID = transcriptAgentID
+        self.transcriptAgentName = transcriptAgentName
+        self.transcriptModelID = transcriptModelID
         self.mcpServers = mcpServers
         let factory = clientFactory ?? { AcpClient() }
         self.clientFactory = factory
@@ -1102,6 +1118,33 @@ final class AcpConversation: ObservableObject {
             self.pendingDraftPersistence = nil
             self.onDraftChanged?(pending)
         }
+    }
+
+    /// The latest visible assistant prose, deliberately excluding thought,
+    /// tool, and plan rows that may follow it. The restored tail always contains
+    /// the end of the conversation, so this remains bounded for paged chats.
+    var lastAssistantResponse: String? {
+        AcpTranscriptMarkdownExport.lastAssistantResponse(in: rows)
+    }
+
+    func exportTranscriptMarkdown(
+        to destination: URL,
+        exportedAt: Date = Date()
+    ) async throws -> AcpTranscriptMarkdownExport.Receipt {
+        guard let onExportTranscriptMarkdown else {
+            throw AcpTranscriptStore.StoreError.database("Transcript export is unavailable")
+        }
+        let modelID = currentModelID ?? transcriptModelID
+        return try await onExportTranscriptMarkdown(
+            AcpTranscriptMarkdownExport.Request(
+                title: title,
+                agentID: transcriptAgentID,
+                agentName: transcriptAgentName,
+                modelID: modelID,
+                exportedAt: exportedAt
+            ),
+            destination
+        )
     }
 
     // MARK: - Test hooks

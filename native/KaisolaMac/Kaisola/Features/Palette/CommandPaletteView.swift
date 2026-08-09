@@ -127,20 +127,20 @@ struct CommandPaletteView: View {
         return HStack(spacing: 10) {
             Image(systemName: item.systemImage)
                 .frame(width: 18)
-                .foregroundStyle(selected ? selectedText : .secondary)
+                .foregroundStyle(selected ? selectedText : .kaisolaSecondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.title)
                     .foregroundStyle(selected ? selectedText : .primary)
                 Text(item.disabledReason ?? item.subtitle)
                     .font(.caption)
-                    .foregroundStyle(selected ? selectedText.opacity(0.78) : .secondary)
+                    .foregroundStyle(selected ? selectedText.opacity(0.78) : .kaisolaSecondary)
                     .lineLimit(2)
             }
             Spacer()
             if let shortcutHint = item.shortcutHint {
                 Text(shortcutHint)
                     .font(.caption.monospaced())
-                    .foregroundStyle(selected ? selectedText.opacity(0.8) : .secondary)
+                    .foregroundStyle(selected ? selectedText.opacity(0.8) : .kaisolaSecondary)
                     .accessibilityHidden(true)
             }
         }

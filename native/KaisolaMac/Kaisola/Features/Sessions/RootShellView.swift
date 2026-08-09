@@ -2285,6 +2285,10 @@ struct RootShellView: View {
         if unifiedTerminalDocument(id) != nil,
            let feed = model.terminalSurfaceFeed(for: id) {
             let owned = model.isOwned(id)
+            let authority = TerminalSurfaceAuthority(
+                isOwned: owned,
+                hasDurableOwnership: model.canClose(id)
+            )
             ZStack(alignment: .top) {
                 TerminalSurfaceFeedView(feed: feed) { liveDocument in
                     NativeTerminalSurface(
@@ -2294,7 +2298,7 @@ struct RootShellView: View {
                         scrollback: liveDocument.scrollback,
                         surfaceDelta: liveDocument.surfaceDelta,
                         workingDirectory: model.directory(for: id),
-                        isOwned: owned,
+                        authority: authority,
                         fontSize: settings.terminalFontSize,
                         fontFamily: settings.terminalFontFamily,
                         fontWeight: settings.terminalFontWeight,
@@ -2313,11 +2317,11 @@ struct RootShellView: View {
                         onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) }
                     )
                 }
-                // A reconnect can promote an observed surface to an owned one
-                // after inventory is already visible. The concrete AppKit class is
-                // part of the input-safety boundary: remount so a formerly
-                // ReadOnlyTerminalView can never keep swallowing owned keystrokes.
-                .id("unified-\(id)-\(owned)")
+                // Live controller ownership may flap while the control socket
+                // reconnects. Keep the exact parsed view for durable local
+                // sessions and revoke its input capability in place; only a
+                // genuine observer/controller class change may remount.
+                .id("unified-\(id)-\(authority.controllerCapable)")
                 .onAppear { fulfillTerminalKeyboardFocusRequest(for: id) }
                 .onChange(of: model.keyboardFocusRequest) { _, _ in
                     fulfillTerminalKeyboardFocusRequest(for: id)

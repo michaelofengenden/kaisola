@@ -700,6 +700,43 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    func testStaleSurfaceCallbackCannotWriteAcrossVisualOwnershipFlap() async throws {
+        let fixture = try VisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        await fixture.model.reload()
+        let fixtureConnectionCount = await fixture.control.connectionCount()
+        XCTAssertEqual(
+            fixtureConnectionCount,
+            0,
+            "A fixture-side reload must remain broker-free even if future UI automation invokes it."
+        )
+        let staleSurfaceCallback = {
+            fixture.model.sendInput("stale", to: "visual-terminal")
+        }
+
+        // Both packets are accepted while owned but remain queued until the
+        // drain task gets an actor turn. Revocation must invalidate that whole
+        // capability generation, not leave them waiting for the next owner.
+        fixture.model.sendInput("queued-stale-1", to: "visual-terminal")
+        fixture.model.sendInput("queued-stale-2", to: "visual-terminal")
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(false))
+        staleSurfaceCallback()
+        await Task.yield()
+        let staleWrites = await fixture.control.writes()
+        XCTAssertTrue(
+            staleWrites.isEmpty,
+            "AppModel must reject a stale callback even after the view-level capability is revoked."
+        )
+
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(true))
+        fixture.model.sendInput("live", to: "visual-terminal")
+        await waitUntil { await fixture.control.writes().count == 1 }
+        let liveWrites = await fixture.control.writes()
+        XCTAssertEqual(liveWrites, ["live"])
+        await fixture.model.disconnect()
+    }
+
     func testInputToAnUnownedTerminalExplainsItselfInsteadOfVanishing() async throws {
         let fixture = try Fixture(failingConnectAttempts: Set(2...20))
         defer { fixture.cleanUp() }

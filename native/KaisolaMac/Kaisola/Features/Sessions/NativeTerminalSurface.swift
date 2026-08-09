@@ -10,6 +10,35 @@ extension Notification.Name {
     static let kaisolaOpenFileLink = Notification.Name("kaisolaOpenFileLink")
 }
 
+/// Separates the durable AppKit surface class from the controller connection's
+/// live write authority.
+///
+/// A terminal Kaisola created remains controller-capable while its control
+/// socket reconnects, so a brief ownership publication must not replace its
+/// parsed SwiftTerm view. The `active` bit is still revoked immediately and is
+/// the only state that enables outbound bytes. A genuinely foreign terminal
+/// stays on `ReadOnlyTerminalView` by construction.
+enum TerminalSurfaceAuthority: Equatable {
+    case observerOnly
+    case localController(active: Bool)
+
+    init(isOwned: Bool, hasDurableOwnership: Bool) {
+        self = isOwned || hasDurableOwnership
+            ? .localController(active: isOwned)
+            : .observerOnly
+    }
+
+    var controllerCapable: Bool {
+        if case .localController = self { return true }
+        return false
+    }
+
+    var inputEnabled: Bool {
+        if case .localController(active: true) = self { return true }
+        return false
+    }
+}
+
 /// Redraws only a terminal card when its document advances. The parent shell
 /// passes stable configuration and closures, while the high-frequency document
 /// lives in a dedicated observable object that does not invalidate the rest of
@@ -45,9 +74,10 @@ struct NativeTerminalSurface: NSViewRepresentable {
     /// Initial directory used to resolve the relative file citations emitted
     /// by agent CLIs. OSC 7 updates replace it as the shell changes directory.
     var workingDirectory: URL? = nil
-    // Input exists only for sessions the native app owns; observed sessions
-    // keep the sealed read-only view whose send path is compiled away.
-    var isOwned: Bool = false
+    /// Durable class eligibility and independently revocable live authority.
+    /// See `TerminalSurfaceAuthority` for why controller reconnects must not
+    /// change the concrete AppKit view.
+    let authority: TerminalSurfaceAuthority
     /// Terminal font size (⌘+/⌘−/⌘0 via NativePreviewSettings).
     var fontSize: Double = NativePreviewSettings.terminalFontDefault
     var fontFamily: String = TerminalFontOptions.systemMonoSentinel
@@ -90,7 +120,10 @@ struct NativeTerminalSurface: NSViewRepresentable {
         // render state that describes it can never be mismatched. See
         // `TerminalSurfaceCache` for why they must move together.
         if let sessionID,
-           let claimed = TerminalSurfaceCache.shared.claim(sessionID: sessionID, isOwned: isOwned) {
+           let claimed = TerminalSurfaceCache.shared.claim(
+               sessionID: sessionID,
+               controllerCapable: authority.controllerCapable
+           ) {
             claimed.coordinator.reusedView = claimed.view
             return claimed.coordinator
         }
@@ -102,6 +135,10 @@ struct NativeTerminalSurface: NSViewRepresentable {
         // the view and its render state so returning to this project re-attaches
         // the already-parsed terminal instead of replaying the transcript.
         guard let sessionID = coordinator.retainedSessionID else { return }
+        // Deny at the concrete view before clearing delegate callbacks. A
+        // parked surface remains a live object in the cache and must never
+        // retain keyboard, mouse-reporting, paste, or drop authority.
+        (view as? OwnedTerminalView)?.setInputAuthorized(false)
         coordinator.prepareForRetention()
         view.onHistoryBoundary = nil
         // Parked surfaces must not retain the shell (and its AppModel) through
@@ -122,7 +159,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             configureReusedView(reused, context: context)
             return reused
         }
-        let view: ReadOnlyTerminalView = isOwned
+        let view: ReadOnlyTerminalView = authority.controllerCapable
             ? OwnedTerminalView(frame: .zero, font: font)
             : ReadOnlyTerminalView(frame: .zero, font: font)
         // SwiftTerm's overlay scroller follows the system auto-hide policy and
@@ -142,14 +179,12 @@ struct NativeTerminalSurface: NSViewRepresentable {
         view.configureJumpToLiveBottomAffordance()
         view.terminalDelegate = context.coordinator
         view.configureTerminalTheme(light: lightSurface, themeID: themeID)
-        view.allowMouseReporting = isOwned
         view.configureLinkInteraction()
         Self.configureKeyboardInput(on: view)
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
         view.paneSessionID = sessionID
         view.onKeyboardFocus = onKeyboardFocus
-        view.setAccessibilityLabel(isOwned ? "Terminal" : "Read-only terminal output")
         TerminalScrollGestureMonitor.install()
         let coordinator = context.coordinator
         view.onUsableLayout = { [weak view, weak coordinator] in
@@ -158,9 +193,14 @@ struct NativeTerminalSurface: NSViewRepresentable {
             coordinator.repinAfterLayout(view)
             coordinator.synchronizeCurrentGeometry(from: view)
         }
-        context.coordinator.onInput = onInput
-        context.coordinator.setResizeHandler(onResize, synchronizing: view)
-        context.coordinator.onTitleChange = onTitleChange
+        Self.configureAuthority(
+            authority,
+            on: view,
+            coordinator: context.coordinator,
+            onInput: onInput,
+            onResize: onResize,
+            onTitleChange: onTitleChange
+        )
         context.coordinator.onBell = onBell
         context.coordinator.allowsClipboardWrite = allowsClipboardWrite
         context.coordinator.setBaseWorkingDirectory(workingDirectory)
@@ -184,7 +224,6 @@ struct NativeTerminalSurface: NSViewRepresentable {
         view.scrollerStyle = .legacy
         view.terminalDelegate = coordinator
         view.configureTerminalTheme(light: lightSurface, themeID: themeID)
-        view.allowMouseReporting = isOwned
         Self.configureKeyboardInput(on: view)
         view.agentLaunchCommand = agentLaunchCommand
         view.onHistoryBoundary = onHistoryBoundary
@@ -199,18 +238,28 @@ struct NativeTerminalSurface: NSViewRepresentable {
             coordinator.repinAfterLayout(view)
             coordinator.synchronizeCurrentGeometry(from: view)
         }
-        coordinator.onInput = onInput
-        coordinator.setResizeHandler(onResize, synchronizing: view)
-        coordinator.onTitleChange = onTitleChange
+        Self.configureAuthority(
+            authority,
+            on: view,
+            coordinator: coordinator,
+            onInput: onInput,
+            onResize: onResize,
+            onTitleChange: onTitleChange
+        )
         coordinator.onBell = onBell
         coordinator.allowsClipboardWrite = allowsClipboardWrite
         coordinator.setBaseWorkingDirectory(workingDirectory)
     }
 
     func updateNSView(_ view: ReadOnlyTerminalView, context: Context) {
-        context.coordinator.onInput = onInput
-        context.coordinator.setResizeHandler(onResize, synchronizing: view)
-        context.coordinator.onTitleChange = onTitleChange
+        Self.configureAuthority(
+            authority,
+            on: view,
+            coordinator: context.coordinator,
+            onInput: onInput,
+            onResize: onResize,
+            onTitleChange: onTitleChange
+        )
         context.coordinator.onBell = onBell
         context.coordinator.allowsClipboardWrite = allowsClipboardWrite
         context.coordinator.setBaseWorkingDirectory(workingDirectory)
@@ -246,6 +295,38 @@ struct NativeTerminalSurface: NSViewRepresentable {
         "\(themeID):\(light ? "light" : "dark")"
     }
 
+    /// Rebind a controller-capable surface without ever leaving a stale write
+    /// window. Revocation seals the view before callbacks disappear; granting
+    /// installs every callback before the view may emit a byte. Read-only views
+    /// ignore grants and remain non-promotable.
+    @MainActor
+    static func configureAuthority(
+        _ authority: TerminalSurfaceAuthority,
+        on view: ReadOnlyTerminalView,
+        coordinator: Coordinator,
+        onInput: ((String) -> Void)?,
+        onResize: ((_ columns: Int, _ rows: Int) -> Void)?,
+        onTitleChange: ((String) -> Void)?
+    ) {
+        if authority.inputEnabled,
+           let ownedView = view as? OwnedTerminalView {
+            coordinator.onInput = onInput
+            coordinator.setResizeHandler(onResize, synchronizing: view)
+            coordinator.setTitleChangeHandler(onTitleChange)
+            coordinator.setInputAuthorized(true)
+            ownedView.setInputAuthorized(true)
+            view.setAccessibilityLabel("Terminal")
+        } else {
+            (view as? OwnedTerminalView)?.setInputAuthorized(false)
+            view.allowMouseReporting = false
+            view.setAccessibilityLabel("Read-only terminal output")
+            coordinator.setInputAuthorized(false)
+            coordinator.onInput = nil
+            coordinator.setResizeHandler(nil, synchronizing: view)
+            coordinator.setTitleChangeHandler(nil)
+        }
+    }
+
     /// Keep Option available to the active keyboard layout. Hard-wiring it to
     /// Meta turns international-layout characters such as @, brackets, braces,
     /// pipes, tildes, and dead-key accents into escape sequences. A future user
@@ -278,6 +359,13 @@ struct NativeTerminalSurface: NSViewRepresentable {
 
     @MainActor
     final class Coordinator: NSObject, @preconcurrency TerminalViewDelegate {
+        struct ReplayMetrics: Equatable {
+            var fullReplayStarts: Int = 0
+            var scheduledProgressiveBytes: Int = 0
+            var progressiveBytesFed: Int = 0
+            var synchronousReplayBytes: Int = 0
+        }
+
         var onInput: ((String) -> Void)?
         var onResize: ((_ columns: Int, _ rows: Int) -> Void)?
         var onTitleChange: ((String) -> Void)?
@@ -306,6 +394,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
         private var hasRendered = false
         private(set) var directDeltaApplyCount = 0
         private(set) var scrollbackFlattenCount = 0
+        private(set) var replayMetrics = ReplayMetrics()
+        /// Explicit second gate beneath `OwnedTerminalView`. A stale delegate
+        /// call cannot cross an ownership transition even before AppModel and
+        /// the broker perform their independent owner checks.
+        private var isInputAuthorized = false
         private var resourceFixtureReceiptEmitted = false
         /// Large retained transcripts are replayed a slice per main-actor turn
         /// instead of monopolizing the click that mounted the pane. SwiftTerm's
@@ -403,10 +496,30 @@ struct NativeTerminalSurface: NSViewRepresentable {
         /// Clearing the resize handler also makes the next owned reattachment
         /// an explicit activation, which force-synchronizes current geometry.
         func prepareForRetention() {
+            isInputAuthorized = false
             onInput = nil
             onResize = nil
-            onTitleChange = nil
+            setTitleChangeHandler(nil)
             onBell = nil
+        }
+
+        func setInputAuthorized(_ authorized: Bool) {
+            isInputAuthorized = authorized
+        }
+
+        /// Revocation also discards a title waiting in the trailing debounce.
+        /// Otherwise a title parsed while owned could publish into a callback
+        /// rebound after a reconnect and mutate a now-observed session.
+        func setTitleChangeHandler(_ handler: ((String) -> Void)?) {
+            onTitleChange = handler
+            guard handler == nil else { return }
+            NSObject.cancelPreviousPerformRequests(
+                withTarget: self,
+                selector: #selector(deliverPendingTitleChange),
+                object: nil
+            )
+            pendingTitleChange = nil
+            titleChangeDeliveryScheduled = false
         }
 
         /// BEL-heavy TUIs may emit several bytes for one logical prompt. Keep
@@ -527,6 +640,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             let startOffset = endOffset.map { $0 - Int64(scrollback.byteCount) }
 
             if !hasRendered {
+                replayMetrics.fullReplayStarts += 1
                 if scrollback.byteCount > Self.progressiveReplayThresholdBytes {
                     beginProgressiveReplay(
                         scrollback: scrollback,
@@ -537,6 +651,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
                     )
                     return
                 }
+                replayMetrics.synchronousReplayBytes += scrollback.byteCount
                 feed(pages: scrollback.pages, to: view, suppressReplies: true)
                 renderedEpoch = epoch
                 renderedStartOffset = startOffset
@@ -583,6 +698,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
                 view.getTerminal().resetToInitialState()
                 userUnpinned = false
                 hasRendered = false
+                replayMetrics.fullReplayStarts += 1
                 if scrollback.byteCount > Self.progressiveReplayThresholdBytes {
                     beginProgressiveReplay(
                         scrollback: scrollback,
@@ -593,6 +709,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
                     )
                     return
                 }
+                replayMetrics.synchronousReplayBytes += scrollback.byteCount
                 feed(pages: scrollback.pages, to: view, suppressReplies: true)
             }
             renderedEpoch = epoch
@@ -626,6 +743,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             let startOffset = endOffset.map { $0 - outputBytes }
 
             if !hasRendered {
+                replayMetrics.fullReplayStarts += 1
                 if output.utf8.count > Self.progressiveReplayThresholdBytes {
                     beginProgressiveReplay(
                         output: output,
@@ -636,7 +754,10 @@ struct NativeTerminalSurface: NSViewRepresentable {
                     )
                     return
                 }
-                if !output.isEmpty { feed(output, to: view, suppressReplies: true) }
+                if !output.isEmpty {
+                    replayMetrics.synchronousReplayBytes += output.utf8.count
+                    feed(output, to: view, suppressReplies: true)
+                }
                 renderedEpoch = epoch
                 renderedStartOffset = startOffset
                 renderedEndOffset = endOffset
@@ -700,7 +821,11 @@ struct NativeTerminalSurface: NSViewRepresentable {
                 // prior scroll targeted the now-discarded scrollback, so re-pin to
                 // live output (Electron parity: remounts follow the newest bytes).
                 userUnpinned = false
-                if !output.isEmpty { feed(output, to: view, suppressReplies: true) }
+                replayMetrics.fullReplayStarts += 1
+                if !output.isEmpty {
+                    replayMetrics.synchronousReplayBytes += output.utf8.count
+                    feed(output, to: view, suppressReplies: true)
+                }
             }
             renderedEpoch = epoch
             renderedStartOffset = startOffset
@@ -720,6 +845,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             to view: ReadOnlyTerminalView
         ) {
             progressiveReplayTask?.cancel()
+            replayMetrics.scheduledProgressiveBytes += output.utf8.count
             isProgressivelyReplaying = true
             queuedDuringProgressiveReplay = nil
             progressiveReplayTask = Task { @MainActor [weak self, weak view] in
@@ -740,6 +866,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
                         suppressReplies: true,
                         scrollAfter: isFinalChunk
                     )
+                    self.replayMetrics.progressiveBytesFed += output[cursor..<next].utf8.count
                     cursor = next
                     if !isFinalChunk { await Task.yield() }
                 }
@@ -785,6 +912,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             to view: ReadOnlyTerminalView
         ) {
             progressiveReplayTask?.cancel()
+            replayMetrics.scheduledProgressiveBytes += scrollback.byteCount
             isProgressivelyReplaying = true
             queuedPagedDuringProgressiveReplay = nil
             progressiveReplayTask = Task { @MainActor [weak self, weak view] in
@@ -807,6 +935,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
                             suppressReplies: true,
                             scrollAfter: isFinalChunk
                         )
+                        self.replayMetrics.progressiveBytesFed += page[cursor..<next].utf8.count
                         cursor = next
                         if !isFinalChunk { await Task.yield() }
                     }
@@ -1044,7 +1173,10 @@ struct NativeTerminalSurface: NSViewRepresentable {
         func send(source: TerminalView, data: ArraySlice<UInt8>) {
             // Reached only from OwnedTerminalView: the read-only subclass
             // swallows every byte before the delegate can see it.
-            guard !suppressReplayReplies, let onInput, !data.isEmpty else { return }
+            guard isInputAuthorized,
+                  !suppressReplayReplies,
+                  let onInput,
+                  !data.isEmpty else { return }
             onInput(String(decoding: data, as: UTF8.self))
         }
 
@@ -1900,6 +2032,26 @@ class ReadOnlyTerminalView: TerminalView {
         bounds.width > 1 && bounds.height > 1
     }
 
+    override init(frame: CGRect, font: NSFont?) {
+        super.init(frame: frame, font: font)
+        configureSealedPresentation()
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        configureSealedPresentation()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        configureSealedPresentation()
+    }
+
+    private func configureSealedPresentation() {
+        allowMouseReporting = false
+        setAccessibilityLabel("Read-only terminal output")
+    }
+
     /// Typed bytes reaching a read-only surface used to vanish without a
     /// word — during the 2026-08-07 phantom-owner incident that silence WAS
     /// the user-visible bug ("can't type"). The bytes still go nowhere (this
@@ -1910,6 +2062,10 @@ class ReadOnlyTerminalView: TerminalView {
     private static var lastReadOnlyNoticeAt: Date?
 
     override func send(source: Terminal, data: ArraySlice<UInt8>) {
+        notifyReadOnlyInput()
+    }
+
+    func notifyReadOnlyInput() {
         let now = Date()
         if Self.lastReadOnlyNoticeAt.map({ now.timeIntervalSince($0) > 3 }) ?? true {
             Self.lastReadOnlyNoticeAt = now
@@ -2920,14 +3076,38 @@ enum TerminalScrollGestureMonitor {
 /// forwards to the broker controller connection.
 final class OwnedTerminalView: ReadOnlyTerminalView {
     private var fileDropActive = false
+    private(set) var isInputAuthorized = false
+
+    /// The concrete class expresses durable controller eligibility; this
+    /// revocable capability expresses whether this exact controller connection
+    /// owns the PTY right now. Default-denied prevents a just-created or reused
+    /// view from emitting before the coordinator callbacks are fully rebound.
+    func setInputAuthorized(_ authorized: Bool) {
+        guard isInputAuthorized != authorized else {
+            allowMouseReporting = authorized
+            setAccessibilityLabel(authorized ? "Terminal" : "Read-only terminal output")
+            reconcileInputAffordances()
+            return
+        }
+        isInputAuthorized = authorized
+        allowMouseReporting = authorized
+        setAccessibilityLabel(authorized ? "Terminal" : "Read-only terminal output")
+        reconcileInputAffordances()
+    }
 
     override func send(source: Terminal, data: ArraySlice<UInt8>) {
+        guard isInputAuthorized else {
+            notifyReadOnlyInput()
+            return
+        }
         terminalDelegate?.send(source: self, data: data)
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let menu = super.menu(for: event) ?? NSMenu(title: "Terminal")
-        addContextItem("Paste", action: #selector(paste(_:)), to: menu, at: min(1, menu.items.count))
+        if isInputAuthorized {
+            addContextItem("Paste", action: #selector(paste(_:)), to: menu, at: min(1, menu.items.count))
+        }
         return menu
     }
 
@@ -2938,6 +3118,10 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
     /// image-specific key to Codex only when an image is actually present;
     /// ordinary text continues through SwiftTerm's bracketed-paste path.
     override func paste(_ sender: Any) {
+        guard isInputAuthorized else {
+            notifyReadOnlyInput()
+            return
+        }
         if agentLaunchCommand == "codex",
            TerminalImageDrop.pasteboardContainsImage(.general) {
             send(source: getTerminal(), data: ArraySlice([0x16]))
@@ -2963,6 +3147,7 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
     /// still Control-V, which in a plain shell is the literal-next-character
     /// quote and must keep working.
     func handleControlVIfImagePresent() -> Bool {
+        guard isInputAuthorized else { return false }
         guard let plan = TerminalImageDrop.pastePlan(
             from: .general,
             syntax: TerminalImageDrop.syntax(forLaunchCommand: agentLaunchCommand)
@@ -2984,7 +3169,8 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
     /// horizontal case needs only `getCursorLocation()`. Vertical movement is
     /// allowed solely when OSC 133 proves both rows are active prompt input.
     override func mouseUp(with event: NSEvent) {
-        guard shouldHandleOptionClick(event),
+        guard isInputAuthorized,
+              shouldHandleOptionClick(event),
               let cell = terminalCell(at: convert(event.locationInWindow, from: nil)),
               // A scrolled-back viewport row is not the cursor's screen row.
               isViewportAtLiveBottom
@@ -3077,13 +3263,15 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
     }
 
     override func draggingEntered(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        let accepts = !droppedFileURLs(from: sender.draggingPasteboard).isEmpty
+        let accepts = isInputAuthorized
+            && !droppedFileURLs(from: sender.draggingPasteboard).isEmpty
         setFileDropActive(accepts)
         return accepts ? .copy : []
     }
 
     override func draggingUpdated(_ sender: any NSDraggingInfo) -> NSDragOperation {
-        let accepts = !droppedFileURLs(from: sender.draggingPasteboard).isEmpty
+        let accepts = isInputAuthorized
+            && !droppedFileURLs(from: sender.draggingPasteboard).isEmpty
         setFileDropActive(accepts)
         return accepts ? .copy : []
     }
@@ -3093,12 +3281,19 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
     }
 
     override func prepareForDragOperation(_ sender: any NSDraggingInfo) -> Bool {
-        !droppedFileURLs(from: sender.draggingPasteboard).isEmpty
+        isInputAuthorized && !droppedFileURLs(from: sender.draggingPasteboard).isEmpty
     }
 
     override func performDragOperation(_ sender: any NSDraggingInfo) -> Bool {
         defer { setFileDropActive(false) }
-        let urls = droppedFileURLs(from: sender.draggingPasteboard)
+        return performFileDrop(urls: droppedFileURLs(from: sender.draggingPasteboard))
+    }
+
+    /// Testable core shared with AppKit drag delivery. Authorization is checked
+    /// before an image can be staged or an insertion plan can be constructed.
+    @discardableResult
+    func performFileDrop(urls: [URL]) -> Bool {
+        guard isInputAuthorized else { return false }
         let plan = Self.droppedFilePlan(urls, agentLaunchCommand: agentLaunchCommand)
         guard !plan.text.isEmpty else { return false }
         window?.makeFirstResponder(self)
@@ -3111,6 +3306,7 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
     /// Shared by the drop and the paste paths so a clipboard image and a
     /// dropped one reach the CLI by exactly the same route.
     private func insert(_ plan: TerminalImageDrop.InsertionPlan) {
+        guard isInputAuthorized else { return }
         let terminal = getTerminal()
         if terminal.bracketedPasteMode {
             send(source: terminal, data: ArraySlice(Array("\u{1B}[200~".utf8)))
@@ -3153,44 +3349,54 @@ final class OwnedTerminalView: ReadOnlyTerminalView {
             && modifierFlags.intersection(.deviceIndependentFlagsMask) == .control
     }
 
-    override func viewDidMoveToWindow() {
-        super.viewDidMoveToWindow()
-        if window == nil {
+    /// Shared by the local key monitor and tests so Shift+Enter cannot bypass
+    /// the same revocable `send` gate as ordinary keys and paste.
+    @discardableResult
+    func sendShiftEnter() -> Bool {
+        guard isInputAuthorized else { return false }
+        send(source: getTerminal(), data: ArraySlice([0x1B, 0x0D]))
+        return true
+    }
+
+    private func reconcileInputAffordances() {
+        guard isInputAuthorized, window != nil else {
             unregisterDraggedTypes()
             setFileDropActive(false)
             if let shiftEnterMonitor {
                 NSEvent.removeMonitor(shiftEnterMonitor)
                 self.shiftEnterMonitor = nil
             }
-        } else if shiftEnterMonitor == nil {
-            registerForDraggedTypes([.fileURL])
-            shiftEnterMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                let isShiftEnter = Self.shouldHandleShiftEnter(
-                    keyCode: event.keyCode,
-                    modifierFlags: event.modifierFlags
-                )
-                let isControlV = Self.shouldConsiderControlV(
-                    keyCode: event.keyCode,
-                    modifierFlags: event.modifierFlags
-                )
-                guard isShiftEnter || isControlV else { return event }
-                // Local monitors fire on the main thread; NSEvent itself must
-                // stay outside the isolation hop (it isn't Sendable).
-                let handled = MainActor.assumeIsolated { () -> Bool in
-                    // Only claim the keystroke when THIS view is the first
-                    // responder of the KEY window — otherwise a background
-                    // window's terminal would swallow a Shift+Enter meant for
-                    // whatever the user is actually focused on.
-                    guard let self,
-                          let window = self.window,
-                          window.isKeyWindow,
-                          window.firstResponder === self else { return false }
-                    if isControlV { return self.handleControlVIfImagePresent() }
-                    self.terminalDelegate?.send(source: self, data: ArraySlice([0x1B, 0x0D]))
-                    return true
-                }
-                return handled ? nil : event
-            }
+            return
         }
+        registerForDraggedTypes([.fileURL])
+        guard shiftEnterMonitor == nil else { return }
+        shiftEnterMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            let isShiftEnter = Self.shouldHandleShiftEnter(
+                keyCode: event.keyCode,
+                modifierFlags: event.modifierFlags
+            )
+            let isControlV = Self.shouldConsiderControlV(
+                keyCode: event.keyCode,
+                modifierFlags: event.modifierFlags
+            )
+            guard isShiftEnter || isControlV else { return event }
+            // Local monitors fire on the main thread; NSEvent itself must stay
+            // outside the isolation hop (it isn't Sendable).
+            let handled = MainActor.assumeIsolated { () -> Bool in
+                guard let self,
+                      self.isInputAuthorized,
+                      let window = self.window,
+                      window.isKeyWindow,
+                      window.firstResponder === self else { return false }
+                if isControlV { return self.handleControlVIfImagePresent() }
+                return self.sendShiftEnter()
+            }
+            return handled ? nil : event
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        reconcileInputAffordances()
     }
 }

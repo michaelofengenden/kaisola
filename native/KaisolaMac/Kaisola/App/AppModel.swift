@@ -302,9 +302,14 @@ final class AppModel: ObservableObject {
         let projectID: String
         let data: String
         let opensAgentTurn: Bool
+        let generation: UInt64
     }
     private var terminalInputQueues: [String: [PendingTerminalInput]] = [:]
     private var terminalInputDrainTasks: [String: Task<Void, Never>] = [:]
+    /// Ownership is a revocable capability. Bytes accepted under one
+    /// generation must never drain after that capability disappears and a
+    /// later controller reattaches to the same PTY.
+    private var terminalInputGenerations: [String: UInt64] = [:]
     private var terminalInputFailureNoticeAt: [String: Date] = [:]
     /// Broker PTYs can emit hundreds of small packets in one display interval.
     /// Merge contiguous packets for 16 ms so a 64 MiB retained document is
@@ -4096,19 +4101,29 @@ final class AppModel: ObservableObject {
         selectedSession = sessions[0]
         selectedSessionID = sessions[0].id
 
-        let requestedResourceBytes = ProcessInfo.processInfo.environment[
-            "KAISOLA_NATIVE_RESOURCE_SCROLLBACK_BYTES"
-        ].flatMap(Int.init)
-        let resourceScrollback: TerminalScrollback? = if visualSurface != "terminal-transcript",
-                                                         visualSurface != "terminal-semantic",
-                                                         visualSurface != "terminal-scroll-output",
-                                                         let requestedResourceBytes,
-                                                         requestedResourceBytes > 0 {
-            VisualTerminalResourceFixture.scrollback(
-                targetBytes: min(requestedResourceBytes, TerminalDocument.maximumRetainedBytes)
-            )
+        let requestedResourceBytes = visualSurface == "terminal-ownership-flap"
+            ? TerminalDocument.maximumRetainedBytes
+            : ProcessInfo.processInfo.environment[
+                "KAISOLA_NATIVE_RESOURCE_SCROLLBACK_BYTES"
+            ].flatMap(Int.init)
+        let resourceScrollback: TerminalScrollback?
+        if visualSurface != "terminal-transcript",
+           visualSurface != "terminal-semantic",
+           visualSurface != "terminal-scroll-output",
+           let requestedResourceBytes,
+           requestedResourceBytes > 0 {
+            let targetBytes = min(requestedResourceBytes, TerminalDocument.maximumRetainedBytes)
+            if visualSurface == "terminal-ownership-flap" {
+                resourceScrollback = VisualTerminalOwnershipFlapFixture.scrollback(
+                    targetBytes: targetBytes
+                )
+            } else {
+                resourceScrollback = VisualTerminalResourceFixture.scrollback(
+                    targetBytes: targetBytes
+                )
+            }
         } else {
-            nil
+            resourceScrollback = nil
         }
         let output: String
         if visualSurface == "terminal-transcript" {
@@ -4186,6 +4201,27 @@ final class AppModel: ObservableObject {
             splitOrder = [sessions[1].id]
             paneLayouts[project.id]?.add(sessions[1].id)
         }
+    }
+
+    /// Broker-free ownership transition used by hosted visual QA and unit
+    /// fixtures. Production models never set `usesVisualFixtureTransport`, so
+    /// this cannot alter a live controller or terminal.
+    @discardableResult
+    func setVisualFixtureTerminalOwnership(
+        _ owned: Bool,
+        terminalID: String = "visual-terminal"
+    ) -> Bool {
+        guard usesVisualFixtureTransport,
+              sessions.contains(where: { $0.id == terminalID && !$0.exited }) else {
+            return false
+        }
+        if owned {
+            ownedTerminalIDs.insert(terminalID)
+        } else {
+            invalidateTerminalInput(for: terminalID)
+            ownedTerminalIDs.remove(terminalID)
+        }
+        return true
     }
 
     /// Feed the broker-free streaming fixture through the same 16 ms output
@@ -4276,6 +4312,10 @@ final class AppModel: ObservableObject {
     }
 
     func reload() async {
+        // Hosted visual fixtures are deliberately broker-free. Even an
+        // accidental menu command or future fixture interaction must not turn
+        // their otherwise inert live clients into a real broker connection.
+        guard !usesVisualFixtureTransport else { return }
         flushPendingTerminalOutputs()
         hasStarted = true
         shouldReconnect = true
@@ -5216,36 +5256,52 @@ final class AppModel: ObservableObject {
             reportTerminalInputFailure(terminalID)
             return
         }
+        let inputGeneration = terminalInputGenerations[terminalID, default: 0]
         terminalInputQueues[terminalID, default: []].append(PendingTerminalInput(
             projectID: projectID,
             data: data,
-            opensAgentTurn: opensAgentTurn
+            opensAgentTurn: opensAgentTurn,
+            generation: inputGeneration
         ))
         guard terminalInputDrainTasks[terminalID] == nil else { return }
         terminalInputDrainTasks[terminalID] = Task { [weak self] in
-            await self?.drainTerminalInputQueue(terminalID)
+            await self?.drainTerminalInputQueue(
+                terminalID,
+                generation: inputGeneration
+            )
         }
     }
 
     /// One consumer per PTY makes keyboard bytes FIFO by construction. The
     /// previous fire-and-forget Task per key depended on actor scheduling order
     /// and swallowed every mutation error.
-    private func drainTerminalInputQueue(_ terminalID: String) async {
-        defer { terminalInputDrainTasks[terminalID] = nil }
+    private func drainTerminalInputQueue(
+        _ terminalID: String,
+        generation: UInt64
+    ) async {
+        defer {
+            if terminalInputGenerations[terminalID, default: 0] == generation {
+                terminalInputDrainTasks[terminalID] = nil
+            }
+        }
         while !Task.isCancelled,
+              terminalInputGenerations[terminalID, default: 0] == generation,
               controlAvailable,
               isOwned(terminalID),
               var queue = terminalInputQueues[terminalID],
               !queue.isEmpty {
             let packet = queue.removeFirst()
             terminalInputQueues[terminalID] = queue
+            guard packet.generation == generation else { continue }
             do {
                 try await controlClient.write(
                     projectID: packet.projectID,
                     terminalID: terminalID,
                     data: packet.data
                 )
-                if packet.opensAgentTurn {
+                if packet.opensAgentTurn,
+                   terminalInputGenerations[terminalID, default: 0] == generation,
+                   isOwned(terminalID) {
                     try? await controlClient.setAgentTurn(
                         projectID: packet.projectID,
                         terminalID: terminalID,
@@ -5253,7 +5309,13 @@ final class AppModel: ObservableObject {
                     )
                 }
             } catch {
-                terminalInputQueues.removeValue(forKey: terminalID)
+                // An invalidated generation may finish its cancelled transport
+                // await after a fresh owner has already queued input. It must
+                // not erase that new queue or tear down the replacement lane.
+                guard terminalInputGenerations[terminalID, default: 0] == generation else {
+                    return
+                }
+                invalidateAllTerminalInput()
                 reportTerminalInputFailure(terminalID)
                 guard controlAvailable else { return }
                 controlAvailable = false
@@ -5262,8 +5324,27 @@ final class AppModel: ObservableObject {
                 return
             }
         }
-        if terminalInputQueues[terminalID]?.isEmpty == true {
+        if terminalInputGenerations[terminalID, default: 0] == generation,
+           terminalInputQueues[terminalID]?.isEmpty == true {
             terminalInputQueues.removeValue(forKey: terminalID)
+        }
+    }
+
+    /// Cancel and forget bytes accepted under the terminal's previous owner
+    /// capability. Generation fencing also keeps an old task's `defer` or
+    /// transport error from clearing a new drain installed after reattachment.
+    private func invalidateTerminalInput(for terminalID: String) {
+        terminalInputGenerations[terminalID, default: 0] &+= 1
+        terminalInputDrainTasks.removeValue(forKey: terminalID)?.cancel()
+        terminalInputQueues.removeValue(forKey: terminalID)
+    }
+
+    private func invalidateAllTerminalInput() {
+        let terminalIDs = Set(terminalInputQueues.keys)
+            .union(terminalInputDrainTasks.keys)
+            .union(ownedTerminalIDs)
+        for terminalID in terminalIDs {
+            invalidateTerminalInput(for: terminalID)
         }
     }
 
@@ -5500,8 +5581,7 @@ final class AppModel: ObservableObject {
         terminalResizeGeneration.removeValue(forKey: terminalID)
         desiredTerminalGeometry.removeValue(forKey: terminalID)
         lastTerminalSize.removeValue(forKey: terminalID)
-        terminalInputDrainTasks.removeValue(forKey: terminalID)?.cancel()
-        terminalInputQueues.removeValue(forKey: terminalID)
+        invalidateTerminalInput(for: terminalID)
         terminalInputFailureNoticeAt.removeValue(forKey: terminalID)
         ownedTerminalIDs.remove(terminalID)
         companionControlledTerminalIDs.remove(terminalID)
@@ -5878,11 +5958,13 @@ final class AppModel: ObservableObject {
         topology: BrokerGenerationTopology,
         generation: Int
     ) async {
+        invalidateAllTerminalInput()
         controlAvailable = false
         ownedTerminalIDs = []
         await controlClient.setDisconnectHandler { [weak self] error in
             Task { @MainActor in
                 guard let self, self.controlAvailable else { return }
+                self.invalidateAllTerminalInput()
                 self.controlAvailable = false
                 self.ownedTerminalIDs = []
                 for task in self.terminalResizeTasks.values { task.cancel() }
@@ -6154,6 +6236,7 @@ final class AppModel: ObservableObject {
         }
         await controlClient.setDisconnectHandler(nil)
         await controlClient.disconnect()
+        invalidateAllTerminalInput()
         controlAvailable = false
     }
 
@@ -6176,9 +6259,7 @@ final class AppModel: ObservableObject {
         terminalResizeTasks.removeAll()
         terminalResizeGeneration.removeAll()
         lastTerminalSize.removeAll()
-        for task in terminalInputDrainTasks.values { task.cancel() }
-        terminalInputDrainTasks.removeAll()
-        terminalInputQueues.removeAll()
+        invalidateAllTerminalInput()
         terminalInputFailureNoticeAt.removeAll()
         cursorSaveTask?.cancel()
         cursorSaveTask = nil
@@ -7004,6 +7085,25 @@ enum VisualTerminalResourceFixture {
             result.append(chunk)
             remaining -= chunkBytes
         }
+        return result
+    }
+}
+
+/// Exact-size retained transcript for the broker-free ownership-flap gate. The
+/// OSC 8 tail makes link/parser state part of the same mounted-view receipt.
+enum VisualTerminalOwnershipFlapFixture {
+    static let linkText = "FLAP-LINK"
+    static let linkURL = "https://flap.test/state"
+    private static let tail = "\r\n\u{1B}]8;;\(linkURL)\u{7}\(linkText)\u{1B}]8;;\u{7}\r\nready"
+
+    static func scrollback(targetBytes: Int) -> TerminalScrollback {
+        guard targetBytes >= tail.utf8.count else {
+            return VisualTerminalResourceFixture.scrollback(targetBytes: targetBytes)
+        }
+        var result = VisualTerminalResourceFixture.scrollback(
+            targetBytes: targetBytes - tail.utf8.count
+        )
+        result.append(tail)
         return result
     }
 }

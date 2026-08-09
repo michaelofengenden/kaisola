@@ -19,8 +19,16 @@ import SwiftUI
 final class GitPanelModel: ObservableObject {
     @Published private(set) var status: GitService.Status?
     @Published private(set) var errorMessage: String?
+    /// True when the last failure was a command Kaisola *stopped* on its
+    /// deadline rather than one that failed. Git never reported anything about
+    /// the repository, so the banner offers Retry instead of only explaining.
+    @Published private(set) var errorIsRetryable = false
     @Published var commitMessage = ""
     @Published private(set) var isBusy = false
+
+    /// Re-runs exactly the operation the timeout interrupted. Nil unless the
+    /// last failure was retryable.
+    private var retryOperation: (() -> Void)?
 
     /// One-click PR state: the current branch's push/PR readiness, plus the
     /// result of the last Create-PR run (a PR or compare URL, and a status note).
@@ -386,6 +394,8 @@ final class GitPanelModel: ObservableObject {
             )
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            errorIsRetryable = false
+            retryOperation = nil
             return
         }
         prState = nil
@@ -473,6 +483,8 @@ final class GitPanelModel: ObservableObject {
         guard !isBusy else { return }
         isBusy = true
         errorMessage = nil
+        errorIsRetryable = false
+        retryOperation = nil
         // Every operation re-reads status, so any of them satisfies the refresh
         // policy's rate floor — a stage and an event-driven refresh must not run
         // git twice in the same window.
@@ -486,9 +498,29 @@ final class GitPanelModel: ObservableObject {
             } catch {
                 onError?(error)
                 errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                errorIsRetryable = Self.isRetryable(error)
+                // Hold the same closures, so Retry re-runs this operation
+                // rather than falling back to a generic refresh.
+                retryOperation = errorIsRetryable
+                    ? { [weak self] in self?.perform(work, apply: apply, onError: onError) }
+                    : nil
                 isBusy = false
             }
         }
+    }
+
+    /// Whether a failed operation is worth offering again. Pulled out as a pure
+    /// decision so the banner's Retry affordance is directly unit-testable.
+    nonisolated static func isRetryable(_ error: any Error) -> Bool {
+        (error as? GitService.GitError)?.isRetryable ?? false
+    }
+
+    /// Run the stopped operation again, from the banner's Retry button.
+    func retryLastOperation() {
+        guard !isBusy, let retry = retryOperation else { return }
+        retryOperation = nil
+        errorIsRetryable = false
+        retry()
     }
 
     private func closeDiff(_ path: String) {
@@ -543,12 +575,30 @@ struct GitPanelView: View {
             // (a transient op failure would otherwise blank the whole panel
             // until a manual refresh).
             if let error = model.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle")
+                // A stopped command reads differently from a failed one: amber
+                // rather than red, a clock rather than a warning triangle, and a
+                // Retry button, because nothing is actually known to be wrong.
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Label(
+                        error,
+                        systemImage: model.errorIsRetryable ? "clock.badge.exclamationmark" : "exclamationmark.triangle"
+                    )
                     .font(.caption)
-                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
-                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .foregroundStyle(
+                        (model.errorIsRetryable ? KaisolaStatusTone.needsYou : .failed).foregroundColor
+                    )
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.red.opacity(0.08))
+                    if model.errorIsRetryable {
+                        Button("Retry", action: model.retryLastOperation)
+                            .buttonStyle(.borderless)
+                            .font(.caption)
+                            .disabled(model.isBusy)
+                            .accessibilityIdentifier("git.retry")
+                    }
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(model.errorIsRetryable ? Color.orange.opacity(0.10) : Color.red.opacity(0.08))
                 Divider()
             }
             if let status = model.status {
@@ -627,9 +677,18 @@ struct GitPanelView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 4) {
                     bulkActions(status)
-                    fileSection("Staged", status.staged.map { ($0.path, $0.code) }, action: "Unstage", staged: true) { model.unstage($0) }
-                    fileSection("Changes", status.unstaged.map { ($0.path, $0.code) }, action: "Stage", staged: false, restorable: true) { model.stage($0) }
-                    fileSection("Untracked", status.untracked.map { ($0, "?") }, action: "Stage", staged: false) { model.stage($0) }
+                    fileSection(
+                        "Staged", status.staged.map { ($0.path, $0.code) }, stats: status.stagedStats,
+                        action: "Unstage", staged: true
+                    ) { model.unstage($0) }
+                    fileSection(
+                        "Changes", status.unstaged.map { ($0.path, $0.code) }, stats: status.unstagedStats,
+                        action: "Stage", staged: false, restorable: true
+                    ) { model.stage($0) }
+                    fileSection(
+                        "Untracked", status.untracked.map { ($0, "?") }, stats: nil,
+                        action: "Stage", staged: false
+                    ) { model.stage($0) }
                     logSection
                     prSection
                 }
@@ -667,6 +726,11 @@ struct GitPanelView: View {
                 .accessibilityIdentifier("git.stageAll")
             }
             Spacer()
+            if let summary = GitStatsRendering.summary(status.combinedStats) {
+                Text("Total \(summary)")
+                    .foregroundStyle(.secondary)
+                    .accessibilityIdentifier("git.stats.combined")
+            }
         }
         .font(.caption)
         .buttonStyle(.borderless)
@@ -952,16 +1016,25 @@ struct GitPanelView: View {
     private func fileSection(
         _ title: String,
         _ files: [(String, String)],
+        stats: GitService.ChangeStats?,
         action: String,
         staged: Bool,
         restorable: Bool = false,
         perform: @escaping (String) -> Void
     ) -> some View {
         if !files.isEmpty {
-            Text("\(title) (\(files.count))")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.top, 4)
+            HStack(spacing: 6) {
+                Text("\(title) (\(files.count))")
+                    .fontWeight(.semibold)
+                if let stats, let summary = GitStatsRendering.summary(stats) {
+                    Text(summary)
+                        .foregroundStyle(.tertiary)
+                        .accessibilityIdentifier("git.stats.\(staged ? "staged" : "unstaged")")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .padding(.top, 4)
             ForEach(files, id: \.0) { path, code in
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 8) {
@@ -1013,6 +1086,21 @@ struct GitPanelView: View {
         case "?": .secondary
         default: .primary
         }
+    }
+}
+
+enum GitStatsRendering {
+    /// Text and binary truth occupy separate parts of the summary. In
+    /// particular an all-binary diff renders only "1 binary", never +0/-0.
+    static func summary(_ stats: GitService.ChangeStats) -> String? {
+        var parts: [String] = []
+        if stats.textFiles > 0 {
+            parts.append("+\(stats.additions) −\(stats.deletions)")
+        }
+        if stats.binaryFiles > 0 {
+            parts.append("\(stats.binaryFiles) binary")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 

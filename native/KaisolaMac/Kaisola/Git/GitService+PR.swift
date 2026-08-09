@@ -174,7 +174,12 @@ extension GitService {
         process.currentDirectoryURL = repoRoot
         GitProcessEnvironment.configureNonInteractive(process)
         let capture: (out: Data, err: Data)
-        do { capture = try GitProcessCapture.run(process) }
+        // `gh` talks to GitHub, so it carries the network budget rather than the
+        // shorter local default.
+        do { capture = try GitProcessCapture.run(process, deadline: .network) }
+        catch let failure as GitProcessCapture.Failure {
+            throw GitError.from(failure, command: "gh pr create")
+        }
         catch { throw GitError.commandFailed(error.localizedDescription) }
         if process.terminationStatus != 0 {
             let message = String(data: capture.err, encoding: .utf8) ?? "gh pr create failed"
@@ -403,7 +408,9 @@ extension GitService {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/which")
         process.arguments = ["gh"]
-        guard let capture = try? GitProcessCapture.run(process) else { return nil }
+        // `which` either answers immediately or the PATH lookup is wedged; a few
+        // seconds is already far past "installed?".
+        guard let capture = try? GitProcessCapture.run(process, deadline: .custom(5)) else { return nil }
         guard process.terminationStatus == 0 else { return nil }
         let path = (String(data: capture.out, encoding: .utf8) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -422,7 +429,10 @@ extension GitService {
         process.currentDirectoryURL = repoRoot
         GitProcessEnvironment.configureNonInteractive(process)
         let capture: (out: Data, err: Data)
-        do { capture = try GitProcessCapture.run(process) }
+        do { capture = try GitProcessCapture.run(process, deadline: .forGitArguments(arguments)) }
+        catch let failure as GitProcessCapture.Failure {
+            throw GitError.from(failure, command: Self.commandLabel(arguments))
+        }
         catch { throw GitError.commandFailed(error.localizedDescription) }
         if process.terminationStatus != 0 {
             let message = String(data: capture.err, encoding: .utf8) ?? "git failed"

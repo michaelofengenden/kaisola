@@ -107,6 +107,46 @@ enum CsvTable {
     static let maxRows = 2_000
     static let maxCols = 64
 
+    /// Forward-only access to borrowed UTF-8 storage. Production uses either a
+    /// contiguous view of the source or the source's own `String.UTF8View`, so
+    /// parsing never begins by materializing the document as `[Character]`.
+    struct UTF8Cursor<Source: Collection> where Source.Element == UInt8 {
+        private let source: Source
+        private var index: Source.Index
+
+        init(_ source: Source) {
+            self.source = source
+            index = source.startIndex
+        }
+
+        func peek() -> UInt8? {
+            guard index != source.endIndex else { return nil }
+            return source[index]
+        }
+
+        @discardableResult
+        mutating func take() -> UInt8? {
+            guard index != source.endIndex else { return nil }
+            let byte = source[index]
+            index = source.index(after: index)
+            return byte
+        }
+
+        /// Consume `bytes` only when the complete sequence is next. A failed
+        /// lookahead leaves the cursor unchanged.
+        mutating func consume(_ bytes: ArraySlice<UInt8>) -> Bool {
+            var candidate = index
+            for expected in bytes {
+                guard candidate != source.endIndex, source[candidate] == expected else {
+                    return false
+                }
+                candidate = source.index(after: candidate)
+            }
+            index = candidate
+            return true
+        }
+    }
+
     /// Parse `text` into rows of fields. Handles quoted fields, `""`-escaped
     /// quotes, embedded newlines inside quotes, and CRLF/CR/LF record endings.
     /// Returns the capped rows plus separate actual/displayed dimensions for
@@ -116,23 +156,53 @@ enum CsvTable {
     /// Pure — `nonisolated` keeps CI's strict-concurrency inference from pinning
     /// it to the main actor just because the file also defines SwiftUI views.
     nonisolated static func parse(_ text: String, delimiter: Character = ",") -> ParseResult {
-        let chars = Array(text)
-        let count = chars.count
+        // A Character can contain multiple UTF-8 bytes. Delimiters used by the
+        // preview are ASCII, but preserving the public parser contract costs
+        // only this tiny, delimiter-sized buffer.
+        let delimiterBytes = Array(String(delimiter).utf8)
+
+        // Native Swift strings normally expose contiguous UTF-8 storage. Parse
+        // that storage in place for an integer-indexed hot loop, while retaining
+        // a single-pass view fallback for strings without contiguous storage.
+        if let result = text.utf8.withContiguousStorageIfAvailable({ bytes in
+            parse(bytes, delimiterBytes: delimiterBytes)
+        }) {
+            return result
+        }
+        return parse(text.utf8, delimiterBytes: delimiterBytes)
+    }
+
+    private nonisolated static func parse<Source: Collection>(
+        _ source: Source,
+        delimiterBytes: [UInt8]
+    ) -> ParseResult where Source.Element == UInt8 {
+        var cursor = UTF8Cursor(source)
         var rows: [[String]] = []
         var record: [String] = []
-        var field = ""
+        var fieldBytes: [UInt8] = []
+        // Once a row or column is outside the render cap its value is not
+        // retained. This separate flag preserves field-start quote semantics
+        // even when `field` deliberately stays empty.
+        var fieldIsEmpty = true
         var fieldCount = 0
         var actualRowCount = 0
         var actualColumnCount = 0
         var inQuotes = false
-        var index = 0
+
+        func appendToField(_ byte: UInt8) {
+            if rows.count < maxRows, record.count < maxCols {
+                fieldBytes.append(byte)
+            }
+            fieldIsEmpty = false
+        }
 
         func endField() {
             fieldCount += 1
             if rows.count < maxRows, record.count < maxCols {
-                record.append(field)
+                record.append(String(decoding: fieldBytes, as: UTF8.self))
             }
-            field = ""
+            fieldBytes.removeAll(keepingCapacity: true)
+            fieldIsEmpty = true
         }
         func endRecord() {
             endField()
@@ -145,52 +215,49 @@ enum CsvTable {
             fieldCount = 0
         }
 
-        while index < count {
-            let character = chars[index]
+        while let byte = cursor.take() {
             if inQuotes {
-                if character == "\"" {
+                if byte == 0x22 {
                     // A doubled quote inside a quoted field is a literal quote;
                     // a lone quote closes the field.
-                    if index + 1 < count, chars[index + 1] == "\"" {
-                        field.append("\"")
-                        index += 2
+                    if cursor.peek() == 0x22 {
+                        appendToField(0x22)
+                        cursor.take()
                     } else {
                         inQuotes = false
-                        index += 1
                     }
                 } else {
-                    field.append(character)
-                    index += 1
+                    appendToField(byte)
                 }
                 continue
             }
 
-            switch character {
-            case "\"" where field.isEmpty:
+            if byte == 0x22, fieldIsEmpty {
                 // A quote opens a quoted field ONLY at field start (RFC-4180).
                 // A quote mid-field (e.g. 3"5) is a literal character — handled
                 // by `default` — so one stray quote can't swallow the rest of
                 // the file into a single never-closed field.
                 inQuotes = true
-                index += 1
-            case delimiter:
+            } else if byte == delimiterBytes[0],
+                      delimiterBytes.count == 1 || cursor.consume(delimiterBytes.dropFirst()) {
                 endField()
-                index += 1
-            case "\r\n", "\r", "\n":
-                // Swift segments a CRLF pair into ONE grapheme Character, so the
-                // "\r\n" literal matches that combined form; lone CR / LF cover
-                // the classic-Mac and Unix endings.
+            } else if byte == 0x0D {
+                // Treat CRLF as one record separator while retaining both
+                // bytes verbatim when the pair appears inside a quoted field.
+                if cursor.peek() == 0x0A {
+                    cursor.take()
+                }
                 endRecord()
-                index += 1
-            default:
-                field.append(character)
-                index += 1
+            } else if byte == 0x0A {
+                endRecord()
+            } else {
+                appendToField(byte)
             }
         }
 
         // Flush a trailing record only when real data is pending, so a file that
         // ends on a newline does not yield a spurious empty final row.
-        if !field.isEmpty || !record.isEmpty {
+        if !fieldIsEmpty || fieldCount > 0 {
             endRecord()
         }
         let displayedColumnCount = rows.reduce(0) { max($0, $1.count) }

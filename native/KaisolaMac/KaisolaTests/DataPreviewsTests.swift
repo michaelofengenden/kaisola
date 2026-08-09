@@ -133,6 +133,58 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertEqual(result.rows, [["a", "b", "c"]])
     }
 
+    func testCsvUTF8CursorTraversesComposedUnicodeAndCRLFInSourceOrder() {
+        let source = "café 🍣 e\u{301}\r\n\"\"終"
+        var cursor = CsvTable.UTF8Cursor(source.utf8)
+        var traversed: [UInt8] = []
+
+        while let byte = cursor.take() {
+            traversed.append(byte)
+        }
+
+        XCTAssertEqual(String(decoding: traversed, as: UTF8.self), source)
+        XCTAssertNil(cursor.peek())
+        XCTAssertNil(cursor.take())
+    }
+
+    func testStreamingCsvParserPreservesQuotedUnicodeCorpus() {
+        let fixtures: [(text: String, delimiter: Character, rows: [[String]])] = [
+            (
+                "name,note\r\n藤井,\"café 🍣\"\r\nZoë,\"line one\r\nline two\"",
+                ",",
+                [["name", "note"], ["藤井", "café 🍣"], ["Zoë", "line one\r\nline two"]]
+            ),
+            (
+                "\"He said \"\"終\"\"\";\"данные;δοκιμή\";tail",
+                ";",
+                [["He said \"終\"", "данные;δοκιμή", "tail"]]
+            ),
+            (
+                "decomposed,emoji,empty\ne\u{301},🏳️‍🌈,",
+                ",",
+                [["decomposed", "emoji", "empty"], ["e\u{301}", "🏳️‍🌈", ""]]
+            ),
+            (
+                "literal\"quote\t\"embedded\tseparator\"\t終",
+                "\t",
+                [["literal\"quote", "embedded\tseparator", "終"]]
+            ),
+            (
+                "café💠\"данные💠δοκιμή\"💠終",
+                "💠",
+                [["café", "данные💠δοκιμή", "終"]]
+            ),
+        ]
+
+        for fixture in fixtures {
+            XCTAssertEqual(
+                CsvTable.parse(fixture.text, delimiter: fixture.delimiter).rows,
+                fixture.rows,
+                "fixture: \(fixture.text.debugDescription)"
+            )
+        }
+    }
+
     // MARK: - CSV caps
 
     func testRowCapAndTruncatedFlag() {
@@ -211,6 +263,28 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertFalse(result.truncation.rowsWereTruncated)
         XCTAssertFalse(result.truncation.columnsWereTruncated)
         XCTAssertNil(result.truncation.notice)
+    }
+
+    func testDiscardedColumnBytesCannotChangeQuoteOrRecordBoundaries() {
+        let visible = (0..<CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let result = CsvTable.parse("\(visible),discarded\"literal,tail\nnext")
+
+        XCTAssertEqual(result.truncation.actualRowCount, 2)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols + 2)
+        XCTAssertEqual(result.rows.count, 2)
+        XCTAssertEqual(result.rows[0].count, CsvTable.maxCols)
+        XCTAssertEqual(result.rows[1], ["next"])
+    }
+
+    func testDiscardedRowBytesCannotChangeQuoteOrRecordBoundaries() {
+        let visibleRows = Array(repeating: "visible", count: CsvTable.maxRows)
+            .joined(separator: "\n")
+        let result = CsvTable.parse("\(visibleRows)\ndiscarded\"literal,tail\nlast")
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows + 2)
+        XCTAssertEqual(result.truncation.actualColumnCount, 2)
+        XCTAssertEqual(result.rows.count, CsvTable.maxRows)
+        XCTAssertEqual(result.rows.last, ["visible"])
     }
 
     // MARK: - CSV cell inspection

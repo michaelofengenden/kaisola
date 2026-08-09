@@ -22,18 +22,35 @@ final class UpdateCenter: ObservableObject {
     static let shared = UpdateCenter()
 
     struct PendingUpdate: Equatable {
+        /// A pending update is claimed exactly once. `installing` is entered
+        /// *before* Sparkle's block runs, because the relaunch that follows is
+        /// not instantaneous: Sparkle asks the app to quit, Kaisola's
+        /// `applicationShouldTerminate` cancels that first pass and drains its
+        /// windows, and the whole window is wide enough for a second click to
+        /// land on a restart button that is still enabled.
+        enum State: Equatable { case ready, installing }
+
         let version: String
         /// Sparkle's immediate-installation block. Invoking it installs and
         /// relaunches with no further Sparkle UI.
         let install: () -> Void
+        /// Only `installAndRelaunch()` moves this, and only forwards.
+        fileprivate(set) var state: State = .ready
 
         static func == (lhs: PendingUpdate, rhs: PendingUpdate) -> Bool {
-            lhs.version == rhs.version
+            lhs.version == rhs.version && lhs.state == rhs.state
         }
     }
 
     /// Non-nil once an update is downloaded, verified, and ready to install.
     @Published private(set) var pendingUpdate: PendingUpdate?
+
+    /// The single flag every restart affordance disables on. Settings is a
+    /// per-window view — the standalone ⌘, window and each workspace's settings
+    /// sheet each build their own button — so the disable has to come from this
+    /// shared state or the other windows keep offering a restart that has
+    /// already been claimed.
+    var isInstalling: Bool { pendingUpdate?.state == .installing }
 
     /// True while Sparkle is showing its own update UI, so Kaisola's affordance
     /// can step aside rather than duplicate it.
@@ -130,8 +147,13 @@ final class UpdateCenter: ObservableObject {
     func markReady(version: String, install: @escaping () -> Void) {
         // Sparkle can hand the block over more than once — the docs note the
         // installer may re-offer when a termination request is cancelled, which
-        // Kaisola's `applicationShouldTerminate` does on its first pass. Keep
-        // the newest block and do not re-toast for a version already pending.
+        // Kaisola's `applicationShouldTerminate` does on its first pass. Once a
+        // restart has been claimed that re-offer arrives *during* the relaunch,
+        // so taking it would re-arm the button the user just pressed; the app is
+        // already on its way out and there is nothing left to offer.
+        guard !isInstalling else { return }
+        // Otherwise keep the newest block and do not re-toast for a version
+        // already pending.
         let alreadyPending = pendingUpdate?.version == version
         pendingUpdate = PendingUpdate(version: version, install: install)
         guard !alreadyPending else { return }
@@ -149,8 +171,19 @@ final class UpdateCenter: ObservableObject {
     /// Install and relaunch now. Terminal sessions survive this — they live in
     /// the detached broker — but in-process ACP chats and Mesh columns do not,
     /// so callers should warn when `AppModel.interruptibleTurnCount` is nonzero.
-    func installAndRelaunch() {
-        guard let pendingUpdate else { return }
+    ///
+    /// One-shot: the pending update moves to `.installing` before the block is
+    /// invoked, so a second activation — a double-click, a second window's
+    /// button, a re-offer from Sparkle — returns `false` instead of starting a
+    /// second installation while the first is still relaunching.
+    @discardableResult
+    func installAndRelaunch() -> Bool {
+        guard let pendingUpdate, pendingUpdate.state == .ready else { return false }
+        // Claim first, invoke second. The claim is published before the block
+        // runs, so anything the block re-enters (Sparkle's quit request drives
+        // MainActor work) already sees the update as spoken for.
+        self.pendingUpdate?.state = .installing
         pendingUpdate.install()
+        return true
     }
 }

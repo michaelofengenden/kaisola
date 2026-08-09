@@ -51,6 +51,9 @@ struct SettingsView: View {
             forInfoDictionaryKey: "CFBundleShortVersionString"
         ) as? String ?? "—"
         if let pending = updates.pendingUpdate {
+            if pending.state == .installing {
+                return "Kaisola \(version) — installing \(pending.version) and restarting…"
+            }
             return "Kaisola \(version) — \(pending.version) is downloaded and ready to install"
         }
         if let updateDetail {
@@ -488,9 +491,16 @@ struct SettingsView: View {
                         symbol: "app.badge.checkmark"
                     ) {
                         if updates.pendingUpdate != nil {
-                            Button("Restart and Update") { restartRequest = RestartRequest() }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
+                            // Disabled the moment a restart is claimed, in
+                            // every window at once: the relaunch is slow enough
+                            // to click through, and a second claim would run
+                            // Sparkle's installer again mid-flight.
+                            Button(updates.isInstalling ? "Restarting…" : "Restart and Update") {
+                                restartRequest = RestartRequest()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(updates.isInstalling)
                         } else if case .checking = updates.checkStatus {
                             ProgressView()
                                 .controlSize(.small)

@@ -162,6 +162,18 @@ struct NativeSessionStore: Sendable {
         case unreadable(SessionStoreArchiveFailure)
     }
 
+    private enum ArchiveDescriptorState {
+        case missing
+        case opened(descriptor: Int32, byteCount: Int64)
+        case unreadable(String)
+    }
+
+    private enum BoundedArchiveRead {
+        case data(Data)
+        case oversized(foundBytes: Int64)
+        case unreadable(String)
+    }
+
     /// Process-wide decoded-payload cache, keyed by archive URL.
     ///
     /// `NativeSessionStore` is a value type that callers construct ad hoc —
@@ -226,6 +238,12 @@ struct NativeSessionStore: Sendable {
     /// Archive format this build writes and is willing to read. Bump it only
     /// alongside a change older builds must not try to interpret.
     static let archiveSchemaVersion = 1
+
+    /// A native session archive is metadata, not transcript or terminal
+    /// output. Refuse anything larger than 8 MiB before allocating storage for
+    /// its contents; a legitimate archive is normally orders of magnitude
+    /// smaller, while this ceiling leaves ample room for legacy installations.
+    static let maximumArchiveBytes: Int64 = 8 * 1_024 * 1_024
 
     /// Undo-stack depth (⌘⌥T / ⌘⇧T). A pure UI convenience: the permanent
     /// closed-state markers (`closedTerminals`, `closedProjectIDs`) are what
@@ -683,22 +701,57 @@ struct NativeSessionStore: Sendable {
     /// brand-new file.
     private func loadArchive() -> ArchiveState {
         if let quarantine = SessionStoreQuarantineMonitor.shared.quarantine(for: fileURL) {
+            if case .oversized = quarantine.failure,
+               case .loaded(let payload) = PayloadCache.shared.cached(fileURL) {
+                return .loaded(payload)
+            }
             return .unreadable(quarantine.failure)
         }
-        if let cached = PayloadCache.shared.cached(fileURL) { return cached }
 
-        let data: Data
-        do {
-            data = try Data(contentsOf: fileURL)
-        } catch {
-            guard Self.isMissingFile(error) else {
-                // The bytes are there and unreachable (permissions, I/O). They
-                // cannot be copied aside, so leaving them alone is the whole of
-                // the quarantine.
-                return quarantine(.unreadable(Self.readReason(for: error)), bytes: nil)
-            }
+        let cachedPayload: Payload? = {
+            guard case .loaded(let payload) = PayloadCache.shared.cached(fileURL) else { return nil }
+            return payload
+        }()
+        let descriptor: Int32
+        let initialByteCount: Int64
+        switch Self.openArchiveDescriptor(fileURL) {
+        case .missing:
+            if let cachedPayload { return .loaded(cachedPayload) }
             PayloadCache.shared.store(nil, for: fileURL)
             return .missing
+        case .unreadable(let reason):
+            // The bytes are there and unreachable (permissions, I/O). They
+            // cannot be copied aside, so leaving them alone is the whole of
+            // the quarantine.
+            return quarantine(.unreadable(reason), bytes: nil)
+        case let .opened(openedDescriptor, byteCount):
+            descriptor = openedDescriptor
+            initialByteCount = byteCount
+        }
+        defer { Darwin.close(descriptor) }
+
+        guard initialByteCount <= Self.maximumArchiveBytes else {
+            let failure = SessionStoreArchiveFailure.oversized(
+                foundBytes: initialByteCount,
+                maximumBytes: Self.maximumArchiveBytes
+            )
+            let refused = quarantine(failure, bytes: nil, lastKnownGood: cachedPayload)
+            if let cachedPayload { return .loaded(cachedPayload) }
+            return refused
+        }
+        if let cachedPayload { return .loaded(cachedPayload) }
+
+        let data: Data
+        switch Self.readBoundedArchive(descriptor, initialByteCount: initialByteCount) {
+        case .data(let bounded):
+            data = bounded
+        case .oversized(let foundBytes):
+            return quarantine(
+                .oversized(foundBytes: foundBytes, maximumBytes: Self.maximumArchiveBytes),
+                bytes: nil
+            )
+        case .unreadable(let reason):
+            return quarantine(.unreadable(reason), bytes: nil)
         }
 
         guard let header = try? Self.decoder.decode(ArchiveHeader.self, from: data) else {
@@ -724,15 +777,81 @@ struct NativeSessionStore: Sendable {
     /// Set the unreadable archive aside and latch the failure: until it is
     /// resolved this store reads as empty, refuses every write, and — the point
     /// of the exercise — refuses to mint a replacement owner identity over it.
-    private func quarantine(_ failure: SessionStoreArchiveFailure, bytes: Data?) -> ArchiveState {
+    private func quarantine(
+        _ failure: SessionStoreArchiveFailure,
+        bytes: Data?,
+        lastKnownGood: Payload? = nil
+    ) -> ArchiveState {
         let record = SessionStoreQuarantine(
             path: fileURL.path,
             failure: failure,
             copyPath: bytes.flatMap { Self.copyAside($0, from: fileURL) },
-            salvagedOwnerID: bytes.flatMap { Self.salvageOwnerID(from: $0) }
+            salvagedOwnerID: bytes.flatMap { Self.salvageOwnerID(from: $0) },
+            lastKnownGoodAvailable: lastKnownGood != nil
         )
         SessionStoreQuarantineMonitor.shared.record(record, for: fileURL)
         return .unreadable(failure)
+    }
+
+    /// Open and size the exact archive object that will be read. The descriptor
+    /// keeps the size probe and read on one object even if the path changes,
+    /// while `fstat` establishes the byte budget before any archive-sized
+    /// allocation occurs.
+    private static func openArchiveDescriptor(_ fileURL: URL) -> ArchiveDescriptorState {
+        let descriptor = fileURL.withUnsafeFileSystemRepresentation { path -> Int32 in
+            guard let path else { return -1 }
+            return Darwin.open(path, O_RDONLY | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            let code = errno
+            if code == ENOENT { return .missing }
+            let error = NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+            return .unreadable(readReason(for: error))
+        }
+
+        var metadata = stat()
+        guard Darwin.fstat(descriptor, &metadata) == 0 else {
+            let error = NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            Darwin.close(descriptor)
+            return .unreadable(readReason(for: error))
+        }
+        guard metadata.st_size >= 0 else {
+            Darwin.close(descriptor)
+            return .unreadable("The saved session file reported an invalid size.")
+        }
+        return .opened(descriptor: descriptor, byteCount: metadata.st_size)
+    }
+
+    /// Read at most the documented archive ceiling, plus one stack-buffer byte
+    /// used only to notice a file that grew after `fstat`. The returned `Data`
+    /// can therefore never exceed `maximumArchiveBytes`.
+    private static func readBoundedArchive(
+        _ descriptor: Int32,
+        initialByteCount: Int64
+    ) -> BoundedArchiveRead {
+        var data = Data()
+        if initialByteCount > 0, initialByteCount <= Int64(Int.max) {
+            data.reserveCapacity(Int(initialByteCount))
+        }
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+
+        while true {
+            let remaining = Int(maximumArchiveBytes) - data.count
+            let requested = min(buffer.count, remaining + 1)
+            let count = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress!, requested)
+            }
+            if count == 0 { return .data(data) }
+            if count < 0 {
+                if errno == EINTR { continue }
+                let error = NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+                return .unreadable(readReason(for: error))
+            }
+            guard count <= remaining else {
+                return .oversized(foundBytes: maximumArchiveBytes + 1)
+            }
+            data.append(contentsOf: buffer.prefix(count))
+        }
     }
 
     /// Keep a copy of the bytes we refuse to interpret next to the archive, so
@@ -772,16 +891,6 @@ struct NativeSessionStore: Sendable {
         // Owner ids are `native-<uuid>`, so any escape means this is not one.
         guard !salvaged.isEmpty, !salvaged.contains("\\") else { return nil }
         return salvaged
-    }
-
-    private static func isMissingFile(_ error: Error) -> Bool {
-        let cocoa = error as NSError
-        if cocoa.domain == NSCocoaErrorDomain,
-           cocoa.code == NSFileReadNoSuchFileError || cocoa.code == NSFileNoSuchFileError {
-            return true
-        }
-        let posix = cocoa.userInfo[NSUnderlyingErrorKey] as? NSError ?? cocoa
-        return posix.domain == NSPOSIXErrorDomain && Int32(posix.code) == ENOENT
     }
 
     /// One sentence naming the problem and the thing the user can change.
@@ -853,6 +962,9 @@ enum SessionStoreArchiveFailure: Equatable, Sendable {
     case unreadable(String)
     /// Written by a newer build than this one knows how to interpret.
     case futureVersion(found: Int, supported: Int)
+    /// Larger than this metadata archive is allowed to be. The file is refused
+    /// before any allocation proportional to its declared size.
+    case oversized(foundBytes: Int64, maximumBytes: Int64)
 
     var reason: String {
         switch self {
@@ -863,6 +975,9 @@ enum SessionStoreArchiveFailure: Equatable, Sendable {
         case .futureVersion(let found, let supported):
             return "The saved session file is from a newer version of Kaisola "
                 + "(format \(found); this build reads \(supported))."
+        case .oversized(let foundBytes, let maximumBytes):
+            return "The saved session file is too large "
+                + "(\(foundBytes) bytes; maximum \(maximumBytes) bytes)."
         }
     }
 }
@@ -876,22 +991,52 @@ struct SessionStoreQuarantine: Equatable, Sendable {
     let copyPath: String?
     /// Owner identity recovered from those bytes, when one was still legible.
     let salvagedOwnerID: String?
+    /// A decoded payload from before the archive became unreadable. It remains
+    /// usable for this process, but writes stay blocked until the file is
+    /// repaired so the app never mistakes volatile state for durable state.
+    let lastKnownGoodAvailable: Bool
 
     init(
         path: String,
         failure: SessionStoreArchiveFailure,
         copyPath: String? = nil,
-        salvagedOwnerID: String? = nil
+        salvagedOwnerID: String? = nil,
+        lastKnownGoodAvailable: Bool = false
     ) {
         self.path = path
         self.failure = failure
         self.copyPath = copyPath
         self.salvagedOwnerID = salvagedOwnerID
+        self.lastKnownGoodAvailable = lastKnownGoodAvailable
+    }
+
+    var recoveryInstructions: String {
+        switch failure {
+        case .oversized(_, let maximumBytes):
+            return "Quit Kaisola, move the oversized archive at \(path) aside, restore a trusted "
+                + "archive no larger than \(maximumBytes) bytes, then relaunch."
+        case .futureVersion:
+            return "Update Kaisola to a version that can read the archive at \(path), or restore "
+                + "a compatible trusted archive, then relaunch."
+        case .unreadable:
+            return "Quit Kaisola, restore read access to the archive at \(path) or replace it with "
+                + "a trusted backup, then relaunch."
+        case .corrupt:
+            if let copyPath {
+                return "Quit Kaisola, inspect the recovery copy at \(copyPath), restore a trusted "
+                    + "archive at \(path), then relaunch."
+            }
+            return "Quit Kaisola, restore a trusted archive at \(path), then relaunch."
+        }
     }
 
     var message: String {
-        "Couldn't read your saved sessions. \(failure.reason) Kaisola left the file alone "
-            + "instead of replacing it, so this window starts empty."
+        let state = lastKnownGoodAvailable
+            ? "Kaisola is continuing with the last known-good in-memory session state; "
+                + "changes will not be saved until recovery."
+            : "This window starts empty."
+        return "Couldn't read your saved sessions. \(failure.reason) Kaisola left the file alone "
+            + "instead of replacing it. \(state) \(recoveryInstructions)"
     }
 }
 

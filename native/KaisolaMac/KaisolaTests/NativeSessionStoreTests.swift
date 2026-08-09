@@ -1761,6 +1761,97 @@ final class NativeSessionStoreTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: archiveURL), readable)
     }
 
+    // MARK: - Bounded archive reads (issue #475)
+
+    func testOversizedArchiveIsRejectedBeforeReadAndLeftUntouched() throws {
+        let byteCount = NativeSessionStore.maximumArchiveBytes + 1
+        let archiveURL = try writeSparseArchive(byteCount: byteCount, named: "oversized-cold")
+        let refused = NativeSessionStore(fileURL: archiveURL)
+
+        XCTAssertEqual(refused.ownerID(), "")
+        XCTAssertEqual(refused.sessions(), [])
+        let quarantine = try XCTUnwrap(refused.archiveQuarantine())
+        XCTAssertEqual(
+            quarantine.failure,
+            .oversized(
+                foundBytes: byteCount,
+                maximumBytes: NativeSessionStore.maximumArchiveBytes
+            )
+        )
+        XCTAssertNil(quarantine.copyPath, "Refused bytes must not be read just to make a copy")
+        XCTAssertNil(quarantine.salvagedOwnerID)
+        XCTAssertFalse(quarantine.lastKnownGoodAvailable)
+        XCTAssertTrue(quarantine.recoveryInstructions.contains("move the oversized archive"))
+        XCTAssertTrue(quarantine.recoveryInstructions.contains("restore a trusted archive"))
+        XCTAssertTrue(quarantine.recoveryInstructions.contains("then relaunch"))
+
+        refused.openProject(directory: "/tmp/must-not-replace-oversized")
+        let attributes = try FileManager.default.attributesOfItem(atPath: archiveURL.path)
+        XCTAssertEqual((attributes[.size] as? NSNumber)?.int64Value, byteCount)
+    }
+
+    func testArchiveAtExactByteLimitStillDecodes() throws {
+        let owner = "native-exact-archive-limit"
+        var bytes = Data("{\"ownerID\":\"\(owner)\",\"sessions\":[]}".utf8)
+        bytes.append(
+            Data(
+                repeating: Character(" ").asciiValue!,
+                count: Int(NativeSessionStore.maximumArchiveBytes) - bytes.count
+            )
+        )
+        let archiveURL = try writeArchive(bytes, named: "exact-limit")
+        let accepted = NativeSessionStore(fileURL: archiveURL)
+
+        XCTAssertEqual(accepted.ownerID(), owner)
+        XCTAssertEqual(accepted.sessions(), [])
+        XCTAssertNil(accepted.archiveQuarantine())
+    }
+
+    func testOversizedArchiveKeepsLastKnownGoodPayloadButBlocksFurtherWrites() throws {
+        let owner = store.ownerID()
+        let original = NativeOwnedSession(
+            id: "term-before-oversize",
+            projectID: "nproj_before_oversize",
+            cwd: "/tmp/before-oversize",
+            title: "Before oversize",
+            createdAt: 10
+        )
+        store.upsert(original)
+        XCTAssertEqual(store.sessions(), [original])
+
+        let oversizedByteCount = UInt64(NativeSessionStore.maximumArchiveBytes + 1)
+        let handle = try FileHandle(forWritingTo: fileURL)
+        try handle.truncate(atOffset: oversizedByteCount)
+        try handle.close()
+
+        XCTAssertEqual(store.ownerID(), owner)
+        XCTAssertEqual(store.sessions(), [original])
+        let quarantine = try XCTUnwrap(store.archiveQuarantine())
+        XCTAssertEqual(
+            quarantine.failure,
+            .oversized(
+                foundBytes: Int64(oversizedByteCount),
+                maximumBytes: NativeSessionStore.maximumArchiveBytes
+            )
+        )
+        XCTAssertTrue(quarantine.lastKnownGoodAvailable)
+        XCTAssertNil(quarantine.copyPath)
+        XCTAssertTrue(quarantine.message.contains("last known-good in-memory session state"))
+        XCTAssertTrue(quarantine.message.contains("changes will not be saved until recovery"))
+        XCTAssertTrue(quarantine.message.contains("restore a trusted archive"))
+
+        store.upsert(NativeOwnedSession(
+            id: "term-after-oversize",
+            projectID: "nproj_after_oversize",
+            cwd: "/tmp/after-oversize",
+            title: "After oversize",
+            createdAt: 11
+        ))
+        XCTAssertEqual(store.sessions(), [original])
+        let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
+        XCTAssertEqual((attributes[.size] as? NSNumber)?.uint64Value, oversizedByteCount)
+    }
+
     func testArchiveCarriesItsFormatVersionForwardOnEveryWrite() throws {
         store.openProject(directory: "/tmp/stamped")
         let object = try JSONSerialization.jsonObject(
@@ -1787,6 +1878,14 @@ final class NativeSessionStoreTests: XCTestCase {
             [.posixPermissions: 0o600],
             ofItemAtPath: archiveURL.path
         )
+        return archiveURL
+    }
+
+    private func writeSparseArchive(byteCount: Int64, named name: String) throws -> URL {
+        let archiveURL = try writeArchive(Data(), named: name)
+        let handle = try FileHandle(forWritingTo: archiveURL)
+        try handle.truncate(atOffset: UInt64(byteCount))
+        try handle.close()
         return archiveURL
     }
 

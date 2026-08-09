@@ -548,6 +548,106 @@ final class WorkspaceFilesTests: XCTestCase {
         ).isEmpty)
     }
 
+    /// The Move sheet used to dismiss the instant `performMove` accepted the
+    /// request, which was before the move had run at all. A failure then landed
+    /// as a toast with the destination list already gone, so the only way back
+    /// was to rebuild the whole operation.
+    @MainActor
+    func testMoveSheetKeepsTheItemAndDestinationSelectedWhenTheMoveFails() async throws {
+        let item = FileNode(
+            url: root.appendingPathComponent("README.md").standardizedFileURL,
+            isDirectory: false
+        )
+        let controller = WorkspaceMoveController(root: root, item: item)
+        await controller.loadDestinations()
+        let destination = try XCTUnwrap(
+            controller.visibleDirectories.first { $0.lastPathComponent == "src" }
+        )
+        controller.select(destination)
+
+        let refusal = "Could not move README.md: an item with that name is already there."
+        await controller.submit { _ in .failed(refusal) }
+
+        XCTAssertEqual(controller.phase, .failed(refusal))
+        XCTAssertEqual(controller.failureMessage, refusal)
+        XCTAssertFalse(
+            controller.isFinished,
+            "the sheet was allowed to close on a move that never succeeded"
+        )
+        XCTAssertEqual(controller.item.url, item.url)
+        XCTAssertEqual(
+            controller.selectedDirectory,
+            destination,
+            "the picked destination has to survive the failure for Retry to mean anything"
+        )
+
+        // Retry is the same operation again, not a rebuilt one.
+        await controller.submit { attempted in
+            XCTAssertEqual(attempted, destination)
+            return .succeeded
+        }
+        XCTAssertTrue(controller.isFinished)
+        XCTAssertNil(controller.failureMessage)
+    }
+
+    @MainActor
+    func testMoveSheetReportsTheMoveInFlightAndFinishesOnlyOnConfirmedSuccess() async throws {
+        let item = FileNode(
+            url: root.appendingPathComponent("README.md").standardizedFileURL,
+            isDirectory: false
+        )
+        let controller = WorkspaceMoveController(root: root, item: item)
+        await controller.loadDestinations()
+        XCTAssertEqual(controller.phase, .choosing)
+        XCTAssertFalse(controller.isMoving)
+        XCTAssertNotNil(controller.selectedDirectory)
+
+        await controller.submit { _ in
+            // While the filesystem work runs the sheet is still up, and says so.
+            XCTAssertTrue(controller.isMoving, "the sheet showed no progress while moving")
+            XCTAssertFalse(controller.isFinished, "the sheet closed before the move finished")
+            await Task.yield()
+            XCTAssertFalse(controller.isFinished)
+            return .succeeded
+        }
+
+        XCTAssertEqual(controller.phase, .succeeded)
+        XCTAssertTrue(controller.isFinished)
+        XCTAssertNil(controller.failureMessage)
+    }
+
+    @MainActor
+    func testMoveSheetSearchAndReselectionKeepAVisibleDestinationPicked() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("docs", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let item = FileNode(
+            url: root.appendingPathComponent("README.md").standardizedFileURL,
+            isDirectory: false
+        )
+        let controller = WorkspaceMoveController(root: root, item: item)
+        await controller.loadDestinations()
+        XCTAssertEqual(controller.selectedDirectory?.lastPathComponent, "docs")
+
+        controller.searchText = "src"
+        XCTAssertEqual(controller.selectedDirectory?.lastPathComponent, "src")
+        controller.searchText = ""
+        XCTAssertEqual(controller.selectedDirectory?.lastPathComponent, "src")
+
+        await controller.submit { _ in .failed("Could not move README.md.") }
+        XCTAssertNotNil(controller.failureMessage)
+
+        // Choosing somewhere else retires the diagnostic it was about.
+        let docs = try XCTUnwrap(
+            controller.visibleDirectories.first { $0.lastPathComponent == "docs" }
+        )
+        controller.select(docs)
+        XCTAssertNil(controller.failureMessage)
+        XCTAssertEqual(controller.phase, .choosing)
+        XCTAssertEqual(controller.selectedDirectory, docs)
+    }
+
     func testWorkspaceCreateFileAndFolderAreExclusiveAndWorkspaceBounded() throws {
         let folder = try WorkspaceFileOperations.createFolder(
             named: "Notes",

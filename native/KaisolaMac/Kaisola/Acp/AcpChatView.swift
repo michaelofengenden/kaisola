@@ -2,6 +2,25 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// One spoken contract for the symbol-only checkpoint menu and its destructive
+/// choices. Keep the consequence in the choice hint even though a confirmation
+/// follows: VoiceOver users need to understand the action before selecting it.
+enum CheckpointMenuAccessibility {
+    static let label = "Restore checkpoint"
+    static let hint = "Choose a snapshot taken before a turn. "
+        + "Restoring replaces current working tree files after confirmation."
+    static let choiceHint = "Replaces current working tree files with this snapshot after confirmation."
+    static let identifier = "acp.checkpoints.restore"
+
+    static func value(checkpointCount: Int) -> String {
+        "\(checkpointCount) checkpoint\(checkpointCount == 1 ? "" : "s") available"
+    }
+
+    static func choiceLabel(turn: Int, time: String) -> String {
+        "Restore checkpoint before turn \(turn) at \(time)"
+    }
+}
+
 /// The ACP conversation surface: streaming messages, thinking blocks,
 /// tool-call cards, a plan, a live permission prompt, model picker, usage, and
 /// a composer. Mirrors the Electron Assistant transcript.
@@ -164,15 +183,27 @@ struct AcpChatView: View {
             Menu {
                 Text("Restore the working tree to before a turn:")
                 ForEach(conversation.checkpoints.reversed()) { checkpoint in
-                    Button("Turn \(checkpoint.turn) — \(checkpoint.at.formatted(date: .omitted, time: .shortened))") {
+                    let time = checkpoint.at.formatted(date: .omitted, time: .shortened)
+                    Button("Turn \(checkpoint.turn) — \(time)") {
                         restoreTarget = checkpoint
                     }
+                    .accessibilityLabel(CheckpointMenuAccessibility.choiceLabel(
+                        turn: checkpoint.turn,
+                        time: time
+                    ))
+                    .accessibilityHint(CheckpointMenuAccessibility.choiceHint)
                 }
             } label: {
                 Image(systemName: "clock.arrow.circlepath")
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .accessibilityLabel(CheckpointMenuAccessibility.label)
+            .accessibilityValue(CheckpointMenuAccessibility.value(
+                checkpointCount: conversation.checkpoints.count
+            ))
+            .accessibilityHint(CheckpointMenuAccessibility.hint)
+            .accessibilityIdentifier(CheckpointMenuAccessibility.identifier)
             .help("Pre-turn checkpoints (git snapshots)")
             .confirmationDialog(
                 "Restore checkpoint?",

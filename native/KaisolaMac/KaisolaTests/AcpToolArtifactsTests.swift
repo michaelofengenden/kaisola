@@ -7,6 +7,36 @@ import XCTest
 /// parsing (diff / content / terminal), which feed the chat's inline diff cards.
 final class AcpToolArtifactsTests: XCTestCase {
 
+    // MARK: - Checkpoint menu accessibility
+
+    func testCheckpointMenuAccessibilityNamesPurposeAndAvailableCount() {
+        XCTAssertEqual(CheckpointMenuAccessibility.label, "Restore checkpoint")
+        XCTAssertEqual(
+            CheckpointMenuAccessibility.value(checkpointCount: 1),
+            "1 checkpoint available"
+        )
+        XCTAssertEqual(
+            CheckpointMenuAccessibility.value(checkpointCount: 3),
+            "3 checkpoints available"
+        )
+        XCTAssertEqual(
+            CheckpointMenuAccessibility.hint,
+            "Choose a snapshot taken before a turn. Restoring replaces current working tree files after confirmation."
+        )
+        XCTAssertEqual(CheckpointMenuAccessibility.identifier, "acp.checkpoints.restore")
+    }
+
+    func testCheckpointChoiceAccessibilityExplainsTurnTimeAndDestructiveConsequence() {
+        XCTAssertEqual(
+            CheckpointMenuAccessibility.choiceLabel(turn: 7, time: "3:14 PM"),
+            "Restore checkpoint before turn 7 at 3:14 PM"
+        )
+        XCTAssertEqual(
+            CheckpointMenuAccessibility.choiceHint,
+            "Replaces current working tree files with this snapshot after confirmation."
+        )
+    }
+
     // MARK: - Tool call accessibility
 
     func testToolCallAccessibilityNamesEveryTypedStatusAndDisclosureState() {

@@ -129,6 +129,11 @@ struct FilePreviewView: View {
     /// file is temporarily unreadable. Keep it dirty until an explicit save or
     /// discard even in that edge case.
     @State private var recoveredDraftPending = false
+    /// A claim the store refused. The draft is still journaled, so the banner
+    /// keeps it visible with retry, inspect, and discard instead of letting the
+    /// load pretend nothing was ever stored.
+    @State private var recoveryClaimFailure: FilePreviewRecoveryClaimFailure?
+    @State private var showRecoveryDiscardPrompt = false
     @State private var recoveryOwnerID = UUID().uuidString.lowercased()
     @State private var recoveryRevision: UInt64 = 0
     @State private var recoveryFencedRevision: UInt64 = 0
@@ -159,6 +164,10 @@ struct FilePreviewView: View {
             Divider()
             if let previewNotice {
                 noticeBanner(previewNotice)
+                Divider()
+            }
+            if let recoveryClaimFailure {
+                recoveryFailureBanner(recoveryClaimFailure)
                 Divider()
             }
             if conflict.showsBanner {
@@ -335,6 +344,15 @@ struct FilePreviewView: View {
         } message: {
             Text("An agent or another app edited this file after it was opened. Reload it or explicitly overwrite the newer version.")
         }
+        .confirmationDialog(
+            "Discard the unrecovered draft?",
+            isPresented: $showRecoveryDiscardPrompt
+        ) {
+            Button("Discard Draft", role: .destructive) { discardUnrecoveredDrafts() }
+            Button("Keep Draft", role: .cancel) {}
+        } message: {
+            Text("The stored draft for \(loadedURL?.lastPathComponent ?? url.lastPathComponent) is deleted. Drafts for every other file are left alone.")
+        }
     }
 
     private func completePendingAction() {
@@ -405,6 +423,94 @@ struct FilePreviewView: View {
         .frame(minHeight: 32)
         .background(Color.orange.opacity(colorScheme == .dark ? 0.12 : 0.08))
         .accessibilityElement(children: .contain)
+    }
+
+    /// A claim the recovery store refused is presented as a choice, never as a
+    /// silent loss. Retry re-runs the load and inspect reveals the exact stored
+    /// record; only the explicit discard removes anything, so the banner never
+    /// writes over the journal it is reporting on.
+    private func recoveryFailureBanner(_ failure: FilePreviewRecoveryClaimFailure) -> some View {
+        let retryable = FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: isDirty,
+            isLoading: isLoading,
+            isSaving: isSaving
+        )
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: FilePreviewNotice.Severity.error.systemImageName)
+                .foregroundStyle(.red)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Could not check for an unsaved draft")
+                    .font(.caption.weight(.medium))
+                Text(failure.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 8)
+            Button("Retry") { retryRecoveryClaim() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!retryable)
+                .help(retryable
+                    ? "Look for the stored draft again"
+                    : "Save or discard your current edits before retrying")
+            Button("Inspect") { inspectRecoveryJournal() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Reveal the stored recovery record in Finder")
+            Button("Discard", role: .destructive) { showRecoveryDiscardPrompt = true }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Delete the stored draft for this file")
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 7)
+        .frame(minHeight: 32)
+        .background(Color.red.opacity(colorScheme == .dark ? 0.13 : 0.08))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Error: \(failure.message)")
+    }
+
+    /// The failed attempt never modified the journal, so a retry is just the
+    /// ordinary load again, including its restore, notice, and dirty-state
+    /// bookkeeping.
+    private func retryRecoveryClaim() {
+        guard recoveryClaimFailure != nil, let loadedURL else { return }
+        guard FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: isDirty,
+            isLoading: isLoading,
+            isSaving: isSaving
+        ) else { return }
+        recoveryClaimFailure = nil
+        beginLoad(loadedURL)
+    }
+
+    private func inspectRecoveryJournal() {
+        let target = loadedURL ?? url
+        let reveal = recoveryStore.newestOrphanRecordURL(
+            for: target,
+            workspaceRoot: workspaceRoot
+        ) ?? recoveryStore.directoryURL
+        guard FileManager.default.fileExists(atPath: reveal.path) else {
+            ToastCenter.shared.show(
+                "The recovery record is no longer on disk.",
+                style: .error
+            )
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([reveal])
+    }
+
+    private func discardUnrecoveredDrafts() {
+        let target = loadedURL ?? url
+        do {
+            try recoveryStore.discardOrphans(for: target, workspaceRoot: workspaceRoot)
+            recoveryClaimFailure = nil
+        } catch {
+            handleRecoveryFailure(error, richDocument: false)
+        }
     }
 
     private func noticeBanner(_ notice: FilePreviewNotice) -> some View {
@@ -1020,6 +1126,7 @@ struct FilePreviewView: View {
         outlineNavigationRevision &+= 1
         conflict.apply(.documentLoaded)
         recoveredDraftPending = false
+        recoveryClaimFailure = nil
         ownedRecoveryToken = nil
         claimedRecoverySourceTokens = []
         recoveryRevision = 0
@@ -1035,7 +1142,7 @@ struct FilePreviewView: View {
                 FilePreviewSnapshot(
                     content: FilePreviewContent.load(url: target),
                     modificationDate: FilePreviewDiskState.modificationDate(of: target),
-                    recoveryClaim: try? store.claimNewestOrphan(
+                    recoveryOutcome: store.claimOutcome(
                         for: target,
                         workspaceRoot: root,
                         claimantID: ownerID
@@ -1150,6 +1257,12 @@ struct FilePreviewView: View {
             loadedURL = target
             loadingURL = nil
             recoveredDraftPending = restoredRecovery
+            // A refused claim leaves the stored draft on disk. Carrying the
+            // typed failure onto the banner is the only thing that keeps it
+            // reachable from here.
+            recoveryClaimFailure = snapshot.recoveryFailure.flatMap {
+                FilePreviewRecoveryFailurePolicy.shouldSurface($0) ? $0 : nil
+            }
             if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
                ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "preview-dirty-tab",
                !restoredRecovery {

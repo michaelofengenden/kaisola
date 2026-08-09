@@ -6,6 +6,46 @@ import XCTest
 /// semantics the ACP terminal bridge exposes to agents.
 final class AcpTerminalHostTests: XCTestCase {
 
+    func testHighThroughputOutputBacklogStaysWithinDeclaredCeilingAndAccountsForDrops() async {
+        let (stream, buffer) = AcpTerminalHost.makeOutputStream()
+        let chunk = Data(repeating: 0x78, count: AcpTerminalHost.outputStreamChunkByteLimit)
+        let totalChunks = AcpTerminalHost.outputStreamBufferedChunkLimit * 256
+
+        // Deliberately hold the consumer while the producer offers 1 GiB of
+        // logical output. This deterministically saturates the bufferingNewest
+        // policy without relying on scheduler timing or noisy process RSS.
+        for _ in 0..<totalChunks {
+            buffer.yield(chunk)
+        }
+
+        let saturated = buffer.state().stats
+        let expectedDroppedChunks = totalChunks - AcpTerminalHost.outputStreamBufferedChunkLimit
+        XCTAssertEqual(saturated.bufferedByteCeiling, 4 * 1_048_576)
+        XCTAssertEqual(saturated.peakBufferedChunks, saturated.bufferedChunkLimit)
+        XCTAssertLessThanOrEqual(
+            saturated.peakBufferedChunks * saturated.chunkByteLimit,
+            saturated.bufferedByteCeiling
+        )
+        XCTAssertEqual(saturated.droppedChunks, UInt64(expectedDroppedChunks))
+        XCTAssertEqual(
+            saturated.droppedBytes,
+            UInt64(expectedDroppedChunks * AcpTerminalHost.outputStreamChunkByteLimit)
+        )
+
+        buffer.finish()
+        var retainedSequences: [UInt64] = []
+        for await retained in stream {
+            XCTAssertEqual(retained.data.count, AcpTerminalHost.outputStreamChunkByteLimit)
+            retainedSequences.append(retained.sequence)
+        }
+        XCTAssertEqual(retainedSequences.count, AcpTerminalHost.outputStreamBufferedChunkLimit)
+        XCTAssertEqual(
+            retainedSequences.first,
+            UInt64(totalChunks - AcpTerminalHost.outputStreamBufferedChunkLimit)
+        )
+        XCTAssertEqual(retainedSequences.last, UInt64(totalChunks - 1))
+    }
+
     func testCreateCapturesOutputAndExitCode() async throws {
         let host = AcpTerminalHost()
         let id = try await host.create(

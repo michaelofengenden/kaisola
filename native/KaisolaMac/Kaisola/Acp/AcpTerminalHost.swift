@@ -15,16 +15,117 @@ actor AcpTerminalHost {
         let output: String
         let truncated: Bool
         let exitStatus: ExitStatus?
+        let outputBufferStats: OutputBufferStats
+    }
+
+    /// Diagnostics for the pipe-to-actor backlog. Each queued element is no
+    /// larger than `chunkByteLimit`, so the product of the two declared limits
+    /// is a stable memory ceiling for the AsyncStream's retained payloads.
+    struct OutputBufferStats: Equatable, Sendable {
+        let chunkByteLimit: Int
+        let bufferedChunkLimit: Int
+        let bufferedByteCeiling: Int
+        let peakBufferedChunks: Int
+        let droppedChunks: UInt64
+        let droppedBytes: UInt64
     }
 
     static let defaultOutputByteLimit = 1_048_576
     /// Hard ceiling for adapter-requested output limits (mirrors Electron's
     /// 8 MiB clamp) — a hostile `outputByteLimit` cannot exhaust app memory.
     static let maxOutputByteLimit = 8 * 1_048_576
+    /// FileHandle callbacks are split before they enter the stream. Together
+    /// these bounds cap retained AsyncStream payloads at 4 MiB per terminal.
+    static let outputStreamChunkByteLimit = 64 * 1024
+    static let outputStreamBufferedChunkLimit = 64
+    static let outputStreamBufferedByteCeiling =
+        outputStreamChunkByteLimit * outputStreamBufferedChunkLimit
     private static let signalNames: [Int32: String] = [
         SIGHUP: "SIGHUP", SIGINT: "SIGINT", SIGQUIT: "SIGQUIT", SIGKILL: "SIGKILL",
         SIGTERM: "SIGTERM", SIGPIPE: "SIGPIPE", SIGSEGV: "SIGSEGV", SIGABRT: "SIGABRT",
     ]
+
+    struct OutputChunk: Sendable {
+        let sequence: UInt64
+        let data: Data
+    }
+
+    struct OutputBufferState: Sendable {
+        let stats: OutputBufferStats
+        let latestDroppedSequence: UInt64?
+    }
+
+    /// Owns the continuation and synchronously accounts for every overflow.
+    /// Keeping this bookkeeping off the actor avoids replacing dropped stream
+    /// elements with an unbounded queue of per-drop Tasks.
+    final class OutputStreamBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private let continuation: AsyncStream<OutputChunk>.Continuation
+        private var nextSequence: UInt64 = 0
+        private var peakBufferedChunks = 0
+        private var droppedChunks: UInt64 = 0
+        private var droppedBytes: UInt64 = 0
+        private var latestDroppedSequence: UInt64?
+
+        init(continuation: AsyncStream<OutputChunk>.Continuation) {
+            self.continuation = continuation
+        }
+
+        func yield(_ data: Data) {
+            guard !data.isEmpty else { return }
+            var start = data.startIndex
+            while start < data.endIndex {
+                let end = min(start + AcpTerminalHost.outputStreamChunkByteLimit, data.endIndex)
+                let payload = start == data.startIndex && end == data.endIndex
+                    ? data
+                    : Data(data[start..<end])
+                lock.withLock {
+                    let chunk = OutputChunk(sequence: nextSequence, data: payload)
+                    nextSequence = nextSequence == .max ? .max : nextSequence + 1
+                    switch continuation.yield(chunk) {
+                    case .enqueued(let remainingCapacity):
+                        let buffered = AcpTerminalHost.outputStreamBufferedChunkLimit - remainingCapacity
+                        peakBufferedChunks = max(peakBufferedChunks, buffered)
+                    case .dropped(let dropped):
+                        peakBufferedChunks = AcpTerminalHost.outputStreamBufferedChunkLimit
+                        droppedChunks = Self.saturatingAdd(droppedChunks, 1)
+                        droppedBytes = Self.saturatingAdd(droppedBytes, UInt64(dropped.data.count))
+                        latestDroppedSequence = dropped.sequence
+                    case .terminated:
+                        break
+                    @unknown default:
+                        break
+                    }
+                }
+                start = end
+            }
+        }
+
+        func finish() {
+            lock.withLock { continuation.finish() }
+        }
+
+        func state() -> OutputBufferState {
+            lock.withLock {
+                OutputBufferState(
+                    stats: OutputBufferStats(
+                        chunkByteLimit: AcpTerminalHost.outputStreamChunkByteLimit,
+                        bufferedChunkLimit: AcpTerminalHost.outputStreamBufferedChunkLimit,
+                        bufferedByteCeiling: AcpTerminalHost.outputStreamBufferedByteCeiling,
+                        peakBufferedChunks: peakBufferedChunks,
+                        droppedChunks: droppedChunks,
+                        droppedBytes: droppedBytes
+                    ),
+                    latestDroppedSequence: latestDroppedSequence
+                )
+            }
+        }
+
+        private static func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+            let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? .max : sum
+        }
+    }
 
     private final class Entry {
         let process: Process
@@ -38,10 +139,15 @@ actor AcpTerminalHost {
         var eofReached = false
         var released = false
         var waiters: [CheckedContinuation<ExitStatus, Never>] = []
+        let outputStreamBuffer: OutputStreamBuffer
+        /// Chunks at or below this sequence precede a stream overflow and can
+        /// no longer be part of the contiguous retained suffix.
+        var minimumRetainedSequence: UInt64 = 0
 
-        init(process: Process, byteLimit: Int) {
+        init(process: Process, byteLimit: Int, outputStreamBuffer: OutputStreamBuffer) {
             self.process = process
             self.byteLimit = byteLimit
+            self.outputStreamBuffer = outputStreamBuffer
         }
     }
 
@@ -75,8 +181,13 @@ actor AcpTerminalHost {
         process.standardError = pipe
         process.standardInput = FileHandle.nullDevice
 
+        let (outputStream, outputStreamBuffer) = Self.makeOutputStream()
         let requestedLimit = outputByteLimit ?? Self.defaultOutputByteLimit
-        let entry = Entry(process: process, byteLimit: min(max(1, requestedLimit), Self.maxOutputByteLimit))
+        let entry = Entry(
+            process: process,
+            byteLimit: min(max(1, requestedLimit), Self.maxOutputByteLimit),
+            outputStreamBuffer: outputStreamBuffer
+        )
         entries[id] = entry
 
         // FileHandle may call the readability handler once with bytes and then
@@ -84,19 +195,18 @@ actor AcpTerminalHost {
         // lets the EOF task overtake the final append on a busy executor. Feed
         // one AsyncStream instead: its single consumer commits every chunk in
         // callback order, then marks EOF only after the buffer is fully drained.
-        let (outputStream, outputContinuation) = AsyncStream<Data>.makeStream()
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
-                outputContinuation.finish()
+                outputStreamBuffer.finish()
                 return
             }
-            outputContinuation.yield(data)
+            outputStreamBuffer.yield(data)
         }
         Task { [weak self] in
-            for await data in outputStream {
-                await self?.append(id: id, data: data)
+            for await chunk in outputStream {
+                await self?.append(id: id, chunk: chunk)
             }
             await self?.markEOF(id: id)
         }
@@ -117,7 +227,7 @@ actor AcpTerminalHost {
             try process.run()
         } catch {
             pipe.fileHandleForReading.readabilityHandler = nil
-            outputContinuation.finish()
+            outputStreamBuffer.finish()
             entries[id] = nil
             throw error
         }
@@ -126,10 +236,12 @@ actor AcpTerminalHost {
 
     func output(_ id: String) -> Snapshot? {
         guard let entry = entries[id] else { return nil }
+        let bufferState = reconcileStreamOverflow(entry)
         return Snapshot(
             output: String(decoding: entry.buffer, as: UTF8.self),
             truncated: entry.truncated,
-            exitStatus: entry.exitStatus
+            exitStatus: entry.exitStatus,
+            outputBufferStats: bufferState.stats
         )
     }
 
@@ -168,9 +280,24 @@ actor AcpTerminalHost {
 
     // MARK: - Internal
 
-    private func append(id: String, data: Data) {
+    private func append(id: String, chunk: OutputChunk) {
         guard let entry = entries[id] else { return }
-        entry.buffer.append(data)
+        _ = reconcileStreamOverflow(entry)
+        guard chunk.sequence >= entry.minimumRetainedSequence else { return }
+
+        let data = chunk.data
+        if entry.buffer.isEmpty, entry.truncated {
+            // Stream overflow can split a scalar between fixed-size chunks.
+            // Skip continuation bytes so the retained suffix still starts on
+            // the same clean UTF-8 boundary as byte-limit truncation.
+            var start = data.startIndex
+            while start < data.endIndex, data[start] & 0xC0 == 0x80 {
+                start += 1
+            }
+            entry.buffer.append(contentsOf: data[start...])
+        } else {
+            entry.buffer.append(data)
+        }
         if entry.buffer.count > entry.byteLimit {
             // Keep the tail on a UTF-8 boundary so decoding stays clean.
             var dropCount = entry.buffer.count - entry.byteLimit
@@ -181,6 +308,21 @@ actor AcpTerminalHost {
             entry.buffer.removeFirst(dropCount)
             entry.truncated = true
         }
+    }
+
+    /// Applies stream drops before exposing or appending output. Clearing the
+    /// already-consumed prefix keeps snapshots a contiguous suffix rather than
+    /// concatenating bytes from opposite sides of an overflow gap.
+    private func reconcileStreamOverflow(_ entry: Entry) -> OutputBufferState {
+        let state = entry.outputStreamBuffer.state()
+        guard let latestDropped = state.latestDroppedSequence,
+              latestDropped >= entry.minimumRetainedSequence else {
+            return state
+        }
+        entry.buffer.removeAll(keepingCapacity: true)
+        entry.truncated = true
+        entry.minimumRetainedSequence = latestDropped == .max ? .max : latestDropped + 1
+        return state
     }
 
     /// Exit lands here first; it only becomes visible once the pipe reached
@@ -219,5 +361,17 @@ actor AcpTerminalHost {
 
     private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Internal seam used by the host and by deterministic backlog stress
+    /// tests. The newest elements survive overflow, matching tail semantics.
+    static func makeOutputStream() -> (
+        stream: AsyncStream<OutputChunk>,
+        buffer: OutputStreamBuffer
+    ) {
+        let pair = AsyncStream<OutputChunk>.makeStream(
+            bufferingPolicy: .bufferingNewest(outputStreamBufferedChunkLimit)
+        )
+        return (pair.stream, OutputStreamBuffer(continuation: pair.continuation))
     }
 }

@@ -8,10 +8,37 @@ import Foundation
 /// disk I/O during view evaluation; writes refresh that snapshot immediately.
 extension AppModel {
     /// Toggle a session's pinned state, then republish so the sidebar reorders.
+    /// A failed durable write leaves the in-memory snapshot untouched and is
+    /// surfaced immediately instead of presenting a pin that will vanish.
     func togglePin(_ terminalID: String) {
         let store = SessionPinStore()
-        store.setPinned(terminalID, !persistedPinnedIDs.contains(terminalID))
-        refreshPersistedNavigationState()
+        guard let updated = AppModel.persistPinChange(
+            terminalID: terminalID,
+            currentPins: persistedPinnedIDs,
+            store: store,
+            reportFailure: { message in
+                ToastCenter.shared.show(message, style: .error, duration: 6)
+            }
+        ) else { return }
+
+        persistedPinnedIDs = updated
+        objectWillChange.send()
+    }
+
+    /// Testable durability boundary behind `togglePin`. Returning nil means the
+    /// caller must retain its current in-memory pins.
+    static func persistPinChange(
+        terminalID: String,
+        currentPins: Set<String>,
+        store: SessionPinStore,
+        reportFailure: (String) -> Void
+    ) -> Set<String>? {
+        do {
+            return try store.setPinned(terminalID, !currentPins.contains(terminalID))
+        } catch {
+            reportFailure(error.localizedDescription)
+            return nil
+        }
     }
 
     /// Whether a session is pinned to the top of its project group.

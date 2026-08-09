@@ -25,7 +25,7 @@ after(() => {
   fs.rmSync(managerSpoolDir, { recursive: true, force: true })
 })
 
-test('process-wide terminal capacity is validated and enforced before pty spawn', (t) => {
+test('process-wide terminal capacity is validated and enforced before pty spawn', async (t) => {
   assert.throws(
     () => manager.configureCapacity(0),
     /maximum live terminals must be an integer from 1 to 512/,
@@ -68,7 +68,13 @@ test('process-wide terminal capacity is validated and enforced before pty spawn'
   )
   assert.equal(manager.has(secondID), false)
 
-  manager.release(firstID)
+  const firstExit = manager.waitForExit(firstID)
+  const firstRelease = manager.release(firstID)
+  await firstExit
+  await firstRelease
+  for (let attempt = 0; attempt < 100 && manager.has(firstID); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
   assert.ok(manager.spawn({
     id: secondID,
     command: '/bin/cat',
@@ -153,9 +159,10 @@ function spawnKillTestRecord(t, id) {
     record.exited = false
     record.pty = pty
     pty.kill = acceptedKill
+    try { acceptedKill() } catch { /* fixture child already exited */ }
     manager.release(id)
   })
-  return { record, pty }
+  return { record, pty, acceptedKill }
 }
 
 test('terminal kill reports node-pty refusal and leaves the registered terminal live', (t) => {
@@ -226,6 +233,131 @@ test('terminal kill reports accepted signaling without claiming synchronous exit
   assert.deepEqual(manager.kill(id), { id, ok: true })
   assert.equal(killCalls, 1)
   assert.equal(record.exited, false)
+})
+
+function unconfirmedRelease(id, code) {
+  return {
+    id,
+    ok: false,
+    released: false,
+    termination: {
+      confirmed: false,
+      retryable: true,
+      code,
+      message: 'terminal termination is not confirmed',
+    },
+    deletion: null,
+    cleanup: { method: 'terminal.release', id },
+  }
+}
+
+test('terminal release retains a recoverable tombstone when node-pty refuses termination', (t) => {
+  const id = 'release-kill-refusal-retains-tombstone'
+  const { record, pty } = spawnKillTestRecord(t, id)
+  record.spool.push('retained release evidence')
+  record.spool.flush()
+  const target = record.spool.file
+
+  pty.kill = () => false
+  assert.deepEqual(manager.release(id), unconfirmedRelease(id, 'terminal_kill_failed'))
+
+  assert.equal(manager.has(id), true, 'an unconfirmed process keeps its broker record')
+  assert.equal(manager.isLive(id), true)
+  assert.equal(manager.diagnostics().find((row) => row.id === id)?.releasePending, true)
+  assert.equal(fs.readFileSync(target, 'utf8'), 'retained release evidence')
+  assert.equal(TerminalSpool.readMeta(id, managerSpoolDir)?.id, id)
+})
+
+test('terminal release keeps the spool until an accepted signal produces an exit event', async (t) => {
+  const id = 'release-awaits-exit-confirmation'
+  const { record, pty } = spawnKillTestRecord(t, id)
+  record.spool.push('do not erase before exit')
+  record.spool.flush()
+  const target = record.spool.file
+  const acceptedKill = pty.kill.bind(pty)
+  let releaseKill
+  const releaseKillScheduled = new Promise((resolve) => { releaseKill = resolve })
+  pty.kill = () => {
+    setImmediate(() => {
+      pty.kill = acceptedKill
+      acceptedKill()
+      releaseKill()
+    })
+    return true
+  }
+
+  const releasing = manager.release(id)
+  assert.equal(typeof releasing?.then, 'function')
+  assert.equal(manager.has(id), true)
+  assert.equal(fs.readFileSync(target, 'utf8'), 'do not erase before exit')
+
+  await releaseKillScheduled
+  const result = await releasing
+  assert.equal(result.ok, true)
+  assert.deepEqual(result.termination, { confirmed: true, evidence: 'exit-event' })
+  assert.equal(manager.has(id), false, 'the pending release finalizes after authoritative exit')
+  assert.equal(fs.existsSync(target), false)
+})
+
+test('terminal release times out to a retained tombstone when accepted signaling never exits', async (t) => {
+  const id = 'release-signal-without-exit-times-out'
+  const { record, pty, acceptedKill } = spawnKillTestRecord(t, id)
+  record.spool.push('timeout keeps this evidence')
+  record.spool.flush()
+  const target = record.spool.file
+  pty.kill = () => true
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+
+  const releasing = manager.release(id)
+  assert.equal(typeof releasing?.then, 'function')
+  assert.equal(manager.has(id), true)
+  t.mock.timers.tick(__test.RELEASE_CONFIRM_MS)
+  assert.deepEqual(await releasing, unconfirmedRelease(id, 'terminal_exit_unconfirmed'))
+  assert.equal(manager.has(id), true)
+  assert.equal(manager.diagnostics().find((row) => row.id === id)?.releasePending, true)
+  assert.equal(fs.readFileSync(target, 'utf8'), 'timeout keeps this evidence')
+
+  t.mock.timers.reset()
+  pty.kill = acceptedKill
+  const exited = new Promise((resolve) => pty.onExit(resolve))
+  acceptedKill()
+  await exited
+})
+
+test('terminal release may delete after the exact child pid is verified missing', async (t) => {
+  const id = 'release-verifies-missing-pid'
+  const { record, pty, acceptedKill } = spawnKillTestRecord(t, id)
+  record.spool.push('safe to erase only after ESRCH')
+  record.spool.flush()
+  const target = record.spool.file
+  const pid = pty.pid
+  let probes = 0
+
+  pty.kill = () => false
+  t.mock.method(process, 'kill', (candidate, signal) => {
+    assert.equal(candidate, pid)
+    assert.equal(signal, 0)
+    probes += 1
+    const error = new Error('no such process')
+    error.code = 'ESRCH'
+    throw error
+  })
+
+  const result = manager.release(id)
+  assert.equal(probes, 1)
+  assert.equal(result.ok, true)
+  assert.equal(result.released, true)
+  assert.equal(result.termination.confirmed, true)
+  assert.equal(result.termination.evidence, 'pid-missing')
+  assert.equal(result.deletion.complete, true)
+  assert.equal(manager.has(id), false)
+  assert.equal(fs.existsSync(target), false)
+  // The ESRCH probe is injected, so explicitly reap the real fixture child:
+  // the manager correctly discarded its record on the evidence it received.
+  t.mock.restoreAll()
+  const exited = new Promise((resolve) => pty.onExit(resolve))
+  acceptedKill()
+  await exited
 })
 
 test('terminal owner detach targets one terminal when an owner has several', (t) => {
@@ -688,19 +820,20 @@ test('manager controls stay responsive while an asynchronous spool writer drains
   assert.deepEqual(manager.resize(id, 90, 30), { ok: true })
   assert.ok(performance.now() - startedAt < 100, 'resize must not wait for terminal storage')
 
+  const exited = manager.waitForExit(id)
   const releasing = manager.release(id)
   assert.equal(typeof releasing?.then, 'function')
-  assert.equal(manager.has(id), false, 'release revokes the live record before storage finishes')
-  let released = false
-  releasing.then(() => { released = true })
+  assert.equal(manager.has(id), true, 'release retains its tombstone while storage and exit settle')
   await new Promise((resolve) => setImmediate(resolve))
-  assert.equal(released, false, 'release receipt waits for the queued append and deletion')
+  assert.equal(manager.has(id), true, 'the retained spool cannot be deleted behind a queued append')
 
   releaseWriter()
+  await exited
   const result = await releasing
   assert.equal(resumeCalls, 1, 'the manager resumes its PTY after the writer drains')
   assert.equal(result.ok, true)
-  assert.equal(result.deletion.complete, true)
+  assert.deepEqual(result.termination, { confirmed: true, evidence: 'exit-event' })
+  assert.equal(manager.has(id), false)
   assert.equal(TerminalSpool.readMeta(id, managerSpoolDir), null)
   assert.equal(TerminalSpool.coldTail(id, managerSpoolDir), null)
 })
@@ -871,6 +1004,9 @@ test('agent silence relaxes the busy indicator but never completes the turn', as
   assert.equal(settled.safe, true)
   assert.deepEqual(settled.busyTerminalIds, [])
   assert.deepEqual(settled.unconfirmedTurnIds, [])
+  // The cleanup hook now awaits release confirmation; restore real timers so
+  // its bounded fallback and node-pty exit delivery cannot be stranded.
+  t.mock.timers.reset()
 })
 
 test('a pty exit completes an open agent turn as an explicit signal', async (t) => {
@@ -1101,26 +1237,27 @@ test('a terminal caps its exit waiters and answers every retained one on release
   )
   assert.equal(__test.exitWaiterCount(id), __test.MAX_EXIT_WAITERS, 'a refused wait adds nothing')
 
-  // Release deletes the record, so its pty exit can never answer these: they
-  // must fail now instead of staying pending for the broker's lifetime.
+  // Release keeps the record until the PTY's exit arrives, so every retained
+  // waiter receives the authoritative status instead of a synthetic failure.
   manager.release(id)
   const settled = await Promise.allSettled(waits)
   assert.deepEqual(
     [...new Set(settled.map((result) => `${result.status}:${result.reason?.message ?? ''}`))],
-    ['rejected:Terminal is no longer available.'],
+    ['fulfilled:'],
   )
   assert.equal(__test.exitWaiterCount(id), 0)
 })
 
-test('release surfaces incomplete spool deletion and safely retries after record removal', (t) => {
+test('release surfaces incomplete spool deletion and safely retries after record removal', async () => {
   const id = 'release-retries-spool-cleanup'
   const record = manager.spawn({
     id,
-    command: '/bin/cat',
-    args: [],
+    command: '/bin/sh',
+    args: ['-c', 'exit 0'],
     cwd: managerSpoolDir,
   })
   assert.ok(record)
+  await manager.waitForExit(id)
   record.spool.push('terminal secret awaiting verified deletion')
   record.spool.flush()
   const target = record.spool.file
@@ -1147,6 +1284,7 @@ test('release surfaces incomplete spool deletion and safely retries after record
     id,
     ok: false,
     released: true,
+    termination: { confirmed: true, evidence: 'exit-event' },
     deletion: {
       complete: false,
       retryable: true,

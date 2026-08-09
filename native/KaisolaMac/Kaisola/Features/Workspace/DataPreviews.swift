@@ -837,10 +837,10 @@ struct HtmlFilePreview: View {
     }
 }
 
-/// A WKWebView with a non-persistent data store and project-confined file
-/// access. JavaScript follows the visible preview toggle. Explicit off-scope
-/// top-level links open in the system browser; other off-scope navigations are
-/// dropped.
+/// A WKWebView with a non-persistent data store of its own — not the browser
+/// card's — and project-confined file access. JavaScript follows the visible
+/// preview toggle. Explicit off-scope top-level links open in the system
+/// browser; other off-scope navigations are dropped.
 private struct ConfinedFileWebView: NSViewRepresentable {
     let fileURL: URL
     let readAccessRoot: URL?
@@ -854,11 +854,10 @@ private struct ConfinedFileWebView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        // Ephemeral, and SHARED with the browser card: same trust class, and
-        // one store gives the content surfaces shared process affinity
-        // instead of isolated ephemeral state per view (spec §2e).
-        configuration.websiteDataStore = SharedWebKit.ephemeralContentStore
+        // Ephemeral, and ISOLATED from the browser card: approved project
+        // JavaScript must never read the cookies or storage of an
+        // authenticated local dev server (spec §2e, revised).
+        let configuration = SharedWebKit.contentConfiguration(for: .filePreview)
         // The web view is ephemeral and file-confined. Script execution remains
         // off until the user opts in from the visible preview menu.
         let pagePreferences = WKWebpagePreferences()

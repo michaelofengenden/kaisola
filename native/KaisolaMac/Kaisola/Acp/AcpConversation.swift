@@ -212,9 +212,13 @@ final class AcpConversation: ObservableObject {
     }
 
     struct TurnCheckpoint: Identifiable, Equatable, Sendable {
-        let id: String       // stash commit hash
+        let checkpoint: GitService.Checkpoint
         let turn: Int
         let at: Date
+
+        /// A stash commit can be identical across owners or turns. The exact
+        /// owner ref is the durable UI identity and cleanup capability.
+        var id: String { checkpoint.keepAliveRef }
     }
 
     @Published var title: String
@@ -245,6 +249,11 @@ final class AcpConversation: ObservableObject {
     /// parameter. Nil disables persistence: `loadDraft` returns "" and
     /// `saveDraft` is a no-op.
     var draftStorageKey: String?
+    /// Stable chat/column identity plus a per-live-instance incarnation keep
+    /// checkpoint refs independent across windows and concurrently running app
+    /// builds that restore the same durable conversation.
+    private let checkpointOwnerID: String
+    private let checkpointIncarnationID: UUID
     private var client: AcpClient
     /// Reconciles adapter-reported user messages against the rows already shown.
     private var userMessageLedger: AcpUserMessageLedger
@@ -323,6 +332,7 @@ final class AcpConversation: ObservableObject {
         ruleStore: PermissionRuleStore = PermissionRuleStore(),
         sensitiveGlobs: [String] = AcpPermissionRules.defaultSensitiveGlobs,
         draftKey: String? = nil,
+        checkpointIncarnationID: UUID = UUID(),
         resumeSessionID: String? = nil,
         initialRows: [AcpTranscriptRow] = [],
         initialRowStartOrdinal: Int64 = 0,
@@ -346,6 +356,13 @@ final class AcpConversation: ObservableObject {
         self.ruleStore = ruleStore
         self.sensitiveGlobs = sensitiveGlobs
         self.draftStorageKey = draftKey
+        self.checkpointIncarnationID = checkpointIncarnationID
+        if let draftKey,
+           !draftKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            self.checkpointOwnerID = draftKey
+        } else {
+            self.checkpointOwnerID = "ephemeral-\(checkpointIncarnationID.uuidString.lowercased())"
+        }
         self.resumeSessionID = resumeSessionID
         self.rows = initialRows
         self.userMessageLedger = AcpUserMessageLedger(rows: initialRows)
@@ -944,36 +961,43 @@ final class AcpConversation: ObservableObject {
     /// Snapshots cover TRACKED files (git stash create semantics).
     private func recordCheckpoint(turn: Int) async {
         let workspace = cwd
-        let hash = await Task.detached(priority: .userInitiated) { () -> String? in
+        let ownerID = checkpointOwnerID
+        let incarnationID = checkpointIncarnationID
+        let checkpoint = await Task.detached(priority: .userInitiated) { () -> GitService.Checkpoint? in
             let service = GitService(repoRoot: URL(fileURLWithPath: workspace, isDirectory: true))
-            return try? service.checkpoint()
+            return try? service.checkpoint(
+                ownerID: ownerID,
+                incarnationID: incarnationID,
+                turn: turn
+            )
         }.value
-        guard let hash else { return }
-        checkpoints.append(TurnCheckpoint(id: hash, turn: turn, at: Date()))
+        guard let checkpoint else { return }
+        checkpoints.append(TurnCheckpoint(checkpoint: checkpoint, turn: turn, at: Date()))
         if checkpoints.count > 20 {
             let dropped = checkpoints.removeFirst()
-            dropCheckpointRef(dropped.id)
+            dropCheckpointRef(dropped.checkpoint)
         }
     }
 
     /// Release a checkpoint's keep-alive ref once it ages out of the menu.
-    private func dropCheckpointRef(_ hash: String) {
+    private func dropCheckpointRef(_ checkpoint: GitService.Checkpoint) {
         let workspace = cwd
         Task.detached(priority: .utility) {
             let service = GitService(repoRoot: URL(fileURLWithPath: workspace, isDirectory: true))
-            try? service.dropCheckpoint(hash)
+            try? service.dropCheckpoint(checkpoint)
         }
     }
 
     /// Restore a checkpoint's files over the current tree (user-confirmed in
     /// the header). Conflicts surface as a status message, never silently.
-    func restoreCheckpoint(_ id: String) {
+    func restoreCheckpoint(_ checkpoint: TurnCheckpoint) {
         let workspace = cwd
+        let snapshot = checkpoint.checkpoint
         Task.detached(priority: .userInitiated) { [weak self] in
             let service = GitService(repoRoot: URL(fileURLWithPath: workspace, isDirectory: true))
             let outcome: Result<Void, any Error>
             do {
-                try service.applyCheckpoint(id)
+                try service.applyCheckpoint(snapshot)
                 outcome = .success(())
             } catch {
                 outcome = .failure(error)

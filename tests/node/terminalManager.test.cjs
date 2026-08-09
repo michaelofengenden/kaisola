@@ -109,6 +109,7 @@ test('terminal kill reports node-pty refusal and leaves the registered terminal 
 
   pty.kill = () => false
   assert.deepEqual(manager.kill(id), {
+    id,
     ok: false,
     code: 'terminal_kill_failed',
     message: 'terminal signal failed',
@@ -118,6 +119,7 @@ test('terminal kill reports node-pty refusal and leaves the registered terminal 
 
   pty.kill = () => { throw new Error('sensitive node-pty diagnostic') }
   assert.deepEqual(manager.kill(id), {
+    id,
     ok: false,
     code: 'terminal_kill_failed',
     message: 'terminal signal failed',
@@ -127,7 +129,9 @@ test('terminal kill reports node-pty refusal and leaves the registered terminal 
 })
 
 test('terminal kill distinguishes a missing record from signaling refusal', () => {
-  assert.deepEqual(manager.kill('missing-terminal-kill'), {
+  const id = 'missing-terminal-kill'
+  assert.deepEqual(manager.kill(id), {
+    id,
     ok: false,
     code: 'terminal_not_found',
     message: 'terminal is no longer available',
@@ -140,7 +144,7 @@ test('terminal kill is idempotent after exit and never signals node-pty', (t) =>
   let killCalls = 0
   pty.kill = () => { killCalls += 1 }
   record.exited = true
-  const alreadyExited = { ok: true, alreadyExited: true }
+  const alreadyExited = { id, ok: true, alreadyExited: true }
   assert.deepEqual(manager.kill(id), alreadyExited)
   assert.deepEqual(manager.kill(id), alreadyExited)
   assert.equal(killCalls, 0)
@@ -151,6 +155,7 @@ test('terminal kill fails closed when a live record has no pty', (t) => {
   const { record } = spawnKillTestRecord(t, id)
   record.pty = null
   assert.deepEqual(manager.kill(id), {
+    id,
     ok: false,
     code: 'terminal_kill_unavailable',
     message: 'terminal signal unavailable',
@@ -163,7 +168,7 @@ test('terminal kill reports accepted signaling without claiming synchronous exit
   let killCalls = 0
   pty.kill = () => { killCalls += 1 }
 
-  assert.deepEqual(manager.kill(id), { ok: true })
+  assert.deepEqual(manager.kill(id), { id, ok: true })
   assert.equal(killCalls, 1)
   assert.equal(record.exited, false)
 })

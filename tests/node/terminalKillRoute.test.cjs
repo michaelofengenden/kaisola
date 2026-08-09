@@ -6,6 +6,7 @@ const { terminalKillRoute } = require('../../runtime/node-broker/ipc/terminalCre
 
 test('terminal kill wire route returns typed nested failure verbatim', () => {
   const failure = {
+    id: 'kill-refused-on-wire',
     ok: false,
     code: 'terminal_kill_failed',
     message: 'terminal signal failed',
@@ -31,8 +32,8 @@ test('terminal kill wire route returns typed nested failure verbatim', () => {
 
 test('terminal kill wire route preserves success and idempotent-exit details', async (t) => {
   for (const result of [
-    { ok: true },
-    { ok: true, alreadyExited: true },
+    { id: 'kill-success-on-wire', ok: true },
+    { id: 'kill-success-on-wire', ok: true, alreadyExited: true },
   ]) {
     await t.test(JSON.stringify(result), () => {
       const response = terminalKillRoute({

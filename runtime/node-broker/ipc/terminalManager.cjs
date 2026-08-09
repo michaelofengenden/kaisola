@@ -844,7 +844,7 @@ function killRecord(record) {
 }
 
 function kill(id) {
-  return killRecord(terms.get(id))
+  return { id, ...killRecord(terms.get(id)) }
 }
 
 function release(id) {

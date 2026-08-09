@@ -19,6 +19,7 @@ const {
 const { terminalAttachRoute, terminalCreateRoute, terminalKillRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalDetachOwnerRoute } = require('./ipc/terminalDetachOwnerRoute.cjs')
 const { BrokerRequestGate, dispatchBrokerRequest } = require('./ipc/brokerRequestGate.cjs')
+const { collectBrokerInventorySnapshot } = require('./ipc/brokerInventorySnapshot.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
@@ -205,6 +206,34 @@ function scheduleNoClientExit() {
   noClientTimer.unref?.()
 }
 
+function brokerStatusSnapshot() {
+  return {
+    ok: true,
+    protocol: PROTOCOL,
+    securityEpoch: SECURITY_EPOCH,
+    implementationVersion: BROKER_IMPLEMENTATION_VERSION,
+    packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
+    packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
+    contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
+    features: FEATURES,
+    pid: process.pid,
+    startedAt: config.startedAt,
+    version: config.version,
+    activityEpoch,
+    companionLeaseEpoch,
+    companionLeaseCount: companionLeases.size,
+    inFlightMutations,
+    generationState: drainingTarget ? 'draining' : 'current',
+    drainingTargetContentDigest: drainingTarget?.targetContentDigest ?? null,
+    // Degraded means the live sockets and PTYs are fine but the info file is
+    // stale or absent, so a restarted GUI cannot rendezvous yet.
+    rendezvous: rendezvousStatus(),
+    health: rejectionSupervisor.status(),
+    authenticatedClientCount: clients.size,
+    terminals: mgr.diagnostics(),
+  }
+}
+
 function detachInstance(instanceId) {
   if (!instanceId) return
   mgr.detachSenderPrefix(`${instanceId}|`)
@@ -267,33 +296,23 @@ async function dispatch(client, method, params = {}) {
   const requireAllowed = (id, adopt = false) => {
     if (!allowed(id, adopt)) throw new Error('terminal access denied')
   }
+  const visibleRows = (rows) => admin ? rows : rows.filter((row) => terminalOwnerAllowed({
+    recordOwner: row.owner,
+    recordLastOwner: row.lastOwner,
+    requestOwner: owner,
+    requestProject,
+  }))
   switch (method) {
     case 'broker.status':
-      return {
-        ok: true,
-        protocol: PROTOCOL,
-        securityEpoch: SECURITY_EPOCH,
-        implementationVersion: BROKER_IMPLEMENTATION_VERSION,
-        packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
-        packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
-        contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
-        features: FEATURES,
-        pid: process.pid,
-        startedAt: config.startedAt,
-        version: config.version,
-        activityEpoch,
-        companionLeaseEpoch,
-        companionLeaseCount: companionLeases.size,
-        inFlightMutations,
-        generationState: drainingTarget ? 'draining' : 'current',
-        drainingTargetContentDigest: drainingTarget?.targetContentDigest ?? null,
-        // Degraded means the live sockets and PTYs are fine but the info file
-        // is stale or absent, so a restarted GUI cannot rendezvous yet.
-        rendezvous: rendezvousStatus(),
-        health: rejectionSupervisor.status(),
-        authenticatedClientCount: clients.size,
-        terminals: mgr.diagnostics(),
-      }
+      return brokerStatusSnapshot()
+    case 'broker.inventory':
+      return collectBrokerInventorySnapshot({
+        activityEpoch: () => activityEpoch,
+        inFlightMutations: () => inFlightMutations,
+        status: brokerStatusSnapshot,
+        diagnostics: () => visibleRows(mgr.diagnostics()),
+        live: () => visibleRows(mgr.list()),
+      })
     case 'broker.shutdown':
       setTimeout(() => gracefulExit(true), 20).unref?.()
       return { ok: true }
@@ -552,22 +571,10 @@ async function dispatch(client, method, params = {}) {
       return { ok: mgr.cancelRelease(id) }
     }
     case 'terminal.list': {
-      const rows = mgr.list()
-      return admin ? rows : rows.filter((row) => terminalOwnerAllowed({
-        recordOwner: row.owner,
-        recordLastOwner: row.lastOwner,
-        requestOwner: owner,
-        requestProject,
-      }))
+      return visibleRows(mgr.list())
     }
     case 'terminal.diagnostics': {
-      const rows = mgr.diagnostics()
-      return admin ? rows : rows.filter((row) => terminalOwnerAllowed({
-        recordOwner: row.owner,
-        recordLastOwner: row.lastOwner,
-        requestOwner: owner,
-        requestProject,
-      }))
+      return visibleRows(mgr.diagnostics())
     }
     case 'terminal.setFocused':
       mgr.setAppFocused(!!params.focused)

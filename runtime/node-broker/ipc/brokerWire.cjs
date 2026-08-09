@@ -25,6 +25,7 @@ const TERMINAL_HISTORY_CONTINUOUS_FEATURE = 'terminal-history-continuous-v1'
 const OBSERVER_ROLE_FEATURE = 'observer-role-v1'
 const BROKER_UPDATE_FEATURE = 'broker-update-v1'
 const BROKER_ROLLING_UPDATE_FEATURE = 'broker-rolling-update-v1'
+const BROKER_INVENTORY_FEATURE = 'broker-inventory-v1'
 // terminal:exit:<id> shipped as a bare exit code, so a signal-killed session
 // arrived as an ordinary numeric exit and the cause was lost. Clients that
 // declare this feature receive the same { exitCode, signal } record the
@@ -37,12 +38,14 @@ const FEATURES = Object.freeze([
   OBSERVER_ROLE_FEATURE,
   BROKER_UPDATE_FEATURE,
   BROKER_ROLLING_UPDATE_FEATURE,
+  BROKER_INVENTORY_FEATURE,
   TERMINAL_EXIT_STATUS_FEATURE,
 ])
 const TERMINAL_EXIT_CHANNEL_PREFIX = 'terminal:exit:'
 const OBSERVER_ACCESS = 'observer'
 const OBSERVER_METHODS = Object.freeze([
   'broker.status',
+  'broker.inventory',
   'terminal.list',
   'terminal.diagnostics',
   'terminal.history',
@@ -57,6 +60,7 @@ const OBSERVER_METHODS = Object.freeze([
 // a socket teardown + reconnect loop on the durability-critical reattach path.
 const MAX_FRAME = 56 * 1024 * 1024
 const TERMINAL_HISTORY_PAGE_BYTES = 4 * 1024 * 1024
+const BROKER_INVENTORY_RESPONSE_BYTES = 12 * 1024 * 1024
 const HELLO_FRAME_BYTES = 64 * 1024
 const DEFAULT_REQUEST_FRAME_BYTES = 64 * 1024
 const DEFAULT_RESPONSE_FRAME_BYTES = 256 * 1024
@@ -84,6 +88,8 @@ function responseFrameBytes(method) {
     case 'terminal.list':
     case 'terminal.diagnostics':
       return 4 * 1024 * 1024
+    case 'broker.inventory':
+      return BROKER_INVENTORY_RESPONSE_BYTES
     default:
       return DEFAULT_RESPONSE_FRAME_BYTES
   }
@@ -306,6 +312,7 @@ module.exports = {
   OBSERVER_ROLE_FEATURE,
   BROKER_UPDATE_FEATURE,
   BROKER_ROLLING_UPDATE_FEATURE,
+  BROKER_INVENTORY_FEATURE,
   TERMINAL_EXIT_STATUS_FEATURE,
   TERMINAL_EXIT_CHANNEL_PREFIX,
   FEATURES,
@@ -313,6 +320,7 @@ module.exports = {
   OBSERVER_METHODS,
   MAX_FRAME,
   TERMINAL_HISTORY_PAGE_BYTES,
+  BROKER_INVENTORY_RESPONSE_BYTES,
   HELLO_FRAME_BYTES,
   DEFAULT_REQUEST_FRAME_BYTES,
   DEFAULT_RESPONSE_FRAME_BYTES,

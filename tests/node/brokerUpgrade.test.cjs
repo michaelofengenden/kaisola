@@ -81,6 +81,7 @@ test('an unclassified rejection latches a mutation fence without hiding observat
   assert.equal(supervisor.allows('broker.shutdownForUpdate'), false)
   for (const method of [
     'broker.status',
+    'broker.inventory',
     'terminal.available',
     'terminal.subscribe',
     'terminal.unsubscribe',

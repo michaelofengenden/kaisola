@@ -982,7 +982,8 @@ struct SettingsView: View {
                 }
                 ProjectAccountsSection(
                     projectID: workspace.map { NativeSessionStore.projectID(forDirectory: $0.path) },
-                    projectName: workspace.map { ($0.path as NSString).lastPathComponent }
+                    projectName: workspace.map { ($0.path as NSString).lastPathComponent },
+                    workspace: workspace
                 )
             }
             .padding(18)

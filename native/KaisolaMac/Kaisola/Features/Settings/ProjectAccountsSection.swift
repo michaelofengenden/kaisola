@@ -169,6 +169,131 @@ struct NamedAccountRemovalConfirmation: Equatable {
     }
 }
 
+/// Non-secret account state derived from the signed usage helper's latest
+/// provider-scoped result. The UI never inspects credential files or retains
+/// provider identity data; it shows only readiness, a bounded diagnostic, and
+/// when the helper last answered.
+struct NamedAccountAuthenticationPresentation: Equatable {
+    enum Status: Equatable {
+        case checking
+        case unchecked
+        case signedIn
+        case signedOut
+        case expired
+        case failed
+    }
+
+    enum Action: Equatable {
+        case signIn
+        case reauthenticate
+        case check
+    }
+
+    let status: Status
+    let action: Action
+    let lastVerification: Date?
+    let diagnostic: String?
+
+    static func resolve(
+        reading: UsageCenter.ProviderPlanUsage?,
+        isRefreshing: Bool
+    ) -> NamedAccountAuthenticationPresentation {
+        guard let reading else {
+            return NamedAccountAuthenticationPresentation(
+                status: isRefreshing ? .checking : .unchecked,
+                action: .check,
+                lastVerification: nil,
+                diagnostic: nil
+            )
+        }
+        if reading.ok {
+            return NamedAccountAuthenticationPresentation(
+                status: .signedIn,
+                action: .check,
+                lastVerification: reading.updatedDate,
+                diagnostic: nil
+            )
+        }
+        let message = reading.message?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if reading.authRequired == true {
+            let expired = message.map(isExpiredAuthenticationMessage) ?? false
+            return NamedAccountAuthenticationPresentation(
+                status: expired ? .expired : .signedOut,
+                action: expired ? .reauthenticate : .signIn,
+                lastVerification: reading.updatedDate,
+                diagnostic: message
+            )
+        }
+        return NamedAccountAuthenticationPresentation(
+            status: .failed,
+            action: .check,
+            lastVerification: reading.updatedDate,
+            diagnostic: message
+        )
+    }
+
+    var title: String {
+        switch status {
+        case .checking: "Checking"
+        case .unchecked: "Not checked"
+        case .signedIn: "Signed in"
+        case .signedOut: "Not signed in"
+        case .expired: "Sign-in expired"
+        case .failed: "Check failed"
+        }
+    }
+
+    var actionTitle: String {
+        switch action {
+        case .signIn: "Sign In"
+        case .reauthenticate: "Reauthenticate"
+        case .check: "Check"
+        }
+    }
+
+    var symbolName: String {
+        switch status {
+        case .checking: "clock.arrow.circlepath"
+        case .unchecked: "circle.dotted"
+        case .signedIn: "checkmark.circle.fill"
+        case .signedOut: "person.crop.circle.badge.questionmark"
+        case .expired: "clock.badge.exclamationmark"
+        case .failed: "exclamationmark.circle.fill"
+        }
+    }
+
+    func detail(now: Date) -> String {
+        let checked = Self.lastCheckedCaption(lastVerification, now: now)
+        switch status {
+        case .checking:
+            return "Checking provider authentication…"
+        case .unchecked:
+            return "No verification yet."
+        case .signedIn:
+            return checked
+        case .signedOut, .expired, .failed:
+            guard let diagnostic, !diagnostic.isEmpty else { return checked }
+            return "\(diagnostic) · \(checked)"
+        }
+    }
+
+    static func lastCheckedCaption(_ date: Date?, now: Date) -> String {
+        guard let date else { return "No verification time." }
+        let elapsed = max(0, now.timeIntervalSince(date))
+        if elapsed < 60 { return "Last checked just now" }
+        if elapsed < 3_600 { return "Last checked \(Int(elapsed / 60))m ago" }
+        if elapsed < 86_400 { return "Last checked \(Int(elapsed / 3_600))h ago" }
+        return "Last checked \(Int(elapsed / 86_400))d ago"
+    }
+
+    private static func isExpiredAuthenticationMessage(_ message: String) -> Bool {
+        let normalized = message.lowercased()
+        return ["expired", "revoked", "unauthorized", "invalidated oauth"].contains {
+            normalized.contains($0)
+        }
+    }
+}
+
 /// Which surface the per-project card must show. Store recovery outranks an
 /// ordinary project row because unreadable account data cannot safely be
 /// interpreted as App Default or as a missing named-account assignment.
@@ -194,6 +319,9 @@ struct ProjectAccountsSection: View {
     let projectID: String?
     /// The active project's display name, for the caption.
     let projectName: String?
+    /// The usage helper scopes provider probes to the same effective account
+    /// environment as the active workspace.
+    let workspace: URL?
 
     @State private var claudeConfigDir = ""
     @State private var codexHome = ""
@@ -208,16 +336,21 @@ struct ProjectAccountsSection: View {
     /// The account whose sign-in sheet is open, if any.
     @State private var signingIn: UsageAccountProfile?
     @ObservedObject private var recoveryCenter: ProjectAccountRecoveryCenter
+    @ObservedObject private var usage: UsageCenter
     private let usageAccountStore = UsageAccountStore()
 
     init(
         projectID: String?,
         projectName: String?,
-        recoveryCenter: ProjectAccountRecoveryCenter = .shared
+        workspace: URL? = nil,
+        recoveryCenter: ProjectAccountRecoveryCenter = .shared,
+        usage: UsageCenter = .shared
     ) {
         self.projectID = projectID
         self.projectName = projectName
+        self.workspace = workspace
         _recoveryCenter = ObservedObject(wrappedValue: recoveryCenter)
+        _usage = ObservedObject(wrappedValue: usage)
     }
 
     var body: some View {
@@ -229,19 +362,25 @@ struct ProjectAccountsSection: View {
         .onAppear {
             load()
             loadUsageProfiles()
+            refreshAuthentication()
         }
-        .onChange(of: projectID) { _, _ in load() }
+        .onChange(of: projectID) { _, _ in
+            load()
+            refreshAuthentication()
+        }
         // Persist on every edit — the store no-ops when nothing changed, so the
         // load above never triggers a spurious write.
         .onChange(of: claudeConfigDir) { _, _ in if let projectID { save(projectID) } }
         .onChange(of: codexHome) { _, _ in if let projectID { save(projectID) } }
         .onReceive(NotificationCenter.default.publisher(for: .kaisolaUsageAccountsChanged)) { _ in
             loadUsageProfiles()
+            refreshAuthentication(force: true)
         }
         .sheet(item: $signingIn) { profile in
             AccountSignInSheet(profile: profile) {
                 signingIn = nil
                 loadUsageProfiles()
+                refreshAuthentication(force: true)
             }
         }
         .confirmationDialog(
@@ -416,40 +555,91 @@ struct ProjectAccountsSection: View {
     /// starburst there, which made two views of one account look like two
     /// different things.
     private func accountRow(_ profile: UsageAccountProfile) -> some View {
-        HStack(spacing: 12) {
-            QuietIdentityMarkView(
-                identity: profile.provider == .claude ? .claude : .openai,
-                size: 18
-            )
-            .frame(width: 22)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(profile.label)
-                    .font(.callout.weight(.medium))
-                    .lineLimit(1)
-                Text(profile.directory)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.kaisolaSecondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer(minLength: 12)
-            // Sign-in belongs beside the account it signs in, not one tab away
-            // under Usage. Adding a subscription and logging into it are one
-            // intention; splitting them across two screens is why five logins
-            // could go into one directory without a single new card appearing.
-            Button("Sign In") { signingIn = profile }
+        TimelineView(.periodic(from: .now, by: 60)) { timeline in
+            let authentication = authenticationPresentation(for: profile)
+            HStack(spacing: 12) {
+                QuietIdentityMarkView(
+                    identity: profile.provider == .claude ? .claude : .openai,
+                    size: 18
+                )
+                .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(profile.label)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    Text(profile.directory)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.kaisolaSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Label(authentication.title, systemImage: authentication.symbolName)
+                        .font(.caption)
+                        .foregroundStyle(authenticationColor(authentication.status))
+                    Text(authentication.detail(now: timeline.date))
+                        .font(.caption2)
+                        .foregroundStyle(.kaisolaSecondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 12)
+                Button(authentication.actionTitle) {
+                    performAuthenticationAction(authentication.action, profile: profile)
+                }
                 .controlSize(.small)
-                .accessibilityLabel("Sign in to \(profile.label)")
-            Button(role: .destructive) { prepareRemoval(profile) } label: {
-                Image(systemName: "xmark")
-                    .font(.caption.weight(.semibold))
+                .disabled(authentication.status == .checking)
+                .accessibilityLabel("\(authentication.actionTitle) \(profile.label)")
+                if usage.isRefreshingPlanUsage, authentication.action == .check {
+                    ProgressView().controlSize(.mini)
+                        .accessibilityLabel("Checking \(profile.label)")
+                }
+                Button(role: .destructive) { prepareRemoval(profile) } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.borderless)
+                .help("Remove this account from Kaisola; its provider files stay on disk")
+                .accessibilityLabel("Remove account \(profile.label)")
             }
-            .buttonStyle(.borderless)
-            .help("Remove this account from Kaisola; its provider files stay on disk")
-            .accessibilityLabel("Remove account \(profile.label)")
+            .padding(.horizontal, 16)
+            .frame(minHeight: 86)
         }
-        .padding(.horizontal, 16)
-        .frame(minHeight: 58)
+    }
+
+    private func authenticationPresentation(
+        for profile: UsageAccountProfile
+    ) -> NamedAccountAuthenticationPresentation {
+        let reading = usage.planUsage.first { $0.profileID == profile.id }
+        return NamedAccountAuthenticationPresentation.resolve(
+            reading: reading,
+            isRefreshing: usage.isRefreshingPlanUsage
+        )
+    }
+
+    private func performAuthenticationAction(
+        _ action: NamedAccountAuthenticationPresentation.Action,
+        profile: UsageAccountProfile
+    ) {
+        switch action {
+        case .signIn, .reauthenticate:
+            signingIn = profile
+        case .check:
+            refreshAuthentication(force: true)
+        }
+    }
+
+    private func refreshAuthentication(force: Bool = false) {
+        usage.refreshPlanUsage(workspace: workspace, force: force)
+    }
+
+    private func authenticationColor(
+        _ status: NamedAccountAuthenticationPresentation.Status
+    ) -> Color {
+        switch status {
+        case .signedIn: .green
+        case .expired, .failed: KaisolaStatusTone.failed.foregroundColor
+        case .signedOut: KaisolaStatusTone.needsYou.foregroundColor
+        case .checking, .unchecked: .secondary
+        }
     }
 
     /// Adding an account is a label and a provider; the directory is derived

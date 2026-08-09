@@ -42,6 +42,33 @@ test('native usage bridge normalizes Claude Agent SDK windows', () => {
   assert.deepEqual(value.windows.map((window) => window.label), ['5 hour', '7 day', 'Opus'])
 })
 
+test('native usage bridge preserves actionable authentication failures', () => {
+  const expired = normalizeCodex({
+    ok: false,
+    authRequired: true,
+    message: 'Your Codex sign-in expired. Sign in again to refresh usage limits.',
+  }, 999)
+  assert.equal(expired.authRequired, true)
+  assert.match(expired.message, /expired/u)
+
+  const signedOut = normalizeClaude({
+    ok: true,
+    rateLimitsAvailable: false,
+    limits: {},
+  }, 999)
+  assert.equal(signedOut.ok, false)
+  assert.equal(signedOut.authRequired, true)
+  assert.match(signedOut.message, /Sign in/u)
+
+  assert.equal(
+    normalizeClaude({ ok: false, message: 'Authentication required.' }, 999).authRequired,
+    true,
+  )
+
+  const ordinaryFailure = normalizeCodex({ ok: false, message: 'Helper timed out.' }, 999)
+  assert.equal(ordinaryFailure.authRequired, undefined)
+})
+
 test('native usage window rejects malformed percentage and fixture is deterministic in shape', () => {
   assert.equal(normalizedWindow('bad', { usedPercent: 101 }), null)
   const value = fixture(1_700_000_000_000)

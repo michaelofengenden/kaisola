@@ -75,6 +75,83 @@ final class ProjectAccountSelectionTests: XCTestCase {
         )
     }
 
+    func testNamedAccountAuthenticationStatesChooseActionableControls() {
+        let checkedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let updatedAt = checkedAt.timeIntervalSince1970 * 1_000
+        func reading(
+            ok: Bool,
+            authRequired: Bool? = nil,
+            message: String? = nil
+        ) -> UsageCenter.ProviderPlanUsage {
+            UsageCenter.ProviderPlanUsage(
+                provider: "codex",
+                displayName: "Codex",
+                profileID: "acct_codex",
+                profileLabel: "Codex Work",
+                ok: ok,
+                authRequired: authRequired,
+                sourceLabel: "test",
+                windows: [],
+                message: message,
+                updatedAt: updatedAt
+            )
+        }
+
+        XCTAssertEqual(
+            NamedAccountAuthenticationPresentation.resolve(reading: nil, isRefreshing: true).status,
+            .checking
+        )
+        XCTAssertEqual(
+            NamedAccountAuthenticationPresentation.resolve(reading: nil, isRefreshing: false).action,
+            .check
+        )
+
+        let signedIn = NamedAccountAuthenticationPresentation.resolve(
+            reading: reading(ok: true),
+            isRefreshing: false
+        )
+        XCTAssertEqual(signedIn.status, .signedIn)
+        XCTAssertEqual(signedIn.actionTitle, "Check")
+        XCTAssertEqual(signedIn.lastVerification, checkedAt)
+
+        let signedOut = NamedAccountAuthenticationPresentation.resolve(
+            reading: reading(ok: false, authRequired: true, message: "Codex is not signed in."),
+            isRefreshing: false
+        )
+        XCTAssertEqual(signedOut.status, .signedOut)
+        XCTAssertEqual(signedOut.actionTitle, "Sign In")
+
+        let expired = NamedAccountAuthenticationPresentation.resolve(
+            reading: reading(ok: false, authRequired: true, message: "Your sign-in expired."),
+            isRefreshing: false
+        )
+        XCTAssertEqual(expired.status, .expired)
+        XCTAssertEqual(expired.actionTitle, "Reauthenticate")
+
+        let failed = NamedAccountAuthenticationPresentation.resolve(
+            reading: reading(ok: false, message: "Provider check timed out."),
+            isRefreshing: false
+        )
+        XCTAssertEqual(failed.status, .failed)
+        XCTAssertEqual(failed.actionTitle, "Check")
+        XCTAssertEqual(failed.diagnostic, "Provider check timed out.")
+    }
+
+    func testNamedAccountAuthenticationShowsLastVerificationAge() {
+        let now = Date(timeIntervalSince1970: 1_700_007_200)
+        XCTAssertEqual(
+            NamedAccountAuthenticationPresentation.lastCheckedCaption(
+                Date(timeIntervalSince1970: 1_700_000_000),
+                now: now
+            ),
+            "Last checked 2h ago"
+        )
+        XCTAssertEqual(
+            NamedAccountAuthenticationPresentation.lastCheckedCaption(nil, now: now),
+            "No verification time."
+        )
+    }
+
     // MARK: - Healthy assignments
 
     func testBlankOverrideIsAppDefault() {

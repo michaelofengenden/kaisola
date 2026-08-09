@@ -772,6 +772,7 @@ final class UsageCenter: ObservableObject {
         let profileID: String?
         let profileLabel: String?
         let ok: Bool
+        let authRequired: Bool?
         let sourceLabel: String
         let experimental: Bool?
         let account: String?
@@ -818,6 +819,7 @@ final class UsageCenter: ObservableObject {
             profileID: String? = nil,
             profileLabel: String? = nil,
             ok: Bool,
+            authRequired: Bool? = nil,
             sourceLabel: String,
             experimental: Bool? = nil,
             account: String? = nil,
@@ -831,6 +833,7 @@ final class UsageCenter: ObservableObject {
             self.profileID = profileID
             self.profileLabel = profileLabel
             self.ok = ok
+            self.authRequired = authRequired
             self.sourceLabel = sourceLabel
             self.experimental = experimental
             self.account = account
@@ -847,6 +850,7 @@ final class UsageCenter: ObservableObject {
                 profileID: request.profileID,
                 profileLabel: request.profileLabel,
                 ok: ok,
+                authRequired: authRequired,
                 sourceLabel: sourceLabel,
                 experimental: experimental,
                 account: account,

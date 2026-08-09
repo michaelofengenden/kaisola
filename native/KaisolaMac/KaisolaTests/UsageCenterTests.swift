@@ -209,6 +209,7 @@ final class UsageCenterTests: XCTestCase {
             "provider": "claude",
             "displayName": "Claude",
             "ok": true,
+            "authRequired": false,
             "sourceLabel": "Claude Agent SDK 0.3.205",
             "experimental": true,
             "plan": "max",
@@ -221,6 +222,7 @@ final class UsageCenterTests: XCTestCase {
         let providers = try UsageCenter.decodeProviderPlanUsage(data)
         XCTAssertEqual(providers.count, 1)
         XCTAssertEqual(providers.first?.provider, "claude")
+        XCTAssertEqual(providers.first?.authRequired, false)
         XCTAssertEqual(providers.first?.plan, "max")
         XCTAssertEqual(providers.first?.windows.first?.usedPercent, 37.5)
         XCTAssertEqual(providers.first?.windows.first?.resetsAt, 1_800_000_000)

@@ -212,6 +212,7 @@
 		AABE3ED97624943DA99C6C61 /* TerminalResurrectionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AABBF49984658B7AB571E382 /* TerminalResurrectionTests.swift */; };
 		ABFE1EB6921E713C884F2BAB /* TerminalScrollPinTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2E93B6B24B1536CA24F517A /* TerminalScrollPinTests.swift */; };
 		AC44D95F8D8934E9FA04981D /* AppModelProjectContextTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07063F75FCF57994E572B99C /* AppModelProjectContextTests.swift */; };
+		AC549E4FFE8A21A0057E7980 /* GitProcessDeadlineTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D52B58085865FAA876D950B5 /* GitProcessDeadlineTests.swift */; };
 		AC6BB6AEBEC2E94507837EA0 /* TerminalFileLinkResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = 48B188286E91EA94C628221F /* TerminalFileLinkResolver.swift */; };
 		AE16DBA9C3C56992F46A611A /* BrokerModelsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 991FCF32D009E1236EBF19A5 /* BrokerModelsTests.swift */; };
 		B245BBDC77E5759C77403AD7 /* TerminalTranscriptTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B2C1094B3B6E5323C1AAE22E /* TerminalTranscriptTests.swift */; };
@@ -572,6 +573,7 @@
 		D2D6020A7FBF1683EB7484D0 /* MarkdownAssets.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownAssets.swift; sourceTree = "<group>"; };
 		D2E74B62A47941983B368E8F /* ResumeChipEligibility.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ResumeChipEligibility.swift; sourceTree = "<group>"; };
 		D3B5EDEC3440E3166941306C /* TerminalScrollbackDepthTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalScrollbackDepthTests.swift; sourceTree = "<group>"; };
+		D52B58085865FAA876D950B5 /* GitProcessDeadlineTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitProcessDeadlineTests.swift; sourceTree = "<group>"; };
 		D5CC774EC646C7FF89176197 /* FilePreviewEditors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewEditors.swift; sourceTree = "<group>"; };
 		D5E2B204EE7B57EDF7B64A59 /* AccountSignInSheet.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountSignInSheet.swift; sourceTree = "<group>"; };
 		D624AF2C46BA83B73A21F0B3 /* KaisolaMacAppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KaisolaMacAppDelegate.swift; sourceTree = "<group>"; };
@@ -991,6 +993,7 @@
 				EC8170548CE831438700C2F4 /* DetailShowDoorsTests.swift */,
 				F45BCF775EB8D43CFD1BFE2E /* FuzzyMatchTests.swift */,
 				007B60933A677DAD3CB98F9D /* GitPanelModelTests.swift */,
+				D52B58085865FAA876D950B5 /* GitProcessDeadlineTests.swift */,
 				143732221EC63F82B5874931 /* GitPRTests.swift */,
 				73C156565BA4025A74960AD9 /* GitServiceTests.swift */,
 				E3D72AABAD7E8FBF9B665E43 /* GlassClarityTradeTests.swift */,
@@ -1533,6 +1536,7 @@
 				8BDA99F9EAB9C98190CA3E86 /* FuzzyMatchTests.swift in Sources */,
 				94F2C07F9D519F8C1428062E /* GitPRTests.swift in Sources */,
 				C6B77BD965183EA73469C7A1 /* GitPanelModelTests.swift in Sources */,
+				AC549E4FFE8A21A0057E7980 /* GitProcessDeadlineTests.swift in Sources */,
 				D1DF7C334CB6E3B1B0D12BBF /* GitServiceTests.swift in Sources */,
 				BA6D43828E4685E984297FCF /* GlassClarityTradeTests.swift in Sources */,
 				F60ACD0B816BBDC03277BD4A /* KaisolaProductMigrationTests.swift in Sources */,

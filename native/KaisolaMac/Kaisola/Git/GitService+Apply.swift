@@ -35,7 +35,10 @@ extension GitService {
         process.arguments = arguments
         process.currentDirectoryURL = repoRoot
         let capture: (out: Data, err: Data)
-        do { capture = try GitProcessCapture.run(process) } catch {
+        do { capture = try GitProcessCapture.run(process, deadline: .forGitArguments(arguments)) }
+        catch let failure as GitProcessCapture.Failure {
+            throw GitError.from(failure, command: GitService.commandLabel(arguments))
+        } catch {
             throw GitError.commandFailed(error.localizedDescription)
         }
         guard process.terminationStatus != 0 else { return }

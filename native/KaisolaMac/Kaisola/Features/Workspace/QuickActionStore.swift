@@ -13,7 +13,8 @@ struct QuickAction: Codable, Equatable, Identifiable {
 /// keeps its buttons across launches. Atomic writes, corrupt file → empty,
 /// mirroring `SessionPinStore`. Actions per project are capped; saving past the
 /// cap drops the oldest (front of the array) so a full row still accepts a new
-/// button.
+/// button. Ids are repaired on both read and write, so a hand-edited or imported
+/// file with repeated or blank ids cannot reach the UI's row identity.
 struct QuickActionStore: Sendable {
     private struct Payload: Codable {
         /// projectID → its ordered Quick Actions (display order = array order).
@@ -31,27 +32,60 @@ struct QuickActionStore: Sendable {
     }
 
     /// This project's actions in display order, or an empty array when the
-    /// project has none (or the file is missing/corrupt).
+    /// project has none (or the file is missing/corrupt). Ids are normalized on
+    /// the way out so a hand-edited or imported file can never hand SwiftUI two
+    /// rows with the same identity.
     func actions(forProject projectID: String) -> [QuickAction] {
-        read()?.actionsByProject[projectID] ?? []
+        Self.normalizedIdentifiers(read()?.actionsByProject[projectID] ?? [])
     }
 
     /// Replace a project's actions wholesale. The cap is enforced here by
     /// dropping the oldest entries first, so an editor that appended past the
-    /// cap still persists the most recent `capPerProject` buttons. Passing an
-    /// empty array clears the project's row (and prunes the key).
+    /// cap still persists the most recent `capPerProject` buttons. Ids are
+    /// normalized before the write so the file on disk is repaired, not just the
+    /// copy this session read. Passing an empty array clears the project's row
+    /// (and prunes the key).
     func save(_ actions: [QuickAction], forProject projectID: String) {
         var payload = read() ?? Payload(actionsByProject: [:])
         var trimmed = actions
         if trimmed.count > capPerProject {
             trimmed.removeFirst(trimmed.count - capPerProject)
         }
+        trimmed = Self.normalizedIdentifiers(trimmed)
         if trimmed.isEmpty {
             payload.actionsByProject.removeValue(forKey: projectID)
         } else {
             payload.actionsByProject[projectID] = trimmed
         }
         write(payload)
+    }
+
+    /// Repairs identifiers so every action in a row carries a nonempty id that
+    /// is unique within that project — `ForEach` identity, "edit this row" and
+    /// "delete this row" all key off the id, so a repeated one edits or deletes
+    /// the wrong button. Ids are trimmed; a blank one takes a slot-derived name
+    /// and a repeat takes a numbered suffix, both probed until they collide with
+    /// nothing else in the row. Deliberately deterministic rather than a fresh
+    /// UUID: the same file normalizes to the same ids on every load, so a row
+    /// the user never edits keeps its identity across reads.
+    private static func normalizedIdentifiers(_ actions: [QuickAction]) -> [QuickAction] {
+        var used = Set<String>()
+        var normalized: [QuickAction] = []
+        normalized.reserveCapacity(actions.count)
+        for (slot, action) in actions.enumerated() {
+            var identifier = action.id.trimmingCharacters(in: .whitespacesAndNewlines)
+            if identifier.isEmpty { identifier = "action-\(slot)" }
+            if used.contains(identifier) {
+                var suffix = 2
+                while used.contains("\(identifier)-\(suffix)") { suffix += 1 }
+                identifier = "\(identifier)-\(suffix)"
+            }
+            used.insert(identifier)
+            var repaired = action
+            repaired.id = identifier
+            normalized.append(repaired)
+        }
+        return normalized
     }
 
     private func read() -> Payload? {

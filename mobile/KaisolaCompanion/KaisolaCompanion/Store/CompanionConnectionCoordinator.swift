@@ -246,7 +246,7 @@ final class CompanionConnectionCoordinator: ObservableObject {
                 return
             case .connecting, .handshaking, .live:
                 return
-            case .idle:
+            case .idle, .reconnectRequired:
                 break
             }
         }
@@ -265,7 +265,10 @@ final class CompanionConnectionCoordinator: ObservableObject {
                 preferred: desktop.transportHint,
                 desktopId: desktop.desktopId,
                 deviceId: identity.id,
-                force: force
+                // A spent automatic retry budget is a completed resume
+                // episode. Foreground activation or the explicit reconnect
+                // button begins a fresh bounded episode without re-pairing.
+                force: force || client.transport.state == .reconnectRequired
             )
         } catch {
             store.connection = store.projects.isEmpty ? .offline : .stale
@@ -544,6 +547,9 @@ final class CompanionConnectionCoordinator: ObservableObject {
     // MARK: Wiring
 
     private func observe() {
+        client.onRevoked = { [weak self] message in
+            self?.handleDeviceRevocation(message: message)
+        }
         client.onStreamIssue = { [weak self] sessionId, message in
             guard let self else { return }
             if let message { self.terminalStreamIssues[sessionId] = message }
@@ -614,6 +620,25 @@ final class CompanionConnectionCoordinator: ObservableObject {
         pairedDesktop = desktop
         connectionWanted = true
         pairingPhase = .paired
+    }
+
+    func handleDeviceRevocation(message: String) {
+        connectionWanted = false
+        lifecycleIntentVersion &+= 1
+        clearLocalTerminalControls()
+        controlAuthorization.lock()
+        persistence.clear()
+        pairedDesktop = nil
+        pendingPayload = nil
+        activePairingNonce = nil
+        accountLookupID = nil
+        accountLookupInProgress = false
+        accountOffers.removeAll()
+        pairingTimeoutTask?.cancel()
+        pairingTimeoutTask = nil
+        terminalStreamIssues.removeAll()
+        pairingPhase = .failed(message)
+        store.clearAfterRevocation(message: message)
     }
 
     private func authorizeControl(reason: String) async throws {

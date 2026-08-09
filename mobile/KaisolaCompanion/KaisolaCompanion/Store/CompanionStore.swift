@@ -89,6 +89,22 @@ final class CompanionStore: ObservableObject {
         }
     }
 
+    /// A signed revocation terminal frame is content-free. Drop every cached
+    /// projection and replay cursor before presenting its recovery message so
+    /// no remembered screen can be mistaken for retained authorization.
+    func clearAfterRevocation(message: String) {
+        projects.removeAll()
+        sessions.removeAll()
+        attention.removeAll()
+        permissions.removeAll()
+        projectIdsByWindowId.removeAll()
+        selectedProjectId = nil
+        lastAckCursor = nil
+        capabilities = [.observe]
+        connection = .offline
+        previewReceipt = String(message.prefix(240))
+    }
+
     @discardableResult
     func apply(_ envelope: CompanionEnvelope) throws -> Bool {
         guard !isPreview else { return false }

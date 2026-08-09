@@ -83,14 +83,25 @@ struct CompanionRootView: View {
 
     @ViewBuilder private var connectionRecoveryBar: some View {
         if coordinator.isPaired, !store.isPreview, store.connection != .live {
+            let reconnectRequired = store.transportState == .reconnectRequired
             Button {
                 Task { await coordinator.reconnect() }
             } label: {
                 HStack(spacing: 8) {
-                    ProgressView()
-                        .controlSize(.mini)
-                        .tint(KaisolaTheme.accent)
-                    Text(store.connection == .stale ? "Cached · reconnecting to Mac" : "Connecting to Mac")
+                    if reconnectRequired {
+                        Image(systemName: "wifi.exclamationmark")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(KaisolaTheme.waiting)
+                    } else {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .tint(KaisolaTheme.accent)
+                    }
+                    Text(reconnectRequired
+                        ? "Reconnect required · tap to retry"
+                        : store.connection == .stale
+                            ? "Cached · reconnecting to Mac"
+                            : "Connecting to Mac")
                         .font(.caption.weight(.medium))
                     Spacer(minLength: 8)
                     Image(systemName: "arrow.clockwise")
@@ -104,8 +115,8 @@ struct CompanionRootView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Reconnect to Mac")
-            .accessibilityHint("Retries the secure connection now")
+            .accessibilityLabel(reconnectRequired ? "Connection paused. Reconnect to Mac" : "Reconnect to Mac")
+            .accessibilityHint("Starts a new bounded secure connection attempt. Pairing is preserved")
         }
     }
 

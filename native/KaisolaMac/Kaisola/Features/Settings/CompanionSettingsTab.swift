@@ -165,12 +165,13 @@ struct CompanionSettingsTab: View {
                     } else {
                         ForEach(Array(host.pairedDevices.enumerated()), id: \.element.id) { index, device in
                             if index > 0 { SettingsDivider() }
+                            let connected = host.connectedDeviceIDs.contains(device.deviceId)
                             SettingsRow(
                                 title: device.displayName,
-                                detail: capabilityDetail(device.capabilities),
+                                detail: "\(capabilityDetail(device.capabilities)) · \(connected ? "Connected" : "Waiting to reconnect")",
                                 symbol: "laptopcomputer.and.iphone"
                             ) {
-                                HStack(spacing: 8) {
+                                HStack(spacing: 6) {
                                     Menu("Access") {
                                         Label("View status and output", systemImage: "checkmark")
                                         Divider()
@@ -198,6 +199,15 @@ struct CompanionSettingsTab: View {
                                     .disabled(capabilityUpdates.contains(device.id))
                                     .accessibilityLabel("Change access for \(device.displayName)")
 
+                                    if !connected {
+                                        Button("Refresh") {
+                                            host.refreshReconnectAvailability()
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .accessibilityLabel("Refresh reconnect routes for \(device.displayName)")
+                                        .accessibilityHint("Keeps this device paired and retries available Nearby and Link routes")
+                                    }
                                     Button("Revoke", role: .destructive) {
                                         pendingRevocation = device
                                     }

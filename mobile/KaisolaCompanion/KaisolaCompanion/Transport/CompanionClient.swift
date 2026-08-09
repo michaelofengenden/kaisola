@@ -29,6 +29,7 @@ final class CompanionClient: ObservableObject {
     var onAckCursor: ((CompanionAckCursor) -> Void)?
     var onCapabilities: ((Set<CompanionCapability>) -> Void)?
     var onStreamIssue: ((String, String?) -> Void)?
+    var onRevoked: ((String) -> Void)?
 
     let transport: CompanionTransport
 
@@ -66,6 +67,16 @@ final class CompanionClient: ObservableObject {
     private var pendingCommands: [String: PendingCommand] = [:]
     private var commandTimeouts: [String: Task<Void, Never>] = [:]
 
+    /// Persisted cursors describe replay position, not authority for a newly
+    /// authenticated connection. Once the desktop publishes its live epoch,
+    /// every command (including stream teardown) must use that value.
+    static func outboundCommandEpoch(
+        liveEpoch: String?,
+        persistedCursor: CompanionAckCursor?
+    ) -> String {
+        liveEpoch ?? persistedCursor?.epoch ?? "initial"
+    }
+
     init(transport: CompanionTransport = CompanionTransport()) {
         self.transport = transport
         transport.onWireFrame = { [weak self] data in try self?.receive(data) }
@@ -84,7 +95,7 @@ final class CompanionClient: ObservableObject {
         transport.onError = { [weak self] error in
             guard let self else { return }
             switch self.transport.state {
-            case .discovering, .connecting, .live, .reconnecting:
+            case .discovering, .connecting, .live, .reconnecting, .reconnectRequired:
                 // Direct endpoint and Bonjour failures are recoverable. The
                 // transport keeps racing/retrying them without invalidating the
                 // single-use offer or flashing a terminal error in the UI.
@@ -248,7 +259,14 @@ final class CompanionClient: ObservableObject {
             desktopId: context.desktopId,
             deviceId: context.deviceId,
             connectionId: context.connectionId,
-            epoch: ackCursor?.epoch ?? "initial",
+            // A desktop relaunch rotates the host epoch while preserving the
+            // paired identity. Unsubscribe must use this connection's learned
+            // epoch just like ordinary commands; the persisted cursor can only
+            // seed replay and must never authenticate a fresh command.
+            epoch: Self.outboundCommandEpoch(
+                liveEpoch: liveEpoch,
+                persistedCursor: ackCursor
+            ),
             seq: outboundSeq,
             id: commandId,
             sentAt: Self.nowMilliseconds,
@@ -321,7 +339,10 @@ final class CompanionClient: ObservableObject {
             // restart. Commands are only ever sent after the first inbound frame
             // (subscriptions are gated, other commands are user-driven), so
             // liveEpoch is populated in every realistic path.
-            epoch: liveEpoch ?? ackCursor?.epoch ?? "initial",
+            epoch: Self.outboundCommandEpoch(
+                liveEpoch: liveEpoch,
+                persistedCursor: ackCursor
+            ),
             seq: outboundSeq,
             id: body.commandId,
             sentAt: Self.nowMilliseconds,
@@ -535,6 +556,14 @@ final class CompanionClient: ObservableObject {
             try activateLive()
             return
         }
+        if type == "device-revoked" {
+            guard case .resume = mode else { throw CompanionCryptoError.authenticationFailed }
+            handleDeviceRevocation(
+                message: object["message"]?.stringValue
+                    ?? "This iPhone was revoked on the Mac. Pair it again to reconnect."
+            )
+            return
+        }
         throw CompanionCryptoError.invalidSecurePayload
     }
 
@@ -576,6 +605,13 @@ final class CompanionClient: ObservableObject {
         guard let channel else { throw CompanionWireError.connectionUnavailable }
         let secure = try JSONDecoder().decode(CompanionSecureFrame.self, from: data)
         let envelope = try CompanionProtocolCodec.decode(channel.decrypt(secure))
+        if envelope.kind == .error {
+            let error = try envelope.body.decode(CompanionErrorBody.self)
+            if error.code == "device_revoked" {
+                handleDeviceRevocation(message: error.message)
+                return
+            }
+        }
         // First inbound frame on this connection tells us the desktop's current
         // epoch. Adopt it for outbound commands and only now fire the deferred
         // stream subscriptions, so they can never carry a stale (rejected) epoch.
@@ -616,6 +652,31 @@ final class CompanionClient: ObservableObject {
             finishCommand(receipt.commandId, result: .success(receipt))
         }
         onEnvelope?(envelope)
+    }
+
+    func handleDeviceRevocation(message: String) {
+        // The authenticated desktop controls only the terminal-state code,
+        // never UI content. Discard its message so terminal output, paths, or
+        // other accidental payloads cannot survive revocation on the phone.
+        _ = message
+        let safeMessage = "This iPhone was revoked on the Mac. Pair it again to reconnect."
+        failPendingCommands(with: CompanionCommandError.unavailable)
+        desiredStreamSubscriptions.removeAll()
+        resetActiveStreamSubscriptions()
+        ackCursor = nil
+        liveEpoch = nil
+        mode = nil
+        pairedDesktop = nil
+        sas = nil
+        initiator = nil
+        handshakeResult = nil
+        channel = nil
+        connectionContext = nil
+        sessionId = nil
+        // The coordinator clears persisted resume authority and seals lifecycle
+        // reconnect intent synchronously before stop publishes an idle state.
+        onRevoked?(safeMessage)
+        transport.stop()
     }
 
     private func finishCommand(_ commandId: String, result: Result<CompanionReceiptBody, Error>) {

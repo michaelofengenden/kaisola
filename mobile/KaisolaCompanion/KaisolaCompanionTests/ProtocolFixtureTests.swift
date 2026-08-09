@@ -2,6 +2,23 @@ import KaisolaCore
 import XCTest
 @testable import KaisolaCompanion
 
+@MainActor
+private final class RevocationDesktopStore: PairedDesktopPersisting {
+    private(set) var desktop: CompanionPairedDesktop?
+    private(set) var clearCount = 0
+
+    init(desktop: CompanionPairedDesktop) {
+        self.desktop = desktop
+    }
+
+    func load() -> CompanionPairedDesktop? { desktop }
+    func save(_ desktop: CompanionPairedDesktop) { self.desktop = desktop }
+    func clear() {
+        clearCount += 1
+        desktop = nil
+    }
+}
+
 final class ProtocolFixtureTests: XCTestCase {
     private let validEnvelopeFixtures = [
         "hello", "agent-delta", "command-receipt", "permission-requested",
@@ -196,6 +213,115 @@ final class ProtocolFixtureTests: XCTestCase {
 
         XCTAssertFalse(try store.apply(CompanionProtocolCodec.decode(fixtureData("command-receipt"))))
         XCTAssertNil(store.previewReceipt, "subscribe/control receipts must not become global banners")
+    }
+
+    @MainActor
+    func testDeviceRevocationDropsCachedProjectionCursorAndCapabilities() throws {
+        let store = CompanionStore(
+            connection: .offline,
+            projects: [],
+            sessions: [],
+            attention: [],
+            permissions: [],
+            isPreview: false
+        )
+        XCTAssertTrue(try store.apply(CompanionProtocolCodec.decode(fixtureData("snapshot-board"))))
+        XCTAssertTrue(try store.apply(CompanionProtocolCodec.decode(fixtureData("permission-requested"))))
+        let privilegedHello = try CompanionEnvelope(
+            kind: .hello,
+            desktopId: "desktop-fixture",
+            deviceId: "device-fixture",
+            connectionId: "connection-fixture",
+            epoch: "desktop-epoch-7",
+            seq: 0,
+            id: "hello-before-revocation",
+            sentAt: 1_784_250_001_000,
+            body: CompanionBody(CompanionHelloBody(
+                role: .desktop,
+                capabilities: [.observe, .agentControl, .terminalControl]
+            ))
+        )
+        XCTAssertFalse(try store.apply(privilegedHello))
+
+        store.clearAfterRevocation(
+            message: "This iPhone was revoked on the Mac. Pair it again to reconnect."
+        )
+
+        XCTAssertTrue(store.projects.isEmpty)
+        XCTAssertTrue(store.sessions.isEmpty)
+        XCTAssertTrue(store.attention.isEmpty)
+        XCTAssertTrue(store.permissions.isEmpty)
+        XCTAssertNil(store.selectedProjectId)
+        XCTAssertNil(store.lastAckCursor)
+        XCTAssertEqual(store.capabilities, [.observe])
+        XCTAssertFalse(store.canControlAgents)
+        XCTAssertFalse(store.canControlTerminals)
+        XCTAssertEqual(store.connection, .offline)
+        XCTAssertEqual(
+            store.previewReceipt,
+            "This iPhone was revoked on the Mac. Pair it again to reconnect."
+        )
+    }
+
+    @MainActor
+    func testDeviceRevocationClearsResumeAuthorityBeforeStoppingTransport() throws {
+        let desktop = CompanionPairedDesktop(
+            desktopId: "desktop-revocation-fixture",
+            identityPublic: Data(repeating: 1, count: 32).base64URLEncodedString(),
+            x25519StaticPublic: Data(repeating: 2, count: 32).base64URLEncodedString(),
+            capabilities: [.observe, .terminalControl],
+            transportHint: nil
+        )
+        let persistence = RevocationDesktopStore(desktop: desktop)
+        let transport = CompanionTransport(autoConnect: false)
+        let client = CompanionClient(transport: transport)
+        let store = CompanionStore(
+            connection: .live,
+            projects: [],
+            sessions: [],
+            attention: [],
+            permissions: [],
+            isPreview: false,
+            canControlAgents: true,
+            canControlTerminals: true,
+            transportState: .live
+        )
+        let coordinator = CompanionConnectionCoordinator(
+            client: client,
+            persistence: persistence,
+            store: store
+        )
+        let identity = try CompanionIdentity(
+            id: "device-revocation-fixture",
+            role: .device,
+            displayName: "Revoked iPhone"
+        )
+        try client.configureResume(
+            desktop: desktop,
+            identity: identity,
+            cursor: CompanionAckCursor(epoch: "old-epoch", seq: 42)
+        )
+        XCTAssertNotNil(client.pairedDesktop)
+        XCTAssertNotNil(client.ackCursor)
+        XCTAssertNotNil(coordinator.pairedDesktop)
+
+        client.handleDeviceRevocation(
+            message: "secret terminal output must never survive revocation"
+        )
+
+        XCTAssertNil(client.pairedDesktop)
+        XCTAssertNil(client.ackCursor)
+        XCTAssertNil(coordinator.pairedDesktop)
+        XCTAssertEqual(persistence.clearCount, 1)
+        XCTAssertNil(persistence.desktop)
+        XCTAssertEqual(transport.state, .idle)
+        XCTAssertEqual(store.connection, .offline)
+        XCTAssertEqual(store.capabilities, [.observe])
+        XCTAssertEqual(
+            coordinator.pairingPhase,
+            .failed("This iPhone was revoked on the Mac. Pair it again to reconnect.")
+        )
+        XCTAssertFalse(store.previewReceipt?.contains("secret terminal output") == true)
     }
 
     @MainActor

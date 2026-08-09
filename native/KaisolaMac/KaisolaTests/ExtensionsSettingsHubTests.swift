@@ -203,6 +203,40 @@ final class ExtensionsSettingsHubTests: XCTestCase {
         guard case .disabled = custom.status else { return XCTFail("Invalid theme was enabled") }
     }
 
+    func testUnreadableThemeRegistryIsASecretFreeActionableCatalogRow() {
+        let preservedURL = URL(fileURLWithPath: "/private/tmp/terminal-themes.json.preserved-deadbeef.json")
+        let state = CustomThemeStore.LoadState.corrupt(.preserved(preservedURL))
+        let item = ExtensionSettingsItem.customThemeRegistryIssue(state)
+
+        XCTAssertEqual(item.id, CustomThemeStore.registryIssueID)
+        XCTAssertEqual(item.category, .terminalThemes)
+        XCTAssertEqual(item.status, .disabled("Needs attention"))
+        XCTAssertEqual(item.source, .user)
+        XCTAssertEqual(item.scope, .appWide)
+        XCTAssertEqual(item.versionIntegrity, "Unreadable registry preserved")
+        XCTAssertEqual(item.updateState, .manual("Reset explicitly to repair"))
+        XCTAssertTrue(item.validationMessage?.contains(preservedURL.lastPathComponent) == true)
+        XCTAssertTrue(item.validationMessage?.lowercased().contains("last-known-good") == true)
+        XCTAssertFalse(item.searchableText.contains("/private/tmp"))
+        XCTAssertFalse(item.accessibilityDescription.contains("/private/tmp"))
+        XCTAssertTrue(state.canReset)
+        XCTAssertFalse(state.allowsMutations)
+        XCTAssertEqual(state.preservedCopyURL, preservedURL)
+    }
+
+    func testThemeRegistryIOFailureCannotOfferDestructiveRecoveryOrLeakItsPath() {
+        let state = CustomThemeStore.LoadState.ioFailure("permission denied at /secret/location")
+        let item = ExtensionSettingsItem.customThemeRegistryIssue(state)
+
+        XCTAssertFalse(state.canReset)
+        XCTAssertFalse(state.allowsMutations)
+        XCTAssertNil(state.preservedCopyURL)
+        XCTAssertEqual(item.versionIntegrity, "Registry unavailable")
+        XCTAssertEqual(item.updateState, .manual("Resolve storage access to continue"))
+        XCTAssertFalse(item.searchableText.contains("/secret/location"))
+        XCTAssertFalse(item.accessibilityDescription.contains("/secret/location"))
+    }
+
     func testSearchIsCaseAndDiacriticInsensitiveAcrossNameCategoryAndMetadata() {
         let items = ExtensionsSettingsFixture.items
         XCTAssertEqual(

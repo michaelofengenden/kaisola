@@ -291,6 +291,51 @@ struct ExtensionSettingsItem: Equatable, Sendable {
         )
     }
 
+    static func customThemeRegistryIssue(_ state: CustomThemeStore.LoadState) -> Self {
+        let integrity: String
+        let updates: String
+        let message: String
+        switch state {
+        case let .corrupt(.preserved(url)):
+            integrity = "Unreadable registry preserved"
+            updates = "Reset explicitly to repair"
+            message = "Kaisola preserved the unreadable registry as \(url.lastPathComponent). Last-known-good themes remain active for this run; review the recovery copy, then reset explicitly to change themes."
+        case .corrupt(.failed):
+            integrity = "Unreadable registry not preserved"
+            updates = "Resolve storage access before reset"
+            message = "Kaisola could not preserve the unreadable theme registry. Last-known-good themes remain active for this run; resolve storage access before recovery."
+        case let .newerVersion(version, .preserved(url)):
+            integrity = "Newer registry v\(version) preserved"
+            updates = "Reset explicitly to replace"
+            message = "This theme registry uses schema v\(version), which is newer than Kaisola supports. It was preserved as \(url.lastPathComponent), and last-known-good themes remain active for this run."
+        case let .newerVersion(version, .failed):
+            integrity = "Newer registry v\(version) not preserved"
+            updates = "Resolve storage access before reset"
+            message = "This theme registry uses unsupported schema v\(version), and Kaisola could not create a recovery copy. Last-known-good themes remain active for this run."
+        case .ioFailure:
+            integrity = "Registry unavailable"
+            updates = "Resolve storage access to continue"
+            message = "Kaisola could not read the terminal-theme registry. The file was not changed, and last-known-good themes remain active for this run."
+        case .missing, .ready:
+            integrity = "Registry ready"
+            updates = "Local · no remote updates"
+            message = "The terminal-theme registry is ready."
+        }
+
+        return Self(
+            id: CustomThemeStore.registryIssueID,
+            category: .terminalThemes,
+            name: "Terminal theme registry",
+            detail: "Recovery required before custom themes can change",
+            status: .disabled("Needs attention"),
+            source: .user,
+            versionIntegrity: integrity,
+            scope: .appWide,
+            updateState: .manual(updates),
+            validationMessage: message
+        )
+    }
+
     static func languageGrammar(_ spec: CustomGrammarSpec) -> Self {
         let validation = spec.validationError
         return Self(
@@ -392,8 +437,12 @@ enum ExtensionsSettingsCatalog {
                 selected: selectedThemeID == $0.id
             )
         }
-        let customThemes = CustomThemeStore().specs().map {
+        let themeSnapshot = CustomThemeStore().load()
+        var customThemes = themeSnapshot.specs.map {
             ExtensionSettingsItem.customTheme($0, selected: selectedThemeID == $0.id)
+        }
+        if !themeSnapshot.state.allowsMutations {
+            customThemes.append(.customThemeRegistryIssue(themeSnapshot.state))
         }
         let grammars = CustomGrammarStore().specs().map(ExtensionSettingsItem.languageGrammar)
         let mappingSnapshot = PreviewMappingStore().load()

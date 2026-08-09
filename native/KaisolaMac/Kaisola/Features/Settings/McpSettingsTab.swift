@@ -25,7 +25,7 @@ struct McpSettingsTab: View {
                 Section("MCP Servers") {
                     Text("Open a project to configure its MCP servers. Servers are scoped to that project and are available to every agent chat you start there.")
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
             }
             .formStyle(.grouped)
@@ -39,6 +39,23 @@ struct McpSettingsTab: View {
 /// bounded store can persist.
 enum McpSettingsPolicy {
     private static let nameComparisonLocale = Locale(identifier: "en_US_POSIX")
+
+    /// One line of a `NAME=value` block that could not be read, addressed the
+    /// way the user sees it: the 1-based line number plus what is wrong. Blank
+    /// lines still count toward the number, so the report points at the line
+    /// the editor shows.
+    struct PairLineProblem: Equatable {
+        let line: Int
+        let reason: String
+    }
+
+    /// Everything a `NAME=value` block produced: the pairs that parsed and
+    /// every line that did not. Both halves come back together so the caller
+    /// can block on `problems` without re-walking the text.
+    struct PairParse: Equatable {
+        var pairs: [McpServerConfig.Pair]
+        var problems: [PairLineProblem]
+    }
 
     static func remainingCapacity(serverCount: Int) -> Int {
         max(0, McpConfigStore.maximumServerCount - max(0, serverCount))
@@ -67,12 +84,83 @@ enum McpSettingsPolicy {
         rawName: String,
         servers: [McpServerConfig],
         hasRequiredFields: Bool,
-        remainingCapacity: Int
+        remainingCapacity: Int,
+        pairText: String = ""
     ) -> Bool {
         hasRequiredFields
             && remainingCapacity > 0
             && !normalizedName(rawName).isEmpty
             && duplicateName(rawName, servers: servers) == nil
+            && parsePairs(pairText).problems.isEmpty
+    }
+
+    /// Reads a `NAME=value` block strictly: one pair per non-blank line, split
+    /// on the first `=`. A line that cannot become a pair is reported rather
+    /// than dropped, because a silently discarded header or environment
+    /// variable only shows up much later as a server that fails to start. An
+    /// empty value (`NAME=`) is a real setting and stays legal. Per-line bounds
+    /// mirror `McpServerConfig.safePair`, so the line-level message arrives
+    /// before the whole-server validation error would.
+    static func parsePairs(_ text: String) -> PairParse {
+        var parse = PairParse(pairs: [], problems: [])
+        // Normalize first so CRLF and lone CR do not shift the numbering the
+        // user is being pointed at.
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        for (index, rawLine) in normalized.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            let number = index + 1
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            guard let separator = line.firstIndex(of: "=") else {
+                parse.problems.append(.init(line: number, reason: "no \"=\" separator. Write NAME=value."))
+                continue
+            }
+            let name = line[..<separator].trimmingCharacters(in: .whitespaces)
+            let value = line[line.index(after: separator)...].trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else {
+                parse.problems.append(.init(line: number, reason: "the name before \"=\" is empty."))
+                continue
+            }
+            guard name.rangeOfCharacter(from: .controlCharacters) == nil, !value.contains("\0") else {
+                parse.problems.append(.init(line: number, reason: "control characters are not allowed."))
+                continue
+            }
+            guard name.utf8.count <= 128 else {
+                parse.problems.append(.init(line: number, reason: "the name is longer than 128 bytes."))
+                continue
+            }
+            guard value.utf8.count <= 4_096 else {
+                parse.problems.append(.init(line: number, reason: "the value is longer than 4096 bytes."))
+                continue
+            }
+            parse.pairs.append(McpServerConfig.Pair(name: name, value: value))
+        }
+        return parse
+    }
+
+    /// The exact gate the Add button binds to. Living here rather than in the
+    /// view means a malformed line can never be the difference between what the
+    /// screen allows and what the tests check.
+    static func canAdd(
+        hasRequiredFields: Bool,
+        serverCount: Int,
+        duplicateName: String?,
+        pairText: String
+    ) -> Bool {
+        hasRequiredFields
+            && remainingCapacity(serverCount: serverCount) > 0
+            && duplicateName == nil
+            && parsePairs(pairText).problems.isEmpty
+    }
+
+    /// A single message naming every malformed line, used for the inline report
+    /// under the editor and for the error `add()` sets if it is ever reached
+    /// with a bad draft.
+    static func malformedPairMessage(field: String, problems: [PairLineProblem]) -> String? {
+        guard !problems.isEmpty else { return nil }
+        let detail = problems.map { "Line \($0.line): \($0.reason)" }.joined(separator: "\n")
+        return "\(field) could not be read, so nothing was saved:\n\(detail)"
     }
 }
 
@@ -180,7 +268,7 @@ private struct McpServerEditor: View {
             if servers.isEmpty {
                 Text("No MCP servers yet — add one below.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .accessibilityIdentifier("extensions.mcp.empty")
             }
             ForEach(servers) { server in
@@ -194,7 +282,7 @@ private struct McpServerEditor: View {
                             Text(server.name).font(.callout)
                             Text(subtitle(for: server))
                                 .font(.caption2.monospaced())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
@@ -233,14 +321,14 @@ private struct McpServerEditor: View {
                                 .accessibilityHidden(true)
                             Text(result.message)
                             if let identity = probeIdentity(result) {
-                                Text(identity).foregroundStyle(.tertiary)
+                                Text(identity).foregroundStyle(.kaisolaTertiary)
                             }
                         }
                         .font(.caption)
                         .foregroundStyle(
                             result.status == .failed
                                 ? KaisolaStatusTone.failed.foregroundColor
-                                : Color.secondary
+                                : Color.kaisolaSecondary
                         )
                         .accessibilityElement(children: .combine)
 
@@ -258,7 +346,7 @@ private struct McpServerEditor: View {
                                     .buttonStyle(.borderless)
                                     .disabled(probingNames.contains(server.name))
                             } else if let title = authentication.action.title {
-                                Text(title).foregroundStyle(.tertiary)
+                                Text(title).foregroundStyle(.kaisolaTertiary)
                             }
                         }
                         .font(.caption)
@@ -284,7 +372,7 @@ private struct McpServerEditor: View {
                 HStack(spacing: 8) {
                     Label("\(deleted.server.name) removed", systemImage: "trash")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     Spacer()
                     Button("Undo") { restore(deleted) }
                         .buttonStyle(.borderless)
@@ -374,7 +462,7 @@ private struct McpServerEditor: View {
         Section("Import Existing Configuration") {
             Text("Find MCP servers already configured in Cursor, Claude, Codex, Gemini, VS Code, or Windsurf. Kaisola reads only their standard local config files, never expands secrets, and imports selected servers disabled.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
 
             if discoveries.isEmpty {
                 Button {
@@ -394,7 +482,7 @@ private struct McpServerEditor: View {
                             Text(discovery.config.name)
                             Text("\(discovery.origin) · \(subtitle(for: discovery.config))")
                                 .font(.caption2.monospaced())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
@@ -412,12 +500,12 @@ private struct McpServerEditor: View {
             if let discoveryMessage {
                 Text(discoveryMessage)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             if remainingCapacity == 0 {
                 Text("MCP server limit reached (\(McpConfigStore.maximumServerCount)). Remove a server before importing another.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
         }
     }
@@ -498,6 +586,19 @@ private struct McpServerEditor: View {
                 lineEditor("Headers — NAME=value per line", text: $draft.headerText)
             }
 
+            if !pairProblems.isEmpty {
+                // Every malformed line, listed as the user types, so a header or
+                // environment variable can never be dropped behind a successful
+                // Add.
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(pairProblems, id: \.line) { problem in
+                        Text("\(pairFieldLabel) line \(problem.line): \(problem.reason)")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                .accessibilityElement(children: .combine)
+            }
             if let addError {
                 Text(addError)
                     .font(.caption)
@@ -511,7 +612,7 @@ private struct McpServerEditor: View {
             if remainingCapacity == 0 {
                 Text("MCP server limit reached (\(McpConfigStore.maximumServerCount)). Remove a server before adding another.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             Button("Add Server", action: add)
                 .disabled(!canAddServer)
@@ -525,8 +626,9 @@ private struct McpServerEditor: View {
         VStack(alignment: .leading, spacing: 2) {
             Text(label)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             TextEditor(text: text)
+                .onChange(of: text.wrappedValue) { _, _ in addError = nil }
                 .font(.callout.monospaced())
                 .frame(minHeight: 52)
                 .overlay(RoundedRectangle(cornerRadius: 4).stroke(.quaternary))
@@ -556,12 +658,28 @@ private struct McpServerEditor: View {
         duplicateName.map { McpSettingsPolicy.duplicateMessage($0) }
     }
 
+    /// The `NAME=value` editor the chosen transport actually shows — stdio
+    /// carries environment variables, http/sse carry headers — and the label the
+    /// per-line report names it by.
+    private var pairFieldLabel: String {
+        draft.kind == .stdio ? "Environment" : "Headers"
+    }
+
+    private var pairDraftText: String {
+        draft.kind == .stdio ? draft.envText : draft.headerText
+    }
+
+    private var pairProblems: [McpSettingsPolicy.PairLineProblem] {
+        McpSettingsPolicy.parsePairs(pairDraftText).problems
+    }
+
     private var canAddServer: Bool {
         McpSettingsPolicy.canAddServer(
             rawName: draft.name,
             servers: servers,
             hasRequiredFields: hasRequiredFields,
-            remainingCapacity: remainingCapacity
+            remainingCapacity: remainingCapacity,
+            pairText: pairDraftText
         )
     }
 
@@ -572,7 +690,25 @@ private struct McpServerEditor: View {
             return
         }
         guard hasRequiredFields else { return }
-        guard canAddServer else { return }
+        guard canAddServer else {
+            let parse = McpSettingsPolicy.parsePairs(pairDraftText)
+            if let message = McpSettingsPolicy.malformedPairMessage(
+                field: pairFieldLabel, problems: parse.problems
+            ) {
+                addError = message
+            }
+            return
+        }
+        // The button is already disabled while a line is malformed; this keeps
+        // the draft (and its unparsed text) on screen if `add` is ever reached
+        // another way.
+        let parse = McpSettingsPolicy.parsePairs(pairDraftText)
+        if let message = McpSettingsPolicy.malformedPairMessage(
+            field: pairFieldLabel, problems: parse.problems
+        ) {
+            addError = message
+            return
+        }
         let server: McpServerConfig
         switch draft.kind {
         case .stdio:
@@ -581,14 +717,14 @@ private struct McpServerEditor: View {
                 kind: .stdio,
                 command: draft.command.trimmingCharacters(in: .whitespaces),
                 args: Self.parseLines(draft.argsText),
-                envPairs: Self.parsePairs(draft.envText)
+                envPairs: parse.pairs
             )
         case .http, .sse:
             server = McpServerConfig(
                 name: name,
                 kind: draft.kind,
                 url: draft.url.trimmingCharacters(in: .whitespaces),
-                headerPairs: Self.parsePairs(draft.headerText)
+                headerPairs: parse.pairs
             )
         }
         if let error = server.validationError {
@@ -602,29 +738,16 @@ private struct McpServerEditor: View {
         addError = nil
     }
 
-    // MARK: - Lenient parsing
+    // MARK: - Line parsing
 
-    /// One entry per non-blank line, trimmed. Used for stdio arguments.
+    /// One entry per non-blank line, trimmed. Used for stdio arguments, where a
+    /// line carries no structure to get wrong. `NAME=value` blocks go through
+    /// `McpSettingsPolicy.parsePairs`, which reports rather than drops.
     static func parseLines(_ text: String) -> [String] {
         text.split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
     }
-
-    /// One `{name,value}` per line, split on the first `=`. Blank lines, lines
-    /// with no `=`, and lines with an empty name are skipped; an empty value is
-    /// allowed.
-    static func parsePairs(_ text: String) -> [McpServerConfig.Pair] {
-        text.split(whereSeparator: \.isNewline).compactMap { rawLine -> McpServerConfig.Pair? in
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty, let separator = line.firstIndex(of: "=") else { return nil }
-            let name = line[..<separator].trimmingCharacters(in: .whitespaces)
-            let value = line[line.index(after: separator)...].trimmingCharacters(in: .whitespaces)
-            guard !name.isEmpty else { return nil }
-            return McpServerConfig.Pair(name: name, value: value)
-        }
-    }
-
     private func notifyCatalogChanged() {
         NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
     }

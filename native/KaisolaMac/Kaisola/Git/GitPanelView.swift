@@ -608,8 +608,7 @@ struct GitPanelView: View {
     @ViewBuilder
     private func content(_ status: GitService.Status) -> some View {
         if status.isClean {
-            VStack(spacing: 0) {
-                ContentUnavailableView("Working tree clean", systemImage: "checkmark.seal")
+            cleanTree {
                 logSection
                 prSection
             }
@@ -634,6 +633,36 @@ struct GitPanelView: View {
                     .disabled(model.commitMessage.trimmingCharacters(in: .whitespaces).isEmpty || status.staged.isEmpty || model.isBusy)
             }
             .padding(12)
+        }
+    }
+
+    /// The clean-tree half of the panel: the "working tree clean" placeholder
+    /// above History and Pull Request.
+    ///
+    /// It scrolls, like the dirty half. A plain stack let the placeholder — a
+    /// `ContentUnavailableView`, which fills whatever it is given — take the
+    /// pane's height and push the two sections below it past the bottom edge
+    /// with no way back. A clean tree is exactly the state in which those
+    /// sections matter most: an open pull-request review is the tallest thing
+    /// the panel ever shows, and its Confirm and Cancel buttons sit at its foot.
+    ///
+    /// The column keeps a minimum of the pane's own height, so on a roomy pane
+    /// the placeholder still expands and centers as before; only content that
+    /// outgrows the pane starts scrolling.
+    ///
+    /// Generic over its sections so a layout test can drive it with content of
+    /// a known height. The panel itself always passes `logSection` + `prSection`.
+    func cleanTree<Sections: View>(@ViewBuilder sections: () -> Sections) -> some View {
+        let resolved = sections()
+        return GeometryReader { proxy in
+            ScrollView {
+                VStack(spacing: 0) {
+                    ContentUnavailableView("Working tree clean", systemImage: "checkmark.seal")
+                    resolved
+                }
+                .frame(maxWidth: .infinity, minHeight: proxy.size.height)
+            }
+            .scrollBounceBehavior(.basedOnSize)
         }
     }
 

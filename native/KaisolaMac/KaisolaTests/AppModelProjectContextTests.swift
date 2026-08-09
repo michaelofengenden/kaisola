@@ -1089,6 +1089,188 @@ final class AppModelProjectContextTests: XCTestCase {
     }
 
     @MainActor
+    func testColdRestoreWithRemovedNamedAccountStopsAtActionableState() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let now = Date(timeIntervalSince1970: 10)
+        let access = ChatAccountAccess(
+            binding: binding,
+            requiresResolution: true,
+            now: now
+        )
+
+        let transition = access.reconcile(.init(
+            profiles: [],
+            readings: [],
+            isRefreshing: false,
+            now: now
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.accountRemoved))
+        XCTAssertFalse(access.allowsAdapterStart)
+        let presentation = try XCTUnwrap(access.presentation)
+        XCTAssertEqual(presentation.provider, profile.provider.displayName)
+        XCTAssertEqual(presentation.account, profile.label)
+        XCTAssertFalse(presentation.showsActivityIndicator)
+        XCTAssertEqual(presentation.actions, [.signIn, .chooseAccount, .preserveTranscript])
+        XCTAssertTrue(presentation.detail.contains("Claude account “Work”"))
+        XCTAssertTrue(presentation.detail.contains("transcript and draft are still here"))
+    }
+
+    @MainActor
+    func testDelayedAccountResolutionUnlocksBeforeBoundedDeadline() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let now = Date(timeIntervalSince1970: 20)
+        let access = ChatAccountAccess(
+            binding: binding,
+            requiresResolution: true,
+            now: now
+        )
+
+        _ = access.reconcile(.init(
+            profiles: [profile],
+            readings: [],
+            isRefreshing: true,
+            now: now
+        ))
+        XCTAssertEqual(access.phase, .resolving)
+        XCTAssertEqual(access.presentation?.showsActivityIndicator, true)
+        XCTAssertTrue(access.presentation?.actions.isEmpty == true)
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [signedInReading(profile)],
+            isRefreshing: false,
+            now: now.addingTimeInterval(1)
+        ))
+        XCTAssertEqual(transition, .changed)
+        XCTAssertEqual(access.phase, .ready)
+        XCTAssertTrue(access.allowsAdapterStart)
+        XCTAssertNil(access.presentation)
+    }
+
+    @MainActor
+    func testLogoutInvalidatesResumeAndExposesAllRecoveryActions() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let access = ChatAccountAccess(binding: binding, requiresResolution: false)
+        let signedOut = UsageCenter.ProviderPlanUsage(
+            provider: profile.provider.rawValue,
+            displayName: profile.provider.displayName,
+            profileID: profile.id,
+            profileLabel: profile.label,
+            ok: false,
+            sourceLabel: "fixture",
+            windows: [],
+            message: "Sign in required"
+        )
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [signedOut],
+            isRefreshing: false,
+            now: Date()
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.signedOut))
+        XCTAssertEqual(access.presentation?.actions, [.signIn, .chooseAccount, .preserveTranscript])
+        XCTAssertEqual(access.presentation?.showsActivityIndicator, false)
+    }
+
+    @MainActor
+    func testAccountRemovalInvalidatesPreviouslyReadyChatWithoutDeletingItsContract() throws {
+        let (_, binding) = try restoredChatAccountFixture()
+        let access = ChatAccountAccess(binding: binding, requiresResolution: false)
+
+        let transition = access.reconcile(.init(
+            profiles: [],
+            readings: [],
+            isRefreshing: false,
+            now: Date()
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.accountRemoved))
+        XCTAssertEqual(access.binding, binding)
+        XCTAssertTrue(access.presentation?.detail.contains("transcript and draft are still here") == true)
+    }
+
+    @MainActor
+    func testOrdinarySignedInRestorationStartsWithoutRecoveryUI() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let access = ChatAccountAccess(binding: binding, requiresResolution: true)
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [signedInReading(profile)],
+            isRefreshing: false,
+            now: Date()
+        ))
+
+        XCTAssertEqual(transition, .changed)
+        XCTAssertEqual(access.phase, .ready)
+        XCTAssertTrue(access.allowsAdapterStart)
+        XCTAssertNil(access.presentation)
+    }
+
+    @MainActor
+    func testUnresolvedAccountStopsSpinnerAtDeadline() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let now = Date(timeIntervalSince1970: 30)
+        let access = ChatAccountAccess(
+            binding: binding,
+            requiresResolution: true,
+            now: now,
+            timeout: 5
+        )
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [],
+            isRefreshing: false,
+            now: now.addingTimeInterval(5)
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.resolutionTimedOut))
+        XCTAssertFalse(try XCTUnwrap(access.presentation).showsActivityIndicator)
+    }
+
+    private func restoredChatAccountFixture() throws -> (
+        UsageAccountProfile,
+        SessionAccountBinding
+    ) {
+        let profile = UsageAccountProfile(
+            id: "restored-work",
+            provider: .claude,
+            label: "Work",
+            directory: storeFile.deletingLastPathComponent()
+                .appendingPathComponent("claude-work", isDirectory: true).path
+        )
+        let binding = try XCTUnwrap(SessionAccountBinding.resolve(
+            provider: profile.provider,
+            profile: profile,
+            fallbackEnvironment: [:]
+        ))
+        return (profile, binding)
+    }
+
+    private func signedInReading(
+        _ profile: UsageAccountProfile
+    ) -> UsageCenter.ProviderPlanUsage {
+        UsageCenter.ProviderPlanUsage(
+            provider: profile.provider.rawValue,
+            displayName: profile.provider.displayName,
+            profileID: profile.id,
+            profileLabel: profile.label,
+            ok: true,
+            sourceLabel: "fixture",
+            account: "ready@example.test",
+            windows: []
+        )
+    }
+
+    @MainActor
     func testChatRestorationLoadsOnlyTailThenFetchesEarlierSQLitePage() async throws {
         let root = storeFile.deletingLastPathComponent()
         let projectDirectory = root.appendingPathComponent("paged-chat-project", isDirectory: true)
@@ -1155,6 +1337,7 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertEqual(conversation.hiddenEarlierCount, 680)
         await model.teardown()
     }
+
 
     @MainActor
     private func makeRestoringModel(

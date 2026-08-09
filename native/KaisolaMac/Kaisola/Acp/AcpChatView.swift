@@ -16,6 +16,7 @@ struct AcpChatView: View {
 
     @State private var restoreTarget: AcpConversation.TurnCheckpoint?
     @ObservedObject var conversation: AcpConversation
+    @ObservedObject private var accountAccess: ChatAccountAccess
     private let presentation: Presentation
     @State private var draft = ""
     /// Highlights the composer while an OS file drag hovers it.
@@ -28,17 +29,33 @@ struct AcpChatView: View {
     @FocusState private var composerFocused: Bool
     private let focusRequestGeneration: UInt64?
     private let onKeyboardFocus: (() -> Void)?
+    private let onSignIn: () -> Void
+    private let onChooseAccount: () -> Void
+    private let onPreserveTranscript: () -> Void
+
+    private struct StartupTaskID: Hashable {
+        let conversation: ObjectIdentifier
+        let accountAllowsStart: Bool
+    }
 
     init(
         conversation: AcpConversation,
+        accountAccess: ChatAccountAccess,
         presentation: Presentation = .standard,
         focusRequestGeneration: UInt64? = nil,
-        onKeyboardFocus: (() -> Void)? = nil
+        onKeyboardFocus: (() -> Void)? = nil,
+        onSignIn: @escaping () -> Void = {},
+        onChooseAccount: @escaping () -> Void = {},
+        onPreserveTranscript: @escaping () -> Void = {}
     ) {
         _conversation = ObservedObject(wrappedValue: conversation)
+        _accountAccess = ObservedObject(wrappedValue: accountAccess)
         self.presentation = presentation
         self.focusRequestGeneration = focusRequestGeneration
         self.onKeyboardFocus = onKeyboardFocus
+        self.onSignIn = onSignIn
+        self.onChooseAccount = onChooseAccount
+        self.onPreserveTranscript = onPreserveTranscript
     }
 
     /// The chat has produced nothing yet, so the transcript's space belongs to
@@ -99,6 +116,12 @@ struct AcpChatView: View {
         // saves the preceding session's draft.
         .task(id: ObjectIdentifier(conversation)) {
             draft = conversation.loadDraft()
+        }
+        .task(id: StartupTaskID(
+            conversation: ObjectIdentifier(conversation),
+            accountAllowsStart: accountAccess.allowsAdapterStart
+        )) {
+            guard accountAccess.allowsAdapterStart else { return }
             await conversation.start()
         }
         .onChange(of: draft) { _, newValue in
@@ -341,7 +364,9 @@ struct AcpChatView: View {
 
     private var composer: some View {
         VStack(spacing: 6) {
-            if !conversation.isConnected, conversation.statusMessage != nil {
+            if let account = accountAccess.presentation {
+                accountRecoveryCard(account)
+            } else if !conversation.isConnected, conversation.statusMessage != nil {
                 HStack(spacing: 8) {
                     Label("Agent disconnected — your draft and queued follow-ups are preserved.", systemImage: "bolt.slash")
                         .font(.caption)
@@ -444,6 +469,63 @@ struct AcpChatView: View {
         DispatchQueue.main.async {
             composerFocused = true
         }
+    }
+
+    private func accountRecoveryCard(
+        _ account: ChatAccountAccess.Presentation
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                if account.showsActivityIndicator {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel(account.headline)
+                } else {
+                    Image(systemName: "person.crop.circle.badge.exclamationmark")
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(account.headline)
+                        .font(.caption.weight(.semibold))
+                    Text("\(account.provider) · \(account.account)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                    Text(account.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            if !account.actions.isEmpty {
+                HStack(spacing: 8) {
+                    Button(ChatAccountAccess.RecoveryAction.signIn.rawValue, action: onSignIn)
+                        .buttonStyle(.borderedProminent)
+                    Button(
+                        ChatAccountAccess.RecoveryAction.chooseAccount.rawValue,
+                        action: onChooseAccount
+                    )
+                        .buttonStyle(.bordered)
+                    Button(
+                        ChatAccountAccess.RecoveryAction.preserveTranscript.rawValue,
+                        action: onPreserveTranscript
+                    )
+                        .buttonStyle(.bordered)
+                    Spacer(minLength: 0)
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(.orange.opacity(0.3), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(account.headline). \(account.provider) account \(account.account). \(account.detail)")
     }
 
     private var attachmentStrip: some View {

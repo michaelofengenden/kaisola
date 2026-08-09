@@ -92,6 +92,77 @@ test('terminal create route always returns recovered null for a plain spawn', ()
   assert.equal(response.recovered, null)
 })
 
+test('terminal create route preserves an id at the 240-character boundary', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const manager = fakeManager()
+  const id = 't'.repeat(240)
+
+  const response = terminalCreateRoute({
+    manager,
+    params: { id, projectId: 'project-boundary' },
+    owner: 'instance|owner|project-boundary',
+    clientInstanceId: 'instance',
+    requireAllowed: () => {},
+  })
+
+  assert.equal(response.ok, true)
+  assert.equal(manager.calls.length, 1)
+  assert.equal(manager.calls[0].id, id)
+})
+
+test('terminal create route rejects an overlong id before authorization or spawn', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const manager = fakeManager()
+  manager.has = () => assert.fail('an overlong id must not reach terminal lookup')
+  const authorized = []
+
+  const response = terminalCreateRoute({
+    manager,
+    params: { id: 't'.repeat(241), projectId: 'project-a' },
+    owner: 'instance-a|owner-a|project-a',
+    clientInstanceId: 'instance-a',
+    requireAllowed: (...args) => authorized.push(args),
+  })
+
+  assert.deepEqual(response, {
+    ok: false,
+    code: 'terminal_id_too_long',
+    message: 'terminal id exceeds 240 characters',
+    maxLength: 240,
+    actualLength: 241,
+  })
+  assert.deepEqual(authorized, [])
+  assert.equal(manager.calls.length, 0)
+})
+
+test('terminal create route never aliases overlong ids with a shared 240-character prefix', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const manager = fakeManager()
+  manager.has = () => assert.fail('colliding overlong ids must not reach terminal lookup')
+  const prefix = 't'.repeat(240)
+  const authorized = []
+
+  const first = terminalCreateRoute({
+    manager,
+    params: { id: `${prefix}a`, projectId: 'project-a' },
+    owner: 'instance-a|owner-a|project-a',
+    clientInstanceId: 'instance-a',
+    requireAllowed: (...args) => authorized.push(args),
+  })
+  const second = terminalCreateRoute({
+    manager,
+    params: { id: `${prefix}b`, projectId: 'project-b' },
+    owner: 'instance-b|owner-b|project-b',
+    clientInstanceId: 'instance-b',
+    requireAllowed: (...args) => authorized.push(args),
+  })
+
+  assert.equal(first.code, 'terminal_id_too_long')
+  assert.equal(second.code, 'terminal_id_too_long')
+  assert.deepEqual(authorized, [])
+  assert.equal(manager.calls.length, 0)
+})
+
 test('restore for an id unknown to this broker requires the id-embedded project to match', () => {
   const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
   const manager = fakeManager({ recovered: { text: 'secret-project-a-output', truncated: false } })

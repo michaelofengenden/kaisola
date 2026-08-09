@@ -2,6 +2,8 @@
 
 const os = require('node:os')
 
+const MAX_TERMINAL_ID_LENGTH = 240
+
 /** The authenticated `terminal.create` operation after access selection. Kept
  * separate from the executable broker so the additive resurrection wire can
  * be contract-tested without binding its AF_UNIX listener. */
@@ -14,8 +16,17 @@ function terminalCreateRoute({
   brokerPid = process.pid,
   now = Date.now,
 }) {
-  const id = String(params.id || '').slice(0, 240)
+  const id = String(params.id || '')
   if (!id) return { ok: false, message: 'terminal id required' }
+  if (id.length > MAX_TERMINAL_ID_LENGTH) {
+    return {
+      ok: false,
+      code: 'terminal_id_too_long',
+      message: `terminal id exceeds ${MAX_TERMINAL_ID_LENGTH} characters`,
+      maxLength: MAX_TERMINAL_ID_LENGTH,
+      actualLength: id.length,
+    }
+  }
   if (manager.has(id)) requireAllowed(id, true)
 
   const existed = manager.isLive(id)

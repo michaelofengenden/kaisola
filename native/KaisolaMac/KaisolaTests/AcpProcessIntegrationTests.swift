@@ -9,6 +9,165 @@ import XCTest
 /// handshake + streamed turn + permission callback. Skips cleanly if node or
 /// the mock is unavailable so it never fails a machine without the toolchain.
 final class AcpProcessIntegrationTests: XCTestCase {
+    func testStdinQueueWritesFramesInFIFOOrderWithEnqueueTimeDeadlines() async throws {
+        let clock = LockedMonotonicClock(1_000)
+        let writer = SuspendedStdinWriter()
+        let queue = AcpStdinWriteQueue(
+            descriptor: -1,
+            frameDeadlineNanoseconds: 100,
+            maximumQueuedFrames: 4,
+            maximumQueuedBytes: 64,
+            writeOperation: { try await writer.write(data: $1, deadline: $2) },
+            monotonicNow: { clock.value }
+        )
+
+        let first = Task { try await queue.send(Data("first".utf8)) }
+        await writer.waitForCallCount(1)
+        clock.value = 2_000
+        let second = Task { try await queue.send(Data("second".utf8)) }
+        await waitForQueuedFrames(2, in: queue)
+
+        let activeCallCount = await writer.callCount
+        XCTAssertEqual(activeCallCount, 1, "only one descriptor write may be active")
+        await writer.succeedNext()
+        await writer.waitForCallCount(2)
+        await writer.succeedNext()
+        try await first.value
+        try await second.value
+
+        let calls = await writer.calls
+        XCTAssertEqual(calls.map(\.payload), ["first", "second"])
+        XCTAssertEqual(calls.map(\.deadline), [1_100, 2_100])
+        let drainedSnapshot = await queue.snapshotForTesting()
+        XCTAssertEqual(
+            drainedSnapshot,
+            .init(queuedFrameCount: 0, queuedBytes: 0, isWriting: false, isClosed: false)
+        )
+        await queue.close()
+    }
+
+    func testStdinQueueOverflowFailsEveryFrameWithoutUnboundedRetention() async throws {
+        let writer = SuspendedStdinWriter()
+        let queue = AcpStdinWriteQueue(
+            descriptor: -1,
+            frameDeadlineNanoseconds: 1_000,
+            maximumQueuedFrames: 2,
+            maximumQueuedBytes: 9,
+            writeOperation: { try await writer.write(data: $1, deadline: $2) },
+            monotonicNow: { 10 }
+        )
+        let first = Task { try await queue.send(Data("1234".utf8)) }
+        await writer.waitForCallCount(1)
+        let second = Task { try await queue.send(Data("5678".utf8)) }
+        await waitForQueuedFrames(2, in: queue)
+
+        let overflowMessage: String
+        do {
+            try await queue.send(Data("9".utf8))
+            XCTFail("the third frame must exceed the two-frame bound")
+            overflowMessage = ""
+        } catch let AcpClientError.requestFailed(message) {
+            overflowMessage = message
+        } catch {
+            throw error
+        }
+        XCTAssertTrue(overflowMessage.contains("bounded capacity"))
+        await assertFailed(first, message: overflowMessage)
+        await assertFailed(second, message: overflowMessage)
+        let failedSnapshot = await queue.snapshotForTesting()
+        XCTAssertEqual(
+            failedSnapshot,
+            .init(queuedFrameCount: 0, queuedBytes: 0, isWriting: false, isClosed: true)
+        )
+
+        // The scripted operation intentionally ignores task cancellation until
+        // the test releases it. Production poll slices observe cancellation.
+        await writer.failNext(CancellationError())
+        await queue.close()
+    }
+
+    func testAdapterThatNeverReadsStdinFailsAtTheFrameDeadlineAndClosesItsTree() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport(stdinFrameDeadlineNanoseconds: 150_000_000)
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.termIgnoringTreeScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path
+        )
+        let pids = try await fixture.waitForPIDs()
+        let startedAt = ContinuousClock.now
+
+        do {
+            try await transport.send(Data(repeating: 0x78, count: 2 * 1_024 * 1_024))
+            XCTFail("a non-consuming adapter must not accept an unbounded frame")
+        } catch let AcpClientError.requestFailed(message) {
+            XCTAssertTrue(message.contains("stopped reading requests"))
+        } catch {
+            XCTFail("unexpected stdin failure: \(error)")
+        }
+
+        XCTAssertLessThan(
+            startedAt.duration(to: .now),
+            .seconds(1),
+            "the descriptor write must return at its own deadline, before process-group teardown"
+        )
+        let stopped = await fixture.waitUntilStopped(pids, timeout: .seconds(4))
+        XCTAssertTrue(stopped, "stdin timeout must close and reap the owned adapter group")
+    }
+
+    @MainActor
+    func testAdapterThatStopsReadingStdinFailsConnectionAndPreservesRetryablePrompt() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport(stdinFrameDeadlineNanoseconds: 150_000_000)
+        let client = AcpClient(transport: transport)
+        let conversation = AcpConversation(
+            title: "Backpressure",
+            command: "/bin/sh",
+            arguments: ["-c", Self.handshakeThenStopReadingStdinScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path,
+            client: client
+        )
+        await conversation.start()
+        XCTAssertTrue(conversation.isConnected)
+        let pids = try await fixture.waitForPIDs()
+        let prompt = String(repeating: "backpressure-payload-", count: 100_000)
+
+        XCTAssertTrue(conversation.send(prompt))
+        try await waitUntil(timeout: .seconds(2)) {
+            !conversation.isRunning && conversation.rows.contains { row in
+                if case let .user(_, text, failed) = row { return failed && text == prompt }
+                return false
+            }
+        }
+
+        let failedRow = try XCTUnwrap(conversation.rows.last)
+        guard case let .user(rowID, retainedText, failed) = failedRow else {
+            return XCTFail("the failed prompt must remain a user row")
+        }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(retainedText, prompt)
+        XCTAssertTrue(conversation.statusMessage?.contains("stopped reading requests") == true)
+
+        let stopped = await fixture.waitUntilStopped(pids, timeout: .seconds(4))
+        XCTAssertTrue(stopped, "write timeout must close and reap the owned adapter group")
+        try await waitUntil(timeout: .seconds(1)) { !conversation.isConnected }
+
+        // The failed row itself and its exact original payload survive the
+        // dead connection. Exercising Retry proves it is not display-only.
+        conversation.retryFailed("user-\(rowID)")
+        try await waitUntil(timeout: .seconds(1)) { !conversation.isRunning }
+        guard case let .user(_, retriedText, retryFailed)? = conversation.rows.last else {
+            return XCTFail("retry must re-dispatch the retained user payload")
+        }
+        XCTAssertTrue(retryFailed)
+        XCTAssertEqual(retriedText, prompt)
+        _ = await conversation.stop()
+    }
+
     func testTransportStopTerminatesItsAdapterAndAppServerChild() async throws {
         let fixture = try OwnedProcessFixture()
         defer { fixture.forceCleanup() }
@@ -374,6 +533,106 @@ final class AcpProcessIntegrationTests: XCTestCase {
     exec 1>&-
     while :; do /bin/sleep 1; done
     """#
+
+    private static let handshakeThenStopReadingStdinScript = #"""
+    trap '' TERM
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" TERM; printf "%s\n" "$$" > "$KAISOLA_FIXTURE_CHILD_PID"; while :; do /bin/sleep 1; done' \
+      </dev/null >/dev/null 2>&1 &
+    IFS= read -r _
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+    IFS= read -r _
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture-session"}}'
+    while :; do /bin/sleep 1; done
+    """#
+
+    private func waitForQueuedFrames(_ count: Int, in queue: AcpStdinWriteQueue) async {
+        for _ in 0..<1_000 {
+            if await queue.snapshotForTesting().queuedFrameCount == count { return }
+            await Task.yield()
+        }
+        XCTFail("stdin queue did not reach \(count) frames")
+    }
+
+    @MainActor
+    private func waitUntil(
+        timeout: Duration,
+        condition: @MainActor () -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while !condition(), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(condition(), "condition did not become true within \(timeout)")
+    }
+
+    private func assertFailed(
+        _ task: Task<Void, any Error>,
+        message: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            try await task.value
+            XCTFail("expected queued write to fail", file: file, line: line)
+        } catch let AcpClientError.requestFailed(actual) {
+            XCTAssertEqual(actual, message, file: file, line: line)
+        } catch {
+            XCTFail("unexpected write error: \(error)", file: file, line: line)
+        }
+    }
+}
+
+private final class LockedMonotonicClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: UInt64
+
+    init(_ value: UInt64) { storage = value }
+
+    var value: UInt64 {
+        get { lock.withLock { storage } }
+        set { lock.withLock { storage = newValue } }
+    }
+}
+
+private actor SuspendedStdinWriter {
+    struct Call: Equatable, Sendable {
+        let payload: String
+        let deadline: UInt64
+    }
+
+    private(set) var calls: [Call] = []
+    private var pending: [CheckedContinuation<Void, any Error>] = []
+    private var callWaiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    var callCount: Int { calls.count }
+
+    func write(data: Data, deadline: UInt64) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            calls.append(Call(payload: String(decoding: data, as: UTF8.self), deadline: deadline))
+            pending.append(continuation)
+            let ready = callWaiters.filter { calls.count >= $0.target }
+            callWaiters.removeAll { calls.count >= $0.target }
+            for waiter in ready { waiter.continuation.resume() }
+        }
+    }
+
+    func waitForCallCount(_ target: Int) async {
+        if calls.count >= target { return }
+        await withCheckedContinuation { continuation in
+            callWaiters.append((target, continuation))
+        }
+    }
+
+    func succeedNext() {
+        guard !pending.isEmpty else { return }
+        pending.removeFirst().resume()
+    }
+
+    func failNext(_ error: any Error) {
+        guard !pending.isEmpty else { return }
+        pending.removeFirst().resume(throwing: error)
+    }
 }
 
 private struct OwnedProcessFixture: @unchecked Sendable {

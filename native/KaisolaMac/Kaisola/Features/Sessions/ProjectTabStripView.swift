@@ -1,14 +1,59 @@
+import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
+
+/// One adjacent project-tab move shared by keyboard/assistive actions and the
+/// pointer drag persistence callback supplied by the parent view.
+enum ProjectTabReorder {
+    enum Direction: CaseIterable, Equatable, Sendable {
+        case left
+        case right
+    }
+
+    static func availableDirections(index: Int, count: Int) -> [Direction] {
+        guard count > 1, (0..<count).contains(index) else { return [] }
+        return Direction.allCases.filter { direction in
+            switch direction {
+            case .left: index > 0
+            case .right: index < count - 1
+            }
+        }
+    }
+
+    static func positionDescription(index: Int, count: Int) -> String? {
+        guard count > 0, (0..<count).contains(index) else { return nil }
+        return "Position \(index + 1) of \(count)"
+    }
+
+    /// Returns false at a boundary without invoking either callback. A valid
+    /// move uses the same absolute-index closure as pointer drag, then emits
+    /// exactly one position announcement for the completed user action.
+    @discardableResult
+    static func perform(
+        projectID: String,
+        projectName: String,
+        index: Int,
+        count: Int,
+        direction: Direction,
+        reorder: (_ id: String, _ toIndex: Int) -> Void,
+        announce: (_ message: String) -> Void
+    ) -> Bool {
+        guard availableDirections(index: index, count: count).contains(direction) else {
+            return false
+        }
+        let destinationIndex = direction == .left ? index - 1 : index + 1
+        reorder(projectID, destinationIndex)
+        announce("Moved \(projectName) to position \(destinationIndex + 1) of \(count).")
+        return true
+    }
+}
 
 /// A horizontal strip of project tabs for the top-bar layout. Chats, Mesh runs,
 /// and terminals live in the active project's surface strip underneath instead
 /// of floating in a global bucket. Clicking a tab makes it the active project;
-/// **dragging** a tab with
-/// the pointer reorders it live (the reorder-on-hover pattern), replacing the
-/// former Move Left / Move Right menu items. Tabs use a softly bordered,
-/// continuous-corner treatment shared with session/file surfaces rather than
-/// floating text chips.
+/// pointer drag and the tab's keyboard/assistive actions both persist through
+/// the same absolute-index reorder callback. Tabs use a softly bordered,
+/// continuous-corner treatment shared with session/file surfaces.
 struct ProjectTabStripView: View {
     let projects: [AppModel.ProjectGroup]
     @Binding var selected: String?
@@ -29,41 +74,59 @@ struct ProjectTabStripView: View {
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
-                    ForEach(projects) { project in
-                    Button {
-                        selected = project.id
-                    } label: {
-                        chipLabel(project)
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel(projectAccessibilityLabel(project))
-                    .accessibilityAddTraits(selected == project.id ? .isSelected : [])
-                    .contextMenu { menu(project) }
-                    .onDrag {
-                        draggingID = project.id
-                        return NSItemProvider(object: project.id as NSString)
-                    }
-                    .onDrop(
-                        of: [.text],
-                        delegate: ProjectTabDropDelegate(
-                            target: project,
-                            projects: projects,
-                            draggingID: $draggingID,
-                            reorder: reorder
+                    ForEach(Array(projects.enumerated()), id: \.element.id) { index, project in
+                        let directions = ProjectTabReorder.availableDirections(
+                            index: index,
+                            count: projects.count
                         )
-                    )
-                    .id(project.id)
+                        Button {
+                            selected = project.id
+                        } label: {
+                            chipLabel(project)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(projectAccessibilityLabel(project))
+                        .accessibilityValue(
+                            ProjectTabReorder.positionDescription(
+                                index: index,
+                                count: projects.count
+                            ) ?? ""
+                        )
+                        .accessibilityAddTraits(selected == project.id ? .isSelected : [])
+                        .accessibilityActions {
+                            if directions.contains(.left) {
+                                Button("Move Left") { reorderProject(project, direction: .left) }
+                            }
+                            if directions.contains(.right) {
+                                Button("Move Right") { reorderProject(project, direction: .right) }
+                            }
+                        }
+                        .contextMenu { menu(project) }
+                        .onDrag {
+                            draggingID = project.id
+                            return NSItemProvider(object: project.id as NSString)
+                        }
+                        .onDrop(
+                            of: [.text],
+                            delegate: ProjectTabDropDelegate(
+                                target: project,
+                                projects: projects,
+                                draggingID: $draggingID,
+                                reorder: reorder
+                            )
+                        )
+                        .id(project.id)
                     }
                     Button(action: openFolder) {
-                    Image(systemName: "plus")
-                        .font(.caption.weight(.semibold))
-                        .frame(width: 26, height: 26)
-                        .background(Color.primary.opacity(0.04), in: Circle())
-                        .overlay {
-                            Circle()
-                                .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
-                        }
-                }
+                        Image(systemName: "plus")
+                            .font(.caption.weight(.semibold))
+                            .frame(width: 26, height: 26)
+                            .background(Color.primary.opacity(0.04), in: Circle())
+                            .overlay {
+                                Circle()
+                                    .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
+                            }
+                    }
                     .buttonStyle(.plain)
                     .help("Open a folder as a project (⌘O)")
                     Button(action: useSidebar) {
@@ -144,6 +207,30 @@ struct ProjectTabStripView: View {
             return "\(project.name), \(project.workingCount) \(noun) working"
         }
         return project.name
+    }
+
+    private func reorderProject(
+        _ project: AppModel.ProjectGroup,
+        direction: ProjectTabReorder.Direction
+    ) {
+        guard let index = projects.firstIndex(where: { $0.id == project.id }) else { return }
+        ProjectTabReorder.perform(
+            projectID: project.id,
+            projectName: project.name,
+            index: index,
+            count: projects.count,
+            direction: direction,
+            reorder: reorder
+        ) { announcement in
+            NSAccessibility.post(
+                element: NSApplication.shared,
+                notification: .announcementRequested,
+                userInfo: [
+                    .announcement: announcement,
+                    .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+                ]
+            )
+        }
     }
 }
 

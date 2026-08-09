@@ -44,3 +44,28 @@ test('visible validation copy is not duplicated as a separate accessibility elem
   assert.notEqual(end, -1)
   assert.match(source.slice(start, end), /\.accessibilityHidden\(true\)/u)
 })
+
+test('sensitive glob removal waits for exact-scope confirmation', () => {
+  const start = source.indexOf('ForEach(settings.sensitiveGlobs')
+  const end = source.indexOf('HStack {\n                    TextField("Add glob', start)
+  assert.notEqual(start, -1)
+  assert.notEqual(end, -1)
+  const rows = source.slice(start, end)
+
+  assert.match(rows, /globPendingRemoval = glob/u)
+  assert.doesNotMatch(rows, /sensitiveGlobs\.remove/u)
+  assert.match(source, /Button\("Remove \\\(glob\)", role: \.destructive\)/u)
+  assert.match(source, /SensitiveGlobRemovalPolicy\.confirmationMessage\(for: glob\)/u)
+})
+
+test('confirmed removal restores stable focus and announces lost protection', () => {
+  assert.match(source, /\.focused\(\$focusedControl, equals: \.remove\(glob\)\)/u)
+  assert.match(
+    source,
+    /\.accessibilityFocused\(\$accessibilityFocusedControl, equals: \.remove\(glob\)\)/u,
+  )
+  assert.match(source, /focusedControl = plan\.nextFocus/u)
+  assert.match(source, /accessibilityFocusedControl = plan\.nextFocus/u)
+  assert.match(source, /SensitiveGlobRemovalPolicy\.announcement\(for: glob\)/u)
+  assert.match(source, /NSAccessibilityPriorityLevel\.medium\.rawValue/u)
+})

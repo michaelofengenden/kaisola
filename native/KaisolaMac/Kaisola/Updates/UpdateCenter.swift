@@ -102,7 +102,10 @@ final class UpdateCenter: ObservableObject {
 
     private var bridge: PreferenceBridge?
 
-    private init() {}
+    /// The app always goes through `shared`; the initializer is reachable so
+    /// the check-status transitions can be driven on a throwaway instance
+    /// instead of the app-wide one.
+    init() {}
 
     func installPreferenceBridge(_ bridge: PreferenceBridge) {
         self.bridge = bridge

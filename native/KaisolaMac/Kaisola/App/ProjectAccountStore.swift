@@ -266,6 +266,87 @@ struct ProjectAccountStore: Sendable {
         try write(payload)
     }
 
+    /// Every project whose provider override resolves to `directory`.
+    /// This is a read-only preview for the removal confirmation; the destructive
+    /// action recomputes the set under the file lock before it writes.
+    func projectIDs(
+        assignedTo directory: String,
+        provider: UsageAccountProfile.Provider
+    ) throws -> [String] {
+        switch loadStatus() {
+        case .missing:
+            return []
+        case .loaded(let payload):
+            return Self.projectIDs(in: payload, assignedTo: directory, provider: provider)
+        case .blocked(let issue):
+            throw StoreError.recoveryRequired(issue)
+        }
+    }
+
+    /// Reassign every project using a named account to App Default for that
+    /// provider, in one locked read-modify-write. The other provider and every
+    /// unrelated project survive unchanged. The returned ids are the exact
+    /// generation that was changed, which may differ from an earlier preview if
+    /// another Settings window edited assignments before confirmation.
+    @discardableResult
+    func clearAssignments(
+        to directory: String,
+        provider: UsageAccountProfile.Provider
+    ) throws -> [String] {
+        let lock = ProjectAccountStore.fileLock(for: fileURL)
+        lock.lock()
+        defer { lock.unlock() }
+
+        var payload: Payload
+        switch loadStatus() {
+        case .missing:
+            return []
+        case .loaded(let loaded):
+            payload = loaded
+        case .blocked(let issue):
+            throw StoreError.recoveryRequired(issue)
+        }
+
+        let projectIDs = Self.projectIDs(in: payload, assignedTo: directory, provider: provider)
+        guard !projectIDs.isEmpty else { return [] }
+        for projectID in projectIDs {
+            guard var assignment = payload.projects[projectID] else { continue }
+            switch provider {
+            case .claude:
+                assignment.claudeConfigDir = nil
+            case .codex:
+                assignment.codexHome = nil
+            }
+            if assignment.isEmpty {
+                payload.projects.removeValue(forKey: projectID)
+            } else {
+                payload.projects[projectID] = assignment.normalized()
+            }
+        }
+        try write(payload)
+        return projectIDs
+    }
+
+    private static func projectIDs(
+        in payload: Payload,
+        assignedTo directory: String,
+        provider: UsageAccountProfile.Provider
+    ) -> [String] {
+        guard let target = AccountDirectory.identityKey(directory) else { return [] }
+        return payload.projects.compactMap { projectID, assignment in
+            let stored: String?
+            switch provider {
+            case .claude:
+                stored = assignment.claudeConfigDir
+            case .codex:
+                stored = assignment.codexHome
+            }
+            guard let stored,
+                  AccountDirectory.identityKey(stored) == target else { return nil }
+            return projectID
+        }.sorted()
+    }
+
     /// Cross the destructive recovery boundary explicitly. Readable failure
     /// bytes already have a verified copy, so only the active source is removed.
     /// If they were unreadable, moving the source itself becomes the byte-exact
@@ -465,6 +546,35 @@ final class ProjectAccountRecoveryCenter: ObservableObject {
         do {
             try store.set(override, forProject: projectID)
             issue = nil
+        } catch ProjectAccountStore.StoreError.recoveryRequired(let recovery) {
+            issue = recovery
+            throw ProjectAccountStore.StoreError.recoveryRequired(recovery)
+        }
+    }
+
+    func projectIDs(
+        assignedTo directory: String,
+        provider: UsageAccountProfile.Provider
+    ) throws -> [String] {
+        do {
+            let projectIDs = try store.projectIDs(assignedTo: directory, provider: provider)
+            issue = nil
+            return projectIDs
+        } catch ProjectAccountStore.StoreError.recoveryRequired(let recovery) {
+            issue = recovery
+            throw ProjectAccountStore.StoreError.recoveryRequired(recovery)
+        }
+    }
+
+    @discardableResult
+    func clearAssignments(
+        to directory: String,
+        provider: UsageAccountProfile.Provider
+    ) throws -> [String] {
+        do {
+            let projectIDs = try store.clearAssignments(to: directory, provider: provider)
+            issue = nil
+            return projectIDs
         } catch ProjectAccountStore.StoreError.recoveryRequired(let recovery) {
             issue = recovery
             throw ProjectAccountStore.StoreError.recoveryRequired(recovery)

@@ -140,6 +140,35 @@ enum NewAccountProviderAccessibility {
     }
 }
 
+/// Copy for the destructive named-account confirmation. Keeping the wording in
+/// a value lets tests prove that affected projects are listed and that the only
+/// destructive choice says what replaces their assignment.
+struct NamedAccountRemovalConfirmation: Equatable {
+    let accountLabel: String
+    let projectLabels: [String]
+
+    var actionTitle: String {
+        projectLabels.isEmpty ? "Remove Account" : "Use App Default and Remove Account"
+    }
+
+    var message: String {
+        guard !projectLabels.isEmpty else {
+            return "Kaisola will forget \(accountLabel). Its provider files and sign-in stay on disk."
+        }
+        let count = projectLabels.count
+        return "\(accountLabel) is assigned to \(count) \(count == 1 ? "project" : "projects"): \(Self.list(projectLabels)). Those projects will use App Default. The provider files and sign-in stay on disk."
+    }
+
+    private static func list(_ values: [String]) -> String {
+        switch values.count {
+        case 0: return ""
+        case 1: return values[0]
+        case 2: return "\(values[0]) and \(values[1])"
+        default: return values.dropLast().joined(separator: ", ") + ", and " + values.last!
+        }
+    }
+}
+
 /// Which surface the per-project card must show. Store recovery outranks an
 /// ordinary project row because unreadable account data cannot safely be
 /// interpreted as App Default or as a missing named-account assignment.
@@ -174,6 +203,7 @@ struct ProjectAccountsSection: View {
     @State private var newDirectory = ""
     @State private var accountError: String?
     @State private var pendingRemoval: UsageAccountProfile?
+    @State private var pendingRemovalProjectLabels: [String] = []
     @State private var confirmingRecoveryReset = false
     /// The account whose sign-in sheet is open, if any.
     @State private var signingIn: UsageAccountProfile?
@@ -218,18 +248,27 @@ struct ProjectAccountsSection: View {
             "Remove \(pendingRemoval?.label ?? "Account")?",
             isPresented: Binding(
                 get: { pendingRemoval != nil },
-                set: { if !$0 { pendingRemoval = nil } }
+                set: {
+                    if !$0 {
+                        pendingRemoval = nil
+                        pendingRemovalProjectLabels = []
+                    }
+                }
             ),
             titleVisibility: .visible
         ) {
-            Button("Remove Account", role: .destructive) {
+            Button(removalConfirmation.actionTitle, role: .destructive) {
                 guard let profile = pendingRemoval else { return }
                 pendingRemoval = nil
+                pendingRemovalProjectLabels = []
                 removeProfile(profile)
             }
-            Button("Cancel", role: .cancel) { pendingRemoval = nil }
+            Button("Cancel", role: .cancel) {
+                pendingRemoval = nil
+                pendingRemovalProjectLabels = []
+            }
         } message: {
-            Text("Kaisola will forget this named account. Its provider files and sign-in stay on disk.")
+            Text(removalConfirmation.message)
         }
         .confirmationDialog(
             "Reset all project account overrides?",
@@ -401,7 +440,7 @@ struct ProjectAccountsSection: View {
             Button("Sign In") { signingIn = profile }
                 .controlSize(.small)
                 .accessibilityLabel("Sign in to \(profile.label)")
-            Button(role: .destructive) { pendingRemoval = profile } label: {
+            Button(role: .destructive) { prepareRemoval(profile) } label: {
                 Image(systemName: "xmark")
                     .font(.caption.weight(.semibold))
             }
@@ -608,8 +647,58 @@ struct ProjectAccountsSection: View {
     }
 
     private func removeProfile(_ profile: UsageAccountProfile) {
-        guard usageAccountStore.remove(id: profile.id) else { return }
-        loadUsageProfiles()
-        NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+        do {
+            _ = try recoveryCenter.clearAssignments(
+                to: profile.directory,
+                provider: profile.provider
+            )
+            guard usageAccountStore.remove(id: profile.id) else {
+                load()
+                accountError = "Kaisola reassigned affected projects to App Default, but couldn't remove \(profile.label). Try removing the account again."
+                return
+            }
+            load()
+            loadUsageProfiles()
+            accountError = nil
+            NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+        } catch {
+            accountError = error.localizedDescription
+        }
+    }
+
+    private var removalConfirmation: NamedAccountRemovalConfirmation {
+        NamedAccountRemovalConfirmation(
+            accountLabel: pendingRemoval?.label ?? "Account",
+            projectLabels: pendingRemovalProjectLabels
+        )
+    }
+
+    private func prepareRemoval(_ profile: UsageAccountProfile) {
+        do {
+            let projectIDs = try recoveryCenter.projectIDs(
+                assignedTo: profile.directory,
+                provider: profile.provider
+            )
+            let projectNames = NativeSessionStore().projects().reduce(into: [String: String]()) {
+                // A malformed legacy session archive must not make the removal
+                // confirmation trap. The account store remains authoritative;
+                // this map is display-only, so the first known name is enough.
+                if $0[$1.id] == nil { $0[$1.id] = $1.name }
+            }
+            pendingRemovalProjectLabels = projectIDs.map { projectID in
+                if projectID == self.projectID,
+                   let projectName,
+                   !projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return projectName
+                }
+                return projectNames[projectID] ?? projectID
+            }
+            pendingRemoval = profile
+            accountError = nil
+        } catch {
+            pendingRemoval = nil
+            pendingRemovalProjectLabels = []
+            accountError = error.localizedDescription
+        }
     }
 }

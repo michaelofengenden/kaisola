@@ -74,6 +74,53 @@ final class ProjectAccountStoreTests: XCTestCase {
         XCTAssertNil(try store.override(forProject: "never-set"))
     }
 
+    func testNamedAccountRemovalListsAndClearsOnlyMatchingProviderAssignments() throws {
+        let target = "/tmp/kaisola-account-work"
+        try store.set(
+            ProjectAccountOverride(claudeConfigDir: target, codexHome: target),
+            forProject: "nproj_current"
+        )
+        try store.set(
+            ProjectAccountOverride(claudeConfigDir: "/tmp/parent/../kaisola-account-work", codexHome: nil),
+            forProject: "nproj_alias"
+        )
+        try store.set(
+            ProjectAccountOverride(claudeConfigDir: "/tmp/other", codexHome: nil),
+            forProject: "nproj_other"
+        )
+
+        let before = try Data(contentsOf: fileURL)
+        XCTAssertEqual(
+            try store.projectIDs(
+                assignedTo: target,
+                provider: .claude
+            ),
+            ["nproj_alias", "nproj_current"]
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: fileURL),
+            before,
+            "listing affected projects must not mutate either assignment or account"
+        )
+
+        XCTAssertEqual(
+            try store.clearAssignments(
+                to: target,
+                provider: .claude
+            ),
+            ["nproj_alias", "nproj_current"]
+        )
+        XCTAssertNil(try store.override(forProject: "nproj_alias"))
+        XCTAssertEqual(
+            try store.override(forProject: "nproj_current"),
+            ProjectAccountOverride(claudeConfigDir: nil, codexHome: target)
+        )
+        XCTAssertEqual(
+            try store.override(forProject: "nproj_other")?.claudeConfigDir,
+            "/tmp/other"
+        )
+    }
+
     // MARK: - Cross-project isolation
 
     func testOverridesAreScopedPerProjectAndIndependent() throws {
@@ -249,6 +296,12 @@ final class ProjectAccountStoreTests: XCTestCase {
                 ProjectAccountOverride(claudeConfigDir: "~/replacement", codexHome: nil),
                 forProject: "nproj_a"
             )
+        )
+        XCTAssertThrowsError(
+            try store.projectIDs(assignedTo: "~/replacement", provider: .claude)
+        )
+        XCTAssertThrowsError(
+            try store.clearAssignments(to: "~/replacement", provider: .claude)
         )
         XCTAssertEqual(try Data(contentsOf: fileURL), original)
     }

@@ -49,6 +49,32 @@ final class ProjectAccountSelectionTests: XCTestCase {
         )
     }
 
+    func testNamedAccountRemovalConfirmationListsProjectsAndOffersAppDefault() {
+        let impact = NamedAccountRemovalConfirmation(
+            accountLabel: "Work",
+            projectLabels: ["Kaisola", "Research"]
+        )
+
+        XCTAssertEqual(impact.actionTitle, "Use App Default and Remove Account")
+        XCTAssertEqual(
+            impact.message,
+            "Work is assigned to 2 projects: Kaisola and Research. Those projects will use App Default. The provider files and sign-in stay on disk."
+        )
+    }
+
+    func testUnassignedAccountRemovalKeepsTheSimpleConfirmation() {
+        let impact = NamedAccountRemovalConfirmation(
+            accountLabel: "Personal",
+            projectLabels: []
+        )
+
+        XCTAssertEqual(impact.actionTitle, "Remove Account")
+        XCTAssertEqual(
+            impact.message,
+            "Kaisola will forget Personal. Its provider files and sign-in stay on disk."
+        )
+    }
+
     // MARK: - Healthy assignments
 
     func testBlankOverrideIsAppDefault() {

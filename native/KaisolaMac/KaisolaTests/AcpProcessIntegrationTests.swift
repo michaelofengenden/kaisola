@@ -9,6 +9,131 @@ import XCTest
 /// handshake + streamed turn + permission callback. Skips cleanly if node or
 /// the mock is unavailable so it never fails a machine without the toolchain.
 final class AcpProcessIntegrationTests: XCTestCase {
+    func testStderrTailIsByteBoundedAndRedactsSensitiveDiagnostics() throws {
+        let tail = AcpStderrTail(byteLimit: 128)
+        tail.append(Data(String(repeating: "discarded-prefix-\n", count: 32).utf8))
+        tail.append(Data("\u{1B}[31mfatal\u{1B}[0m api_".utf8))
+        tail.append(Data("key=sk-ABCDEFGHIJKLMNOPQRST at /Users/alice/private/project\n".utf8))
+
+        let snapshot = tail.snapshotForTesting()
+        XCTAssertEqual(snapshot.retainedByteCount, 128)
+        XCTAssertTrue(snapshot.didTruncate)
+        let detail = try XCTUnwrap(snapshot.failureDetail)
+        XCTAssertTrue(detail.contains("fatal"))
+        XCTAssertTrue(detail.contains("api_key=[redacted]"))
+        XCTAssertTrue(detail.contains("[local path]"))
+        XCTAssertTrue(detail.contains("Earlier adapter stderr was truncated"))
+        XCTAssertFalse(detail.contains("ABCDEFGHIJKLMNOPQRST"))
+        XCTAssertFalse(detail.contains("alice"))
+        XCTAssertFalse(detail.contains("\u{1B}"))
+
+        let boundary = AcpStderrTail(byteLimit: 12)
+        boundary.append(Data("api_key=boundary-secret-without-newline".utf8))
+        let boundaryDetail = try XCTUnwrap(boundary.snapshotForTesting().failureDetail)
+        XCTAssertTrue(boundaryDetail.contains("no complete diagnostic line was safe"))
+        XCTAssertFalse(boundaryDetail.contains("secret"))
+
+        let opaque = AcpStderrTail(
+            byteLimit: 128,
+            sensitiveValues: ["opaque-environment-credential"]
+        )
+        opaque.append(Data("adapter rejected opaque-environment-credential\n".utf8))
+        let opaqueDetail = try XCTUnwrap(opaque.snapshotForTesting().failureDetail)
+        XCTAssertEqual(opaqueDetail, "adapter rejected [redacted]")
+    }
+
+    func testAdapterExitSurfacesOnlyCurrentGenerationStderrWithoutMixingStdout() async throws {
+        let transport = AcpProcessTransport(stderrByteLimit: 96)
+        let environment = [
+            "PATH": "/usr/bin:/bin",
+            "CUSTOM_API_KEY": "first-generation-secret",
+        ]
+        let cwd = FileManager.default.temporaryDirectory.path
+
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: [
+                "-c",
+                "printf '%s\\n' 'wire-one'; "
+                    + "printf 'adapter-one rejected %s\\n' \"$CUSTOM_API_KEY\" >&2; exit 23",
+            ],
+            environment: environment,
+            cwd: cwd
+        )
+        let firstWire = try await transport.receive(maximumBytes: 1_024)
+        XCTAssertEqual(firstWire, Data("wire-one\n".utf8), "stderr must never enter ACP stdout")
+        let firstFailure = try await stderrFailureMessage(from: transport)
+        XCTAssertTrue(firstFailure.contains("code 23"), firstFailure)
+        XCTAssertTrue(firstFailure.contains("adapter-one rejected [redacted]"), firstFailure)
+        XCTAssertTrue(firstFailure.contains("adapter-one"), firstFailure)
+        XCTAssertFalse(firstFailure.contains("first-generation-secret"), firstFailure)
+
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: [
+                "-c",
+                "printf '%s\\n' 'wire-two'; printf '%s\\n' 'adapter-two failed' >&2; exit 7",
+            ],
+            environment: environment,
+            cwd: cwd
+        )
+        let secondWire = try await transport.receive(maximumBytes: 1_024)
+        XCTAssertEqual(secondWire, Data("wire-two\n".utf8))
+        let secondFailure = try await stderrFailureMessage(from: transport)
+        XCTAssertTrue(secondFailure.contains("code 7"), secondFailure)
+        XCTAssertTrue(secondFailure.contains("adapter-two failed"), secondFailure)
+        XCTAssertFalse(secondFailure.contains("adapter-one"), secondFailure)
+        XCTAssertFalse(secondFailure.contains("first-generation-secret"), secondFailure)
+        await transport.terminate()
+    }
+
+    func testAdapterExitWithoutStderrPreservesCleanEOF() async throws {
+        let transport = AcpProcessTransport(stderrByteLimit: 96)
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", "printf '%s\\n' 'wire-only'; exit 3"],
+            environment: ["PATH": "/usr/bin:/bin"],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+
+        let wire = try await transport.receive(maximumBytes: 1_024)
+        XCTAssertEqual(wire, Data("wire-only\n".utf8))
+        let eof = try await transport.receive(maximumBytes: 1_024)
+        XCTAssertNil(eof)
+        let code = await transport.exitCode()
+        XCTAssertEqual(code, 3)
+        await transport.terminate()
+    }
+
+    func testChattyStderrKeepsDrainingAfterTheTailReachesItsByteLimit() async throws {
+        let transport = AcpProcessTransport(stderrByteLimit: 128)
+        let script = #"""
+        index=0
+        while [ "$index" -lt 4096 ]; do
+          printf '%s\n' 'stderr-padding-0123456789abcdefghijklmnopqrstuvwxyz'
+          index=$((index + 1))
+        done >&2
+        printf '%s\n' 'final-adapter-diagnostic' >&2
+        printf '%s\n' 'wire-after-stderr'
+        exit 11
+        """#
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", script],
+            environment: ["PATH": "/usr/bin:/bin"],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+
+        let wire = try await receive(from: transport, timeout: .seconds(3))
+        XCTAssertEqual(wire, Data("wire-after-stderr\n".utf8))
+        let failure = try await stderrFailureMessage(from: transport)
+        XCTAssertTrue(failure.contains("code 11"), failure)
+        XCTAssertTrue(failure.contains("Earlier adapter stderr was truncated"), failure)
+        XCTAssertTrue(failure.contains("final-adapter-diagnostic"), failure)
+        XCTAssertLessThan(failure.utf8.count, 512)
+        await transport.terminate()
+    }
+
     func testStdinQueueWritesFramesInFIFOOrderWithEnqueueTimeDeadlines() async throws {
         let clock = LockedMonotonicClock(1_000)
         let writer = SuspendedStdinWriter()
@@ -581,6 +706,40 @@ final class AcpProcessIntegrationTests: XCTestCase {
             XCTFail("unexpected write error: \(error)", file: file, line: line)
         }
     }
+
+    private func stderrFailureMessage(from transport: AcpProcessTransport) async throws -> String {
+        do {
+            let unexpected = try await transport.receive(maximumBytes: 1_024)
+            await transport.terminate()
+            XCTFail("stderr-bearing adapter EOF must expose a diagnostic failure, got \(String(describing: unexpected))")
+            return ""
+        } catch let AcpClientError.requestFailed(message) {
+            return message
+        }
+    }
+
+    private func receive(
+        from transport: AcpProcessTransport,
+        timeout: Duration
+    ) async throws -> Data? {
+        try await withThrowingTaskGroup(of: Data?.self) { group in
+            group.addTask { try await transport.receive(maximumBytes: 1_024) }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                await transport.terminate()
+                throw AcpProcessIntegrationTestError.receiveTimedOut
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw AcpProcessIntegrationTestError.receiveTimedOut
+            }
+            return result
+        }
+    }
+}
+
+private enum AcpProcessIntegrationTestError: Error {
+    case receiveTimedOut
 }
 
 private final class LockedMonotonicClock: @unchecked Sendable {

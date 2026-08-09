@@ -2275,7 +2275,8 @@ final class AppModel: ObservableObject {
                 accountBinding: chat.accountBinding,
                 title: chat.conversation.title,
                 queuedPrompts: chat.conversation.queued.map(\.text),
-                modelOverride: chat.modelOverride
+                modelOverride: chat.modelOverride,
+                runProfile: chat.runProfile
             )
             panes.append(NativeRestorablePaneState(
                 id: chat.id,
@@ -2865,6 +2866,7 @@ final class AppModel: ObservableObject {
                     resumeSessionID: descriptor.acpSessionID ?? transcript?.sessionID,
                     accountBinding: descriptor.accountBinding,
                     modelOverride: descriptor.modelOverride,
+                    runProfile: descriptor.runProfile ?? .write,
                     requiresAccountResolution: true,
                     initialTranscript: transcript,
                     initialDraft: draft,
@@ -3148,7 +3150,8 @@ final class AppModel: ObservableObject {
         _ agent: AgentProfile,
         inDirectory directory: URL,
         accountProfile: UsageAccountProfile? = nil,
-        initialDraft: String? = nil
+        initialDraft: String? = nil,
+        runProfile: AcpRunProfile? = nil
     ) {
         let project = sessionStore.openProject(directory: directory.path)
         refreshPersistedNavigationState(publish: false)
@@ -3196,6 +3199,7 @@ final class AppModel: ObservableObject {
            ) {
             ToastCenter.shared.show(warning, style: .info, duration: 5)
         }
+        let runProfile = runProfile ?? AcpRunProfileStore().defaultProfile
         guard appendChat(
             id: chatID,
             agent: agent,
@@ -3203,6 +3207,8 @@ final class AppModel: ObservableObject {
             title: "\(agent.name) · \((directory.path as NSString).lastPathComponent)",
             resumeSessionID: nil,
             accountBinding: accountBinding,
+            modelOverride: runProfile.modelID,
+            runProfile: runProfile,
             initialTranscript: nil,
             initialDraft: initialDraft,
             initialQueuedPrompts: []
@@ -3221,6 +3227,7 @@ final class AppModel: ObservableObject {
         resumeSessionID: String?,
         accountBinding: SessionAccountBinding?,
         modelOverride: String? = nil,
+        runProfile: AcpRunProfile = .write,
         accountAccess: ChatAccountAccess? = nil,
         requiresAccountResolution: Bool = false,
         initialTranscript: AcpTranscriptStore.Restoration?,
@@ -3244,6 +3251,8 @@ final class AppModel: ObservableObject {
             return normalized
         }()
         let projectID = NativeSessionStore.projectID(forDirectory: directory.path)
+        var runProfileSnapshot = runProfile
+        runProfileSnapshot.modelID = modelOverride ?? runProfile.modelID
         let mcp = McpConfigStore(workspace: directory).servers()
         let baseEnvironment = ProcessInfo.processInfo.environment.merging(
             ProjectAccountStore.mergedOverlay(
@@ -3252,7 +3261,7 @@ final class AppModel: ObservableObject {
             )
         ) { _, custom in custom }
         var environment = SessionAccountBinding.applying(accountBinding, to: baseEnvironment)
-        environment = SessionModelOverride.applying(modelOverride, agentID: agent.id, to: environment)
+        environment = SessionModelOverride.applying(runProfileSnapshot.modelID, agentID: agent.id, to: environment)
         // The host marker — see the terminal spawn's twin assignment.
         environment["KAISOLA"] = "1"
         environment["KAISOLA_SESSION_ID"] = chatID
@@ -3278,6 +3287,7 @@ final class AppModel: ObservableObject {
             transcriptModelID: modelOverride,
             providerContext: providerContext,
             mcpServers: McpConfigStore.jsonValues(mcp),
+            runProfile: runProfileSnapshot,
             sensitiveGlobs: NativePreviewSettings.shared.sensitiveGlobs,
             draftKey: chatID,
             resumeSessionID: safeResumeSessionID,
@@ -3415,7 +3425,8 @@ final class AppModel: ObservableObject {
             agentID: agent.id,
             workspaceDirectory: directory,
             accountBinding: accountBinding,
-            modelOverride: modelOverride,
+            modelOverride: runProfileSnapshot.modelID,
+            runProfile: runProfileSnapshot,
             accountAccess: accountAccess,
             conversation: conversation
         )
@@ -3466,7 +3477,8 @@ final class AppModel: ObservableObject {
             accountBinding: closingChat.accountBinding,
             title: closingChat.conversation.title,
             queuedPrompts: closingChat.conversation.queued.map(\.text),
-            modelOverride: closingChat.modelOverride
+            modelOverride: closingChat.modelOverride,
+            runProfile: closingChat.runProfile
         )
         storeRecentlyClosedPane(NativeRestorablePaneState(
             id: chatID,
@@ -3688,6 +3700,7 @@ final class AppModel: ObservableObject {
             resumeSessionID: nil,
             accountBinding: chat.accountBinding,
             modelOverride: chat.modelOverride,
+            runProfile: chat.runProfile,
             accountAccess: chat.accountAccess,
             initialTranscript: transcript,
             initialDraft: finalDraft ?? transcript?.draft,
@@ -3819,6 +3832,7 @@ final class AppModel: ObservableObject {
             resumeSessionID: nil,
             accountBinding: binding,
             modelOverride: chat.modelOverride,
+            runProfile: chat.runProfile,
             requiresAccountResolution: requiresAccountResolution,
             initialTranscript: transcript,
             initialDraft: finalDraft ?? transcript?.draft,
@@ -3878,6 +3892,7 @@ final class AppModel: ObservableObject {
             resumeSessionID: resumeSessionID ?? transcript?.sessionID,
             accountBinding: chat.accountBinding,
             modelOverride: target,
+            runProfile: chat.runProfile,
             initialTranscript: transcript,
             initialDraft: finalDraft ?? transcript?.draft,
             initialQueuedPrompts: queued
@@ -3893,6 +3908,52 @@ final class AppModel: ObservableObject {
             "Switched to \(target ?? "the default model").",
             style: .success
         )
+    }
+
+    /// Rebuild the adapter on a new immutable run-profile snapshot. ACP binds
+    /// client capabilities and MCP servers during initialize/session-new, so a
+    /// live process can never be safely widened or narrowed in place.
+    func switchChatRunProfile(_ chatID: String, to profileID: String) async {
+        guard let chat = chats.first(where: { $0.id == chatID }),
+              let agent = AgentRegistry.profile(id: chat.agentID),
+              let profile = AcpRunProfileStore().profile(id: profileID) else {
+            ToastCenter.shared.show("That run profile is no longer available.", style: .error)
+            return
+        }
+        guard profile != chat.runProfile else {
+            ToastCenter.shared.show("This chat already uses \(profile.name).", style: .info)
+            return
+        }
+        let projectID = chat.projectID
+        let queued = chat.conversation.queued.map(\.text)
+        let finalDraft = await chat.conversation.stop()
+        await flushTranscriptPersistence()
+        let transcript = await restoredTranscript(for: chatID)
+        guard let live = chats.first(where: { $0.id == chatID }),
+              live.conversation === chat.conversation else { return }
+        chats.removeAll { $0.id == chatID }
+        usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
+        usageCenter.unregister(chatID: chatID, sourceID: usageSourceID, forgetWhenLast: false)
+        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        guard appendChat(
+            id: chatID,
+            agent: agent,
+            directory: chat.workspaceDirectory,
+            title: chat.conversation.title,
+            resumeSessionID: nil,
+            accountBinding: chat.accountBinding,
+            modelOverride: profile.modelID,
+            runProfile: profile,
+            accountAccess: chat.accountAccess,
+            initialTranscript: transcript,
+            initialDraft: finalDraft ?? transcript?.draft,
+            initialQueuedPrompts: queued
+        ) != nil else {
+            ToastCenter.shared.show("The chat adapter is unavailable, so the profile was not switched.", style: .error)
+            return
+        }
+        scheduleWorkspaceStateSave(projectID: projectID)
+        ToastCenter.shared.show("Switched to \(profile.name). Fresh provider session; the transcript stays.", style: .success)
     }
 
     func selectChat(_ chatID: String?) {
@@ -4105,6 +4166,7 @@ final class AppModel: ObservableObject {
                 resumeSessionID: descriptor.acpSessionID ?? transcript?.sessionID,
                 accountBinding: descriptor.accountBinding,
                 modelOverride: descriptor.modelOverride,
+                runProfile: descriptor.runProfile ?? .write,
                 requiresAccountResolution: true,
                 initialTranscript: transcript,
                 initialDraft: draft,

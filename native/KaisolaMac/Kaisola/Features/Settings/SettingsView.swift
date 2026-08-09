@@ -991,6 +991,7 @@ struct SettingsView: View {
 
     private var agents: some View {
         Form {
+            AgentRunProfilesSection(workspace: workspace)
             Section("Built-in ACP Adapters") {
                 ForEach(AgentRegistry.all) { agent in
                     if let adapter = AcpAdapter.forAgent(agent.id) {
@@ -1037,6 +1038,171 @@ struct SettingsView: View {
             id,
             in: AppCommandContext(model: nil, settings: settings)
         )
+    }
+}
+
+/// CRUD surface for reusable ACP launch profiles. The built-ins are immutable;
+/// Fork creates a fully editable snapshot so changing policy is always an
+/// explicit user action rather than an in-place mutation of a shared default.
+private struct AgentRunProfilesSection: View {
+    let workspace: URL?
+    private let store = AcpRunProfileStore()
+    @State private var profiles: [AcpRunProfile] = []
+    @State private var defaultProfileID = AcpRunProfile.write.id
+
+    private var mcpServerNames: [String] {
+        guard let workspace else { return [] }
+        return McpConfigStore(workspace: workspace).servers().map(\.name)
+    }
+
+    var body: some View {
+        Section("Run Profiles") {
+            Text("Profiles fix the model, host tools, and MCP servers advertised to a new chat. Each turn records the exact snapshot it used.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            ForEach(profiles) { profile in
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(spacing: 8) {
+                        if profile.isBuiltIn {
+                            Text(profile.name).font(.callout.weight(.medium))
+                        } else {
+                            TextField("Profile name", text: nameBinding(profile.id))
+                                .textFieldStyle(.roundedBorder)
+                        }
+                        if profile.id == defaultProfileID {
+                            Text("Default")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Button("Make Default") { setDefault(profile.id) }
+                                .font(.caption)
+                        }
+                        Spacer()
+                        Button("Fork") { fork(profile.id) }.font(.caption)
+                        if !profile.isBuiltIn {
+                            Button(role: .destructive) { delete(profile.id) } label: {
+                                Image(systemName: "trash")
+                            }
+                            .buttonStyle(.borderless)
+                        }
+                    }
+                    TextField("Stable model ID (optional)", text: modelBinding(profile.id))
+                        .font(.caption.monospaced())
+                        .textFieldStyle(.roundedBorder)
+                        .disabled(profile.isBuiltIn)
+                    HStack(spacing: 14) {
+                        ForEach(AcpRunProfile.ClientTool.allCases, id: \.rawValue) { tool in
+                            Toggle(tool.title, isOn: toolBinding(profile.id, tool))
+                                .toggleStyle(.checkbox)
+                                .disabled(profile.isBuiltIn)
+                        }
+                    }
+                    if !mcpServerNames.isEmpty {
+                        HStack(spacing: 14) {
+                            Text("MCP").font(.caption.weight(.semibold))
+                            ForEach(mcpServerNames, id: \.self) { name in
+                                Toggle(name, isOn: mcpBinding(profile.id, name))
+                                    .toggleStyle(.checkbox)
+                                    .disabled(profile.isBuiltIn)
+                            }
+                        }
+                    }
+                    ForEach(profile.availabilityWarnings(knownMCPServerNames: mcpServerNames), id: \.self) { warning in
+                        Label(warning, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    }
+                }
+                .padding(.vertical, 3)
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("settings.run-profile.\(profile.id)")
+            }
+            Button("New Profile") {
+                let created = store.create(name: "New Profile")
+                refresh(selecting: created.id)
+            }
+        }
+        .onAppear { refresh() }
+    }
+
+    private func nameBinding(_ id: String) -> Binding<String> {
+        Binding(
+            get: { profiles.first(where: { $0.id == id })?.name ?? "" },
+            set: { value in
+                guard store.rename(id, to: value) else { return }
+                refresh()
+            }
+        )
+    }
+
+    private func modelBinding(_ id: String) -> Binding<String> {
+        Binding(
+            get: { profiles.first(where: { $0.id == id })?.modelID ?? "" },
+            set: { value in
+                update(id) { profile in
+                    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    profile.modelID = trimmed.isEmpty ? nil : trimmed
+                }
+            }
+        )
+    }
+
+    private func toolBinding(_ id: String, _ tool: AcpRunProfile.ClientTool) -> Binding<Bool> {
+        Binding(
+            get: { profiles.first(where: { $0.id == id })?.allows(tool) == true },
+            set: { enabled in
+                update(id) { profile in
+                    profile.enabledClientToolIDs.removeAll { $0 == tool.rawValue }
+                    if enabled { profile.enabledClientToolIDs.append(tool.rawValue) }
+                }
+            }
+        )
+    }
+
+    private func mcpBinding(_ id: String, _ name: String) -> Binding<Bool> {
+        Binding(
+            get: {
+                guard let profile = profiles.first(where: { $0.id == id }) else { return false }
+                return profile.enabledMCPServerNames.contains(AcpRunProfile.allMCPServersID)
+                    || profile.enabledMCPServerNames.contains(name)
+            },
+            set: { enabled in
+                update(id) { profile in
+                    if profile.enabledMCPServerNames.contains(AcpRunProfile.allMCPServersID) {
+                        profile.enabledMCPServerNames = mcpServerNames
+                    }
+                    profile.enabledMCPServerNames.removeAll { $0 == name }
+                    if enabled { profile.enabledMCPServerNames.append(name) }
+                }
+            }
+        )
+    }
+
+    private func update(_ id: String, mutation: (inout AcpRunProfile) -> Void) {
+        guard var profile = store.profile(id: id), !profile.isBuiltIn else { return }
+        mutation(&profile)
+        _ = store.update(profile)
+        refresh()
+    }
+
+    private func setDefault(_ id: String) {
+        store.defaultProfileID = id
+        refresh()
+    }
+
+    private func fork(_ id: String) {
+        let created = store.fork(id)
+        refresh(selecting: created?.id)
+    }
+
+    private func delete(_ id: String) {
+        _ = store.delete(id)
+        refresh()
+    }
+
+    private func refresh(selecting _: String? = nil) {
+        profiles = store.all()
+        defaultProfileID = store.defaultProfileID
     }
 }
 

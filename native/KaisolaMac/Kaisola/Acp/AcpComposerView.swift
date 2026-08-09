@@ -203,6 +203,7 @@ struct AcpComposerCard: View {
 
             Spacer(minLength: 8)
 
+            runProfileChip
             settingsPill
                 .layoutPriority(1)
             trailingControls
@@ -216,6 +217,56 @@ struct AcpComposerCard: View {
             .frame(width: KaisolaVisualSystem.focusStroke, height: 15)
             .padding(.horizontal, 2)
             .accessibilityHidden(true)
+    }
+
+    /// Visible before the first prompt because capability advertisement has
+    /// already been fixed for this adapter process. Selecting another profile
+    /// asks AppModel to rebuild the process rather than mutating its policy.
+    private var runProfileChip: some View {
+        let profile = conversation.runProfile
+        let knownServers = McpConfigStore(workspace: conversation.workspaceURL).servers().map(\.name)
+        let warnings = profile.availabilityWarnings(knownMCPServerNames: knownServers)
+        return Menu {
+            ForEach(AcpRunProfileStore().all()) { candidate in
+                Button {
+                    guard let chatID = model.chats.first(where: {
+                        $0.conversation === conversation
+                    })?.id else { return }
+                    Task { await model.switchChatRunProfile(chatID, to: candidate.id) }
+                } label: {
+                    if candidate.id == profile.id {
+                        Label(candidate.name, systemImage: "checkmark")
+                    } else {
+                        Text(candidate.name)
+                    }
+                }
+            }
+            if !warnings.isEmpty {
+                Divider()
+                ForEach(warnings, id: \.self) { warning in
+                    Text(warning)
+                }
+            }
+            Divider()
+            Button("Manage Profiles…") {
+                NSApp.sendAction(
+                    #selector(KaisolaMacAppDelegate.openAgentSettings(_:)),
+                    to: nil,
+                    from: nil
+                )
+            }
+        } label: {
+            AcpComposerChipLabel(label: profile.name, tint: warnings.isEmpty ? nil : .orange) {
+                Image(systemName: warnings.isEmpty ? "checkmark.shield" : "exclamationmark.triangle")
+                    .font(.system(size: 10, weight: .medium))
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help(warnings.first ?? "Run profile: model, host tools, and MCP availability")
+        .accessibilityLabel("Run profile: \(profile.name)" + (warnings.isEmpty ? "" : ", \(warnings.joined(separator: " "))"))
+        .accessibilityIdentifier("acp.composer.run-profile")
     }
 
     // MARK: - Attachment menu

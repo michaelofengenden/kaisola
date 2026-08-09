@@ -69,6 +69,9 @@ enum AcpTranscriptMarkdownExport {
         var hiddenReasoningCount = 0
         for row in rows {
             switch row {
+            case let .runProfileAudit(_, profile):
+                let model = profile.modelID.map { " · Model: \(singleLine($0))" } ?? ""
+                sections.append("## Run profile\n\n\(singleLine(profile.name))\(model)")
             case let .user(_, text, failed):
                 let state = failed ? " (send failed)" : ""
                 var section = "## User\(state)\n\n\(visibleBody(text))"
@@ -1960,7 +1963,7 @@ actor AcpTranscriptStore {
 
     private static func isPinnedEvidence(_ row: AcpTranscriptRow) -> Bool {
         switch row {
-        case .user, .tool: true
+        case .user, .tool, .runProfileAudit: true
         case .message, .thought, .plan, .permissionDecision: false
         }
     }

@@ -9,6 +9,157 @@ import XCTest
 /// protocol (initialize → session/new → session/prompt → session/update
 /// stream, plus a permission callback) is verified without spawning a process.
 final class AcpClientTests: XCTestCase {
+    func testRunProfileStoreSupportsCreateForkRenameDeleteAndRetainsUnknownAvailability() throws {
+        let suite = "AcpRunProfileStoreTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = AcpRunProfileStore(defaults: defaults, key: "profiles")
+
+        let created = store.create(
+            name: "Docs only",
+            modelID: "stable-model",
+            enabledClientToolIDs: [AcpRunProfile.ClientTool.readTextFile.rawValue, "future.tool"],
+            enabledMCPServerNames: ["docs", "removed-server"]
+        )
+        let fork = try XCTUnwrap(store.fork(created.id))
+        XCTAssertNotEqual(fork.id, created.id)
+        XCTAssertEqual(fork.modelID, "stable-model")
+        XCTAssertTrue(store.rename(fork.id, to: "Docs review"))
+        XCTAssertEqual(store.profile(id: fork.id)?.name, "Docs review")
+        XCTAssertTrue(store.delete(fork.id))
+        XCTAssertNil(store.profile(id: fork.id))
+
+        let restored = try XCTUnwrap(store.profile(id: created.id))
+        XCTAssertEqual(restored.enabledClientToolIDs, ["readTextFile", "future.tool"])
+        XCTAssertEqual(restored.enabledMCPServerNames, ["docs", "removed-server"])
+        XCTAssertEqual(
+            restored.availabilityWarnings(knownMCPServerNames: ["docs"]),
+            ["Tool “future.tool” is unavailable.", "MCP server “removed-server” is unavailable."]
+        )
+    }
+
+    func testRunProfileRestrictsAdvertisedAndEnforcedToolsAndMCPServers() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-acp-profile-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("readable".utf8).write(to: directory.appending(path: "input.txt"))
+        let profile = AcpRunProfile(
+            id: "docs-only",
+            name: "Docs only",
+            modelID: "stable-model",
+            enabledClientToolIDs: [AcpRunProfile.ClientTool.readTextFile.rawValue],
+            enabledMCPServerNames: ["docs", "removed-server"]
+        )
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+
+        _ = try await client.start(
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: directory.path,
+            mcpServers: [
+                .object(["name": .string("docs"), "command": .string("docs-mcp")]),
+                .object(["name": .string("other"), "command": .string("other-mcp")]),
+            ],
+            access: .unrestricted,
+            runProfile: profile
+        )
+
+        let advertised = await transport.receivedClientCapabilities()?.objectValue
+        XCTAssertEqual(advertised?["fs"]?.objectValue?["readTextFile"], .bool(true))
+        XCTAssertEqual(advertised?["fs"]?.objectValue?["writeTextFile"], .bool(false))
+        XCTAssertEqual(advertised?["terminal"], .bool(false))
+        let servers = await transport.receivedSessionMcpServers()
+        XCTAssertEqual(servers.compactMap { $0.objectValue?["name"]?.stringValue }, ["docs"])
+
+        await transport.sendAgentRequest(
+            id: 25_401,
+            method: "fs/write_text_file",
+            params: .object(["path": .string("blocked.txt"), "content": .string("blocked")])
+        )
+        let response = try await transport.waitForClientResponse(id: 25_401)
+        XCTAssertTrue(
+            response.objectValue?["error"]?.objectValue?["message"]?.stringValue?
+                .contains("run profile") == true
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appending(path: "blocked.txt").path))
+        await client.stop()
+    }
+
+    func testRunProfileSnapshotPersistsWithRestorableChatWhileLegacyDefaultsToWrite() throws {
+        let profile = AcpRunProfile(
+            id: "review",
+            name: "Review",
+            modelID: "sonnet",
+            enabledClientToolIDs: [AcpRunProfile.ClientTool.readTextFile.rawValue],
+            enabledMCPServerNames: ["docs"]
+        )
+        let descriptor = NativeRestorableAgentChatDescriptor(
+            id: "chat-profile",
+            projectID: "project",
+            agentID: "claude-code",
+            workspacePath: "/tmp/project",
+            acpSessionID: nil,
+            title: "Review",
+            runProfile: profile
+        )
+        let surface = NativeRestorableSurfaceState(agentChat: descriptor)
+        XCTAssertEqual(surface.agentChatDescriptor?.runProfile, profile)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                NativeRestorableAgentChatDescriptor.self,
+                from: JSONSerialization.data(withJSONObject: [
+                    "id": "legacy",
+                    "projectID": "project",
+                    "agentID": "codex",
+                    "workspacePath": "/tmp/project",
+                ])
+            ).runProfile,
+            nil
+        )
+    }
+
+    @MainActor
+    func testEveryDispatchedTurnRecordsTheImmutableRunProfileSnapshot() async throws {
+        let profile = AcpRunProfile(
+            id: "review",
+            name: "Review",
+            modelID: "sonnet",
+            enabledClientToolIDs: [AcpRunProfile.ClientTool.readTextFile.rawValue],
+            enabledMCPServerNames: ["docs"]
+        )
+        let transport = ScriptedAcpTransport()
+        let conversation = AcpConversation(
+            title: "Audit",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            runProfile: profile,
+            client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+
+        conversation.send("first")
+        try await Self.until("first turn settled") { !conversation.isRunning }
+        conversation.send("second")
+        try await Self.until("second turn settled") { !conversation.isRunning }
+
+        let audits = conversation.rows.compactMap { row -> AcpRunProfile? in
+            if case let .runProfileAudit(_, snapshot) = row { return snapshot }
+            return nil
+        }
+        XCTAssertEqual(audits, [profile, profile])
+        let roundTrip = try JSONDecoder().decode(
+            [AcpTranscriptRow].self,
+            from: JSONEncoder().encode(conversation.rows)
+        )
+        XCTAssertEqual(roundTrip, conversation.rows)
+    }
+
     func testCustomAdapterLaunchUsesSeatbeltAndAProviderScopedEnvironment() throws {
         let fixture = try CustomContainmentFixture()
         let containment = CustomAdapterContainment(

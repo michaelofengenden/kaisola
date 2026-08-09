@@ -6,6 +6,247 @@ enum AcpWire {
     static let protocolVersion = 1
 }
 
+/// A reusable, immutable-at-launch declaration of the model and host services
+/// an ACP chat may use. String identifiers are retained deliberately: a tool
+/// or MCP server removed after the profile was saved must remain visible as an
+/// actionable warning, never disappear and silently broaden the profile.
+struct AcpRunProfile: Codable, Equatable, Hashable, Identifiable, Sendable {
+    enum ClientTool: String, CaseIterable, Codable, Sendable {
+        case readTextFile
+        case writeTextFile
+        case terminal
+
+        var title: String {
+            switch self {
+            case .readTextFile: "Read workspace files"
+            case .writeTextFile: "Write workspace files"
+            case .terminal: "Run host terminals"
+            }
+        }
+    }
+
+    static let allMCPServersID = "*"
+    static let write = AcpRunProfile(
+        id: "write",
+        name: "Write",
+        modelID: nil,
+        enabledClientToolIDs: ClientTool.allCases.map(\.rawValue),
+        enabledMCPServerNames: [allMCPServersID]
+    )
+    static let ask = AcpRunProfile(
+        id: "ask",
+        name: "Ask",
+        modelID: nil,
+        enabledClientToolIDs: [ClientTool.readTextFile.rawValue],
+        enabledMCPServerNames: [allMCPServersID]
+    )
+    static let minimal = AcpRunProfile(
+        id: "minimal",
+        name: "Minimal",
+        modelID: nil,
+        enabledClientToolIDs: [],
+        enabledMCPServerNames: []
+    )
+    static let builtIns = [write, ask, minimal]
+
+    let id: String
+    var name: String
+    var modelID: String?
+    var enabledClientToolIDs: [String]
+    var enabledMCPServerNames: [String]
+
+    init(
+        id: String,
+        name: String,
+        modelID: String?,
+        enabledClientToolIDs: [String],
+        enabledMCPServerNames: [String]
+    ) {
+        self.id = id
+        self.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = modelID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.modelID = model?.isEmpty == false ? model : nil
+        self.enabledClientToolIDs = Self.unique(enabledClientToolIDs)
+        self.enabledMCPServerNames = Self.unique(enabledMCPServerNames)
+    }
+
+    var isBuiltIn: Bool { Self.builtIns.contains { $0.id == id } }
+
+    func allows(_ tool: ClientTool) -> Bool {
+        enabledClientToolIDs.contains(tool.rawValue)
+    }
+
+    func restricting(_ access: AcpAdapterAccess) -> AcpAdapterAccess {
+        AcpAdapterAccess(
+            workspaceRead: access.workspaceRead && allows(.readTextFile),
+            workspaceWrite: access.workspaceWrite && allows(.writeTextFile),
+            network: access.network,
+            childProcess: access.childProcess,
+            hostTerminal: access.hostTerminal && allows(.terminal)
+        )
+    }
+
+    func filterMCPServers(_ servers: [JSONValue]) -> [JSONValue] {
+        guard !enabledMCPServerNames.contains(Self.allMCPServersID) else { return servers }
+        let allowed = Set(enabledMCPServerNames)
+        return servers.filter { value in
+            guard let name = value.objectValue?["name"]?.stringValue else { return false }
+            return allowed.contains(name)
+        }
+    }
+
+    func availabilityWarnings(knownMCPServerNames: [String]) -> [String] {
+        let tools = Set(ClientTool.allCases.map(\.rawValue))
+        let knownServers = Set(knownMCPServerNames)
+        let toolWarnings = enabledClientToolIDs
+            .filter { !tools.contains($0) }
+            .map { "Tool “\($0)” is unavailable." }
+        let serverWarnings = enabledMCPServerNames
+            .filter { $0 != Self.allMCPServersID && !knownServers.contains($0) }
+            .map { "MCP server “\($0)” is unavailable." }
+        return toolWarnings + serverWarnings
+    }
+
+    private static func unique(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        return values.compactMap { raw in
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, seen.insert(value).inserted else { return nil }
+            return value
+        }
+    }
+}
+
+/// UserDefaults-backed custom run profiles. Built-ins are immutable and kept
+/// out of the payload so upgrades can safely improve their definitions.
+final class AcpRunProfileStore {
+    private let defaults: UserDefaults
+    private let key: String
+
+    init(defaults: UserDefaults = .standard, key: String = "acpRunProfiles.v1") {
+        self.defaults = defaults
+        self.key = key
+    }
+
+    func all() -> [AcpRunProfile] { AcpRunProfile.builtIns + custom() }
+
+    func profile(id: String) -> AcpRunProfile? {
+        all().first { $0.id == id }
+    }
+
+    var defaultProfileID: String {
+        get {
+            let stored = defaults.string(forKey: "\(key).default") ?? AcpRunProfile.write.id
+            return profile(id: stored) == nil ? AcpRunProfile.write.id : stored
+        }
+        set {
+            guard profile(id: newValue) != nil else { return }
+            defaults.set(newValue, forKey: "\(key).default")
+        }
+    }
+
+    var defaultProfile: AcpRunProfile {
+        profile(id: defaultProfileID) ?? .write
+    }
+
+    @discardableResult
+    func create(
+        name: String,
+        modelID: String? = nil,
+        enabledClientToolIDs: [String] = AcpRunProfile.write.enabledClientToolIDs,
+        enabledMCPServerNames: [String] = AcpRunProfile.write.enabledMCPServerNames
+    ) -> AcpRunProfile {
+        var profiles = custom()
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = Self.slug(trimmed.isEmpty ? "Profile" : trimmed)
+        let existing = Set(all().map(\.id))
+        var candidate = base
+        var suffix = 2
+        while existing.contains(candidate) {
+            candidate = "\(base)-\(suffix)"
+            suffix += 1
+        }
+        let profile = AcpRunProfile(
+            id: candidate,
+            name: trimmed.isEmpty ? "Profile" : trimmed,
+            modelID: modelID,
+            enabledClientToolIDs: enabledClientToolIDs,
+            enabledMCPServerNames: enabledMCPServerNames
+        )
+        profiles.append(profile)
+        save(profiles)
+        return profile
+    }
+
+    @discardableResult
+    func fork(_ id: String) -> AcpRunProfile? {
+        guard let source = profile(id: id) else { return nil }
+        return create(
+            name: "\(source.name) Copy",
+            modelID: source.modelID,
+            enabledClientToolIDs: source.enabledClientToolIDs,
+            enabledMCPServerNames: source.enabledMCPServerNames
+        )
+    }
+
+    @discardableResult
+    func rename(_ id: String, to name: String) -> Bool {
+        guard !AcpRunProfile.builtIns.contains(where: { $0.id == id }) else { return false }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        var profiles = custom()
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return false }
+        profiles[index].name = trimmed
+        save(profiles)
+        return true
+    }
+
+    @discardableResult
+    func update(_ profile: AcpRunProfile) -> Bool {
+        guard !profile.isBuiltIn else { return false }
+        var profiles = custom()
+        guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else { return false }
+        profiles[index] = profile
+        save(profiles)
+        return true
+    }
+
+    @discardableResult
+    func delete(_ id: String) -> Bool {
+        guard !AcpRunProfile.builtIns.contains(where: { $0.id == id }) else { return false }
+        var profiles = custom()
+        let oldCount = profiles.count
+        profiles.removeAll { $0.id == id }
+        guard profiles.count != oldCount else { return false }
+        save(profiles)
+        if defaults.string(forKey: "\(key).default") == id {
+            defaults.set(AcpRunProfile.write.id, forKey: "\(key).default")
+        }
+        return true
+    }
+
+    private func custom() -> [AcpRunProfile] {
+        guard let data = defaults.data(forKey: key),
+              let profiles = try? JSONDecoder().decode([AcpRunProfile].self, from: data) else {
+            return []
+        }
+        return profiles.filter { !$0.isBuiltIn }.prefix(32).map { $0 }
+    }
+
+    private func save(_ profiles: [AcpRunProfile]) {
+        guard let data = try? JSONEncoder().encode(Array(profiles.prefix(32))) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    private static func slug(_ value: String) -> String {
+        let scalars = value.lowercased().unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) ? Character(String(scalar)) : "-"
+        }
+        let collapsed = String(scalars).split(separator: "-").joined(separator: "-")
+        return collapsed.isEmpty ? "profile" : collapsed
+    }
+}
+
 /// A streamed conversation turn item, mirroring the ACP `session/update`
 /// variants the Electron renderer consumes (agent_message_chunk,
 /// agent_thought_chunk, tool_call, plan, …).

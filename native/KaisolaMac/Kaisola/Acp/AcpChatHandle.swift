@@ -226,6 +226,9 @@ struct AcpChatHandle: Identifiable {
     /// The model this chat runs on, when it departs from the app default —
     /// applied as an environment override at adapter spawn.
     let modelOverride: String?
+    /// Exact launch-policy snapshot. A later edit or deletion of the reusable
+    /// profile cannot rewrite what this chat advertised or its turn audit.
+    let runProfile: AcpRunProfile
     /// Restored named-account availability and recovery actions. All chats own
     /// one gate; ordinary/new/default-account chats begin ready.
     let accountAccess: ChatAccountAccess
@@ -237,6 +240,7 @@ struct AcpChatHandle: Identifiable {
         workspaceDirectory: URL,
         accountBinding: SessionAccountBinding? = nil,
         modelOverride: String? = nil,
+        runProfile: AcpRunProfile = .write,
         accountAccess: ChatAccountAccess? = nil,
         conversation: AcpConversation
     ) {
@@ -245,6 +249,7 @@ struct AcpChatHandle: Identifiable {
         self.workspaceDirectory = workspaceDirectory
         self.accountBinding = accountBinding?.normalized
         self.modelOverride = modelOverride
+        self.runProfile = runProfile
         self.accountAccess = accountAccess ?? ChatAccountAccess(
             binding: accountBinding,
             requiresResolution: false
@@ -265,6 +270,7 @@ struct AcpChatHandle: Identifiable {
             workspaceDirectory: workspaceDirectory,
             accountBinding: accountBinding,
             modelOverride: modelOverride,
+            runProfile: runProfile,
             accountAccess: accountAccess,
             conversation: conversation
         )

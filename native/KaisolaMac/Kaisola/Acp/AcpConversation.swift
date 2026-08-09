@@ -9,6 +9,10 @@ enum AcpTranscriptRow: Codable, Identifiable, Equatable, Sendable {
     /// `failed` marks an optimistic send whose prompt request errored — the row
     /// stays visible with a retry affordance instead of vanishing.
     case user(id: String, text: String, failed: Bool)
+    /// Client-owned immutable launch-policy evidence emitted immediately
+    /// before each user turn. It is durable and contains identifiers only — no
+    /// credentials, prompt text, or environment values.
+    case runProfileAudit(id: String, snapshot: AcpRunProfile)
     case message(id: String, text: String)
     case thought(id: String, text: String)
     case tool(AcpToolCall)
@@ -21,6 +25,7 @@ enum AcpTranscriptRow: Codable, Identifiable, Equatable, Sendable {
     var id: String {
         switch self {
         case let .user(id, _, _): "user-\(id)"
+        case let .runProfileAudit(id, _): "run-profile-\(id)"
         case let .message(id, _): "msg-\(id)"
         case let .thought(id, _): "thought-\(id)"
         case let .tool(call): "tool-\(call.id)"
@@ -432,6 +437,7 @@ final class AcpConversation: ObservableObject {
     private let transcriptModelID: String?
     private let providerContext: AcpProviderLaunchContext
     private let mcpServers: [JSONValue]
+    let runProfile: AcpRunProfile
     private let ruleStore: PermissionRuleStore
     private let sensitiveGlobs: [String]
     private let resumeSessionID: String?
@@ -533,6 +539,7 @@ final class AcpConversation: ObservableObject {
         transcriptModelID: String? = nil,
         providerContext: AcpProviderLaunchContext? = nil,
         mcpServers: [JSONValue] = [],
+        runProfile: AcpRunProfile = .write,
         client: AcpClient? = nil,
         clientFactory: (@MainActor () -> AcpClient)? = nil,
         ruleStore: PermissionRuleStore = PermissionRuleStore(),
@@ -567,6 +574,7 @@ final class AcpConversation: ObservableObject {
             defaultSettingsSectionID: "agents"
         )
         self.mcpServers = mcpServers
+        self.runProfile = runProfile
         let factory = clientFactory ?? { AcpClient() }
         self.clientFactory = factory
         self.client = client ?? factory()
@@ -651,7 +659,8 @@ final class AcpConversation: ObservableObject {
                 cwd: launch.cwd,
                 mcpServers: mcpServers,
                 resumeSessionID: providerSessionID ?? resumeSessionID,
-                access: launch.access
+                access: launch.access,
+                runProfile: runProfile
             )
             providerSessionID = info.sessionID
             onProviderSessionID?(info.sessionID)
@@ -859,6 +868,7 @@ final class AcpConversation: ObservableObject {
     /// rather than shown a second time.
     private func appendInjectedUserRow(_ text: String) {
         turnCounter += 1
+        rows.append(.runProfileAudit(id: "\(turnCounter)", snapshot: runProfile))
         rows.append(.user(id: "\(turnCounter)", text: text, failed: false))
         userMessageLedger.recordLocal(text: text)
     }
@@ -1038,6 +1048,7 @@ final class AcpConversation: ObservableObject {
         let rowID = "\(turnCounter)"
         let turn = turnCounter
         let displayText = Self.userText(trimmed, attachments: attachments)
+        rows.append(.runProfileAudit(id: rowID, snapshot: runProfile))
         rows.append(.user(id: rowID, text: displayText, failed: false))
         // Claude echoes any prompt carrying more than one content block (i.e.
         // every attachment send) straight back as `user_message_chunk`, and a

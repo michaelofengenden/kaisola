@@ -1155,6 +1155,10 @@ actor AcpClient {
     /// reviewed containment grant narrows advertised MCP/fs/terminal services
     /// and is enforced again when a request arrives.
     private var access = AcpAdapterAccess.unrestricted
+    /// The immutable launch profile is retained separately from adapter
+    /// containment so a refused callback can name the user-visible policy that
+    /// blocked it. Both boundaries are intersected before advertisement.
+    private var runProfile = AcpRunProfile.write
     /// Mirrors Electron's MAX_TEXT_FILE_BYTES ACP fs limit.
     static let maxTextFileBytes = 8 * 1024 * 1024
 
@@ -1194,7 +1198,8 @@ actor AcpClient {
         cwd: String,
         mcpServers: [JSONValue],
         resumeSessionID: String? = nil,
-        access: AcpAdapterAccess = .unrestricted
+        access: AcpAdapterAccess = .unrestricted,
+        runProfile: AcpRunProfile = .write
     ) async throws -> AcpSessionInfo {
         try await withTaskCancellationHandler {
             try Task.checkCancellation()
@@ -1205,7 +1210,8 @@ actor AcpClient {
                 cwd: cwd,
                 mcpServers: mcpServers,
                 resumeSessionID: resumeSessionID,
-                access: access
+                access: access,
+                runProfile: runProfile
             )
             if Task.isCancelled {
                 await stop()
@@ -1226,7 +1232,8 @@ actor AcpClient {
         cwd: String,
         mcpServers: [JSONValue],
         resumeSessionID: String?,
-        access: AcpAdapterAccess
+        access: AcpAdapterAccess,
+        runProfile: AcpRunProfile
     ) async throws -> AcpSessionInfo {
         connectionGeneration &+= 1
         let startGeneration = connectionGeneration
@@ -1240,7 +1247,8 @@ actor AcpClient {
         cancelPermissionRequests()
         toolCallReviewContextStore.removeAll(keepingCapacity: true)
         workspaceRoot = (cwd as NSString).standardizingPath
-        self.access = access
+        self.runProfile = runProfile
+        self.access = runProfile.restricting(access)
         do {
             try await transport.start(command: command, arguments: arguments, environment: environment, cwd: cwd)
             readerTask = Task { await readLoop(sourceConnectionGeneration: startGeneration) }
@@ -1249,12 +1257,12 @@ actor AcpClient {
             "protocolVersion": .integer(Int64(AcpWire.protocolVersion)),
             "clientCapabilities": .object([
                 "fs": .object([
-                    "readTextFile": .bool(access.workspaceRead),
-                    "writeTextFile": .bool(access.workspaceWrite),
+                    "readTextFile": .bool(self.access.workspaceRead),
+                    "writeTextFile": .bool(self.access.workspaceWrite),
                 ]),
-                "terminal": .bool(access.hostTerminal),
-                "auth": .object(["terminal": .bool(access.hostTerminal)]),
-                "_meta": .object(["terminal-auth": .bool(access.hostTerminal)]),
+                "terminal": .bool(self.access.hostTerminal),
+                "auth": .object(["terminal": .bool(self.access.hostTerminal)]),
+                "_meta": .object(["terminal-auth": .bool(self.access.hostTerminal)]),
             ]),
         ])))
         // ACP requires the client to disconnect when the negotiated protocol is
@@ -1267,7 +1275,7 @@ actor AcpClient {
             }
             capabilities = Self.parseCapabilities(initResult)
 
-            let sessionServers = sessionMcpServers(mcpServers)
+            let sessionServers = sessionMcpServers(runProfile.filterMCPServers(mcpServers))
             func openSession(_ method: String, priorID: String? = nil) async throws -> JSONValue {
                 if let priorID {
                     restoringSessionIdentity = ScopedSessionIdentity(
@@ -2300,7 +2308,9 @@ actor AcpClient {
             respondError(
                 id: id,
                 code: -32000,
-                message: "Blocked by custom adapter containment: host terminals are unavailable; use a reviewed in-sandbox child-process grant instead."
+                message: runProfile.allows(.terminal)
+                    ? "Blocked by custom adapter containment: host terminals are unavailable; use a reviewed in-sandbox child-process grant instead."
+                    : "Blocked by run profile “\(runProfile.name)”: host terminals are disabled."
             )
             return
         }
@@ -3019,7 +3029,9 @@ actor AcpClient {
             respondError(
                 id: id,
                 code: -32000,
-                message: "Blocked by custom adapter containment: workspace read was not approved."
+                message: runProfile.allows(.readTextFile)
+                    ? "Blocked by custom adapter containment: workspace read was not approved."
+                    : "Blocked by run profile “\(runProfile.name)”: workspace read is disabled."
             )
             return
         }
@@ -3068,7 +3080,9 @@ actor AcpClient {
             respondError(
                 id: id,
                 code: -32000,
-                message: "Blocked by custom adapter containment: workspace write was not approved."
+                message: runProfile.allows(.writeTextFile)
+                    ? "Blocked by custom adapter containment: workspace write was not approved."
+                    : "Blocked by run profile “\(runProfile.name)”: workspace write is disabled."
             )
             return
         }

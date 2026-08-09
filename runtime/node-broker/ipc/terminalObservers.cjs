@@ -55,15 +55,22 @@ class TerminalObservers {
         continue
       }
       subscriber.paused = true
-      paused++
       // One forced, small reset marker is the only permitted overflow. Future
       // deltas are discarded until an explicit resubscribe obtains a snapshot.
-      this.deliver(owner, 'terminal:observer-snapshot-required', {
+      const resetDelivered = this.deliver(owner, 'terminal:observer-snapshot-required', {
         id: this.terminalId,
         reason: 'slow_consumer',
         ...(cursor.streamEpoch ? { streamEpoch: cursor.streamEpoch } : {}),
         ...(Number.isSafeInteger(cursor.endOffset) ? { endOffset: cursor.endOffset } : {}),
-      }, { force: true, maxQueueBytes: subscriber.maxQueueBytes })
+      }, { force: true, maxQueueBytes: subscriber.maxQueueBytes }) !== false
+      if (resetDelivered) {
+        paused++
+      } else if (this.subscribers.get(owner) === subscriber) {
+        // Without the recovery marker, retaining a paused subscriber would
+        // silently discard every future delta forever. Close only this
+        // subscription; an explicit subscribe can recover from a snapshot.
+        this.subscribers.delete(owner)
+      }
     }
     return { delivered, paused }
   }

@@ -47,6 +47,89 @@ final class CustomAgentStoreTests: XCTestCase {
         XCTAssertEqual(Set(CustomAgentSymbolAccessibility.choices.map(\.name)).count, 6)
     }
 
+    func testFailedAdapterInstallFeedbackStaysOnTheExactRowUntilDismissedOrRetried() throws {
+        let attempt = CustomAdapterInstallAttempt(
+            agentID: "custom-aider",
+            agentName: "Aider",
+            package: "@example/aider-acp@1.2.3",
+            approval: CustomAdapterApproval(
+                credentials: .codex,
+                privileges: [.network, .workspaceRead]
+            )
+        )
+        var feedback = CustomAdapterInstallFeedback()
+        let otherAttempt = CustomAdapterInstallAttempt(
+            agentID: "custom-reviewer",
+            agentName: "Reviewer",
+            package: "reviewer-acp",
+            approval: CustomAdapterApproval(credentials: .none, privileges: [])
+        )
+
+        feedback.recordFailure(
+            for: attempt,
+            diagnostic: "The package registry could not be reached."
+        )
+        feedback.recordFailure(for: otherAttempt, diagnostic: "The package is unavailable.")
+
+        XCTAssertEqual(feedback.failure(for: attempt.agentID)?.attempt, attempt)
+        XCTAssertEqual(feedback.failure(for: otherAttempt.agentID)?.attempt, otherAttempt)
+        feedback.dismiss(agentID: "custom-missing")
+        XCTAssertNotNil(feedback.failure(for: attempt.agentID))
+
+        let retry = try XCTUnwrap(feedback.beginRetry(agentID: attempt.agentID))
+        XCTAssertEqual(retry, attempt)
+        XCTAssertEqual(retry.package, "@example/aider-acp@1.2.3")
+        XCTAssertEqual(retry.approval.credentials, "codex")
+        XCTAssertEqual(retry.approval.privileges, ["network", "workspaceRead"])
+        XCTAssertNil(feedback.failure(for: attempt.agentID))
+        XCTAssertNotNil(feedback.failure(for: otherAttempt.agentID))
+        feedback.dismiss(agentID: otherAttempt.agentID)
+
+        feedback.recordFailure(for: attempt, diagnostic: "Retry failed.")
+        feedback.dismiss(agentID: attempt.agentID)
+        XCTAssertNil(feedback.failure(for: attempt.agentID))
+    }
+
+    func testFailedAdapterInstallFeedbackIsConciseAccessibleAndCopyable() throws {
+        let attempt = CustomAdapterInstallAttempt(
+            agentID: "custom-aider",
+            agentName: "Aider",
+            package: "aider-acp",
+            approval: CustomAdapterApproval(credentials: .none, privileges: [])
+        )
+        var feedback = CustomAdapterInstallFeedback()
+        let detail = "  npm exited with status 17.  \nThe pinned package was not changed.\n"
+            + String(repeating: "diagnostic ", count: 80)
+        feedback.recordFailure(for: attempt, diagnostic: detail)
+
+        let failure = try XCTUnwrap(feedback.failure(for: attempt.agentID))
+        XCTAssertEqual(failure.title, "Chat adapter install failed for Aider")
+        XCTAssertEqual(failure.inlineDiagnostic, "npm exited with status 17.")
+        XCTAssertEqual(
+            failure.accessibilityIdentifier,
+            "extensions.agent.custom-aider.installFailure"
+        )
+        XCTAssertEqual(failure.retryLabel, "Retry adapter install for Aider")
+        XCTAssertEqual(failure.copyDetailsLabel, "Copy adapter install failure details for Aider")
+        XCTAssertEqual(failure.dismissLabel, "Dismiss adapter install failure for Aider")
+        XCTAssertTrue(failure.copyDetails.contains("Agent: Aider (custom-aider)"))
+        XCTAssertTrue(failure.copyDetails.contains("Package: aider-acp"))
+        XCTAssertTrue(failure.copyDetails.contains("Reviewed access: No workspace, network, or process access · No provider account"))
+        XCTAssertTrue(failure.copyDetails.contains("The pinned package was not changed."))
+        XCTAssertTrue(
+            failure.copyDetails.contains(
+                String(repeating: "diagnostic ", count: 79) + "diagnostic"
+            )
+        )
+
+        let longFirstLine = String(repeating: "x", count: 600)
+        feedback.recordFailure(for: attempt, diagnostic: longFirstLine)
+        let bounded = try XCTUnwrap(feedback.failure(for: attempt.agentID))
+        XCTAssertEqual(bounded.inlineDiagnostic.count, 240)
+        XCTAssertTrue(bounded.inlineDiagnostic.hasSuffix("…"))
+        XCTAssertTrue(bounded.copyDetails.contains(longFirstLine))
+    }
+
     // MARK: - Round-trip
 
     func testSaveAllRoundTripAcrossInstances() {

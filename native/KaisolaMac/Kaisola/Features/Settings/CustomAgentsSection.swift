@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 extension Notification.Name {
@@ -38,6 +39,87 @@ enum CustomAgentSymbolAccessibility {
     }
 }
 
+/// The exact adapter contract behind one install click. A retry reuses this
+/// value instead of reconstructing package or containment choices from mutable
+/// row state after the failure.
+struct CustomAdapterInstallAttempt: Equatable, Sendable {
+    let agentID: String
+    let agentName: String
+    let package: String
+    let approval: CustomAdapterApproval
+}
+
+/// Row-scoped failure content shared by the visible Settings card and focused
+/// tests. The short first line stays readable in a roster; Copy Details keeps
+/// the complete diagnostic for support without making the row unbounded.
+struct CustomAdapterInstallFailure: Equatable, Sendable {
+    private static let inlineCharacterLimit = 240
+
+    let attempt: CustomAdapterInstallAttempt
+    let diagnostic: String
+
+    var title: String { "Chat adapter install failed for \(attempt.agentName)" }
+
+    var inlineDiagnostic: String {
+        let firstLine = diagnostic
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+            ?? "Installation failed without additional details."
+        guard firstLine.count > Self.inlineCharacterLimit else { return firstLine }
+        return String(firstLine.prefix(Self.inlineCharacterLimit - 1)) + "…"
+    }
+
+    var copyDetails: String {
+        let detail = diagnostic.trimmingCharacters(in: .whitespacesAndNewlines)
+        return [
+            title,
+            "Agent: \(attempt.agentName) (\(attempt.agentID))",
+            "Package: \(attempt.package)",
+            "Reviewed access: \(attempt.approval.reviewSummary)",
+            "Diagnostic: \(detail.isEmpty ? inlineDiagnostic : detail)",
+        ].joined(separator: "\n")
+    }
+
+    var accessibilityIdentifier: String {
+        "extensions.agent.\(attempt.agentID).installFailure"
+    }
+    var retryLabel: String { "Retry adapter install for \(attempt.agentName)" }
+    var copyDetailsLabel: String {
+        "Copy adapter install failure details for \(attempt.agentName)"
+    }
+    var dismissLabel: String { "Dismiss adapter install failure for \(attempt.agentName)" }
+}
+
+/// Keeps failures attached to agent identity rather than row index. Entries
+/// survive ordinary view updates and are removed only by the actions named in
+/// the row: Dismiss or Retry (success also clears a newly recorded failure).
+struct CustomAdapterInstallFeedback: Equatable, Sendable {
+    private var failures: [String: CustomAdapterInstallFailure] = [:]
+
+    mutating func recordFailure(
+        for attempt: CustomAdapterInstallAttempt,
+        diagnostic: String
+    ) {
+        failures[attempt.agentID] = CustomAdapterInstallFailure(
+            attempt: attempt,
+            diagnostic: diagnostic
+        )
+    }
+
+    func failure(for agentID: String) -> CustomAdapterInstallFailure? {
+        failures[agentID]
+    }
+
+    mutating func dismiss(agentID: String) {
+        failures.removeValue(forKey: agentID)
+    }
+
+    mutating func beginRetry(agentID: String) -> CustomAdapterInstallAttempt? {
+        failures.removeValue(forKey: agentID)?.attempt
+    }
+}
+
 /// Settings ▸ Agents section for user-registered terminal agents (Electron
 /// Settings ▸ Agents parity): list existing custom agents — name, launch
 /// command, an SF-symbol picker, delete — plus an add row. Every mutation
@@ -59,6 +141,9 @@ struct CustomAgentsSection: View {
     @State private var pendingEnableIndex: Int?
     /// The agent whose pinned install is currently running.
     @State private var installingAgentID: String?
+    /// Durable-for-this-settings-session failures, keyed by stable agent id so
+    /// sorting or renaming cannot move the diagnostic to a different row.
+    @State private var installFeedback = CustomAdapterInstallFeedback()
     /// Which row's delete confirmation is open.
     @State private var pendingDeleteID: String?
     /// A load or save failure stays visible in the section instead of making
@@ -87,6 +172,11 @@ struct CustomAgentsSection: View {
                             TextField("Name", text: nameBinding(index))
                                 .font(.callout)
                                 .textFieldStyle(.plain)
+                                .disabled(
+                                    loadBlocked
+                                        || installingAgentID == spec.id
+                                        || installFeedback.failure(for: spec.id) != nil
+                                )
                             Text(spec.launchCommand)
                                 .font(.caption.monospaced()).foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1).truncationMode(.middle)
@@ -294,6 +384,7 @@ struct CustomAgentsSection: View {
         do {
             specs = try deletion.delete(agentID: plan.agentID, from: specs)
             registryError = nil
+            installFeedback.dismiss(agentID: plan.agentID)
             if pendingEnableIndex == removedIndex {
                 pendingEnableIndex = nil
             } else if let pendingEnableIndex, let removedIndex,
@@ -341,11 +432,13 @@ struct CustomAgentsSection: View {
     private func acpControls(index: Int, spec: CustomAgentSpec) -> some View {
         let hasReviewedAccess = spec.containmentApproval != nil
         let locksContract = spec.chatEnabled == true && hasReviewedAccess
+        let failure = installFeedback.failure(for: spec.id)
+        let locksFailedAttempt = failure != nil || installingAgentID == spec.id
         HStack(spacing: 8) {
             TextField("ACP adapter (npm package, optional)", text: packageBinding(index))
                 .font(.caption.monospaced())
                 .textFieldStyle(.plain)
-                .disabled(locksContract)
+                .disabled(locksContract || locksFailedAttempt)
             Picker("", selection: credentialsBinding(index)) {
                 ForEach(CustomAgentSpec.Credentials.allCases) { credentials in
                     Text(credentials.title).tag(credentials.rawValue)
@@ -354,11 +447,13 @@ struct CustomAgentsSection: View {
             .labelsHidden()
             .pickerStyle(.menu)
             .frame(width: 150)
-            .disabled(locksContract)
+            .disabled(locksContract || locksFailedAttempt)
             if locksContract {
                 Button("Disable Chat") { disableChat(index) }
                     .font(.caption)
-            } else if spec.acpPackage?.isEmpty == false, spec.acpPackageValidationError == nil {
+            } else if failure == nil,
+                      spec.acpPackage?.isEmpty == false,
+                      spec.acpPackageValidationError == nil {
                 Button(installingAgentID == spec.id
                     ? "Installing…"
                     : (spec.chatEnabled == true ? "Review Access…" : "Enable Chat…")) {
@@ -381,7 +476,7 @@ struct CustomAgentsSection: View {
                         Toggle(privilege.title, isOn: privilegeBinding(index, privilege))
                             .toggleStyle(.checkbox)
                             .font(.caption)
-                            .disabled(locksContract)
+                            .disabled(locksContract || locksFailedAttempt)
                             .help(privilege.reviewDetail)
                     }
                 }
@@ -414,6 +509,9 @@ struct CustomAgentsSection: View {
                     .font(.caption).foregroundStyle(.orange)
             }
         }
+        if let failure {
+            adapterInstallFailure(failure)
+        }
         if pendingEnableIndex == index {
             // The exact grant remains visible before installation and, through
             // the status line above, for the lifetime of the approval.
@@ -432,6 +530,39 @@ struct CustomAgentsSection: View {
             .padding(8)
             .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
         }
+    }
+
+    @ViewBuilder
+    private func adapterInstallFailure(_ failure: CustomAdapterInstallFailure) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(failure.title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.red)
+            Text(failure.inlineDiagnostic)
+                .font(.caption)
+                .foregroundStyle(.kaisolaSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: 10) {
+                Button("Retry") { retryInstall(failure) }
+                    .font(.caption)
+                    .accessibilityLabel(failure.retryLabel)
+                    .disabled(installingAgentID != nil)
+                Button("Copy Details") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(failure.copyDetails, forType: .string)
+                }
+                .font(.caption)
+                .accessibilityLabel(failure.copyDetailsLabel)
+                Button("Dismiss") {
+                    installFeedback.dismiss(agentID: failure.attempt.agentID)
+                }
+                .font(.caption)
+                .accessibilityLabel(failure.dismissLabel)
+            }
+        }
+        .padding(8)
+        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityIdentifier(failure.accessibilityIdentifier)
     }
 
     private func packageBinding(_ index: Int) -> Binding<String> {
@@ -518,30 +649,60 @@ struct CustomAgentsSection: View {
             )
             return
         }
-        let agentID = specs[index].id
+        let attempt = CustomAdapterInstallAttempt(
+            agentID: specs[index].id,
+            agentName: specs[index].name,
+            package: package,
+            approval: approval
+        )
         pendingEnableIndex = nil
+        installAdapter(attempt)
+    }
+
+    private func retryInstall(_ failure: CustomAdapterInstallFailure) {
+        guard installingAgentID == nil,
+              let index = specs.firstIndex(where: { $0.id == failure.attempt.agentID }),
+              specs[index].acpPackage == failure.attempt.package,
+              specs[index].containmentApproval == failure.attempt.approval,
+              let attempt = installFeedback.beginRetry(agentID: failure.attempt.agentID)
+        else { return }
+        installAdapter(attempt)
+    }
+
+    private func installAdapter(_ attempt: CustomAdapterInstallAttempt) {
+        let agentID = attempt.agentID
+        installFeedback.dismiss(agentID: agentID)
         installingAgentID = agentID
         Task { @MainActor in
             defer { installingAgentID = nil }
             do {
                 let record = try await installs.install(
                     agentID: agentID,
-                    package: package,
-                    approval: approval
+                    package: attempt.package,
+                    approval: attempt.approval
                 )
                 if let liveIndex = specs.firstIndex(where: { $0.id == agentID }) {
                     let previous = specs
                     specs[liveIndex].chatEnabled = true
                     guard persist(affectedAgentID: agentID, restoring: previous) else {
                         installs.uninstall(agentID: agentID)
+                        installFeedback.recordFailure(
+                            for: attempt,
+                            diagnostic: registryError
+                                ?? "The adapter installed, but enabling Chat could not be saved. The pinned install was removed."
+                        )
                         return
                     }
                 }
                 ToastCenter.shared.show(
-                    "\(package) v\(record.resolvedVersion) installed, pinned, and contained. Chat is enabled.",
+                    "\(attempt.package) v\(record.resolvedVersion) installed, pinned, and contained. Chat is enabled.",
                     style: .success
                 )
             } catch {
+                installFeedback.recordFailure(
+                    for: attempt,
+                    diagnostic: error.localizedDescription
+                )
                 ToastCenter.shared.show(error.localizedDescription, style: .error, duration: 6)
             }
         }

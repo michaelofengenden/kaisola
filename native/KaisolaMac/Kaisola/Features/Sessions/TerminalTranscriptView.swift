@@ -20,6 +20,8 @@ struct TerminalTranscriptView: View {
     @State private var renderedGeneration = 0
     @State private var searchWorker = TerminalTranscriptSearchWorker()
     @State private var preparedSearch: TerminalTranscriptSearchWorker.Prepared?
+    @State private var searchPreparationState = TerminalTranscriptSearchPreparationState()
+    @State private var searchRetryGeneration = 0
     @State private var initialLoadState = TerminalTranscriptInitialLoadState()
     @State private var isSupplementalLoading = false
     @State private var didPositionAtBottom = false
@@ -36,6 +38,10 @@ struct TerminalTranscriptView: View {
         // every iteration.
         let transcriptFont = self.transcriptFont
         let searchRequest = self.searchRequest
+        let searchTaskID = TerminalTranscriptSearchTaskID(
+            request: searchRequest,
+            retryGeneration: searchRetryGeneration
+        )
         VStack(spacing: 0) {
             header
             Divider()
@@ -61,7 +67,7 @@ struct TerminalTranscriptView: View {
                 .task { await loadInitial(using: proxy) }
             }
         }
-        .task(id: searchRequest) {
+        .task(id: searchTaskID) {
             await prepareSearch(for: searchRequest)
         }
         .frame(minWidth: 620, idealWidth: 820, minHeight: 440, idealHeight: 660)
@@ -149,9 +155,7 @@ struct TerminalTranscriptView: View {
             }
             if !pages.isEmpty {
                 if searchRequest.hasQuery {
-                    Text(searchStatus(for: searchRequest))
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                    searchPreparationStatus(for: searchRequest)
                 }
                 Text(ByteCountFormatter.string(
                     fromByteCount: Int64(pages.reduce(0) { $0 + $1.output.utf8.count }),
@@ -234,11 +238,32 @@ struct TerminalTranscriptView: View {
         return Text(renderedPages[page.id] ?? "")
     }
 
-    private func searchStatus(for request: TerminalTranscriptSearchWorker.Request) -> String {
-        guard preparedSearch?.request == request, let count = preparedSearch?.matchCount else {
-            return "Searching…"
+    @ViewBuilder
+    private func searchPreparationStatus(
+        for request: TerminalTranscriptSearchWorker.Request
+    ) -> some View {
+        let presentation = searchPreparationState.presentation(for: request)
+        if let visibleText = presentation.visibleText,
+           let accessibilityLabel = presentation.accessibilityLabel {
+            Text(visibleText)
+                .monospacedDigit()
+                .foregroundStyle(
+                    presentation.canRetry
+                        ? KaisolaStatusTone.needsYou.foregroundColor
+                        : Color.secondary
+                )
+                .help(accessibilityLabel)
+                .accessibilityLabel(accessibilityLabel)
+            if presentation.canRetry {
+                Button("Retry") {
+                    searchRetryGeneration &+= 1
+                }
+                .controlSize(.small)
+                .accessibilityIdentifier("terminal-transcript-search-retry")
+                .accessibilityLabel("Retry terminal transcript search")
+                .accessibilityHint("Searches the loaded transcript again without changing its selectable text")
+            }
         }
-        return "\(count) matches"
     }
 
     @ViewBuilder
@@ -451,27 +476,51 @@ struct TerminalTranscriptView: View {
 
     @MainActor
     private func prepareSearch(for request: TerminalTranscriptSearchWorker.Request) async {
+        let attempt = searchPreparationState.begin(request: request)
+        preparedSearch = nil
+        guard request.hasQuery else {
+            _ = searchPreparationState.finishSuccess(matchCount: 0, attempt: attempt)
+            return
+        }
         do {
-            if request.hasQuery {
-                // Avoid queueing a full retained-history scan for every
-                // intermediate keystroke. SwiftUI cancels this task whenever
-                // the query, appearance, or rendered page generation changes.
-                try await Task.sleep(for: .milliseconds(120))
-            }
+            // Avoid queueing a full retained-history scan for every
+            // intermediate keystroke. SwiftUI cancels this task whenever
+            // the query, appearance, or rendered page generation changes.
+            try await Task.sleep(for: .milliseconds(120))
             let snapshot = pages.compactMap { page -> TerminalTranscriptSearchWorker.Page? in
                 guard let text = renderedPages[page.id] else { return nil }
                 return TerminalTranscriptSearchWorker.Page(id: page.id, text: text)
             }
             let prepared = try await searchWorker.prepare(snapshot, request: request)
             try Task.checkCancellation()
-            guard request == searchRequest else { return }
+            guard request == searchRequest else {
+                searchPreparationState.cancel(attempt: attempt)
+                return
+            }
             preparedSearch = prepared
+            postSearchPreparationAnnouncement(searchPreparationState.finishSuccess(
+                matchCount: prepared.matchCount,
+                attempt: attempt
+            ))
         } catch is CancellationError {
-            // A new query/generation supersedes this preparation normally.
+            searchPreparationState.cancel(attempt: attempt)
         } catch {
-            // Search is an enhancement over the selectable plain transcript.
-            // Keep that transcript available if preparation ever fails.
+            guard !Task.isCancelled else {
+                searchPreparationState.cancel(attempt: attempt)
+                return
+            }
+            postSearchPreparationAnnouncement(searchPreparationState.finishFailure(
+                searchErrorDescription(error),
+                attempt: attempt
+            ))
         }
+    }
+
+    private func searchErrorDescription(_ error: any Error) -> String {
+        let description = (error as? any LocalizedError)?.errorDescription?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let description, !description.isEmpty { return description }
+        return "Search preparation failed."
     }
 
     private func transcriptErrorDescription(_ error: any Error) -> String {
@@ -497,6 +546,30 @@ struct TerminalTranscriptView: View {
             ]
         )
     }
+
+    @MainActor
+    private func postSearchPreparationAnnouncement(
+        _ announcement: TerminalTranscriptSearchPreparationState.Announcement?
+    ) {
+        guard let announcement else { return }
+        let priority: NSAccessibilityPriorityLevel = switch announcement.priority {
+        case .medium: .medium
+        case .high: .high
+        }
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: announcement.message,
+                .priority: priority.rawValue,
+            ]
+        )
+    }
+}
+
+private struct TerminalTranscriptSearchTaskID: Hashable {
+    let request: TerminalTranscriptSearchWorker.Request
+    let retryGeneration: Int
 }
 
 /// Keeps the retry path deterministic across SwiftUI task restarts. The view
@@ -653,6 +726,144 @@ enum TerminalTranscriptTypography {
     }
 }
 
+/// View-owned state for one transcript-search request. Search preparation is
+/// intentionally independent from transcript loading: a failed enhancement
+/// must leave every rendered page visible and selectable, while late results
+/// from an older query or sanitizer generation must not overwrite current UI.
+struct TerminalTranscriptSearchPreparationState: Equatable {
+    struct Attempt: Equatable {
+        fileprivate let request: TerminalTranscriptSearchWorker.Request
+        fileprivate let sequence: Int
+    }
+
+    struct Announcement: Equatable {
+        enum Priority: Equatable {
+            case medium
+            case high
+        }
+
+        let message: String
+        let priority: Priority
+    }
+
+    enum Presentation: Equatable {
+        case hidden
+        case searching
+        case matches(Int)
+        case unavailable(message: String)
+
+        var visibleText: String? {
+            switch self {
+            case .hidden: nil
+            case .searching: "Searching…"
+            case let .matches(count): count == 1 ? "1 match" : "\(count) matches"
+            case .unavailable: "Search unavailable"
+            }
+        }
+
+        var accessibilityLabel: String? {
+            switch self {
+            case .hidden:
+                nil
+            case .searching:
+                "Searching loaded terminal transcript."
+            case .matches(0):
+                "No matches in loaded terminal transcript."
+            case .matches(1):
+                "1 match in loaded terminal transcript."
+            case let .matches(count):
+                "\(count) matches in loaded terminal transcript."
+            case let .unavailable(message):
+                "Search unavailable. \(message)"
+            }
+        }
+
+        var canRetry: Bool {
+            if case .unavailable = self { return true }
+            return false
+        }
+    }
+
+    private enum Phase: Equatable {
+        case idle
+        case preparing(Attempt, previousFailure: String?)
+        case prepared(TerminalTranscriptSearchWorker.Request, matchCount: Int)
+        case failed(TerminalTranscriptSearchWorker.Request, message: String)
+    }
+
+    private var phase: Phase = .idle
+    private var nextSequence = 0
+
+    func presentation(
+        for request: TerminalTranscriptSearchWorker.Request
+    ) -> Presentation {
+        guard request.hasQuery else { return .hidden }
+        switch phase {
+        case let .preparing(attempt, _) where attempt.request == request:
+            return .searching
+        case let .prepared(preparedRequest, matchCount) where preparedRequest == request:
+            return .matches(matchCount)
+        case let .failed(failedRequest, message) where failedRequest == request:
+            return .unavailable(message: message)
+        default:
+            // A query, appearance, or rendered-generation change invalidates
+            // both an old result and an old failure immediately.
+            return .searching
+        }
+    }
+
+    mutating func begin(request: TerminalTranscriptSearchWorker.Request) -> Attempt {
+        let previousFailure: String?
+        if case let .failed(failedRequest, message) = phase,
+           failedRequest == request {
+            previousFailure = message
+        } else {
+            previousFailure = nil
+        }
+        nextSequence &+= 1
+        let attempt = Attempt(request: request, sequence: nextSequence)
+        phase = .preparing(attempt, previousFailure: previousFailure)
+        return attempt
+    }
+
+    mutating func finishSuccess(matchCount: Int, attempt: Attempt) -> Announcement? {
+        guard case let .preparing(activeAttempt, previousFailure) = phase,
+              activeAttempt == attempt else { return nil }
+        let count = max(0, matchCount)
+        phase = .prepared(attempt.request, matchCount: count)
+        guard previousFailure != nil else { return nil }
+        let matches = count == 1 ? "1 match" : "\(count) matches"
+        return Announcement(
+            message: "Terminal transcript search available. \(matches).",
+            priority: .medium
+        )
+    }
+
+    mutating func finishFailure(_ message: String, attempt: Attempt) -> Announcement? {
+        guard case let .preparing(activeAttempt, previousFailure) = phase,
+              activeAttempt == attempt else { return nil }
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        let failure = trimmed.isEmpty ? "Search preparation failed." : trimmed
+        phase = .failed(attempt.request, message: failure)
+        return Announcement(
+            message: previousFailure == nil
+                ? "Terminal transcript search unavailable. \(failure)"
+                : "Terminal transcript search still unavailable. \(failure)",
+            priority: .high
+        )
+    }
+
+    mutating func cancel(attempt: Attempt) {
+        guard case let .preparing(activeAttempt, previousFailure) = phase,
+              activeAttempt == attempt else { return }
+        if let previousFailure {
+            phase = .failed(attempt.request, message: previousFailure)
+        } else {
+            phase = .idle
+        }
+    }
+}
+
 enum TerminalTranscriptSearch {
     private struct HighlightStyle: Sendable {
         let red: Double
@@ -746,6 +957,8 @@ enum TerminalTranscriptSearch {
 /// off the main actor; the request generation prevents a cached result from a
 /// prior sanitizer pass from being reused after older pages are prepended.
 actor TerminalTranscriptSearchWorker {
+    typealias PreparationGate = @Sendable (_ request: Request, _ attempt: Int) throws -> Void
+
     struct Page: Sendable {
         let id: Int64
         let text: String
@@ -771,11 +984,21 @@ actor TerminalTranscriptSearchWorker {
         let matchCount: Int
     }
 
+    private let preparationGate: PreparationGate
     private var cached: Prepared?
+    private var preparationAttemptCount = 0
     private(set) var preparationCount = 0
 
+    init(preparationGate: @escaping PreparationGate = { _, _ in }) {
+        self.preparationGate = preparationGate
+    }
+
     func prepare(_ sourcePages: [Page], request: Request) async throws -> Prepared {
+        try Task.checkCancellation()
         if let cached, cached.request == request { return cached }
+        preparationAttemptCount += 1
+        try preparationGate(request, preparationAttemptCount)
+        try Task.checkCancellation()
 
         var pages: [Int64: AttributedString] = [:]
         pages.reserveCapacity(sourcePages.count)

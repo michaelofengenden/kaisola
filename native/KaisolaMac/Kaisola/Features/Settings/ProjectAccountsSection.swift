@@ -136,7 +136,7 @@ struct ProjectAccountsSection: View {
             if usageProfiles.isEmpty {
                 Text("Add each subscription once. Every account keeps its own credentials, and Usage shows their limits side by side.")
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)
@@ -172,7 +172,7 @@ struct ProjectAccountsSection: View {
                     .lineLimit(1)
                 Text(profile.directory)
                     .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
@@ -238,7 +238,7 @@ struct ProjectAccountsSection: View {
             } else {
                 Text("Kaisola stores only the label and this directory. Credentials stay with the provider.")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
         }
         .padding(.horizontal, 16)
@@ -267,7 +267,7 @@ struct ProjectAccountsSection: View {
             } else {
                 Text("Open a project to give it its own account. Until then, sessions use the app default.")
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .fixedSize(horizontal: false, vertical: true)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)

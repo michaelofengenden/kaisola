@@ -138,7 +138,75 @@ final class NativeUpdateConfigurationTests: XCTestCase {
                 canCheck: true,
                 sparkleIsPresenting: true
             ),
-            .check(enabled: false)
+            .check(.updateWindowOpen)
+        )
+    }
+
+    func testSettingsPresentationExplainsEveryCheckAvailability() throws {
+        let unavailable = SettingsView.SoftwareUpdateActionPresentation.resolve(
+            canInstall: false,
+            isInstalling: false,
+            isChecking: false,
+            canCheck: false,
+            sparkleIsPresenting: false
+        )
+        let updateWindowOpen = SettingsView.SoftwareUpdateActionPresentation.resolve(
+            canInstall: false,
+            isInstalling: false,
+            isChecking: false,
+            canCheck: true,
+            sparkleIsPresenting: true
+        )
+        let ready = SettingsView.SoftwareUpdateActionPresentation.resolve(
+            canInstall: false,
+            isInstalling: false,
+            isChecking: false,
+            canCheck: true,
+            sparkleIsPresenting: false
+        )
+
+        XCTAssertEqual(unavailable, .check(.unavailable))
+        XCTAssertEqual(updateWindowOpen, .check(.updateWindowOpen))
+        XCTAssertEqual(ready, .check(.ready))
+
+        let unavailableState = try XCTUnwrap(unavailable.checkAvailability)
+        let updateWindowOpenState = try XCTUnwrap(updateWindowOpen.checkAvailability)
+        let readyState = try XCTUnwrap(ready.checkAvailability)
+
+        XCTAssertFalse(unavailableState.isEnabled)
+        XCTAssertEqual(unavailableState.visibleTitle, "Unavailable")
+        XCTAssertEqual(
+            unavailableState.accessibilityLabel,
+            "Check for updates unavailable"
+        )
+        XCTAssertEqual(
+            unavailableState.accessibilityHint,
+            "This build does not include an update checker."
+        )
+
+        XCTAssertFalse(updateWindowOpenState.isEnabled)
+        XCTAssertEqual(
+            updateWindowOpenState.visibleTitle,
+            "Update Window Open"
+        )
+        XCTAssertEqual(
+            updateWindowOpenState.accessibilityLabel,
+            "Update window already open"
+        )
+        XCTAssertEqual(
+            updateWindowOpenState.accessibilityHint,
+            "Finish or close the existing update window before checking again."
+        )
+
+        XCTAssertTrue(readyState.isEnabled)
+        XCTAssertEqual(readyState.visibleTitle, "Check Now")
+        XCTAssertEqual(
+            readyState.accessibilityLabel,
+            "Check for updates now"
+        )
+        XCTAssertEqual(
+            readyState.accessibilityHint,
+            "Opens Kaisola's update checker."
         )
     }
 

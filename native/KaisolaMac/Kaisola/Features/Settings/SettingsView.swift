@@ -36,9 +36,14 @@ struct SettingsView: View {
         case restart
         case installing
         case checking
-        case check(enabled: Bool)
+        case check(SoftwareUpdateCheckAvailability)
 
         static let installingAccessibilityLabel = "Installing update and restarting Kaisola"
+
+        var checkAvailability: SoftwareUpdateCheckAvailability? {
+            guard case .check(let availability) = self else { return nil }
+            return availability
+        }
 
         static func resolve(
             canInstall: Bool,
@@ -52,7 +57,42 @@ struct SettingsView: View {
             if isInstalling { return .installing }
             if canInstall { return .restart }
             if isChecking { return .checking }
-            return .check(enabled: canCheck && !sparkleIsPresenting)
+            if sparkleIsPresenting { return .check(.updateWindowOpen) }
+            if !canCheck { return .check(.unavailable) }
+            return .check(.ready)
+        }
+    }
+
+    enum SoftwareUpdateCheckAvailability: Equatable {
+        case ready
+        case unavailable
+        case updateWindowOpen
+
+        var isEnabled: Bool { self == .ready }
+
+        var visibleTitle: String {
+            switch self {
+            case .ready: "Check Now"
+            case .unavailable: "Unavailable"
+            case .updateWindowOpen: "Update Window Open"
+            }
+        }
+
+        var accessibilityLabel: String {
+            switch self {
+            case .ready: "Check for updates now"
+            case .unavailable: "Check for updates unavailable"
+            case .updateWindowOpen: "Update window already open"
+            }
+        }
+
+        var accessibilityHint: String {
+            switch self {
+            case .ready: "Opens Kaisola's update checker."
+            case .unavailable: "This build does not include an update checker."
+            case .updateWindowOpen:
+                "Finish or close the existing update window before checking again."
+            }
         }
     }
 
@@ -560,13 +600,19 @@ struct SettingsView: View {
                             ProgressView()
                                 .controlSize(.small)
                                 .accessibilityLabel("Checking for updates")
-                        case .check(let enabled):
+                        case .check(let availability):
                             // Steps aside while Sparkle's own window is up so
                             // the two UIs never fight over one check.
-                            Button("Check Now") { checkForUpdates?() }
+                            Button(availability.visibleTitle) {
+                                guard availability.isEnabled else { return }
+                                checkForUpdates?()
+                            }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
-                                .disabled(!enabled)
+                                .disabled(!availability.isEnabled)
+                                .accessibilityLabel(availability.accessibilityLabel)
+                                .accessibilityHint(availability.accessibilityHint)
+                                .help(availability.accessibilityHint)
                         }
                     }
                     SettingsDivider()

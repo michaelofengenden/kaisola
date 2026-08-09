@@ -18,6 +18,84 @@ final class AccountSignInControllerTests: XCTestCase {
         return value.intValue & 0o777
     }
 
+    func testFailedSignInOffersRetryWhileDoneIsReservedForSuccess() {
+        XCTAssertEqual(
+            AccountSignInFooterPolicy.actions(for: .failed("The provider rejected the code.")),
+            [.cancel, .retry]
+        )
+        XCTAssertEqual(
+            AccountSignInFooterPolicy.actions(for: .succeeded),
+            [.done]
+        )
+        XCTAssertEqual(
+            AccountSignInFooterPolicy.actions(for: .launching),
+            [.cancel]
+        )
+    }
+
+    func testRetryFormResetClearsCodeDetailsAndFocusIntent() {
+        var form = AccountSignInFormState(
+            code: "secret-code",
+            showsTranscript: true
+        )
+
+        let codeFocused = form.prepareForRetry()
+
+        XCTAssertEqual(form, AccountSignInFormState())
+        XCTAssertFalse(codeFocused)
+    }
+
+    @MainActor
+    func testRetryStartsOneFreshAttemptAndDropsThePreviousTranscript() async throws {
+        let resolver = AccountSignInRetryResolver()
+        let controller = AccountSignInController(executableResolver: { tool in
+            await resolver.resolve(tool)
+        })
+        let profile = UsageAccountProfile(
+            id: "claude-work",
+            provider: .claude,
+            label: "Work",
+            directory: "/tmp/kaisola-account-signin-retry"
+        )
+
+        controller.start(profile: profile)
+        try await waitUntil { controller.phase.isFinished }
+        guard case .failed = controller.phase else {
+            return XCTFail("expected the first lookup to fail, got \(controller.phase)")
+        }
+        XCTAssertTrue(controller.transcript.contains("couldn’t find"))
+
+        controller.retry(profile: profile)
+        XCTAssertEqual(controller.phase, .launching)
+        XCTAssertEqual(controller.transcript, "Looking for the claude command…\n")
+
+        // A second appearance/start signal while Retry is already resolving
+        // must not launch a concurrent provider process.
+        controller.start(profile: profile)
+        try await waitUntil { await resolver.callCount == 2 }
+        let callCount = await resolver.callCount
+        XCTAssertEqual(callCount, 2)
+
+        await resolver.finishRetry(with: .missing)
+        try await waitUntil { controller.phase.isFinished }
+        let maximumConcurrentCalls = await resolver.maximumConcurrentCalls
+        XCTAssertEqual(maximumConcurrentCalls, 1)
+        controller.cancel()
+    }
+
+    @MainActor
+    private func waitUntil(
+        timeout: Duration = .seconds(2),
+        _ predicate: @escaping @MainActor () async -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if await predicate() { return }
+            await Task.yield()
+        }
+        XCTFail("Timed out waiting for account sign-in state")
+    }
+
     func testExistingAccountDirectoryIsTightenedToOwnerOnly() throws {
         let directory = accountDirectory()
         defer { try? FileManager.default.removeItem(at: directory) }
@@ -465,6 +543,33 @@ final class AccountSignInControllerTests: XCTestCase {
 /// orders the write before the read.
 private final class LookupBox: @unchecked Sendable {
     var value: AccountSignInController.ExecutableLookup?
+}
+
+private actor AccountSignInRetryResolver {
+    private var calls = 0
+    private var activeCalls = 0
+    private var maximumActiveCalls = 0
+    private var retryContinuation: CheckedContinuation<AccountSignInController.ExecutableLookup, Never>?
+
+    var callCount: Int { calls }
+    var maximumConcurrentCalls: Int { maximumActiveCalls }
+
+    func resolve(_ tool: String) async -> AccountSignInController.ExecutableLookup {
+        calls += 1
+        activeCalls += 1
+        maximumActiveCalls = max(maximumActiveCalls, activeCalls)
+        defer { activeCalls -= 1 }
+
+        if calls == 1 { return .missing }
+        return await withCheckedContinuation { continuation in
+            retryContinuation = continuation
+        }
+    }
+
+    func finishRetry(with result: AccountSignInController.ExecutableLookup) {
+        retryContinuation?.resume(returning: result)
+        retryContinuation = nil
+    }
 }
 
 /// A reset time is said the way its horizon is useful: a countdown when you

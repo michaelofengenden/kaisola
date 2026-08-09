@@ -94,6 +94,8 @@ struct AccountSignInUTF8Decoder {
 /// one.
 @MainActor
 final class AccountSignInController: ObservableObject {
+    typealias ExecutableResolver = @Sendable (String) async -> ExecutableLookup
+
     enum AccountDirectoryError: Error, Equatable, LocalizedError {
         case symbolicLink(String)
         case notDirectory(String)
@@ -202,10 +204,23 @@ final class AccountSignInController: ObservableObject {
     private var process: Process?
     private var input: FileHandle?
     private var outputPhaseTracker = OutputPhaseTracker()
+    private let executableResolver: ExecutableResolver
     /// The off-main lookup, held so an abandoned sheet can call it off.
     private var discovery: Task<Void, Never>?
+    /// Every async callback is tied to the attempt that created it. Retrying or
+    /// cancelling advances this generation before touching the old handles, so
+    /// a late shell lookup, pipe read, or process exit cannot mutate the new UI.
+    private var attemptGeneration: UInt64 = 0
+    private var attemptActive = false
+    private var hasStarted = false
     /// Ours, so the blocking read loop never occupies a cooperative thread.
     private let readQueue = DispatchQueue(label: "com.kaisola.account-signin.read")
+
+    init(executableResolver: ExecutableResolver? = nil) {
+        self.executableResolver = executableResolver ?? { tool in
+            await AccountSignInController.resolveExecutable(tool)
+        }
+    }
 
     /// How long a login shell gets to say where the CLI is. Long enough for the
     /// heavy `.zshrc` people actually have — nvm and mise both re-exec things —
@@ -517,32 +532,60 @@ final class AccountSignInController: ObservableObject {
     }
 
     func start(profile: UsageAccountProfile) {
+        // SwiftUI may deliver appearance more than once for the same sheet.
+        // Only the explicit Retry action is allowed to create a replacement.
+        guard !hasStarted, !attemptActive else { return }
+        hasStarted = true
+        beginAttempt(profile: profile)
+    }
+
+    func retry(profile: UsageAccountProfile) {
+        guard case .failed = phase else { return }
+        stopCurrentAttempt()
+        beginAttempt(profile: profile)
+    }
+
+    private func beginAttempt(profile: UsageAccountProfile) {
+        attemptGeneration &+= 1
+        let generation = attemptGeneration
+        attemptActive = true
         let tool = Self.toolName(for: profile.provider)
         phase = .launching
         outputPhaseTracker.reset(for: profile.provider)
-        transcript += "Looking for the \(tool) command…\n"
+        transcript = "Looking for the \(tool) command…\n"
         discovery?.cancel()
+        let executableResolver = self.executableResolver
         discovery = Task { [weak self] in
-            let lookup = await Self.resolveExecutable(tool)
-            guard let self else { return }
+            let lookup = await executableResolver(tool)
+            guard let self,
+                  self.attemptGeneration == generation,
+                  self.attemptActive else { return }
+            self.discovery = nil
             switch lookup {
             case let .found(executable):
                 self.transcript += "Found \(executable).\n"
-                self.launch(profile: profile, executable: executable)
+                self.launch(profile: profile, executable: executable, generation: generation)
             case .cancelled:
                 // The sheet is going away; there is nobody left to tell.
+                self.attemptActive = false
                 break
             case .missing, .timedOut, .couldNotStart:
                 let message = Self.lookupFailureMessage(tool: tool, lookup: lookup) ?? ""
                 // The transcript is where someone looks when the sentence above
                 // it was not enough, so the diagnosis lands there too.
                 self.transcript += message + "\n"
+                self.attemptActive = false
                 self.phase = .failed(message)
             }
         }
     }
 
-    private func launch(profile: UsageAccountProfile, executable: String) {
+    private func launch(
+        profile: UsageAccountProfile,
+        executable: String,
+        generation: UInt64
+    ) {
+        guard attemptGeneration == generation, attemptActive else { return }
         // The account's directory has to exist before the CLI is pointed at it.
         //
         // `claude` creates its config directory; `codex` does not — it reads
@@ -558,6 +601,7 @@ final class AccountSignInController: ObservableObject {
                 at: URL(fileURLWithPath: profile.expandedDirectory, isDirectory: true)
             )
         } catch {
+            attemptActive = false
             phase = .failed(
                 "Kaisola couldn’t create \(profile.directory): \(error.localizedDescription)"
             )
@@ -587,6 +631,10 @@ final class AccountSignInController: ObservableObject {
         do {
             try process.run()
         } catch {
+            self.process = nil
+            try? self.input?.close()
+            self.input = nil
+            attemptActive = false
             phase = .failed("Kaisola couldn't start the sign-in: \(error.localizedDescription)")
             return
         }
@@ -609,21 +657,28 @@ final class AccountSignInController: ObservableObject {
             while let chunk = try? handle.read(upToCount: 8_192), !chunk.isEmpty {
                 let text = decoder.decode(chunk)
                 guard !text.isEmpty else { continue }
-                Task { @MainActor [weak self] in self?.absorb(text) }
+                Task { @MainActor [weak self] in
+                    self?.absorb(text, generation: generation)
+                }
             }
             let trailingText = decoder.finish()
             if !trailingText.isEmpty {
-                Task { @MainActor [weak self] in self?.absorb(trailingText) }
+                Task { @MainActor [weak self] in
+                    self?.absorb(trailingText, generation: generation)
+                }
             }
             // EOF means the child closed its output; waiting now yields the
             // real status rather than racing it.
             process.waitUntilExit()
             let status = process.terminationStatus
-            Task { @MainActor [weak self] in self?.finish(status: status) }
+            Task { @MainActor [weak self] in
+                self?.finish(status: status, generation: generation)
+            }
         }
     }
 
-    private func absorb(_ text: String) {
+    private func absorb(_ text: String, generation: UInt64) {
+        guard attemptGeneration == generation else { return }
         transcript += text
         guard !phase.isFinished else { return }
         phase = outputPhaseTracker.phaseAfterOutput(
@@ -647,13 +702,15 @@ final class AccountSignInController: ObservableObject {
         NSWorkspace.shared.open(url)
     }
 
-    private func finish(status: Int32) {
+    private func finish(status: Int32, generation: UInt64) {
+        guard attemptGeneration == generation, attemptActive else { return }
         // The pipes are left attached on purpose. Detaching them here is what
         // released a live dispatch source out from under itself; the process is
         // already reaped, and letting it deallocate normally is safe.
         process = nil
         try? input?.close()
         input = nil
+        attemptActive = false
         guard !phase.isFinished else { return }
         if status == 0 {
             phase = .succeeded
@@ -679,6 +736,14 @@ final class AccountSignInController: ObservableObject {
     /// Stop a sign-in the user abandoned; a login left running would hold the
     /// account's directory open and keep a zsh alive for the session.
     func cancel() {
+        stopCurrentAttempt()
+    }
+
+    private func stopCurrentAttempt() {
+        // Deny late callbacks before cancelling or terminating anything. A
+        // replacement attempt can be started immediately after this returns.
+        attemptGeneration &+= 1
+        attemptActive = false
         // Discovery may still be the only thing running: a sheet dismissed
         // while a shell is thinking should take that shell with it.
         discovery?.cancel()

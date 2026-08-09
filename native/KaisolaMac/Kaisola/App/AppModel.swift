@@ -523,7 +523,6 @@ final class AppModel: ObservableObject {
     /// they finish (or until window teardown awaits them) so application
     /// termination cannot strand child adapters.
     private let chatShutdownTasks = ShutdownTaskRegistry()
-    private var meshShutdownTasks: [String: Task<Void, Never>] = [:]
     /// A durable Mesh may be restored by only one window model at a time.
     /// Main-actor isolation makes this a process-wide claim without locks.
     private static var claimedRestoredMeshIDs: Set<String> = []
@@ -2920,7 +2919,19 @@ final class AppModel: ObservableObject {
                         project: ProjectAccountStore().override(forProject: descriptor.projectID)
                     )
                 ) { _, custom in custom }
-                await mesh.restore(states: states, agents: AgentRegistry.all, environment: environment)
+                let restoreCompletion = await meshLifecycleCoordinator.restore(
+                    mesh,
+                    states: states,
+                    agents: AgentRegistry.all,
+                    environment: environment
+                )
+                guard restoreCompletion == .completed else {
+                    meshes.removeAll { $0.id == mesh.id }
+                    Self.claimedRestoredMeshIDs.remove(mesh.id)
+                    surfaceObservers.removeValue(forKey: mesh.id)?.cancel()
+                    meshLifecycleCoordinator.forget(meshID: mesh.id)
+                    continue
+                }
                 if mesh.lifecycle == .pendingDeletion,
                    mesh.restorationDescriptor.columns.isEmpty {
                     do {
@@ -2931,6 +2942,7 @@ final class AppModel: ObservableObject {
                         meshes.removeAll { $0.id == mesh.id }
                         Self.claimedRestoredMeshIDs.remove(mesh.id)
                         surfaceObservers.removeValue(forKey: mesh.id)?.cancel()
+                        meshLifecycleCoordinator.forget(meshID: mesh.id)
                         await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
                     } catch {
                         // Keep the empty pending-deletion recovery surface. A
@@ -3898,6 +3910,9 @@ final class AppModel: ObservableObject {
     /// Live Mesh sessions (app-scoped, like chats).
     @Published private(set) var meshes: [MeshSession] = []
     @Published var selectedMeshID: String?
+    /// AppModel owns presentation membership; this object owns lifecycle tasks,
+    /// cancellation, and transition state.
+    private let meshLifecycleCoordinator = MeshLifecycleCoordinator()
 
     /// Start a Mesh in a directory with every ACP-capable agent. `staged`
     /// runs the scout→execute pipeline; `idea` runs the read-only brainstorm.
@@ -3931,7 +3946,7 @@ final class AppModel: ObservableObject {
                 )
             )
         ) { _, custom in custom }
-        Task { await mesh.start(agents: agents, environment: environment) }
+        meshLifecycleCoordinator.start(mesh, agents: agents, environment: environment)
     }
 
     /// Close a Mesh without deleting any durable state. Running adapters stop,
@@ -3950,7 +3965,9 @@ final class AppModel: ObservableObject {
             .first(where: { $0.id == meshID })?.sizeWeight ?? 1
 
         mesh.onFileActivity = nil
-        await mesh.suspend()
+        guard await meshLifecycleCoordinator.suspend(mesh) == .completed else {
+            return .unavailable
+        }
         storeRecentlyClosedPane(NativeRestorablePaneState(
             id: mesh.id,
             surface: NativeRestorableSurfaceState(mesh: mesh.restorationDescriptor),
@@ -3964,6 +3981,7 @@ final class AppModel: ObservableObject {
         surfaceObservers.removeValue(forKey: meshID)?.cancel()
         if selectedMeshID == meshID { selectedMeshID = nil }
         unifiedSessionCards.remove(meshID, from: projectID)
+        meshLifecycleCoordinator.forget(meshID: meshID)
         await persistWorkspaceStateImmediately(projectID: projectID)
         ToastCenter.shared.show("Moved Mesh to Recently Closed", style: .success)
         return .completed
@@ -3975,7 +3993,11 @@ final class AppModel: ObservableObject {
     func requestDeleteMesh(_ meshID: String, allowRecoverableWork: Bool) async -> MeshDeleteResult {
         guard let mesh = meshes.first(where: { $0.id == meshID }) else { return .unavailable }
         let columnIDs = mesh.durableColumnIDs
-        let result = await mesh.destroy(allowRecoverableWork: allowRecoverableWork)
+        let outcome = await meshLifecycleCoordinator.destroy(
+            mesh,
+            allowRecoverableWork: allowRecoverableWork
+        )
+        guard case let .completed(result) = outcome else { return .unavailable }
         switch result {
         case .safe:
             let projectID = mesh.projectID
@@ -3989,6 +4011,7 @@ final class AppModel: ObservableObject {
             surfaceObservers.removeValue(forKey: meshID)?.cancel()
             if selectedMeshID == meshID { selectedMeshID = nil }
             unifiedSessionCards.remove(meshID, from: projectID)
+            meshLifecycleCoordinator.forget(meshID: meshID)
             let transcriptRemoval = await removeTranscripts(chatIDs: columnIDs)
             if case let .failed(error) = transcriptRemoval {
                 return .blocked(
@@ -4173,7 +4196,12 @@ final class AppModel: ObservableObject {
             return .blocked("The Mesh project folder is unavailable. Its worktrees were preserved.")
         }
         let columnIDs = mesh.durableColumnIDs
-        switch await mesh.destroy(allowRecoverableWork: allowRecoverableWork) {
+        let outcome = await meshLifecycleCoordinator.destroy(
+            mesh,
+            allowRecoverableWork: allowRecoverableWork
+        )
+        guard case let .completed(result) = outcome else { return .unavailable }
+        switch result {
         case .safe:
             // The user crossed the permanent-delete boundary. Remove column
             // data even if writing the final archive tombstone needs a retry.
@@ -4193,6 +4221,7 @@ final class AppModel: ObservableObject {
                 return .blocked("Mesh work was cleaned up, but the delete tombstone could not be saved: \(error.localizedDescription)")
             }
             _ = removeRecentlyClosedPane(id: surfaceID)
+            meshLifecycleCoordinator.forget(meshID: surfaceID)
             await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
             ToastCenter.shared.show("Permanently deleted Mesh", style: .success)
             return .completed
@@ -4250,7 +4279,16 @@ final class AppModel: ObservableObject {
                 project: ProjectAccountStore().override(forProject: descriptor.projectID)
             )
         ) { _, custom in custom }
-        await mesh.restore(states: states, agents: AgentRegistry.all, environment: environment)
+        let completion = await meshLifecycleCoordinator.restore(
+            mesh,
+            states: states,
+            agents: AgentRegistry.all,
+            environment: environment
+        )
+        guard completion == .completed else {
+            meshLifecycleCoordinator.forget(meshID: descriptor.id)
+            return nil
+        }
         return mesh
     }
 
@@ -4289,16 +4327,18 @@ final class AppModel: ObservableObject {
         await draftPersistenceTask?.value
         await persistWorkspaceStateNow()
         chats.removeAll()
+        meshLifecycleCoordinator.cancelAll()
         for mesh in meshes {
-            await mesh.suspend()
+            _ = await meshLifecycleCoordinator.suspend(mesh)
         }
-        for task in meshShutdownTasks.values { await task.value }
-        meshShutdownTasks.removeAll()
         // `suspend` updates lifecycle and can fence a worktree provision that
         // was already in flight. Flush that final safe manifest before the
         // window model releases its claim.
         await persistWorkspaceStateNow()
-        for mesh in meshes { Self.claimedRestoredMeshIDs.remove(mesh.id) }
+        for mesh in meshes {
+            Self.claimedRestoredMeshIDs.remove(mesh.id)
+            meshLifecycleCoordinator.forget(meshID: mesh.id)
+        }
         meshes.removeAll()
         surfaceObservers.removeAll()
         splitIntentTokens.removeAll()
@@ -8396,6 +8436,238 @@ enum NativeSemanticShellIntegration {
 
     private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+/// Owns the cancellable operations that move a Mesh between durable lifecycle
+/// states. `MeshSession` remains responsible for the worktree and adapter
+/// transaction itself; this coordinator prevents stale AppModel tasks from
+/// publishing a superseded transition.
+@MainActor
+final class MeshLifecycleCoordinator {
+    enum State: Equatable, Sendable {
+        case idle
+        case starting
+        case restoring
+        case active
+        case suspending
+        case suspended
+        case destroying
+        case destroyed
+        case recoveryRequired
+        case cancelled
+
+        init(_ persisted: NativeMeshLifecycle) {
+            switch persisted {
+            case .provisioning:
+                self = .starting
+            case .active:
+                self = .active
+            case .suspended:
+                self = .suspended
+            case .pendingDeletion:
+                self = .destroying
+            case .recoveryRequired:
+                self = .recoveryRequired
+            }
+        }
+    }
+
+    enum Completion: Equatable, Sendable {
+        case completed
+        case cancelled
+    }
+
+    enum Outcome<Value: Equatable & Sendable>: Equatable, Sendable {
+        case completed(Value)
+        case cancelled
+    }
+
+    private struct ActiveOperation {
+        let generation: UInt64
+        let cancel: @MainActor () -> Void
+        let wait: @MainActor () async -> Void
+    }
+
+    private var generationCounter: UInt64 = 0
+    private var operations: [String: ActiveOperation] = [:]
+    private var states: [String: State] = [:]
+
+    func state(for meshID: String) -> State {
+        states[meshID] ?? .idle
+    }
+
+    func start(
+        _ mesh: MeshSession,
+        agents: [AgentProfile],
+        environment: [String: String]
+    ) {
+        start(meshID: mesh.id) {
+            await mesh.start(agents: agents, environment: environment)
+            return State(mesh.lifecycle)
+        }
+    }
+
+    func restore(
+        _ mesh: MeshSession,
+        states: [MeshSession.RestoredColumnState],
+        agents: [AgentProfile],
+        environment: [String: String]
+    ) async -> Completion {
+        await restore(meshID: mesh.id) {
+            await mesh.restore(states: states, agents: agents, environment: environment)
+            return State(mesh.lifecycle)
+        }
+    }
+
+    func suspend(_ mesh: MeshSession) async -> Completion {
+        await suspend(meshID: mesh.id) {
+            await mesh.suspend()
+            return State(mesh.lifecycle)
+        }
+    }
+
+    func destroy(
+        _ mesh: MeshSession,
+        allowRecoverableWork: Bool
+    ) async -> Outcome<MeshSession.DiscardAssessment> {
+        await destroy(
+            meshID: mesh.id,
+            operation: {
+                await mesh.destroy(allowRecoverableWork: allowRecoverableWork)
+            },
+            resolvedState: { result in
+                result == .safe ? .destroyed : State(mesh.lifecycle)
+            }
+        )
+    }
+
+    /// Starts a retained operation without making AppModel own an unstructured
+    /// Task. A later suspend, destroy, or explicit cancellation invalidates its
+    /// generation before the underlying MeshSession is asked to stop.
+    func start(
+        meshID: String,
+        operation: @escaping @MainActor @Sendable () async -> State
+    ) {
+        let (generation, task) = beginOperation(
+            meshID: meshID,
+            transition: .starting,
+            operation: operation
+        )
+        Task { [weak self] in
+            let finalState = await task.value
+            self?.finish(meshID: meshID, generation: generation, state: finalState)
+        }
+    }
+
+    func restore(
+        meshID: String,
+        operation: @escaping @MainActor @Sendable () async -> State
+    ) async -> Completion {
+        await stateTransition(meshID: meshID, transition: .restoring, operation: operation)
+    }
+
+    func suspend(
+        meshID: String,
+        operation: @escaping @MainActor @Sendable () async -> State
+    ) async -> Completion {
+        await stateTransition(meshID: meshID, transition: .suspending, operation: operation)
+    }
+
+    func destroy<Value: Equatable & Sendable>(
+        meshID: String,
+        operation: @escaping @MainActor @Sendable () async -> Value,
+        resolvedState: @MainActor (Value) -> State
+    ) async -> Outcome<Value> {
+        let (generation, task) = beginOperation(
+            meshID: meshID,
+            transition: .destroying,
+            operation: operation
+        )
+        let value = await task.value
+        guard finish(
+            meshID: meshID,
+            generation: generation,
+            state: resolvedState(value)
+        ) else {
+            return .cancelled
+        }
+        return .completed(value)
+    }
+
+    /// Invalidates an operation synchronously. Its work receives cooperative
+    /// Task cancellation, while the generation fence prevents late completion
+    /// from changing the visible lifecycle even if that work ignores it.
+    func cancel(meshID: String) {
+        guard states[meshID] != nil || operations[meshID] != nil else { return }
+        let operation = operations.removeValue(forKey: meshID)
+        operation?.cancel()
+        states[meshID] = .cancelled
+    }
+
+    func cancelAll() {
+        for meshID in Array(operations.keys) {
+            cancel(meshID: meshID)
+        }
+    }
+
+    func waitForIdle(meshID: String) async {
+        while let operation = operations[meshID] {
+            await operation.wait()
+            if operations[meshID]?.generation == operation.generation {
+                await Task.yield()
+            }
+        }
+    }
+
+    /// Removes bounded coordinator metadata after AppModel drops the surface.
+    func forget(meshID: String) {
+        operations.removeValue(forKey: meshID)?.cancel()
+        states.removeValue(forKey: meshID)
+    }
+
+    private func stateTransition(
+        meshID: String,
+        transition: State,
+        operation: @escaping @MainActor @Sendable () async -> State
+    ) async -> Completion {
+        let (generation, task) = beginOperation(
+            meshID: meshID,
+            transition: transition,
+            operation: operation
+        )
+        let finalState = await task.value
+        return finish(meshID: meshID, generation: generation, state: finalState)
+            ? .completed
+            : .cancelled
+    }
+
+    private func beginOperation<Value: Sendable>(
+        meshID: String,
+        transition: State,
+        operation: @escaping @MainActor @Sendable () async -> Value
+    ) -> (UInt64, Task<Value, Never>) {
+        operations.removeValue(forKey: meshID)?.cancel()
+        generationCounter &+= 1
+        let generation = generationCounter
+        states[meshID] = transition
+        let task = Task { await operation() }
+        operations[meshID] = ActiveOperation(
+            generation: generation,
+            cancel: { task.cancel() },
+            wait: { _ = await task.value }
+        )
+        return (generation, task)
+    }
+
+    @discardableResult
+    private func finish(meshID: String, generation: UInt64, state: State) -> Bool {
+        guard operations[meshID]?.generation == generation else {
+            return false
+        }
+        operations.removeValue(forKey: meshID)
+        states[meshID] = state
+        return true
     }
 }
 

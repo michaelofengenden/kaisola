@@ -1356,6 +1356,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
             .plan(id: "plan-1", entries: [
                 .init(id: "step-1", content: "Ship it", priority: "high", status: "completed"),
             ]),
+            .permissionDecision(id: "permission-1", text: "EPHEMERAL_PERMISSION_SECRET"),
         ]
         let markdown = AcpTranscriptMarkdownExport.markdown(
             request: .init(
@@ -1405,6 +1406,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
         XCTAssertFalse(markdown.contains("/private/secret/path"))
         XCTAssertFalse(markdown.contains("BINARY_ATTACHMENT_SECRET"))
         XCTAssertFalse(markdown.contains("TEXT_ATTACHMENT_SECRET"))
+        XCTAssertFalse(markdown.contains("EPHEMERAL_PERMISSION_SECRET"))
         XCTAssertEqual(
             AcpTranscriptMarkdownExport.lastAssistantResponse(in: rows),
             "Done.\n\n```diff\n-old\n+new\n```"

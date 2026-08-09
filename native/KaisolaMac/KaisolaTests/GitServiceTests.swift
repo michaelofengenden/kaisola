@@ -27,15 +27,19 @@ final class GitServiceTests: XCTestCase {
         // Dirty the tree, checkpoint, dirty differently, then restore.
         try write("file.txt", "checkpointed change\n")
         let service = GitService(repoRoot: repo)
-        let hash = try XCTUnwrap(service.checkpoint())
-        XCTAssertFalse(hash.isEmpty)
+        let checkpoint = try XCTUnwrap(service.checkpoint(
+            ownerID: "chat",
+            incarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!,
+            turn: 1
+        ))
+        XCTAssertFalse(checkpoint.commitHash.isEmpty)
         // The snapshot must not disturb the working tree.
         XCTAssertEqual(try String(contentsOf: repo.appendingPathComponent("file.txt"), encoding: .utf8), "checkpointed change\n")
 
         try git(["checkout", "--", "file.txt"])   // wipe the change
         XCTAssertEqual(try String(contentsOf: repo.appendingPathComponent("file.txt"), encoding: .utf8), "original\n")
 
-        try service.applyCheckpoint(hash)
+        try service.applyCheckpoint(checkpoint)
         XCTAssertEqual(try String(contentsOf: repo.appendingPathComponent("file.txt"), encoding: .utf8), "checkpointed change\n")
     }
 
@@ -43,12 +47,309 @@ final class GitServiceTests: XCTestCase {
         try write("clean.txt", "x\n")
         try git(["add", "clean.txt"])
         try git(["commit", "-q", "-m", "base"])
-        XCTAssertNil(try GitService(repoRoot: repo).checkpoint())
+        XCTAssertNil(try GitService(repoRoot: repo).checkpoint(
+            ownerID: "chat",
+            incarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!,
+            turn: 1
+        ))
     }
 
-    func testApplyCheckpointRejectsMalformedHash() {
+    func testCheckpointRefsAreNamespacedByOwnerAndTurnWhenSnapshotHashIsShared() throws {
+        try write("file.txt", "base\n")
+        try git(["add", "file.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("file.txt", "shared dirty tree\n")
+
+        let service = GitService(repoRoot: repo, checkpointDate: "2026-08-08T12:00:00Z")
+        let first = try XCTUnwrap(service.checkpoint(
+            ownerID: "chat-one",
+            incarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!,
+            turn: 7
+        ))
+        let second = try XCTUnwrap(service.checkpoint(
+            ownerID: "chat-two",
+            incarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!,
+            turn: 7
+        ))
+
+        XCTAssertEqual(first.commitHash, second.commitHash)
+        XCTAssertNotEqual(first.keepAliveRef, second.keepAliveRef)
+        XCTAssertEqual(try git(["show-ref", "--verify", "--quiet", first.keepAliveRef]), 0)
+        XCTAssertEqual(try git(["show-ref", "--verify", "--quiet", second.keepAliveRef]), 0)
+
+        try service.dropCheckpoint(first)
+        XCTAssertNotEqual(try git(["show-ref", "--verify", "--quiet", first.keepAliveRef]), 0)
+        XCTAssertEqual(
+            try git(["show-ref", "--verify", "--quiet", second.keepAliveRef]),
+            0,
+            "expiring one logical owner must retain the other owner ref"
+        )
+        XCTAssertEqual(try git(["reflog", "expire", "--expire=now", "--all"]), 0)
+        XCTAssertEqual(try git(["gc", "--prune=now"]), 0)
+        XCTAssertEqual(try git(["cat-file", "-e", "\(second.commitHash)^{commit}"]), 0)
+
+        try git(["checkout", "--", "file.txt"])
+        try service.applyCheckpoint(second)
+        XCTAssertEqual(
+            try String(contentsOf: repo.appendingPathComponent("file.txt"), encoding: .utf8),
+            "shared dirty tree\n"
+        )
+
+        try service.dropCheckpoint(second)
+        XCTAssertNotEqual(try git(["show-ref", "--verify", "--quiet", second.keepAliveRef]), 0)
+    }
+
+    func testCheckpointTurnsAreIndependentForTheSameOwnerAndIncarnation() throws {
+        try write("file.txt", "base\n")
+        try git(["add", "file.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("file.txt", "shared dirty tree\n")
+
+        let service = GitService(repoRoot: repo, checkpointDate: "2026-08-08T12:00:00Z")
+        let incarnation = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
+        let first = try XCTUnwrap(service.checkpoint(
+            ownerID: "chat",
+            incarnationID: incarnation,
+            turn: 7
+        ))
+        let second = try XCTUnwrap(service.checkpoint(
+            ownerID: "chat",
+            incarnationID: incarnation,
+            turn: 8
+        ))
+
+        XCTAssertEqual(first.commitHash, second.commitHash)
+        XCTAssertNotEqual(first.keepAliveRef, second.keepAliveRef)
+        try service.dropCheckpoint(first)
+        XCTAssertNotEqual(try git(["show-ref", "--verify", "--quiet", first.keepAliveRef]), 0)
+        XCTAssertEqual(try git(["show-ref", "--verify", "--quiet", second.keepAliveRef]), 0)
+    }
+
+    func testCheckpointIncarnationsAreIndependentForTheSameDurableChatAndTurn() throws {
+        try write("file.txt", "base\n")
+        try git(["add", "file.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("file.txt", "shared dirty tree\n")
+
+        let service = GitService(repoRoot: repo, checkpointDate: "2026-08-08T12:00:00Z")
+        let first = try XCTUnwrap(service.checkpoint(
+            ownerID: "restored-chat",
+            incarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!,
+            turn: 7
+        ))
+        let second = try XCTUnwrap(service.checkpoint(
+            ownerID: "restored-chat",
+            incarnationID: UUID(uuidString: "22222222-2222-4222-8222-222222222222")!,
+            turn: 7
+        ))
+
+        XCTAssertEqual(first.commitHash, second.commitHash)
+        XCTAssertNotEqual(first.keepAliveRef, second.keepAliveRef)
+        try service.dropCheckpoint(first)
+        XCTAssertNotEqual(try git(["show-ref", "--verify", "--quiet", first.keepAliveRef]), 0)
+        XCTAssertEqual(try git(["show-ref", "--verify", "--quiet", second.keepAliveRef]), 0)
+    }
+
+    func testCheckpointDropFailsClosedWhenTheRefWasRepointed() throws {
+        try write("file.txt", "base\n")
+        try git(["add", "file.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let head = try GitService(repoRoot: repo).headOID()
+        try write("file.txt", "dirty\n")
+
         let service = GitService(repoRoot: repo)
-        XCTAssertThrowsError(try service.applyCheckpoint("not-a-hash; rm -rf /"))
+        let checkpoint = try XCTUnwrap(service.checkpoint(
+            ownerID: "chat",
+            incarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!,
+            turn: 1
+        ))
+        try git(["update-ref", checkpoint.keepAliveRef, head, checkpoint.commitHash])
+
+        XCTAssertThrowsError(try service.dropCheckpoint(checkpoint))
+        XCTAssertEqual(try gitOutput(["rev-parse", checkpoint.keepAliveRef]), head)
+    }
+
+    func testSymbolicCheckpointRefsNeverDereferenceIntoBranches() throws {
+        try write("file.txt", "base\n")
+        try git(["add", "file.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let head = try GitService(repoRoot: repo).headOID()
+        try write("file.txt", "dirty\n")
+
+        let service = GitService(repoRoot: repo)
+        let checkpoint = try XCTUnwrap(service.checkpoint(
+            ownerID: "chat",
+            incarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!,
+            turn: 1
+        ))
+        try git(["symbolic-ref", checkpoint.keepAliveRef, "refs/heads/main"])
+        let symbolicLegacyRef = "refs/kaisola/checkpoints/\(head)"
+        try git(["symbolic-ref", symbolicLegacyRef, "refs/heads/main"])
+
+        XCTAssertThrowsError(try service.dropCheckpoint(checkpoint))
+        try service.migrateLegacyCheckpointRefs()
+
+        XCTAssertEqual(try service.headOID(), head)
+        XCTAssertEqual(try gitOutput(["symbolic-ref", checkpoint.keepAliveRef]), "refs/heads/main")
+        XCTAssertEqual(try gitOutput(["symbolic-ref", symbolicLegacyRef]), "refs/heads/main")
+        XCTAssertNotEqual(
+            try git(["show-ref", "--verify", "--quiet", "refs/kaisola/checkpoints/legacy/\(head)"]),
+            0
+        )
+    }
+
+    func testLegacyCheckpointMigrationPreservesAReservedKeepAliveCopy() throws {
+        try write("file.txt", "base\n")
+        try git(["add", "file.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("file.txt", "legacy dirty tree\n")
+
+        let service = GitService(repoRoot: repo)
+        let current = try XCTUnwrap(service.checkpoint(
+            ownerID: "current-chat",
+            incarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!,
+            turn: 1
+        ))
+        let oldRef = "refs/kaisola/checkpoints/\(current.commitHash)"
+        let preservedRef = "refs/kaisola/checkpoints/legacy/\(current.commitHash)"
+        try git(["update-ref", oldRef, current.commitHash])
+
+        try service.migrateLegacyCheckpointRefs()
+        try service.migrateLegacyCheckpointRefs() // idempotent after a partial/previous migration
+
+        XCTAssertNotEqual(try git(["show-ref", "--verify", "--quiet", oldRef]), 0)
+        XCTAssertEqual(try git(["show-ref", "--verify", "--quiet", preservedRef]), 0)
+        XCTAssertEqual(try git(["show-ref", "--verify", "--quiet", current.keepAliveRef]), 0)
+
+        try service.dropCheckpoint(current)
+        XCTAssertEqual(
+            try git(["show-ref", "--verify", "--quiet", preservedRef]),
+            0,
+            "namespaced expiry must never collect a legacy checkpoint with unknown ownership"
+        )
+        try git(["checkout", "--", "file.txt"])
+        XCTAssertEqual(try git(["reflog", "expire", "--expire=now", "--all"]), 0)
+        XCTAssertEqual(try git(["gc", "--prune=now"]), 0)
+        XCTAssertEqual(try git(["cat-file", "-e", "\(current.commitHash)^{commit}"]), 0)
+        try service.applyCheckpoint(current)
+        XCTAssertEqual(
+            try String(contentsOf: repo.appendingPathComponent("file.txt"), encoding: .utf8),
+            "legacy dirty tree\n"
+        )
+    }
+
+    func testLegacyCheckpointMigrationPreservesBothRefsOnDestinationConflict() throws {
+        try write("file.txt", "base\n")
+        try git(["add", "file.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let head = try GitService(repoRoot: repo).headOID()
+        try write("file.txt", "legacy dirty tree\n")
+
+        let service = GitService(repoRoot: repo)
+        let checkpoint = try XCTUnwrap(service.checkpoint(
+            ownerID: "chat",
+            incarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!,
+            turn: 1
+        ))
+        let oldRef = "refs/kaisola/checkpoints/\(checkpoint.commitHash)"
+        let preservedRef = "refs/kaisola/checkpoints/legacy/\(checkpoint.commitHash)"
+        try git(["update-ref", oldRef, checkpoint.commitHash])
+        try git(["update-ref", preservedRef, head])
+
+        XCTAssertThrowsError(try service.migrateLegacyCheckpointRefs())
+        XCTAssertEqual(try gitOutput(["rev-parse", oldRef]), checkpoint.commitHash)
+        XCTAssertEqual(try gitOutput(["rev-parse", preservedRef]), head)
+    }
+
+    func testLegacyCheckpointMigrationLeavesMismatchedAndNonCommitRefsUntouched() throws {
+        try write("file.txt", "base\n")
+        try git(["add", "file.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let head = try GitService(repoRoot: repo).headOID()
+        let blob = try gitOutput(["hash-object", "-w", "file.txt"])
+        let mismatchedRef = "refs/kaisola/checkpoints/\(head)"
+        let blobRef = "refs/kaisola/checkpoints/\(blob)"
+        try git(["update-ref", mismatchedRef, blob])
+        try git(["update-ref", blobRef, blob])
+
+        try GitService(repoRoot: repo).migrateLegacyCheckpointRefs()
+
+        XCTAssertEqual(try gitOutput(["rev-parse", mismatchedRef]), blob)
+        XCTAssertEqual(try gitOutput(["rev-parse", blobRef]), blob)
+        XCTAssertNotEqual(
+            try git(["show-ref", "--verify", "--quiet", "refs/kaisola/checkpoints/legacy/\(blob)"]),
+            0
+        )
+    }
+
+    func testConcurrentLegacyCheckpointMigrationsConverge() async throws {
+        try write("file.txt", "base\n")
+        try git(["add", "file.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("file.txt", "legacy dirty tree\n")
+
+        let service = GitService(repoRoot: repo)
+        let checkpoint = try XCTUnwrap(service.checkpoint(
+            ownerID: "chat",
+            incarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!,
+            turn: 1
+        ))
+        let oldRef = "refs/kaisola/checkpoints/\(checkpoint.commitHash)"
+        let preservedRef = "refs/kaisola/checkpoints/legacy/\(checkpoint.commitHash)"
+        try git(["update-ref", oldRef, checkpoint.commitHash])
+
+        async let first: Void = service.migrateLegacyCheckpointRefs()
+        async let second: Void = service.migrateLegacyCheckpointRefs()
+        _ = try await (first, second)
+
+        XCTAssertNotEqual(try git(["show-ref", "--verify", "--quiet", oldRef]), 0)
+        XCTAssertEqual(try gitOutput(["rev-parse", preservedRef]), checkpoint.commitHash)
+    }
+
+    func testCheckpointSupportsSHA256RepositoriesWhenGitDoes() throws {
+        let shaRepo = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-git-sha256-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: shaRepo, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: shaRepo) }
+        guard try git(["init", "-q", "--object-format=sha256", "-b", "main"], at: shaRepo) == 0 else {
+            throw XCTSkip("System Git does not support SHA-256 repositories")
+        }
+        try git(["config", "user.email", "test@example.com"], at: shaRepo)
+        try git(["config", "user.name", "Test"], at: shaRepo)
+        try "base\n".write(
+            to: shaRepo.appendingPathComponent("file.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try git(["add", "file.txt"], at: shaRepo)
+        try git(["commit", "-q", "-m", "base"], at: shaRepo)
+        try "dirty\n".write(
+            to: shaRepo.appendingPathComponent("file.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let service = GitService(repoRoot: shaRepo)
+        let checkpoint = try XCTUnwrap(service.checkpoint(
+            ownerID: "chat",
+            incarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!,
+            turn: 1
+        ))
+        XCTAssertEqual(checkpoint.commitHash.count, 64)
+        XCTAssertTrue(checkpoint.keepAliveRef.hasSuffix("-\(checkpoint.commitHash)"))
+        try service.dropCheckpoint(checkpoint)
+    }
+
+    func testCheckpointOwnerValidationFailsClosed() throws {
+        try write("file.txt", "base\n")
+        try git(["add", "file.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("file.txt", "dirty\n")
+
+        let service = GitService(repoRoot: repo)
+        let incarnation = UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
+        XCTAssertThrowsError(try service.checkpoint(ownerID: "", incarnationID: incarnation, turn: 1))
+        XCTAssertThrowsError(try service.checkpoint(ownerID: "chat", incarnationID: incarnation, turn: 0))
     }
 
     func testRestoreFileDiscardsUnstagedChanges() throws {
@@ -438,5 +739,23 @@ final class GitServiceTests: XCTestCase {
         p.standardOutput = Pipe(); p.standardError = Pipe()
         try p.run(); p.waitUntilExit()
         return p.terminationStatus
+    }
+
+    private func gitOutput(_ args: [String], at directory: URL? = nil) throws -> String {
+        let p = Process()
+        let output = Pipe()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+        p.arguments = args
+        p.currentDirectoryURL = directory ?? repo
+        p.standardOutput = output
+        p.standardError = Pipe()
+        try p.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0 else {
+            throw GitService.GitError.commandFailed("git \(args.joined(separator: " ")) failed")
+        }
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 }

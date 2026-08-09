@@ -774,6 +774,79 @@ final class AcpClientTests: XCTestCase {
         conversation.removeQueued(id)
         XCTAssertTrue(conversation.queued.isEmpty)
     }
+
+    @MainActor
+    func testConversationCheckpointEvictionDropsOnlyTheExactTypedOwnerRef() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-checkpoint-menu-\(UUID().uuidString.prefix(8))")
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        @discardableResult
+        func git(_ arguments: [String]) throws -> Int32 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+            process.arguments = arguments
+            process.currentDirectoryURL = workspace
+            process.standardOutput = Pipe()
+            process.standardError = Pipe()
+            try process.run()
+            process.waitUntilExit()
+            return process.terminationStatus
+        }
+
+        func refExists(_ ref: String) -> Bool {
+            (try? git(["show-ref", "--verify", "--quiet", ref])) == 0
+        }
+
+        XCTAssertEqual(try git(["init", "-q", "-b", "main"]), 0)
+        XCTAssertEqual(try git(["config", "user.email", "test@example.com"]), 0)
+        XCTAssertEqual(try git(["config", "user.name", "Test"]), 0)
+        try "base\n".write(
+            to: workspace.appendingPathComponent("file.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        XCTAssertEqual(try git(["add", "file.txt"]), 0)
+        XCTAssertEqual(try git(["commit", "-q", "-m", "base"]), 0)
+        try "dirty\n".write(
+            to: workspace.appendingPathComponent("file.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let transport = ScriptedAcpTransport()
+        let conversation = AcpConversation(
+            title: "Checkpoint eviction",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: workspace.path,
+            client: AcpClient(transport: transport),
+            draftKey: "durable-chat",
+            checkpointIncarnationID: UUID(uuidString: "11111111-1111-4111-8111-111111111111")!
+        )
+        await conversation.start()
+
+        var first: AcpConversation.TurnCheckpoint?
+        for turn in 1...21 {
+            XCTAssertTrue(conversation.send("turn \(turn)"))
+            try await Self.until("checkpoint for turn \(turn)", timeout: 15) {
+                !conversation.isRunning && conversation.checkpoints.last?.turn == turn
+            }
+            if turn == 1 { first = conversation.checkpoints.first }
+        }
+
+        let evicted = try XCTUnwrap(first)
+        XCTAssertEqual(conversation.checkpoints.count, 20)
+        XCTAssertFalse(conversation.checkpoints.contains(where: { $0.id == evicted.id }))
+        let retained = try XCTUnwrap(conversation.checkpoints.last)
+        try await Self.until("the evicted checkpoint ref to be deleted") {
+            !refExists(evicted.checkpoint.keepAliveRef)
+        }
+        XCTAssertTrue(refExists(retained.checkpoint.keepAliveRef))
+        _ = await conversation.stop()
+    }
 }
 
 private final class EventCollector: @unchecked Sendable {

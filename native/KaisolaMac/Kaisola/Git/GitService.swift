@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// Subprocess output capture that cannot deadlock when several Mesh columns
@@ -5,7 +6,7 @@ import Foundation
 /// sibling child, preventing EOF forever; private regular files have no such
 /// lifetime coupling and also absorb verbose failures without back-pressure.
 enum GitProcessCapture {
-    static func run(_ process: Process) throws -> (out: Data, err: Data) {
+    static func run(_ process: Process, standardInput: Data? = nil) throws -> (out: Data, err: Data) {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-process-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -19,9 +20,17 @@ enum GitProcessCapture {
         }
         let output = try FileHandle(forWritingTo: outputURL)
         let errors = try FileHandle(forWritingTo: errorURL)
+        var input: FileHandle?
+        if let standardInput {
+            let inputURL = directory.appendingPathComponent("stdin")
+            try standardInput.write(to: inputURL)
+            input = try FileHandle(forReadingFrom: inputURL)
+            process.standardInput = input
+        }
         defer {
             try? output.close()
             try? errors.close()
+            try? input?.close()
         }
         process.standardOutput = output
         process.standardError = errors
@@ -58,6 +67,36 @@ enum GitProcessEnvironment {
 /// push); path arguments are guarded against escaping the repo root.
 struct GitService: Sendable {
     let repoRoot: URL
+    private let checkpointDate: String?
+
+    init(repoRoot: URL) {
+        self.repoRoot = repoRoot
+        self.checkpointDate = nil
+    }
+
+    #if DEBUG
+    /// Process-scoped determinism for collision tests. Unlike `setenv`, this
+    /// cannot race Git subprocesses launched by another XCTest.
+    init(repoRoot: URL, checkpointDate: String) {
+        self.repoRoot = repoRoot
+        self.checkpointDate = checkpointDate
+    }
+    #endif
+
+    /// A restorable snapshot and the exact private ref that keeps it alive.
+    /// The commit may be shared by several conversations, but the ref never is.
+    struct Checkpoint: Equatable, Sendable {
+        let commitHash: String
+        let keepAliveRef: String
+
+        /// Capabilities are minted only by GitService after constructing and
+        /// validating the complete v2 ref; other app code cannot forge a token
+        /// for an arbitrary ref such as a branch or legacy quarantine entry.
+        fileprivate init(commitHash: String, keepAliveRef: String) {
+            self.commitHash = commitHash
+            self.keepAliveRef = keepAliveRef
+        }
+    }
 
     struct Status: Equatable, Sendable {
         var branch: String?
@@ -186,33 +225,270 @@ struct GitService: Sendable {
         _ = try run(["restore", "--", path])
     }
 
-    /// Snapshot the working tree without moving HEAD or touching the index:
+    /// Snapshot the working tree without moving HEAD or touching the index.
     /// `git stash create` writes the stash commit and returns its hash but
     /// stores nothing, so the tree is untouched. Returns nil on a clean tree.
-    /// The snapshot is kept alive under a PRIVATE ref namespace
-    /// (`refs/kaisola/checkpoints/*`) — never the user's stash list.
-    func checkpoint() throws -> String? {
-        let hash = try run(["stash", "create", "kaisola pre-turn checkpoint"])
+    ///
+    /// Snapshot commits are content-addressed: two chats can legitimately get
+    /// the same hash. Their keep-alive refs therefore include a stable owner
+    /// digest, a per-live-conversation incarnation, and the turn rather than
+    /// using the hash as the entire ref name.
+    func checkpoint(ownerID: String, incarnationID: UUID, turn: Int) throws -> Checkpoint? {
+        try validateCheckpointOwner(ownerID, turn: turn)
+        // Old builds used one hash-only ref for every logical owner. Quarantine
+        // those refs atomically before writing v2 state so migration is safe
+        // even while another process still holds only the commit hash.
+        try migrateLegacyCheckpointRefs()
+        var environmentOverrides: [String: String] = [:]
+        if let checkpointDate {
+            environmentOverrides["GIT_AUTHOR_DATE"] = checkpointDate
+            environmentOverrides["GIT_COMMITTER_DATE"] = checkpointDate
+        }
+        let hash = try run(
+            ["stash", "create", "kaisola pre-turn checkpoint"],
+            environmentOverrides: environmentOverrides
+        )
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !hash.isEmpty else { return nil }
-        _ = try run(["update-ref", "refs/kaisola/checkpoints/\(hash)", hash])
-        return hash
+        return try retainCheckpoint(
+            commitHash: hash,
+            ownerID: ownerID,
+            incarnationID: incarnationID,
+            turn: turn
+        )
     }
 
-    /// Release an aged-out checkpoint's keep-alive ref.
-    func dropCheckpoint(_ hash: String) throws {
-        guard hash.range(of: "^[0-9a-f]{7,40}$", options: .regularExpression) != nil else {
-            throw GitError.commandFailed("Invalid checkpoint id")
-        }
-        _ = try run(["update-ref", "-d", "refs/kaisola/checkpoints/\(hash)"])
+    private func retainCheckpoint(
+        commitHash: String,
+        ownerID: String,
+        incarnationID: UUID,
+        turn: Int
+    ) throws -> Checkpoint {
+        try validateCheckpointOwner(ownerID, turn: turn)
+
+        let normalizedHash = commitHash.lowercased()
+        try validateObjectID(normalizedHash)
+        try requireCommitObject(normalizedHash)
+        let ownerDigest = SHA256.hash(data: Data(ownerID.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let incarnation = incarnationID.uuidString.lowercased()
+        let keepAliveRef = "\(Self.checkpointV2Prefix)\(ownerDigest)/\(incarnation)/\(turn)-\(normalizedHash)"
+        try createRefIfAbsent(keepAliveRef, target: normalizedHash)
+        return Checkpoint(commitHash: normalizedHash, keepAliveRef: keepAliveRef)
+    }
+
+    /// Release only the aged-out logical owner's keep-alive ref. Supplying the
+    /// expected object id makes deletion fail closed if another process moved
+    /// or replaced the ref after it was read.
+    func dropCheckpoint(_ checkpoint: Checkpoint) throws {
+        try validate(checkpoint)
+        try deleteRefIfMatching(checkpoint.keepAliveRef, expectedTarget: checkpoint.commitHash)
     }
 
     /// Restore the files recorded in a checkpoint over the current tree.
-    func applyCheckpoint(_ hash: String) throws {
-        guard hash.range(of: "^[0-9a-f]{7,40}$", options: .regularExpression) != nil else {
+    func applyCheckpoint(_ checkpoint: Checkpoint) throws {
+        try validate(checkpoint)
+        try requireCommitObject(checkpoint.commitHash)
+        _ = try run(["stash", "apply", checkpoint.commitHash])
+    }
+
+    /// Move unowned hash-only refs into a reserved keep-alive namespace. The
+    /// original conversation and turn were never stored, so legacy copies are
+    /// deliberately not garbage-collected automatically.
+    func migrateLegacyCheckpointRefs() throws {
+        let expectedObjectIDLength = try objectIDLength()
+        let refs = try checkpointRefStates()
+        for (ref, state) in refs.sorted(by: { $0.key < $1.key }) {
+            guard ref.hasPrefix(Self.checkpointPrefix) else { continue }
+            let suffix = String(ref.dropFirst(Self.checkpointPrefix.count))
+            guard state.symbolicTarget == nil,
+                  !suffix.contains("/"),
+                  suffix.count == expectedObjectIDLength,
+                  Self.isFullObjectID(suffix),
+                  suffix == state.objectID else { continue }
+            do { try requireCommitObject(suffix) }
+            catch { continue }
+
+            try migrateLegacyCheckpointRef(ref, objectID: suffix)
+        }
+    }
+
+    private static let checkpointPrefix = "refs/kaisola/checkpoints/"
+    private static let checkpointV2Prefix = "refs/kaisola/checkpoints/v2/"
+    private static let checkpointLegacyPrefix = "refs/kaisola/checkpoints/legacy/"
+
+    private static func isFullObjectID(_ value: String) -> Bool {
+        value.range(of: "^(?:[0-9a-f]{40}|[0-9a-f]{64})$", options: .regularExpression) != nil
+    }
+
+    private func validateCheckpointOwner(_ ownerID: String, turn: Int) throws {
+        guard !ownerID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw GitError.commandFailed("Checkpoint owner is required")
+        }
+        guard turn > 0 else {
+            throw GitError.commandFailed("Checkpoint turn must be positive")
+        }
+    }
+
+    private func validate(_ checkpoint: Checkpoint) throws {
+        try validateObjectID(checkpoint.commitHash)
+        guard checkpoint.keepAliveRef.hasPrefix(Self.checkpointV2Prefix) else {
             throw GitError.commandFailed("Invalid checkpoint id")
         }
-        _ = try run(["stash", "apply", hash])
+
+        let relative = String(checkpoint.keepAliveRef.dropFirst(Self.checkpointV2Prefix.count))
+        let components = relative.split(separator: "/", omittingEmptySubsequences: false)
+        guard components.count == 3,
+              components[0].range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil,
+              UUID(uuidString: String(components[1]))?.uuidString.lowercased() == String(components[1]) else {
+            throw GitError.commandFailed("Invalid checkpoint id")
+        }
+
+        let expectedSuffix = "-\(checkpoint.commitHash)"
+        let checkpointName = String(components[2])
+        guard checkpointName.hasSuffix(expectedSuffix) else {
+            throw GitError.commandFailed("Checkpoint ref does not match its commit")
+        }
+        let turnText = String(checkpointName.dropLast(expectedSuffix.count))
+        guard let turn = Int(turnText), turn > 0, String(turn) == turnText else {
+            throw GitError.commandFailed("Invalid checkpoint turn")
+        }
+    }
+
+    private func validateObjectID(_ value: String) throws {
+        let expectedLength = try objectIDLength()
+        guard value.count == expectedLength, Self.isFullObjectID(value) else {
+            throw GitError.commandFailed("Invalid checkpoint id")
+        }
+    }
+
+    private func objectIDLength() throws -> Int {
+        let objectFormat = try run(["rev-parse", "--show-object-format"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        switch objectFormat {
+        case "sha1": return 40
+        case "sha256": return 64
+        default: throw GitError.commandFailed("Unsupported Git object format: \(objectFormat)")
+        }
+    }
+
+    private func requireCommitObject(_ objectID: String) throws {
+        _ = try run(["cat-file", "-e", "\(objectID)^{commit}"])
+    }
+
+    /// Atomically establish/verify the quarantine ref and remove the old name.
+    /// A separate copy then delete would leave a gap if another process removed
+    /// the destination between those commands. The transaction either applies
+    /// both updates or neither; bounded retries accept only a safely converged
+    /// state produced by another migrator.
+    private func migrateLegacyCheckpointRef(_ sourceRef: String, objectID: String) throws {
+        let preservedRef = "\(Self.checkpointLegacyPrefix)\(objectID)"
+        for _ in 0..<3 {
+            let states = try checkpointRefStates()
+            let source = states[sourceRef]
+            let destination = states[preservedRef]
+
+            if source == nil {
+                guard destination?.symbolicTarget == nil,
+                      destination?.objectID == objectID else {
+                    throw GitError.commandFailed("Legacy checkpoint migration lost its keep-alive ref")
+                }
+                return
+            }
+            guard source?.symbolicTarget == nil, source?.objectID == objectID else {
+                throw GitError.commandFailed("Legacy checkpoint ref changed during migration")
+            }
+
+            let destinationCommand: String
+            if destination == nil {
+                destinationCommand = "create \(preservedRef) \(objectID)"
+            } else if destination?.symbolicTarget == nil, destination?.objectID == objectID {
+                destinationCommand = "verify \(preservedRef) \(objectID)"
+            } else {
+                throw GitError.commandFailed("Legacy checkpoint destination conflicts with its object")
+            }
+
+            let transaction = """
+            start
+            \(destinationCommand)
+            delete \(sourceRef) \(objectID)
+            prepare
+            commit
+
+            """
+            do {
+                _ = try run(
+                    ["update-ref", "--stdin", "--no-deref"],
+                    standardInput: transaction
+                )
+                return
+            } catch {
+                let refreshed = try checkpointRefStates()
+                if refreshed[sourceRef] == nil,
+                   refreshed[preservedRef]?.symbolicTarget == nil,
+                   refreshed[preservedRef]?.objectID == objectID {
+                    return
+                }
+                // A competing migrator may have created the destination while
+                // leaving this source for our next verify-and-delete attempt.
+                continue
+            }
+        }
+        throw GitError.commandFailed("Legacy checkpoint migration did not converge")
+    }
+
+    /// Create a ref without overwriting a concurrent owner. A retry that finds
+    /// the exact desired target is idempotent; any other target is a collision.
+    private func createRefIfAbsent(_ ref: String, target: String) throws {
+        let zeroObjectID = String(repeating: "0", count: target.count)
+        do {
+            _ = try run(["update-ref", "--no-deref", ref, target, zeroObjectID])
+        } catch {
+            let current = try checkpointRefStates()[ref]
+            guard current?.symbolicTarget == nil, current?.objectID == target else {
+                throw GitError.commandFailed("Checkpoint ref already exists with a different target")
+            }
+        }
+    }
+
+    /// Idempotent compare-and-delete. A concurrent deletion is success; a
+    /// changed target is never removed.
+    private func deleteRefIfMatching(_ ref: String, expectedTarget: String) throws {
+        guard let current = try checkpointRefStates()[ref] else { return }
+        guard current.symbolicTarget == nil, current.objectID == expectedTarget else {
+            throw GitError.commandFailed("Checkpoint ref changed before deletion")
+        }
+        do {
+            _ = try run(["update-ref", "--no-deref", "-d", ref, expectedTarget])
+        } catch {
+            if try checkpointRefStates()[ref] == nil { return }
+            throw error
+        }
+    }
+
+    private struct CheckpointRefState {
+        let objectID: String
+        let symbolicTarget: String?
+    }
+
+    private func checkpointRefStates() throws -> [String: CheckpointRefState] {
+        let output = try run([
+            "for-each-ref",
+            "--format=%(refname)%00%(objectname)%00%(symref)",
+            Self.checkpointPrefix,
+        ])
+        var refs: [String: CheckpointRefState] = [:]
+        for line in output.split(separator: "\n") {
+            let fields = line.split(separator: "\0", omittingEmptySubsequences: false)
+            guard fields.count == 3 else { continue }
+            let ref = String(fields[0])
+            let target = String(fields[1]).lowercased()
+            guard ref.hasPrefix(Self.checkpointPrefix), Self.isFullObjectID(target) else { continue }
+            let symbolicTarget = fields[2].isEmpty ? nil : String(fields[2])
+            refs[ref] = CheckpointRefState(objectID: target, symbolicTarget: symbolicTarget)
+        }
+        return refs
     }
 
     // MARK: - Worktrees (Kaisola Mesh)
@@ -408,14 +684,28 @@ struct GitService: Sendable {
     }
 
     @discardableResult
-    private func run(_ arguments: [String]) throws -> String {
+    private func run(
+        _ arguments: [String],
+        environmentOverrides: [String: String] = [:],
+        standardInput: String? = nil
+    ) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
         process.arguments = arguments
         process.currentDirectoryURL = repoRoot
         GitProcessEnvironment.configureNonInteractive(process)
+        if !environmentOverrides.isEmpty {
+            var environment = process.environment ?? ProcessInfo.processInfo.environment
+            for (key, value) in environmentOverrides { environment[key] = value }
+            process.environment = environment
+        }
         let capture: (out: Data, err: Data)
-        do { capture = try GitProcessCapture.run(process) }
+        do {
+            capture = try GitProcessCapture.run(
+                process,
+                standardInput: standardInput.map { Data($0.utf8) }
+            )
+        }
         catch { throw GitError.commandFailed(error.localizedDescription) }
         if process.terminationStatus != 0 {
             let message = String(data: capture.err, encoding: .utf8) ?? "git failed"

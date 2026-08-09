@@ -10,6 +10,7 @@ final class NativeSessionStoreTests: XCTestCase {
     private var store: NativeSessionStore!
 
     override func setUpWithError() throws {
+        SessionStoreProjectIdentityQuarantineMonitor.shared.reset()
         fileURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-store-\(UUID().uuidString.prefix(8))")
             .appendingPathComponent("native-sessions.json")
@@ -18,6 +19,7 @@ final class NativeSessionStoreTests: XCTestCase {
 
     override func tearDownWithError() throws {
         SessionStoreQuarantineMonitor.shared.reset()
+        SessionStoreProjectIdentityQuarantineMonitor.shared.reset()
         try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent())
     }
 
@@ -329,6 +331,137 @@ final class NativeSessionStoreTests: XCTestCase {
             store.recoverOwnedSessions(from: [observed, exited, unknownProject]).isEmpty
         )
         XCTAssertTrue(store.sessions().isEmpty)
+    }
+
+    func testDuplicateProjectIdentitiesAreQuarantinedDuringDecode() throws {
+        let duplicateA = OpenProject(
+            id: "nproj_duplicated",
+            path: "/tmp/duplicate-a",
+            name: "Duplicate A",
+            createdAt: 10
+        )
+        let unaffected = OpenProject(
+            id: "nproj_unaffected",
+            path: "/tmp/unaffected",
+            name: "Unaffected",
+            createdAt: 20
+        )
+        let duplicateB = OpenProject(
+            id: duplicateA.id,
+            path: "/tmp/duplicate-b",
+            name: "Duplicate B",
+            createdAt: 30
+        )
+        let existingSession = NativeOwnedSession(
+            id: "term-existing",
+            projectID: duplicateA.id,
+            cwd: "/tmp/already-established",
+            title: "Existing",
+            createdAt: 40
+        )
+        let (archiveURL, bytes) = try writeProjectArchive(
+            ownerID: "native-duplicate-projects",
+            sessions: [existingSession],
+            projects: [duplicateA, unaffected, duplicateB],
+            named: "duplicate-projects"
+        )
+        let observed = CollectedProjectIdentityQuarantines()
+        SessionStoreProjectIdentityQuarantineMonitor.shared.setObserver { observed.append($0) }
+        let decoded = NativeSessionStore(fileURL: archiveURL)
+
+        XCTAssertEqual(decoded.ownerID(), "native-duplicate-projects")
+        XCTAssertEqual(decoded.projects(), [unaffected])
+        XCTAssertEqual(decoded.sessions(), [existingSession])
+        XCTAssertNil(decoded.archiveQuarantine(), "The readable archive itself remains usable")
+        let quarantine = try XCTUnwrap(decoded.projectIdentityQuarantine())
+        XCTAssertEqual(
+            quarantine.conflicts,
+            [SessionStoreProjectIdentityConflict(
+                projectID: duplicateA.id,
+                records: [duplicateA, duplicateB]
+            )]
+        )
+        XCTAssertEqual(quarantine.quarantinedRecordCount, 2)
+        XCTAssertTrue(quarantine.message.contains("Other projects and sessions remain available"))
+        let copyPath = try XCTUnwrap(quarantine.copyPath)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: copyPath)), bytes)
+
+        // The process-wide decoded cache and report ledger prevent repeated
+        // reads from creating copies or presenting duplicate notices.
+        XCTAssertEqual(NativeSessionStore(fileURL: archiveURL).projects(), [unaffected])
+        XCTAssertEqual(observed.all(), [quarantine])
+
+        // Ordinary writes remain available and persist only the validated
+        // records; the original conflicting bytes stay in the recovery copy.
+        decoded.renameProject(id: unaffected.id, name: "Renamed safely")
+        let persisted = try JSONDecoder().decode(
+            ProjectArchiveFixture.self,
+            from: Data(contentsOf: archiveURL)
+        )
+        XCTAssertEqual(persisted.projects.map(\.id), [unaffected.id])
+        XCTAssertEqual(persisted.projects.first?.name, "Renamed safely")
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: copyPath)), bytes)
+    }
+
+    func testRecoveryRejectsAmbiguousProjectsAndRecoversUnaffectedProjects() throws {
+        let duplicateA = OpenProject(
+            id: "nproj_ambiguous",
+            path: "/tmp/ambiguous-a",
+            name: "Ambiguous A",
+            createdAt: 1
+        )
+        let duplicateB = OpenProject(
+            id: duplicateA.id,
+            path: "/tmp/ambiguous-b",
+            name: "Ambiguous B",
+            createdAt: 2
+        )
+        let unaffected = OpenProject(
+            id: "nproj_safe",
+            path: "/tmp/safe",
+            name: "Safe",
+            createdAt: 3
+        )
+        let ownerID = "native-project-recovery"
+        let (archiveURL, _) = try writeProjectArchive(
+            ownerID: ownerID,
+            projects: [duplicateA, duplicateB, unaffected],
+            named: "duplicate-recovery"
+        )
+        let decoded = NativeSessionStore(fileURL: archiveURL)
+        let ambiguousRecord = BrokerTerminalRecord(
+            id: "term-ambiguous",
+            projectID: duplicateA.id,
+            pid: 1,
+            exited: false,
+            streamEpoch: "epoch-ambiguous",
+            endOffset: 1,
+            lastOwnerID: ownerID
+        )
+        let unaffectedRecord = BrokerTerminalRecord(
+            id: "term-safe",
+            projectID: unaffected.id,
+            pid: 2,
+            exited: false,
+            streamEpoch: "epoch-safe",
+            endOffset: 2,
+            lastOwnerID: ownerID
+        )
+
+        let recovered = decoded.recoverOwnedSessions(
+            from: [ambiguousRecord, unaffectedRecord],
+            now: 123_456
+        )
+
+        XCTAssertEqual(recovered.map(\.id), [unaffectedRecord.id])
+        XCTAssertEqual(recovered.first?.cwd, unaffected.path)
+        XCTAssertEqual(recovered.first?.title, unaffected.name)
+        XCTAssertEqual(decoded.sessions(), recovered)
+        XCTAssertEqual(decoded.projects(), [unaffected])
+        XCTAssertEqual(
+            decoded.projectIdentityQuarantine()?.conflicts.first?.records,
+            [duplicateA, duplicateB]
+        )
     }
 
     func testWorkspaceRestorationRoundTripsPaneOrderAndAgentDescriptor() async throws {
@@ -1889,6 +2022,21 @@ final class NativeSessionStoreTests: XCTestCase {
         return archiveURL
     }
 
+    private func writeProjectArchive(
+        ownerID: String,
+        sessions: [NativeOwnedSession] = [],
+        projects: [OpenProject],
+        named name: String
+    ) throws -> (url: URL, bytes: Data) {
+        let bytes = try JSONEncoder().encode(ProjectArchiveFixture(
+            ownerID: ownerID,
+            schemaVersion: NativeSessionStore.archiveSchemaVersion,
+            sessions: sessions,
+            projects: projects
+        ))
+        return (try writeArchive(bytes, named: name), bytes)
+    }
+
     private func makeMeshPane(
         id: String,
         basePath: String,
@@ -1944,6 +2092,30 @@ private final class CollectedQuarantines: @unchecked Sendable {
     }
 
     func all() -> [SessionStoreQuarantine] {
+        lock.lock()
+        defer { lock.unlock() }
+        return quarantines
+    }
+}
+
+private struct ProjectArchiveFixture: Codable {
+    let ownerID: String
+    let schemaVersion: Int
+    let sessions: [NativeOwnedSession]
+    let projects: [OpenProject]
+}
+
+private final class CollectedProjectIdentityQuarantines: @unchecked Sendable {
+    private let lock = NSLock()
+    private var quarantines: [SessionStoreProjectIdentityQuarantine] = []
+
+    func append(_ quarantine: SessionStoreProjectIdentityQuarantine) {
+        lock.lock()
+        defer { lock.unlock() }
+        quarantines.append(quarantine)
+    }
+
+    func all() -> [SessionStoreProjectIdentityQuarantine] {
         lock.lock()
         defer { lock.unlock() }
         return quarantines

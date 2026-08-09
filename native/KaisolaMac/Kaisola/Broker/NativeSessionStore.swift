@@ -299,6 +299,14 @@ struct NativeSessionStore: Sendable {
         return SessionStoreQuarantineMonitor.shared.quarantine(for: fileURL)
     }
 
+    /// Duplicate project identities found in an otherwise readable archive.
+    /// The ambiguous records are excluded from navigation and broker recovery,
+    /// while the report and recovery copy preserve exactly what was refused.
+    func projectIdentityQuarantine() -> SessionStoreProjectIdentityQuarantine? {
+        _ = loadArchive()
+        return SessionStoreProjectIdentityQuarantineMonitor.shared.quarantine(for: fileURL)
+    }
+
     private static func freshOwnerID() -> String {
         "native-" + UUID().uuidString.lowercased()
     }
@@ -360,7 +368,19 @@ struct NativeSessionStore: Sendable {
         now: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
     ) -> [NativeOwnedSession] {
         guard var payload = read(), !payload.ownerID.isEmpty else { return [] }
-        let projectsByID = Dictionary(uniqueKeysWithValues: (payload.projects ?? []).map { ($0.id, $0) })
+        // Project identities were validated while decoding. Build this without
+        // a trapping unique-key initializer anyway, so recovery stays fail
+        // closed if a future in-memory mutation violates that invariant.
+        var projectsByID: [String: OpenProject] = [:]
+        var ambiguousProjectIDs: Set<String> = []
+        for project in payload.projects ?? [] {
+            if projectsByID.updateValue(project, forKey: project.id) != nil {
+                ambiguousProjectIDs.insert(project.id)
+            }
+        }
+        for id in ambiguousProjectIDs {
+            projectsByID.removeValue(forKey: id)
+        }
         var known = Set(payload.sessions.map(\.id))
         var recovered: [NativeOwnedSession] = []
 
@@ -767,11 +787,46 @@ struct NativeSessionStore: Sendable {
                 bytes: nil
             )
         }
-        guard let payload = try? Self.decoder.decode(Payload.self, from: data) else {
+        guard var payload = try? Self.decoder.decode(Payload.self, from: data) else {
             return quarantine(.corrupt, bytes: data)
         }
+        payload = quarantineDuplicateProjectIdentities(in: payload, archiveBytes: data)
         PayloadCache.shared.store(payload, for: fileURL)
         return .loaded(payload)
+    }
+
+    /// Treat every record for a repeated identity as ambiguous. First- or
+    /// last-record-wins would let a partially merged archive silently choose a
+    /// different workspace path for broker recovery. Unique projects remain
+    /// available, and the exact refused records survive in a recovery copy.
+    private func quarantineDuplicateProjectIdentities(
+        in payload: Payload,
+        archiveBytes: Data
+    ) -> Payload {
+        guard let projects = payload.projects, !projects.isEmpty else { return payload }
+
+        var recordsByID: [String: [OpenProject]] = [:]
+        var identityOrder: [String] = []
+        for project in projects {
+            if recordsByID[project.id] == nil { identityOrder.append(project.id) }
+            recordsByID[project.id, default: []].append(project)
+        }
+        let conflicts = identityOrder.compactMap { id -> SessionStoreProjectIdentityConflict? in
+            guard let records = recordsByID[id], records.count > 1 else { return nil }
+            return SessionStoreProjectIdentityConflict(projectID: id, records: records)
+        }
+        guard !conflicts.isEmpty else { return payload }
+
+        let conflictingIDs = Set(conflicts.map(\.projectID))
+        var validated = payload
+        validated.projects = projects.filter { !conflictingIDs.contains($0.id) }
+        let report = SessionStoreProjectIdentityQuarantine(
+            path: fileURL.path,
+            conflicts: conflicts,
+            copyPath: Self.copyAside(archiveBytes, from: fileURL, marker: "project-conflicts")
+        )
+        SessionStoreProjectIdentityQuarantineMonitor.shared.record(report, for: fileURL)
+        return validated
     }
 
     /// Set the unreadable archive aside and latch the failure: until it is
@@ -854,13 +909,17 @@ struct NativeSessionStore: Sendable {
         }
     }
 
-    /// Keep a copy of the bytes we refuse to interpret next to the archive, so
-    /// recovery logic — or a human with a text editor — can still get the owner
-    /// identity out of them later.
-    private static func copyAside(_ data: Data, from fileURL: URL) -> String? {
+    /// Keep a copy of bytes containing records we refuse to trust next to the
+    /// archive, so recovery logic — or a human with a text editor — can inspect
+    /// them later without weakening the live store's validation.
+    private static func copyAside(
+        _ data: Data,
+        from fileURL: URL,
+        marker: String = "corrupt"
+    ) -> String? {
         let stamp = Int64(Date().timeIntervalSince1970 * 1_000)
         let target = fileURL.deletingLastPathComponent()
-            .appendingPathComponent("\(fileURL.lastPathComponent).corrupt-\(stamp)")
+            .appendingPathComponent("\(fileURL.lastPathComponent).\(marker)-\(stamp)")
         guard FileManager.default.createFile(
             atPath: target.path,
             contents: data,
@@ -1102,6 +1161,93 @@ final class SessionStoreQuarantineMonitor: @unchecked Sendable {
                 + "reason=\(quarantine.failure.reason) "
                 + "copy=\(quarantine.copyPath ?? "none") "
                 + "salvagedOwner=\(quarantine.salvagedOwnerID ?? "none")\n").utf8
+        ))
+        if let observer {
+            observer(quarantine)
+        } else {
+            let message = quarantine.message
+            Task { @MainActor in
+                ToastCenter.shared.show(message, style: .error, duration: 8)
+            }
+        }
+        return true
+    }
+}
+
+/// Every saved project record sharing one identity. None is trusted: choosing
+/// a first or last record could bind recovered broker sessions to the wrong
+/// workspace after a partial archive merge.
+struct SessionStoreProjectIdentityConflict: Equatable, Sendable {
+    let projectID: String
+    let records: [OpenProject]
+}
+
+/// A readable archive whose ambiguous project records were set aside while
+/// unaffected projects continued loading normally.
+struct SessionStoreProjectIdentityQuarantine: Equatable, Sendable {
+    let path: String
+    let conflicts: [SessionStoreProjectIdentityConflict]
+    let copyPath: String?
+
+    var quarantinedRecordCount: Int {
+        conflicts.reduce(0) { $0 + $1.records.count }
+    }
+
+    var message: String {
+        let identityWord = conflicts.count == 1 ? "identity" : "identities"
+        let recordWord = quarantinedRecordCount == 1 ? "record" : "records"
+        let recovery = copyPath.map { " A recovery copy is at \($0)." } ?? ""
+        return "Skipped \(quarantinedRecordCount) saved project \(recordWord) with "
+            + "\(conflicts.count) duplicated \(identityWord). Other projects and sessions "
+            + "remain available.\(recovery)"
+    }
+}
+
+/// Process-wide, one-notice-per-archive ledger for ambiguous project records.
+/// This is separate from the archive quarantine: the JSON and owner identity
+/// are readable, so only conflicting projects fail closed.
+final class SessionStoreProjectIdentityQuarantineMonitor: @unchecked Sendable {
+    static let shared = SessionStoreProjectIdentityQuarantineMonitor()
+
+    private let lock = NSLock()
+    private var quarantines: [URL: SessionStoreProjectIdentityQuarantine] = [:]
+    private var observer: (@Sendable (SessionStoreProjectIdentityQuarantine) -> Void)?
+
+    func setObserver(
+        _ observer: (@Sendable (SessionStoreProjectIdentityQuarantine) -> Void)?
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.observer = observer
+    }
+
+    func quarantine(for url: URL) -> SessionStoreProjectIdentityQuarantine? {
+        lock.lock()
+        defer { lock.unlock() }
+        return quarantines[url]
+    }
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        quarantines.removeAll()
+        observer = nil
+    }
+
+    @discardableResult
+    func record(_ quarantine: SessionStoreProjectIdentityQuarantine, for url: URL) -> Bool {
+        lock.lock()
+        let isNew = quarantines[url] == nil
+        quarantines[url] = quarantine
+        let observer = self.observer
+        lock.unlock()
+
+        guard isNew else { return false }
+        FileHandle.standardError.write(Data(
+            ("KAISOLA_SESSION_STORE_PROJECTS_QUARANTINED path=\(quarantine.path) "
+                + "identities=\(quarantine.conflicts.count) "
+                + "records=\(quarantine.quarantinedRecordCount) "
+                + "copy=\(quarantine.copyPath ?? "none")\n").utf8
         ))
         if let observer {
             observer(quarantine)

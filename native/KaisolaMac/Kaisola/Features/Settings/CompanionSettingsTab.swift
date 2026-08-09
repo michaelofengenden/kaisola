@@ -3,6 +3,24 @@ import CoreImage.CIFilterBuiltins
 import KaisolaCore
 import SwiftUI
 
+struct CompanionPairingCodePresentation: Equatable, Sendable {
+    let code: String
+
+    var title: String { "Single-use pairing code" }
+    var displayValue: String { code }
+    var copyValue: String { code }
+    var accessibilityValue: String { code }
+}
+
+enum CompanionPairingOfferAccessibility {
+    static let group = "companion.pairing-offer"
+    static let code = group + ".code"
+    static let qrCode = group + ".qr-code"
+    static let copy = group + ".copy"
+    static let cancel = group + ".cancel"
+    static let allControlIdentifiers = [code, qrCode, copy, cancel]
+}
+
 struct CompanionSettingsTab: View {
     @ObservedObject private var host = CompanionHost.shared
     @State private var allowsAgentControl = false
@@ -88,48 +106,94 @@ struct CompanionSettingsTab: View {
                                 .accessibilityLabel("Allow terminal control")
                         }
                         SettingsDivider()
-                        HStack {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(host.pairingCode == nil ? "Create a single-use code" : "Code expires after two minutes")
-                                    .font(.callout.weight(.medium))
-                                Text("Scan on iPhone, or copy the code into kaisola.com/app.")
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                            Spacer()
-                            if host.pairingCode == nil {
-                                Button("Pair New Device") { createOffer() }
-                                    .buttonStyle(.borderedProminent)
-                                    .controlSize(.small)
-                            } else {
-                                Button("Cancel", action: host.cancelPairing)
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
-                            }
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 11)
-
-                        if let code = host.pairingCode,
-                           let image = CompanionQRCode.image(for: code) {
-                            Divider().opacity(0.45)
-                            VStack(spacing: 10) {
-                                Image(nsImage: image)
-                                    .interpolation(.none)
-                                    .resizable()
-                                    .frame(width: 220, height: 220)
-                                    .accessibilityLabel("Companion pairing QR code")
-                                Button("Copy Pairing Code") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(code, forType: .string)
+                        VStack(spacing: 0) {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(host.pairingCode == nil ? "Create a single-use code" : "Code expires after two minutes")
+                                        .font(.callout.weight(.medium))
+                                    Text("Scan on iPhone, or copy the code into kaisola.com/app.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
                                 }
-                                .buttonStyle(.plain)
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(Color.accentColor)
+                                Spacer()
+                                if host.pairingCode == nil {
+                                    Button("Pair New Device") { createOffer() }
+                                        .buttonStyle(.borderedProminent)
+                                        .controlSize(.small)
+                                } else {
+                                    Button("Cancel", action: host.cancelPairing)
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .accessibilityIdentifier(
+                                            CompanionPairingOfferAccessibility.cancel
+                                        )
+                                }
                             }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 14)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 11)
+
+                            if let code = host.pairingCode {
+                                let presentation = CompanionPairingCodePresentation(code: code)
+                                Divider().opacity(0.45)
+                                VStack(spacing: 12) {
+                                    if let image = CompanionQRCode.image(for: code) {
+                                        Image(nsImage: image)
+                                            .interpolation(.none)
+                                            .resizable()
+                                            .frame(width: 220, height: 220)
+                                            .accessibilityLabel("Companion pairing QR code")
+                                            .accessibilityIdentifier(
+                                                CompanionPairingOfferAccessibility.qrCode
+                                            )
+                                    }
+
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Text(presentation.title)
+                                            .font(.caption.weight(.semibold))
+                                        Text(presentation.displayValue)
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.primary)
+                                            .textSelection(.enabled)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .padding(10)
+                                            .background(
+                                                Color(nsColor: .textBackgroundColor),
+                                                in: RoundedRectangle(cornerRadius: 8)
+                                            )
+                                            .overlay {
+                                                RoundedRectangle(cornerRadius: 8)
+                                                    .stroke(Color(nsColor: .separatorColor))
+                                            }
+                                            .accessibilityLabel(presentation.title)
+                                            .accessibilityValue(presentation.accessibilityValue)
+                                            .accessibilityIdentifier(
+                                                CompanionPairingOfferAccessibility.code
+                                            )
+                                    }
+                                    .frame(maxWidth: 360, alignment: .leading)
+
+                                    Button("Copy Pairing Code") {
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(
+                                            presentation.copyValue,
+                                            forType: .string
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(Color.accentColor)
+                                    .accessibilityIdentifier(
+                                        CompanionPairingOfferAccessibility.copy
+                                    )
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 14)
+                            }
                         }
+                        .accessibilityElement(children: .contain)
+                        .accessibilityIdentifier(CompanionPairingOfferAccessibility.group)
 
                         if let phrase = host.pairingPhrase {
                             Divider().opacity(0.45)

@@ -368,6 +368,29 @@ final class CompanionHostFoundationTests: XCTestCase {
         XCTAssertNil(CompanionQRCode.image(for: ""))
     }
 
+    func testPairingCodePresentationPreservesTheExactDisplayedAndCopiedValue() {
+        let code = #"{"accountScope":"acct-1","pairingNonce":"aB-_09","type":"kaisola-companion-pairing"}"#
+        let presentation = CompanionPairingCodePresentation(code: code)
+
+        XCTAssertEqual(presentation.displayValue, code)
+        XCTAssertEqual(presentation.copyValue, code)
+        XCTAssertEqual(presentation.accessibilityValue, code)
+        XCTAssertEqual(presentation.title, "Single-use pairing code")
+    }
+
+    func testPairingOfferControlsUseOneStableAccessibilityGroup() {
+        let identifiers = CompanionPairingOfferAccessibility.allControlIdentifiers
+
+        XCTAssertEqual(Set(identifiers).count, identifiers.count)
+        XCTAssertTrue(identifiers.allSatisfy {
+            $0.hasPrefix(CompanionPairingOfferAccessibility.group + ".")
+        })
+        XCTAssertTrue(identifiers.contains(CompanionPairingOfferAccessibility.code))
+        XCTAssertTrue(identifiers.contains(CompanionPairingOfferAccessibility.qrCode))
+        XCTAssertTrue(identifiers.contains(CompanionPairingOfferAccessibility.copy))
+        XCTAssertTrue(identifiers.contains(CompanionPairingOfferAccessibility.cancel))
+    }
+
     func testPairingCoordinatorCompletesMutualProofSASAndSecureResume() async throws {
         let fixture = try makePairingFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }

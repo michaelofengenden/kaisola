@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import SwiftUI
 import WebKit
@@ -283,14 +284,21 @@ struct CsvCellInspection: Equatable, Sendable, Identifiable {
 
     let id: ID
     let value: String
+    private let rowAccessibilityLabel: String
 
-    init(rowIndex: Int, columnIndex: Int, value: String) {
+    init(
+        rowIndex: Int,
+        columnIndex: Int,
+        value: String,
+        rowAccessibilityLabel: String? = nil
+    ) {
         id = ID(rowIndex: rowIndex, columnIndex: columnIndex)
         self.value = value
+        self.rowAccessibilityLabel = rowAccessibilityLabel ?? "Row \(rowIndex + 1)"
     }
 
     var accessibilityLabel: String {
-        "Row \(id.rowIndex + 1), column \(id.columnIndex + 1)"
+        "\(rowAccessibilityLabel), column \(id.columnIndex + 1)"
     }
 
     var accessibilityValue: String {
@@ -312,20 +320,150 @@ enum CsvCellClipboard {
     }
 }
 
-/// A scrollable table for CSV/TSV text. The first row is styled as a header;
-/// cells are monospaced 12pt with fixed per-column widths so columns align
-/// across a vertically lazy list. Delimiter is auto-detected.
+enum CsvHeaderMode: String, CaseIterable, Identifiable, Sendable {
+    case automatic
+    case firstRowIsHeader
+    case noHeader
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .automatic: "Auto"
+        case .firstRowIsHeader: "First Row Is Header"
+        case .noHeader: "No Header"
+        }
+    }
+}
+
+struct CsvHeaderResolution: Equatable, Sendable {
+    let mode: CsvHeaderMode
+    let hasHeader: Bool
+
+    init(mode: CsvHeaderMode, rows: [[String]]) {
+        self.mode = mode
+        switch mode {
+        case .automatic:
+            hasHeader = Self.automaticHeaderEvidence(in: rows)
+        case .firstRowIsHeader:
+            hasHeader = !rows.isEmpty
+        case .noHeader:
+            hasHeader = false
+        }
+    }
+
+    func isHeader(rowIndex: Int) -> Bool {
+        hasHeader && rowIndex == 0
+    }
+
+    func dataRowNumber(rowIndex: Int) -> Int? {
+        guard rowIndex >= 0 else { return nil }
+        if hasHeader {
+            return rowIndex == 0 ? nil : rowIndex
+        }
+        return rowIndex + 1
+    }
+
+    func accessibilityLabel(rowIndex: Int, columnIndex: Int) -> String {
+        if isHeader(rowIndex: rowIndex) {
+            return "Header, column \(columnIndex + 1)"
+        }
+        return "Row \(dataRowNumber(rowIndex: rowIndex) ?? rowIndex + 1), column \(columnIndex + 1)"
+    }
+
+    /// Automatic mode only promotes row zero when a later value supplies
+    /// concrete type evidence (for example `age` followed by `36`). Ambiguous
+    /// all-text tables remain data rows until the user explicitly opts in.
+    private static func automaticHeaderEvidence(in rows: [[String]]) -> Bool {
+        guard rows.count > 1 else { return false }
+        let first = rows[0]
+        let second = rows[1]
+        let comparableColumns = min(first.count, second.count)
+        guard comparableColumns > 0 else { return false }
+        return (0..<comparableColumns).contains { column in
+            let candidate = first[column].trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = second[column].trimmingCharacters(in: .whitespacesAndNewlines)
+            return !candidate.isEmpty
+                && !Self.isTypedData(candidate)
+                && Self.isTypedData(value)
+        }
+    }
+
+    private static func isTypedData(_ value: String) -> Bool {
+        guard !value.isEmpty else { return false }
+        if Double(value) != nil { return true }
+        switch value.lowercased() {
+        case "true", "false", "yes", "no", "null", "nil": return true
+        default: return false
+        }
+    }
+}
+
+/// Per-document preference storage. The key contains only a SHA-256 digest of
+/// the standardized path, so UserDefaults never becomes an absolute-path
+/// inventory. Automatic is the implicit default and removes any stored value.
+final class CsvHeaderPreferenceStore: @unchecked Sendable {
+    static let shared = CsvHeaderPreferenceStore()
+
+    private static let keyPrefix = "csvHeaderMode.v1."
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func mode(forPath path: String) -> CsvHeaderMode {
+        guard let rawValue = defaults.string(forKey: key(forPath: path)) else {
+            return .automatic
+        }
+        return CsvHeaderMode(rawValue: rawValue) ?? .automatic
+    }
+
+    func set(_ mode: CsvHeaderMode, forPath path: String) {
+        let key = key(forPath: path)
+        if mode == .automatic {
+            defaults.removeObject(forKey: key)
+        } else {
+            defaults.set(mode.rawValue, forKey: key)
+        }
+    }
+
+    private func key(forPath path: String) -> String {
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        let digest = SHA256.hash(data: Data(standardized.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return Self.keyPrefix + digest
+    }
+}
+
+/// A scrollable table for CSV/TSV text. Header semantics are inferred or
+/// explicitly selected per document; cells are monospaced 12pt with fixed
+/// per-column widths so columns align across a vertically lazy list.
 struct CsvPreview: View {
     let text: String
     let identity: PreviewParseIdentity
+    private let preferenceStore: CsvHeaderPreferenceStore
 
     @State private var cache = PreviewParseCache<CsvPreviewModel>()
     @State private var model: CsvPreviewModel?
     @State private var preparedIdentity: PreviewParseIdentity?
     @State private var inspectedCell: CsvCellInspection?
+    @State private var headerMode: CsvHeaderMode
     @FocusState private var focusedCellID: CsvCellInspection.ID?
 
     private static let cellFont = Font.system(size: 12, design: .monospaced)
+
+    init(
+        text: String,
+        identity: PreviewParseIdentity,
+        preferenceStore: CsvHeaderPreferenceStore = .shared
+    ) {
+        self.text = text
+        self.identity = identity
+        self.preferenceStore = preferenceStore
+        _headerMode = State(initialValue: preferenceStore.mode(forPath: identity.path))
+    }
 
     var body: some View {
         Group {
@@ -342,6 +480,7 @@ struct CsvPreview: View {
             // previous document while its replacement is parsing.
             inspectedCell = nil
             focusedCellID = nil
+            headerMode = preferenceStore.mode(forPath: identity.path)
             let source = text
             let parsed = await cache.value(for: source, parse: CsvPreviewModel.make)
             guard !Task.isCancelled else { return }
@@ -351,7 +490,9 @@ struct CsvPreview: View {
     }
 
     private func table(_ model: CsvPreviewModel) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
+        let headerResolution = CsvHeaderResolution(mode: headerMode, rows: model.rows)
+        return VStack(alignment: .leading, spacing: 0) {
+            headerControls(headerResolution)
             if let notice = model.truncation.notice { truncationNotice(notice) }
             if model.rows.isEmpty {
                 ContentUnavailableView(
@@ -368,7 +509,7 @@ struct CsvPreview: View {
                                 row,
                                 rowIndex: index,
                                 columnWidths: model.columnWidths,
-                                isHeader: index == 0
+                                headerResolution: headerResolution
                             )
                             Divider()
                         }
@@ -379,19 +520,72 @@ struct CsvPreview: View {
         }
     }
 
+    private func headerControls(_ resolution: CsvHeaderResolution) -> some View {
+        HStack(spacing: 8) {
+            Text("Header Row")
+                .font(.caption.weight(.medium))
+            Picker("Header Row", selection: headerModeSelection) {
+                ForEach(CsvHeaderMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .accessibilityLabel("CSV header row")
+            .accessibilityValue(headerMode.title)
+            .accessibilityIdentifier("csv.headerMode")
+            if headerMode == .automatic {
+                Text(resolution.hasHeader ? "Header detected" : "No header detected")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(
+                        resolution.hasHeader
+                            ? "Auto detected a header row"
+                            : "Auto detected no header row"
+                    )
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .background(Color.primary.opacity(0.035))
+    }
+
+    private var headerModeSelection: Binding<CsvHeaderMode> {
+        Binding(
+            get: { headerMode },
+            set: { mode in
+                headerMode = mode
+                preferenceStore.set(mode, forPath: identity.path)
+            }
+        )
+    }
+
     private func rowView(
         _ row: [String],
         rowIndex: Int,
         columnWidths: [CGFloat],
-        isHeader: Bool
+        headerResolution: CsvHeaderResolution
     ) -> some View {
-        HStack(spacing: 0) {
+        let isHeader = headerResolution.isHeader(rowIndex: rowIndex)
+        let dataRowNumber = headerResolution.dataRowNumber(rowIndex: rowIndex)
+        return HStack(spacing: 0) {
+            Text(isHeader ? "Header" : String(dataRowNumber ?? rowIndex + 1))
+                .font(.caption2.monospacedDigit().weight(isHeader ? .semibold : .regular))
+                .foregroundStyle(.secondary)
+                .frame(width: 48, alignment: .trailing)
+                .padding(.trailing, 8)
+                .help(isHeader ? "Header row" : "Data row \(dataRowNumber ?? rowIndex + 1)")
+                .accessibilityHidden(true)
             ForEach(Array(columnWidths.enumerated()), id: \.offset) { column, width in
                 cell(
                     CsvCellInspection(
                         rowIndex: rowIndex,
                         columnIndex: column,
-                        value: column < row.count ? row[column] : ""
+                        value: column < row.count ? row[column] : "",
+                        rowAccessibilityLabel: isHeader
+                            ? "Header"
+                            : "Row \(dataRowNumber ?? rowIndex + 1)"
                     ),
                     width: width,
                     isHeader: isHeader

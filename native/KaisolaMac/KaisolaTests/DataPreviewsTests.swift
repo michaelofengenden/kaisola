@@ -10,6 +10,78 @@ final class DataPreviewsTests: XCTestCase {
 
     // MARK: - CSV parsing
 
+    func testCsvHeaderModesResolveHeaderSemanticsAndDataRowNumbers() {
+        let labeled = [["name", "age"], ["Ada", "36"], ["Grace", "37"]]
+        let headerless = [["Ada", "36"], ["Grace", "37"]]
+
+        let automatic = CsvHeaderResolution(mode: .automatic, rows: labeled)
+        XCTAssertTrue(automatic.hasHeader)
+        XCTAssertTrue(automatic.isHeader(rowIndex: 0))
+        XCTAssertNil(automatic.dataRowNumber(rowIndex: 0))
+        XCTAssertEqual(automatic.dataRowNumber(rowIndex: 1), 1)
+        XCTAssertEqual(automatic.accessibilityLabel(rowIndex: 0, columnIndex: 1), "Header, column 2")
+        XCTAssertEqual(automatic.accessibilityLabel(rowIndex: 1, columnIndex: 1), "Row 1, column 2")
+
+        let conservativeAuto = CsvHeaderResolution(mode: .automatic, rows: headerless)
+        XCTAssertFalse(conservativeAuto.hasHeader)
+        XCTAssertEqual(conservativeAuto.dataRowNumber(rowIndex: 0), 1)
+
+        let forcedHeader = CsvHeaderResolution(mode: .firstRowIsHeader, rows: headerless)
+        XCTAssertTrue(forcedHeader.hasHeader)
+        XCTAssertEqual(forcedHeader.dataRowNumber(rowIndex: 1), 1)
+        XCTAssertEqual(
+            CsvCellInspection(
+                rowIndex: 0,
+                columnIndex: 1,
+                value: "36",
+                rowAccessibilityLabel: "Header"
+            ).accessibilityLabel,
+            "Header, column 2"
+        )
+
+        let forcedData = CsvHeaderResolution(mode: .noHeader, rows: labeled)
+        XCTAssertFalse(forcedData.hasHeader)
+        XCTAssertEqual(forcedData.dataRowNumber(rowIndex: 0), 1)
+        XCTAssertEqual(forcedData.accessibilityLabel(rowIndex: 0, columnIndex: 0), "Row 1, column 1")
+    }
+
+    func testCsvHeaderModeChoicesUseExactUserFacingNames() {
+        XCTAssertEqual(CsvHeaderMode.allCases.map(\.title), [
+            "Auto",
+            "First Row Is Header",
+            "No Header",
+        ])
+    }
+
+    func testCsvHeaderPreferencePersistsPerPreviewWithoutStoringThePath() {
+        let suite = "CsvHeaderPreferenceTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let firstPath = "/private/tmp/Customer exports/people.csv"
+        let secondPath = "/private/tmp/Customer exports/events.csv"
+
+        var store = CsvHeaderPreferenceStore(defaults: defaults)
+        XCTAssertEqual(store.mode(forPath: firstPath), .automatic)
+        store.set(.noHeader, forPath: firstPath)
+        store.set(.firstRowIsHeader, forPath: secondPath)
+
+        store = CsvHeaderPreferenceStore(defaults: defaults)
+        XCTAssertEqual(store.mode(forPath: firstPath), .noHeader)
+        XCTAssertEqual(
+            store.mode(forPath: "/private/tmp/Customer exports/archive/../people.csv"),
+            .noHeader,
+            "standardized aliases of the same preview must share one preference"
+        )
+        XCTAssertEqual(store.mode(forPath: secondPath), .firstRowIsHeader)
+        XCTAssertFalse(
+            defaults.dictionaryRepresentation().keys.contains { $0.contains(firstPath) },
+            "the persisted key must not expose an absolute preview path"
+        )
+
+        store.set(.automatic, forPath: firstPath)
+        XCTAssertEqual(CsvHeaderPreferenceStore(defaults: defaults).mode(forPath: firstPath), .automatic)
+    }
+
     func testParsesSimpleRows() {
         let result = CsvTable.parse("a,b,c\n1,2,3")
         XCTAssertEqual(result.rows, [["a", "b", "c"], ["1", "2", "3"]])

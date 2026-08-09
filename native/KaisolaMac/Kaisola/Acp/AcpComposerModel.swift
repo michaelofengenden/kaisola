@@ -246,11 +246,12 @@ enum AcpComposerMetrics {
     /// setting differently but both file it under `thought_level`. The word
     /// search stays as the fallback for adapters that omit the field.
     static func effortOption(_ options: [AcpConfigOption]) -> AcpConfigOption? {
-        if let declared = options.first(where: { $0.category?.lowercased() == "thought_level" }) {
+        let selects = options.filter { $0.currentValue != nil }
+        if let declared = selects.first(where: { $0.category?.lowercased() == "thought_level" }) {
             return declared
         }
         let effortWords = ["effort", "reasoning", "thinking", "think"]
-        return options.first { option in
+        return selects.first { option in
             let haystack = (option.id + " " + option.name).lowercased()
             return effortWords.contains { haystack.contains($0) }
         }
@@ -260,7 +261,7 @@ enum AcpComposerMetrics {
     /// change mid-task; anything else is a preset they set once, so it stays in
     /// the chip's menu rather than on its face.
     static func primaryOption(_ options: [AcpConfigOption]) -> AcpConfigOption? {
-        effortOption(options) ?? options.first
+        effortOption(options) ?? options.first(where: { $0.currentValue != nil })
     }
 
     /// The chosen value in the adapter's own display wording, falling back to
@@ -347,16 +348,17 @@ struct AcpComposerSurface: Equatable, Sendable {
         modes: [AcpSessionInfo.Mode],
         configOptions: [AcpConfigOption]
     ) -> AcpComposerSurface {
-        // An option with nothing to choose is not a setting; it is a label the
-        // menu would open onto a blank panel.
-        var options = configOptions.filter { !$0.choices.isEmpty }
+        // Select options need choices; a boolean is already a complete setting
+        // and deliberately has no `options` array in ACP.
+        var options = configOptions.filter { $0.booleanValue != nil || !$0.choices.isEmpty }
 
         // The permission chip already renders `modes`. An option offering those
         // very ids is that chip written out a second time.
         let modeIDs = Set(modes.map { folded($0.id) })
         if !modeIDs.isEmpty {
             options.removeAll { option in
-                classified(option, as: "mode", fallbackWords: ["mode", "approval"])
+                !option.choices.isEmpty
+                    && classified(option, as: "mode", fallbackWords: ["mode", "approval"])
                     && option.choices.allSatisfy { modeIDs.contains(folded($0.value)) }
             }
         }
@@ -510,11 +512,11 @@ struct AcpComposerSurface: Equatable, Sendable {
 
 // MARK: - Settings menu
 
-/// One top-level row of the composer's settings menu: `Label … value ›`.
+/// One top-level row of the composer's settings menu. Select controls disclose
+/// a second panel; ACP booleans are switches in place.
 ///
-/// The menu is a *disclosure* list, not a list of controls: every row states
-/// the setting's name, the value in force, and that there is more behind it.
-/// Nothing is chosen at this level, so nothing here needs a widget.
+/// Every row states the setting's name and confirmed value. Selects disclose
+/// their choices; booleans carry their switch state and adapter hint directly.
 struct AcpComposerMenuRow: Equatable, Sendable, Identifiable {
     enum Target: Equatable, Sendable {
         case agent
@@ -526,6 +528,12 @@ struct AcpComposerMenuRow: Equatable, Sendable, Identifiable {
     let target: Target
     let label: String
     let value: String
+    var booleanValue: Bool? = nil
+    var hint: String? = nil
+
+    var accessibilityValue: String {
+        booleanValue.map { $0 ? "On" : "Off" } ?? value
+    }
 
     var id: String {
         switch target {
@@ -582,13 +590,23 @@ enum AcpComposerMenu {
         if let model = currentModel(surface) {
             rows.append(AcpComposerMenuRow(target: .model, label: "Model", value: model.name))
         }
-        for option in surface.options where !option.choices.isEmpty {
-            let value = AcpComposerMetrics.optionLabel(option) ?? option.choices[0].name
-            rows.append(AcpComposerMenuRow(
-                target: .option(option.id),
-                label: shortLabel(name: option.name, id: option.id),
-                value: value
-            ))
+        for option in surface.options {
+            if let enabled = option.booleanValue {
+                rows.append(AcpComposerMenuRow(
+                    target: .option(option.id),
+                    label: option.name,
+                    value: enabled ? "On" : "Off",
+                    booleanValue: enabled,
+                    hint: option.description
+                ))
+            } else if !option.choices.isEmpty {
+                let value = AcpComposerMetrics.optionLabel(option) ?? option.choices[0].name
+                rows.append(AcpComposerMenuRow(
+                    target: .option(option.id),
+                    label: shortLabel(name: option.name, id: option.id),
+                    value: value
+                ))
+            }
         }
         return rows
     }

@@ -1,14 +1,14 @@
 import AppKit
 import SwiftUI
 
-/// The composer's settings menu: a compact disclosure list — `Label  value ›` —
-/// with the choosing done in a panel beside it.
+/// The composer's settings menu: compact disclosure rows — `Label  value ›` —
+/// plus ACP boolean switches that are complete controls in the first column.
 ///
 /// This replaces the provider rail, search field, and ⌘-numbered column the
 /// round-3 picker used. Those were three affordances answering one question,
 /// and that question ("which model?") is now one row among the settings a chat
-/// actually has. Nothing at this level is a control: every row states a name,
-/// the value in force, and that there is more behind it.
+/// actually has. Select rows state a name, the value in force, and that there
+/// is more behind it; boolean rows keep the adapter's native on/off shape.
 ///
 /// Both panels live inside one popover. A second floating window would match
 /// the reference's overlapping cards more literally, but a submenu drawn in the
@@ -117,12 +117,12 @@ struct AcpComposerMenuView: View {
     private var rowsColumn: some View {
         VStack(alignment: .leading, spacing: 1) {
             ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
-                disclosureRow(row, isHighlighted: highlightedRow == index || armed == row.target)
+                settingsRow(row, isHighlighted: highlightedRow == index || armed == row.target)
                     .onHover { inside in
                         guard inside else { return }
                         highlightedRow = index
                         highlightedOption = nil
-                        armed = row.target
+                        armed = row.booleanValue == nil ? row.target : nil
                     }
             }
 
@@ -133,6 +133,42 @@ struct AcpComposerMenuView: View {
         }
         .padding(Self.panelInset)
         .frame(width: Self.rowsWidth, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func settingsRow(_ row: AcpComposerMenuRow, isHighlighted: Bool) -> some View {
+        if row.booleanValue != nil {
+            booleanRow(row, isHighlighted: isHighlighted)
+        } else {
+            disclosureRow(row, isHighlighted: isHighlighted)
+        }
+    }
+
+    private func booleanRow(_ row: AcpComposerMenuRow, isHighlighted: Bool) -> some View {
+        Toggle(isOn: Binding(
+            get: { row.booleanValue ?? false },
+            set: { value in
+                guard value != row.booleanValue else { return }
+                choose(row.target, value ? "true" : "false")
+            }
+        )) {
+            Text(row.label)
+                .font(.callout)
+        }
+        .toggleStyle(.switch)
+        .controlSize(.small)
+        .padding(.horizontal, 9)
+        .padding(.vertical, 5)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            isHighlighted ? AnyShapeStyle(.quaternary.opacity(0.7)) : AnyShapeStyle(Color.clear),
+            in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius)
+        )
+        .help(row.hint ?? row.label)
+        .accessibilityLabel(row.label)
+        .accessibilityValue(row.accessibilityValue)
+        .accessibilityHint(row.hint ?? "Changes this setting for the current agent session")
+        .accessibilityIdentifier("acp.composer.menu.boolean.\(row.id)")
     }
 
     private func disclosureRow(_ row: AcpComposerMenuRow, isHighlighted: Bool) -> some View {
@@ -423,7 +459,7 @@ struct AcpComposerMenuView: View {
         }
         highlightedRow = next
         highlightedOption = nil
-        armed = rows[next].target
+        armed = rows[next].booleanValue == nil ? rows[next].target : nil
         return .handled
     }
 
@@ -454,7 +490,12 @@ struct AcpComposerMenuView: View {
             return .handled
         }
         if let index = highlightedRow, rows.indices.contains(index) {
-            armed = rows[index].target
+            let row = rows[index]
+            if let enabled = row.booleanValue {
+                choose(row.target, enabled ? "false" : "true")
+                return .handled
+            }
+            armed = row.target
             return enterSubmenu()
         }
         return .ignored

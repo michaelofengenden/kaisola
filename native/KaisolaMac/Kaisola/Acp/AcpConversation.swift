@@ -152,6 +152,10 @@ final class AcpConversation: ObservableObject {
     @Published private(set) var modes: [AcpSessionInfo.Mode] = []
     @Published private(set) var currentModeID: String?
     @Published private(set) var configOptions: [AcpConfigOption] = []
+    /// Durable, adapter-confirmed boolean values only. Select controls remain
+    /// adapter-session state; these values are explicitly persisted because an
+    /// ACP boolean has no safe string fallback when a session must be recreated.
+    @Published private(set) var confirmedBooleanConfigValues: [String: Bool]
     /// The one adapter-owned setting currently awaiting confirmation. Keeping
     /// the prior value visible until this clears prevents a rejected effort
     /// level from masquerading as the value the next prompt will use.
@@ -388,6 +392,9 @@ final class AcpConversation: ObservableObject {
         self.unloadedEarlierRowCount = max(0, initialEarlierRowCount)
         self.transcriptRetentionStatus = initialRetentionStatus
         self.restoredDraft = initialDraft
+        self.confirmedBooleanConfigValues = draftKey.map {
+            Self.loadPersistedBooleanConfigValues(for: $0)
+        } ?? [:]
         self.pendingAttachments = Self.restoredPendingAttachments(initialAttachments)
         self.attachmentCounter = self.pendingAttachments.count
         self.usage = initialUsage
@@ -438,11 +445,27 @@ final class AcpConversation: ObservableObject {
             currentModelID = info.currentModelID
             modes = info.modes
             currentModeID = info.currentModeID
-            configOptions = info.configOptions
+            var confirmedOptions = info.configOptions
+            var restorationFailure: String?
+            for (id, desiredValue) in confirmedBooleanConfigValues.sorted(by: { $0.key < $1.key }) {
+                guard let option = confirmedOptions.first(where: { $0.id == id }),
+                      let currentValue = option.booleanValue,
+                      currentValue != desiredValue else { continue }
+                do {
+                    confirmedOptions = try await client.setConfigOption(
+                        id: id,
+                        value: .boolean(desiredValue)
+                    )
+                } catch {
+                    let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    restorationFailure = "Couldn’t restore \(option.name) to \(desiredValue ? "On" : "Off"). \(detail)"
+                }
+            }
+            applyConfirmedConfigOptions(confirmedOptions)
             supportsSteering = info.supportsSteering
             isConnected = true
-            statusMessage = nil
-            lastConfigOptionFailureMessage = nil
+            statusMessage = restorationFailure
+            lastConfigOptionFailureMessage = restorationFailure
             // Only entries still in `queued` are known never to have been
             // dispatched. An explicit adapter restart resumes them; ordinary
             // app restoration leaves them paused until the user chooses Resume
@@ -821,20 +844,48 @@ final class AcpConversation: ObservableObject {
     /// One request at a time also makes response order unambiguous.
     func selectConfigOption(_ id: String, value: String) {
         guard isConnected, pendingConfigOptionID == nil,
-              let option = configOptions.first(where: { $0.id == id }),
-              option.currentValue != value,
+              let option = configOptions.first(where: { $0.id == id }) else { return }
+
+        if option.booleanValue != nil {
+            guard let boolean = Bool(value) else { return }
+            selectBooleanConfigOption(id, value: boolean)
+            return
+        }
+
+        guard option.currentValue != value,
               let choice = option.choices.first(where: { $0.value == value }) else { return }
 
+        requestConfigOptionChange(option, value: .select(value), requestedLabel: choice.name)
+    }
+
+    func selectBooleanConfigOption(_ id: String, value: Bool) {
+        guard isConnected, pendingConfigOptionID == nil,
+              let option = configOptions.first(where: { $0.id == id }),
+              let confirmed = option.booleanValue,
+              confirmed != value else { return }
+
+        requestConfigOptionChange(
+            option,
+            value: .boolean(value),
+            requestedLabel: value ? "On" : "Off"
+        )
+    }
+
+    private func requestConfigOptionChange(
+        _ option: AcpConfigOption,
+        value: AcpConfigOption.Value,
+        requestedLabel: String
+    ) {
         configOptionRequestGeneration &+= 1
         let generation = configOptionRequestGeneration
-        pendingConfigOptionID = id
+        pendingConfigOptionID = option.id
         let requestClient = client
         Task { [weak self] in
             do {
-                let confirmed = try await requestClient.setConfigOption(id: id, value: value)
+                let confirmed = try await requestClient.setConfigOption(id: option.id, value: value)
                 guard let self, self.configOptionRequestGeneration == generation else { return }
                 self.pendingConfigOptionID = nil
-                self.configOptions = confirmed
+                self.applyConfirmedConfigOptions(confirmed)
                 if self.statusMessage == self.lastConfigOptionFailureMessage {
                     self.statusMessage = nil
                 }
@@ -843,10 +894,23 @@ final class AcpConversation: ObservableObject {
                 guard let self, self.configOptionRequestGeneration == generation else { return }
                 self.pendingConfigOptionID = nil
                 let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                let message = "Couldn’t change \(option.name) to \(choice.name). \(detail)"
+                let message = "Couldn’t change \(option.name) to \(requestedLabel). \(detail)"
                 self.lastConfigOptionFailureMessage = message
                 self.statusMessage = message
             }
+        }
+    }
+
+    private func applyConfirmedConfigOptions(_ options: [AcpConfigOption]) {
+        configOptions = options
+        var booleans: [String: Bool] = [:]
+        for option in options {
+            if let value = option.booleanValue { booleans[option.id] = value }
+        }
+        guard booleans != confirmedBooleanConfigValues else { return }
+        confirmedBooleanConfigValues = booleans
+        if let draftStorageKey {
+            Self.persistBooleanConfigValues(booleans, for: draftStorageKey)
         }
     }
 
@@ -1118,6 +1182,46 @@ final class AcpConversation: ObservableObject {
         ["chatDraft.\(draftStorageKey)"]
     }
 
+    static func persistedBooleanConfigDefaultsKeys(for draftStorageKey: String) -> [String] {
+        ["chatBooleanConfig.\(draftStorageKey)"]
+    }
+
+    static func loadPersistedBooleanConfigValues(
+        for draftStorageKey: String,
+        defaults: UserDefaults = .standard
+    ) -> [String: Bool] {
+        guard let key = persistedBooleanConfigDefaultsKeys(for: draftStorageKey).first,
+              let data = defaults.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([String: Bool].self, from: data) else {
+            return [:]
+        }
+        return Dictionary(
+            uniqueKeysWithValues: decoded.keys.sorted().prefix(64).compactMap { id in
+                guard !id.isEmpty, id.utf8.count <= 256, let value = decoded[id] else { return nil }
+                return (id, value)
+            }
+        )
+    }
+
+    private static func persistBooleanConfigValues(
+        _ values: [String: Bool],
+        for draftStorageKey: String,
+        defaults: UserDefaults = .standard
+    ) {
+        guard let key = persistedBooleanConfigDefaultsKeys(for: draftStorageKey).first else { return }
+        let bounded: [String: Bool] = Dictionary(
+            uniqueKeysWithValues: values.keys.sorted().prefix(64).compactMap { id in
+                guard !id.isEmpty, id.utf8.count <= 256, let value = values[id] else { return nil }
+                return (id, value)
+            }
+        )
+        guard !bounded.isEmpty, let data = try? JSONEncoder().encode(bounded) else {
+            defaults.removeObject(forKey: key)
+            return
+        }
+        defaults.set(data, forKey: key)
+    }
+
     static func removePersistedDraft(
         for draftStorageKey: String,
         currentDefaults: UserDefaults = .standard,
@@ -1125,7 +1229,9 @@ final class AcpConversation: ObservableObject {
             suiteName: KaisolaProductMigration.legacyBundleIdentifier
         )
     ) {
-        for key in persistedDraftDefaultsKeys(for: draftStorageKey) {
+        let keys = persistedDraftDefaultsKeys(for: draftStorageKey)
+            + persistedBooleanConfigDefaultsKeys(for: draftStorageKey)
+        for key in keys {
             currentDefaults.removeObject(forKey: key)
             migratedDefaults?.removeObject(forKey: key)
         }
@@ -1330,7 +1436,7 @@ final class AcpConversation: ObservableObject {
         case let .commands(list):
             commands = list
         case let .configOptions(options):
-            configOptions = options
+            applyConfirmedConfigOptions(options)
         case let .permission(request):
             handlePermission(request)
         case .turnEnded:

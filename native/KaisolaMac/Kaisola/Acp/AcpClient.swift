@@ -128,7 +128,7 @@ actor AcpClient {
             try await transport.start(command: command, arguments: arguments, environment: environment, cwd: cwd)
             readerTask = Task { await readLoop() }
 
-            let initResult = try await request("initialize", params: .object([
+            let initResult = try await request("initialize", params: AcpBooleanConfigWire.advertise(in: .object([
             "protocolVersion": .integer(Int64(AcpWire.protocolVersion)),
             "clientCapabilities": .object([
                 "fs": .object(["readTextFile": .bool(true), "writeTextFile": .bool(true)]),
@@ -136,7 +136,7 @@ actor AcpClient {
                 "auth": .object(["terminal": .bool(true)]),
                 "_meta": .object(["terminal-auth": .bool(true)]),
             ]),
-        ]))
+        ])))
         // ACP requires the client to disconnect when the negotiated protocol is
         // not one it speaks. Silently continuing here can make a newer adapter
         // look connected while every later request is subtly malformed.
@@ -214,7 +214,7 @@ actor AcpClient {
                 currentModelID: modelsNode?["currentModelId"]?.stringValue ?? object["currentModelId"]?.stringValue,
                 modes: modes,
                 currentModeID: modesNode?["currentModeId"]?.stringValue ?? object["currentModeId"]?.stringValue,
-                configOptions: Self.parseConfigOptions(object["configOptions"]),
+                configOptions: AcpBooleanConfigWire.parseOptions(object["configOptions"]),
                 supportsSteering: capabilities.steering
             )
         } catch {
@@ -371,6 +371,31 @@ actor AcpClient {
         ]))
         let options = Self.parseConfigOptions(result.objectValue?["configOptions"])
         guard options.contains(where: { $0.id == id && $0.currentValue != nil }) else {
+            throw AcpClientError.malformedResponse
+        }
+        return options
+    }
+
+    /// Boolean ACP config mutations retain their JSON type on the wire. Select
+    /// options continue through the established string path above unchanged.
+    func setConfigOption(
+        id: String,
+        value: AcpConfigOption.Value
+    ) async throws -> [AcpConfigOption] {
+        if case let .select(selected) = value {
+            return try await setConfigOption(id: id, value: selected)
+        }
+        guard case let .boolean(enabled) = value, let sessionID else {
+            throw AcpClientError.notRunning
+        }
+        let result = try await request("session/set_config_option", params: .object([
+            "sessionId": .string(sessionID),
+            "configId": .string(id),
+            "type": .string("boolean"),
+            "value": .bool(enabled),
+        ]))
+        let options = AcpBooleanConfigWire.parseOptions(result.objectValue?["configOptions"])
+        guard options.contains(where: { $0.id == id && $0.booleanValue != nil }) else {
             throw AcpClientError.malformedResponse
         }
         return options
@@ -797,7 +822,7 @@ actor AcpClient {
             eventHandler?(.commands(commands))
         case "config_option_update":
             if let options = object["configOptions"] {
-                eventHandler?(.configOptions(Self.parseConfigOptions(options)))
+                eventHandler?(.configOptions(AcpBooleanConfigWire.parseOptions(options)))
             }
         default:
             break

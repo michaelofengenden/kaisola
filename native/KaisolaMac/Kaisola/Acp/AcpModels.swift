@@ -194,8 +194,16 @@ struct AcpCommand: Equatable, Sendable, Identifiable {
 /// An adapter configuration option (reasoning effort, approval preset, …) from
 /// `session/new`'s `configOptions` and `session/set_config_option` responses.
 struct AcpConfigOption: Equatable, Sendable, Identifiable {
+    enum Value: Equatable, Sendable {
+        case select(String)
+        case boolean(Bool)
+    }
+
     let id: String
     let name: String
+    /// Adapter-provided explanatory copy. Boolean rows use it as both help and
+    /// an accessibility hint; it is never inferred from the identifier.
+    let description: String?
     /// ACP's own classification of what this option *is* (`mode`, `model`,
     /// `thought_level`, …). Adapters name the same setting differently — Codex
     /// says "Reasoning effort", our mock says the same, a third could say
@@ -203,13 +211,117 @@ struct AcpConfigOption: Equatable, Sendable, Identifiable {
     /// two surfaces are describing one setting. `nil` when the adapter omits it,
     /// which is why the name heuristics survive alongside it.
     var category: String?
-    var currentValue: String?
+    let value: Value?
     let choices: [Choice]
+
+    /// Compatibility accessor for select options. A boolean never degrades to
+    /// the strings "true"/"false", which keeps wire typing fail closed.
+    var currentValue: String? {
+        guard case let .select(current)? = value else { return nil }
+        return current
+    }
+
+    var booleanValue: Bool? {
+        guard case let .boolean(current)? = value else { return nil }
+        return current
+    }
+
+    init(
+        id: String,
+        name: String,
+        description: String? = nil,
+        category: String? = nil,
+        currentValue: String?,
+        choices: [Choice]
+    ) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.category = category
+        self.value = currentValue.map(Value.select)
+        self.choices = choices
+    }
+
+    init(
+        id: String,
+        name: String,
+        description: String? = nil,
+        category: String? = nil,
+        currentBooleanValue: Bool
+    ) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.category = category
+        self.value = .boolean(currentBooleanValue)
+        self.choices = []
+    }
 
     struct Choice: Equatable, Sendable, Identifiable {
         let value: String
         let name: String
         var id: String { value }
+    }
+}
+
+/// ACP v1 boolean session configuration is optional and separately negotiated.
+/// Keeping its additive wire contract here leaves the established select-option
+/// parser and mutation path unchanged for adapters that do not support it.
+enum AcpBooleanConfigWire {
+    static func advertise(in parameters: JSONValue) -> JSONValue {
+        guard var root = parameters.objectValue,
+              var capabilities = root["clientCapabilities"]?.objectValue else {
+            return parameters
+        }
+        capabilities["session"] = .object([
+            "configOptions": .object([
+                "boolean": .object([:]),
+            ]),
+        ])
+        root["clientCapabilities"] = .object(capabilities)
+        return .object(root)
+    }
+
+    /// Unknown option types and type/value mismatches are ignored rather than
+    /// coerced into a control that could send a differently typed mutation.
+    static func parseOptions(_ value: JSONValue?) -> [AcpConfigOption] {
+        (value?.arrayValue ?? []).compactMap { item -> AcpConfigOption? in
+            guard let object = item.objectValue,
+                  let id = object["id"]?.stringValue else { return nil }
+            let name = object["name"]?.stringValue ?? id
+            let description = object["description"]?.stringValue
+            let category = object["category"]?.stringValue
+            switch object["type"]?.stringValue {
+            case "boolean":
+                guard let currentValue = object["currentValue"]?.boolValue else { return nil }
+                return AcpConfigOption(
+                    id: id,
+                    name: name,
+                    description: description,
+                    category: category,
+                    currentBooleanValue: currentValue
+                )
+            case "select", nil:
+                let choices = (object["options"]?.arrayValue ?? []).compactMap { choice -> AcpConfigOption.Choice? in
+                    guard let fields = choice.objectValue,
+                          let value = fields["value"]?.stringValue else { return nil }
+                    return AcpConfigOption.Choice(
+                        value: value,
+                        name: fields["name"]?.stringValue ?? value
+                    )
+                }
+                return AcpConfigOption(
+                    id: id,
+                    name: name,
+                    description: description,
+                    category: category,
+                    currentValue: object["currentValue"]?.stringValue,
+                    choices: choices
+                )
+            default:
+                return nil
+            }
+        }
     }
 }
 

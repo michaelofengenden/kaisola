@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 
 /// Runs a provider's own login command from inside Settings, rather than
@@ -24,6 +25,29 @@ import Foundation
 /// one.
 @MainActor
 final class AccountSignInController: ObservableObject {
+    enum AccountDirectoryError: Error, Equatable, LocalizedError {
+        case symbolicLink(String)
+        case notDirectory(String)
+        case wrongOwner(String)
+        case couldNotInspect(String)
+        case couldNotSecure(String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .symbolicLink(path):
+                "Kaisola refused a symbolic link in the account path: \(path)"
+            case let .notDirectory(path):
+                "The account path contains something that is not a directory: \(path)"
+            case let .wrongOwner(path):
+                "The account directory path is owned by another user: \(path)"
+            case let .couldNotInspect(path):
+                "Kaisola couldn’t inspect the account directory path: \(path)"
+            case let .couldNotSecure(path):
+                "Kaisola couldn’t secure the account directory: \(path)"
+            }
+        }
+    }
+
     enum Phase: Equatable {
         case launching
         /// The browser step. `url` is nil only until the CLI has printed it.
@@ -137,6 +161,137 @@ final class AccountSignInController: ObservableObject {
             .last { $0.hasPrefix("/") && !$0.contains(" ") }
     }
 
+    /// Prepares a credential-bearing directory without letting Foundation
+    /// follow a link hidden anywhere in its path. System-owned ancestors (for
+    /// example `/` and `/Users`) are trusted, while the account directory
+    /// itself and every component Kaisola creates must belong to this user.
+    /// Existing ancestors are inspected but never chmodded; changing a home,
+    /// mount, or other caller-owned parent would be an over-broad side effect.
+    @discardableResult
+    nonisolated static func prepareAccountDirectory(
+        at requestedURL: URL,
+        currentUserID: uid_t = geteuid()
+    ) throws -> URL {
+        let standardizedPath = (requestedURL.path as NSString).standardizingPath
+        let directory = URL(fileURLWithPath: standardizedPath, isDirectory: true)
+        let components = directory.pathComponents
+        guard directory.isFileURL, components.first == "/" else {
+            throw AccountDirectoryError.couldNotInspect(directory.path)
+        }
+
+        var componentURL = URL(fileURLWithPath: "/", isDirectory: true)
+        try validateAccountPathComponent(
+            at: componentURL,
+            currentUserID: currentUserID,
+            isAccountDirectory: components.count == 1
+        )
+
+        for (offset, component) in components.dropFirst().enumerated() {
+            componentURL.appendPathComponent(component, isDirectory: true)
+            let isAccountDirectory = offset == components.count - 2
+            var needsPrivateMode = isAccountDirectory
+            var metadata = stat()
+            if lstat(componentURL.path, &metadata) == 0 {
+                try validateAccountPathComponent(
+                    at: componentURL,
+                    metadata: metadata,
+                    currentUserID: currentUserID,
+                    isAccountDirectory: isAccountDirectory
+                )
+            } else {
+                guard errno == ENOENT else {
+                    throw AccountDirectoryError.couldNotInspect(componentURL.path)
+                }
+                do {
+                    try FileManager.default.createDirectory(
+                        at: componentURL,
+                        withIntermediateDirectories: false,
+                        attributes: [.posixPermissions: 0o700]
+                    )
+                } catch {
+                    // A concurrent creator may win between lstat and mkdir.
+                    // Re-inspect it instead of either following it or assuming
+                    // that a file-exists failure made the path safe.
+                    guard lstat(componentURL.path, &metadata) == 0 else { throw error }
+                }
+                try validateAccountPathComponent(
+                    at: componentURL,
+                    currentUserID: currentUserID,
+                    isAccountDirectory: true
+                )
+                needsPrivateMode = true
+            }
+
+            if needsPrivateMode {
+                try enforcePrivateDirectory(at: componentURL, currentUserID: currentUserID)
+            }
+        }
+        return directory
+    }
+
+    private nonisolated static func validateAccountPathComponent(
+        at url: URL,
+        currentUserID: uid_t,
+        isAccountDirectory: Bool
+    ) throws {
+        var metadata = stat()
+        guard lstat(url.path, &metadata) == 0 else {
+            throw AccountDirectoryError.couldNotInspect(url.path)
+        }
+        try validateAccountPathComponent(
+            at: url,
+            metadata: metadata,
+            currentUserID: currentUserID,
+            isAccountDirectory: isAccountDirectory
+        )
+    }
+
+    private nonisolated static func validateAccountPathComponent(
+        at url: URL,
+        metadata: stat,
+        currentUserID: uid_t,
+        isAccountDirectory: Bool
+    ) throws {
+        let kind = metadata.st_mode & S_IFMT
+        guard kind != S_IFLNK else {
+            throw AccountDirectoryError.symbolicLink(url.path)
+        }
+        guard kind == S_IFDIR else {
+            throw AccountDirectoryError.notDirectory(url.path)
+        }
+        let ownerIsTrusted = metadata.st_uid == currentUserID
+            || (!isAccountDirectory && metadata.st_uid == 0)
+        guard ownerIsTrusted else {
+            throw AccountDirectoryError.wrongOwner(url.path)
+        }
+    }
+
+    /// Use a directory descriptor so a last-moment link swap cannot redirect
+    /// chmod to an unrelated path. fstat then proves the descriptor still
+    /// names the expected kind, owner, and final mode.
+    private nonisolated static func enforcePrivateDirectory(
+        at url: URL,
+        currentUserID: uid_t
+    ) throws {
+        let descriptor = open(url.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        guard descriptor >= 0 else {
+            throw AccountDirectoryError.couldNotSecure(url.path)
+        }
+        defer { close(descriptor) }
+
+        var metadata = stat()
+        guard fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFDIR,
+              metadata.st_uid == currentUserID,
+              fchmod(descriptor, mode_t(0o700)) == 0,
+              fstat(descriptor, &metadata) == 0,
+              metadata.st_mode & S_IFMT == S_IFDIR,
+              metadata.st_uid == currentUserID,
+              metadata.st_mode & mode_t(0o777) == mode_t(0o700) else {
+            throw AccountDirectoryError.couldNotSecure(url.path)
+        }
+    }
+
     func start(profile: UsageAccountProfile) {
         let tool = Self.toolName(for: profile.provider)
         guard let executable = Self.resolveExecutable(tool) else {
@@ -154,11 +309,10 @@ final class AccountSignInController: ObservableObject {
         // is Kaisola's job rather than something to hand back to the user.
         //
         // 0700 because a config directory is about to hold credentials.
+        let accountDirectory: URL
         do {
-            try FileManager.default.createDirectory(
-                at: URL(fileURLWithPath: profile.expandedDirectory, isDirectory: true),
-                withIntermediateDirectories: true,
-                attributes: [.posixPermissions: 0o700]
+            accountDirectory = try Self.prepareAccountDirectory(
+                at: URL(fileURLWithPath: profile.expandedDirectory, isDirectory: true)
             )
         } catch {
             phase = .failed(
@@ -171,7 +325,7 @@ final class AccountSignInController: ObservableObject {
         let login = profile.provider == .claude
             ? "\(quotedTool) auth login --claudeai"
             : "\(quotedTool) login"
-        let quoted = "'" + profile.expandedDirectory.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let quoted = "'" + accountDirectory.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
         let command = "\(profile.provider.environmentKey)=\(quoted) \(login)"
 
         let process = Process()

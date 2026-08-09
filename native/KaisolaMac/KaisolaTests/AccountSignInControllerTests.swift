@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import Kaisola
 
@@ -5,6 +6,92 @@ import XCTest
 /// provider CLIs' flow is predictable: print an OAuth URL, then block on stdin
 /// for a pasted code. These cover the two readings that drive the sheet.
 final class AccountSignInControllerTests: XCTestCase {
+    private func accountDirectory(_ suffix: String = UUID().uuidString) -> URL {
+        URL(fileURLWithPath: "/Users/Shared", isDirectory: true)
+            .appendingPathComponent("kaisola-account-tests-\(suffix)", isDirectory: true)
+    }
+
+    private func permissions(at url: URL) throws -> Int {
+        let value = try XCTUnwrap(
+            FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
+        )
+        return value.intValue & 0o777
+    }
+
+    func testExistingAccountDirectoryIsTightenedToOwnerOnly() throws {
+        let directory = accountDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o755]
+        )
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o755],
+            ofItemAtPath: directory.path
+        )
+
+        let prepared = try AccountSignInController.prepareAccountDirectory(at: directory)
+
+        XCTAssertEqual(prepared.path, directory.path)
+        XCTAssertEqual(try permissions(at: directory), 0o700)
+    }
+
+    func testEveryNewAccountDirectoryComponentIsOwnerOnly() throws {
+        let root = accountDirectory()
+        let parent = root.appendingPathComponent("profiles", isDirectory: true)
+        let directory = parent.appendingPathComponent("work", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try AccountSignInController.prepareAccountDirectory(at: directory)
+
+        XCTAssertEqual(try permissions(at: root), 0o700)
+        XCTAssertEqual(try permissions(at: parent), 0o700)
+        XCTAssertEqual(try permissions(at: directory), 0o700)
+    }
+
+    func testAccountDirectoryOwnedByAnotherUserIsRejected() throws {
+        let directory = accountDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        let userID = geteuid()
+        let differentUserID = userID == uid_t.max ? userID - 1 : userID + 1
+
+        XCTAssertThrowsError(
+            try AccountSignInController.prepareAccountDirectory(
+                at: directory,
+                currentUserID: differentUserID
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AccountSignInController.AccountDirectoryError,
+                .wrongOwner(directory.path)
+            )
+        }
+    }
+
+    func testSymlinkInAccountDirectoryPathIsRejected() throws {
+        let root = accountDirectory()
+        let realDirectory = root.appendingPathComponent("real", isDirectory: true)
+        let link = root.appendingPathComponent("linked", isDirectory: true)
+        let account = link.appendingPathComponent("work", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: realDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: realDirectory)
+
+        XCTAssertThrowsError(
+            try AccountSignInController.prepareAccountDirectory(at: account)
+        ) { error in
+            XCTAssertEqual(
+                error as? AccountSignInController.AccountDirectoryError,
+                .symbolicLink(link.path)
+            )
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: realDirectory.appendingPathComponent("work").path)
+        )
+    }
+
     /// The real first lines of `claude auth login --claudeai`, captured from
     /// the CLI. The URL must come back whole — a truncated `code_challenge`
     /// produces a sign-in page that fails at the end rather than the start.

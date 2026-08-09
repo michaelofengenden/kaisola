@@ -108,6 +108,42 @@ async function connectClient(config, access = 'controller') {
   return { socket, hello, request }
 }
 
+test('broker.inventory returns one stable observer snapshot', async (t) => {
+  const fixture = startBroker()
+  t.after(() => {
+    try { fixture.child.kill('SIGKILL') } catch {}
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  })
+  await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
+
+  const controller = await connectClient(fixture.config)
+  const created = await controller.request('terminal.create', {
+    ownerId: '0',
+    projectId: 'atomic-inventory',
+    id: 'atomic-inventory-terminal',
+    command: '/bin/cat',
+    args: [],
+    cwd: fixture.root,
+  })
+  assert.equal(created.result.ok, true)
+
+  const observer = await connectClient(fixture.config, 'observer')
+  assert.ok(observer.hello.features.includes('broker-inventory-v1'))
+  const response = await observer.request('broker.inventory', { ownerId: '0' })
+  assert.equal(response.ok, true)
+  assert.equal(response.result.ok, true)
+  assert.equal(response.result.state, 'stable')
+  assert.equal(response.result.activityEpoch, response.result.status.activityEpoch)
+  assert.equal(response.result.status.inFlightMutations, 0)
+  for (const rows of [response.result.diagnostics, response.result.live]) {
+    assert.ok(rows.some((row) => row.id === 'atomic-inventory-terminal'))
+  }
+
+  observer.socket.destroy()
+  controller.socket.destroy()
+})
+
 test('unhandled rejection policy preserves observation while fencing mutations', async (t) => {
   const fixture = startBroker({ rejectionProbe: true })
   t.after(() => {

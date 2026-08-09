@@ -18,8 +18,10 @@ public enum BrokerWire {
     public static let observerRoleFeature = "observer-role-v1"
     public static let brokerUpdateFeature = "broker-update-v1"
     public static let brokerRollingUpdateFeature = "broker-rolling-update-v1"
+    public static let brokerInventoryFeature = "broker-inventory-v1"
     public static let observerMethods: Set<String> = [
         "broker.status",
+        "broker.inventory",
         "terminal.list",
         "terminal.diagnostics",
         "terminal.history",
@@ -51,6 +53,8 @@ public enum BrokerWire {
                 26 * 1_024 * 1_024
             case "broker.status", "terminal.list", "terminal.diagnostics":
                 4 * 1_024 * 1_024
+            case "broker.inventory":
+                12 * 1_024 * 1_024
             default:
                 256 * 1_024
             }

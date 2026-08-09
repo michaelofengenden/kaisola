@@ -14,6 +14,7 @@ const brokerRuntimeTestFiles = Object.freeze([
   'tests/node/brokerCompatibility.test.cjs',
   'tests/node/brokerExitStatus.test.cjs',
   'tests/node/brokerFrameLimits.test.cjs',
+  'tests/node/brokerInventorySnapshot.test.cjs',
   'tests/node/brokerRendezvous.test.cjs',
   'tests/node/brokerRequestGate.test.cjs',
   'tests/node/brokerUpgrade.test.cjs',

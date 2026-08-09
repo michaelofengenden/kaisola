@@ -461,6 +461,210 @@ final class McpConfigStoreTests: XCTestCase {
         )
     }
 
+    // MARK: - In-place server editing (#412)
+
+    func testEditDraftPrefillsEveryFieldWithoutExposingAStoredSecret() throws {
+        let reference = McpOAuthSecretReference.make(
+            projectID: "project",
+            serverName: "remote",
+            location: .header,
+            pairName: "Authorization"
+        )
+        let original = McpServerConfig(
+            name: "remote",
+            kind: .http,
+            url: "https://old.example.test/mcp",
+            headerPairs: [
+                .init(name: "Authorization", value: "", secretReference: reference),
+                .init(name: "X-Region", value: "west"),
+            ],
+            enabled: false
+        )
+
+        var draft = McpServerEditDraft(server: original)
+        XCTAssertEqual(draft.name, "remote")
+        XCTAssertEqual(draft.kind, .http)
+        XCTAssertEqual(draft.url, "https://old.example.test/mcp")
+        XCTAssertTrue(draft.headerText.contains(
+            "Authorization=\(McpSettingsPolicy.storedSecretMarker)"
+        ))
+        XCTAssertTrue(draft.headerText.contains("X-Region=west"))
+        XCTAssertFalse(draft.headerText.contains(reference))
+
+        draft.url = "https://new.example.test/mcp"
+        let edited = try draft.server(preservingIdentityAndEnabledFrom: original)
+        XCTAssertEqual(edited.name, original.name)
+        XCTAssertEqual(edited.enabled, original.enabled)
+        XCTAssertEqual(edited.url, "https://new.example.test/mcp")
+        XCTAssertEqual(edited.headerPairs.first, original.headerPairs.first)
+    }
+
+    func testEditDraftRejectsMalformedLinesAndAnUnmatchedStoredSecretMarker() {
+        let original = McpServerConfig(
+            name: "remote",
+            kind: .http,
+            url: "https://example.test/mcp",
+            headerPairs: [.init(name: "Authorization", value: "Bearer old")]
+        )
+        var malformed = McpServerEditDraft(server: original)
+        malformed.headerText = "BROKEN"
+        XCTAssertThrowsError(try malformed.server(preservingIdentityAndEnabledFrom: original))
+
+        var unmatched = McpServerEditDraft(server: original)
+        unmatched.headerText = "X-Other=\(McpSettingsPolicy.storedSecretMarker)"
+        XCTAssertThrowsError(try unmatched.server(preservingIdentityAndEnabledFrom: original)) { error in
+            XCTAssertEqual(
+                error as? McpServerEditDraft.ValidationError,
+                .storedSecretMarkerDoesNotMatch(line: 1)
+            )
+        }
+    }
+
+    func testEditDraftPrefillsAndRebuildsEveryStdioField() throws {
+        let original = McpServerConfig(
+            name: "local",
+            kind: .stdio,
+            command: "npx",
+            args: ["-y", "server-filesystem"],
+            envPairs: [.init(name: "REGION", value: "west")],
+            enabled: true
+        )
+        var draft = McpServerEditDraft(server: original)
+        XCTAssertEqual(draft.command, "npx")
+        XCTAssertEqual(draft.argsText, "-y\nserver-filesystem")
+        XCTAssertEqual(draft.envText, "REGION=west")
+
+        draft.command = "node"
+        draft.argsText = "server.js\n--safe"
+        draft.envText = "REGION=east\nEMPTY="
+        let edited = try draft.server(preservingIdentityAndEnabledFrom: original)
+        XCTAssertEqual(edited.name, "local")
+        XCTAssertEqual(edited.command, "node")
+        XCTAssertEqual(edited.args, ["server.js", "--safe"])
+        XCTAssertEqual(edited.envPairs, [
+            .init(name: "REGION", value: "east"),
+            .init(name: "EMPTY", value: ""),
+        ])
+        XCTAssertTrue(edited.enabled)
+    }
+
+    func testReplacingServerPreservesOrderIdentityEnabledStateAndUnrelatedLegacySecrets() throws {
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+        let reference = McpOAuthSecretReference.make(
+            projectID: "project",
+            serverName: "remote",
+            location: .header,
+            pairName: "Authorization"
+        )
+        try secrets.vault.write(reference, "Bearer existing")
+        let original = [
+            McpServerConfig(name: "first", kind: .stdio, command: "first"),
+            McpServerConfig(
+                name: "remote",
+                kind: .http,
+                url: "https://old.example.test/mcp",
+                headerPairs: [.init(name: "Authorization", value: "", secretReference: reference)],
+                enabled: false
+            ),
+            McpServerConfig(
+                name: "legacy",
+                kind: .stdio,
+                command: "legacy",
+                envPairs: [.init(name: "ACCESS_TOKEN", value: "unapproved-legacy")]
+            ),
+        ]
+        configured.save(original)
+
+        var replacement = original[1]
+        replacement.url = "https://new.example.test/mcp"
+        replacement.enabled = true // The store seals this to the existing row.
+        replacement.headerPairs.append(.init(name: "X-API-Key", value: "new-secret"))
+        let receipt = try configured.replaceSecuringOAuthServer(
+            replacement,
+            identifiedBy: "remote",
+            in: original,
+            consent: true
+        )
+
+        XCTAssertEqual(receipt.servers.map(\.name), ["first", "remote", "legacy"])
+        XCTAssertFalse(receipt.servers[1].enabled)
+        XCTAssertEqual(receipt.servers[1].headerPairs[0].secretReference, reference)
+        XCTAssertEqual(receipt.servers[2].envPairs[0].value, "unapproved-legacy")
+        XCTAssertEqual(receipt.migratedCount, 1)
+        let newReference = try XCTUnwrap(receipt.servers[1].headerPairs[1].secretReference)
+        XCTAssertEqual(secrets.values[reference], "Bearer existing")
+        XCTAssertEqual(secrets.values[newReference], "new-secret")
+        XCTAssertEqual(configured.servers(), receipt.servers)
+        XCTAssertEqual(configured.pendingPlaintextOAuthSecretCount(), 1)
+    }
+
+    func testReplacingAMissingIdentityLeavesTheCatalogByteExact() throws {
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+        let original = [McpServerConfig(name: "keep", kind: .stdio, command: "keep")]
+        configured.save(original)
+        let before = try Data(contentsOf: configured.fileURL)
+
+        XCTAssertThrowsError(try configured.replaceSecuringOAuthServer(
+            McpServerConfig(name: "missing", kind: .stdio, command: "replacement"),
+            identifiedBy: "missing",
+            in: original,
+            consent: true
+        )) { error in
+            XCTAssertEqual(error as? McpConfigMutationError, .serverNotFound("missing"))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: configured.fileURL), before)
+        XCTAssertEqual(configured.servers(), original)
+        XCTAssertTrue(secrets.values.isEmpty)
+
+        XCTAssertThrowsError(try configured.replaceSecuringOAuthServer(
+            McpServerConfig(name: "renamed", kind: .stdio, command: "replacement"),
+            identifiedBy: "keep",
+            in: original,
+            consent: true
+        )) { error in
+            XCTAssertEqual(error as? McpConfigMutationError, .identityChanged)
+        }
+        XCTAssertEqual(try Data(contentsOf: configured.fileURL), before)
+    }
+
+    func testFailedEditedWriteKeepsThePriorCatalogAndKeychainByteExact() throws {
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+        let original = [
+            McpServerConfig(
+                name: "remote",
+                kind: .http,
+                url: "https://old.example.test/mcp",
+                enabled: false
+            ),
+        ]
+        configured.save(original)
+        let before = try Data(contentsOf: configured.fileURL)
+        let directory = configured.fileURL.deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
+
+        var replacement = original[0]
+        replacement.url = "https://new.example.test/mcp"
+        replacement.headerPairs = [.init(name: "Authorization", value: "Bearer new-secret")]
+        XCTAssertThrowsError(try configured.replaceSecuringOAuthServer(
+            replacement,
+            identifiedBy: "remote",
+            in: original,
+            consent: true
+        )) { error in
+            XCTAssertEqual(error as? McpOAuthSecretMigrationError, .configurationWriteFailed)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: configured.fileURL), before)
+        XCTAssertTrue(secrets.values.isEmpty)
+    }
+
     // MARK: - Environment / header line validation
 
     /// Every non-blank line either becomes a pair or is reported by number. A

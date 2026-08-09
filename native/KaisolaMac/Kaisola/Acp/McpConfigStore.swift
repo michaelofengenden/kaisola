@@ -45,6 +45,23 @@ enum McpOAuthSecretMigrationError: Error, Equatable, LocalizedError {
     }
 }
 
+enum McpConfigMutationError: Error, Equatable, LocalizedError {
+    case serverNotFound(String)
+    case identityChanged
+    case invalidServer(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .serverNotFound(name):
+            "The MCP server \"\(name)\" no longer exists, so no changes were saved."
+        case .identityChanged:
+            "An MCP server must keep its existing name while it is edited."
+        case let .invalidServer(message):
+            message
+        }
+    }
+}
+
 /// Injectable secret boundary. Production uses a this-device-only,
 /// data-protection Keychain generic-password item. Tests use an in-memory vault
 /// and can deterministically refuse writes without touching a developer login
@@ -429,6 +446,38 @@ struct McpConfigStore: Sendable {
             servers + [server],
             consent: consent,
             migratingServerIndices: [servers.count]
+        )
+    }
+
+    /// Replace one configured row in place. The selected name is its durable
+    /// identity, so an edit cannot reorder the catalog, rename another row, or
+    /// accidentally flip its enabled state. Only the edited row is eligible
+    /// for a consented Keychain migration; unrelated legacy plaintext keeps
+    /// requiring the separate migration confirmation.
+    func replaceSecuringOAuthServer(
+        _ replacement: McpServerConfig,
+        identifiedBy identity: String,
+        in servers: [McpServerConfig],
+        consent: Bool
+    ) throws -> MigrationReceipt {
+        guard let index = servers.firstIndex(where: { $0.id == identity }) else {
+            throw McpConfigMutationError.serverNotFound(identity)
+        }
+        guard replacement.name == identity else {
+            throw McpConfigMutationError.identityChanged
+        }
+        var sealed = replacement
+        sealed.name = servers[index].name
+        sealed.enabled = servers[index].enabled
+        if let validationError = sealed.validationError {
+            throw McpConfigMutationError.invalidServer(validationError)
+        }
+        var updated = servers
+        updated[index] = sealed
+        return try secureAndPersist(
+            updated,
+            consent: consent,
+            migratingServerIndices: [index]
         )
     }
 

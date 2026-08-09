@@ -42,6 +42,7 @@ enum McpSettingsPolicy {
     private static let nameComparisonLocale = Locale(identifier: "en_US_POSIX")
 
     static let changeScopeTitle = "New chats only"
+    static let storedSecretMarker = "<stored in Keychain>"
 
     static func changeScopeDetail(openChatCount: Int) -> String {
         let count = max(0, openChatCount)
@@ -181,6 +182,145 @@ enum McpSettingsPolicy {
         let detail = problems.map { "Line \($0.line): \($0.reason)" }.joined(separator: "\n")
         return "\(field) could not be read, so nothing was saved:\n\(detail)"
     }
+
+    /// Prefill an edit without ever materializing a Keychain-backed or legacy
+    /// plaintext credential into the Settings text editor. Keeping the marker
+    /// on its original pair means Save can preserve the exact opaque reference;
+    /// deleting the line still removes that pair from the configuration.
+    static func pairEditorText(_ pairs: [McpServerConfig.Pair]) -> String {
+        pairs.map { pair in
+            let value = pair.secretReference != nil || McpOAuthSecretPolicy.requiresKeychain(pair)
+                ? storedSecretMarker
+                : pair.value
+            return "\(pair.name)=\(value)"
+        }
+        .joined(separator: "\n")
+    }
+}
+
+/// Lossless, value-blind edit state for one configured server. The immutable
+/// name is the row identity; enabled state comes from the current row at Save
+/// time so an in-place edit cannot silently rename, reorder, or toggle it.
+struct McpServerEditDraft: Equatable {
+    enum ValidationError: Error, Equatable, LocalizedError {
+        case malformedPairs(field: String, problems: [McpSettingsPolicy.PairLineProblem])
+        case storedSecretMarkerDoesNotMatch(line: Int)
+        case invalidServer(String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .malformedPairs(field, problems):
+                return McpSettingsPolicy.malformedPairMessage(field: field, problems: problems)
+            case let .storedSecretMarkerDoesNotMatch(line):
+                return "Line \(line) no longer matches a stored credential. Enter a replacement value or remove the line."
+            case let .invalidServer(message):
+                return message
+            }
+        }
+    }
+
+    let name: String
+    var kind: McpServerConfig.Kind
+    var command: String
+    var argsText: String
+    var url: String
+    var envText: String
+    var headerText: String
+
+    init(server: McpServerConfig) {
+        name = server.name
+        kind = server.kind
+        command = server.command ?? ""
+        argsText = server.args.joined(separator: "\n")
+        url = server.url ?? ""
+        envText = McpSettingsPolicy.pairEditorText(server.envPairs)
+        headerText = McpSettingsPolicy.pairEditorText(server.headerPairs)
+    }
+
+    func server(
+        preservingIdentityAndEnabledFrom original: McpServerConfig
+    ) throws -> McpServerConfig {
+        let candidate: McpServerConfig
+        switch kind {
+        case .stdio:
+            candidate = McpServerConfig(
+                name: original.name,
+                kind: .stdio,
+                command: command.trimmingCharacters(in: .whitespaces),
+                args: Self.parseLines(argsText),
+                envPairs: try Self.resolvedPairs(
+                    envText,
+                    field: "Environment",
+                    preserving: original.envPairs
+                ),
+                enabled: original.enabled
+            )
+        case .http, .sse:
+            candidate = McpServerConfig(
+                name: original.name,
+                kind: kind,
+                url: url.trimmingCharacters(in: .whitespaces),
+                headerPairs: try Self.resolvedPairs(
+                    headerText,
+                    field: "Headers",
+                    preserving: original.headerPairs
+                ),
+                enabled: original.enabled
+            )
+        }
+        if let validationError = candidate.validationError {
+            throw ValidationError.invalidServer(validationError)
+        }
+        return candidate
+    }
+
+    private static func parseLines(_ text: String) -> [String] {
+        text.split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+    }
+
+    private static func resolvedPairs(
+        _ text: String,
+        field: String,
+        preserving original: [McpServerConfig.Pair]
+    ) throws -> [McpServerConfig.Pair] {
+        let parse = McpSettingsPolicy.parsePairs(text)
+        guard parse.problems.isEmpty else {
+            throw ValidationError.malformedPairs(field: field, problems: parse.problems)
+        }
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        var result: [McpServerConfig.Pair] = []
+        var usedOriginalIndices = Set<Int>()
+        for (index, rawLine) in normalized
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .enumerated() {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            guard var pair = McpSettingsPolicy.parsePairs(line).pairs.first else {
+                throw ValidationError.malformedPairs(
+                    field: field,
+                    problems: [.init(line: index + 1, reason: "the line could not be read.")]
+                )
+            }
+            if pair.value == McpSettingsPolicy.storedSecretMarker {
+                guard let preservedIndex = original.indices.first(where: {
+                    !usedOriginalIndices.contains($0)
+                        && original[$0].name == pair.name
+                        && (original[$0].secretReference != nil
+                            || McpOAuthSecretPolicy.requiresKeychain(original[$0]))
+                }) else {
+                    throw ValidationError.storedSecretMarkerDoesNotMatch(line: index + 1)
+                }
+                usedOriginalIndices.insert(preservedIndex)
+                pair = original[preservedIndex]
+            }
+            result.append(pair)
+        }
+        return result
+    }
 }
 
 /// The workspace-scoped editor: the configured list (toggle / delete) plus an
@@ -196,6 +336,8 @@ private struct McpServerEditor: View {
     @State private var servers: [McpServerConfig] = []
     @State private var draft = Draft()
     @State private var addError: String?
+    @State private var editDraft: McpServerEditDraft?
+    @State private var editError: String?
     @State private var probeResults: [String: McpProbeResult] = [:]
     @State private var probingNames = Set<String>()
     @State private var discoveries: [McpDiscoveredServer] = []
@@ -233,8 +375,8 @@ private struct McpServerEditor: View {
                 changeScopeSection
                 secretMigrationSection
                 configuredSection
-                discoverySection
-                addSection
+                discoverySection.disabled(editDraft != nil)
+                addSection.disabled(editDraft != nil)
             }
             .formStyle(.grouped)
             .padding(6)
@@ -443,6 +585,7 @@ private struct McpServerEditor: View {
                         Toggle("", isOn: enabledBinding(for: server))
                             .labelsHidden()
                             .toggleStyle(.switch)
+                            .disabled(editDraft != nil)
                             .accessibilityLabel("Enable MCP server \(server.name)")
                             .accessibilityHint(McpSettingsPolicy.mutationAccessibilityHint)
                         VStack(alignment: .leading, spacing: 1) {
@@ -460,6 +603,16 @@ private struct McpServerEditor: View {
                             .padding(.vertical, 2)
                             .background(.quaternary, in: Capsule())
                         Button {
+                            beginEditing(server)
+                        } label: {
+                            Image(systemName: "pencil")
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(editDraft != nil)
+                        .help("Edit MCP server")
+                        .accessibilityLabel("Edit MCP server \(server.name)")
+                        .accessibilityHint(McpSettingsPolicy.mutationAccessibilityHint)
+                        Button {
                             probe(server)
                         } label: {
                             if probingNames.contains(server.name) {
@@ -469,7 +622,7 @@ private struct McpServerEditor: View {
                             }
                         }
                         .buttonStyle(.borderless)
-                        .disabled(probingNames.contains(server.name))
+                        .disabled(editDraft != nil || probingNames.contains(server.name))
                         .help("Check MCP server")
                         .accessibilityLabel("Check MCP server \(server.name)")
                         Button(role: .destructive) {
@@ -478,8 +631,12 @@ private struct McpServerEditor: View {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
+                        .disabled(editDraft != nil)
                         .accessibilityLabel("Delete MCP server \(server.name)")
                         .accessibilityHint(McpSettingsPolicy.mutationAccessibilityHint)
+                    }
+                    if editDraft?.name == server.name {
+                        editForm(for: server)
                     }
                     if let result = probeResults[server.name] {
                         HStack(spacing: 5) {
@@ -548,6 +705,150 @@ private struct McpServerEditor: View {
             }
         } header: {
             scopeSectionHeader("Configured Servers")
+        }
+    }
+
+    @ViewBuilder
+    private func editForm(for original: McpServerConfig) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Text("Editing \(original.name)")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Text(McpSettingsPolicy.changeScopeTitle)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(Color.accentColor)
+            }
+            Picker("Transport", selection: editBinding(\.kind, default: original.kind)) {
+                Text("stdio").tag(McpServerConfig.Kind.stdio)
+                Text("http").tag(McpServerConfig.Kind.http)
+                Text("sse").tag(McpServerConfig.Kind.sse)
+            }
+            .pickerStyle(.segmented)
+
+            if editDraft?.kind == .stdio {
+                TextField("Command", text: editBinding(\.command, default: ""))
+                editLineEditor(
+                    "Arguments — one per line",
+                    text: editBinding(\.argsText, default: "")
+                )
+                editLineEditor(
+                    "Environment — NAME=value per line",
+                    text: editBinding(\.envText, default: "")
+                )
+            } else {
+                TextField("URL", text: editBinding(\.url, default: ""))
+                editLineEditor(
+                    "Headers — NAME=value per line",
+                    text: editBinding(\.headerText, default: "")
+                )
+            }
+
+            Text("Stored credentials stay hidden behind \(McpSettingsPolicy.storedSecretMarker). Entering a replacement value moves only this server's changed credential to Keychain when you save.")
+                .font(.caption)
+                .foregroundStyle(.kaisolaSecondary)
+
+            if let validationMessage = editValidationMessage(for: original) {
+                Text(validationMessage)
+                    .font(.caption)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                    .accessibilityIdentifier("extensions.mcp.edit.validation.\(original.id)")
+            }
+            if let editError {
+                Text(editError)
+                    .font(.caption)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                    .accessibilityIdentifier("extensions.mcp.edit.error.\(original.id)")
+            }
+
+            HStack {
+                Button("Cancel") { cancelEditing() }
+                    .accessibilityLabel("Cancel editing MCP server \(original.name)")
+                Button("Save Changes") { saveEditing(original) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(editValidationMessage(for: original) != nil)
+                    .accessibilityLabel("Save changes to MCP server \(original.name)")
+                    .accessibilityHint(McpSettingsPolicy.mutationAccessibilityHint)
+            }
+        }
+        .padding(10)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("extensions.mcp.edit.\(original.id)")
+    }
+
+    private func editLineEditor(_ label: String, text: Binding<String>) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.kaisolaSecondary)
+            TextEditor(text: text)
+                .font(.callout.monospaced())
+                .frame(minHeight: 52)
+                .overlay(RoundedRectangle(cornerRadius: 4).stroke(.quaternary))
+                .accessibilityLabel(label)
+        }
+    }
+
+    private func editBinding<Value>(
+        _ keyPath: WritableKeyPath<McpServerEditDraft, Value>,
+        default fallback: Value
+    ) -> Binding<Value> {
+        Binding(
+            get: { editDraft?[keyPath: keyPath] ?? fallback },
+            set: { value in
+                guard var updated = editDraft else { return }
+                updated[keyPath: keyPath] = value
+                editDraft = updated
+                editError = nil
+            }
+        )
+    }
+
+    private func editValidationMessage(for original: McpServerConfig) -> String? {
+        guard let draft = editDraft, draft.name == original.name else { return nil }
+        let current = servers.first(where: { $0.id == original.id }) ?? original
+        do {
+            _ = try draft.server(preservingIdentityAndEnabledFrom: current)
+            return nil
+        } catch {
+            return (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    private func beginEditing(_ server: McpServerConfig) {
+        editDraft = McpServerEditDraft(server: server)
+        editError = nil
+        recentlyDeleted = nil
+    }
+
+    private func cancelEditing() {
+        editDraft = nil
+        editError = nil
+    }
+
+    private func saveEditing(_ original: McpServerConfig) {
+        guard let draft = editDraft, draft.name == original.name,
+              let current = servers.first(where: { $0.id == original.id }) else {
+            editError = McpConfigMutationError.serverNotFound(original.name).localizedDescription
+            return
+        }
+        do {
+            let replacement = try draft.server(preservingIdentityAndEnabledFrom: current)
+            let receipt = try store.replaceSecuringOAuthServer(
+                replacement,
+                identifiedBy: current.id,
+                in: servers,
+                consent: true
+            )
+            servers = receipt.servers
+            pendingPlaintextSecretCount = store.pendingPlaintextOAuthSecretCount()
+            probeResults[current.name] = nil
+            editDraft = nil
+            editError = nil
+            notifyCatalogChanged()
+        } catch {
+            editError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 

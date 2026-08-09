@@ -150,6 +150,24 @@ final class GitPRTests: XCTestCase {
         )
     }
 
+    /// A confirm that pushed but never opened the pull request has to show the
+    /// user where their work went, so the pushed branch resolves to its own page
+    /// on the reviewed remote.
+    func testBranchWebURLPointsAtThePushedBranchOnTheReviewedRemote() throws {
+        try git(["remote", "add", "origin", "git@github.com:acme/widget.git"])
+        let destination = GitService(repoRoot: repo).prDestination()
+        XCTAssertEqual(
+            GitService.branchWebURL(destination: destination, headBranch: "kaisola/pr-branch"),
+            "https://github.com/acme/widget/tree/kaisola/pr-branch"
+        )
+        // Nothing to link to without a web remote, or without a branch.
+        XCTAssertNil(GitService.branchWebURL(destination: destination, headBranch: ""))
+        XCTAssertNil(GitService.branchWebURL(
+            destination: .unavailable(baseBranch: "main"),
+            headBranch: "kaisola/pr-branch"
+        ))
+    }
+
     func testPushUsesTheReviewedRemoteNameInsteadOfAnImplicitUpstream() throws {
         try write("a.txt", "hello\n")
         try git(["add", "a.txt"])

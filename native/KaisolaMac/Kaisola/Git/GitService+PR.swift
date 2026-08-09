@@ -200,6 +200,16 @@ extension GitService {
         return "\(base)/compare/\(destination.baseBranch)...\(headBranch)"
     }
 
+    /// The pushed branch's own page on the remote (`…/tree/<branch>`). A confirm
+    /// that pushed but could not open the pull request has this to show for
+    /// itself, so the branch it left behind is a link the user can follow rather
+    /// than an unmentioned side effect. Static and pure like `webURL`.
+    static func branchWebURL(destination: PRDestination, headBranch: String) -> String? {
+        guard let base = destination.webURL, !headBranch.isEmpty else { return nil }
+        let path = headBranch.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? headBranch
+        return "\(base)/tree/\(path)"
+    }
+
     /// Turn a git remote URL into its web base (`https://host/owner/repo`, no
     /// `.git`). Handles scp-style ssh (`git@github.com:owner/repo.git`) and url
     /// forms (`https://…`, `ssh://git@…`). Pure and static so it is unit testable

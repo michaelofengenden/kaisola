@@ -56,6 +56,97 @@ struct PRPlan: Equatable, Sendable {
     }
 }
 
+/// Which side effects of a reviewed plan have already happened.
+///
+/// Confirming a pull request is three effects in a row — fork the branch, push
+/// it, then ask `gh` to open the PR — and only the last one can simply be run
+/// again. A failure at the third step used to come back as one generic
+/// operation error, leaving the user standing on a branch they were never told
+/// had been created, with a remote branch nothing on screen mentioned. Progress
+/// records each completed phase so the panel can name it, link the pushed
+/// branch, and resume at the first phase that has not run.
+struct PRExecutionProgress: Equatable, Sendable {
+    /// The branch `createBranchFromHead` forked and checked out, if it ran.
+    var createdBranch: String?
+    /// The branch a completed push put on the remote, if it ran…
+    var pushedBranch: String?
+    /// …and the commit it put there. A plan for the same branch at a *newer*
+    /// commit must push again, or the pull request would omit that newer work.
+    var pushedHeadOID: String?
+    /// The pushed branch's page on the remote — the "where did my work go?"
+    /// answer for a run that pushed but never opened a pull request.
+    var remoteBranchURL: String?
+
+    /// Did anything at all run? Drives whether the panel may still claim that
+    /// nothing has happened yet.
+    var hasSideEffects: Bool { createdBranch != nil || pushedBranch != nil }
+
+    /// The completed phases, in the order they ran, phrased for the panel.
+    var completedPhases: [String] {
+        var phases: [String] = []
+        if let createdBranch { phases.append("Created branch \(createdBranch)") }
+        if let pushedBranch { phases.append("Pushed \(pushedBranch) to the remote") }
+        return phases
+    }
+
+    /// The line the panel keeps even after the review card is dismissed, so a
+    /// half-finished run never becomes invisible. Nil when nothing ran.
+    var recoveryNote: String? {
+        guard hasSideEffects else { return nil }
+        return (completedPhases + ["The pull request was not opened."]).joined(separator: ". ")
+    }
+
+    /// Does this plan still need its branch forked? False once an earlier
+    /// attempt created exactly that branch — `checkout -b` would only fail.
+    func needsBranchCreation(for plan: PRPlan) -> Bool {
+        plan.createsBranch && createdBranch != plan.headBranch
+    }
+
+    /// Does this plan still need a push? Only when the remote does not already
+    /// have this branch at this exact commit.
+    func needsPush(for plan: PRPlan) -> Bool {
+        pushedBranch != plan.headBranch || pushedHeadOID != plan.headOID
+    }
+
+    /// What a confirm would still do, phrased for the review card's caption so
+    /// the button never over-promises or under-reports.
+    func remainingWork(for plan: PRPlan) -> String {
+        var steps: [String] = []
+        if needsBranchCreation(for: plan) { steps.append("create branch \(plan.headBranch)") }
+        if needsPush(for: plan) { steps.append("push \(plan.headBranch) to \(plan.destination.remoteName)") }
+        steps.append("open the pull request against \(plan.baseBranch)")
+        return steps.joined(separator: ", then ")
+    }
+
+    /// The part of this progress that still describes a freshly assembled plan.
+    /// A re-review after a failed run must not forget a branch that already
+    /// exists, and must not remember a push that no longer covers the commit
+    /// the new plan would open.
+    func carriedForward(into plan: PRPlan) -> PRExecutionProgress {
+        var carried = PRExecutionProgress()
+        if createdBranch == plan.headBranch { carried.createdBranch = createdBranch }
+        if !needsPush(for: plan) {
+            carried.pushedBranch = pushedBranch
+            carried.pushedHeadOID = pushedHeadOID
+            carried.remoteBranchURL = remoteBranchURL
+        }
+        return carried
+    }
+}
+
+/// A confirm that stopped part way, carrying the phases that did complete. The
+/// panel reads `progress` off it instead of reducing a partly-executed run to a
+/// single error string; `errorDescription` stays the underlying git/`gh`
+/// message so the error banner reads exactly as it did before.
+struct PRExecutionFailure: Error, LocalizedError {
+    let progress: PRExecutionProgress
+    let underlying: any Error
+
+    var errorDescription: String? {
+        (underlying as? LocalizedError)?.errorDescription ?? underlying.localizedDescription
+    }
+}
+
 /// Pure assembly and validation for `PRPlan` — every git read happens in the
 /// caller, so the decisions themselves are unit-testable without a repository.
 enum GitPRPlanner {
@@ -160,7 +251,8 @@ enum GitPRPlanner {
         plan: PRPlan,
         currentHeadOID: String,
         currentBranch: String,
-        currentDestination: GitService.PRDestination? = nil
+        currentDestination: GitService.PRDestination? = nil,
+        completedBranchCreation: Bool = false
     ) -> String? {
         if plan.headOID.lowercased() != currentHeadOID.lowercased() {
             return "The branch moved since this plan was reviewed. Review it again."
@@ -173,7 +265,13 @@ enum GitPRPlanner {
             // happens to point at the same commit (a synced branch, a
             // detached checkout) between review and confirm, and forking would
             // then run against a branch context nobody reviewed.
-            if currentBranch != plan.baseBranch {
+            //
+            // Unless this very plan already forked it: the fork is checked out
+            // *because* the run got that far, so the branch it must still be
+            // standing on is the head, not the base. Expecting the base here is
+            // what used to make a half-finished run unretryable.
+            let expected = completedBranchCreation ? plan.headBranch : plan.baseBranch
+            if currentBranch != expected {
                 return "The checked-out branch changed since this plan was reviewed. Review it again."
             }
         } else if plan.headBranch != currentBranch {
@@ -197,14 +295,16 @@ enum GitPRPlanner {
         plan: PRPlan,
         currentHeadOID: String?,
         currentBranch: String?,
-        currentDestination: GitService.PRDestination? = nil
+        currentDestination: GitService.PRDestination? = nil,
+        completedBranchCreation: Bool = false
     ) -> Bool {
         guard let currentHeadOID, let currentBranch else { return false }
         return stalenessMessage(
             plan: plan,
             currentHeadOID: currentHeadOID,
             currentBranch: currentBranch,
-            currentDestination: currentDestination
+            currentDestination: currentDestination,
+            completedBranchCreation: completedBranchCreation
         ) != nil
     }
 }

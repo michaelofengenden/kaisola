@@ -1,3 +1,4 @@
+import Foundation
 import SwiftUI
 
 /// Settings tab for per-project MCP servers. Whatever is configured here rides
@@ -37,14 +38,41 @@ struct McpSettingsTab: View {
 /// catalog cap here prevents UI state from ever getting ahead of what the
 /// bounded store can persist.
 enum McpSettingsPolicy {
+    private static let nameComparisonLocale = Locale(identifier: "en_US_POSIX")
+
     static func remainingCapacity(serverCount: Int) -> Int {
         max(0, McpConfigStore.maximumServerCount - max(0, serverCount))
     }
 
+    static func normalizedName(_ rawName: String) -> String {
+        rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     static func duplicateName(_ rawName: String, servers: [McpServerConfig]) -> String? {
-        let name = rawName.trimmingCharacters(in: .whitespaces)
-        guard !name.isEmpty, servers.contains(where: { $0.id == name }) else { return nil }
+        let name = normalizedName(rawName)
+        let comparisonKey = name.folding(options: [.caseInsensitive], locale: nameComparisonLocale)
+        guard !name.isEmpty,
+              servers.contains(where: {
+                  normalizedName($0.name)
+                      .folding(options: [.caseInsensitive], locale: nameComparisonLocale) == comparisonKey
+              }) else { return nil }
         return name
+    }
+
+    static func duplicateMessage(_ name: String) -> String {
+        "A server named \"\(name)\" already exists in this project."
+    }
+
+    static func canAddServer(
+        rawName: String,
+        servers: [McpServerConfig],
+        hasRequiredFields: Bool,
+        remainingCapacity: Int
+    ) -> Bool {
+        hasRequiredFields
+            && remainingCapacity > 0
+            && !normalizedName(rawName).isEmpty
+            && duplicateName(rawName, servers: servers) == nil
     }
 }
 
@@ -451,6 +479,9 @@ private struct McpServerEditor: View {
         Section("Add a Server") {
             TextField("Name", text: $draft.name, prompt: Text("unique per project"))
                 .onChange(of: draft.name) { _, _ in addError = nil }
+                .accessibilityHint(
+                    duplicateNameMessage ?? "Server names must be unique in this project."
+                )
             Picker("Transport", selection: $draft.kind) {
                 Text("stdio").tag(McpServerConfig.Kind.stdio)
                 Text("http").tag(McpServerConfig.Kind.http)
@@ -472,8 +503,8 @@ private struct McpServerEditor: View {
                     .font(.caption)
                     .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
             }
-            if let duplicate = duplicateName {
-                Text("A server named \"\(duplicate)\" already exists in this project.")
+            if let duplicateNameMessage {
+                Text(duplicateNameMessage)
                     .font(.caption)
                     .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
             }
@@ -483,7 +514,10 @@ private struct McpServerEditor: View {
                     .foregroundStyle(.secondary)
             }
             Button("Add Server", action: add)
-                .disabled(!hasRequiredFields || remainingCapacity == 0)
+                .disabled(!canAddServer)
+                .accessibilityHint(
+                    duplicateNameMessage ?? "Adds this server to the current project."
+                )
         }
     }
 
@@ -501,7 +535,7 @@ private struct McpServerEditor: View {
     }
 
     private var hasRequiredFields: Bool {
-        guard !draft.name.trimmingCharacters(in: .whitespaces).isEmpty else { return false }
+        guard !McpSettingsPolicy.normalizedName(draft.name).isEmpty else { return false }
         switch draft.kind {
         case .stdio:
             return !draft.command.trimmingCharacters(in: .whitespaces).isEmpty
@@ -518,14 +552,27 @@ private struct McpServerEditor: View {
         McpSettingsPolicy.duplicateName(draft.name, servers: servers)
     }
 
+    private var duplicateNameMessage: String? {
+        duplicateName.map { McpSettingsPolicy.duplicateMessage($0) }
+    }
+
+    private var canAddServer: Bool {
+        McpSettingsPolicy.canAddServer(
+            rawName: draft.name,
+            servers: servers,
+            hasRequiredFields: hasRequiredFields,
+            remainingCapacity: remainingCapacity
+        )
+    }
+
     private func add() {
-        let name = draft.name.trimmingCharacters(in: .whitespaces)
+        let name = McpSettingsPolicy.normalizedName(draft.name)
         guard remainingCapacity > 0 else {
             addError = "MCP server limit reached (\(McpConfigStore.maximumServerCount))."
             return
         }
         guard hasRequiredFields else { return }
-        guard duplicateName == nil else { return }
+        guard canAddServer else { return }
         let server: McpServerConfig
         switch draft.kind {
         case .stdio:

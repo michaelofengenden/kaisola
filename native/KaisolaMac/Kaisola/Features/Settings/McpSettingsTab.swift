@@ -204,6 +204,11 @@ private struct McpServerEditor: View {
     @State private var isImporting = false
     @State private var discoveryMessage: String?
     @State private var recentlyDeleted: DeletedServer?
+    @State private var pendingPlaintextSecretCount = 0
+    @State private var secretMigrationMessage: String?
+    @State private var isMigratingSecrets = false
+    @State private var showsSecretMigrationConfirmation = false
+    @State private var showsImportSecretConfirmation = false
 
     private struct DeletedServer: Identifiable {
         let id = UUID()
@@ -226,6 +231,7 @@ private struct McpServerEditor: View {
         ScrollViewReader { proxy in
             Form {
                 changeScopeSection
+                secretMigrationSection
                 configuredSection
                 discoverySection
                 addSection
@@ -324,6 +330,7 @@ private struct McpServerEditor: View {
         guard environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
               environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "settings-mcp" else {
             servers = store.servers()
+            pendingPlaintextSecretCount = store.pendingPlaintextOAuthSecretCount()
             return
         }
         servers = [
@@ -356,6 +363,71 @@ private struct McpServerEditor: View {
     }
 
     // MARK: - Configured servers
+
+    @ViewBuilder
+    private var secretMigrationSection: some View {
+        if pendingPlaintextSecretCount > 0 || secretMigrationMessage != nil {
+            Section("Credential Storage") {
+                if pendingPlaintextSecretCount > 0 {
+                    Label(
+                        "\(pendingPlaintextSecretCount) saved OAuth credential\(pendingPlaintextSecretCount == 1 ? "" : "s") still \(pendingPlaintextSecretCount == 1 ? "is" : "are") in this project's MCP configuration.",
+                        systemImage: "key.fill"
+                    )
+                    .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                    Text("Move them to this Mac's app-scoped, this-device-only Keychain. The configuration is rewritten only after every Keychain write succeeds; exports and new chats omit plaintext while migration is pending.")
+                        .font(.caption)
+                        .foregroundStyle(.kaisolaSecondary)
+                    Button("Move Credentials to Keychain…") {
+                        showsSecretMigrationConfirmation = true
+                    }
+                    .disabled(isMigratingSecrets)
+                    .confirmationDialog(
+                        "Move MCP credentials to Keychain?",
+                        isPresented: $showsSecretMigrationConfirmation,
+                        titleVisibility: .visible
+                    ) {
+                        Button("Move to Keychain") { migratePlaintextSecrets() }
+                        Button("Not Now", role: .cancel) {}
+                    } message: {
+                        Text("Kaisola will replace the saved plaintext with opaque references only after the Keychain accepts every credential.")
+                    }
+                }
+                if isMigratingSecrets {
+                    ProgressView("Moving credentials…")
+                }
+                if let secretMigrationMessage {
+                    Text(secretMigrationMessage)
+                        .font(.caption)
+                        .foregroundStyle(
+                            pendingPlaintextSecretCount == 0
+                                ? Color.kaisolaSecondary
+                                : KaisolaStatusTone.failed.foregroundColor
+                        )
+                }
+            }
+        }
+    }
+
+    private func migratePlaintextSecrets() {
+        guard !isMigratingSecrets else { return }
+        isMigratingSecrets = true
+        secretMigrationMessage = nil
+        Task {
+            do {
+                let receipt = try await Task.detached(priority: .userInitiated) {
+                    try store.migratePlaintextOAuthSecrets(consent: true)
+                }.value
+                servers = receipt.servers
+                pendingPlaintextSecretCount = 0
+                secretMigrationMessage = "Moved \(receipt.migratedCount) credential\(receipt.migratedCount == 1 ? "" : "s") to Keychain. The MCP configuration now contains only opaque references."
+                notifyCatalogChanged()
+            } catch {
+                pendingPlaintextSecretCount = store.pendingPlaintextOAuthSecretCount()
+                secretMigrationMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+            isMigratingSecrets = false
+        }
+    }
 
     private var configuredSection: some View {
         Section {
@@ -501,9 +573,19 @@ private struct McpServerEditor: View {
 
     private func probe(_ server: McpServerConfig) {
         guard probingNames.insert(server.name).inserted else { return }
+        guard let materialized = store.materializedServer(server) else {
+            probeResults[server.name] = .init(
+                status: .failed,
+                verified: true,
+                message: "MCP credential unavailable in Keychain",
+                authentication: .unknown(.keychainDenied)
+            )
+            probingNames.remove(server.name)
+            return
+        }
         probeResults[server.name] = .probing
         Task {
-            let result = await McpProbeService.shared.probe(server)
+            let result = await McpProbeService.shared.probe(materialized)
             probeResults[server.name] = result
             probingNames.remove(server.name)
         }
@@ -558,7 +640,7 @@ private struct McpServerEditor: View {
 
     private var discoverySection: some View {
         Section {
-            Text("Find MCP servers already configured in Cursor, Claude, Codex, Gemini, VS Code, or Windsurf. Kaisola reads only their standard local config files, never expands secrets, and imports selected servers disabled.")
+            Text("Find MCP servers already configured in Cursor, Claude, Codex, Gemini, VS Code, or Windsurf. Kaisola reads only their standard local config files, never expands placeholders, and imports selected servers disabled. Literal credentials move directly to Keychain only after confirmation.")
                 .font(.caption)
                 .foregroundStyle(.kaisolaSecondary)
 
@@ -583,14 +665,37 @@ private struct McpServerEditor: View {
                                 .foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
+                            if discovery.plaintextSecretCount > 0 {
+                                Text("\(discovery.plaintextSecretCount) credential\(discovery.plaintextSecretCount == 1 ? "" : "s") will move to Keychain")
+                                    .font(.caption2)
+                                    .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                            }
                         }
                     }
                     .accessibilityLabel("Import \(discovery.config.name) from \(discovery.origin)")
                 }
                 HStack {
-                    Button("Import as Disabled") { importSelected() }
+                    Button("Import as Disabled") {
+                        if selectedDiscoverySecretCount > 0 {
+                            showsImportSecretConfirmation = true
+                        } else {
+                            importSelected(consentToMigrateSecrets: false)
+                        }
+                    }
                         .disabled(selectedDiscoveryIDs.isEmpty || isImporting || remainingCapacity == 0)
                         .accessibilityHint(McpSettingsPolicy.mutationAccessibilityHint)
+                        .confirmationDialog(
+                            "Move imported MCP credentials to Keychain?",
+                            isPresented: $showsImportSecretConfirmation,
+                            titleVisibility: .visible
+                        ) {
+                            Button("Import and Move to Keychain") {
+                                importSelected(consentToMigrateSecrets: true)
+                            }
+                            Button("Cancel", role: .cancel) {}
+                        } message: {
+                            Text("Kaisola will import the selected servers disabled and replace \(selectedDiscoverySecretCount) plaintext credential\(selectedDiscoverySecretCount == 1 ? "" : "s") with opaque Keychain references. The source configuration is not changed.")
+                        }
                     Button("Search Again") { discover() }
                         .disabled(isDiscovering || isImporting)
                     if isImporting { ProgressView().controlSize(.small) }
@@ -621,6 +726,12 @@ private struct McpServerEditor: View {
         )
     }
 
+    private var selectedDiscoverySecretCount: Int {
+        discoveries
+            .filter { selectedDiscoveryIDs.contains($0.id) }
+            .reduce(0) { $0 + $1.plaintextSecretCount }
+    }
+
     private func discover() {
         guard !isDiscovering else { return }
         isDiscovering = true
@@ -639,24 +750,33 @@ private struct McpServerEditor: View {
         }
     }
 
-    private func importSelected() {
+    private func importSelected(consentToMigrateSecrets: Bool) {
         guard !isImporting else { return }
         let selected = discoveries.filter { selectedDiscoveryIDs.contains($0.id) }
         guard !selected.isEmpty else { return }
         isImporting = true
         Task {
-            let imported = await Task.detached(priority: .userInitiated) {
-                store.importDiscovered(selected)
-            }.value
-            servers = store.servers()
-            notifyCatalogChanged()
-            let savedNames = Set(servers.map(\.name))
-            discoveries.removeAll { savedNames.contains($0.config.name) }
-            selectedDiscoveryIDs = Set(discoveries.map(\.id))
-            if imported < selected.count {
-                discoveryMessage = "Imported \(imported) of \(selected.count) selected servers as disabled; the \(McpConfigStore.maximumServerCount)-server limit was reached."
-            } else {
-                discoveryMessage = "Imported \(imported) server\(imported == 1 ? "" : "s") as disabled. Enable one only after reviewing its command or URL."
+            do {
+                let receipt = try await Task.detached(priority: .userInitiated) {
+                    try store.importDiscovered(
+                        selected,
+                        consentToMigrateSecrets: consentToMigrateSecrets
+                    )
+                }.value
+                servers = receipt.servers
+                notifyCatalogChanged()
+                let savedNames = Set(servers.map(\.name))
+                discoveries.removeAll { savedNames.contains($0.config.name) }
+                selectedDiscoveryIDs = Set(discoveries.map(\.id))
+                if receipt.importedCount < selected.count {
+                    discoveryMessage = "Imported \(receipt.importedCount) of \(selected.count) selected servers as disabled; the \(McpConfigStore.maximumServerCount)-server limit was reached."
+                } else if receipt.migratedSecretCount > 0 {
+                    discoveryMessage = "Imported \(receipt.importedCount) server\(receipt.importedCount == 1 ? "" : "s") as disabled and moved \(receipt.migratedSecretCount) credential\(receipt.migratedSecretCount == 1 ? "" : "s") to Keychain."
+                } else {
+                    discoveryMessage = "Imported \(receipt.importedCount) server\(receipt.importedCount == 1 ? "" : "s") as disabled. Enable one only after reviewing its command or URL."
+                }
+            } catch {
+                discoveryMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
             }
             isImporting = false
         }
@@ -686,6 +806,10 @@ private struct McpServerEditor: View {
                 TextField("URL", text: $draft.url, prompt: Text("https://example.com/mcp"))
                 lineEditor("Headers — NAME=value per line", text: $draft.headerText)
             }
+
+            Text("Authorization, client-secret, access-token, and refresh-token values are written directly to this Mac's Keychain. Only opaque references are saved in MCP configuration or export data.")
+                .font(.caption)
+                .foregroundStyle(.kaisolaSecondary)
 
             if !pairProblems.isEmpty {
                 // Every malformed line, listed as the user types, so a header or
@@ -834,8 +958,13 @@ private struct McpServerEditor: View {
             addError = error
             return
         }
-        servers.append(server)
-        store.save(servers)
+        do {
+            let receipt = try store.appendSecuringOAuthServer(server, to: servers, consent: true)
+            servers = receipt.servers
+        } catch {
+            addError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            return
+        }
         notifyCatalogChanged()
         draft = Draft()
         addError = nil

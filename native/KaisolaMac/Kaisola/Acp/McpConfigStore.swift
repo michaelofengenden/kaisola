@@ -1,5 +1,163 @@
+import CryptoKit
 import Foundation
 import KaisolaCore
+import Security
+
+enum McpOAuthSecretLocation: String, Sendable {
+    case environment
+    case header
+}
+
+/// Opaque, deterministic account names for MCP credentials. The reference is
+/// safe to persist and export: its digest carries no workspace path, server
+/// name, header name, or credential material.
+enum McpOAuthSecretReference {
+    static func make(
+        projectID: String,
+        serverName: String,
+        location: McpOAuthSecretLocation,
+        pairName: String
+    ) -> String {
+        let material = [projectID, serverName, location.rawValue, pairName]
+            .joined(separator: "\u{1F}")
+        let digest = SHA256.hash(data: Data(material.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "mcp-oauth-v1:\(digest)"
+    }
+
+    static func isValid(_ value: String) -> Bool {
+        value.range(of: #"^mcp-oauth-v1:[0-9a-f]{64}$"#, options: .regularExpression) != nil
+    }
+}
+
+enum McpOAuthSecretMigrationError: Error, Equatable, LocalizedError {
+    case consentRequired
+    case configurationWriteFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .consentRequired:
+            "Confirm moving the saved MCP credentials to this Mac's Keychain before continuing."
+        case .configurationWriteFailed:
+            "The MCP configuration could not be rewritten, so its existing credentials were left unchanged."
+        }
+    }
+}
+
+/// Injectable secret boundary. Production uses a this-device-only,
+/// data-protection Keychain generic-password item. Tests use an in-memory vault
+/// and can deterministically refuse writes without touching a developer login
+/// Keychain.
+struct McpSecretVault: Sendable {
+    let read: @Sendable (String) throws -> String?
+    let write: @Sendable (String, String) throws -> Void
+    let delete: @Sendable (String) throws -> Void
+
+    static let keychain = McpSecretVault(
+        read: McpOAuthKeychain.read,
+        write: McpOAuthKeychain.write,
+        delete: McpOAuthKeychain.delete
+    )
+}
+
+private enum McpOAuthKeychain {
+    static let service = "com.kaisola.mac.mcp-oauth"
+
+    static func read(_ reference: String) throws -> String? {
+        guard McpOAuthSecretReference.isValid(reference) else { return nil }
+        var query = baseQuery(reference)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let value = String(data: data, encoding: .utf8),
+              !value.isEmpty else {
+            throw keychainError(status, operation: "read")
+        }
+        return value
+    }
+
+    static func write(_ reference: String, _ value: String) throws {
+        guard McpOAuthSecretReference.isValid(reference),
+              !value.isEmpty,
+              value.utf8.count <= 4_096,
+              !value.contains("\0"), !value.contains("\r"), !value.contains("\n"),
+              let data = value.data(using: .utf8) else {
+            throw keychainError(errSecParam, operation: "save")
+        }
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            // OAuth bearer material is useful only while the user is logged in.
+            // This is stricter than the app's background API-key boundary and
+            // never synchronizes to another device.
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            kSecAttrSynchronizable as String: false,
+        ]
+        var status = SecItemUpdate(baseQuery(reference) as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var query = baseQuery(reference)
+            for (key, value) in attributes { query[key] = value }
+            status = SecItemAdd(query as CFDictionary, nil)
+        }
+        guard status == errSecSuccess else { throw keychainError(status, operation: "save") }
+    }
+
+    static func delete(_ reference: String) throws {
+        guard McpOAuthSecretReference.isValid(reference) else { return }
+        let status = SecItemDelete(baseQuery(reference) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw keychainError(status, operation: "remove")
+        }
+    }
+
+    private static func baseQuery(_ reference: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: reference,
+            kSecUseDataProtectionKeychain as String: true,
+        ]
+    }
+
+    private static func keychainError(_ status: OSStatus, operation: String) -> NSError {
+        let detail = SecCopyErrorMessageString(status, nil).map { $0 as String } ?? "OSStatus \(status)"
+        return NSError(
+            domain: service,
+            code: Int(status),
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Kaisola could not \(operation) the MCP credential in this Mac's Keychain. (\(detail))",
+            ]
+        )
+    }
+}
+
+enum McpOAuthSecretPolicy {
+    static func requiresKeychain(_ pair: McpServerConfig.Pair) -> Bool {
+        guard pair.secretReference == nil, !pair.value.isEmpty, !isPlaceholder(pair.value) else {
+            return false
+        }
+        let normalized = pair.name.lowercased().filter(\.isLetter)
+        return normalized == "authorization"
+            || normalized.contains("secret")
+            || normalized.hasSuffix("token")
+            || normalized.hasSuffix("password")
+            || normalized.hasSuffix("credential")
+            || normalized.hasSuffix("apikey")
+            || normalized.hasSuffix("privatekey")
+    }
+
+    private static func isPlaceholder(_ value: String) -> Bool {
+        value.range(
+            of: #"^(Bearer\s+)?\$\{[A-Z_][A-Z0-9_]*\}$"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+}
 
 /// One configured MCP server, scoped to a workspace. `id` is the `name`, so a
 /// workspace can hold at most one server per name (mirroring the Node registry's
@@ -17,6 +175,34 @@ struct McpServerConfig: Codable, Equatable, Identifiable, Sendable {
     struct Pair: Codable, Equatable, Sendable {
         var name: String
         var value: String
+        var secretReference: String?
+
+        init(name: String, value: String, secretReference: String? = nil) {
+            self.name = name
+            self.value = value
+            self.secretReference = secretReference
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case name, value, secretReference
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            name = try container.decode(String.self, forKey: .name)
+            secretReference = try container.decodeIfPresent(String.self, forKey: .secretReference)
+            value = try container.decodeIfPresent(String.self, forKey: .value) ?? ""
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(name, forKey: .name)
+            if let secretReference {
+                try container.encode(secretReference, forKey: .secretReference)
+            } else {
+                try container.encode(value, forKey: .value)
+            }
+        }
     }
 
     var name: String
@@ -78,10 +264,14 @@ struct McpServerConfig: Codable, Equatable, Identifiable, Sendable {
     }
 
     private static func safePair(_ pair: Pair) -> Bool {
-        pair.name.utf8.count <= 128
+        let safeName = pair.name.utf8.count <= 128
             && safeRequired(pair.name.trimmingCharacters(in: .whitespacesAndNewlines))
             && pair.name.rangeOfCharacter(from: .controlCharacters) == nil
-            && pair.value.utf8.count <= 4_096
+        guard safeName else { return false }
+        if let secretReference = pair.secretReference {
+            return pair.value.isEmpty && McpOAuthSecretReference.isValid(secretReference)
+        }
+        return pair.value.utf8.count <= 4_096
             && !pair.value.contains("\0")
             && !pair.value.contains("\r")
             && !pair.value.contains("\n")
@@ -129,14 +319,19 @@ struct McpConfigStore: Sendable {
     }
 
     let fileURL: URL
+    private let projectID: String
+    private let secretVault: McpSecretVault
 
     init(
         workspace: URL,
-        rootDirectory: URL = NativePreviewPaths.applicationSupportDirectory
+        rootDirectory: URL = NativePreviewPaths.applicationSupportDirectory,
+        secretVault: McpSecretVault = .keychain
     ) {
         // Same digest the session store uses for project identity, so one
         // workspace ⇒ one config file regardless of how it was opened.
         let digest = NativeSessionStore.projectID(forDirectory: workspace.path)
+        projectID = digest
+        self.secretVault = secretVault
         fileURL = rootDirectory
             .appendingPathComponent("mcp", isDirectory: true)
             .appendingPathComponent("\(digest).json", isDirectory: false)
@@ -151,14 +346,18 @@ struct McpConfigStore: Sendable {
     }
 
     func save(_ servers: [McpServerConfig]) {
+        try? persist(servers)
+    }
+
+    private func persist(_ servers: [McpServerConfig]) throws {
         let directory = fileURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(
+        try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
         let validated = Array(servers.filter { $0.validationError == nil }.prefix(Self.maximumServerCount))
-        guard let data = try? JSONEncoder().encode(Payload(servers: validated)) else { return }
+        let data = try JSONEncoder().encode(Payload(servers: validated))
         let temporary = directory.appendingPathComponent(
             ".\(fileURL.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier)"
         )
@@ -168,6 +367,146 @@ struct McpConfigStore: Sendable {
             _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
         } catch {
             try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
+    }
+
+    struct MigrationReceipt: Equatable, Sendable {
+        let servers: [McpServerConfig]
+        let migratedCount: Int
+    }
+
+    func pendingPlaintextOAuthSecretCount() -> Int {
+        servers().reduce(into: 0) { count, server in
+            count += server.envPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+            count += server.headerPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+        }
+    }
+
+    /// Move legacy plaintext OAuth material only after the user confirms. Each
+    /// Keychain write lands before the atomic JSON rewrite. If any step fails,
+    /// prior Keychain state is restored and the original config file remains
+    /// byte-for-byte untouched.
+    func migratePlaintextOAuthSecrets(consent: Bool) throws -> MigrationReceipt {
+        try secureAndPersist(servers(), consent: consent)
+    }
+
+    /// New/manual entries take the same route without ever first writing the
+    /// plaintext draft to disk. The Add action is the user's explicit consent;
+    /// failures leave both the prior catalog and Keychain state unchanged.
+    func saveSecuringOAuthSecrets(
+        _ servers: [McpServerConfig],
+        consent: Bool
+    ) throws -> MigrationReceipt {
+        try secureAndPersist(servers, consent: consent)
+    }
+
+    /// Append one manually entered server without treating unrelated legacy
+    /// credentials as implicitly approved. The Add action consents only to the
+    /// new draft's secret fields; the separate migration confirmation remains
+    /// authoritative for every older plaintext value.
+    func appendSecuringOAuthServer(
+        _ server: McpServerConfig,
+        to servers: [McpServerConfig],
+        consent: Bool
+    ) throws -> MigrationReceipt {
+        try secureAndPersist(
+            servers + [server],
+            consent: consent,
+            migratingServerIndices: [servers.count]
+        )
+    }
+
+    private func secureAndPersist(
+        _ input: [McpServerConfig],
+        consent: Bool,
+        migratingServerIndices: Set<Int>? = nil
+    ) throws -> MigrationReceipt {
+        let indices = migratingServerIndices ?? Set(input.indices)
+        let pending = input.indices.filter(indices.contains).reduce(into: 0) { count, index in
+            let server = input[index]
+            count += server.envPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+            count += server.headerPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+        }
+        if pending > 0, !consent { throw McpOAuthSecretMigrationError.consentRequired }
+        var migrated = input
+        var rollback: [(reference: String, previous: String?)] = []
+        var count = 0
+
+        do {
+            for serverIndex in migrated.indices where indices.contains(serverIndex) {
+                count += try migratePairs(
+                    &migrated[serverIndex].envPairs,
+                    serverName: migrated[serverIndex].name,
+                    location: .environment,
+                    rollback: &rollback
+                )
+                count += try migratePairs(
+                    &migrated[serverIndex].headerPairs,
+                    serverName: migrated[serverIndex].name,
+                    location: .header,
+                    rollback: &rollback
+                )
+            }
+            do {
+                try persist(migrated)
+            } catch {
+                throw McpOAuthSecretMigrationError.configurationWriteFailed
+            }
+            return MigrationReceipt(servers: migrated, migratedCount: count)
+        } catch {
+            for item in rollback.reversed() {
+                if let previous = item.previous {
+                    try? secretVault.write(item.reference, previous)
+                } else {
+                    try? secretVault.delete(item.reference)
+                }
+            }
+            throw error
+        }
+    }
+
+    private func migratePairs(
+        _ pairs: inout [McpServerConfig.Pair],
+        serverName: String,
+        location: McpOAuthSecretLocation,
+        rollback: inout [(reference: String, previous: String?)]
+    ) throws -> Int {
+        var count = 0
+        for index in pairs.indices where McpOAuthSecretPolicy.requiresKeychain(pairs[index]) {
+            let reference = McpOAuthSecretReference.make(
+                projectID: projectID,
+                serverName: serverName,
+                location: location,
+                pairName: pairs[index].name
+            )
+            let previous = try secretVault.read(reference)
+            try secretVault.write(reference, pairs[index].value)
+            rollback.append((reference, previous))
+            pairs[index].value = ""
+            pairs[index].secretReference = reference
+            count += 1
+        }
+        return count
+    }
+
+    /// Export is safe even before a user approves migration: legacy plaintext
+    /// OAuth values are replaced by an explicit pending reference and are never
+    /// copied into an export, diagnostic, or crash attachment.
+    func exportData() throws -> Data {
+        let redacted = servers().map { server in
+            var server = server
+            server.envPairs = Self.redactedPairs(server.envPairs)
+            server.headerPairs = Self.redactedPairs(server.headerPairs)
+            return server
+        }
+        return try JSONEncoder().encode(Payload(servers: redacted))
+    }
+
+    private static func redactedPairs(_ pairs: [McpServerConfig.Pair]) -> [McpServerConfig.Pair] {
+        pairs.map { pair in
+            guard McpOAuthSecretPolicy.requiresKeychain(pair) else { return pair }
+            return .init(name: pair.name, value: "", secretReference: "mcp-oauth-v1:" + String(repeating: "0", count: 64))
         }
     }
 
@@ -181,53 +520,126 @@ struct McpConfigStore: Sendable {
     /// servers are emitted. Capability filtering (dropping http/sse an agent can't
     /// reach) is NOT applied here — `AcpClient.sessionMcpServers` does it later,
     /// client-side, keyed off the `type` field this method stamps.
-    static func jsonValues(_ servers: [McpServerConfig]) -> [JSONValue] {
+    static func jsonValues(
+        _ servers: [McpServerConfig],
+        resolveSecret: (String) -> String? = { try? McpOAuthKeychain.read($0) }
+    ) -> [JSONValue] {
         servers.compactMap { server in
             guard server.enabled, server.validationError == nil else { return nil }
+            guard let environment = materializedPairs(server.envPairs, resolveSecret: resolveSecret),
+                  let headers = materializedPairs(server.headerPairs, resolveSecret: resolveSecret) else {
+                return nil
+            }
             switch server.kind {
             case .stdio:
                 return .object([
                     "name": .string(server.name),
                     "command": .string(server.command ?? ""),
                     "args": .array(server.args.map(JSONValue.string)),
-                    "env": .array(server.envPairs.map(Self.pairObject)),
+                    "env": .array(environment.map(Self.pairObject)),
                 ])
             case .http, .sse:
                 return .object([
                     "type": .string(server.kind.rawValue),
                     "name": .string(server.name),
                     "url": .string(server.url ?? ""),
-                    "headers": .array(server.headerPairs.map(Self.pairObject)),
+                    "headers": .array(headers.map(Self.pairObject)),
                 ])
             }
         }
+    }
+
+    func sessionJSONValues(_ servers: [McpServerConfig]? = nil) -> [JSONValue] {
+        Self.jsonValues(servers ?? self.servers()) { reference in
+            try? secretVault.read(reference)
+        }
+    }
+
+    func materializedServer(_ server: McpServerConfig) -> McpServerConfig? {
+        guard let environment = Self.materializedPairs(server.envPairs, resolveSecret: {
+            try? secretVault.read($0)
+        }), let headers = Self.materializedPairs(server.headerPairs, resolveSecret: {
+            try? secretVault.read($0)
+        }) else { return nil }
+        var server = server
+        server.envPairs = environment
+        server.headerPairs = headers
+        return server
+    }
+
+    private static func materializedPairs(
+        _ pairs: [McpServerConfig.Pair],
+        resolveSecret: (String) -> String?
+    ) -> [McpServerConfig.Pair]? {
+        var result: [McpServerConfig.Pair] = []
+        result.reserveCapacity(pairs.count)
+        for pair in pairs {
+            if let reference = pair.secretReference {
+                guard let value = resolveSecret(reference),
+                      !value.isEmpty, value.utf8.count <= 4_096,
+                      !value.contains("\0"), !value.contains("\r"), !value.contains("\n") else {
+                    return nil
+                }
+                result.append(.init(name: pair.name, value: value))
+            } else {
+                // A legacy plaintext OAuth value never crosses into ACP. The
+                // server stays disabled-at-launch until the user consents to
+                // the transactional Keychain migration in Settings.
+                guard !McpOAuthSecretPolicy.requiresKeychain(pair) else { return nil }
+                result.append(pair)
+            }
+        }
+        return result
     }
 
     private static func pairObject(_ pair: McpServerConfig.Pair) -> JSONValue {
         .object(["name": .string(pair.name), "value": .string(pair.value)])
     }
 
+    struct ImportReceipt: Equatable, Sendable {
+        let servers: [McpServerConfig]
+        let importedCount: Int
+        let migratedSecretCount: Int
+    }
+
     /// Imports only the explicit discoveries selected by the user. New entries
     /// always arrive disabled: reading a sibling config must never spawn a
-    /// process or contact a remote endpoint. Existing names win and the
-    /// workspace catalog remains bounded.
-    @discardableResult
-    func importDiscovered(_ discoveries: [McpDiscoveredServer]) -> Int {
+    /// process or contact a remote endpoint. Literal credentials are migrated
+    /// directly to Keychain only after explicit import consent; they are never
+    /// first written to Kaisola's JSON. Existing names win and the catalog
+    /// remains bounded.
+    func importDiscovered(
+        _ discoveries: [McpDiscoveredServer],
+        consentToMigrateSecrets: Bool
+    ) throws -> ImportReceipt {
         var current = servers()
         var names = Set(current.map(\.name))
         var imported = 0
+        var importedIndices = Set<Int>()
         for discovery in discoveries {
             guard current.count < Self.maximumServerCount,
                   !names.contains(discovery.config.name) else { continue }
             var config = discovery.config
             config.enabled = false
             guard config.validationError == nil else { continue }
+            importedIndices.insert(current.count)
             current.append(config)
             names.insert(config.name)
             imported += 1
         }
-        if imported > 0 { save(current) }
-        return imported
+        guard imported > 0 else {
+            return ImportReceipt(servers: current, importedCount: 0, migratedSecretCount: 0)
+        }
+        let migration = try secureAndPersist(
+            current,
+            consent: consentToMigrateSecrets,
+            migratingServerIndices: importedIndices
+        )
+        return ImportReceipt(
+            servers: migration.servers,
+            importedCount: imported,
+            migratedSecretCount: migration.migratedCount
+        )
     }
 }
 
@@ -238,11 +650,16 @@ struct McpDiscoveredServer: Equatable, Identifiable, Sendable {
     let config: McpServerConfig
 
     var id: String { "\(origin)\u{1F}\(config.name)" }
+    var plaintextSecretCount: Int {
+        config.envPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+            + config.headerPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+    }
 }
 
 /// Reads the MCP shapes already used by common local clients. Discovery is a
 /// read-only, bounded operation: it never expands `${VAR}`, follows no custom
-/// paths, imports no literal credentials, and does not arm anything.
+/// paths, logs no values, and arms nothing. A selected literal credential stays
+/// memory-only until the explicit import confirmation migrates it to Keychain.
 enum McpConfigDiscovery {
     private struct Source {
         let origin: String
@@ -308,7 +725,7 @@ enum McpConfigDiscovery {
     }
 
     private static func sanitizedConfig(name: String, raw: [String: Any]) -> McpServerConfig? {
-        guard isSafeName(name), name != "kaisola", !containsLiteralSecret(raw) else { return nil }
+        guard isSafeName(name), name != "kaisola", !containsCredentialedURL(raw) else { return nil }
         if let rawURL = raw["url"] as? String, !rawURL.isEmpty {
             let kind: McpServerConfig.Kind = (raw["type"] as? String) == "sse" ? .sse : .http
             let pairs = sanitizedPairs(raw["headers"], namesAreEnvironment: false)
@@ -355,18 +772,7 @@ enum McpConfigDiscovery {
         return value.range(of: pattern, options: .regularExpression) != nil
     }
 
-    private static func containsLiteralSecret(_ raw: [String: Any]) -> Bool {
-        let sensitive = #"(?i)(authorization|api[-_]?key|token|secret|password|credential)"#
-        let placeholder = #"(?i)^(Bearer\s+)?\$\{[A-Z_][A-Z0-9_]*\}$"#
-        for field in ["env", "headers"] {
-            guard let map = raw[field] as? [String: Any] else { continue }
-            for (name, anyValue) in map {
-                guard name.range(of: sensitive, options: .regularExpression) != nil,
-                      let value = anyValue as? String,
-                      !value.isEmpty else { continue }
-                if value.range(of: placeholder, options: .regularExpression) == nil { return true }
-            }
-        }
+    private static func containsCredentialedURL(_ raw: [String: Any]) -> Bool {
         if let rawURL = raw["url"] as? String,
            let components = URLComponents(string: rawURL),
            components.user != nil || components.password != nil { return true }

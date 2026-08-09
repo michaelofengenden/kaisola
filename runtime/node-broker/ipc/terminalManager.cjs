@@ -16,6 +16,98 @@ const { TerminalCursor, isUtf8Boundary } = require('../companion/terminalCursor.
 let pty = null
 let ptyLoadAttempted = false
 
+const HELPER_MODE = 0o700
+const HELPER_TEMP_FLAGS = fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL
+
+/** lstat, never stat: a symlink has to be visible AS a symlink here. Whoever
+ * controls a component of the helper path controls the executable node-pty
+ * hands to posix_spawn, so a link, a non-directory or another account's inode
+ * on that path is refused rather than followed. */
+function assertRealDirectory(dir, { mustOwn = true } = {}) {
+  const stat = fs.lstatSync(dir)
+  if (stat.isSymbolicLink()) throw new Error(`helper path component is a symlink: ${dir}`)
+  if (!stat.isDirectory()) throw new Error(`helper path component is not a directory: ${dir}`)
+  const ours = stat.uid === process.getuid()
+  if (!ours && (mustOwn || stat.uid !== 0)) throw new Error(`helper path component is foreign-owned: ${dir}`)
+  return stat
+}
+
+/** Writable by group or other is tolerable only with the sticky bit (/tmp,
+ * /var/folders): there just the owner may replace an entry, and the component
+ * below it still has to pass the ownership check. */
+function assertNotOtherWritable(dir, stat) {
+  if ((stat.mode & 0o022) !== 0 && (stat.mode & 0o1000) === 0) {
+    throw new Error(`helper path component is writable by other users: ${dir}`)
+  }
+}
+
+/** Create one level of the private helper path. Plain mkdir (unlike the
+ * recursive form) fails with EEXIST on a pre-existing symlink instead of
+ * following it, so create-then-verify leaves an attacker no entry to redirect.
+ * A directory an earlier, looser build left behind is ours to tighten back to
+ * 0700; the repair is then re-checked instead of assumed. */
+function createPrivateDir(dir) {
+  try {
+    fs.mkdirSync(dir, { mode: HELPER_MODE })
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err
+  }
+  if ((assertRealDirectory(dir).mode & 0o077) !== 0) fs.chmodSync(dir, HELPER_MODE)
+  if ((assertRealDirectory(dir).mode & 0o077) !== 0) throw new Error(`helper path component stayed group- or world-accessible: ${dir}`)
+  return dir
+}
+
+/** Resolve and validate the private directory the signed helper is copied into.
+ * Everything above `root` is canonicalized first — macOS reaches real storage
+ * through the /var and /tmp symlinks, so a blanket link rejection would refuse
+ * every default path — and each canonical component is then checked for owner
+ * and mode, which is what a hostile ancestor link would fail anyway once it
+ * lands in the attacker's own directory. `root` and the arch directory below it
+ * are ours to create, so there a link is rejected outright. */
+function prepareHelperDir(root, arch) {
+  const resolved = path.resolve(root)
+  const parent = path.dirname(resolved)
+  fs.mkdirSync(parent, { recursive: true, mode: HELPER_MODE })
+  const canonicalParent = fs.realpathSync(parent)
+  let walked = path.sep
+  for (const part of canonicalParent.split(path.sep).filter(Boolean)) {
+    walked = path.join(walked, part)
+    assertNotOtherWritable(walked, assertRealDirectory(walked, { mustOwn: false }))
+  }
+  const base = createPrivateDir(path.join(canonicalParent, path.basename(resolved)))
+  return createPrivateDir(path.join(base, `darwin-${arch}`))
+}
+
+/** Write the helper through an unpredictable, exclusively created temp file and
+ * rename it into place. O_EXCL refuses an existing entry, so a pre-planted
+ * symlink at the temp path cannot be written through the way copyFileSync would
+ * have, and the rename replaces a tampered helper atomically instead of
+ * following it. */
+function installSpawnHelper(source, helperDir) {
+  const helper = path.join(helperDir, 'spawn-helper')
+  const tmp = path.join(helperDir, `spawn-helper.${process.pid}.${crypto.randomBytes(8).toString('hex')}.tmp`)
+  const fd = fs.openSync(tmp, HELPER_TEMP_FLAGS, HELPER_MODE)
+  try {
+    try {
+      fs.writeFileSync(fd, fs.readFileSync(source))
+      fs.fchmodSync(fd, HELPER_MODE)
+    } finally {
+      fs.closeSync(fd)
+    }
+    fs.renameSync(tmp, helper)
+  } catch (err) {
+    try { fs.unlinkSync(tmp) } catch { /* nothing left to clean up */ }
+    throw err
+  }
+  return helper
+}
+
+/** The packaged helper must be a plain file: the packager already refuses to
+ * ship a symlink, so one here means the bundle was rewritten after signing. */
+function isRegularFile(file) {
+  try { return fs.lstatSync(file).isFile() } catch { return false }
+}
+
 /** Hardened macOS apps may load node-pty's native module from Resources, but
  * posix_spawn refuses its nested spawn-helper at that location. Copy only the
  * signed 50 KB helper into private userData and point node-pty at that stable
@@ -31,17 +123,10 @@ function loadPty(helperRoot) {
         path.join(packageRoot, 'build', 'Release', 'spawn-helper'),
         path.join(packageRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper'),
       ]
-      const source = candidates.find((file) => fs.existsSync(file))
+      const source = candidates.find(isRegularFile)
       if (!source) throw new Error('node-pty spawn-helper is missing')
-      const helperDir = path.join(helperRoot, `darwin-${process.arch}`)
-      fs.mkdirSync(helperDir, { recursive: true, mode: 0o700 })
-      try { fs.chmodSync(helperDir, 0o700) } catch { /* best effort */ }
-      const helper = path.join(helperDir, 'spawn-helper')
-      const tmp = `${helper}.${process.pid}.${Date.now()}.tmp`
-      fs.copyFileSync(source, tmp)
-      fs.chmodSync(tmp, 0o700)
-      fs.renameSync(tmp, helper)
-      fs.chmodSync(helper, 0o700)
+      const helperDir = prepareHelperDir(helperRoot, process.arch)
+      installSpawnHelper(source, helperDir)
 
       // unixTerminal captures `native.dir` at module evaluation. Override the
       // loader for that one require, then restore the package unchanged.
@@ -1061,4 +1146,4 @@ function diagnostics() {
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, setEventSink, setActivitySink, diagnostics, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper } }

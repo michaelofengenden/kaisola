@@ -550,7 +550,7 @@ private enum PRResult: Sendable {
 
 struct GitPanelView: View {
     @StateObject private var model: GitPanelModel
-    @State private var restoreCandidate: String?
+    @State private var restoreCandidate: GitDiscardCandidate?
 
     init(repoRoot: URL) {
         _model = StateObject(wrappedValue: GitPanelModel(repoRoot: repoRoot))
@@ -621,12 +621,18 @@ struct GitPanelView: View {
             isPresented: Binding(get: { restoreCandidate != nil }, set: { if !$0 { restoreCandidate = nil } })
         ) {
             Button("Discard Changes", role: .destructive) {
-                if let restoreCandidate { model.restore(restoreCandidate) }
+                if let restoreCandidate { model.restore(restoreCandidate.path) }
                 restoreCandidate = nil
             }
             Button("Cancel", role: .cancel) { restoreCandidate = nil }
         } message: {
-            Text("Unstaged changes to \((restoreCandidate as NSString?)?.lastPathComponent ?? "this file") are discarded permanently (git restore).")
+            Text(
+                restoreCandidate.map {
+                    GitDiscardConfirmation.message(path: $0.path, code: $0.code)
+                } ?? "These changes will be discarded permanently (git restore)."
+            )
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -1052,7 +1058,9 @@ struct GitPanelView: View {
                         .accessibilityHint("Show the \(staged ? "staged" : "unstaged") diff")
                         Spacer()
                         if restorable {
-                            Button("Discard") { restoreCandidate = path }
+                            Button("Discard") {
+                                restoreCandidate = GitDiscardCandidate(path: path, code: code)
+                            }
                                 .buttonStyle(.borderless)
                                 .font(.caption)
                                 .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
@@ -1089,6 +1097,11 @@ struct GitPanelView: View {
     }
 }
 
+private struct GitDiscardCandidate: Equatable {
+    let path: String
+    let code: String
+}
+
 enum GitStatusAccessibility {
     /// Expand porcelain-v2's compact status codes without changing the visual
     /// row. Unknown codes stay inspectable instead of being announced as an
@@ -1113,6 +1126,16 @@ enum GitStatusAccessibility {
     /// partially staged file remain unambiguous to VoiceOver.
     static func rowLabel(path: String, code: String, staged: Bool) -> String {
         "\(statusName(for: code)), \(staged ? "staged" : "unstaged"), \(path)"
+    }
+}
+
+enum GitDiscardConfirmation {
+    /// A destructive restore must identify both the status category and the
+    /// complete project-relative path. Keeping the path verbatim makes files
+    /// with equal basenames distinguishable and leaves long paths selectable.
+    static func message(path: String, code: String) -> String {
+        "\(GitStatusAccessibility.statusName(for: code)) unstaged changes to \(path) "
+            + "will be discarded permanently (git restore)."
     }
 }
 

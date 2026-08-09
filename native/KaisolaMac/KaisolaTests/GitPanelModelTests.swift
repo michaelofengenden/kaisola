@@ -577,6 +577,37 @@ final class GitPanelModelTests: XCTestCase {
         )
     }
 
+    func testGitDiscardConfirmationNamesCategoryAndFullRelativePath() {
+        XCTAssertEqual(
+            GitDiscardConfirmation.message(
+                path: "Sources/Authentication/Recovery/AccountState.swift",
+                code: "M"
+            ),
+            "Modified unstaged changes to Sources/Authentication/Recovery/AccountState.swift "
+                + "will be discarded permanently (git restore)."
+        )
+    }
+
+    func testGitDiscardConfirmationDistinguishesDuplicateBasenamesAndPreservesLongUnicodePath() {
+        let first = GitDiscardConfirmation.message(path: "Client/Models/Status.swift", code: "D")
+        let second = GitDiscardConfirmation.message(path: "Server/Models/Status.swift", code: "D")
+        let unicodePath = "資料/非常に長いディレクトリ/調査結果/Status.swift"
+
+        XCTAssertEqual(
+            first,
+            "Deleted unstaged changes to Client/Models/Status.swift will be discarded permanently (git restore)."
+        )
+        XCTAssertEqual(
+            second,
+            "Deleted unstaged changes to Server/Models/Status.swift will be discarded permanently (git restore)."
+        )
+        XCTAssertNotEqual(first, second)
+        XCTAssertTrue(
+            GitDiscardConfirmation.message(path: unicodePath, code: "M").contains(unicodePath),
+            "The complete project-relative path must remain readable and unambiguous."
+        )
+    }
+
     @MainActor
     func testRejectingCommitMessageHookKeepsDraftAndStagedIndexVisible() throws {
         try write("base.txt", "base\n")

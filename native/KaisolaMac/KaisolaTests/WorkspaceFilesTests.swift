@@ -2545,6 +2545,74 @@ final class WorkspaceFilesTests: XCTestCase {
 
     // MARK: - Continuous Markdown editing
 
+    func testMarkdownHybridDiffMarksSeparatedChangesWithoutRewritingTheDraft() {
+        let baseline = """
+        # Title
+        keep
+        old value
+        same
+        remove [unsafe](javascript:alert(1))
+        tail
+        """
+        let edited = """
+        # Title
+        keep
+        new value
+        same
+        tail
+        | added | table |
+        """
+
+        let plan = MarkdownHybridDiffPlan.build(baseline: baseline, edited: edited)
+
+        XCTAssertEqual(plan.editedSource, edited)
+        XCTAssertEqual(plan.markers.map(\.kind), [.changed, .deletion, .addition])
+        XCTAssertEqual(plan.markers[0].oldText, "old value")
+        XCTAssertEqual(plan.markers[0].newText, "new value")
+        XCTAssertEqual(
+            (edited as NSString).substring(with: plan.markers[0].editedRange),
+            "new value"
+        )
+        XCTAssertEqual(plan.markers[1].editedRange.length, 0)
+        XCTAssertTrue(plan.markers[1].inspectionText.contains("[unsafe](javascript:alert(1))"))
+        XCTAssertEqual(
+            (edited as NSString).substring(with: plan.markers[2].editedRange),
+            "| added | table |"
+        )
+    }
+
+    func testMarkdownHybridDiffKeepsCodeTablesLinksAndLineEndingsAsPlainExactText() {
+        let baseline = "| name | value |\r\n| --- | --- |\r\n| old | [site](https://example.com) |\r\n"
+        let edited = "| name | value |\r\n| --- | --- |\r\n| new | `code <tag>` |\r\n"
+
+        let plan = MarkdownHybridDiffPlan.build(baseline: baseline, edited: edited)
+        let marker = try? XCTUnwrap(plan.markers.first)
+
+        XCTAssertEqual(plan.editedSource.utf8.count, edited.utf8.count)
+        XCTAssertEqual(marker?.kind, .changed)
+        XCTAssertEqual(marker?.newText, "| new | `code <tag>` |")
+        XCTAssertEqual(marker?.inspectionPresentation, .plainText)
+        XCTAssertFalse(marker?.inspectionAllowsLinkActivation ?? true)
+    }
+
+    func testMarkdownHybridDiffIsEmptyForIdenticalBytesAndBoundedForHugeFiles() {
+        XCTAssertTrue(
+            MarkdownHybridDiffPlan.build(baseline: "same\n", edited: "same\n").markers.isEmpty
+        )
+
+        let baseline = (0...MarkdownHybridDiffPlan.maximumComparedLines)
+            .map { "old-\($0)" }
+            .joined(separator: "\n")
+        let edited = (0...MarkdownHybridDiffPlan.maximumComparedLines)
+            .map { "new-\($0)" }
+            .joined(separator: "\n")
+        let plan = MarkdownHybridDiffPlan.build(baseline: baseline, edited: edited)
+
+        XCTAssertTrue(plan.isTruncated)
+        XCTAssertLessThanOrEqual(plan.markers.count, MarkdownHybridDiffPlan.maximumMarkers)
+        XCTAssertEqual(plan.editedSource, edited)
+    }
+
     /// The jump this surface exists to remove. Save, autosave, the recovery
     /// journal, and external reconciliation of identical bytes all re-run the
     /// SwiftUI body with the string the text view already holds; swapping the

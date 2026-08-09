@@ -184,6 +184,57 @@ struct FilePreviewExternalOpenState: Equatable {
     }
 }
 
+/// The complete destructive choice shown before Revert Changes replaces an
+/// editor draft. Keeping this value independent of the dialog makes the exact
+/// document and recovered-draft warning stable even if surrounding view state
+/// refreshes while the confirmation is open.
+struct FilePreviewRevertConfirmation: Equatable {
+    let fileURL: URL
+    let includesRecoveredDraft: Bool
+
+    private var filename: String {
+        fileURL.lastPathComponent.nilIfEmpty ?? "this file"
+    }
+
+    var title: String { "Revert changes in \(filename)?" }
+    var confirmLabel: String { "Revert \(filename)" }
+
+    var message: String {
+        if includesRecoveredDraft {
+            return "This permanently discards current edits and the recovered draft for "
+                + "\(filename). Recovery data is kept until you confirm."
+        }
+        return "This permanently discards current edits in \(filename). "
+            + "Recovery data is kept until you confirm."
+    }
+
+    func matchesCurrentDocument(_ url: URL) -> Bool {
+        fileURL.standardizedFileURL == url.standardizedFileURL
+    }
+}
+
+private struct FilePreviewRevertConfirmationModifier: ViewModifier {
+    @Binding var confirmation: FilePreviewRevertConfirmation?
+    let onConfirm: (FilePreviewRevertConfirmation) -> Void
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            confirmation?.title ?? "Revert changes?",
+            isPresented: Binding(
+                get: { confirmation != nil },
+                set: { if !$0 { confirmation = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: confirmation
+        ) { value in
+            Button(value.confirmLabel, role: .destructive) { onConfirm(value) }
+            Button("Cancel", role: .cancel) {}
+        } message: { value in
+            Text(value.message)
+        }
+    }
+}
+
 /// File preview/editor pane: UTF-8 text is editable with ⌘S save + revert,
 /// markdown renders styled (with a raw-source toggle), images display, and
 /// binary/oversized files degrade to a clear notice.
@@ -276,6 +327,7 @@ struct FilePreviewView: View {
     @State private var textScrollMemory = FilePreviewTextScrollMemory()
     @State private var previewNotice: FilePreviewNotice?
     @State private var externalOpen = FilePreviewExternalOpenState()
+    @State private var revertConfirmation: FilePreviewRevertConfirmation?
     /// The URL that produced the currently rendered draft. It deliberately
     /// stays unchanged while another URL loads, so Save can never target the
     /// incoming file with the outgoing file's contents.
@@ -540,6 +592,12 @@ struct FilePreviewView: View {
         } message: {
             Text("The stored draft for \(loadedURL?.lastPathComponent ?? url.lastPathComponent) is deleted. Drafts for every other file are left alone.")
         }
+        .modifier(
+            FilePreviewRevertConfirmationModifier(
+                confirmation: $revertConfirmation,
+                onConfirm: performConfirmedRevert
+            )
+        )
     }
 
     private func completePendingAction() {
@@ -1072,17 +1130,10 @@ struct FilePreviewView: View {
             if isEditable {
                 Divider()
                 Button("Revert Changes") {
-                    // Under an unresolved conflict the saved file is the newer
-                    // disk version, so reverting takes that rather than leaving
-                    // a stale buffer behind an indicator that just cleared.
-                    guard !conflict.isActive else {
-                        reloadExternalVersion()
-                        return
-                    }
-                    if let loadedURL, !clearRecoveryTokens(for: loadedURL) { return }
-                    if case .docx = content { richDraft = savedRichText }
-                    else { draft = savedText }
-                    recoveredDraftPending = false
+                    revertConfirmation = FilePreviewRevertConfirmation(
+                        fileURL: loadedURL ?? url,
+                        includesRecoveredDraft: recoveredDraftPending
+                    )
                 }
                 .disabled(!isDirty)
             }
@@ -1144,6 +1195,31 @@ struct FilePreviewView: View {
             for: target,
             accepted: NSWorkspace.shared.open(target)
         )
+    }
+
+    private func performConfirmedRevert(_ confirmation: FilePreviewRevertConfirmation) {
+        let target = loadedURL ?? url
+        guard confirmation.matchesCurrentDocument(target) else {
+            ToastCenter.shared.show(
+                "The selected document changed. No edits were reverted.",
+                style: .error
+            )
+            return
+        }
+        // Under an unresolved conflict the saved file is the newer disk
+        // version, so the confirmed revert reloads that rather than leaving a
+        // stale buffer behind an indicator that just cleared.
+        guard !conflict.isActive else {
+            reloadExternalVersion()
+            return
+        }
+        // This is deliberately the first recovery-store mutation in the
+        // Revert path. Opening or cancelling the dialog leaves every token and
+        // recovered draft byte intact.
+        if let loadedURL, !clearRecoveryTokens(for: loadedURL) { return }
+        if case .docx = content { richDraft = savedRichText }
+        else { draft = savedText }
+        recoveredDraftPending = false
     }
 
     private func revealExternalOpenFailureInFinder() {

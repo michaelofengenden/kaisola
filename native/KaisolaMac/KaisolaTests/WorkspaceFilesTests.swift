@@ -8,6 +8,40 @@ import XCTest
 /// ProjectFiles (tree listing + bounded enumeration) and FilePreviewContent
 /// (what a file renders as) — the workspace rail's foundations.
 final class WorkspaceFilesTests: XCTestCase {
+    func testRevertConfirmationNamesTheExactDocumentAndRecoveredDraft() {
+        let confirmation = FilePreviewRevertConfirmation(
+            fileURL: URL(fileURLWithPath: "/tmp/Incident notes.md"),
+            includesRecoveredDraft: true
+        )
+
+        XCTAssertEqual(confirmation.title, "Revert changes in Incident notes.md?")
+        XCTAssertEqual(confirmation.confirmLabel, "Revert Incident notes.md")
+        XCTAssertEqual(
+            confirmation.message,
+            "This permanently discards current edits and the recovered draft for Incident notes.md. Recovery data is kept until you confirm."
+        )
+        XCTAssertTrue(confirmation.matchesCurrentDocument(
+            URL(fileURLWithPath: "/tmp/Incident notes.md")
+        ))
+        XCTAssertFalse(confirmation.matchesCurrentDocument(
+            URL(fileURLWithPath: "/tmp/another.md")
+        ))
+    }
+
+    func testOrdinaryRevertConfirmationDoesNotClaimARecoveredDraft() {
+        let confirmation = FilePreviewRevertConfirmation(
+            fileURL: URL(fileURLWithPath: "/tmp/main.swift"),
+            includesRecoveredDraft: false
+        )
+
+        XCTAssertEqual(confirmation.title, "Revert changes in main.swift?")
+        XCTAssertEqual(
+            confirmation.message,
+            "This permanently discards current edits in main.swift. Recovery data is kept until you confirm."
+        )
+        XCTAssertFalse(confirmation.message.contains("recovered draft"))
+    }
+
     func testExternalOpenFailurePersistsUntilMacOSAcceptsTheRequest() throws {
         let file = URL(fileURLWithPath: "/tmp/Preview report.pdf")
         var state = FilePreviewExternalOpenState()

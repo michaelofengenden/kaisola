@@ -49,6 +49,7 @@
 		A65F91BF6BD9DD28932BBA85 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = F3E24D7D1EC4E30B65BD94A2 /* Assets.xcassets */; };
 		A98394A51DDA2EC7CCAA8FF9 /* terminal-cursor.json in Resources */ = {isa = PBXBuildFile; fileRef = 54C3242A4E6F662802C00D20 /* terminal-cursor.json */; };
 		AA16C1D4BED8BCBD03E42D6A /* CompanionAccountRendezvousTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0FF79DE9CC775AE35916D16B /* CompanionAccountRendezvousTests.swift */; };
+		AC0D5CEA605420C85CD9565A /* CompanionResumePolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AC33A18D3725EAA0A6FECB6 /* CompanionResumePolicyTests.swift */; };
 		AC871C80111F68A72A00571B /* SessionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 01FF0D8B88D7B3360A938A15 /* SessionsView.swift */; };
 		ACAB626729D77A22A4C6FA79 /* RememberedSessionCatalogTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF4B0DA53BCDAD9BB4D89379 /* RememberedSessionCatalogTests.swift */; };
 		B219E2A44715999A43C5DB73 /* KaisolaTheme.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC552FAB4C3E746B92613FAD /* KaisolaTheme.swift */; };
@@ -112,6 +113,7 @@
 		74907E2AA6DEFB4DE3F3A1F5 /* Components.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Components.swift; sourceTree = "<group>"; };
 		7EDE52D3363B955168BF12E7 /* terminal-control-receipt.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = "terminal-control-receipt.json"; sourceTree = "<group>"; };
 		8720C781C8D2D8A9C95C4268 /* TransportFramingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TransportFramingTests.swift; sourceTree = "<group>"; };
+		8AC33A18D3725EAA0A6FECB6 /* CompanionResumePolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionResumePolicyTests.swift; sourceTree = "<group>"; };
 		8B5BD3EA8BD42770A248DD57 /* FirebaseAuthBackendTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirebaseAuthBackendTests.swift; sourceTree = "<group>"; };
 		95E232A7BC17BFA758E30B9C /* hello.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = hello.json; sourceTree = "<group>"; };
 		98DE11C5FAB40CD2B4715652 /* CompanionIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionIdentity.swift; sourceTree = "<group>"; };
@@ -322,6 +324,7 @@
 			isa = PBXGroup;
 			children = (
 				0FF79DE9CC775AE35916D16B /* CompanionAccountRendezvousTests.swift */,
+				8AC33A18D3725EAA0A6FECB6 /* CompanionResumePolicyTests.swift */,
 				B0C84646A00B84861C0E3616 /* CompanionTerminalSurfaceTests.swift */,
 				485B243F17DF73AB60584C92 /* CryptoNoiseVectorTests.swift */,
 				8B5BD3EA8BD42770A248DD57 /* FirebaseAuthBackendTests.swift */,
@@ -509,6 +512,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				AA16C1D4BED8BCBD03E42D6A /* CompanionAccountRendezvousTests.swift in Sources */,
+				AC0D5CEA605420C85CD9565A /* CompanionResumePolicyTests.swift in Sources */,
 				05F82150CB592AD995A31D7D /* CompanionTerminalSurfaceTests.swift in Sources */,
 				8CEF7D6FCA7B1BAF7B93641E /* CryptoNoiseVectorTests.swift in Sources */,
 				57358CCC88313352F26D6EDA /* FirebaseAuthBackendTests.swift in Sources */,

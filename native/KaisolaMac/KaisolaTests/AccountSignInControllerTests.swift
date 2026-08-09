@@ -69,6 +69,108 @@ final class AccountSignInControllerTests: XCTestCase {
         )
         XCTAssertEqual(message, "Sign-in did not complete (exit code 130).")
     }
+
+    // The sheet reads the CLI over a pipe, and a pipe read ends wherever the
+    // kernel filled it, not on a character boundary. The rest of this class
+    // pins the reading down at every boundary there is, because the failure it
+    // replaced was silent: the chunk holding half a `…` was dropped whole,
+    // taking the OAuth URL or the error line with it.
+
+    /// The shape of a real `claude auth login` banner, carrying a character of
+    /// every width: `…` and `✓` at three bytes, `é` at two, `🔐` at four.
+    private let banner = """
+    Opening browser to sign in…
+    If the browser didn't open, visit: \
+    https://claude.com/cai/oauth/authorize?code=true&\
+    code_challenge=07J1eR7wXRb0WXREhNtNHpClCE0XWlBvqbTlhVoqGBo&state=GFNgPs8Yr5Ux
+    Signed in as café ✓ 🔐
+    Paste code here if prompted >
+    """
+
+    /// Feed `text` through the loop that actually ships, one `chunkSize` read at
+    /// a time, and collect what it hands over.
+    private func drained(_ text: String, chunkSize: Int) throws -> [String] {
+        let pipe = Pipe()
+        try pipe.fileHandleForWriting.write(contentsOf: Data(text.utf8))
+        try pipe.fileHandleForWriting.close()
+        var received: [String] = []
+        AccountSignInController.drain(pipe.fileHandleForReading, chunkSize: chunkSize) {
+            received.append($0)
+        }
+        try pipe.fileHandleForReading.close()
+        return received
+    }
+
+    /// Every chunk size from one byte upwards, which is every place a multibyte
+    /// character can be cut in two.
+    func testTheBannerSurvivesAReadEndingAtEveryByteBoundary() throws {
+        for chunkSize in 1...Data(banner.utf8).count {
+            let text = try drained(banner, chunkSize: chunkSize).joined()
+            XCTAssertEqual(text, banner, "lost text at a \(chunkSize)-byte read")
+        }
+    }
+
+    /// The two readings that drive the sheet have to survive the same cuts:
+    /// a truncated `code_challenge` produces a sign-in page that fails at the
+    /// end, and a lost prompt leaves the code field locked forever.
+    func testTheURLAndTheCodePromptSurviveEveryByteBoundary() throws {
+        let whole = try XCTUnwrap(AccountSignInController.signInURL(in: banner))
+        for chunkSize in 1...Data(banner.utf8).count {
+            let text = try drained(banner, chunkSize: chunkSize).joined()
+            XCTAssertEqual(
+                AccountSignInController.signInURL(in: text)?.absoluteString,
+                whole.absoluteString,
+                "the OAuth URL did not come back whole at a \(chunkSize)-byte read"
+            )
+            XCTAssertTrue(
+                AccountSignInController.promptsForCode(text),
+                "the code prompt was lost at a \(chunkSize)-byte read"
+            )
+        }
+    }
+
+    /// Split every character at every one of its internal byte boundaries,
+    /// straight through the decoder, so the guarantee is stated on the type and
+    /// not only on the loop that uses it.
+    func testTheDecoderRejoinsACharacterCutAtAnyPointInIt() {
+        let bytes = Array(banner.utf8)
+        for split in 1..<bytes.count {
+            var decoder = IncrementalUTF8Decoder()
+            let head = decoder.decode(Data(bytes[..<split]))
+            let tail = decoder.decode(Data(bytes[split...]))
+            XCTAssertEqual(head + tail + decoder.flush(), banner, "split at byte \(split)")
+        }
+    }
+
+    /// A character the CLI never finished sending is broken input, and broken
+    /// input should be visible. Dropping it is how a truncated URL used to look
+    /// like a working one.
+    func testACharacterTruncatedAtEOFIsMarkedRatherThanDropped() {
+        var decoder = IncrementalUTF8Decoder()
+        // "ok " followed by the first two bytes of a three-byte "…".
+        let truncated = Data([0x6F, 0x6B, 0x20, 0xE2, 0x80])
+        XCTAssertEqual(decoder.decode(truncated), "ok ")
+        XCTAssertEqual(decoder.flush(), "\u{FFFD}")
+        XCTAssertEqual(decoder.flush(), "", "the carry is spent once")
+    }
+
+    /// A byte that can never start a character is not an unfinished one, so it
+    /// must not be held back — carrying it would stall everything after it.
+    func testAnImpossibleByteDoesNotStallTheStream() {
+        var decoder = IncrementalUTF8Decoder()
+        let text = decoder.decode(Data([0x41, 0xFF, 0x42]))
+        XCTAssertTrue(text.hasPrefix("A"), text)
+        XCTAssertTrue(text.hasSuffix("B"), "text after a bad byte still arrives now: \(text)")
+        XCTAssertEqual(decoder.flush(), "")
+    }
+
+    /// Nothing carried, nothing said.
+    func testAnEmptyStreamSaysNothing() throws {
+        XCTAssertEqual(try drained("", chunkSize: 8_192), [])
+        var decoder = IncrementalUTF8Decoder()
+        XCTAssertEqual(decoder.decode(Data()), "")
+        XCTAssertEqual(decoder.flush(), "")
+    }
 }
 
 /// A reset time is said the way its horizon is useful: a countdown when you

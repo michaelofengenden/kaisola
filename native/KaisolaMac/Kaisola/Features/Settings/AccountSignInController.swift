@@ -208,8 +208,7 @@ final class AccountSignInController: ObservableObject {
         // descriptor.
         let handle = output.fileHandleForReading
         readQueue.async { [weak self] in
-            while let chunk = try? handle.read(upToCount: 8_192), !chunk.isEmpty {
-                guard let text = String(data: chunk, encoding: .utf8) else { continue }
+            Self.drain(handle) { text in
                 Task { @MainActor [weak self] in self?.absorb(text) }
             }
             // EOF means the child closed its output; waiting now yields the
@@ -218,6 +217,27 @@ final class AccountSignInController: ObservableObject {
             let status = process.terminationStatus
             Task { @MainActor [weak self] in self?.finish(status: status) }
         }
+    }
+
+    /// Read `handle` to EOF, handing over text as fast as it becomes whole.
+    ///
+    /// Split out and `nonisolated` so the loop that actually ships can be
+    /// driven from a test with any chunk size, including sizes that land in the
+    /// middle of a character.
+    nonisolated static func drain(
+        _ handle: FileHandle,
+        chunkSize: Int = 8_192,
+        receive: (String) -> Void
+    ) {
+        var decoder = IncrementalUTF8Decoder()
+        while let chunk = try? handle.read(upToCount: chunkSize), !chunk.isEmpty {
+            let text = decoder.decode(chunk)
+            if !text.isEmpty { receive(text) }
+        }
+        // Anything still held back at EOF is a truncated character, so it is
+        // said now rather than dropped.
+        let trailing = decoder.flush()
+        if !trailing.isEmpty { receive(trailing) }
     }
 
     private func absorb(_ text: String) {
@@ -276,5 +296,76 @@ final class AccountSignInController: ObservableObject {
         process = nil
         try? input?.close()
         input = nil
+    }
+}
+
+/// Turns a stream of pipe chunks into text without losing a character that
+/// straddles a read boundary.
+///
+/// A read of the pipe ends wherever the kernel filled it, which is regularly
+/// mid-character. `String(data:encoding:.utf8)` returns nil for such a chunk,
+/// and the reader used to skip it — throwing away the whole 8 KiB, so a single
+/// `…` landing on the boundary could take the OAuth URL or the CLI's error line
+/// with it. Holding the unfinished character back until its remaining bytes
+/// arrive costs at most three carried bytes.
+struct IncrementalUTF8Decoder {
+    /// The tail of the last chunk that began a character no one has finished.
+    private var carry: [UInt8] = []
+
+    /// The text that is whole as of this chunk.
+    mutating func decode(_ chunk: Data) -> String {
+        guard !chunk.isEmpty else { return "" }
+        var bytes = carry
+        bytes.append(contentsOf: chunk)
+        let boundary = Self.wholePrefixLength(of: bytes)
+        carry = Array(bytes[boundary...])
+        bytes.removeLast(bytes.count - boundary)
+        return String(decoding: bytes, as: UTF8.self)
+    }
+
+    /// Whatever is still carried when the stream ends. A character truncated at
+    /// EOF is genuinely broken input, so it comes back as U+FFFD rather than
+    /// disappearing — a mangled tail is visible, a missing one is not.
+    mutating func flush() -> String {
+        guard !carry.isEmpty else { return "" }
+        let remainder = carry
+        carry = []
+        return String(decoding: remainder, as: UTF8.self)
+    }
+
+    /// How much of `bytes` can be decoded now, i.e. everything up to a character
+    /// that has started but not finished.
+    ///
+    /// Bytes that are invalid rather than unfinished are deliberately left in
+    /// the decodable prefix; `String(decoding:as:)` marks them and moves on,
+    /// which is what keeps a corrupt byte from stalling the stream.
+    static func wholePrefixLength(of bytes: [UInt8]) -> Int {
+        // A character is at most four bytes, so the only one that can still be
+        // in flight started within the last three.
+        var index = bytes.count - 1
+        let earliest = max(0, bytes.count - 4)
+        while index >= earliest {
+            let byte = bytes[index]
+            // Continuation byte: the character it belongs to starts earlier.
+            if byte & 0b1100_0000 == 0b1000_0000 {
+                index -= 1
+                continue
+            }
+            guard let width = characterWidth(startingWith: byte) else { return bytes.count }
+            return bytes.count - index < width ? index : bytes.count
+        }
+        return bytes.count
+    }
+
+    /// How many bytes the character starting with `byte` occupies, or nil if it
+    /// cannot start one.
+    private static func characterWidth(startingWith byte: UInt8) -> Int? {
+        switch byte {
+        case 0x00...0x7F: 1
+        case 0xC2...0xDF: 2
+        case 0xE0...0xEF: 3
+        case 0xF0...0xF4: 4
+        default: nil
+        }
     }
 }

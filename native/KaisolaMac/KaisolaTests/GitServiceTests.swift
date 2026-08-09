@@ -19,6 +19,48 @@ final class GitServiceTests: XCTestCase {
         try? FileManager.default.removeItem(at: repo)
     }
 
+    func testAgentReviewSnapshotHashesExactStagedUnstagedAndUntrackedContent() throws {
+        try write("both.swift", "let value = 1\n")
+        try git(["add", "both.swift"])
+        try git(["commit", "-q", "-m", "base"])
+
+        try write("both.swift", "let value = 2\n")
+        try git(["add", "both.swift"])
+        try write("both.swift", "let value = 3\n")
+        try write("notes with space.txt", "untracked α\n")
+
+        let service = GitService(repoRoot: repo)
+        let first = try service.agentReviewSnapshot()
+        let repeated = try service.agentReviewSnapshot()
+
+        XCTAssertEqual(first, repeated)
+        XCTAssertEqual(first.hash.count, 64)
+        XCTAssertEqual(first.files.map(\.path), ["both.swift", "notes with space.txt"])
+        XCTAssertTrue(first.files[0].stagedPatch.contains("let value = 2"))
+        XCTAssertTrue(first.files[0].unstagedPatch.contains("let value = 3"))
+        XCTAssertEqual(first.files[1].untrackedText, "untracked α\n")
+
+        try write("notes with space.txt", "untracked β\n")
+        let changed = try service.agentReviewSnapshot()
+        XCTAssertNotEqual(changed.hash, first.hash)
+        XCTAssertEqual(changed.files[0], first.files[0])
+        XCTAssertNotEqual(changed.files[1], first.files[1])
+    }
+
+    func testAgentReviewSnapshotRejectsOversizedPayloadInsteadOfTruncating() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write(
+            "oversized.txt",
+            String(repeating: "x", count: GitService.AgentReviewSnapshot.maximumPayloadBytes + 1)
+        )
+
+        XCTAssertThrowsError(try GitService(repoRoot: repo).agentReviewSnapshot()) { error in
+            XCTAssertTrue(error.localizedDescription.contains("too large"), error.localizedDescription)
+        }
+    }
+
     func testCheckpointSnapshotsAndRestoresTrackedChanges() throws {
         try write("file.txt", "original\n")
         try git(["add", "file.txt"])

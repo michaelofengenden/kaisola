@@ -360,6 +360,83 @@ struct GitService: Sendable {
         var isClean: Bool { staged.isEmpty && unstaged.isEmpty && untracked.isEmpty }
     }
 
+    struct AgentReviewFile: Codable, Equatable, Sendable {
+        let path: String
+        let stagedPatch: String
+        let unstagedPatch: String
+        let untrackedData: Data?
+
+        var untrackedText: String? {
+            guard let untrackedData else { return nil }
+            return String(data: untrackedData, encoding: .utf8)
+        }
+
+        init(
+            path: String,
+            stagedPatch: String,
+            unstagedPatch: String,
+            untrackedText: String?
+        ) {
+            self.init(
+                path: path,
+                stagedPatch: stagedPatch,
+                unstagedPatch: unstagedPatch,
+                untrackedData: untrackedText.map { Data($0.utf8) }
+            )
+        }
+
+        init(
+            path: String,
+            stagedPatch: String,
+            unstagedPatch: String,
+            untrackedData: Data?
+        ) {
+            self.path = path
+            self.stagedPatch = stagedPatch
+            self.unstagedPatch = unstagedPatch
+            self.untrackedData = untrackedData
+        }
+    }
+
+    /// The exact local review payload. The hash is over the canonical encoded
+    /// HEAD identity plus every staged, unstaged, and untracked byte the agent
+    /// receives, so a displayed result can never be mistaken for a newer diff.
+    struct AgentReviewSnapshot: Equatable, Sendable {
+        static let maximumPayloadBytes = 1 * 1_024 * 1_024
+        static let maximumFileBytes = 256 * 1_024
+
+        let headOID: String
+        let files: [AgentReviewFile]
+        let hash: String
+
+        init(headOID: String, files: [AgentReviewFile]) {
+            self.headOID = headOID
+            self.files = files.sorted { $0.path < $1.path }
+            self.hash = Self.digest(headOID: headOID, files: self.files)
+        }
+
+        private static func digest(headOID: String, files: [AgentReviewFile]) -> String {
+            struct Payload: Codable {
+                let headOID: String
+                let files: [AgentReviewFile]
+            }
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+            let data = (try? encoder.encode(Payload(headOID: headOID, files: files))) ?? Data()
+            return SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+        }
+
+        var retainedPayloadBytes: Int {
+            files.reduce(headOID.utf8.count) { total, file in
+                total
+                    + file.path.utf8.count
+                    + file.stagedPatch.utf8.count
+                    + file.unstagedPatch.utf8.count
+                    + (file.untrackedData?.count ?? 0)
+            }
+        }
+    }
+
     /// Line counts from one `git diff --numstat` view. Binary entries are
     /// tracked separately because Git deliberately reports `-\t-`; turning
     /// those markers into zero lines would invent precision the diff lacks.
@@ -602,6 +679,105 @@ struct GitService: Sendable {
             staged: try reviewSurface(repoName: repoName, kind: .staged, status: snapshot),
             unstaged: try reviewSurface(repoName: repoName, kind: .unstaged, status: snapshot)
         )
+    }
+
+    /// Capture one bounded review input without mutating the index or worktree.
+    /// Two identical payload captures plus stable status/HEAD reads reject an
+    /// external edit that lands during collection rather than associating a
+    /// hash with mixed generations.
+    func agentReviewSnapshot() throws -> AgentReviewSnapshot {
+        for _ in 0 ..< 3 {
+            let beforeStatus = try status()
+            let beforeHead = try headOID()
+            guard !beforeStatus.isClean else {
+                throw GitError.commandFailed("There are no local changes to review.")
+            }
+            let first = try captureAgentReviewSnapshot(status: beforeStatus, headOID: beforeHead)
+            let afterStatus = try status()
+            let afterHead = try headOID()
+            guard beforeStatus == afterStatus, beforeHead == afterHead else { continue }
+            let second = try captureAgentReviewSnapshot(status: afterStatus, headOID: afterHead)
+            let finalStatus = try status()
+            let finalHead = try headOID()
+            guard afterStatus == finalStatus,
+                  afterHead == finalHead,
+                  first == second else { continue }
+            return second
+        }
+        throw GitError.commandFailed(
+            "Repository changed repeatedly while the agent review was being prepared. Review again."
+        )
+    }
+
+    private func captureAgentReviewSnapshot(status: Status, headOID: String) throws -> AgentReviewSnapshot {
+        let stagedPaths = Set(status.staged.map(\.path))
+        let unstagedPaths = Set(status.unstaged.map(\.path))
+        let untrackedPaths = Set(status.untracked)
+        let paths = stagedPaths.union(unstagedPaths).union(untrackedPaths).sorted()
+        var files: [AgentReviewFile] = []
+        var retainedBytes = headOID.utf8.count
+
+        for path in paths {
+            try guardPath(path)
+            let stagedPatch = try stagedPaths.contains(path)
+                ? reviewPatch(path: path, staged: true)
+                : ""
+            let unstagedPatch = try unstagedPaths.contains(path)
+                ? reviewPatch(path: path, staged: false)
+                : ""
+            let untrackedData = try untrackedPaths.contains(path)
+                ? reviewUntrackedData(path: path)
+                : nil
+            let fileBytes = path.utf8.count
+                + stagedPatch.utf8.count
+                + unstagedPatch.utf8.count
+                + (untrackedData?.count ?? 0)
+            guard fileBytes <= AgentReviewSnapshot.maximumFileBytes else {
+                throw GitError.commandFailed(
+                    "The local review for \(path) is too large; keep each reviewed file under "
+                        + "\(AgentReviewSnapshot.maximumFileBytes) bytes."
+                )
+            }
+            retainedBytes += fileBytes
+            guard retainedBytes <= AgentReviewSnapshot.maximumPayloadBytes else {
+                throw GitError.commandFailed(
+                    "The local review is too large; narrow it below "
+                        + "\(AgentReviewSnapshot.maximumPayloadBytes) bytes."
+                )
+            }
+            files.append(AgentReviewFile(
+                path: path,
+                stagedPatch: stagedPatch,
+                unstagedPatch: unstagedPatch,
+                untrackedData: untrackedData
+            ))
+        }
+        return AgentReviewSnapshot(headOID: headOID, files: files)
+    }
+
+    private func reviewPatch(path: String, staged: Bool) throws -> String {
+        var arguments = [
+            "--no-optional-locks", "diff", "--binary", "--no-ext-diff", "--no-textconv",
+            "--no-color", "--find-renames=50%",
+        ]
+        if staged { arguments.append("--cached") }
+        arguments.append(contentsOf: ["--", path])
+        return try run(arguments)
+    }
+
+    private func reviewUntrackedData(path: String) throws -> Data {
+        let url = repoRoot.appendingPathComponent(path).standardizedFileURL
+        let values = try url.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey, .fileSizeKey])
+        guard values.isRegularFile == true, values.isSymbolicLink != true else {
+            throw GitError.commandFailed("The untracked review path \(path) is not a regular file.")
+        }
+        if let size = values.fileSize, size > AgentReviewSnapshot.maximumFileBytes {
+            throw GitError.commandFailed(
+                "The local review for \(path) is too large; keep each reviewed file under "
+                    + "\(AgentReviewSnapshot.maximumFileBytes) bytes."
+            )
+        }
+        return try Data(contentsOf: url, options: [.mappedIfSafe])
     }
 
     private func reviewSurface(repoName: String, kind: ReviewKind, status: Status) throws -> ReviewSurface {

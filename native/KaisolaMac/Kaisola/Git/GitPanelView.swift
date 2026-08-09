@@ -60,6 +60,240 @@ enum GitReviewCapabilities {
     }
 }
 
+struct GitAgentReviewFinding: Codable, Equatable, Identifiable, Sendable {
+    enum Severity: String, Codable, CaseIterable, Sendable {
+        case error
+        case warning
+        case note
+    }
+
+    let severity: Severity
+    let path: String
+    let line: Int
+    let message: String
+
+    var id: String { "\(severity.rawValue):\(path):\(line):\(message)" }
+}
+
+struct GitAgentReviewInput: Codable, Equatable, Sendable {
+    let diffHash: String
+    let baseDiffHash: String?
+    let files: [GitService.AgentReviewFile]
+    let removedPaths: [String]
+}
+
+struct GitAgentReviewResult: Equatable, Identifiable, Sendable {
+    let agentID: String
+    let agentName: String
+    let diffHash: String
+    let baseDiffHash: String?
+    let findings: [GitAgentReviewFinding]
+    let reused: Bool
+
+    var id: String { "\(agentID):\(diffHash)" }
+
+    func markedReused() -> Self {
+        Self(
+            agentID: agentID,
+            agentName: agentName,
+            diffHash: diffHash,
+            baseDiffHash: baseDiffHash,
+            findings: findings,
+            reused: true
+        )
+    }
+}
+
+struct GitAgentReviewResponse: Decodable, Equatable, Sendable {
+    let findings: [GitAgentReviewFinding]
+
+    static func parse(_ text: String, input: GitAgentReviewInput) throws -> Self {
+        guard text.utf8.count <= 64 * 1_024,
+              let first = text.firstIndex(of: "{"),
+              let last = text.lastIndex(of: "}"),
+              first <= last else {
+            throw GitService.GitError.commandFailed("The reviewer returned no bounded JSON result.")
+        }
+        let data = Data(text[first ... last].utf8)
+        let response: Self
+        do {
+            response = try JSONDecoder().decode(Self.self, from: data)
+        } catch {
+            throw GitService.GitError.commandFailed("The reviewer returned malformed findings JSON.")
+        }
+        guard response.findings.count <= 64 else {
+            throw GitService.GitError.commandFailed("The reviewer returned too many findings.")
+        }
+        let allowedPaths = Set(input.files.map(\.path))
+        for finding in response.findings {
+            guard allowedPaths.contains(finding.path), finding.line > 0,
+                  !finding.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  finding.message.utf8.count <= 2 * 1_024 else {
+                throw GitService.GitError.commandFailed(
+                    "The reviewer returned a finding without a valid reviewed file and line anchor."
+                )
+            }
+        }
+        return response
+    }
+}
+
+enum GitAgentReviewPrompt {
+    static func render(_ input: GitAgentReviewInput) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let payload = (try? encoder.encode(input)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let scope = input.baseDiffHash.map {
+            "Review only the changed-file delta from local diff \($0) to \(input.diffHash)."
+        } ?? "Review the complete local diff \(input.diffHash)."
+        return """
+        Perform a read-only code and security review. Do not edit files, invoke tools, or request permission.
+        \(scope)
+        Report only concrete regressions introduced by this payload. Every finding must name one payload file and a positive line number.
+        Return exactly one JSON object: {"findings":[{"severity":"error|warning|note","path":"relative/path","line":1,"message":"concise finding"}]}
+        Return {"findings":[]} when no actionable regression is present.
+
+        REVIEW_PAYLOAD_JSON
+        \(payload)
+        """
+    }
+}
+
+struct GitAgentReviewStore: Sendable {
+    enum Plan: Equatable, Sendable {
+        case reuse(GitAgentReviewResult)
+        case run(GitAgentReviewInput)
+    }
+
+    private struct Entry: Sendable {
+        let snapshot: GitService.AgentReviewSnapshot
+        let result: GitAgentReviewResult
+    }
+
+    let maximumEntries: Int
+    private var entries: [String: Entry] = [:]
+    private var order: [String] = []
+
+    init(maximumEntries: Int = 16) {
+        self.maximumEntries = max(1, maximumEntries)
+    }
+
+    func plan(
+        agentID: String,
+        snapshot: GitService.AgentReviewSnapshot,
+        deltaOnly: Bool
+    ) -> Plan {
+        let exactKey = key(agentID: agentID, hash: snapshot.hash)
+        if let exact = entries[exactKey] { return .reuse(exact.result) }
+
+        let previous = order.reversed().lazy.compactMap { entries[$0] }
+            .first { $0.result.agentID == agentID }
+        guard deltaOnly, let previous else {
+            return .run(GitAgentReviewInput(
+                diffHash: snapshot.hash,
+                baseDiffHash: nil,
+                files: snapshot.files,
+                removedPaths: []
+            ))
+        }
+
+        let oldFiles = Dictionary(uniqueKeysWithValues: previous.snapshot.files.map { ($0.path, $0) })
+        let newFiles = Dictionary(uniqueKeysWithValues: snapshot.files.map { ($0.path, $0) })
+        let changed = snapshot.files.filter { oldFiles[$0.path] != $0 }
+        let removed = oldFiles.keys.filter { newFiles[$0] == nil }.sorted()
+        return .run(GitAgentReviewInput(
+            diffHash: snapshot.hash,
+            baseDiffHash: previous.snapshot.hash,
+            files: changed,
+            removedPaths: removed
+        ))
+    }
+
+    mutating func record(_ result: GitAgentReviewResult, snapshot: GitService.AgentReviewSnapshot) {
+        let entryKey = key(agentID: result.agentID, hash: snapshot.hash)
+        entries[entryKey] = Entry(snapshot: snapshot, result: result)
+        order.removeAll { $0 == entryKey }
+        order.append(entryKey)
+        while order.count > maximumEntries, let oldest = order.first {
+            order.removeFirst()
+            entries[oldest] = nil
+        }
+    }
+
+    private func key(agentID: String, hash: String) -> String { "\(agentID):\(hash)" }
+}
+
+protocol GitAgentReviewRunning: Sendable {
+    func review(
+        agent: AgentProfile,
+        input: GitAgentReviewInput,
+        environment: [String: String]
+    ) async throws -> [GitAgentReviewFinding]
+}
+
+struct AcpGitAgentReviewRunner: GitAgentReviewRunning {
+    func review(
+        agent: AgentProfile,
+        input: GitAgentReviewInput,
+        environment: [String: String]
+    ) async throws -> [GitAgentReviewFinding] {
+        guard let adapter = AcpAdapter.forAgent(agent.id, environment: environment) else {
+            throw GitService.GitError.commandFailed("\(agent.name) has no configured ACP reviewer adapter.")
+        }
+        let reviewRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-local-review-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: reviewRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: reviewRoot) }
+
+        let launch = try adapter.prepare(environment: environment, cwd: reviewRoot.path)
+        let client = AcpClient()
+        let collector = GitAgentReviewCollector()
+        await client.setEventHandler { event in
+            collector.consume(event)
+            if case let .permission(request) = event {
+                Task { await client.cancelPermission(id: request.id) }
+            }
+        }
+        let readOnlyAccess = AcpAdapterAccess(
+            workspaceRead: false,
+            workspaceWrite: false,
+            network: false,
+            childProcess: false,
+            hostTerminal: false
+        )
+        do {
+            _ = try await client.start(
+                command: launch.command,
+                arguments: launch.arguments,
+                environment: launch.environment,
+                cwd: reviewRoot.path,
+                mcpServers: [],
+                access: readOnlyAccess
+            )
+            try await client.prompt(GitAgentReviewPrompt.render(input))
+            await client.stop()
+            return try GitAgentReviewResponse.parse(collector.text, input: input).findings
+        } catch {
+            await client.stop()
+            throw error
+        }
+    }
+}
+
+private final class GitAgentReviewCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = ""
+    var text: String { lock.withLock { storage } }
+
+    func consume(_ event: AcpEvent) {
+        guard case let .turnItem(.message(_, text)) = event else { return }
+        lock.withLock {
+            guard storage.utf8.count < 64 * 1_024 else { return }
+            storage.append(text)
+        }
+    }
+}
+
 /// User-facing identity and cancellation truth for one serialized Git command.
 /// Read-only work can be abandoned without changing the repository; mutating
 /// work may have completed an earlier Git step before cancellation is observed.
@@ -101,6 +335,7 @@ struct GitPanelOperation: Equatable, Sendable {
     static let pull = mutating("Pulling latest changes")
     static let commit = mutating("Committing changes")
     static let history = readOnly("Loading recent history")
+    static let agentReview = readOnly("Running local agent review")
     static let preparePullRequest = readOnly("Preparing pull request review")
     static let createPullRequest = mutating("Pushing and creating pull request")
 
@@ -186,6 +421,9 @@ final class GitPanelModel: ObservableObject {
     @Published private(set) var isCancellingOperation = false
     @Published var reviewKind: GitService.ReviewKind?
     @Published private(set) var reviewSurfaces: GitService.ReviewSurfaces?
+    @Published var selectedReviewerAgentIDs: Set<String>
+    @Published var reviewDeltaOnly = false
+    @Published private(set) var agentReviewResults: [GitAgentReviewResult] = []
     var isBusy: Bool { activeOperation != nil }
 
     /// Re-runs exactly the operation the timeout interrupted. Nil unless the
@@ -259,6 +497,16 @@ final class GitPanelModel: ObservableObject {
     /// subprocess) so the view can render the fallback note without re-probing.
     let ghAvailable: Bool
     private let service: GitService
+    private let agentReviewRunner: any GitAgentReviewRunning
+    private let onPrefillChat: @MainActor (AgentProfile, String) -> Void
+    private var agentReviewStore = GitAgentReviewStore()
+
+    var availableAgentReviewers: [AgentProfile] {
+        let environment = ProcessInfo.processInfo.environment.merging(
+            NativePreviewSettings.shared.agentEnvironmentOverlay
+        ) { _, configured in configured }
+        return AgentRegistry.all.filter { AcpAdapter.forAgent($0.id, environment: environment) != nil }
+    }
 
     /// Which inline patches are open and whether each represents the index.
     /// Every authoritative refresh recomputes these patches with the status in
@@ -285,10 +533,124 @@ final class GitPanelModel: ObservableObject {
     /// The running decide/wait/refresh loop; nil while idle.
     private var refreshPump: Task<Void, Never>?
 
-    init(repoRoot: URL) {
+    init(
+        repoRoot: URL,
+        agentReviewRunner: any GitAgentReviewRunning = AcpGitAgentReviewRunner(),
+        onPrefillChat: @escaping @MainActor (AgentProfile, String) -> Void = { _, _ in }
+    ) {
         self.repoRoot = repoRoot
         self.service = GitService(repoRoot: repoRoot)
         self.ghAvailable = GitService.ghAvailable()
+        self.agentReviewRunner = agentReviewRunner
+        self.onPrefillChat = onPrefillChat
+        let environment = ProcessInfo.processInfo.environment.merging(
+            NativePreviewSettings.shared.agentEnvironmentOverlay
+        ) { _, configured in configured }
+        let configured = AgentRegistry.all.filter {
+            AcpAdapter.forAgent($0.id, environment: environment) != nil
+        }
+        self.selectedReviewerAgentIDs = Set(configured.prefix(1).map(\.id))
+    }
+
+    func toggleReviewer(_ agentID: String) {
+        if selectedReviewerAgentIDs.contains(agentID) {
+            selectedReviewerAgentIDs.remove(agentID)
+        } else {
+            selectedReviewerAgentIDs.insert(agentID)
+        }
+    }
+
+    func runAgentReview() {
+        guard !isBusy else { return }
+        let selected = availableAgentReviewers.filter { selectedReviewerAgentIDs.contains($0.id) }
+        guard !selected.isEmpty else {
+            errorMessage = "Select at least one configured reviewer agent."
+            errorIsRetryable = false
+            return
+        }
+
+        activeOperation = .agentReview
+        isCancellingOperation = false
+        errorMessage = nil
+        errorIsRetryable = false
+        retryOperation = nil
+        lastActivityAt = Date()
+        let service = self.service
+        let runner = agentReviewRunner
+        let deltaOnly = reviewDeltaOnly
+        let environment = ProcessInfo.processInfo.environment.merging(
+            NativePreviewSettings.shared.agentEnvironmentOverlay
+        ) { _, configured in configured }
+        let snapshotWorker = Task.detached(priority: .userInitiated) {
+            try service.agentReviewSnapshot()
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let snapshot = try await snapshotWorker.value
+                var results: [GitAgentReviewResult] = []
+                for agent in selected {
+                    try Task.checkCancellation()
+                    switch self.agentReviewStore.plan(
+                        agentID: agent.id,
+                        snapshot: snapshot,
+                        deltaOnly: deltaOnly
+                    ) {
+                    case let .reuse(cached):
+                        results.append(cached.markedReused())
+                    case let .run(input):
+                        let findings = try await runner.review(
+                            agent: agent,
+                            input: input,
+                            environment: environment
+                        )
+                        let result = GitAgentReviewResult(
+                            agentID: agent.id,
+                            agentName: agent.name,
+                            diffHash: snapshot.hash,
+                            baseDiffHash: input.baseDiffHash,
+                            findings: findings,
+                            reused: false
+                        )
+                        self.agentReviewStore.record(result, snapshot: snapshot)
+                        results.append(result)
+                    }
+                }
+                self.agentReviewResults = results
+            } catch {
+                if Self.isCancellation(error) {
+                    self.errorMessage = nil
+                    self.errorIsRetryable = false
+                } else {
+                    self.errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    self.errorIsRetryable = Self.isRetryable(error)
+                    self.retryOperation = self.errorIsRetryable
+                        ? { [weak self] in self?.runAgentReview() }
+                        : nil
+                }
+            }
+            guard self.activeOperation == .agentReview else { return }
+            self.cancelActiveWork = nil
+            self.activeOperation = nil
+            self.isCancellingOperation = false
+        }
+        cancelActiveWork = {
+            snapshotWorker.cancel()
+            task.cancel()
+        }
+    }
+
+    func prefillFollowUp(for result: GitAgentReviewResult) {
+        guard let agent = AgentRegistry.profile(id: result.agentID) else { return }
+        let findings = result.findings.map {
+            "\($0.path):\($0.line) [\($0.severity.rawValue)] \($0.message)"
+        }.joined(separator: "\n")
+        let draft = """
+        Follow up on the local review of diff \(result.diffHash):
+
+        \(findings.isEmpty ? "The review found no actionable regressions; double-check the diff." : findings)
+        """
+        onPrefillChat(agent, draft)
     }
 
     /// Load the current status and start following the repository. Idempotent.
@@ -939,9 +1301,16 @@ private enum PRResult: Sendable {
 struct GitPanelView: View {
     @StateObject private var model: GitPanelModel
     @State private var restoreCandidate: GitDiscardCandidate?
+    @State private var showAgentReview = false
 
-    init(repoRoot: URL) {
-        _model = StateObject(wrappedValue: GitPanelModel(repoRoot: repoRoot))
+    init(
+        repoRoot: URL,
+        onPrefillChat: @escaping @MainActor (AgentProfile, String) -> Void = { _, _ in }
+    ) {
+        _model = StateObject(wrappedValue: GitPanelModel(
+            repoRoot: repoRoot,
+            onPrefillChat: onPrefillChat
+        ))
     }
 
     var body: some View {
@@ -1028,6 +1397,9 @@ struct GitPanelView: View {
         }
         .sheet(item: $model.reviewKind) { kind in
             GitHunkReviewSheet(model: model, initialKind: kind)
+        }
+        .sheet(isPresented: $showAgentReview) {
+            GitAgentReviewSheet(model: model) { showAgentReview = false }
         }
     }
 
@@ -1201,6 +1573,12 @@ struct GitPanelView: View {
             }
             .disabled(status.unstaged.isEmpty && status.untracked.isEmpty)
             .accessibilityIdentifier("git.review.unstaged")
+            Button {
+                showAgentReview = true
+            } label: {
+                Label("Agent Review", systemImage: "checklist.checked")
+            }
+            .accessibilityIdentifier("git.review.agent")
             if let summary = GitStatsRendering.summary(status.combinedStats) {
                 Text("Total \(summary)")
                     .foregroundStyle(.kaisolaSecondary)
@@ -1633,6 +2011,155 @@ struct GitPanelView: View {
         case "?": .secondary
         default: .primary
         }
+    }
+}
+
+private struct GitAgentReviewSheet: View {
+    @ObservedObject var model: GitPanelModel
+    let dismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Local Agent Review")
+                        .font(.headline)
+                    Text("Snapshots the current local diff. Reviewing never changes or sends the repository.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Done", action: dismiss)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(14)
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    reviewerPicker
+
+                    Toggle("Review only changes since each agent's last result", isOn: $model.reviewDeltaOnly)
+                        .font(.caption)
+                        .disabled(model.isBusy)
+                        .accessibilityIdentifier("git.review.agent.deltaOnly")
+
+                    HStack(spacing: 10) {
+                        if model.activeOperation == .agentReview {
+                            ProgressView().controlSize(.small)
+                            Button("Cancel") { model.cancelActiveOperation() }
+                                .disabled(model.isCancellingOperation)
+                                .accessibilityIdentifier("git.review.agent.cancel")
+                        } else {
+                            Button {
+                                model.runAgentReview()
+                            } label: {
+                                Label("Run Review", systemImage: "play.fill")
+                            }
+                            .disabled(model.isBusy || model.selectedReviewerAgentIDs.isEmpty)
+                            .accessibilityIdentifier("git.review.agent.run")
+                        }
+                    }
+
+                    if let error = model.errorMessage {
+                        Label(error, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                            .textSelection(.enabled)
+                    }
+
+                    ForEach(model.agentReviewResults) { result in
+                        resultCard(result)
+                    }
+                }
+                .padding(16)
+            }
+        }
+        .frame(width: 620, height: 540)
+    }
+
+    @ViewBuilder
+    private var reviewerPicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Configured reviewers")
+                .font(.subheadline.weight(.semibold))
+            if model.availableAgentReviewers.isEmpty {
+                Label("No configured ACP reviewer agents are available.", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.availableAgentReviewers) { agent in
+                    Toggle(isOn: Binding(
+                        get: { model.selectedReviewerAgentIDs.contains(agent.id) },
+                        set: { _ in model.toggleReviewer(agent.id) }
+                    )) {
+                        Label(agent.name, systemImage: agent.symbol)
+                    }
+                    .toggleStyle(.checkbox)
+                    .disabled(model.isBusy)
+                    .accessibilityIdentifier("git.review.agent.reviewer.\(agent.id)")
+                }
+            }
+        }
+    }
+
+    private func resultCard(_ result: GitAgentReviewResult) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(result.agentName)
+                    .font(.subheadline.weight(.semibold))
+                Text(String(result.diffHash.prefix(12)))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Follow up in Chat") { model.prefillFollowUp(for: result) }
+                    .font(.caption)
+                    .buttonStyle(.borderless)
+            }
+
+            if result.reused {
+                Label("Reused the result for this unchanged diff", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let base = result.baseDiffHash {
+                Text("Reviewed only changed files since \(base.prefix(12)).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if result.findings.isEmpty {
+                Label("No actionable regressions", systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(KaisolaStatusTone.done.foregroundColor)
+            } else {
+                ForEach(result.findings) { finding in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: finding.severity == .error ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(
+                                finding.severity == .error
+                                    ? KaisolaStatusTone.failed.foregroundColor
+                                    : KaisolaStatusTone.needsYou.foregroundColor
+                            )
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(finding.path):\(finding.line)")
+                                .font(.caption.monospaced().weight(.semibold))
+                                .textSelection(.enabled)
+                            Text(finding.message)
+                                .font(.caption)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(
+                        "\(finding.severity.rawValue), \(finding.path), line \(finding.line), \(finding.message)"
+                    )
+                }
+            }
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary))
     }
 }
 

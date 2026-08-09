@@ -28,6 +28,84 @@ final class GitPanelModelTests: XCTestCase {
         try? FileManager.default.removeItem(at: repo)
     }
 
+    func testAgentReviewStoreReusesExactHashAndBuildsOnlyChangedFileDelta() throws {
+        let first = GitService.AgentReviewSnapshot(
+            headOID: String(repeating: "a", count: 40),
+            files: [
+                .init(path: "A.swift", stagedPatch: "A1", unstagedPatch: "", untrackedText: nil),
+                .init(path: "B.swift", stagedPatch: "B1", unstagedPatch: "", untrackedText: nil),
+            ]
+        )
+        let result = GitAgentReviewResult(
+            agentID: "codex",
+            agentName: "Codex",
+            diffHash: first.hash,
+            baseDiffHash: nil,
+            findings: [.init(severity: .warning, path: "A.swift", line: 1, message: "Check A")],
+            reused: false
+        )
+        var store = GitAgentReviewStore(maximumEntries: 4)
+        store.record(result, snapshot: first)
+
+        XCTAssertEqual(store.plan(agentID: "codex", snapshot: first, deltaOnly: false), .reuse(result))
+
+        let second = GitService.AgentReviewSnapshot(
+            headOID: first.headOID,
+            files: [
+                first.files[0],
+                .init(path: "B.swift", stagedPatch: "B2", unstagedPatch: "", untrackedText: nil),
+                .init(path: "C.swift", stagedPatch: "", unstagedPatch: "", untrackedText: "new\n"),
+            ]
+        )
+        guard case let .run(input) = store.plan(agentID: "codex", snapshot: second, deltaOnly: true) else {
+            return XCTFail("a changed diff should run")
+        }
+        XCTAssertEqual(input.baseDiffHash, first.hash)
+        XCTAssertEqual(input.files.map(\.path), ["B.swift", "C.swift"])
+        XCTAssertEqual(input.removedPaths, [])
+    }
+
+    func testAgentReviewResponseRequiresAnchorsInsideTheReviewedSnapshot() throws {
+        let input = GitAgentReviewInput(
+            diffHash: String(repeating: "a", count: 64),
+            baseDiffHash: nil,
+            files: [.init(path: "Sources/App.swift", stagedPatch: "patch", unstagedPatch: "", untrackedText: nil)],
+            removedPaths: []
+        )
+        let valid = try GitAgentReviewResponse.parse(
+            #"{"findings":[{"severity":"warning","path":"Sources/App.swift","line":12,"message":"Handle the nil case."}]}"#,
+            input: input
+        )
+        XCTAssertEqual(valid.findings, [
+            .init(severity: .warning, path: "Sources/App.swift", line: 12, message: "Handle the nil case.")
+        ])
+
+        XCTAssertThrowsError(try GitAgentReviewResponse.parse(
+            #"{"findings":[{"severity":"error","path":"Secrets.txt","line":1,"message":"Not reviewed."}]}"#,
+            input: input
+        ))
+        XCTAssertThrowsError(try GitAgentReviewResponse.parse(
+            #"{"findings":[{"severity":"error","path":"Sources/App.swift","line":0,"message":"Bad anchor."}]}"#,
+            input: input
+        ))
+    }
+
+    func testAgentReviewPromptPinsHashDeltaAndReadOnlyContract() {
+        let input = GitAgentReviewInput(
+            diffHash: String(repeating: "b", count: 64),
+            baseDiffHash: String(repeating: "a", count: 64),
+            files: [.init(path: "A.swift", stagedPatch: "diff", unstagedPatch: "", untrackedText: nil)],
+            removedPaths: ["Old.swift"]
+        )
+        let prompt = GitAgentReviewPrompt.render(input)
+        XCTAssertTrue(prompt.contains(input.diffHash))
+        XCTAssertTrue(prompt.contains(input.baseDiffHash!))
+        XCTAssertTrue(prompt.contains("read-only"))
+        XCTAssertTrue(prompt.contains("A.swift"))
+        XCTAssertTrue(prompt.contains("Old.swift"))
+        XCTAssertFalse(prompt.contains("push"), "review must not imply a push side effect")
+    }
+
     // MARK: - GitRefreshPolicy (pure)
 
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
@@ -708,6 +786,42 @@ final class GitPanelModelTests: XCTestCase {
     }
 
     // MARK: - Live model behavior
+
+    @MainActor
+    func testAgentReviewRunsConfiguredAgentReusesExactDiffAndPrefillsChat() throws {
+        try write("review.swift", "let value = 1\n")
+        try git(["add", "review.swift"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("review.swift", "let value = 2\n")
+        let runner = RecordingGitAgentReviewRunner()
+        var followUpAgent: AgentProfile?
+        var followUpDraft: String?
+        let model = GitPanelModel(repoRoot: repo, agentReviewRunner: runner) { agent, draft in
+            followUpAgent = agent
+            followUpDraft = draft
+        }
+        model.selectedReviewerAgentIDs = ["codex"]
+
+        model.runAgentReview()
+        XCTAssertTrue(pump(until: { !model.isBusy }, timeout: 12))
+        let first = try XCTUnwrap(model.agentReviewResults.first, model.errorMessage ?? "missing result")
+        XCTAssertEqual(first.agentID, "codex")
+        XCTAssertFalse(first.reused)
+        XCTAssertEqual(first.findings.first?.path, "review.swift")
+        XCTAssertEqual(runner.inputs.count, 1)
+        XCTAssertEqual(runner.inputs[0].diffHash, first.diffHash)
+
+        model.runAgentReview()
+        XCTAssertTrue(pump(until: { !model.isBusy }, timeout: 12))
+        let reused = try XCTUnwrap(model.agentReviewResults.first)
+        XCTAssertTrue(reused.reused)
+        XCTAssertEqual(runner.inputs.count, 1, "an unchanged diff must not launch the agent again")
+
+        model.prefillFollowUp(for: reused)
+        XCTAssertEqual(followUpAgent?.id, "codex")
+        XCTAssertTrue(followUpDraft?.contains("review.swift:1") == true)
+        XCTAssertTrue(followUpDraft?.contains(reused.diffHash) == true)
+    }
 
     @MainActor
     func testHunkActionRefreshesBothReviewSurfacesWithoutClosingTheSelectedView() throws {
@@ -1500,5 +1614,28 @@ final class GitPanelModelTests: XCTestCase {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
+private final class RecordingGitAgentReviewRunner: GitAgentReviewRunning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedInputs: [GitAgentReviewInput] = []
+
+    var inputs: [GitAgentReviewInput] { lock.withLock { storedInputs } }
+
+    func review(
+        agent: AgentProfile,
+        input: GitAgentReviewInput,
+        environment: [String: String]
+    ) async throws -> [GitAgentReviewFinding] {
+        lock.withLock { storedInputs.append(input) }
+        return [
+            GitAgentReviewFinding(
+                severity: .warning,
+                path: input.files[0].path,
+                line: 1,
+                message: "Verify the changed value."
+            ),
+        ]
     }
 }

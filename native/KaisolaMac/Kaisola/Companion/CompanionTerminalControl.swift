@@ -66,7 +66,9 @@ struct CompanionTerminalControlAdapter {
 /// + authenticated-connection + lease-generation checks before every call.
 @MainActor
 final class CompanionTerminalControl {
-    static let leaseTTLMilliseconds: Int64 = 30_000
+    // Nonisolated so the header chip can band its lease against the same TTL
+    // the lease is armed with, without hopping to the main actor to read it.
+    nonisolated static let leaseTTLMilliseconds: Int64 = 30_000
     static let maximumInputBytes = 16 * 1_024
     static let minimumColumns = 20
     static let maximumColumns = 400

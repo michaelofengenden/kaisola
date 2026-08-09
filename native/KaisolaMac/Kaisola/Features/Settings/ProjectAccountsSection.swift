@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Settings ▸ Accounts section that pins a per-project Claude/Codex account on top
@@ -20,10 +21,21 @@ struct ProjectAccountsSection: View {
     @State private var newDirectory = ""
     @State private var accountError: String?
     @State private var pendingRemoval: UsageAccountProfile?
+    @State private var confirmingRecoveryReset = false
     /// The account whose sign-in sheet is open, if any.
     @State private var signingIn: UsageAccountProfile?
-    private let store = ProjectAccountStore()
+    @ObservedObject private var recoveryCenter: ProjectAccountRecoveryCenter
     private let usageAccountStore = UsageAccountStore()
+
+    init(
+        projectID: String?,
+        projectName: String?,
+        recoveryCenter: ProjectAccountRecoveryCenter = .shared
+    ) {
+        self.projectID = projectID
+        self.projectName = projectName
+        _recoveryCenter = ObservedObject(wrappedValue: recoveryCenter)
+    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -66,19 +78,64 @@ struct ProjectAccountsSection: View {
         } message: {
             Text("Kaisola will forget this named account. Its provider files and sign-in stay on disk.")
         }
+        .confirmationDialog(
+            "Reset all project account overrides?",
+            isPresented: $confirmingRecoveryReset,
+            titleVisibility: .visible
+        ) {
+            Button("Reset Project Accounts", role: .destructive) { resetAfterFailure() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Kaisola will keep the damaged or unsupported file beside the active one, then clear every project's Claude and Codex selection. Agent launches can use app defaults again only after this explicit reset.")
+        }
     }
 
     private func load() {
-        let override = projectID.flatMap { store.override(forProject: $0) }
-        claudeConfigDir = override?.claudeConfigDir ?? ""
-        codexHome = override?.codexHome ?? ""
+        switch recoveryCenter.loadStatus() {
+        case .missing:
+            claudeConfigDir = ""
+            codexHome = ""
+        case .loaded(let payload):
+            let override = projectID.flatMap { payload.projects[$0] }
+            claudeConfigDir = override?.claudeConfigDir ?? ""
+            codexHome = override?.codexHome ?? ""
+        case .blocked:
+            claudeConfigDir = ""
+            codexHome = ""
+        }
     }
 
     private func save(_ projectID: String) {
-        store.set(
-            ProjectAccountOverride(claudeConfigDir: claudeConfigDir, codexHome: codexHome),
-            forProject: projectID
-        )
+        guard recoveryCenter.issue == nil else { return }
+        do {
+            try recoveryCenter.set(
+                ProjectAccountOverride(claudeConfigDir: claudeConfigDir, codexHome: codexHome),
+                forProject: projectID
+            )
+        } catch ProjectAccountStore.StoreError.recoveryRequired {
+        } catch {
+            accountError = error.localizedDescription
+        }
+    }
+
+    private func revealRecoveryFile() {
+        guard let recoveryIssue = recoveryCenter.issue else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([recoveryIssue.revealURL])
+    }
+
+    private func resetAfterFailure() {
+        do {
+            let preserved = try recoveryCenter.resetAfterFailure()
+            load()
+            ToastCenter.shared.show(
+                "Reset project account overrides; kept \(preserved.lastPathComponent)",
+                style: .success,
+                duration: 6
+            )
+        } catch {
+            load()
+            accountError = error.localizedDescription
+        }
     }
 
     private var suggestedDirectory: String? {
@@ -248,7 +305,36 @@ struct ProjectAccountsSection: View {
     /// Which account this project's sessions actually run as.
     private var perProjectCard: some View {
         SettingsCard(title: "This project", symbol: "folder") {
-            if let projectID {
+            if let recoveryIssue = recoveryCenter.issue {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label(recoveryIssue.title, systemImage: "exclamationmark.triangle.fill")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                    Text(recoveryIssue.message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        Button("Retry") { load() }
+                            .buttonStyle(.borderedProminent)
+                        Button(recoveryIssue.preservedCopyURL == nil
+                            ? "Reveal Original in Finder"
+                            : "Reveal Preserved Copy in Finder") {
+                            revealRecoveryFile()
+                        }
+                        .buttonStyle(.bordered)
+                        Button("Reset…", role: .destructive) {
+                            confirmingRecoveryReset = true
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 14)
+                .accessibilityElement(children: .contain)
+                .accessibilityIdentifier("kaisola.project-account-recovery")
+            } else if let projectID {
                 SettingsRow(
                     title: "Claude account",
                     detail: projectName.map { "Used by Claude sessions in \($0)" } ?? "Used by Claude sessions here",

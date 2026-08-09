@@ -721,6 +721,7 @@ final class UsageCenter: ObservableObject {
     private let persistenceStore: AcpTranscriptStore?
     private let planUsageContextResolver: PlanUsageContextResolver
     private let usageAccountStore: UsageAccountStore
+    private let projectAccountRecoveryCenter: ProjectAccountRecoveryCenter
     private var persistenceTask: Task<Void, Never>?
     private var chatSources: [String: Set<String>] = [:]
 
@@ -728,6 +729,7 @@ final class UsageCenter: ObservableObject {
         now: @escaping () -> Date = Date.init,
         persistenceStore: AcpTranscriptStore? = nil,
         usageAccountStore: UsageAccountStore = UsageAccountStore(),
+        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = .shared,
         planUsageContextResolver: @escaping PlanUsageContextResolver = { workspace, environment in
             UsageCenter.planUsageContextKey(workspace: workspace, environment: environment)
         }
@@ -735,6 +737,7 @@ final class UsageCenter: ObservableObject {
         self.now = now
         self.persistenceStore = persistenceStore
         self.usageAccountStore = usageAccountStore
+        self.projectAccountRecoveryCenter = projectAccountRecoveryCenter
         self.planUsageContextResolver = planUsageContextResolver
     }
 
@@ -948,15 +951,26 @@ final class UsageCenter: ObservableObject {
     /// credential reads, package hashing, and provider processes stay off the
     /// main actor.
     func refreshPlanUsage(workspace: URL?, force: Bool = false) {
-        let projectOverride = workspace.map {
-            ProjectAccountStore().override(
-                forProject: NativeSessionStore.projectID(forDirectory: $0.path)
-            )
-        } ?? nil
-        let overlay = ProjectAccountStore.mergedOverlay(
-            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-            project: projectOverride
-        )
+        let appOverlay = NativePreviewSettings.shared.agentEnvironmentOverlay
+        let overlay: [String: String]
+        if let workspace {
+            switch projectAccountRecoveryCenter.launchOverlay(
+                app: appOverlay,
+                forProject: NativeSessionStore.projectID(forDirectory: workspace.path)
+            ) {
+            case .success(let resolved):
+                overlay = resolved
+            case .failure(let issue):
+                planRefreshTask?.cancel()
+                planRefreshTask = nil
+                planRefreshGeneration &+= 1
+                isRefreshingPlanUsage = false
+                planUsageError = issue.message
+                return
+            }
+        } else {
+            overlay = appOverlay
+        }
         let environment = ProcessInfo.processInfo.environment.merging(overlay) { _, project in project }
         let profiles = usageAccountStore.profiles()
         let requests = Self.planUsageRequests(

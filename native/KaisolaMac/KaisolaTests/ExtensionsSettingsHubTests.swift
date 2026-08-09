@@ -237,6 +237,76 @@ final class ExtensionsSettingsHubTests: XCTestCase {
         XCTAssertFalse(item.accessibilityDescription.contains("/secret/location"))
     }
 
+    func testInactiveThemeRemovalPlanNamesTheExactThemeAndPromisesNoSelectionChange() {
+        let theme = removalTheme(id: "midnight", title: "Midnight")
+        let plan = TerminalThemeRemovalPlan(
+            theme: theme,
+            selectedThemeID: "kaisola",
+            fallbackThemeID: "native",
+            fallbackThemeTitle: "macOS Terminal"
+        )
+
+        XCTAssertEqual(plan.id, theme.id)
+        XCTAssertEqual(plan.theme, theme, "the confirmation must retain the exact stored spec")
+        XCTAssertEqual(plan.title, "Remove “Midnight” theme?")
+        XCTAssertEqual(
+            plan.message,
+            "This permanently removes “Midnight” from Kaisola. Your current terminal theme stays active."
+        )
+        XCTAssertEqual(plan.selectionAfterSuccessfulRemoval(currentThemeID: "kaisola"), "kaisola")
+    }
+
+    func testSelectedThemeRemovalPlanNamesTheFallbackBeforeConfirmation() {
+        let plan = TerminalThemeRemovalPlan(
+            theme: removalTheme(id: "midnight", title: "Midnight"),
+            selectedThemeID: "midnight",
+            fallbackThemeID: "native",
+            fallbackThemeTitle: "macOS Terminal"
+        )
+
+        XCTAssertEqual(
+            plan.message,
+            "“Midnight” is currently active. Removing it permanently switches Kaisola to “macOS Terminal”."
+        )
+        XCTAssertEqual(plan.selectionAfterSuccessfulRemoval(currentThemeID: "midnight"), "native")
+    }
+
+    func testRemovalUsesCurrentSelectionAtCommitTimeRatherThanAStaleAlertSnapshot() {
+        let plan = TerminalThemeRemovalPlan(
+            theme: removalTheme(id: "midnight", title: "Midnight"),
+            selectedThemeID: "kaisola",
+            fallbackThemeID: "native",
+            fallbackThemeTitle: "macOS Terminal"
+        )
+
+        XCTAssertEqual(
+            plan.selectionAfterSuccessfulRemoval(currentThemeID: "midnight"),
+            "native",
+            "another Settings window can select the theme while confirmation is open"
+        )
+        XCTAssertEqual(
+            plan.selectionAfterSuccessfulRemoval(currentThemeID: "kaisola"),
+            "kaisola",
+            "another Settings window can move away from the theme while confirmation is open"
+        )
+    }
+
+    func testRemovalConfirmationNormalizesControlCharactersInUserThemeTitles() {
+        let plan = TerminalThemeRemovalPlan(
+            theme: removalTheme(id: "night-shift", title: "  Night\n\tShift  "),
+            selectedThemeID: "night-shift",
+            fallbackThemeID: "native",
+            fallbackThemeTitle: "macOS\nTerminal"
+        )
+
+        XCTAssertEqual(plan.displayName, "Night Shift")
+        XCTAssertEqual(plan.title, "Remove “Night Shift” theme?")
+        XCTAssertEqual(
+            plan.message,
+            "“Night Shift” is currently active. Removing it permanently switches Kaisola to “macOS Terminal”."
+        )
+    }
+
     func testSearchIsCaseAndDiacriticInsensitiveAcrossNameCategoryAndMetadata() {
         let items = ExtensionsSettingsFixture.items
         XCTAssertEqual(
@@ -356,5 +426,16 @@ final class ExtensionsSettingsHubTests: XCTestCase {
             "missing-compact-picker-label-ax"
         )
         XCTAssertEqual(receipt(width: 900).failure, "wide-content-too-narrow-900.0")
+    }
+
+    private func removalTheme(id: String, title: String) -> CustomThemeSpec {
+        let palette = CustomThemeSpec.PaletteSpec(
+            background: "#101010",
+            foreground: "#eeeeee",
+            cursor: "#ffffff",
+            selection: "#334455",
+            ansi: Array(repeating: "#777777", count: 16)
+        )
+        return CustomThemeSpec(id: id, title: title, light: palette, dark: palette)
     }
 }

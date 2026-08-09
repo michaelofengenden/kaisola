@@ -1,5 +1,62 @@
 import Foundation
 
+/// Immutable context carried from the trash button into the destructive
+/// confirmation. Keeping the exact spec prevents a reordered/reloaded catalog
+/// from deleting a different row, while recomputing the selected id after the
+/// store mutation handles another Settings window changing themes while the
+/// alert is open.
+struct TerminalThemeRemovalPlan: Identifiable, Equatable, Sendable {
+    let theme: CustomThemeSpec
+    let wasSelectedWhenRequested: Bool
+    let fallbackThemeID: String
+    let fallbackThemeTitle: String
+
+    init(
+        theme: CustomThemeSpec,
+        selectedThemeID: String,
+        fallbackThemeID: String,
+        fallbackThemeTitle: String
+    ) {
+        self.theme = theme
+        wasSelectedWhenRequested = selectedThemeID == theme.id
+        self.fallbackThemeID = fallbackThemeID
+        self.fallbackThemeTitle = fallbackThemeTitle
+    }
+
+    var id: String { theme.id }
+
+    var title: String { "Remove “\(displayName)” theme?" }
+
+    var message: String {
+        if wasSelectedWhenRequested {
+            return "“\(displayName)” is currently active. Removing it permanently switches Kaisola to “\(safeFallbackTitle)”."
+        }
+        return "This permanently removes “\(displayName)” from Kaisola. Your current terminal theme stays active."
+    }
+
+    func selectionAfterSuccessfulRemoval(currentThemeID: String) -> String {
+        currentThemeID == theme.id ? fallbackThemeID : currentThemeID
+    }
+
+    var displayName: String {
+        Self.safeName(theme.title, fallback: theme.id)
+    }
+
+    private var safeFallbackTitle: String {
+        Self.safeName(fallbackThemeTitle, fallback: "the built-in theme")
+    }
+
+    private static func safeName(_ value: String, fallback: String) -> String {
+        let withoutControls = value
+            .components(separatedBy: .controlCharacters)
+            .joined(separator: " ")
+        let normalized = withoutControls
+            .split(whereSeparator: \Character.isWhitespace)
+            .joined(separator: " ")
+        return normalized.isEmpty ? fallback : normalized
+    }
+}
+
 /// The five registries that share the consolidated Extensions destination.
 /// These are presentation categories only: each underlying store keeps its
 /// existing ownership and persistence contract.

@@ -577,6 +577,7 @@ private struct TerminalThemesExtensionEditor: View {
     @State private var snapshot = CustomThemeStore.Snapshot(specs: [], state: .missing)
     @State private var operationError: String?
     @State private var confirmReset = false
+    @State private var pendingRemoval: TerminalThemeRemovalPlan?
     private let store = CustomThemeStore()
 
     var body: some View {
@@ -667,12 +668,15 @@ private struct TerminalThemesExtensionEditor: View {
                                     .controlSize(.small)
                                     .disabled(settings.terminalThemeID == spec.id)
                                 }
-                                Button(role: .destructive) { remove(spec) } label: {
-                                    Image(systemName: "trash")
+                                Button { requestRemoval(spec) } label: {
+                                    Label("Remove", systemImage: "trash")
                                 }
                                 .buttonStyle(.borderless)
+                                .foregroundStyle(.red)
                                 .disabled(!snapshot.state.allowsMutations)
                                 .accessibilityLabel("Remove theme \(item.name)")
+                                .accessibilityHint("Opens a confirmation before permanently removing this theme.")
+                                .accessibilityAction { requestRemoval(spec) }
                             }
                         }
                         .id(spec.id)
@@ -710,9 +714,32 @@ private struct TerminalThemesExtensionEditor: View {
                 Text("Kaisola will replace the active unreadable registry with an empty version. The recovery copy will remain on disk.")
             }
         }
+        // Keep the removal confirmation on a different presentation host from
+        // the registry-reset dialog above. SwiftUI otherwise accepts the row
+        // action but can suppress the second presenter on macOS.
+        .confirmationDialog(
+            pendingRemoval?.title ?? "Remove custom terminal theme?",
+            isPresented: removalConfirmationPresented,
+            titleVisibility: .visible,
+            presenting: pendingRemoval
+        ) { plan in
+            Button("Remove Theme", role: .destructive) { confirmRemoval(plan) }
+            Button("Cancel", role: .cancel) {}
+        } message: { plan in
+            Text(plan.message)
+        }
     }
 
     private var specs: [CustomThemeSpec] { snapshot.specs }
+
+    private var removalConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { pendingRemoval != nil },
+            set: { isPresented in
+                if !isPresented { pendingRemoval = nil }
+            }
+        )
+    }
 
     private func scrollToHighlight(using proxy: ScrollViewProxy) {
         guard let highlightedID else { return }
@@ -721,10 +748,27 @@ private struct TerminalThemesExtensionEditor: View {
         }
     }
 
-    private func remove(_ spec: CustomThemeSpec) {
+    private func requestRemoval(_ spec: CustomThemeSpec) {
+        guard let fallback = TerminalThemeRegistry.shipped.first else { return }
+        pendingRemoval = TerminalThemeRemovalPlan(
+            theme: spec,
+            selectedThemeID: settings.terminalThemeID,
+            fallbackThemeID: fallback.id,
+            fallbackThemeTitle: fallback.title
+        )
+    }
+
+    private func confirmRemoval(_ plan: TerminalThemeRemovalPlan) {
         do {
-            _ = try store.remove(id: spec.id)
+            let removed = try store.remove(id: plan.theme.id)
+            settings.terminalThemeID = plan.selectionAfterSuccessfulRemoval(
+                currentThemeID: settings.terminalThemeID
+            )
             reload()
+            ToastCenter.shared.show(
+                removed ? "Removed \(plan.displayName)" : "That theme was already removed",
+                style: .success
+            )
             NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
         } catch {
             report(error)

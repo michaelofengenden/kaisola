@@ -137,6 +137,35 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         }
     }
 
+    func testInvalidInventoryRowPreservesTheLastPublishedRouteSnapshot() async throws {
+        let topology = makeTopology()
+        let current = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("current-terminal")])
+        )
+        let draining = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("draining-terminal")])
+        )
+        let queue = ObserverClientQueue([current, draining])
+        let routes = BrokerGenerationRouteTable()
+        let observer = BrokerGenerationObserverRouter(routes: routes, factory: { queue.next() })
+
+        _ = try await observer.connect(to: topology)
+        _ = try await observer.inventory()
+        await current.failInventory(with: .invalidDiagnosticRow(index: 2))
+
+        do {
+            _ = try await observer.inventory()
+            XCTFail("an invalid child row must reject the complete merged inventory")
+        } catch {
+            XCTAssertEqual(error as? BrokerInventoryError, .invalidDiagnosticRow(index: 2))
+        }
+
+        let retainedCurrentRoute = try await routes.generationID(for: "current-terminal")
+        let retainedDrainingRoute = try await routes.generationID(for: "draining-terminal")
+        XCTAssertEqual(retainedCurrentRoute, topology.current.id)
+        XCTAssertEqual(retainedDrainingRoute, topology.draining[0].id)
+    }
+
     func testInventoryRetriesWholeMergeWhenOneBrokerActivityEpochChanges() async throws {
         let topology = makeTopology()
         let current = RoutingObserverClient(statuses: [
@@ -519,6 +548,7 @@ private final class ControlClientQueue: @unchecked Sendable {
 
 private actor RoutingObserverClient: ObserveOnlyBrokerServing {
     private var statuses: [BrokerStatus]
+    private var inventoryError: BrokerInventoryError?
     private let pause: RoutingInventoryPause?
     private var recordedInventoryCount = 0
     private var recordedCalls: [String] = []
@@ -573,6 +603,7 @@ private actor RoutingObserverClient: ObserveOnlyBrokerServing {
 
     func inventory() async throws -> BrokerStatus {
         recordedInventoryCount += 1
+        if let inventoryError { throw inventoryError }
         if recordedInventoryCount == 1, let pause { await pause.pause() }
         if statuses.count > 1 { return statuses.removeFirst() }
         return statuses[0]
@@ -624,6 +655,7 @@ private actor RoutingObserverClient: ObserveOnlyBrokerServing {
     }
 
     func calls() -> [String] { recordedCalls }
+    func failInventory(with error: BrokerInventoryError) { inventoryError = error }
     func inventoryCount() -> Int { recordedInventoryCount }
     func disconnectCount() -> Int { recordedDisconnectCount }
 

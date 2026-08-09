@@ -114,9 +114,18 @@ struct BrokerStatus: Equatable, Sendable {
                 return (id, value)
             }
         )
-        terminals = diagnosticValues.compactMap { value in
-            BrokerTerminalRecord(value: value, liveValue: value.objectValue?["id"]?.stringValue.flatMap { liveByID[$0] })
+        var decodedTerminals: [BrokerTerminalRecord] = []
+        decodedTerminals.reserveCapacity(diagnosticValues.count)
+        for (index, value) in diagnosticValues.enumerated() {
+            guard let terminal = BrokerTerminalRecord(
+                value: value,
+                liveValue: value.objectValue?["id"]?.stringValue.flatMap { liveByID[$0] }
+            ) else {
+                throw BrokerInventoryError.invalidDiagnosticRow(index: index)
+            }
+            decodedTerminals.append(terminal)
         }
+        terminals = decodedTerminals
         activityEpoch = parsedActivityEpoch
     }
 
@@ -515,6 +524,17 @@ enum BrokerClientError: Error, Equatable, LocalizedError {
         case .requestFailed: "The session service rejected a read-only request."
         case let .socketFailure(code): "The private terminal connection failed (\(code)); running sessions were not changed."
         case .socketPathTooLong: "The private terminal connection path is too long for macOS."
+        }
+    }
+}
+
+enum BrokerInventoryError: Error, Equatable, LocalizedError {
+    case invalidDiagnosticRow(index: Int)
+
+    var errorDescription: String? {
+        switch self {
+        case let .invalidDiagnosticRow(index):
+            "The session service returned an invalid terminal inventory row at index \(index); running sessions were left untouched."
         }
     }
 }

@@ -111,16 +111,48 @@ final class BrokerModelsTests: XCTestCase {
         XCTAssertFalse(terminal.wasOwned(by: "legacy-project"))
     }
 
-    func testStatusDropsTerminalWithoutExactProjectCapability() throws {
-        let status = try BrokerStatus(
-            status: validStatus,
-            diagnostics: .array([
-                .object(["id": .string("orphan"), "owner": .string("")]),
+    func testStatusRejectsCompleteInventoryAtTheFirstInvalidDiagnosticRow() {
+        let diagnostics: [JSONValue] = [
+            validDiagnostic(id: "terminal:first"),
+            .object([
+                "id": .string("forged-secret-terminal"),
+                "owner": .string(""),
             ]),
+            validDiagnostic(id: "terminal:never-published"),
+        ]
+
+        XCTAssertThrowsError(try BrokerStatus(
+            status: validStatus,
+            diagnostics: .array(diagnostics),
             live: .array([]),
             expectedHello: hello
-        )
-        XCTAssertTrue(status.terminals.isEmpty)
+        )) { error in
+            XCTAssertEqual(error as? BrokerInventoryError, .invalidDiagnosticRow(index: 1))
+            XCTAssertEqual(
+                error.localizedDescription,
+                "The session service returned an invalid terminal inventory row at index 1; running sessions were left untouched."
+            )
+            XCTAssertFalse(error.localizedDescription.contains("forged-secret-terminal"))
+        }
+    }
+
+    func testStatusReportsZeroBasedIndexForMalformedDiagnosticShapes() {
+        for (diagnostics, expectedIndex) in [
+            ([JSONValue.string("not-an-object"), validDiagnostic(id: "terminal:valid")], 0),
+            ([validDiagnostic(id: "terminal:valid"), JSONValue.array([])], 1),
+        ] {
+            XCTAssertThrowsError(try BrokerStatus(
+                status: validStatus,
+                diagnostics: .array(diagnostics),
+                live: .array([]),
+                expectedHello: hello
+            )) { error in
+                XCTAssertEqual(
+                    error as? BrokerInventoryError,
+                    .invalidDiagnosticRow(index: expectedIndex)
+                )
+            }
+        }
     }
 
     func testSnapshotRequiresByteExactOffsets() {
@@ -213,6 +245,15 @@ final class BrokerModelsTests: XCTestCase {
             "ok": .bool(true),
             "protocol": .integer(2),
             "securityEpoch": .integer(1),
+        ])
+    }
+
+    private func validDiagnostic(id: String) -> JSONValue {
+        .object([
+            "id": .string(id),
+            "owner": .string("instance|install|project"),
+            "lastOwner": .string(""),
+            "exited": .bool(false),
         ])
     }
 

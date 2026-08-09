@@ -26,6 +26,7 @@ final class CompanionClient: ObservableObject {
     var onAckCursor: ((CompanionAckCursor) -> Void)?
     var onCapabilities: ((Set<CompanionCapability>) -> Void)?
     var onStreamIssue: ((String, String?) -> Void)?
+    var onRevoked: ((String) -> Void)?
 
     let transport: CompanionTransport
 
@@ -514,6 +515,14 @@ final class CompanionClient: ObservableObject {
             try activateLive()
             return
         }
+        if type == "device-revoked" {
+            guard case .resume = mode else { throw CompanionCryptoError.authenticationFailed }
+            handleDeviceRevocation(
+                message: object["message"]?.stringValue
+                    ?? "This iPhone was revoked on the Mac. Pair it again to reconnect."
+            )
+            return
+        }
         throw CompanionCryptoError.invalidSecurePayload
     }
 
@@ -555,6 +564,13 @@ final class CompanionClient: ObservableObject {
         guard let channel else { throw CompanionWireError.connectionUnavailable }
         let secure = try JSONDecoder().decode(CompanionSecureFrame.self, from: data)
         let envelope = try CompanionProtocolCodec.decode(channel.decrypt(secure))
+        if envelope.kind == .error {
+            let error = try envelope.body.decode(CompanionErrorBody.self)
+            if error.code == "device_revoked" {
+                handleDeviceRevocation(message: error.message)
+                return
+            }
+        }
         // First inbound frame on this connection tells us the desktop's current
         // epoch. Adopt it for outbound commands and only now fire the deferred
         // stream subscriptions, so they can never carry a stale (rejected) epoch.
@@ -591,6 +607,31 @@ final class CompanionClient: ObservableObject {
             finishCommand(receipt.commandId, result: .success(receipt))
         }
         onEnvelope?(envelope)
+    }
+
+    func handleDeviceRevocation(message: String) {
+        // The authenticated desktop controls only the terminal-state code,
+        // never UI content. Discard its message so terminal output, paths, or
+        // other accidental payloads cannot survive revocation on the phone.
+        _ = message
+        let safeMessage = "This iPhone was revoked on the Mac. Pair it again to reconnect."
+        failPendingCommands(with: CompanionCommandError.unavailable)
+        desiredStreamSubscriptions.removeAll()
+        resetActiveStreamSubscriptions()
+        ackCursor = nil
+        liveEpoch = nil
+        mode = nil
+        pairedDesktop = nil
+        sas = nil
+        initiator = nil
+        handshakeResult = nil
+        channel = nil
+        connectionContext = nil
+        sessionId = nil
+        // The coordinator clears persisted resume authority and seals lifecycle
+        // reconnect intent synchronously before stop publishes an idle state.
+        onRevoked?(safeMessage)
+        transport.stop()
     }
 
     private func finishCommand(_ commandId: String, result: Result<CompanionReceiptBody, Error>) {

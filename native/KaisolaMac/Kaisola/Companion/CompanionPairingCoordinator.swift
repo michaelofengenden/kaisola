@@ -36,6 +36,7 @@ struct CompanionPairingCoordinatorOutput: Sendable {
             sas: CompanionSAS
         )
         case authenticated(device: CompanionPairedDeviceRecord, resumed: Bool)
+        case revoked(deviceID: String)
     }
 
     var frames: [Data] = []
@@ -81,6 +82,7 @@ actor CompanionPairingCoordinator {
         let expiresAt: Int64
         let requestedCapabilities: [CompanionCapability]
         let knownResumeDevice: CompanionPairedDeviceRecord?
+        let revokedResumeDevice: CompanionRevokedDeviceRecord?
         var phase: Phase = .awaitingMessage3
         var result: NoiseHandshakeResult?
         var channel: SecureFrameChannel?
@@ -99,7 +101,8 @@ actor CompanionPairingCoordinator {
             responder: NoiseXXResponder,
             expiresAt: Int64,
             requestedCapabilities: [CompanionCapability],
-            knownResumeDevice: CompanionPairedDeviceRecord?
+            knownResumeDevice: CompanionPairedDeviceRecord?,
+            revokedResumeDevice: CompanionRevokedDeviceRecord?
         ) {
             self.kind = kind
             self.sessionID = sessionID
@@ -109,6 +112,7 @@ actor CompanionPairingCoordinator {
             self.expiresAt = expiresAt
             self.requestedCapabilities = requestedCapabilities
             self.knownResumeDevice = knownResumeDevice
+            self.revokedResumeDevice = revokedResumeDevice
         }
     }
 
@@ -300,7 +304,8 @@ actor CompanionPairingCoordinator {
                 responder: responder,
                 expiresAt: min(qrPayload.expiresAt, nowMilliseconds + Self.handshakeTTL),
                 requestedCapabilities: qrPayload.requestedCapabilities,
-                knownResumeDevice: nil
+                knownResumeDevice: nil,
+                revokedResumeDevice: nil
             )
             sessionsBySocket[socketID] = session
             return CompanionPairingCoordinatorOutput(frames: [try Self.encode(JSONValue.object([
@@ -318,9 +323,12 @@ actor CompanionPairingCoordinator {
             }
             _ = try CompanionCrypto.validateIdentifier(deviceID, label: "deviceId")
             let known = await roster.device(deviceID)
+            let revoked = known == nil ? await roster.revokedDevice(deviceID) : nil
             let pin: CompanionIdentityPin
             if let known {
                 pin = known.pin
+            } else if let revoked {
+                pin = revoked.pin
             } else {
                 pin = CompanionIdentityPin(
                     id: deviceID,
@@ -351,7 +359,8 @@ actor CompanionPairingCoordinator {
                 responder: responder,
                 expiresAt: nowMilliseconds + Self.handshakeTTL,
                 requestedCapabilities: known?.capabilities ?? [.observe],
-                knownResumeDevice: known
+                knownResumeDevice: known,
+                revokedResumeDevice: revoked
             )
             sessionsBySocket[socketID] = session
             return CompanionPairingCoordinatorOutput(frames: [try Self.encode(JSONValue.object([
@@ -393,7 +402,8 @@ actor CompanionPairingCoordinator {
                 throw CompanionPairingCoordinatorError.duplicateDevice
             }
         } else {
-            guard let known = session.knownResumeDevice, peer == known.pin else {
+            guard peer == session.knownResumeDevice?.pin
+                    || peer == session.revokedResumeDevice?.pin else {
                 throw CompanionPairingCoordinatorError.authenticationFailed
             }
         }
@@ -444,11 +454,31 @@ actor CompanionPairingCoordinator {
         }
         session.remoteKeyConfirmed = true
         if session.kind == .resume {
+            if let revoked = session.revokedResumeDevice {
+                return try revokedResumeOutput(
+                    session: session,
+                    deviceID: revoked.deviceId
+                )
+            }
             guard let known = session.knownResumeDevice else {
                 throw CompanionPairingCoordinatorError.authenticationFailed
             }
-            try await roster.markSeen(known.deviceId, now: nowMilliseconds)
-            let refreshed = await roster.device(known.deviceId) ?? known
+            let refreshed: CompanionPairedDeviceRecord
+            do {
+                refreshed = try await roster.authorizeResume(
+                    deviceID: known.deviceId,
+                    expectedPin: known.pin,
+                    now: nowMilliseconds
+                )
+            } catch {
+                if await roster.revokedDevice(known.deviceId)?.pin == known.pin {
+                    return try revokedResumeOutput(
+                        session: session,
+                        deviceID: known.deviceId
+                    )
+                }
+                throw CompanionPairingCoordinatorError.authenticationFailed
+            }
             session.authenticatedDevice = refreshed
             session.phase = .authenticated
             return CompanionPairingCoordinatorOutput(
@@ -468,6 +498,24 @@ actor CompanionPairingCoordinator {
             displayName: result.peerDisplayName ?? "Kaisola Device",
             sas: sas
         ))
+    }
+
+    private func revokedResumeOutput(
+        session: Session,
+        deviceID: String
+    ) throws -> CompanionPairingCoordinatorOutput {
+        guard let channel = session.channel else {
+            throw CompanionPairingCoordinatorError.handshakeOrder
+        }
+        let payload: JSONValue = .object([
+            "type": .string("device-revoked"),
+            "message": .string("This iPhone was revoked on the Mac. Pair it again to reconnect."),
+        ])
+        session.phase = .finalizing
+        return CompanionPairingCoordinatorOutput(
+            frames: [try Self.encode(channel.encrypt(payload))],
+            event: .revoked(deviceID: deviceID)
+        )
     }
 
     private func receiveRemoteSAS(

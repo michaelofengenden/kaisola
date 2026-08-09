@@ -270,6 +270,32 @@ actor CompanionConnectionSession {
         }
     }
 
+    /// May run immediately after Noise authentication, before device hello.
+    /// This closes the final race where revocation lands after the roster
+    /// authorizes a resume but before the host adopts that connection.
+    func sendDeviceRevoked() async throws {
+        guard phase == .authenticated || phase == .live,
+              let authenticated else { throw CompanionWireError.connectionUnavailable }
+        let sequence = nextOutgoingSequence
+        nextOutgoingSequence += 1
+        let envelope = try CompanionEnvelope(
+            kind: .error,
+            desktopId: authenticated.context.desktopId,
+            deviceId: authenticated.context.deviceId,
+            connectionId: authenticated.context.connectionId,
+            epoch: epoch,
+            seq: sequence,
+            id: "device-revoked-\(UUID().uuidString.lowercased())",
+            sentAt: now(),
+            body: CompanionBody(CompanionErrorBody(
+                type: "error",
+                code: "device_revoked",
+                message: "This iPhone was revoked on the Mac. Pair it again to reconnect."
+            ))
+        )
+        try await sendSecure(envelope, channel: authenticated.channel)
+    }
+
     func authenticationTimedOut() async {
         guard phase == .handshaking else { return }
         await close(reason: "authentication_timeout")
@@ -313,6 +339,10 @@ actor CompanionConnectionSession {
             phase = .authenticated
             try await sendDesktopHello(connection: connection)
             eventSink(.authenticated(device: device, resumed: resumed))
+        case .revoked:
+            // The coordinator already queued the Noise-authenticated,
+            // content-free terminal frame. Close only after it is written.
+            await close(reason: "device_revoked")
         }
     }
 
@@ -465,6 +495,7 @@ protocol CompanionHostConnection: Actor {
         sequence: Int64?,
         sentAt: Int64?
     ) async throws
+    func sendDeviceRevoked() async throws
     func close(reason: String) async
 }
 
@@ -585,6 +616,11 @@ actor CompanionNetworkConnection: CompanionHostConnection {
     ) async throws {
         guard let session else { throw CompanionWireError.connectionUnavailable }
         try await session.sendReceipt(receipt, sequence: sequence, sentAt: sentAt)
+    }
+
+    func sendDeviceRevoked() async throws {
+        guard let session else { throw CompanionWireError.connectionUnavailable }
+        try await session.sendDeviceRevoked()
     }
 
     func close(reason: String = "closed") async {

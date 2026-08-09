@@ -267,6 +267,11 @@ actor CompanionRelayConnection: CompanionHostConnection {
         try await session.sendReceipt(receipt, sequence: sequence, sentAt: sentAt)
     }
 
+    func sendDeviceRevoked() async throws {
+        guard let session else { throw CompanionRelayError.disconnected }
+        try await session.sendDeviceRevoked()
+    }
+
     func close(reason: String = "closed") async {
         timeoutTask?.cancel()
         timeoutTask = nil

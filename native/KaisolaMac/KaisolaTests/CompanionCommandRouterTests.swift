@@ -4,6 +4,35 @@ import XCTest
 @testable import Kaisola
 
 @MainActor
+private final class CommandAuthorizationState {
+    var value = true
+}
+
+@MainActor
+private final class SuspendedCommandRoute {
+    private var started = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        started = true
+        for waiter in startedWaiters { waiter.resume() }
+        startedWaiters.removeAll()
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+@MainActor
 final class CompanionCommandRouterTests: XCTestCase {
     func testAttentionAckRequiresExactProjectAndRevisionAndIsAtMostOnce() async throws {
         let router = CompanionCommandRouter()
@@ -129,6 +158,115 @@ final class CompanionCommandRouterTests: XCTestCase {
             acknowledgeAttention: { _ in false }
         )
         XCTAssertEqual(unavailable.status, .unavailable)
+    }
+
+    func testRevocationRejectsQueuedCommandsAndPurgesPriorReceipts() async throws {
+        let router = CompanionCommandRouter()
+        let device = try pairedDevice()
+        let envelope = try commandEnvelope(
+            id: "command-revoked",
+            projectID: "project-1",
+            targetID: "attention-session-1",
+            expectedRevision: 7
+        )
+        let authorization = CommandAuthorizationState()
+        var applied: [String] = []
+
+        let first = try await router.route(
+            envelope,
+            device: device,
+            projection: projection(revision: 7),
+            isAuthorized: { authorization.value },
+            acknowledgeAttention: { applied.append($0); return true }
+        )
+        XCTAssertEqual(first.status, .applied)
+        XCTAssertEqual(applied, ["session-1"])
+
+        authorization.value = false
+        router.revoke(deviceID: device.deviceId)
+        let revoked = try await router.route(
+            envelope,
+            device: device,
+            projection: projection(revision: 7),
+            isAuthorized: { authorization.value },
+            acknowledgeAttention: { _ in XCTFail("revoked command applied"); return true }
+        )
+        XCTAssertEqual(revoked.status, .rejected)
+        XCTAssertEqual(applied, ["session-1"])
+
+        authorization.value = true
+        let repaired = try await router.route(
+            envelope,
+            device: device,
+            projection: projection(revision: 7),
+            isAuthorized: { authorization.value },
+            acknowledgeAttention: { applied.append($0); return true }
+        )
+        XCTAssertEqual(repaired.status, .applied)
+        XCTAssertEqual(applied, ["session-1", "session-1"])
+    }
+
+    func testRevocationRejectsLateInFlightResultWithoutPoisoningNewAuthority() async throws {
+        let router = CompanionCommandRouter()
+        let device = try pairedDevice(capabilities: [.observe, .terminalControl])
+        let envelope = try terminalCommandEnvelope(
+            id: "command-in-flight-revocation",
+            type: "terminal.interrupt"
+        )
+        let authorization = CommandAuthorizationState()
+        let gate = SuspendedCommandRoute()
+        var routeCount = 0
+
+        let staleTask = Task { @MainActor in
+            try await router.route(
+                envelope,
+                device: device,
+                projection: nil,
+                isAuthorized: { authorization.value },
+                acknowledgeAttention: { _ in false },
+                handleExternal: { command in
+                    routeCount += 1
+                    await gate.suspend()
+                    return CompanionReceiptBody(
+                        type: "command.receipt",
+                        commandId: command.commandId,
+                        status: .applied,
+                        message: "stale result",
+                        payload: nil
+                    )
+                }
+            )
+        }
+        await gate.waitUntilStarted()
+        authorization.value = false
+        router.revoke(deviceID: device.deviceId)
+        gate.release()
+
+        let stale = try await staleTask.value
+        XCTAssertEqual(stale.status, .rejected)
+        XCTAssertEqual(routeCount, 1)
+
+        authorization.value = true
+        let repaired = try await router.route(
+            envelope,
+            device: device,
+            projection: nil,
+            isAuthorized: { authorization.value },
+            acknowledgeAttention: { _ in false },
+            handleExternal: { command in
+                routeCount += 1
+                return CompanionReceiptBody(
+                    type: "command.receipt",
+                    commandId: command.commandId,
+                    status: .applied,
+                    message: "fresh result",
+                    payload: nil
+                )
+            }
+        )
+        XCTAssertEqual(repaired.status, .applied)
+        XCTAssertEqual(repaired.message, "fresh result")
+        XCTAssertEqual(routeCount, 2)
     }
 
     private func projection(revision: Int) -> CompanionProjection {

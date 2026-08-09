@@ -14,6 +14,8 @@ final class CompanionCommandRouter {
     }
 
     private struct Pending {
+        let id: UUID
+        let generation: UInt64
         let fingerprint: Data
         let task: Task<CompanionReceiptBody, Never>
     }
@@ -21,11 +23,13 @@ final class CompanionCommandRouter {
     private var cache: [String: Cached] = [:]
     private var cacheOrder: [String] = []
     private var pending: [String: Pending] = [:]
+    private var authorityGenerations: [String: UInt64] = [:]
 
     func route(
         _ envelope: CompanionEnvelope,
         device: CompanionPairedDeviceRecord,
         projection: CompanionProjection?,
+        isAuthorized: @escaping @MainActor () -> Bool = { true },
         acknowledgeAttention: @escaping @MainActor (String) -> Bool,
         handleExternal: (@MainActor (CompanionCommandBody) async -> CompanionReceiptBody?)? = nil
     ) async throws -> CompanionReceiptBody {
@@ -33,8 +37,10 @@ final class CompanionCommandRouter {
             throw CompanionProtocolError.invalidBody("command router")
         }
         let command = try envelope.body.decode(CompanionCommandBody.self)
+        guard isAuthorized() else { return revokedReceipt(command) }
         let fingerprint = try CanonicalJSON.data(from: .object(envelope.body.fields))
         let cacheKey = "\(device.deviceId)\u{0}\(command.commandId)"
+        let generation = authorityGenerations[device.deviceId, default: 0]
         if let prior = cache[cacheKey] {
             guard prior.fingerprint == fingerprint else {
                 return receipt(
@@ -46,6 +52,7 @@ final class CompanionCommandRouter {
             return prior.receipt
         }
         if let inFlight = pending[cacheKey] {
+            guard inFlight.generation == generation else { return revokedReceipt(command) }
             guard inFlight.fingerprint == fingerprint else {
                 return receipt(
                     command,
@@ -56,9 +63,14 @@ final class CompanionCommandRouter {
             return await inFlight.task.value
         }
 
+        let pendingID = UUID()
         let task = Task { @MainActor [projection] in
+            guard !Task.isCancelled,
+                  self.authorityGenerations[device.deviceId, default: 0] == generation,
+                  isAuthorized() else { return self.revokedReceipt(command) }
             switch command.type {
             case "attention.ack":
+                guard isAuthorized() else { return self.revokedReceipt(command) }
                 return self.acknowledge(command, projection: projection, apply: acknowledgeAttention)
             case "stream.subscribe", "stream.unsubscribe",
                  "terminal.acquire-control", "terminal.renew-control",
@@ -78,11 +90,30 @@ final class CompanionCommandRouter {
                 )
             }
         }
-        pending[cacheKey] = Pending(fingerprint: fingerprint, task: task)
+        pending[cacheKey] = Pending(
+            id: pendingID,
+            generation: generation,
+            fingerprint: fingerprint,
+            task: task
+        )
         let result = await task.value
-        pending.removeValue(forKey: cacheKey)
+        if pending[cacheKey]?.id == pendingID { pending.removeValue(forKey: cacheKey) }
+        guard authorityGenerations[device.deviceId, default: 0] == generation,
+              isAuthorized() else { return revokedReceipt(command) }
         remember(result, fingerprint: fingerprint, key: cacheKey)
         return result
+    }
+
+    /// Cancel queued work and erase at-most-once receipts at the same
+    /// synchronous authority boundary used to close the device's transports.
+    func revoke(deviceID: String) {
+        authorityGenerations[deviceID, default: 0] &+= 1
+        let prefix = "\(deviceID)\u{0}"
+        for key in pending.keys.filter({ $0.hasPrefix(prefix) }) {
+            pending.removeValue(forKey: key)?.task.cancel()
+        }
+        for key in cache.keys.filter({ $0.hasPrefix(prefix) }) { cache.removeValue(forKey: key) }
+        cacheOrder.removeAll { $0.hasPrefix(prefix) }
     }
 
     private func acknowledge(
@@ -133,6 +164,14 @@ final class CompanionCommandRouter {
             status: status,
             message: String(message.prefix(800)),
             payload: payload
+        )
+    }
+
+    private func revokedReceipt(_ command: CompanionCommandBody) -> CompanionReceiptBody {
+        receipt(
+            command,
+            status: .rejected,
+            message: "This Companion device is no longer authorized."
         )
     }
 

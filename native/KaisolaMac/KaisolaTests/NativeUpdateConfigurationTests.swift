@@ -210,6 +210,96 @@ final class NativeUpdateConfigurationTests: XCTestCase {
         )
     }
 
+    func testBackgroundDownloadPresentationExplainsEveryAvailability() {
+        let unavailable = SettingsView.SoftwareUpdateDownloadAvailability.resolve(
+            canConfigureUpdates: false,
+            allowsAutomaticUpdates: true,
+            automaticallyChecksForUpdates: true
+        )
+        XCTAssertEqual(unavailable, .updaterUnavailable)
+        XCTAssertFalse(unavailable.isEnabled)
+        XCTAssertEqual(
+            unavailable.visibleDetail,
+            "Unavailable because this build cannot configure automatic updates"
+        )
+        XCTAssertEqual(
+            unavailable.accessibilityHint,
+            "Background downloads are unavailable because this build cannot configure automatic updates."
+        )
+
+        let unsupported = SettingsView.SoftwareUpdateDownloadAvailability.resolve(
+            canConfigureUpdates: true,
+            allowsAutomaticUpdates: false,
+            automaticallyChecksForUpdates: true
+        )
+        XCTAssertEqual(unsupported, .interactiveUpdateRequired)
+        XCTAssertFalse(unsupported.isEnabled)
+        XCTAssertEqual(
+            unsupported.visibleDetail,
+            "This update type must be downloaded interactively"
+        )
+        XCTAssertEqual(
+            unsupported.accessibilityHint,
+            "Background downloads are unavailable because this update type requires an interactive download."
+        )
+
+        let checksRequired = SettingsView.SoftwareUpdateDownloadAvailability.resolve(
+            canConfigureUpdates: true,
+            allowsAutomaticUpdates: true,
+            automaticallyChecksForUpdates: false
+        )
+        XCTAssertEqual(checksRequired, .automaticChecksRequired)
+        XCTAssertFalse(checksRequired.isEnabled)
+        XCTAssertEqual(
+            checksRequired.visibleDetail,
+            "Turn on automatic checks first"
+        )
+        XCTAssertEqual(
+            checksRequired.accessibilityHint,
+            "Enable Check for updates automatically before enabling background downloads."
+        )
+
+        let ready = SettingsView.SoftwareUpdateDownloadAvailability.resolve(
+            canConfigureUpdates: true,
+            allowsAutomaticUpdates: true,
+            automaticallyChecksForUpdates: true
+        )
+        XCTAssertEqual(ready, .ready)
+        XCTAssertTrue(ready.isEnabled)
+        XCTAssertEqual(ready.visibleDetail, "Kaisola asks before restarting to install")
+        XCTAssertEqual(
+            ready.accessibilityHint,
+            "Downloads updates in the background. Kaisola asks before restarting to install."
+        )
+    }
+
+    func testBackgroundDownloadPresentationPrioritizesHardCapabilityLimits() {
+        XCTAssertEqual(
+            SettingsView.SoftwareUpdateDownloadAvailability.resolve(
+                canConfigureUpdates: false,
+                allowsAutomaticUpdates: false,
+                automaticallyChecksForUpdates: false
+            ),
+            .updaterUnavailable
+        )
+        XCTAssertEqual(
+            SettingsView.SoftwareUpdateDownloadAvailability.resolve(
+                canConfigureUpdates: true,
+                allowsAutomaticUpdates: false,
+                automaticallyChecksForUpdates: false
+            ),
+            .interactiveUpdateRequired
+        )
+        XCTAssertEqual(
+            SettingsView.SoftwareUpdateDownloadAvailability.resolve(
+                canConfigureUpdates: true,
+                allowsAutomaticUpdates: true,
+                automaticallyChecksForUpdates: false
+            ),
+            .automaticChecksRequired
+        )
+    }
+
     func testVisualFixtureUpdateStateRequiresBothIsolationGates() throws {
         XCTAssertNil(UpdateCenter.visualFixturePendingUpdate(environment: [:]))
         XCTAssertNil(UpdateCenter.visualFixturePendingUpdate(environment: [

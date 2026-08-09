@@ -96,6 +96,52 @@ struct SettingsView: View {
         }
     }
 
+    enum SoftwareUpdateDownloadAvailability: Equatable {
+        case ready
+        case updaterUnavailable
+        case interactiveUpdateRequired
+        case automaticChecksRequired
+
+        static func resolve(
+            canConfigureUpdates: Bool,
+            allowsAutomaticUpdates: Bool,
+            automaticallyChecksForUpdates: Bool
+        ) -> SoftwareUpdateDownloadAvailability {
+            if !canConfigureUpdates { return .updaterUnavailable }
+            if !allowsAutomaticUpdates { return .interactiveUpdateRequired }
+            if !automaticallyChecksForUpdates { return .automaticChecksRequired }
+            return .ready
+        }
+
+        var isEnabled: Bool { self == .ready }
+
+        var visibleDetail: String {
+            switch self {
+            case .ready:
+                "Kaisola asks before restarting to install"
+            case .updaterUnavailable:
+                "Unavailable because this build cannot configure automatic updates"
+            case .interactiveUpdateRequired:
+                "This update type must be downloaded interactively"
+            case .automaticChecksRequired:
+                "Turn on automatic checks first"
+            }
+        }
+
+        var accessibilityHint: String {
+            switch self {
+            case .ready:
+                "Downloads updates in the background. Kaisola asks before restarting to install."
+            case .updaterUnavailable:
+                "Background downloads are unavailable because this build cannot configure automatic updates."
+            case .interactiveUpdateRequired:
+                "Background downloads are unavailable because this update type requires an interactive download."
+            case .automaticChecksRequired:
+                "Enable Check for updates automatically before enabling background downloads."
+            }
+        }
+    }
+
     private struct SoftwareUpdateInstallingIndicator: View {
         var body: some View {
             HStack(spacing: 7) {
@@ -165,6 +211,14 @@ struct SettingsView: View {
             }(),
             canCheck: checkForUpdates != nil,
             sparkleIsPresenting: updates.sparkleIsPresentingUpdate
+        )
+    }
+
+    private var softwareUpdateDownloadAvailability: SoftwareUpdateDownloadAvailability {
+        SoftwareUpdateDownloadAvailability.resolve(
+            canConfigureUpdates: updates.canConfigureUpdates,
+            allowsAutomaticUpdates: updates.allowsAutomaticUpdates,
+            automaticallyChecksForUpdates: updates.automaticallyChecksForUpdates
         )
     }
 
@@ -633,7 +687,7 @@ struct SettingsView: View {
                     SettingsDivider()
                     SettingsRow(
                         title: "Download updates in the background",
-                        detail: "Kaisola asks before restarting to install",
+                        detail: softwareUpdateDownloadAvailability.visibleDetail,
                         symbol: "arrow.down.circle"
                     ) {
                         Toggle("", isOn: Binding(
@@ -642,12 +696,10 @@ struct SettingsView: View {
                         ))
                         .labelsHidden()
                         .toggleStyle(.switch)
-                        // Sparkle refuses silent downloads for update kinds it
-                        // insists on showing (a major upgrade, for instance).
-                        .disabled(!updates.canConfigureUpdates
-                                  || !updates.allowsAutomaticUpdates
-                                  || !updates.automaticallyChecksForUpdates)
+                        .disabled(!softwareUpdateDownloadAvailability.isEnabled)
                         .accessibilityLabel("Download updates in the background")
+                        .accessibilityHint(softwareUpdateDownloadAvailability.accessibilityHint)
+                        .help(softwareUpdateDownloadAvailability.accessibilityHint)
                     }
                 }
             }

@@ -125,6 +125,109 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertNil(McpSettingsPolicy.duplicateName("other", servers: servers))
     }
 
+    // MARK: - Environment / header line validation
+
+    /// Every non-blank line either becomes a pair or is reported by number. A
+    /// line that is neither must never exist: that is how a header used to
+    /// vanish while Add reported success.
+    func testEveryMalformedPairLineIsReportedWithItsLineNumber() {
+        let parse = McpSettingsPolicy.parsePairs("""
+        TOKEN=abc
+
+        MISSING_SEPARATOR
+        =orphan-value
+        EMPTY=
+        """)
+
+        XCTAssertEqual(parse.pairs, [
+            .init(name: "TOKEN", value: "abc"),
+            .init(name: "EMPTY", value: ""),
+        ])
+        XCTAssertEqual(parse.problems.map(\.line), [3, 4])
+        XCTAssertTrue(parse.problems[0].reason.contains("\"=\""))
+        XCTAssertTrue(parse.problems[1].reason.contains("name"))
+    }
+
+    /// Blank lines are still counted, and CRLF must not shift the number the
+    /// user is pointed at.
+    func testPairLineNumbersFollowTheEditorIncludingBlankAndCRLFLines() {
+        XCTAssertEqual(
+            McpSettingsPolicy.parsePairs("A=1\r\n\r\nBROKEN").problems.map(\.line),
+            [3]
+        )
+        XCTAssertEqual(
+            McpSettingsPolicy.parsePairs("\n\n\n  \nBROKEN").problems.map(\.line),
+            [5]
+        )
+    }
+
+    /// `NAME=` is a real setting (an explicitly empty variable or header), so it
+    /// must parse and keep its empty value rather than be reported or dropped.
+    func testEmptyValuesParseAndKeepTheirEmptyString() {
+        let parse = McpSettingsPolicy.parsePairs("TOKEN=\n  SPACED  =   ")
+        XCTAssertTrue(parse.problems.isEmpty)
+        XCTAssertEqual(parse.pairs, [
+            .init(name: "TOKEN", value: ""),
+            .init(name: "SPACED", value: ""),
+        ])
+    }
+
+    /// Bounds that `McpServerConfig.safePair` would only reject for the whole
+    /// server are reported against the line that broke them.
+    func testOversizedAndControlCharacterLinesAreReportedPerLine() {
+        let longName = String(repeating: "N", count: 129)
+        let longValue = String(repeating: "v", count: 4_097)
+        let parse = McpSettingsPolicy.parsePairs("""
+        \(longName)=fine
+        NAME=\(longValue)
+        BE\u{7}LL=fine
+        """)
+
+        XCTAssertTrue(parse.pairs.isEmpty)
+        XCTAssertEqual(parse.problems.map(\.line), [1, 2, 3])
+        XCTAssertTrue(parse.problems[0].reason.contains("128"))
+        XCTAssertTrue(parse.problems[1].reason.contains("4096"))
+        XCTAssertTrue(parse.problems[2].reason.contains("control"))
+    }
+
+    /// The Add gate the button binds to: a malformed line blocks the save while
+    /// the draft text stays exactly as typed, and the existing capacity and
+    /// duplicate rules keep applying.
+    func testAddIsBlockedUntilEveryPairLineParses() {
+        let draft = "TOKEN=abc\nMISSING_SEPARATOR"
+        XCTAssertFalse(McpSettingsPolicy.canAdd(
+            hasRequiredFields: true, serverCount: 0, duplicateName: nil, pairText: draft
+        ))
+        XCTAssertTrue(McpSettingsPolicy.canAdd(
+            hasRequiredFields: true, serverCount: 0, duplicateName: nil, pairText: "TOKEN=abc\n\nEMPTY="
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAdd(
+            hasRequiredFields: false, serverCount: 0, duplicateName: nil, pairText: ""
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAdd(
+            hasRequiredFields: true, serverCount: 0, duplicateName: "files", pairText: ""
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAdd(
+            hasRequiredFields: true,
+            serverCount: McpConfigStore.maximumServerCount,
+            duplicateName: nil,
+            pairText: ""
+        ))
+    }
+
+    /// The message shown when a save is attempted names every bad line, not
+    /// just the first, and says nothing was saved.
+    func testMalformedPairMessageNamesEveryBadLine() {
+        let problems = McpSettingsPolicy.parsePairs("BROKEN\n=orphan\nOK=1").problems
+        let message = McpSettingsPolicy.malformedPairMessage(field: "Headers", problems: problems)
+        XCTAssertEqual(
+            message?.contains("Headers could not be read, so nothing was saved:"), true
+        )
+        XCTAssertEqual(message?.contains("Line 1:"), true)
+        XCTAssertEqual(message?.contains("Line 2:"), true)
+        XCTAssertNil(McpSettingsPolicy.malformedPairMessage(field: "Headers", problems: []))
+    }
+
     // MARK: - Session wire shapes
 
     func testStdioJsonValueMatchesNodeShape() {

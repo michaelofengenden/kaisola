@@ -32,6 +32,23 @@ struct McpSettingsTab: View {
 /// catalog cap here prevents UI state from ever getting ahead of what the
 /// bounded store can persist.
 enum McpSettingsPolicy {
+    /// One line of a `NAME=value` block that could not be read, addressed the
+    /// way the user sees it: the 1-based line number plus what is wrong. Blank
+    /// lines still count toward the number, so the report points at the line
+    /// the editor shows.
+    struct PairLineProblem: Equatable {
+        let line: Int
+        let reason: String
+    }
+
+    /// Everything a `NAME=value` block produced: the pairs that parsed and
+    /// every line that did not. Both halves come back together so the caller
+    /// can block on `problems` without re-walking the text.
+    struct PairParse: Equatable {
+        var pairs: [McpServerConfig.Pair]
+        var problems: [PairLineProblem]
+    }
+
     static func remainingCapacity(serverCount: Int) -> Int {
         max(0, McpConfigStore.maximumServerCount - max(0, serverCount))
     }
@@ -40,6 +57,75 @@ enum McpSettingsPolicy {
         let name = rawName.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty, servers.contains(where: { $0.id == name }) else { return nil }
         return name
+    }
+
+    /// Reads a `NAME=value` block strictly: one pair per non-blank line, split
+    /// on the first `=`. A line that cannot become a pair is reported rather
+    /// than dropped, because a silently discarded header or environment
+    /// variable only shows up much later as a server that fails to start. An
+    /// empty value (`NAME=`) is a real setting and stays legal. Per-line bounds
+    /// mirror `McpServerConfig.safePair`, so the line-level message arrives
+    /// before the whole-server validation error would.
+    static func parsePairs(_ text: String) -> PairParse {
+        var parse = PairParse(pairs: [], problems: [])
+        // Normalize first so CRLF and lone CR do not shift the numbering the
+        // user is being pointed at.
+        let normalized = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        for (index, rawLine) in normalized.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            let number = index + 1
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            guard let separator = line.firstIndex(of: "=") else {
+                parse.problems.append(.init(line: number, reason: "no \"=\" separator. Write NAME=value."))
+                continue
+            }
+            let name = line[..<separator].trimmingCharacters(in: .whitespaces)
+            let value = line[line.index(after: separator)...].trimmingCharacters(in: .whitespaces)
+            guard !name.isEmpty else {
+                parse.problems.append(.init(line: number, reason: "the name before \"=\" is empty."))
+                continue
+            }
+            guard name.rangeOfCharacter(from: .controlCharacters) == nil, !value.contains("\0") else {
+                parse.problems.append(.init(line: number, reason: "control characters are not allowed."))
+                continue
+            }
+            guard name.utf8.count <= 128 else {
+                parse.problems.append(.init(line: number, reason: "the name is longer than 128 bytes."))
+                continue
+            }
+            guard value.utf8.count <= 4_096 else {
+                parse.problems.append(.init(line: number, reason: "the value is longer than 4096 bytes."))
+                continue
+            }
+            parse.pairs.append(McpServerConfig.Pair(name: name, value: value))
+        }
+        return parse
+    }
+
+    /// The exact gate the Add button binds to. Living here rather than in the
+    /// view means a malformed line can never be the difference between what the
+    /// screen allows and what the tests check.
+    static func canAdd(
+        hasRequiredFields: Bool,
+        serverCount: Int,
+        duplicateName: String?,
+        pairText: String
+    ) -> Bool {
+        hasRequiredFields
+            && remainingCapacity(serverCount: serverCount) > 0
+            && duplicateName == nil
+            && parsePairs(pairText).problems.isEmpty
+    }
+
+    /// A single message naming every malformed line, used for the inline report
+    /// under the editor and for the error `add()` sets if it is ever reached
+    /// with a bad draft.
+    static func malformedPairMessage(field: String, problems: [PairLineProblem]) -> String? {
+        guard !problems.isEmpty else { return nil }
+        let detail = problems.map { "Line \($0.line): \($0.reason)" }.joined(separator: "\n")
+        return "\(field) could not be read, so nothing was saved:\n\(detail)"
     }
 }
 
@@ -403,6 +489,19 @@ private struct McpServerEditor: View {
                 lineEditor("Headers — NAME=value per line", text: $draft.headerText)
             }
 
+            if !pairProblems.isEmpty {
+                // Every malformed line, listed as the user types, so a header or
+                // environment variable can never be dropped behind a successful
+                // Add.
+                VStack(alignment: .leading, spacing: 2) {
+                    ForEach(pairProblems, id: \.line) { problem in
+                        Text("\(pairFieldLabel) line \(problem.line): \(problem.reason)")
+                    }
+                }
+                .font(.caption)
+                .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                .accessibilityElement(children: .combine)
+            }
             if let addError {
                 Text(addError)
                     .font(.caption)
@@ -419,7 +518,7 @@ private struct McpServerEditor: View {
                     .foregroundStyle(.secondary)
             }
             Button("Add Server", action: add)
-                .disabled(!hasRequiredFields || remainingCapacity == 0)
+                .disabled(!canAdd)
         }
     }
 
@@ -429,6 +528,7 @@ private struct McpServerEditor: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
             TextEditor(text: text)
+                .onChange(of: text.wrappedValue) { _, _ in addError = nil }
                 .font(.callout.monospaced())
                 .frame(minHeight: 52)
                 .overlay(RoundedRectangle(cornerRadius: 4).stroke(.quaternary))
@@ -454,6 +554,30 @@ private struct McpServerEditor: View {
         McpSettingsPolicy.duplicateName(draft.name, servers: servers)
     }
 
+    /// The `NAME=value` editor the chosen transport actually shows — stdio
+    /// carries environment variables, http/sse carry headers — and the label the
+    /// per-line report names it by.
+    private var pairFieldLabel: String {
+        draft.kind == .stdio ? "Environment" : "Headers"
+    }
+
+    private var pairDraftText: String {
+        draft.kind == .stdio ? draft.envText : draft.headerText
+    }
+
+    private var pairProblems: [McpSettingsPolicy.PairLineProblem] {
+        McpSettingsPolicy.parsePairs(pairDraftText).problems
+    }
+
+    private var canAdd: Bool {
+        McpSettingsPolicy.canAdd(
+            hasRequiredFields: hasRequiredFields,
+            serverCount: servers.count,
+            duplicateName: duplicateName,
+            pairText: pairDraftText
+        )
+    }
+
     private func add() {
         let name = draft.name.trimmingCharacters(in: .whitespaces)
         guard remainingCapacity > 0 else {
@@ -462,6 +586,16 @@ private struct McpServerEditor: View {
         }
         guard hasRequiredFields else { return }
         guard duplicateName == nil else { return }
+        // The button is already disabled while a line is malformed; this keeps
+        // the draft (and its unparsed text) on screen if `add` is ever reached
+        // another way.
+        let parse = McpSettingsPolicy.parsePairs(pairDraftText)
+        if let message = McpSettingsPolicy.malformedPairMessage(
+            field: pairFieldLabel, problems: parse.problems
+        ) {
+            addError = message
+            return
+        }
         let server: McpServerConfig
         switch draft.kind {
         case .stdio:
@@ -470,14 +604,14 @@ private struct McpServerEditor: View {
                 kind: .stdio,
                 command: draft.command.trimmingCharacters(in: .whitespaces),
                 args: Self.parseLines(draft.argsText),
-                envPairs: Self.parsePairs(draft.envText)
+                envPairs: parse.pairs
             )
         case .http, .sse:
             server = McpServerConfig(
                 name: name,
                 kind: draft.kind,
                 url: draft.url.trimmingCharacters(in: .whitespaces),
-                headerPairs: Self.parsePairs(draft.headerText)
+                headerPairs: parse.pairs
             )
         }
         if let error = server.validationError {
@@ -490,26 +624,14 @@ private struct McpServerEditor: View {
         addError = nil
     }
 
-    // MARK: - Lenient parsing
+    // MARK: - Line parsing
 
-    /// One entry per non-blank line, trimmed. Used for stdio arguments.
+    /// One entry per non-blank line, trimmed. Used for stdio arguments, where a
+    /// line carries no structure to get wrong. `NAME=value` blocks go through
+    /// `McpSettingsPolicy.parsePairs`, which reports rather than drops.
     static func parseLines(_ text: String) -> [String] {
         text.split(whereSeparator: \.isNewline)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-    }
-
-    /// One `{name,value}` per line, split on the first `=`. Blank lines, lines
-    /// with no `=`, and lines with an empty name are skipped; an empty value is
-    /// allowed.
-    static func parsePairs(_ text: String) -> [McpServerConfig.Pair] {
-        text.split(whereSeparator: \.isNewline).compactMap { rawLine -> McpServerConfig.Pair? in
-            let line = rawLine.trimmingCharacters(in: .whitespaces)
-            guard !line.isEmpty, let separator = line.firstIndex(of: "=") else { return nil }
-            let name = line[..<separator].trimmingCharacters(in: .whitespaces)
-            let value = line[line.index(after: separator)...].trimmingCharacters(in: .whitespaces)
-            guard !name.isEmpty else { return nil }
-            return McpServerConfig.Pair(name: name, value: value)
-        }
     }
 }

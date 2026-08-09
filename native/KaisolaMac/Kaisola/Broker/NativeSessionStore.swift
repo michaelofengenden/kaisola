@@ -141,6 +141,78 @@ struct NativeSessionStore: Sendable {
         /// Permanent closed-project markers. The `closedProjects` UNDO stack
         /// above stays a bounded convenience; this set is the closed state.
         var closedProjectIDs: [String]?
+        /// Duplicate project records held out of `projects` by the decode
+        /// below. Never encoded: the next ordinary write is what retires them
+        /// from the archive for good.
+        var projectConflicts: [SessionStoreProjectConflict] = []
+
+        private enum CodingKeys: String, CodingKey {
+            case ownerID
+            case sessions
+            case projects
+            case closedProjects
+            case closedSessions
+            case recentFolders
+            case lastSelectedSessionID
+            case sessionAliases
+            case closedTerminals
+            case pendingReleases
+            case closedProjectIDs
+        }
+
+        init(ownerID: String, sessions: [NativeOwnedSession], projects: [OpenProject]? = nil) {
+            self.ownerID = ownerID
+            self.sessions = sessions
+            self.projects = projects
+        }
+
+        /// Project identity is a key everywhere downstream of here — recovery,
+        /// restore and the sidebar all index projects by id — so decode is
+        /// where an ambiguous archive has to stop being ambiguous. A record
+        /// whose id an earlier record already claimed (a half-applied merge, a
+        /// hand-edited file) is quarantined rather than kept, and rather than
+        /// left to trap a keyed lookup later.
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            ownerID = try container.decode(String.self, forKey: .ownerID)
+            sessions = try container.decode([NativeOwnedSession].self, forKey: .sessions)
+            let resolved = Self.resolveProjectIdentities(
+                try container.decodeIfPresent([OpenProject].self, forKey: .projects)
+            )
+            projects = resolved.kept
+            projectConflicts = resolved.conflicts
+            closedProjects = try container.decodeIfPresent([OpenProject].self, forKey: .closedProjects)
+            closedSessions = try container.decodeIfPresent([ClosedSession].self, forKey: .closedSessions)
+            recentFolders = try container.decodeIfPresent([String].self, forKey: .recentFolders)
+            lastSelectedSessionID = try container.decodeIfPresent(String.self, forKey: .lastSelectedSessionID)
+            sessionAliases = try container.decodeIfPresent([String: String].self, forKey: .sessionAliases)
+            closedTerminals = try container.decodeIfPresent([String: Int64].self, forKey: .closedTerminals)
+            pendingReleases = try container.decodeIfPresent([PendingRelease].self, forKey: .pendingReleases)
+            closedProjectIDs = try container.decodeIfPresent([String].self, forKey: .closedProjectIDs)
+        }
+
+        /// First record for an id wins, so the winner does not depend on which
+        /// side of a merge landed last. Order is otherwise preserved: the
+        /// project tab strip renders this array directly.
+        private static func resolveProjectIdentities(
+            _ decoded: [OpenProject]?
+        ) -> (kept: [OpenProject]?, conflicts: [SessionStoreProjectConflict]) {
+            guard let decoded else { return (nil, []) }
+            var keptByID: [String: OpenProject] = [:]
+            var kept: [OpenProject] = []
+            var conflicts: [SessionStoreProjectConflict] = []
+            for project in decoded {
+                if let winner = keptByID[project.id] {
+                    conflicts.append(
+                        SessionStoreProjectConflict(kept: winner, quarantined: project)
+                    )
+                    continue
+                }
+                keptByID[project.id] = project
+                kept.append(project)
+            }
+            return (kept, conflicts)
+        }
     }
 
     struct PendingRelease: Codable, Equatable, Sendable {
@@ -261,7 +333,15 @@ struct NativeSessionStore: Sendable {
         now: Int64 = Int64(Date().timeIntervalSince1970 * 1_000)
     ) -> [NativeOwnedSession] {
         guard var payload = read(), !payload.ownerID.isEmpty else { return [] }
-        let projectsByID = Dictionary(uniqueKeysWithValues: (payload.projects ?? []).map { ($0.id, $0) })
+        // Decode has already quarantined (and reported) duplicate ids, so this
+        // lookup cannot be ambiguous. It is still built first-wins rather than
+        // with `uniqueKeysWithValues`: a trap here would abort the app exactly
+        // when durable terminals are being repaired, and every project that is
+        // not part of the conflict recovers fine.
+        let projectsByID = Dictionary(
+            (payload.projects ?? []).map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         var known = Set(payload.sessions.map(\.id))
         var recovered: [NativeOwnedSession] = []
 
@@ -291,6 +371,13 @@ struct NativeSessionStore: Sendable {
 
     func projects() -> [OpenProject] {
         read()?.projects ?? []
+    }
+
+    /// Duplicate project records the decode held out of `projects()`. Empty
+    /// for a healthy archive; non-empty means the file carried the same id
+    /// twice and the later copies were dropped.
+    func quarantinedProjects() -> [SessionStoreProjectConflict] {
+        read()?.projectConflicts ?? []
     }
 
     /// Add a project tab for a directory (idempotent by projectID). Returns the
@@ -597,6 +684,11 @@ struct NativeSessionStore: Sendable {
         let payload: Payload? = (try? Data(contentsOf: fileURL))
             .flatMap { try? Self.decoder.decode(Payload.self, from: $0) }
         PayloadCache.shared.store(payload, for: fileURL)
+        // This is the only cache miss for the archive, so a conflicting record
+        // is reported once per process instead of on every read.
+        if let conflicts = payload?.projectConflicts, !conflicts.isEmpty {
+            SessionStoreProjectConflictMonitor.shared.record(conflicts, path: fileURL.path)
+        }
         return payload
     }
 
@@ -755,6 +847,86 @@ final class SessionStoreWriteFailureMonitor: @unchecked Sendable {
             }
         }
         return true
+    }
+}
+
+/// A persisted project record dropped while decoding the session archive
+/// because an earlier record in the same file already claimed its id.
+struct SessionStoreProjectConflict: Equatable, Sendable {
+    /// The id both records claim.
+    let projectID: String
+    /// The record that keeps the id — the first one in the archive.
+    let kept: OpenProject
+    /// The later record, held out of the live project list.
+    let quarantined: OpenProject
+
+    init(kept: OpenProject, quarantined: OpenProject) {
+        projectID = kept.id
+        self.kept = kept
+        self.quarantined = quarantined
+    }
+
+    /// One line naming the id and the two folders that claimed it.
+    var message: String {
+        "Project \(projectID) appears twice in the session archive; "
+            + "kept \(kept.path) and ignored \(quarantined.path)."
+    }
+}
+
+/// Process-wide reporting for quarantined duplicate project identities.
+///
+/// A conflict is decided exactly once per archive per process — the payload
+/// cache guarantees a single decode — so unlike write failures there is
+/// nothing here to throttle. Nothing is surfaced to the user either: the app
+/// has already recovered, and the archive self-heals on the next write.
+final class SessionStoreProjectConflictMonitor: @unchecked Sendable {
+    static let shared = SessionStoreProjectConflictMonitor()
+
+    /// Bounded like the payload cache (spec §2i): tests decode hundreds of
+    /// throwaway archives in one process.
+    private let cap = 50
+    private let lock = NSLock()
+    private var recorded: [SessionStoreProjectConflict] = []
+    private var observer: (@Sendable ([SessionStoreProjectConflict]) -> Void)?
+
+    /// Conflicts reported so far, oldest first.
+    var conflicts: [SessionStoreProjectConflict] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recorded
+    }
+
+    /// Tests use this to observe a decode without scraping stderr.
+    func setObserver(_ observer: (@Sendable ([SessionStoreProjectConflict]) -> Void)?) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.observer = observer
+    }
+
+    func reset() {
+        lock.lock()
+        defer { lock.unlock() }
+        recorded.removeAll()
+        observer = nil
+    }
+
+    func record(_ conflicts: [SessionStoreProjectConflict], path: String) {
+        guard !conflicts.isEmpty else { return }
+        lock.lock()
+        recorded.append(contentsOf: conflicts)
+        if recorded.count > cap { recorded.removeFirst(recorded.count - cap) }
+        let observer = self.observer
+        lock.unlock()
+
+        for conflict in conflicts {
+            FileHandle.standardError.write(Data(
+                ("KAISOLA_SESSION_STORE_PROJECT_CONFLICT path=\(path)"
+                    + " projectID=\(conflict.projectID)"
+                    + " kept=\(conflict.kept.path)"
+                    + " quarantined=\(conflict.quarantined.path)\n").utf8
+            ))
+        }
+        observer?(conflicts)
     }
 }
 

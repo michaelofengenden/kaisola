@@ -17,6 +17,7 @@ final class NativeSessionStoreTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        SessionStoreProjectConflictMonitor.shared.reset()
         try? FileManager.default.removeItem(at: fileURL.deletingLastPathComponent())
     }
 
@@ -328,6 +329,95 @@ final class NativeSessionStoreTests: XCTestCase {
             store.recoverOwnedSessions(from: [observed, exited, unknownProject]).isEmpty
         )
         XCTAssertTrue(store.sessions().isEmpty)
+    }
+
+    func testDecodeQuarantinesDuplicateProjectIdentitiesAndReportsThem() throws {
+        try writeArchiveWithDuplicateProject()
+        let observed = CollectedProjectConflicts()
+        SessionStoreProjectConflictMonitor.shared.setObserver { observed.append($0) }
+
+        // The live list keeps one record per id, in archive order.
+        XCTAssertEqual(store.projects().map(\.id), ["nproj_dup", "nproj_ok"])
+        XCTAssertEqual(store.projects().map(\.path), ["/tmp/dup-first", "/tmp/ok"])
+
+        let conflict = try XCTUnwrap(store.quarantinedProjects().first)
+        XCTAssertEqual(store.quarantinedProjects().count, 1)
+        XCTAssertEqual(conflict.projectID, "nproj_dup")
+        XCTAssertEqual(conflict.kept.path, "/tmp/dup-first")
+        XCTAssertEqual(conflict.quarantined.path, "/tmp/dup-second")
+        XCTAssertEqual(observed.projectIDs(), ["nproj_dup"])
+        XCTAssertTrue(
+            try XCTUnwrap(observed.messages().first).contains("/tmp/dup-second"),
+            "The report must name the record that was ignored"
+        )
+
+        // The next ordinary write retires the duplicate from the archive.
+        store.setSessionAlias("Observed", for: "terminal:observed")
+        XCTAssertEqual(try persistedProjectPaths(), ["/tmp/dup-first", "/tmp/ok"])
+    }
+
+    func testRecoverOwnedSessionsSurvivesADuplicatedProjectRecord() throws {
+        try writeArchiveWithDuplicateProject()
+        let healthy = BrokerTerminalRecord(
+            id: "term-nproj_ok-recovered",
+            projectID: "nproj_ok",
+            pid: 11,
+            exited: false,
+            streamEpoch: nil,
+            endOffset: 0,
+            lastOwnerID: Self.archiveOwnerID
+        )
+        let conflicted = BrokerTerminalRecord(
+            id: "term-nproj_dup-recovered",
+            projectID: "nproj_dup",
+            pid: 12,
+            exited: false,
+            streamEpoch: nil,
+            endOffset: 0,
+            lastOwnerID: Self.archiveOwnerID
+        )
+
+        let recovered = store.recoverOwnedSessions(from: [healthy, conflicted], now: 7)
+
+        // A duplicated record must not cost the unaffected project its repair,
+        // and the conflicted id resolves to the record decode kept.
+        XCTAssertEqual(recovered.map(\.id), [healthy.id, conflicted.id])
+        XCTAssertEqual(recovered.map(\.cwd), ["/tmp/ok", "/tmp/dup-first"])
+        XCTAssertEqual(store.sessions().map(\.id), [healthy.id, conflicted.id])
+    }
+
+    /// Owner id baked into the hand-written archives below, so a broker record
+    /// can present it as its last owner.
+    private static let archiveOwnerID = "native-duplicate-project-owner"
+
+    /// An archive as a partially merged file leaves it: `nproj_dup` twice with
+    /// different folders, plus an unrelated healthy project.
+    private func writeArchiveWithDuplicateProject() throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let json = """
+        {
+          "ownerID": "\(Self.archiveOwnerID)",
+          "sessions": [],
+          "projects": [
+            {"id": "nproj_dup", "path": "/tmp/dup-first", "name": "First", "createdAt": 1},
+            {"id": "nproj_dup", "path": "/tmp/dup-second", "name": "Second", "createdAt": 2},
+            {"id": "nproj_ok", "path": "/tmp/ok", "name": "Healthy", "createdAt": 3}
+          ]
+        }
+        """
+        try Data(json.utf8).write(to: fileURL)
+    }
+
+    /// Project paths as they sit on disk, bypassing the process-wide payload
+    /// cache so a write can actually be checked.
+    private func persistedProjectPaths() throws -> [String] {
+        let object = try JSONSerialization.jsonObject(with: try Data(contentsOf: fileURL))
+        let projects = (object as? [String: Any])?["projects"] as? [[String: Any]] ?? []
+        return projects.compactMap { $0["path"] as? String }
     }
 
     func testWorkspaceRestorationRoundTripsPaneOrderAndAgentDescriptor() async throws {
@@ -1672,4 +1762,27 @@ final class NativeSessionStoreTests: XCTestCase {
         }
     }
 
+}
+
+private final class CollectedProjectConflicts: @unchecked Sendable {
+    private let lock = NSLock()
+    private var conflicts: [SessionStoreProjectConflict] = []
+
+    func append(_ reported: [SessionStoreProjectConflict]) {
+        lock.lock()
+        defer { lock.unlock() }
+        conflicts.append(contentsOf: reported)
+    }
+
+    func projectIDs() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return conflicts.map(\.projectID)
+    }
+
+    func messages() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return conflicts.map(\.message)
+    }
 }

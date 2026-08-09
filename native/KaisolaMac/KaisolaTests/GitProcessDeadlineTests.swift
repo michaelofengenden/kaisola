@@ -49,6 +49,59 @@ final class GitProcessDeadlineTests: XCTestCase {
         XCTAssertEqual(GitService.commandLabel([]), "git")
     }
 
+    func testOutputLimitsMatchTheOperationRatherThanOneGlobalAllowance() {
+        let diff = GitProcessCapture.Limits.forGitArguments(["--no-optional-locks", "diff", "HEAD"])
+        let commit = GitProcessCapture.Limits.forGitArguments(["commit", "-m", "subject"])
+        let push = GitProcessCapture.Limits.forGitArguments(["push", "origin", "HEAD"])
+        let status = GitProcessCapture.Limits.forGitArguments(["status", "--porcelain=v2"])
+
+        XCTAssertEqual(diff, .bulk)
+        XCTAssertEqual(status, .bulk)
+        XCTAssertEqual(commit, .hooked)
+        XCTAssertEqual(push, .network)
+        XCTAssertLessThan(GitProcessCapture.Limits.probe.stdoutBytes, commit.stdoutBytes)
+        XCTAssertLessThan(commit.stdoutBytes, diff.stdoutBytes)
+    }
+
+    func testFailedCommandRetainsBoundedHeadAndTailWithExactByteCounts() throws {
+        let process = shellProcess(
+            "printf 'BEGIN-'; i=0; while [ \"$i\" -lt 100 ]; do printf x; i=$((i + 1)); done; printf '%s' '-END'; exit 7"
+        )
+        let capture = try GitProcessCapture.run(
+            process,
+            deadline: .custom(5),
+            limits: .init(stdoutBytes: 20, stderrBytes: 8)
+        )
+
+        XCTAssertEqual(process.terminationStatus, 7)
+        XCTAssertEqual(capture.out.totalByteCount, 110)
+        XCTAssertEqual(capture.out.retainedByteCount, 20)
+        XCTAssertTrue(capture.out.isTruncated)
+        XCTAssertNil(capture.out.completeData)
+        let diagnostic = capture.out.diagnosticText()
+        XCTAssertTrue(diagnostic.hasPrefix("BEGIN-"), diagnostic)
+        XCTAssertTrue(diagnostic.hasSuffix("-END"), diagnostic)
+        XCTAssertTrue(diagnostic.contains("output truncated"), diagnostic)
+        XCTAssertTrue(diagnostic.contains("retained 20 of 110 bytes"), diagnostic)
+        XCTAssertTrue(diagnostic.contains("10 head + 10 tail"), diagnostic)
+    }
+
+    func testSuccessfulCommandOverItsLimitFailsWithExactRetainedCounts() {
+        let process = shellProcess("i=0; while [ \"$i\" -lt 100 ]; do printf x; i=$((i + 1)); done")
+        XCTAssertThrowsError(
+            try GitProcessCapture.run(
+                process,
+                deadline: .custom(5),
+                limits: .init(stdoutBytes: 16, stderrBytes: 8)
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? GitProcessCapture.Failure,
+                .outputLimitExceeded(stream: "stdout", totalBytes: 100, retainedBytes: 16)
+            )
+        }
+    }
+
     // MARK: - A timeout is retryable, a failure is not
 
     func testATimeoutReadsAsRetryableAndDistinctFromAFailure() throws {
@@ -76,6 +129,16 @@ final class GitProcessDeadlineTests: XCTestCase {
             .timedOut(command: "git push", seconds: 30)
         )
         XCTAssertEqual(GitService.GitError.from(.cancelled, command: "git push"), .cancelled)
+        XCTAssertEqual(
+            GitService.GitError.from(
+                .outputLimitExceeded(stream: "stdout", totalBytes: 1_000, retainedBytes: 64),
+                command: "git status"
+            ),
+            .commandFailed(
+                "git status produced 1000 stdout bytes; retained 64 bytes at its output limit. "
+                    + "Narrow the operation and try again."
+            )
+        )
     }
 
     // MARK: - Stopping a wedged child
@@ -119,7 +182,7 @@ final class GitProcessDeadlineTests: XCTestCase {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: "/bin/sh")
             process.arguments = ["-c", script]
-            return try GitProcessCapture.run(process).out.count
+            return try GitProcessCapture.run(process).out.completeData?.count ?? 0
         }
         let child = try await waitForPID(at: marker)
 

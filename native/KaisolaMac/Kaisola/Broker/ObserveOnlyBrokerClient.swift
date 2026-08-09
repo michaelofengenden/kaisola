@@ -331,7 +331,8 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             startOffset: snapshot.endOffset - retained,
             endOffset: snapshot.endOffset,
             truncated: true,
-            exited: snapshot.exited
+            exited: snapshot.exited,
+            readError: snapshot.readError
         )
     }
 
@@ -381,7 +382,11 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             startOffset: page.startOffset,
             endOffset: snapshot.endOffset,
             truncated: page.hasMore || page.truncated || page.startOffset > 0,
-            exited: snapshot.exited
+            exited: snapshot.exited,
+            // A top-up page that could not read a segment leaves the combined
+            // tail incomplete, so the combined snapshot is not authoritative
+            // either.
+            readError: snapshot.readError ?? page.readError
         )
     }
 

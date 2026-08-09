@@ -246,7 +246,7 @@ final class CompanionConnectionCoordinator: ObservableObject {
                 return
             case .connecting, .handshaking, .live:
                 return
-            case .idle:
+            case .idle, .reconnectRequired:
                 break
             }
         }
@@ -265,7 +265,10 @@ final class CompanionConnectionCoordinator: ObservableObject {
                 preferred: desktop.transportHint,
                 desktopId: desktop.desktopId,
                 deviceId: identity.id,
-                force: force
+                // A spent automatic retry budget is a completed resume
+                // episode. Foreground activation or the explicit reconnect
+                // button begins a fresh bounded episode without re-pairing.
+                force: force || client.transport.state == .reconnectRequired
             )
         } catch {
             store.connection = store.projects.isEmpty ? .offline : .stale

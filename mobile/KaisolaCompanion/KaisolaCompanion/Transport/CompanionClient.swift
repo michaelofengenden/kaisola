@@ -59,6 +59,16 @@ final class CompanionClient: ObservableObject {
     private var pendingCommands: [String: CheckedContinuation<CompanionReceiptBody, Error>] = [:]
     private var commandTimeouts: [String: Task<Void, Never>] = [:]
 
+    /// Persisted cursors describe replay position, not authority for a newly
+    /// authenticated connection. Once the desktop publishes its live epoch,
+    /// every command (including stream teardown) must use that value.
+    static func outboundCommandEpoch(
+        liveEpoch: String?,
+        persistedCursor: CompanionAckCursor?
+    ) -> String {
+        liveEpoch ?? persistedCursor?.epoch ?? "initial"
+    }
+
     init(transport: CompanionTransport = CompanionTransport()) {
         self.transport = transport
         transport.onWireFrame = { [weak self] data in try self?.receive(data) }
@@ -76,7 +86,7 @@ final class CompanionClient: ObservableObject {
         transport.onError = { [weak self] error in
             guard let self else { return }
             switch self.transport.state {
-            case .discovering, .connecting, .live, .reconnecting:
+            case .discovering, .connecting, .live, .reconnecting, .reconnectRequired:
                 // Direct endpoint and Bonjour failures are recoverable. The
                 // transport keeps racing/retrying them without invalidating the
                 // single-use offer or flashing a terminal error in the UI.
@@ -238,7 +248,14 @@ final class CompanionClient: ObservableObject {
             desktopId: context.desktopId,
             deviceId: context.deviceId,
             connectionId: context.connectionId,
-            epoch: ackCursor?.epoch ?? "initial",
+            // A desktop relaunch rotates the host epoch while preserving the
+            // paired identity. Unsubscribe must use this connection's learned
+            // epoch just like ordinary commands; the persisted cursor can only
+            // seed replay and must never authenticate a fresh command.
+            epoch: Self.outboundCommandEpoch(
+                liveEpoch: liveEpoch,
+                persistedCursor: ackCursor
+            ),
             seq: outboundSeq,
             id: commandId,
             sentAt: Self.nowMilliseconds,
@@ -301,7 +318,10 @@ final class CompanionClient: ObservableObject {
             // restart. Commands are only ever sent after the first inbound frame
             // (subscriptions are gated, other commands are user-driven), so
             // liveEpoch is populated in every realistic path.
-            epoch: liveEpoch ?? ackCursor?.epoch ?? "initial",
+            epoch: Self.outboundCommandEpoch(
+                liveEpoch: liveEpoch,
+                persistedCursor: ackCursor
+            ),
             seq: outboundSeq,
             id: body.commandId,
             sentAt: Self.nowMilliseconds,

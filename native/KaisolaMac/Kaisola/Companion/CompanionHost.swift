@@ -43,6 +43,7 @@ final class CompanionHost: ObservableObject {
     @Published private(set) var pairingCode: String?
     @Published private(set) var pairingPhrase: PairingPhrase?
     @Published private(set) var pairedDevices: [CompanionPairedDeviceRecord] = []
+    @Published private(set) var connectedDeviceIDs: Set<String> = []
     @Published private(set) var terminalControlStatuses: [CompanionTerminalControlStatus] = []
     @Published private(set) var linkPhase: CompanionLinkClient.Phase = .off
     @Published private(set) var linkChannelCount = 0
@@ -108,6 +109,7 @@ final class CompanionHost: ObservableObject {
                 lastSeenAt: 1_785_216_060_000
             )
         ]
+        connectedDeviceIDs = ["visual-iphone"]
         lastError = nil
     }
 
@@ -224,6 +226,23 @@ final class CompanionHost: ObservableObject {
         else { stop() }
     }
 
+    /// A recovery action that never revokes a pairing or widens capabilities.
+    /// Nearby already listens continuously; refreshing Link (or restarting a
+    /// failed listener) gives an offline phone a fresh route to resume on.
+    func refreshReconnectAvailability() {
+        lastError = nil
+        if case .failed = state {
+            stop(persistPreference: false)
+            start()
+            return
+        }
+        if !isEnabled {
+            setEnabled(true)
+            return
+        }
+        linkClient?.refresh()
+    }
+
     func createPairingOffer(allowsTerminalControl: Bool) async throws {
         guard case let .ready(port) = state, let coordinator else {
             throw CompanionWireError.connectionUnavailable
@@ -277,6 +296,7 @@ final class CompanionHost: ObservableObject {
             await connection.close(reason: "device_revoked")
         }
         eventLog.dropClient(deviceID)
+        connectedDeviceIDs.remove(deviceID)
         _ = try await roster.revoke(deviceID)
         await refreshDevices()
     }
@@ -392,6 +412,7 @@ final class CompanionHost: ObservableObject {
         pairingCode = nil
         pairingPhrase = nil
         pairedDevices = []
+        connectedDeviceIDs = []
         terminalControlStatuses = []
         lastError = nil
         state = .disabled
@@ -471,6 +492,7 @@ final class CompanionHost: ObservableObject {
                 sas: sas
             )
         case let .authenticated(device, _):
+            connectedDeviceIDs.remove(device.deviceId)
             if let previousID = deviceConnections[device.deviceId],
                previousID != connectionID,
                let previous = connections.removeValue(forKey: previousID) {
@@ -490,6 +512,7 @@ final class CompanionHost: ObservableObject {
             Task { await refreshDevices() }
         case let .live(device, _, resumeCursor):
             guard let connection = connections[connectionID] else { break }
+            connectedDeviceIDs.insert(device.deviceId)
             synchronizationTasks[connectionID]?.cancel()
             let synchronizationToken = UUID()
             synchronizationTokens[connectionID] = synchronizationToken
@@ -587,7 +610,10 @@ final class CompanionHost: ObservableObject {
             let disconnectedDeviceIDs = deviceConnections.compactMap { entry in
                 entry.value == connectionID ? entry.key : nil
             }
-            for deviceID in disconnectedDeviceIDs { eventLog.dropClient(deviceID) }
+            for deviceID in disconnectedDeviceIDs {
+                eventLog.dropClient(deviceID)
+                connectedDeviceIDs.remove(deviceID)
+            }
             deviceConnections = deviceConnections.filter { $0.value != connectionID }
             if pairingPhrase?.connectionID == connectionID { pairingPhrase = nil }
             Task {

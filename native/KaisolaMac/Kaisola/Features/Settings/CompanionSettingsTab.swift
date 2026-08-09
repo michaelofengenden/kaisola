@@ -152,16 +152,28 @@ struct CompanionSettingsTab: View {
                     } else {
                         ForEach(Array(host.pairedDevices.enumerated()), id: \.element.id) { index, device in
                             if index > 0 { SettingsDivider() }
+                            let connected = host.connectedDeviceIDs.contains(device.deviceId)
                             SettingsRow(
                                 title: device.displayName,
-                                detail: capabilityDetail(device.capabilities),
+                                detail: "\(capabilityDetail(device.capabilities)) · \(connected ? "Connected" : "Waiting to reconnect")",
                                 symbol: "laptopcomputer.and.iphone"
                             ) {
-                                Button("Revoke", role: .destructive) {
-                                    pendingRevocation = device
+                                HStack(spacing: 6) {
+                                    if !connected {
+                                        Button("Refresh") {
+                                            host.refreshReconnectAvailability()
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .accessibilityLabel("Refresh reconnect routes for \(device.displayName)")
+                                        .accessibilityHint("Keeps this device paired and retries available Nearby and Link routes")
+                                    }
+                                    Button("Revoke", role: .destructive) {
+                                        pendingRevocation = device
+                                    }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
                                 }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
                             }
                         }
                     }

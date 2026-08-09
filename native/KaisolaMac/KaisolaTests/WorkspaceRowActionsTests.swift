@@ -33,9 +33,10 @@ final class WorkspaceRowActionsTests: XCTestCase {
         ))
     }
 
-    /// The load-bearing distinction: a resting row and a hovered row must not
-    /// look the same. An implementation that revealed the button unconditionally
-    /// would satisfy every "true" case above and still be the reported bug.
+    /// The distinction the whole issue turns on: a resting row and a hovered
+    /// row must not look the same. An implementation that revealed the button
+    /// unconditionally would satisfy every "true" case above and still be the
+    /// reported bug.
     func testRestingAndHoveredRowsDifferAtAll() {
         let resting = WorkspaceRowActions.isRevealed(
             isHovering: false, isFocused: false, isSelected: false, alwaysVisible: false

@@ -26,6 +26,7 @@ on:
       - 'protocol/broker/**'
       - 'runtime/**'
       - 'tests/**'
+      - 'scripts/companion-*.cjs'
       - 'scripts/download-native-node-runtime.cjs'
       - 'scripts/native-*.cjs'
       - 'package.json'
@@ -38,6 +39,7 @@ on:
       - 'protocol/broker/**'
       - 'runtime/**'
       - 'tests/**'
+      - 'scripts/companion-*.cjs'
       - 'scripts/download-native-node-runtime.cjs'
       - 'scripts/native-*.cjs'
       - 'package.json'
@@ -50,16 +52,40 @@ jobs:
   verify:
     runs-on: macos-15
     timeout-minutes: 50
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      KAISOLA_COMPANION_XCODE_VERSION: '16.4'
+      KAISOLA_COMPANION_XCODE_BUILD: 16F6
+      # Xcode 16.4 owns the iOS 18.5 simulator SDK. During the recurring crash,
+      # `OS=latest` instead selected the image's Xcode-26-owned iOS 26.2 runtime.
+      KAISOLA_COMPANION_SIMULATOR_RUNTIME: com.apple.CoreSimulator.SimRuntime.iOS-18-5
+      KAISOLA_COMPANION_SIMULATOR_OS: '18.5'
+      KAISOLA_COMPANION_SIMULATOR_NAME: iPhone 16 Pro
+      KAISOLA_COMPANION_SIMULATOR_DEVICE_TYPE: com.apple.CoreSimulator.SimDeviceType.iPhone-16-Pro
+      KAISOLA_COMPANION_SIMULATOR_ARCH: arm64
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
           cache: npm
+      - name: Prepare Companion diagnostics paths
+        run: |
+          DIAGNOSTICS="$RUNNER_TEMP/kaisola-companion-diagnostics"
+          mkdir -p "$DIAGNOSTICS"
+          printf 'KAISOLA_COMPANION_DIAGNOSTICS=%s\n' "$DIAGNOSTICS" >> "$GITHUB_ENV"
+          printf 'KAISOLA_COMPANION_RESULT_BUNDLE=%s/KaisolaCompanion.xcresult\n' "$DIAGNOSTICS" >> "$GITHUB_ENV"
       - name: Record Apple toolchain
         run: |
-          swift --version
-          xcodebuild -version
+          swift --version | tee "$KAISOLA_COMPANION_DIAGNOSTICS/swift-version.txt"
+          xcodebuild -version | tee "$KAISOLA_COMPANION_DIAGNOSTICS/xcodebuild-version.txt"
+          {
+            printf 'runner_arch=%s\n' "${RUNNER_ARCH:-unknown}"
+            printf 'image_os=%s\n' "${ImageOS:-unknown}"
+            printf 'image_version=%s\n' "${ImageVersion:-unknown}"
+            uname -a
+            sw_vers
+          } > "$KAISOLA_COMPANION_DIAGNOSTICS/runner-host.txt"
       - name: Install exact Node helper dependencies
         run: npm ci --prefer-offline --no-audit --no-fund
         env:
@@ -70,6 +96,7 @@ jobs:
         run: >-
           node --test
           tests/node/brokerCompatibility.test.cjs
+          tests/node/companionCITestGate.test.cjs
           tests/node/companionProtocolTables.test.cjs
           tests/node/nativeAppcast.test.cjs
           tests/node/nativeBrokerPackage.test.cjs
@@ -79,6 +106,32 @@ jobs:
           tests/node/nativeResourceFixtureGate.test.cjs
       - name: Test shared Swift contracts
         run: swift test --package-path native/KaisolaCore
+      - name: Resolve exact Companion simulator
+        id: companion-simulator
+        if: ${{ !inputs.skip-ios }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcrun simctl list runtimes --json > "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-runtimes.json"
+          xcrun simctl list devices available --json > "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-devices.json"
+          xcodebuild \
+            -project mobile/KaisolaCompanion/KaisolaCompanion.xcodeproj \
+            -scheme KaisolaCompanion \
+            -showdestinations \
+            > "$KAISOLA_COMPANION_DIAGNOSTICS/xcode-destinations.txt"
+          node scripts/companion-ci-test-gate.cjs resolve-simulator \
+            --devices-json "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-devices.json" \
+            --runtimes-json "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-runtimes.json" \
+            --xcode-version-file "$KAISOLA_COMPANION_DIAGNOSTICS/xcodebuild-version.txt" \
+            --expected-xcode-version "$KAISOLA_COMPANION_XCODE_VERSION" \
+            --expected-xcode-build-version "$KAISOLA_COMPANION_XCODE_BUILD" \
+            --runtime-identifier "$KAISOLA_COMPANION_SIMULATOR_RUNTIME" \
+            --runtime-version "$KAISOLA_COMPANION_SIMULATOR_OS" \
+            --device-type-identifier "$KAISOLA_COMPANION_SIMULATOR_DEVICE_TYPE" \
+            --device-name "$KAISOLA_COMPANION_SIMULATOR_NAME" \
+            --architecture "$KAISOLA_COMPANION_SIMULATOR_ARCH" \
+            --output "$KAISOLA_COMPANION_DIAGNOSTICS/destination.json" \
+            --github-output "$GITHUB_OUTPUT"
       - name: Compile optimized iPhone app against KaisolaCore
         if: ${{ !inputs.skip-ios }}
         run: >-
@@ -86,8 +139,10 @@ jobs:
           -project mobile/KaisolaCompanion/KaisolaCompanion.xcodeproj
           -scheme KaisolaCompanion
           -configuration Release
-          -destination 'generic/platform=iOS Simulator'
+          -destination "${{ steps.companion-simulator.outputs.destination }}"
           -derivedDataPath "$RUNNER_TEMP/kaisola-ios"
+          ARCHS=arm64
+          ONLY_ACTIVE_ARCH=YES
           CODE_SIGNING_ALLOWED=NO
           build
       - name: Compile iPhone test bundle against KaisolaCore
@@ -97,21 +152,192 @@ jobs:
           -project mobile/KaisolaCompanion/KaisolaCompanion.xcodeproj
           -scheme KaisolaCompanion
           -configuration Debug
-          -destination 'generic/platform=iOS Simulator'
+          -destination "${{ steps.companion-simulator.outputs.destination }}"
           -derivedDataPath "$RUNNER_TEMP/kaisola-ios-tests"
+          ARCHS=arm64
+          ONLY_ACTIVE_ARCH=YES
           CODE_SIGNING_ALLOWED=NO
           build-for-testing
-      - name: Run iPhone contract and app tests
+      - name: Verify Companion test-host architectures
         if: ${{ !inputs.skip-ios }}
         run: >-
-          xcodebuild
-          -project mobile/KaisolaCompanion/KaisolaCompanion.xcodeproj
-          -scheme KaisolaCompanion
-          -configuration Debug
-          -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest'
-          -derivedDataPath "$RUNNER_TEMP/kaisola-ios-tests"
-          CODE_SIGNING_ALLOWED=NO
-          test-without-building
+          node scripts/companion-ci-test-gate.cjs verify-architectures
+          --architecture "$KAISOLA_COMPANION_SIMULATOR_ARCH"
+          --binary "test-host=$RUNNER_TEMP/kaisola-ios-tests/Build/Products/Debug-iphonesimulator/KaisolaCompanion.app/KaisolaCompanion"
+          --binary "test-host-debug-dylib=$RUNNER_TEMP/kaisola-ios-tests/Build/Products/Debug-iphonesimulator/KaisolaCompanion.app/KaisolaCompanion.debug.dylib"
+          --binary "test-bundle=$RUNNER_TEMP/kaisola-ios-tests/Build/Products/Debug-iphonesimulator/KaisolaCompanion.app/PlugIns/KaisolaCompanionTests.xctest/KaisolaCompanionTests"
+          --output "$KAISOLA_COMPANION_DIAGNOSTICS/binary-architectures.json"
+      - name: Boot and probe pinned Companion simulator
+        if: ${{ !inputs.skip-ios }}
+        timeout-minutes: 5
+        shell: bash
+        run: |
+          set -euo pipefail
+          UDID="${{ steps.companion-simulator.outputs.udid }}"
+          xcrun simctl bootstatus "$UDID" -b 2>&1 | tee "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-bootstatus.log"
+          xcrun simctl spawn --arch="$KAISOLA_COMPANION_SIMULATOR_ARCH" "$UDID" uname -m \
+            | tee "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-spawn-architecture.txt"
+          node scripts/companion-ci-test-gate.cjs verify-simulator-probe \
+            --input "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-spawn-architecture.txt" \
+            --architecture "$KAISOLA_COMPANION_SIMULATOR_ARCH" \
+            --output "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-probe.json"
+      - name: Run iPhone contract and app tests
+        id: companion-tests
+        if: ${{ !inputs.skip-ios }}
+        timeout-minutes: 12
+        shell: bash
+        run: |
+          set +e
+          xcodebuild \
+            -project mobile/KaisolaCompanion/KaisolaCompanion.xcodeproj \
+            -scheme KaisolaCompanion \
+            -configuration Debug \
+            -destination "${{ steps.companion-simulator.outputs.destination }}" \
+            -derivedDataPath "$RUNNER_TEMP/kaisola-ios-tests" \
+            -resultBundlePath "$KAISOLA_COMPANION_RESULT_BUNDLE" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=NO \
+            TEST_RUNNER_KAISOLA_COMPANION_TEST_LAUNCH_DIAGNOSTICS=1 \
+            test-without-building \
+            2>&1 | tee "$KAISOLA_COMPANION_DIAGNOSTICS/xcodebuild-test.log"
+          PIPE_STATUSES=("${PIPESTATUS[@]}")
+          STATUS="${PIPE_STATUSES[0]}"
+          if [[ "$STATUS" -eq 0 && "${PIPE_STATUSES[1]}" -ne 0 ]]; then
+            STATUS="${PIPE_STATUSES[1]}"
+          fi
+          printf '%s\n' "$STATUS" > "$KAISOLA_COMPANION_DIAGNOSTICS/xcodebuild-exit-code.txt"
+          exit "$STATUS"
+      - name: Extract Companion xcresult and launch diagnostics
+        if: ${{ always() && !inputs.skip-ios }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set +e
+          LAUNCH_DIAGNOSTICS_RAW="$KAISOLA_COMPANION_DIAGNOSTICS/launch-diagnostics.raw.log"
+          LAUNCH_DIAGNOSTICS="$KAISOLA_COMPANION_DIAGNOSTICS/launch-diagnostics.log"
+          : > "$LAUNCH_DIAGNOSTICS_RAW"
+          : > "$LAUNCH_DIAGNOSTICS"
+          if [[ -f "$KAISOLA_COMPANION_DIAGNOSTICS/xcodebuild-test.log" ]]; then
+            grep -aEo 'KAISOLA_COMPANION_TEST_LAUNCH phase=[a-z_]+ pid=[0-9]+' \
+              "$KAISOLA_COMPANION_DIAGNOSTICS/xcodebuild-test.log" \
+              >> "$LAUNCH_DIAGNOSTICS_RAW" || true
+          fi
+          if [[ -d "$KAISOLA_COMPANION_RESULT_BUNDLE" ]]; then
+            xcrun xcresulttool get test-results summary \
+              --path "$KAISOLA_COMPANION_RESULT_BUNDLE" \
+              --compact \
+              > "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-summary.json.tmp" \
+              2> "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-summary.stderr"
+            if [[ "$?" -eq 0 ]]; then
+              mv "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-summary.json.tmp" \
+                "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-summary.json"
+            fi
+            mkdir -p "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics"
+            xcrun xcresulttool export diagnostics \
+              --path "$KAISOLA_COMPANION_RESULT_BUNDLE" \
+              --output-path "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics" \
+              > "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics.stdout" \
+              2> "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics.stderr"
+            if [[ "$?" -eq 0 ]]; then
+              printf 'complete\n' > "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics.complete"
+            fi
+          fi
+          if [[ -d "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics" ]]; then
+            while IFS= read -r -d '' DIAGNOSTIC_LOG; do
+              grep -aEo 'KAISOLA_COMPANION_TEST_LAUNCH phase=[a-z_]+ pid=[0-9]+' \
+                "$DIAGNOSTIC_LOG" >> "$LAUNCH_DIAGNOSTICS_RAW" || true
+            done < <(find "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics" \
+              -type f \( -name '*.log' -o -name '*.txt' \) -print0)
+          fi
+          awk '!seen[$0]++' "$LAUNCH_DIAGNOSTICS_RAW" > "$LAUNCH_DIAGNOSTICS"
+          exit 0
+      - name: Gate Companion test bootstrap and count
+        if: ${{ always() && !inputs.skip-ios }}
+        run: >-
+          node scripts/companion-ci-test-gate.cjs classify-test
+          --log "$KAISOLA_COMPANION_DIAGNOSTICS/xcodebuild-test.log"
+          --launch-diagnostics "$KAISOLA_COMPANION_DIAGNOSTICS/launch-diagnostics.log"
+          --exit-code-file "$KAISOLA_COMPANION_DIAGNOSTICS/xcodebuild-exit-code.txt"
+          --result-bundle "$KAISOLA_COMPANION_RESULT_BUNDLE"
+          --xcresult-diagnostics "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics"
+          --xcresult-diagnostics-success "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics.complete"
+          --destination-receipt "$KAISOLA_COMPANION_DIAGNOSTICS/destination.json"
+          --architecture-receipt "$KAISOLA_COMPANION_DIAGNOSTICS/binary-architectures.json"
+          --simulator-probe-receipt "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-probe.json"
+          --xcresult-summary "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-summary.json"
+          --simulator-log "$KAISOLA_COMPANION_DIAGNOSTICS/simulator.log.json"
+          --simulator-diagnose "$KAISOLA_COMPANION_DIAGNOSTICS/simctl-diagnose"
+          --simulator-diagnose-success "$KAISOLA_COMPANION_DIAGNOSTICS/simctl-diagnose.complete"
+          --crash-reports "$KAISOLA_COMPANION_DIAGNOSTICS/crash-reports"
+          --output "$KAISOLA_COMPANION_DIAGNOSTICS/preliminary-classification.json"
+      - name: Collect failed Companion simulator and crash evidence
+        if: ${{ failure() && !inputs.skip-ios }}
+        timeout-minutes: 3
+        shell: bash
+        run: |
+          set +e
+          UDID="${{ steps.companion-simulator.outputs.udid }}"
+          mkdir -p "$KAISOLA_COMPANION_DIAGNOSTICS/crash-reports"
+          if [[ -n "$UDID" ]]; then
+            xcrun simctl spawn "$UDID" log show --style json --last 30m --info --debug --predicate 'process == "KaisolaCompanion" OR process == "KaisolaCompanionTests-Runner" OR process == "testmanagerd" OR subsystem == "com.apple.CoreSimulator"' > "$KAISOLA_COMPANION_DIAGNOSTICS/simulator.log.json.tmp" 2> "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-log.stderr"
+            if [[ "$?" -eq 0 ]]; then
+              mv "$KAISOLA_COMPANION_DIAGNOSTICS/simulator.log.json.tmp" \
+                "$KAISOLA_COMPANION_DIAGNOSTICS/simulator.log.json"
+            fi
+            xcrun simctl diagnose -b --timeout=60 --output="$KAISOLA_COMPANION_DIAGNOSTICS/simctl-diagnose" --udid="$UDID" 2> "$KAISOLA_COMPANION_DIAGNOSTICS/simctl-diagnose.stderr"
+            if [[ "$?" -eq 0 ]]; then
+              printf 'complete\n' > "$KAISOLA_COMPANION_DIAGNOSTICS/simctl-diagnose.complete"
+            fi
+            CRASH_ROOTS=(
+              "$HOME/Library/Logs/DiagnosticReports"
+              "$HOME/Library/Developer/CoreSimulator/Devices/$UDID/data/Library/Logs/CrashReporter"
+            )
+            for CRASH_ROOT in "${CRASH_ROOTS[@]}"; do
+              if [[ -d "$CRASH_ROOT" ]]; then
+                while IFS= read -r -d '' CRASH_REPORT; do
+                  cp -p "$CRASH_REPORT" "$KAISOLA_COMPANION_DIAGNOSTICS/crash-reports/"
+                done < <(find "$CRASH_ROOT" -type f -mmin -30 \( -iname '*KaisolaCompanion*.crash' -o -iname '*KaisolaCompanion*.ips' \) -print0)
+              fi
+            done
+            if [[ -d "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics" ]]; then
+              while IFS= read -r -d '' CRASH_REPORT; do
+                cp -p "$CRASH_REPORT" "$KAISOLA_COMPANION_DIAGNOSTICS/crash-reports/"
+              done < <(find "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics" \
+                -type f \( -iname '*.crash' -o -iname '*.ips' \) -print0)
+            fi
+          else
+            printf 'exact simulator resolution did not complete\n' \
+              > "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-collection-unavailable.txt"
+          fi
+          exit 0
+      - name: Seal Companion diagnostic classification
+        if: ${{ always() && !inputs.skip-ios }}
+        run: >-
+          node scripts/companion-ci-test-gate.cjs classify-test
+          --log "$KAISOLA_COMPANION_DIAGNOSTICS/xcodebuild-test.log"
+          --launch-diagnostics "$KAISOLA_COMPANION_DIAGNOSTICS/launch-diagnostics.log"
+          --exit-code-file "$KAISOLA_COMPANION_DIAGNOSTICS/xcodebuild-exit-code.txt"
+          --result-bundle "$KAISOLA_COMPANION_RESULT_BUNDLE"
+          --xcresult-diagnostics "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics"
+          --xcresult-diagnostics-success "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-diagnostics.complete"
+          --destination-receipt "$KAISOLA_COMPANION_DIAGNOSTICS/destination.json"
+          --architecture-receipt "$KAISOLA_COMPANION_DIAGNOSTICS/binary-architectures.json"
+          --simulator-probe-receipt "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-probe.json"
+          --xcresult-summary "$KAISOLA_COMPANION_DIAGNOSTICS/xcresult-summary.json"
+          --simulator-log "$KAISOLA_COMPANION_DIAGNOSTICS/simulator.log.json"
+          --simulator-diagnose "$KAISOLA_COMPANION_DIAGNOSTICS/simctl-diagnose"
+          --simulator-diagnose-success "$KAISOLA_COMPANION_DIAGNOSTICS/simctl-diagnose.complete"
+          --crash-reports "$KAISOLA_COMPANION_DIAGNOSTICS/crash-reports"
+          --output "$KAISOLA_COMPANION_DIAGNOSTICS/classification.json"
+      - name: Upload failed Companion test evidence
+        if: ${{ failure() && !inputs.skip-ios }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: companion-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/kaisola-companion-diagnostics
+          if-no-files-found: error
+          retention-days: 14
       - name: Compile optimized Kaisola macOS app
         if: ${{ !inputs.skip-macos-release-build }}
         run: >-

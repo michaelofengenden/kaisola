@@ -13,7 +13,9 @@ struct KaisolaCompanionApp: App {
     private let rememberedSessionCache: RememberedSessionCatalogSnapshotStore?
 
     init() {
+        Self.testLaunchDiagnostic("app_init_started")
         _auth = StateObject(wrappedValue: Self.makeAuth())
+        Self.testLaunchDiagnostic("auth_model_constructed")
         let store = Self.usePreviewStore ? CompanionStore.preview() : nil
         _coordinator = StateObject(wrappedValue: CompanionConnectionCoordinator(store: store))
         _rememberedSessions = StateObject(wrappedValue: Self.usePreviewStore
@@ -34,6 +36,7 @@ struct KaisolaCompanionApp: App {
                 )
             )
         }
+        Self.testLaunchDiagnostic("app_init_completed")
     }
 
     var body: some Scene {
@@ -45,7 +48,9 @@ struct KaisolaCompanionApp: App {
                 .environmentObject(rememberedSessions)
                 .tint(KaisolaTheme.accent)
                 .task {
+                    Self.testLaunchDiagnostic("auth_restore_started")
                     await auth.restore()
+                    Self.testLaunchDiagnostic("auth_restore_completed")
                     guard !Self.usePreviewStore else { return }
                     let relayURL = (try? FirebaseAuthConfiguration.load())?.relayURL
                     coordinator.configureKaisolaLink(
@@ -54,6 +59,7 @@ struct KaisolaCompanionApp: App {
                     )
                     await coordinator.connectIfPaired()
                     await Self.autoPairIfRequested(coordinator)
+                    Self.testLaunchDiagnostic("root_task_completed")
                 }
                 .task(id: auth.account?.uid) {
                     // A UID transition owns a fresh presentation scope even if
@@ -112,6 +118,20 @@ struct KaisolaCompanionApp: App {
         return ProcessInfo.processInfo.environment[name] == "1"
         #else
         return false
+        #endif
+    }
+
+    /// Direct stderr milestones survive an early XCTest host crash more
+    /// reliably than buffered unified logging. They are disabled in product
+    /// launches and carry only a phase name plus the process ID, so the CI
+    /// classifier can bind evidence to the exact host that crashed.
+    private static func testLaunchDiagnostic(_ phase: String) {
+        #if DEBUG
+        guard ProcessInfo.processInfo.environment[
+            "KAISOLA_COMPANION_TEST_LAUNCH_DIAGNOSTICS"
+        ] == "1" else { return }
+        let line = "KAISOLA_COMPANION_TEST_LAUNCH phase=\(phase) pid=\(ProcessInfo.processInfo.processIdentifier)\n"
+        FileHandle.standardError.write(Data(line.utf8))
         #endif
     }
 

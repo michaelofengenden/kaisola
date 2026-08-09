@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -276,7 +277,7 @@ final class TerminalMetaServiceTests: XCTestCase {
         )
     }
 
-    // MARK: - Live smoke (no assertions beyond "did not crash")
+    // MARK: - Live collector coverage
 
     func testCollectForOwnProcessDoesNotCrash() {
         let meta = TerminalMetaService.collect(pid: ProcessInfo.processInfo.processIdentifier)
@@ -299,36 +300,358 @@ final class TerminalMetaServiceTests: XCTestCase {
         XCTAssertEqual(TerminalMetaService.collect(pid: -1), .empty)
     }
 
-    /// Opt-in live probe: point this at the PID of a real shell that has an
-    /// agent running in it and the whole shipped path — `ps`, the chain walk,
-    /// the marker scan — runs against a live process tree rather than a fixture.
-    ///
-    ///     TEST_RUNNER_KAISOLA_LIVE_AGENT_ROOT_PID=<shell pid> \
-    ///       npm run native:test:focus -- TerminalMetaServiceTests
-    ///
-    /// The `TEST_RUNNER_` prefix is required: `xcodebuild` does not hand its own
-    /// environment to the test host, it forwards exactly the variables named
-    /// that way. (Without it this test silently *skips*, which looks like a
-    /// pass — check the negative case with `TEST_RUNNER_KAISOLA_LIVE_AGENT_NAME`
-    /// set to the wrong agent before trusting a green run.)
-    ///
-    /// Skipped without the variable, because a unit suite cannot assume any
-    /// particular process is running on the machine it happens to be on.
-    func testLiveAgentChainResolvesThroughTheShippedCollector() throws {
-        guard let raw = ProcessInfo.processInfo.environment["KAISOLA_LIVE_AGENT_ROOT_PID"],
-              let pid = Int32(raw), pid > 0 else {
-            throw XCTSkip("set KAISOLA_LIVE_AGENT_ROOT_PID to a shell running an agent")
-        }
-        let expected = ProcessInfo.processInfo.environment["KAISOLA_LIVE_AGENT_NAME"] ?? "claude"
-        let meta = TerminalMetaService.collect(pid: pid)
-        XCTAssertEqual(
-            meta.processName,
-            expected,
-            "the live chain under \(pid) did not resolve to \(expected)"
-        )
+    func testControlledAgentChainResolvesThroughTheShippedCollector() throws {
+        let harness = try TerminalAgentProcessHarness(agentDirectoryName: "codex")
+        defer { harness.stopAndVerify() }
+
+        let snapshot = try harness.snapshot()
+        XCTAssertEqual(snapshot[harness.wrapperPID]?.parentPID, harness.rootPID)
+        XCTAssertEqual(snapshot[harness.agentPID]?.parentPID, harness.wrapperPID)
+        XCTAssertEqual(TerminalMetaService.agentName(
+            fromCommand: snapshot[harness.agentPID]?.command ?? ""
+        ), "codex")
+
+        let meta = try harness.collect(untilProcessNameIs: "codex")
+        XCTAssertEqual(meta.processName, "codex")
         XCTAssertEqual(
             QuietIdentity.identity(agentName: nil, processName: meta.processName),
-            expected == "claude" ? .claude : .openai
+            .openai
         )
+    }
+
+    func testControlledNonAgentChainDoesNotClaimAnAgentIdentity() throws {
+        let harness = try TerminalAgentProcessHarness(agentDirectoryName: "ordinary-worker")
+        defer { harness.stopAndVerify() }
+
+        let snapshot = try harness.snapshot()
+        let command = snapshot[harness.agentPID]?.command ?? ""
+        XCTAssertNil(TerminalMetaService.agentName(fromCommand: command))
+        let expectedName = try XCTUnwrap(TerminalMetaService.processName(fromCommand: command))
+        XCTAssertNotEqual(expectedName, "codex")
+        let meta = try harness.collect(untilProcessNameIs: expectedName)
+        XCTAssertEqual(meta.processName, expectedName)
+    }
+
+    func testExitedControlledTreeCannotRetainAnAgentIdentity() throws {
+        let harness = try TerminalAgentProcessHarness(agentDirectoryName: "codex")
+        defer { harness.stopAndVerify() }
+        let rootPID = harness.rootPID
+        _ = try harness.collect(untilProcessNameIs: "codex")
+
+        harness.stopAndVerify()
+
+        XCTAssertEqual(TerminalMetaService.collect(pid: rootPID), .empty)
+    }
+
+    func testFreshSnapshotDropsAReparentedAgentFromTheTerminalRoot() {
+        let attached = TerminalMetaService.parseProcessSnapshot(
+            """
+            100 1 /bin/zsh -i
+            200 100 /bin/zsh /tmp/wrapper.zsh
+            300 200 /usr/bin/python3 /tmp/codex/mock-agent.py
+            """
+        )
+        let attachedChain = TerminalMetaService.processChains(
+            rootPIDs: [100],
+            recordsByPID: attached
+        )[100] ?? []
+        XCTAssertEqual(
+            TerminalMetaService.foregroundName(chain: attachedChain, recordsByPID: attached),
+            "codex"
+        )
+
+        let reparented = TerminalMetaService.parseProcessSnapshot(
+            """
+            100 1 /bin/zsh -i
+            300 1 /usr/bin/python3 /tmp/codex/mock-agent.py
+            """
+        )
+        let reparentedChain = TerminalMetaService.processChains(
+            rootPIDs: [100],
+            recordsByPID: reparented
+        )[100] ?? []
+        XCTAssertEqual(reparentedChain, [100])
+        XCTAssertEqual(
+            TerminalMetaService.foregroundName(chain: reparentedChain, recordsByPID: reparented),
+            "zsh"
+        )
+    }
+
+    func testFreshSnapshotDoesNotReuseAnExitedPIDsAgentIdentity() {
+        let original = TerminalMetaService.parseProcessSnapshot(
+            """
+            100 1 /bin/zsh -i
+            200 100 /usr/bin/python3 /tmp/codex/mock-agent.py
+            """
+        )
+        let originalChain = TerminalMetaService.processChains(
+            rootPIDs: [100],
+            recordsByPID: original
+        )[100] ?? []
+        XCTAssertEqual(
+            TerminalMetaService.foregroundName(chain: originalChain, recordsByPID: original),
+            "codex"
+        )
+
+        let reused = TerminalMetaService.parseProcessSnapshot(
+            """
+            100 1 /bin/zsh -i
+            200 100 /usr/bin/python3 /tmp/ordinary-worker/mock-agent.py
+            """
+        )
+        let reusedChain = TerminalMetaService.processChains(
+            rootPIDs: [100],
+            recordsByPID: reused
+        )[100] ?? []
+        XCTAssertEqual(reusedChain, [100, 200])
+        XCTAssertEqual(
+            TerminalMetaService.foregroundName(chain: reusedChain, recordsByPID: reused),
+            "python3"
+        )
+    }
+}
+
+private final class TerminalAgentProcessHarness {
+    private(set) var rootPID: Int32 = 0
+    private(set) var wrapperPID: Int32 = 0
+    private(set) var agentPID: Int32 = 0
+
+    private let directory: URL
+    private let rootProcess: Process
+    private let pidPrefix: URL
+    private var stopped = false
+
+    init(agentDirectoryName: String) throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-terminal-agent-harness-\(UUID().uuidString)", isDirectory: true)
+        pidPrefix = directory.appendingPathComponent("fixture", isDirectory: false)
+        rootProcess = Process()
+
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let agentDirectory = directory.appendingPathComponent(agentDirectoryName, isDirectory: true)
+        try FileManager.default.createDirectory(at: agentDirectory, withIntermediateDirectories: true)
+
+        let agentScript = agentDirectory.appendingPathComponent("mock-agent.py", isDirectory: false)
+        let wrapperScript = directory.appendingPathComponent("wrapper.zsh", isDirectory: false)
+        let rootScript = directory.appendingPathComponent("root.zsh", isDirectory: false)
+        try Self.write(
+            """
+            import signal
+            import sys
+            import time
+
+            signal.signal(signal.SIGTERM, lambda _signal, _frame: sys.exit(0))
+            signal.signal(signal.SIGINT, lambda _signal, _frame: sys.exit(0))
+            time.sleep(120)
+            """,
+            to: agentScript
+        )
+        try Self.write(
+            """
+            set -u
+            agent="$1"
+            prefix="$2"
+            /usr/bin/python3 "$agent" &
+            child=$!
+            print -r -- "$$" > "$prefix.wrapper"
+            print -r -- "$child" > "$prefix.agent"
+            print -r -- "ready" > "$prefix.ready"
+            cleanup() {
+              trap - TERM INT EXIT
+              kill -TERM "$child" 2>/dev/null || true
+              wait "$child" 2>/dev/null || true
+            }
+            trap cleanup TERM INT EXIT
+            wait "$child"
+            status=$?
+            trap - TERM INT EXIT
+            exit "$status"
+            """,
+            to: wrapperScript
+        )
+        try Self.write(
+            """
+            set -u
+            wrapper="$1"
+            agent="$2"
+            prefix="$3"
+            /bin/zsh "$wrapper" "$agent" "$prefix" &
+            child=$!
+            print -r -- "$$" > "$prefix.root"
+            cleanup() {
+              trap - TERM INT EXIT
+              kill -TERM "$child" 2>/dev/null || true
+              wait "$child" 2>/dev/null || true
+            }
+            trap cleanup TERM INT EXIT
+            wait "$child"
+            status=$?
+            trap - TERM INT EXIT
+            exit "$status"
+            """,
+            to: rootScript
+        )
+
+        rootProcess.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        rootProcess.arguments = [rootScript.path, wrapperScript.path, agentScript.path, pidPrefix.path]
+        rootProcess.environment = [
+            "HOME": directory.path,
+            "PATH": "/usr/bin:/bin",
+            "TMPDIR": directory.path,
+        ]
+        rootProcess.standardInput = FileHandle.nullDevice
+        rootProcess.standardOutput = FileHandle.nullDevice
+        rootProcess.standardError = FileHandle.nullDevice
+        try rootProcess.run()
+        rootPID = rootProcess.processIdentifier
+
+        do {
+            try waitUntilReady()
+        } catch {
+            stopAndVerify()
+            throw error
+        }
+    }
+
+    func snapshot() throws -> [Int32: TerminalProcessRecord] {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: "/bin/ps")
+        process.arguments = ["-axo", "pid=,ppid=,command="]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw failure("ps exited with status \(process.terminationStatus)")
+        }
+        return TerminalMetaService.parseProcessSnapshot(String(decoding: data, as: UTF8.self))
+    }
+
+    func collect(
+        untilProcessNameIs expected: String,
+        timeout: TimeInterval = 5
+    ) throws -> TerminalMeta {
+        let deadline = Date().addingTimeInterval(timeout)
+        var last = TerminalMeta.empty
+        repeat {
+            last = TerminalMetaService.collect(pid: rootPID)
+            if last.processName == expected { return last }
+            Thread.sleep(forTimeInterval: 0.02)
+        } while rootProcess.isRunning && Date() < deadline
+        throw failure("collector returned \(last.processName ?? "nil") instead of \(expected)")
+    }
+
+    func stopAndVerify(file: StaticString = #filePath, line: UInt = #line) {
+        guard !stopped else { return }
+        stopped = true
+
+        if rootProcess.isRunning { rootProcess.terminate() }
+        if !waitForRootExit(timeout: 2), rootProcess.isRunning {
+            _ = kill(rootPID, SIGKILL)
+            _ = waitForRootExit(timeout: 2)
+        }
+        if !rootProcess.isRunning { rootProcess.waitUntilExit() }
+
+        terminateTrackedFixture(agentPID)
+        terminateTrackedFixture(wrapperPID)
+        for pid in [agentPID, wrapperPID] where pid > 0 {
+            do {
+                let remainingCommand = try fixtureCommand(pid: pid)
+                XCTAssertNil(
+                    remainingCommand,
+                    "fixture process \(pid) survived teardown",
+                    file: file,
+                    line: line
+                )
+            } catch {
+                XCTFail(
+                    "could not verify fixture process \(pid) teardown: \(error)",
+                    file: file,
+                    line: line
+                )
+            }
+        }
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func waitUntilReady(timeout: TimeInterval = 5) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        repeat {
+            if !rootProcess.isRunning {
+                throw failure("fixture root exited before publishing readiness")
+            }
+            if FileManager.default.fileExists(atPath: pidPrefix.appendingPathExtension("ready").path),
+               let root = try? readPID(extension: "root"),
+               let wrapper = try? readPID(extension: "wrapper"),
+               let agent = try? readPID(extension: "agent"),
+               root == rootPID,
+               let records = try? snapshot(),
+               records[wrapper]?.parentPID == root,
+               records[agent]?.parentPID == wrapper,
+               records[wrapper]?.command.contains(directory.path) == true,
+               records[agent]?.command.contains(directory.path) == true {
+                wrapperPID = wrapper
+                agentPID = agent
+                return
+            }
+            Thread.sleep(forTimeInterval: 0.02)
+        } while Date() < deadline
+        throw failure("fixture did not publish one scoped shell-wrapper-agent chain")
+    }
+
+    private func readPID(extension pathExtension: String) throws -> Int32 {
+        let value = try String(
+            contentsOf: pidPrefix.appendingPathExtension(pathExtension),
+            encoding: .utf8
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let pid = Int32(value), pid > 0 else {
+            throw failure("invalid \(pathExtension) PID: \(value)")
+        }
+        return pid
+    }
+
+    private func terminateTrackedFixture(_ pid: Int32) {
+        guard pid > 0, (try? fixtureCommand(pid: pid)) != nil else { return }
+        _ = kill(pid, SIGTERM)
+        let deadline = Date().addingTimeInterval(1)
+        while Date() < deadline {
+            if (try? fixtureCommand(pid: pid)) == nil { return }
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        guard (try? fixtureCommand(pid: pid)) != nil else { return }
+        _ = kill(pid, SIGKILL)
+        let killDeadline = Date().addingTimeInterval(1)
+        while Date() < killDeadline, (try? fixtureCommand(pid: pid)) != nil {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+    }
+
+    private func fixtureCommand(pid: Int32) throws -> String? {
+        guard let command = try snapshot()[pid]?.command,
+              command.contains(directory.path) else { return nil }
+        return command
+    }
+
+    private func waitForRootExit(timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while rootProcess.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return !rootProcess.isRunning
+    }
+
+    private func failure(_ message: String) -> NSError {
+        NSError(
+            domain: "TerminalAgentProcessHarness",
+            code: 1,
+            userInfo: [NSLocalizedDescriptionKey: message]
+        )
+    }
+
+    private static func write(_ text: String, to url: URL) throws {
+        try Data((text + "\n").utf8).write(to: url, options: .atomic)
     }
 }

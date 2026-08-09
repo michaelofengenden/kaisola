@@ -127,13 +127,23 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         "CODEX_THREAD_ID": .string(""),
     ]
 
+    /// The broker plus owner a controller connection speaks for. Reuse is only
+    /// safe for this exact pair: a connect naming another broker or another
+    /// owner would leave the caller believing it adopted a new generation
+    /// while its mutations still landed on the old one under the old owner.
+    private struct ConnectionIdentity: Equatable {
+        let info: BrokerInfo
+        let ownerID: String
+    }
+
     private let transport: any BrokerByteTransport
     private let operationTimeoutNanoseconds: UInt64
     nonisolated let connectionInstanceID: String
     private var decoder = BrokerLineFrameDecoder()
     private var connected = false
     private var connectedFeatures: Set<String> = []
-    private var ownerID = ""
+    private var connectedIdentity: ConnectionIdentity?
+    private var ownerID: String { connectedIdentity?.ownerID ?? "" }
     private var helloWaiter: CheckedContinuation<Void, any Error>?
     private var handshakeTimeoutTask: Task<Void, Never>?
     private var pending: [String: CheckedContinuation<JSONValue, any Error>] = [:]
@@ -158,11 +168,23 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     func connect(to info: BrokerInfo, ownerID: String) async throws {
-        if connected { return }
         try info.validate()
         guard !ownerID.isEmpty else { throw BrokerClientError.requestFailed("controller owner id") }
-        self.ownerID = ownerID
-        try await transport.connect(path: info.socketPath)
+        let requested = ConnectionIdentity(info: info, ownerID: ownerID)
+        if let connectedIdentity {
+            // Reusing this lane for a different broker or owner would hand the
+            // caller a success it cannot act on: every later mutation would
+            // still travel to the connection recorded here.
+            guard connectedIdentity == requested else { throw BrokerClientError.identityChanged }
+            if connected { return }
+        }
+        connectedIdentity = requested
+        do {
+            try await transport.connect(path: info.socketPath)
+        } catch {
+            connectedIdentity = nil
+            throw error
+        }
         readerTask = Task { await readLoop() }
 
         let frame: JSONValue = .object([
@@ -665,5 +687,8 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         pending.removeAll()
         connected = false
         connectedFeatures = []
+        // A dead lane holds no identity: the next connect is free to adopt a
+        // replacement broker or a new owner.
+        connectedIdentity = nil
     }
 }

@@ -116,6 +116,84 @@ final class BrokerControlClientTests: XCTestCase {
         XCTAssertTrue(didUnblock)
     }
 
+    func testReconnectToAReplacementBrokerIsRejectedWhileTheLaneIsLive() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        do {
+            try await client.connect(to: replacementBrokerInfo, ownerID: "native-test")
+            XCTFail("A live controller lane must not answer for a different broker.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
+        let helloCount = await transport.sentFrames()
+            .filter { $0.objectValue?["type"]?.stringValue == "hello" }
+            .count
+        XCTAssertEqual(helloCount, 1, "The rejected reconnect must not reshape the live handshake.")
+        await client.disconnect()
+    }
+
+    func testReconnectUnderADifferentOwnerIsRejectedWhileTheLaneIsLive() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-one")
+
+        do {
+            try await client.connect(to: controlBrokerInfo, ownerID: "native-two")
+            XCTFail("Silent reuse would keep writing as the previous owner.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
+        // The lane still speaks for the owner it connected as, which is exactly
+        // why the caller must never be told the new owner was adopted.
+        try await client.write(projectID: "project.one", terminalID: "terminal-one", data: "ls\n")
+        let frames = await transport.sentFrames()
+        let write = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(write["method"]?.stringValue, "terminal.write")
+        XCTAssertEqual(write["params"]?.objectValue?["ownerId"]?.stringValue, "native-one")
+        await client.disconnect()
+    }
+
+    func testReconnectWithTheSameIdentityReusesTheLiveConnection() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        let helloCount = await transport.sentFrames()
+            .filter { $0.objectValue?["type"]?.stringValue == "hello" }
+            .count
+        XCTAssertEqual(helloCount, 1)
+        await client.disconnect()
+    }
+
+    func testDisconnectReleasesTheIdentitySoAReplacementBrokerCanBeAdopted() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-one")
+        await client.disconnect()
+
+        try await client.connect(to: replacementBrokerInfo, ownerID: "native-two")
+        try await client.write(projectID: "project.one", terminalID: "terminal-one", data: "ls\n")
+        let frames = await transport.sentFrames()
+        let write = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(write["params"]?.objectValue?["ownerId"]?.stringValue, "native-two")
+        await client.disconnect()
+    }
+
     private var controlBrokerInfo: BrokerInfo {
         BrokerInfo(
             protocolVersion: BrokerWire.protocolVersion,
@@ -124,6 +202,19 @@ final class BrokerControlClientTests: XCTestCase {
             socketPath: "/tmp/kaisola-controller-test.sock",
             token: String(repeating: "a", count: 64),
             startedAt: 1_784_250_001_000,
+            version: "test"
+        )
+    }
+
+    /// A broker that replaced the one above: new process, new socket, new token.
+    private var replacementBrokerInfo: BrokerInfo {
+        BrokerInfo(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            pid: 12_346,
+            socketPath: "/tmp/kaisola-controller-test-next.sock",
+            token: String(repeating: "b", count: 64),
+            startedAt: 1_784_250_009_000,
             version: "test"
         )
     }

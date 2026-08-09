@@ -2,6 +2,7 @@
 
 const { after, test } = require('node:test')
 const assert = require('node:assert/strict')
+const crypto = require('node:crypto')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
@@ -315,4 +316,116 @@ test('spool hot cache lives only while observed', async (t) => {
   assert.equal(record.spool.visible, true, 'a remaining observer keeps the cache')
   manager.unsubscribeSubscriberPrefix('window-b|')
   assert.equal(record.spool.visible, false)
+})
+
+// --- signed spawn-helper staging -------------------------------------------
+// The helper copied into private storage is the executable node-pty hands to
+// posix_spawn, so anything pre-created on that path is treated as hostile.
+
+function helperFixture(t) {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-helper-root-'))
+  t.after(() => fs.rmSync(base, { recursive: true, force: true }))
+  const outside = path.join(base, 'attacker')
+  fs.mkdirSync(outside, { mode: 0o700 })
+  const source = path.join(base, 'signed-spawn-helper')
+  fs.writeFileSync(source, 'signed-helper-bytes', { mode: 0o600 })
+  return { base, outside, source, root: path.join(base, 'storage', '.native') }
+}
+
+test('helper staging rejects a symlinked root planted before launch', (t) => {
+  const { outside, root } = helperFixture(t)
+  fs.mkdirSync(path.dirname(root), { mode: 0o700 })
+  fs.symlinkSync(outside, root)
+
+  assert.throws(() => __test.prepareHelperDir(root, process.arch), /helper path component is a symlink/)
+  assert.deepEqual(fs.readdirSync(outside), [], 'nothing is created outside private storage')
+})
+
+test('helper staging rejects a symlinked architecture directory', (t) => {
+  const { outside, root } = helperFixture(t)
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+  fs.symlinkSync(outside, path.join(root, `darwin-${process.arch}`))
+
+  assert.throws(() => __test.prepareHelperDir(root, process.arch), /helper path component is a symlink/)
+  assert.deepEqual(fs.readdirSync(outside), [])
+})
+
+test('helper staging rejects a plain file planted at the root path', (t) => {
+  const { root } = helperFixture(t)
+  fs.mkdirSync(path.dirname(root), { mode: 0o700 })
+  fs.writeFileSync(root, '', { mode: 0o600 })
+
+  assert.throws(() => __test.prepareHelperDir(root, process.arch), /helper path component is not a directory/)
+})
+
+test('helper staging rejects an ancestor other users can write', (t) => {
+  const { root } = helperFixture(t)
+  const storage = path.dirname(root)
+  fs.mkdirSync(storage, { mode: 0o700 })
+  fs.chmodSync(storage, 0o777)
+
+  assert.throws(() => __test.prepareHelperDir(root, process.arch), /helper path component is writable by other users/)
+})
+
+test('helper staging tightens a loose pre-created directory back to owner-only', (t) => {
+  const { root } = helperFixture(t)
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 })
+  fs.chmodSync(root, 0o777)
+
+  const helperDir = __test.prepareHelperDir(root, process.arch)
+  assert.equal(helperDir, path.join(fs.realpathSync(root), `darwin-${process.arch}`))
+  assert.equal(fs.lstatSync(fs.realpathSync(root)).mode & 0o777, 0o700)
+  assert.equal(fs.lstatSync(helperDir).mode & 0o777, 0o700)
+})
+
+test('helper install replaces a symlinked helper instead of writing through it', (t) => {
+  const { outside, source, root } = helperFixture(t)
+  const decoy = path.join(outside, 'target')
+  fs.writeFileSync(decoy, 'untouched', { mode: 0o600 })
+  const helperDir = __test.prepareHelperDir(root, process.arch)
+  fs.symlinkSync(decoy, path.join(helperDir, 'spawn-helper'))
+
+  const helper = __test.installSpawnHelper(source, helperDir)
+  assert.equal(fs.readFileSync(decoy, 'utf8'), 'untouched', 'the symlink target is never written')
+  assert.equal(fs.lstatSync(helper).isSymbolicLink(), false)
+  assert.equal(fs.readFileSync(helper, 'utf8'), 'signed-helper-bytes')
+  assert.equal(fs.lstatSync(helper).mode & 0o777, 0o700)
+  assert.deepEqual(fs.readdirSync(helperDir), ['spawn-helper'], 'no temp file survives the install')
+})
+
+test('helper install refuses a symlink pre-planted at the temp path', (t) => {
+  const { outside, source, root } = helperFixture(t)
+  const decoy = path.join(outside, 'target')
+  fs.writeFileSync(decoy, 'untouched', { mode: 0o600 })
+  const helperDir = __test.prepareHelperDir(root, process.arch)
+  // Pin the random suffix so the test can plant the exact entry an attacker
+  // would otherwise have to guess, then watch exclusive creation refuse it.
+  t.mock.method(crypto, 'randomBytes', () => Buffer.alloc(8, 0xab))
+  fs.symlinkSync(decoy, path.join(helperDir, `spawn-helper.${process.pid}.${'ab'.repeat(8)}.tmp`))
+
+  assert.throws(() => __test.installSpawnHelper(source, helperDir), /EEXIST/)
+  assert.equal(fs.readFileSync(decoy, 'utf8'), 'untouched', 'the symlink target is never written')
+  assert.equal(fs.existsSync(path.join(helperDir, 'spawn-helper')), false)
+})
+
+test('helper install creates its temp file exclusively', (t) => {
+  const { source, root } = helperFixture(t)
+  const helperDir = __test.prepareHelperDir(root, process.arch)
+  const opened = []
+  const openSync = fs.openSync
+  t.mock.method(fs, 'openSync', (file, flags, mode) => {
+    opened.push({ file, flags, mode })
+    return openSync(file, flags, mode)
+  })
+  const copies = []
+  t.mock.method(fs, 'copyFileSync', (from, to) => copies.push([from, to]))
+
+  __test.installSpawnHelper(source, helperDir)
+
+  const temp = opened.find((call) => call.file.endsWith('.tmp'))
+  assert.ok(temp, 'the helper is staged through a temp file')
+  assert.equal(temp.flags & fs.constants.O_EXCL, fs.constants.O_EXCL)
+  assert.equal(temp.flags & fs.constants.O_CREAT, fs.constants.O_CREAT)
+  assert.equal(temp.mode, 0o700)
+  assert.deepEqual(copies, [], 'copyFileSync would follow a pre-planted symlink')
 })

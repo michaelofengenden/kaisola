@@ -420,7 +420,34 @@ struct NativeFrameCadenceReport: Encodable, Equatable, Sendable {
     }
 }
 
-/// A fixture-only, view-bound main-run-loop cadence probe. Instruments remains
+enum NativeTerminalHistoryFrameCadence {
+    static let environmentKey = "KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE"
+    static let workloadID = "terminal-history-sustained-12-surface-v1"
+    static let receiptPrefix = "KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE="
+
+    static func encodeReceipt(
+        report: NativeFrameCadenceReport,
+        appPID: Int32,
+        brokerPID: Int32,
+        capturedAt: String
+    ) throws -> Data {
+        guard report.workload == workloadID,
+              appPID > 1,
+              brokerPID > 1,
+              !capturedAt.isEmpty,
+              let encoded = try? JSONEncoder().encode(report),
+              let object = try? JSONSerialization.jsonObject(with: encoded),
+              var receipt = object as? [String: Any] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        receipt["appPid"] = appPID
+        receipt["brokerPid"] = brokerPID
+        receipt["capturedAt"] = capturedAt
+        return try JSONSerialization.data(withJSONObject: receipt, options: [.sortedKeys])
+    }
+}
+
+/// A request-gated, view-bound main-run-loop cadence probe. Instruments remains
 /// the rendered-hitch authority; this complementary signal catches deadline
 /// loss without enabling a machine-wide trace when unrelated daemons are busy.
 @MainActor
@@ -713,6 +740,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private let resourceFrameCadenceRequested = ProcessInfo.processInfo.environment[
         "KAISOLA_NATIVE_FRAME_CADENCE"
     ] == "1"
+    /// Release qualification only. Unlike the disposable resource workload,
+    /// this instruments the ordinary installed workspace so a physical
+    /// twelve-surface tour and its live broker share one exact app process.
+    private let terminalHistoryFrameCadenceRequested = ProcessInfo.processInfo.environment[
+        NativeTerminalHistoryFrameCadence.environmentKey
+    ] == "1"
     private var resourceFrameCadenceProbe: NativeFrameCadenceProbe?
     private var visualStreamingFixtureTask: Task<Void, Never>?
     private struct ResourceTerminalReceipt {
@@ -792,6 +825,12 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         }
         if resourceWorkloadRequested, resourceWorkload == nil {
             print("KAISOLA_NATIVE_RESOURCE_WORKLOAD_READY=FAIL invalid-private-temporary-root")
+            NSApp.terminate(nil)
+            return
+        }
+        if terminalHistoryFrameCadenceRequested,
+           visualFixture || resourceWorkloadRequested || runtimeSmoke || linkSmoke || catalogSmoke {
+            print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL invalid-launch-mode")
             NSApp.terminate(nil)
             return
         }
@@ -1304,6 +1343,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         window.delegate = self
         window.makeKeyAndOrderFront(nil)
         windowModels[ObjectIdentifier(window)] = model
+        if terminalHistoryFrameCadenceRequested {
+            startTerminalHistoryFrameCadenceProbe(in: window)
+        }
         if resourceWorkload == nil {
             observeCompanionProjection(model, id: ObjectIdentifier(window))
         }
@@ -1592,6 +1634,56 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             }
             FileHandle.standardOutput.write(Data("KAISOLA_NATIVE_FRAME_CADENCE=".utf8))
             FileHandle.standardOutput.write(Data(payload.utf8))
+            FileHandle.standardOutput.write(Data("\n".utf8))
+            try? FileHandle.standardOutput.synchronize()
+        }
+    }
+
+    private func startTerminalHistoryFrameCadenceProbe(in window: NSWindow) {
+        guard resourceFrameCadenceProbe == nil,
+              resourceWorkload == nil,
+              !visualFixture,
+              let contentView = window.contentView else {
+            print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL invalid-workspace-surface")
+            try? FileHandle.standardOutput.synchronize()
+            return
+        }
+        resourceFrameCadenceProbe = NativeFrameCadenceProbe(
+            view: contentView,
+            workload: NativeTerminalHistoryFrameCadence.workloadID
+        ) { [weak self] report in
+            defer { self?.resourceFrameCadenceProbe = nil }
+            guard let report else {
+                print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL display-link-timeout")
+                try? FileHandle.standardOutput.synchronize()
+                return
+            }
+            let locator = BrokerInfoLocator.preview()
+            guard let broker = try? locator.locate(), broker.isProcessAlive,
+                  broker.pid > 1 else {
+                print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL broker-identity-unavailable")
+                try? FileHandle.standardOutput.synchronize()
+                return
+            }
+            let formatter = DateFormatter()
+            formatter.locale = Locale(identifier: "en_US_POSIX")
+            formatter.calendar = Calendar(identifier: .gregorian)
+            formatter.timeZone = TimeZone(secondsFromGMT: 0)
+            formatter.dateFormat = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"
+            guard let payload = try? NativeTerminalHistoryFrameCadence.encodeReceipt(
+                report: report,
+                appPID: ProcessInfo.processInfo.processIdentifier,
+                brokerPID: broker.pid,
+                capturedAt: formatter.string(from: Date())
+            ) else {
+                print("KAISOLA_NATIVE_TERMINAL_HISTORY_FRAME_CADENCE=FAIL receipt-encoding")
+                try? FileHandle.standardOutput.synchronize()
+                return
+            }
+            FileHandle.standardOutput.write(
+                Data(NativeTerminalHistoryFrameCadence.receiptPrefix.utf8)
+            )
+            FileHandle.standardOutput.write(payload)
             FileHandle.standardOutput.write(Data("\n".utf8))
             try? FileHandle.standardOutput.synchronize()
         }

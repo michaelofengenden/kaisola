@@ -12,6 +12,7 @@
     "native:resource": "node scripts/native-resource-gate.cjs",
     "native:frame-trace": "node scripts/native-frame-trace-gate.cjs",
     "native:frame-cadence": "node scripts/native-frame-cadence-gate.cjs",
+    "native:terminal-history-gate": "node scripts/native-terminal-history-gate.cjs",
     "native:resource-fixture": "node scripts/native-resource-fixture-gate.cjs",
     "native:dev": "./scripts/native-dev.sh",
     "native:canary": "./scripts/native-canary.sh",

@@ -10,6 +10,7 @@ npm run native:resource -- --help
 npm run native:resource-fixture -- --help
 npm run native:frame-trace -- --help
 npm run native:frame-cadence -- --help
+npm run native:terminal-history-gate -- --help
 ```
 
 Use `native-resource-gate.cjs` for bounded process-tree footprint samples,
@@ -17,6 +18,13 @@ Use `native-resource-gate.cjs` for bounded process-tree footprint samples,
 fixture, and the frame gates for scrolling and streaming cadence. Every gate
 must receive an explicit app or receipt path and writes a machine-readable
 result; none is part of the per-edit fast loop.
+
+The final installed-build terminal-history qualification is deliberately
+separate from those disposable fixtures. See
+[`terminal-history-gate-v1.md`](terminal-history-gate-v1.md) for the signed,
+physical-trackpad protocol and the sealed receipt contract. Its snapshot path
+is read-only (`broker.status` only), never adopts ownership, and never emits the
+broker token, socket, owner, last-owner, or terminal working directory.
 
 The checked-in interaction matrix records the broader accessibility, session,
 broker, update, and Companion evidence required at release milestones.

@@ -446,6 +446,47 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertFalse(McpProtocolRevision.isAccepted("not-a-revision"))
     }
 
+    // MARK: - Authentication state policy
+
+    func testAuthenticationStatesHaveDistinctCopyAndSafeFollowUpActions() {
+        let expectations: [(McpAuthenticationState, String, McpAuthenticationAction)] = [
+            (.probing, "Checking authentication", .none),
+            (.signedIn, "Signed in", .none),
+            (.signedOut, "Signed out", .reviewCredentialSetup),
+            (.expired, "Credentials expired", .replaceExpiredCredential),
+            (.unknown(.timeout), "Authentication unknown · server timed out", .retryProbe),
+            (.unknown(.keychainDenied), "Authentication unknown · Keychain access denied", .reviewKeychainAccess),
+            (.unknown(.unsupported), "Authentication unknown · status unsupported", .reviewCompatibility),
+        ]
+
+        for (state, copy, action) in expectations {
+            let presentation = state.presentation
+            XCTAssertEqual(presentation.copy, copy)
+            XCTAssertEqual(presentation.action, action)
+        }
+        XCTAssertNotEqual(
+            McpAuthenticationState.signedOut.presentation,
+            McpAuthenticationState.unknown(.timeout).presentation
+        )
+    }
+
+    func testEmptyAuthenticationHeaderIsNotEvidenceOfConfiguredCredentials() {
+        XCTAssertFalse(McpAuthenticationPolicy.hasConfiguredCredential([
+            .init(name: "Authorization", value: "   "),
+        ]))
+        XCTAssertTrue(McpAuthenticationPolicy.hasConfiguredCredential([
+            .init(name: "Authorization", value: "Bearer ${TOKEN}"),
+        ]))
+    }
+
+    func testUnknownAuthenticationActionsNeverLaunchOAuthOrClearCredentials() {
+        for reason in McpAuthenticationState.UnknownReason.allCases {
+            let action = McpAuthenticationState.unknown(reason).presentation.action
+            XCTAssertFalse(action.launchesOAuth)
+            XCTAssertFalse(action.clearsCredentials)
+        }
+    }
+
     // MARK: - MCP lifecycle probe
 
     func testStdioAndLegacySSEProbesNeverOpenANetworkConnection() async {
@@ -459,8 +500,108 @@ final class McpConfigStoreTests: XCTestCase {
         let sse = await service.probe(McpServerConfig(name: "legacy", kind: .sse, url: "https://example.com/sse"))
         XCTAssertEqual(stdio.status, .configured)
         XCTAssertFalse(stdio.verified)
+        XCTAssertEqual(stdio.authentication, .unknown(.unsupported))
         XCTAssertEqual(sse.status, .configured)
         XCTAssertFalse(sse.verified)
+        XCTAssertEqual(sse.authentication, .unknown(.unsupported))
+    }
+
+    func testHTTPProbeReportsSignedInWhenConfiguredCredentialsAreAccepted() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [McpProbeURLProtocol.self]
+        McpProbeURLProtocol.handler = { request in
+            let request = try request.materializingBody()
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(request.httpBody)) as? [String: Any])
+            let method = try XCTUnwrap(object["method"] as? String)
+            let data = method == "initialize"
+                ? Data(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{}}}"#.utf8)
+                : Data()
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: method == "initialize" ? 200 : 202,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: method == "initialize" ? ["Content-Type": "application/json"] : [:]
+                )!,
+                data
+            )
+        }
+        defer { McpProbeURLProtocol.handler = nil }
+        let service = McpProbeService(session: URLSession(configuration: configuration))
+
+        let result = await service.probe(McpServerConfig(
+            name: "remote",
+            kind: .http,
+            url: "https://example.com/mcp",
+            headerPairs: [.init(name: "Authorization", value: "Bearer ${TOKEN}")]
+        ))
+
+        XCTAssertEqual(result.status, .ready)
+        XCTAssertEqual(result.authentication, .signedIn)
+    }
+
+    func testHTTPProbeKeepsSignedOutSeparateFromExpiredCredentials() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [McpProbeURLProtocol.self]
+        McpProbeURLProtocol.handler = { request in
+            let request = try request.materializingBody()
+            let hasCredentials = request.value(forHTTPHeaderField: "Authorization") != nil
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 401,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: hasCredentials
+                        ? ["WWW-Authenticate": #"Bearer error="invalid_token", error_description="token expired""#]
+                        : ["WWW-Authenticate": "Bearer"]
+                )!,
+                Data()
+            )
+        }
+        defer { McpProbeURLProtocol.handler = nil }
+        let service = McpProbeService(session: URLSession(configuration: configuration))
+
+        let signedOutServer = McpServerConfig(
+            name: "signed-out",
+            kind: .http,
+            url: "https://example.com/mcp"
+        )
+        let expiredServer = McpServerConfig(
+            name: "expired",
+            kind: .http,
+            url: "https://example.com/mcp",
+            headerPairs: [.init(name: "Authorization", value: "Bearer ${TOKEN}")]
+        )
+        store(workspace).save([signedOutServer, expiredServer])
+        let persistedBefore = try Data(contentsOf: store(workspace).fileURL)
+
+        let signedOut = await service.probe(signedOutServer)
+        let expired = await service.probe(expiredServer)
+
+        XCTAssertEqual(signedOut.authentication, .signedOut)
+        XCTAssertEqual(expired.authentication, .expired)
+        XCTAssertEqual(try Data(contentsOf: store(workspace).fileURL), persistedBefore)
+    }
+
+    func testHTTPProbeTimeoutLeavesStoredCredentialsUntouched() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [McpProbeURLProtocol.self]
+        McpProbeURLProtocol.handler = { _ in throw URLError(.timedOut) }
+        defer { McpProbeURLProtocol.handler = nil }
+        let service = McpProbeService(session: URLSession(configuration: configuration))
+        let server = McpServerConfig(
+            name: "remote",
+            kind: .http,
+            url: "https://example.com/mcp",
+            headerPairs: [.init(name: "Authorization", value: "Bearer ${TOKEN}")]
+        )
+        store(workspace).save([server])
+        let persistedBefore = try Data(contentsOf: store(workspace).fileURL)
+
+        let result = await service.probe(server)
+
+        XCTAssertEqual(result.authentication, .unknown(.timeout))
+        XCTAssertEqual(try Data(contentsOf: store(workspace).fileURL), persistedBefore)
     }
 
     func testHTTPProbeNegotiatesSessionHeadersAndListsTools() async throws {
@@ -493,7 +634,7 @@ final class McpConfigStoreTests: XCTestCase {
                 XCTAssertEqual(request.value(forHTTPHeaderField: "MCP-Protocol-Version"), "2025-06-18")
                 XCTAssertEqual(request.value(forHTTPHeaderField: "Mcp-Session-Id"), "probe-session")
                 headers = ["Content-Type": "text/event-stream"]
-                data = Data("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"one\"}],\"nextCursor\":\"more\"}}\n\n".utf8)
+                data = Data("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"one\",\"inputSchema\":{\"type\":\"object\"}}],\"nextCursor\":\"more\"}}\n\n".utf8)
             default:
                 XCTFail("Unexpected MCP method \(method)")
                 headers = [:]
@@ -525,6 +666,8 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertEqual(result.serverVersion, "1.2")
         XCTAssertEqual(result.toolCount, 1)
         XCTAssertTrue(result.hasMoreTools)
+        XCTAssertEqual(result.authentication, .signedIn)
+        XCTAssertTrue(result.disabledTools.isEmpty)
         XCTAssertEqual(capture.snapshot().count, 3)
         XCTAssertTrue(capture.snapshot().allSatisfy {
             $0.value(forHTTPHeaderField: "Authorization") == "Bearer ${TOKEN}"
@@ -582,11 +725,168 @@ final class McpConfigStoreTests: XCTestCase {
         }
         defer { McpProbeURLProtocol.handler = nil }
         let service = McpProbeService(session: URLSession(configuration: configuration))
+        let server = McpServerConfig(name: "remote", kind: .http, url: "https://example.com/mcp")
+        store(workspace).save([server])
+        let persistedBefore = try Data(contentsOf: store(workspace).fileURL)
 
-        let result = await service.probe(McpServerConfig(name: "remote", kind: .http, url: "https://example.com/mcp"))
+        let result = await service.probe(server)
         XCTAssertEqual(result.status, .failed)
         XCTAssertTrue(result.verified)
         XCTAssertTrue(result.message.contains("Unsupported protocol version"))
+        XCTAssertEqual(result.authentication, .unknown(.unsupported))
+        XCTAssertEqual(try Data(contentsOf: store(workspace).fileURL), persistedBefore)
+    }
+
+    // MARK: - Provider-facing tool schema normalization
+
+    func testToolSchemaNormalizerResolvesNestedDefinitionsArraysUnionsAndEscapedPointers() throws {
+        let schema: [String: Any] = [
+            "type": "object",
+            "properties": [
+                "payload": ["$ref": "#/$defs/envelope"],
+                "legacy": ["$ref": "#/definitions/a~1b~0c"],
+            ],
+            "$defs": [
+                "envelope": [
+                    "type": "object",
+                    "properties": [
+                        "values": [
+                            "type": "array",
+                            "items": [
+                                "anyOf": [
+                                    ["$ref": "#/$defs/scalar"],
+                                    ["type": "null"],
+                                ],
+                            ],
+                        ],
+                    ],
+                    "required": ["values"],
+                ],
+                "scalar": ["oneOf": [["type": "string"], ["type": "integer"]]],
+            ],
+            "definitions": [
+                "a/b~c": ["type": "string", "minLength": 2],
+            ],
+        ]
+
+        let first = McpToolSchemaNormalizer.normalizeTools([
+            ["name": "nested", "description": "fixture", "inputSchema": schema],
+        ])
+        let second = McpToolSchemaNormalizer.normalizeTools([
+            ["inputSchema": schema, "description": "fixture", "name": "nested"],
+        ])
+
+        XCTAssertEqual(first.usable.count, 1)
+        XCTAssertTrue(first.disabled.isEmpty)
+        let normalized = try XCTUnwrap(first.usable[0]["inputSchema"] as? [String: Any])
+        XCTAssertNil(normalized["$defs"])
+        XCTAssertNil(normalized["definitions"])
+        let properties = try XCTUnwrap(normalized["properties"] as? [String: Any])
+        let legacy = try XCTUnwrap(properties["legacy"] as? [String: Any])
+        XCTAssertEqual(legacy["type"] as? String, "string")
+        XCTAssertEqual(legacy["minLength"] as? Int, 2)
+        XCTAssertFalse(try McpToolSchemaNormalizer.stableData(normalized).isEmpty)
+        XCTAssertEqual(
+            try McpToolSchemaNormalizer.stableData(normalized),
+            try McpToolSchemaNormalizer.stableData(
+                XCTUnwrap(second.usable[0]["inputSchema"] as? [String: Any])
+            )
+        )
+    }
+
+    func testToolSchemaNormalizerDisablesOnlyInvalidToolsWithBoundedVisibleReasons() throws {
+        let cycle: [String: Any] = [
+            "type": "object",
+            "properties": ["node": ["$ref": "#/$defs/node"]],
+            "$defs": ["node": ["$ref": "#/$defs/node"]],
+        ]
+        let result = McpToolSchemaNormalizer.normalizeTools([
+            ["name": "healthy", "inputSchema": ["type": "object", "additionalProperties": false]],
+            ["name": "missing", "inputSchema": ["$ref": "#/$defs/absent", "$defs": [:]]],
+            ["name": "cycle", "inputSchema": cycle],
+            ["name": "remote", "inputSchema": ["$ref": "https://example.test/schema.json"]],
+            ["name": "unsupported", "inputSchema": ["type": "object", "unevaluatedProperties": false]],
+        ])
+
+        XCTAssertEqual(result.usable.compactMap { $0["name"] as? String }, ["healthy"])
+        XCTAssertEqual(result.disabled.map(\.name), ["missing", "cycle", "remote", "unsupported"])
+        XCTAssertTrue(result.disabled[0].reason.localizedCaseInsensitiveContains("missing"))
+        XCTAssertTrue(result.disabled[1].reason.localizedCaseInsensitiveContains("cycle"))
+        XCTAssertTrue(result.disabled[2].reason.localizedCaseInsensitiveContains("local"))
+        XCTAssertTrue(result.disabled[3].reason.localizedCaseInsensitiveContains("unsupported"))
+        XCTAssertTrue(result.disabled.allSatisfy { !$0.reason.isEmpty && $0.reason.count <= 160 })
+    }
+
+    func testToolSchemaNormalizerStopsAtDepthNodeAndByteBudgets() {
+        var deep: [String: Any] = ["type": "string"]
+        for _ in 0..<8 { deep = ["type": "array", "items": deep] }
+        let manyProperties = Dictionary(uniqueKeysWithValues: (0..<20).map {
+            ("p\($0)", ["type": "string"] as [String: Any])
+        })
+        let oversizedDescription = String(repeating: "x", count: 1_024)
+        let limits = McpToolSchemaNormalizer.Limits(
+            maximumInputBytes: 800,
+            maximumOutputBytes: 800,
+            maximumDepth: 4,
+            maximumNodes: 12
+        )
+
+        let result = McpToolSchemaNormalizer.normalizeTools([
+            ["name": "deep", "inputSchema": deep],
+            ["name": "nodes", "inputSchema": ["type": "object", "properties": manyProperties]],
+            ["name": "bytes", "inputSchema": ["type": "string", "description": oversizedDescription]],
+            ["name": "healthy", "inputSchema": ["type": "boolean"]],
+        ], limits: limits)
+
+        XCTAssertEqual(result.usable.compactMap { $0["name"] as? String }, ["healthy"])
+        XCTAssertEqual(result.disabled.map(\.name), ["deep", "nodes", "bytes"])
+        XCTAssertTrue(result.disabled[0].reason.localizedCaseInsensitiveContains("depth"))
+        XCTAssertTrue(result.disabled[1].reason.localizedCaseInsensitiveContains("node"))
+        XCTAssertTrue(result.disabled[2].reason.localizedCaseInsensitiveContains("byte"))
+    }
+
+    func testHTTPProbeReportsUsableAndDisabledToolsWithoutFailingHealthySibling() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [McpProbeURLProtocol.self]
+        McpProbeURLProtocol.handler = { request in
+            let request = try request.materializingBody()
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(request.httpBody)) as? [String: Any])
+            let method = try XCTUnwrap(object["method"] as? String)
+            let data: Data
+            switch method {
+            case "initialize":
+                data = Data(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}"#.utf8)
+            case "notifications/initialized":
+                data = Data()
+            case "tools/list":
+                data = Data(##"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"healthy","inputSchema":{"type":"object","properties":{"value":{"$ref":"#/$defs/value"}},"$defs":{"value":{"type":"string"}}}},{"name":"broken","inputSchema":{"$ref":"#/$defs/missing"}}]}}"##.utf8)
+            default:
+                throw URLError(.badServerResponse)
+            }
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: method == "notifications/initialized" ? 202 : 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: data.isEmpty ? [:] : ["Content-Type": "application/json"]
+                )!,
+                data
+            )
+        }
+        defer { McpProbeURLProtocol.handler = nil }
+
+        let result = await McpProbeService(session: URLSession(configuration: configuration)).probe(
+            McpServerConfig(name: "remote", kind: .http, url: "https://example.com/mcp")
+        )
+
+        XCTAssertEqual(result.status, .ready)
+        XCTAssertEqual(result.toolCount, 1)
+        XCTAssertEqual(result.authentication, .unknown(.unsupported))
+        XCTAssertEqual(result.disabledTools.map(\.name), ["broken"])
+        XCTAssertTrue(result.message.contains("1 usable"))
+        XCTAssertTrue(result.message.contains("1 disabled"))
+        XCTAssertTrue(result.message.contains("broken"))
+        XCTAssertLessThanOrEqual(result.message.count, 240)
     }
 
     private func write(_ value: String, relativePath: String, home: URL) throws {

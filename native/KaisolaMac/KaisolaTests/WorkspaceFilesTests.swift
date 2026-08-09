@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -3282,6 +3283,151 @@ final class WorkspaceFilesTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: loop, withDestinationURL: root)
         XCTAssertFalse(ProjectFiles.children(of: root).contains { $0.name == "loop" })
         XCTAssertEqual(Set(ProjectFiles.enumerate(root: root)), ["README.md", "src/main.swift"])
+    }
+
+    /// Make a folder Kaisola can't read, and put it back afterwards even if
+    /// the test bails out early.
+    private func makeUnreadableFolder(named name: String) throws -> URL {
+        let locked = root.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try "secret".write(
+            to: locked.appendingPathComponent("notes.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+        addTeardownBlock {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: locked.path
+            )
+        }
+        try XCTSkipUnless(
+            access(locked.path, R_OK) != 0,
+            "This test user can read a 000 folder, so permission denied is unreachable."
+        )
+        return locked
+    }
+
+    func testDirectoryListingDistinguishesAnUnreadableFolderFromAnEmptyOne() throws {
+        let empty = root.appendingPathComponent("empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        let locked = try makeUnreadableFolder(named: "locked")
+
+        // Both folders list exactly nothing. Only the typed result tells the
+        // rail which of them is a real, quiet, empty folder.
+        let emptyListing = ProjectFiles.listing(of: empty)
+        XCTAssertEqual(emptyListing.nodes, [])
+        XCTAssertNil(emptyListing.failure)
+        XCTAssertTrue(emptyListing.isEmptyAndReadable)
+
+        let lockedListing = ProjectFiles.listing(of: locked)
+        XCTAssertEqual(lockedListing.nodes, [])
+        XCTAssertEqual(lockedListing.failure, .permissionDenied)
+        XCTAssertFalse(lockedListing.isEmptyAndReadable)
+
+        // The legacy accessor keeps its old shape for the fuzzy index.
+        XCTAssertEqual(ProjectFiles.children(of: locked), [])
+    }
+
+    func testDirectoryListingNamesMissingReplacedCancelledAndBoundedFolders() throws {
+        XCTAssertEqual(
+            ProjectFiles.listing(of: root.appendingPathComponent("gone", isDirectory: true)).failure,
+            .missing
+        )
+        XCTAssertEqual(
+            ProjectFiles.listing(of: root.appendingPathComponent("README.md")).failure,
+            .notDirectory
+        )
+
+        // Cancelled before the first entry, and cancelled part-way through:
+        // neither may look like a folder that simply had nothing in it.
+        XCTAssertEqual(ProjectFiles.listing(of: root, isCancelled: { true }).failure, .cancelled)
+        var checks = 0
+        let interrupted = ProjectFiles.listing(of: root, isCancelled: {
+            checks += 1
+            return checks > 1
+        })
+        XCTAssertEqual(interrupted.failure, .cancelled)
+
+        // A caller's own limit is deliberate bounding, not a failure.
+        let bulk = root.appendingPathComponent("bulk", isDirectory: true)
+        try FileManager.default.createDirectory(at: bulk, withIntermediateDirectories: true)
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            try "x".write(to: bulk.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let bounded = ProjectFiles.listing(of: bulk, limit: 2)
+        XCTAssertEqual(bounded.nodes.count, 2)
+        XCTAssertNil(bounded.failure)
+    }
+
+    func testDirectoryLoadFailuresCarryTheirOwnDiagnostic() throws {
+        let failures: [ProjectFiles.DirectoryLoadFailure] = [
+            .permissionDenied, .missing, .notDirectory, .cancelled, .ioFailure(code: EIO),
+        ]
+        for failure in failures {
+            XCTAssertFalse(failure.summary.isEmpty)
+            XCTAssertFalse(failure.diagnostic.isEmpty)
+        }
+        XCTAssertEqual(Set(failures.map(\.summary)).count, failures.count)
+
+        let reason = String(cString: try XCTUnwrap(strerror(EIO)))
+        XCTAssertTrue(
+            ProjectFiles.DirectoryLoadFailure.ioFailure(code: EIO).diagnostic.contains(reason)
+        )
+        XCTAssertFalse(
+            ProjectFiles.DirectoryLoadFailure.ioFailure(code: 0).diagnostic.contains(reason)
+        )
+    }
+
+    @MainActor
+    func testWorkspaceTreeModelPublishesUnreadableFoldersAndRetryClearsThem() async throws {
+        let locked = try makeUnreadableFolder(named: "locked")
+        let tree = WorkspaceTreeModel(root: root)
+
+        tree.load(locked)
+        let published = await settledListing(from: tree, of: locked)
+        let failed = try XCTUnwrap(published)
+        XCTAssertEqual(failed.failure, .permissionDenied)
+        XCTAssertEqual(tree.children(of: locked), [])
+        XCTAssertEqual(tree.loadFailure(for: locked), .permissionDenied)
+
+        // Retry is the inline affordance the row offers: fix the folder, load
+        // it again, and the rail goes back to an ordinary quiet listing.
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path)
+        tree.load(locked, force: true)
+        let retried = await settledListing(from: tree, of: locked, matching: { $0.failure == nil })
+        let recovered = try XCTUnwrap(retried)
+        XCTAssertEqual(recovered.nodes.map(\.name), ["notes.md"])
+        XCTAssertNil(tree.loadFailure(for: locked))
+
+        // A genuinely empty folder still publishes nothing to complain about.
+        let empty = root.appendingPathComponent("empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        tree.load(empty)
+        let publishedEmpty = await settledListing(from: tree, of: empty)
+        let emptyListing = try XCTUnwrap(publishedEmpty)
+        XCTAssertTrue(emptyListing.isEmptyAndReadable)
+        XCTAssertNil(tree.loadFailure(for: empty))
+    }
+
+    /// Poll the model's published snapshot until its background load lands.
+    @MainActor
+    private func settledListing(
+        from tree: WorkspaceTreeModel,
+        of directory: URL,
+        timeout: TimeInterval = 5,
+        matching isSettled: (ProjectFiles.DirectoryListing) -> Bool = { _ in true }
+    ) async -> ProjectFiles.DirectoryListing? {
+        let key = directory.standardizedFileURL.path
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let listing = tree.listingsByDirectory[key], isSettled(listing) {
+                return listing
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return nil
     }
 
     func testSyntaxHighlighterAppKitPathClampsOutOfRangeSpanInsteadOfThrowing() {

@@ -422,6 +422,70 @@ enum ProjectFiles {
         "__pycache__", ".venv", ".next", ".turbo", "build",
     ]
 
+    /// Why a directory listing came back short. `FileManager` reports every one
+    /// of these the same way — an enumerator that yields nothing — so a folder
+    /// Kaisola can't read is indistinguishable from a genuinely empty one
+    /// unless the scan keeps the error the filesystem handed it.
+    enum DirectoryLoadFailure: Equatable, Sendable {
+        case permissionDenied
+        case missing
+        case notDirectory
+        case cancelled
+        /// A POSIX errno when the filesystem supplied one, otherwise 0.
+        case ioFailure(code: Int32)
+
+        /// Short enough for one row at the rail's narrowest width.
+        var summary: String {
+            switch self {
+            case .permissionDenied:
+                return "Can't read this folder"
+            case .missing:
+                return "This folder is gone"
+            case .notDirectory:
+                return "No longer a folder"
+            case .cancelled:
+                return "Listing was interrupted"
+            case .ioFailure:
+                return "Couldn't list this folder"
+            }
+        }
+
+        /// The actionable half: what the filesystem said, and where to look.
+        var diagnostic: String {
+            switch self {
+            case .permissionDenied:
+                return """
+                Kaisola doesn't have permission to list this folder. Check its \
+                permissions, or grant access under System Settings > Privacy & \
+                Security > Files and Folders.
+                """
+            case .missing:
+                return "This folder no longer exists on disk. It may have been moved, renamed, or deleted."
+            case .notDirectory:
+                return "Something replaced this folder with a file."
+            case .cancelled:
+                return "Listing this folder stopped before it finished, so its contents may be incomplete."
+            case .ioFailure(let code):
+                guard code != 0, let reason = strerror(code) else {
+                    return "The filesystem reported an error while listing this folder."
+                }
+                return "The filesystem reported an error while listing this folder: \(String(cString: reason))."
+            }
+        }
+    }
+
+    /// A directory's immediate children together with the reason the list may
+    /// be short. No nodes and no failure is a real, quiet empty folder.
+    struct DirectoryListing: Equatable, Sendable {
+        var nodes: [FileNode]
+        var failure: DirectoryLoadFailure?
+
+        static let empty = DirectoryListing(nodes: [], failure: nil)
+
+        /// A legitimately empty folder — nothing for the rail to report.
+        var isEmptyAndReadable: Bool { nodes.isEmpty && failure == nil }
+    }
+
     /// Immediate children of a directory: folders first, then files, both
     /// alphabetical; hidden entries and ignored directories skipped.
     static func children(
@@ -436,22 +500,53 @@ enum ProjectFiles {
         ).nodes
     }
 
+    /// The same listing as `children(of:)`, keeping why an unreadable, deleted,
+    /// or failing folder came back empty so the rail can say so.
+    static func listing(
+        of directory: URL,
+        limit: Int = .max,
+        isCancelled: () -> Bool = { Task.isCancelled }
+    ) -> DirectoryListing {
+        let scan = scanChildren(of: directory, limit: limit, isCancelled: isCancelled)
+        return DirectoryListing(nodes: scan.nodes, failure: scan.failure)
+    }
+
     private static func scanChildren(
         of directory: URL,
         limit: Int,
         isCancelled: () -> Bool
-    ) -> (nodes: [FileNode], visited: Int) {
-        guard limit > 0, !isCancelled() else { return ([], 0) }
+    ) -> (nodes: [FileNode], failure: DirectoryLoadFailure?, visited: Int) {
+        guard limit > 0 else { return ([], nil, 0) }
+        guard !isCancelled() else { return ([], .cancelled, 0) }
+        // The error-handling enumerator is the only way to learn *why* a
+        // directory refused to list. The plain one hands back an empty
+        // sequence for permission denied, a deleted folder, and an I/O fault
+        // alike, which is exactly the confusion this scan has to remove.
+        let directoryPath = resolvedPath(directory)
+        var failure: DirectoryLoadFailure?
         guard let contents = FileManager.default.enumerator(
             at: directory,
             includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey],
-            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
-        ) else { return ([], 0) }
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants],
+            errorHandler: { url, error in
+                // A single child Kaisola can't stat is not a reason to fail the
+                // whole folder; only an error about the folder itself stops it.
+                guard resolvedPath(url) == directoryPath else { return true }
+                failure = loadFailure(for: error as NSError)
+                return false
+            }
+        ) else { return ([], probedFailure(for: directory) ?? .ioFailure(code: 0), 0) }
         var nodes: [FileNode] = []
         if limit != .max { nodes.reserveCapacity(min(limit, 256)) }
         var visited = 0
         while let url = contents.nextObject() as? URL {
-            guard !isCancelled(), visited < limit else { break }
+            // Hitting the caller's limit is deliberate bounding, not a failure;
+            // being cancelled mid-walk leaves a truncated list that is.
+            if isCancelled() {
+                failure = .cancelled
+                break
+            }
+            guard visited < limit else { break }
             visited += 1
             let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
             let isDirectory = values?.isDirectory ?? false
@@ -465,7 +560,61 @@ enum ProjectFiles {
             if $0.isDirectory != $1.isDirectory { return $0.isDirectory }
             return $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
-        return (sorted, visited)
+        return (sorted, failure, visited)
+    }
+
+    /// Map what `FileManager` reported onto the five outcomes the rail knows
+    /// how to explain. The POSIX errno is the precise one; the Cocoa code is
+    /// the fallback for errors that arrive without an underlying error.
+    private static func loadFailure(for error: NSError) -> DirectoryLoadFailure {
+        var posixCode: Int32 = 0
+        if error.domain == NSPOSIXErrorDomain {
+            posixCode = Int32(exactly: error.code) ?? 0
+        } else if let underlying = error.userInfo[NSUnderlyingErrorKey] as? NSError,
+                  underlying.domain == NSPOSIXErrorDomain {
+            posixCode = Int32(exactly: underlying.code) ?? 0
+        }
+        switch posixCode {
+        case EACCES, EPERM:
+            return .permissionDenied
+        case ENOENT:
+            return .missing
+        case ENOTDIR:
+            return .notDirectory
+        default:
+            break
+        }
+        if error.domain == NSCocoaErrorDomain {
+            switch error.code {
+            case NSFileReadNoPermissionError:
+                return .permissionDenied
+            case NSFileReadNoSuchFileError, NSFileNoSuchFileError:
+                return .missing
+            default:
+                break
+            }
+        }
+        return .ioFailure(code: posixCode)
+    }
+
+    /// Last resort for the rare case where `FileManager` refuses to hand back
+    /// an enumerator at all and so never reports an error: ask the filesystem.
+    private static func probedFailure(for directory: URL) -> DirectoryLoadFailure? {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory) else {
+            return .missing
+        }
+        guard isDirectory.boolValue else { return .notDirectory }
+        guard FileManager.default.isReadableFile(atPath: directory.path) else {
+            return .permissionDenied
+        }
+        return nil
+    }
+
+    /// `/var` and `/private/var` name the same folder, and the enumerator's
+    /// error handler is free to report either spelling.
+    private static func resolvedPath(_ url: URL) -> String {
+        url.resolvingSymlinksInPath().standardizedFileURL.path
     }
 
     /// Recursively enumerate project files for fuzzy search, bounded so a huge
@@ -820,7 +969,7 @@ final class ProjectFileIndex {
 @MainActor
 final class WorkspaceTreeModel: ObservableObject {
     let root: URL
-    @Published private(set) var childrenByDirectory: [String: [FileNode]] = [:]
+    @Published private(set) var listingsByDirectory: [String: ProjectFiles.DirectoryListing] = [:]
     @Published private(set) var loadingDirectories: Set<String> = []
     @Published private(set) var searchResults: [String] = []
     @Published private(set) var isSearching = false
@@ -838,26 +987,32 @@ final class WorkspaceTreeModel: ObservableObject {
     }
 
     func children(of directory: URL) -> [FileNode]? {
-        childrenByDirectory[directory.standardizedFileURL.path]
+        listingsByDirectory[directory.standardizedFileURL.path]?.nodes
+    }
+
+    /// Why a loaded directory's list is short, if it is. `nil` covers healthy
+    /// folders, including the ones that are legitimately empty.
+    func loadFailure(for directory: URL) -> ProjectFiles.DirectoryLoadFailure? {
+        listingsByDirectory[directory.standardizedFileURL.path]?.failure
     }
 
     func load(_ directory: URL, force: Bool = false) {
         let normalized = directory.standardizedFileURL
         let key = normalized.path
-        if !force, childrenByDirectory[key] != nil { return }
+        if !force, listingsByDirectory[key] != nil { return }
         directoryTasks[key]?.cancel()
         loadingDirectories.insert(key)
         directoryTasks[key] = Task { [weak self] in
             let worker = Task.detached(priority: .userInitiated) {
-                ProjectFiles.children(of: normalized, isCancelled: { Task.isCancelled })
+                ProjectFiles.listing(of: normalized, isCancelled: { Task.isCancelled })
             }
-            let nodes = await withTaskCancellationHandler {
+            let listing = await withTaskCancellationHandler {
                 await worker.value
             } onCancel: {
                 worker.cancel()
             }
             guard !Task.isCancelled, let self else { return }
-            self.childrenByDirectory[key] = nodes
+            self.listingsByDirectory[key] = listing
             self.loadingDirectories.remove(key)
             self.directoryTasks[key] = nil
         }
@@ -886,7 +1041,7 @@ final class WorkspaceTreeModel: ObservableObject {
             return
         }
         let rootPath = root.path
-        let loaded = Set(childrenByDirectory.keys)
+        let loaded = Set(listingsByDirectory.keys)
         var affected: Set<String> = []
         var removedSubtrees: Set<String> = []
         for changedURL in changeBatch.paths {
@@ -903,11 +1058,11 @@ final class WorkspaceTreeModel: ObservableObject {
 
         for removed in removedSubtrees {
             let prefix = removed + "/"
-            let staleKeys = childrenByDirectory.keys.filter {
+            let staleKeys = listingsByDirectory.keys.filter {
                 $0 == removed || $0.hasPrefix(prefix)
             }
             for key in staleKeys {
-                childrenByDirectory[key] = nil
+                listingsByDirectory[key] = nil
                 directoryTasks[key]?.cancel()
                 directoryTasks[key] = nil
                 loadingDirectories.remove(key)

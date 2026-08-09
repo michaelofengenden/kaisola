@@ -575,6 +575,12 @@ struct WorkspaceRailView: View {
                     AnyView(nodeRows(for: node.url, depth: depth + 1))
                 }
             }
+            // A folder that is simply empty stays quiet. A folder Kaisola could
+            // not read looks identical from here unless it says so, which is
+            // how permission and I/O problems used to pass for empty ones.
+            if let failure = tree.loadFailure(for: directory) {
+                failureRow(failure, directory: directory, depth: depth)
+            }
         } else {
             HStack(spacing: 7) {
                 ProgressView().controlSize(.mini)
@@ -584,6 +590,35 @@ struct WorkspaceRailView: View {
             .padding(.vertical, 6)
             .task { tree.load(directory) }
         }
+    }
+
+    /// The one row a failed directory gets: what went wrong, and a way back.
+    private func failureRow(
+        _ failure: ProjectFiles.DirectoryLoadFailure,
+        directory: URL,
+        depth: Int
+    ) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+            Text(failure.summary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+            Button("Retry") { tree.load(directory, force: true) }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .accessibilityIdentifier("files.retry")
+        }
+        .padding(.leading, CGFloat(depth) * 14 + 12)
+        .padding(.trailing, Self.optionsClearance - 10)
+        .padding(.vertical, 4)
+        .help(failure.diagnostic)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(failure.summary). \(failure.diagnostic)")
     }
 
     private func nodeRow(_ node: FileNode, depth: Int) -> some View {

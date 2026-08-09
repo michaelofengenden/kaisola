@@ -50,7 +50,7 @@ struct BrowserCardView: View {
     private var header: some View {
         HStack(spacing: 10) {
             Image(systemName: "globe")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             Text(url.absoluteString)
                 .font(.subheadline.weight(.medium))
                 .lineLimit(1)

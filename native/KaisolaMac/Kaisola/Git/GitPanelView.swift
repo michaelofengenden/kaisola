@@ -2,6 +2,64 @@ import AppKit
 import Combine
 import SwiftUI
 
+/// User-facing identity and cancellation truth for one serialized Git command.
+/// Read-only work can be abandoned without changing the repository; mutating
+/// work may have completed an earlier Git step before cancellation is observed.
+struct GitPanelOperation: Equatable, Sendable {
+    enum CancellationPolicy: Equatable, Sendable {
+        case readOnly
+        case completedChangesRemain
+
+        var description: String {
+            switch self {
+            case .readOnly: "Safe to cancel; the repository is unchanged."
+            case .completedChangesRemain: "Cancel stops the command; completed Git changes remain."
+            }
+        }
+
+        var cancellationResult: String {
+            switch self {
+            case .readOnly: "The repository remains unchanged."
+            case .completedChangesRemain: "Completed Git changes remain."
+            }
+        }
+    }
+
+    let name: String
+    let cancellationPolicy: CancellationPolicy
+
+    var cancellationDescription: String { cancellationPolicy.description }
+
+    func accessibilityValue(cancellationRequested: Bool) -> String {
+        if cancellationRequested {
+            return "Canceling \(name). \(cancellationPolicy.cancellationResult)"
+        }
+        return "\(name) in progress. \(cancellationDescription)"
+    }
+
+    static let refresh = readOnly("Refreshing Git status")
+    static let stageAll = mutating("Staging all changes")
+    static let unstageAll = mutating("Unstaging all changes")
+    static let pull = mutating("Pulling latest changes")
+    static let commit = mutating("Committing changes")
+    static let history = readOnly("Loading recent history")
+    static let preparePullRequest = readOnly("Preparing pull request review")
+    static let createPullRequest = mutating("Pushing and creating pull request")
+
+    static func stage(_ path: String) -> Self { mutating("Staging \(path)") }
+    static func unstage(_ path: String) -> Self { mutating("Unstaging \(path)") }
+    static func diff(_ path: String) -> Self { readOnly("Loading diff for \(path)") }
+    static func restore(_ path: String) -> Self { mutating("Discarding changes to \(path)") }
+
+    private static func readOnly(_ name: String) -> Self {
+        .init(name: name, cancellationPolicy: .readOnly)
+    }
+
+    private static func mutating(_ name: String) -> Self {
+        .init(name: name, cancellationPolicy: .completedChangesRemain)
+    }
+}
+
 /// A compact Git panel: branch + ahead/behind, staged / unstaged / untracked
 /// files with one-click stage/unstage, and a commit box. Backed by GitService
 /// (git as a child process). Operations are serialized so an older status cannot
@@ -24,11 +82,17 @@ final class GitPanelModel: ObservableObject {
     /// the repository, so the banner offers Retry instead of only explaining.
     @Published private(set) var errorIsRetryable = false
     @Published var commitMessage = ""
-    @Published private(set) var isBusy = false
+    @Published private(set) var activeOperation: GitPanelOperation?
+    @Published private(set) var isCancellingOperation = false
+    var isBusy: Bool { activeOperation != nil }
 
     /// Re-runs exactly the operation the timeout interrupted. Nil unless the
     /// last failure was retryable.
     private var retryOperation: (() -> Void)?
+    /// Type-erased cancellation for the current generic worker Task. The Git
+    /// process capture notices cancellation within 50 ms and stops the complete
+    /// process group (including hooks and credential helpers).
+    private var cancelActiveWork: (() -> Void)?
 
     /// One-click PR state: the current branch's push/PR readiness, plus the
     /// result of the last Create-PR run (a PR or compare URL, and a status note).
@@ -120,6 +184,7 @@ final class GitPanelModel: ObservableObject {
         refreshPump?.cancel()
         refreshPump = nil
         pendingEventAt = nil
+        cancelActiveOperation()
     }
 
     /// A workspace or git-directory change was observed. The first event of a
@@ -157,7 +222,7 @@ final class GitPanelModel: ObservableObject {
 
     func refresh() {
         let requests = diffRequests
-        perform { svc -> GitRefreshSnapshot in
+        perform(.refresh) { svc -> GitRefreshSnapshot in
             let status = try svc.status()
             let livePaths = Set(
                 status.staged.map(\.path)
@@ -208,21 +273,21 @@ final class GitPanelModel: ObservableObject {
     }
 
     func stage(_ path: String) {
-        perform { try $0.stage(path: path); return try $0.status() } apply: {
+        perform(.stage(path)) { try $0.stage(path: path); return try $0.status() } apply: {
             self.status = $0
             self.closeDiff(path)
         }
     }
 
     func unstage(_ path: String) {
-        perform { try $0.unstage(path: path); return try $0.status() } apply: {
+        perform(.unstage(path)) { try $0.unstage(path: path); return try $0.status() } apply: {
             self.status = $0
             self.closeDiff(path)
         }
     }
 
     func stageAll() {
-        perform { try $0.stageAll(); return try $0.status() } apply: {
+        perform(.stageAll) { try $0.stageAll(); return try $0.status() } apply: {
             self.status = $0
             self.diffs.removeAll()
             self.diffRequests.removeAll()
@@ -230,7 +295,7 @@ final class GitPanelModel: ObservableObject {
     }
 
     func unstageAll() {
-        perform { try $0.unstageAll(); return try $0.status() } apply: {
+        perform(.unstageAll) { try $0.unstageAll(); return try $0.status() } apply: {
             self.status = $0
             self.diffs.removeAll()
             self.diffRequests.removeAll()
@@ -254,7 +319,7 @@ final class GitPanelModel: ObservableObject {
 
     func pull() {
         guard canPull else { return }
-        perform { service in
+        perform(.pull) { service in
             let changed = try service.pullFastForward()
             return GitPullOutcome(
                 changed: changed,
@@ -278,7 +343,7 @@ final class GitPanelModel: ObservableObject {
 
     func commit() {
         let message = commitMessage
-        perform { (try $0.commit(message: message), try $0.status(), try? $0.prPrep()) } apply: {
+        perform(.commit) { (try $0.commit(message: message), try $0.status(), try? $0.prPrep()) } apply: {
             self.status = $0.1
             self.prPrepInfo = $0.2
             self.commitMessage = ""
@@ -301,7 +366,7 @@ final class GitPanelModel: ObservableObject {
             return
         }
         diffRequests[path] = staged
-        perform { try $0.diff(path: path, staged: staged) } apply: { patch in
+        perform(.diff(path)) { try $0.diff(path: path, staged: staged) } apply: { patch in
             guard self.diffRequests[path] == staged else { return }
             self.diffs[path] = patch.isEmpty ? "No changes." : patch
         } onError: { _ in
@@ -310,12 +375,12 @@ final class GitPanelModel: ObservableObject {
     }
 
     func loadLog() {
-        perform { try $0.log(limit: 10) } apply: { self.log = $0 }
+        perform(.history) { try $0.log(limit: 10) } apply: { self.log = $0 }
     }
 
     /// Discard unstaged changes to a file (destructive; confirmed by the view).
     func restore(_ path: String) {
-        perform { try $0.restoreFile(path: path); return try $0.status() } apply: {
+        perform(.restore(path)) { try $0.restoreFile(path: path); return try $0.status() } apply: {
             self.status = $0
             self.closeDiff(path)
         }
@@ -330,7 +395,7 @@ final class GitPanelModel: ObservableObject {
         prState = nil
         prURL = nil
         let requested = prBranchDraft
-        perform { service -> PRPlan in
+        perform(.preparePullRequest) { service -> PRPlan in
             let destination = service.prDestination()
             let changedFiles = try service.aheadChangedFiles()
             return try GitPRPlanner.assemble(
@@ -400,7 +465,7 @@ final class GitPanelModel: ObservableObject {
         }
         prState = nil
         prURL = nil
-        perform { service -> PROutcome in
+        perform(.createPullRequest) { service -> PROutcome in
             if let stale = GitPRPlanner.stalenessMessage(
                 plan: plan,
                 currentHeadOID: try service.headOID(),
@@ -467,12 +532,14 @@ final class GitPanelModel: ObservableObject {
     /// Sendable result back on the main actor. GitService and Status are
     /// Sendable, so nothing unsafe crosses the boundary.
     private func perform<T: Sendable>(
+        _ operation: GitPanelOperation,
         _ work: @escaping @Sendable (GitService) throws -> T,
         apply: @escaping @MainActor (T) -> Void,
         onError: (@MainActor (any Error) -> Void)? = nil
     ) {
         guard !isBusy else { return }
-        isBusy = true
+        activeOperation = operation
+        isCancellingOperation = false
         errorMessage = nil
         errorIsRetryable = false
         retryOperation = nil
@@ -481,23 +548,59 @@ final class GitPanelModel: ObservableObject {
         // git twice in the same window.
         lastActivityAt = Date()
         let service = self.service
-        Task {
-            do {
-                let value = try await Task.detached { try work(service) }.value
+        let worker = Task.detached(priority: .userInitiated) { try work(service) }
+        cancelActiveWork = { worker.cancel() }
+        Task { @MainActor [weak self] in
+            let result = await worker.result
+            guard let self, self.activeOperation == operation else { return }
+            self.cancelActiveWork = nil
+            var refreshAfterCancellation = false
+            defer {
+                self.activeOperation = nil
+                self.isCancellingOperation = false
+                if refreshAfterCancellation { self.refresh() }
+            }
+            switch result {
+            case let .success(value):
                 apply(value)
-                isBusy = false
-            } catch {
+            case let .failure(error):
+                if Self.isCancellation(error) {
+                    // Cancel is a requested outcome, not a red failure banner.
+                    // Mutating operation copy already warned that any completed
+                    // Git steps remain; the next refresh reports their truth.
+                    self.errorMessage = nil
+                    self.errorIsRetryable = false
+                    self.retryOperation = nil
+                    refreshAfterCancellation = operation.cancellationPolicy == .completedChangesRemain
+                    return
+                }
                 onError?(error)
-                errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                errorIsRetryable = Self.isRetryable(error)
+                self.errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                self.errorIsRetryable = Self.isRetryable(error)
                 // Hold the same closures, so Retry re-runs this operation
                 // rather than falling back to a generic refresh.
-                retryOperation = errorIsRetryable
-                    ? { [weak self] in self?.perform(work, apply: apply, onError: onError) }
+                self.retryOperation = self.errorIsRetryable
+                    ? { [weak self] in self?.perform(operation, work, apply: apply, onError: onError) }
                     : nil
-                isBusy = false
             }
         }
+    }
+
+    /// Stop the exact worker shown in the progress banner. `GitProcessCapture`
+    /// owns process-group termination, so a hook/helper cannot outlive the
+    /// canceled operation. The banner stays visible as “Canceling” until the
+    /// worker acknowledges the request and the model clears it.
+    func cancelActiveOperation() {
+        guard activeOperation != nil, let cancelActiveWork else { return }
+        isCancellingOperation = true
+        self.cancelActiveWork = nil
+        cancelActiveWork()
+    }
+
+    nonisolated static func isCancellation(_ error: any Error) -> Bool {
+        if error is CancellationError { return true }
+        guard let gitError = error as? GitService.GitError else { return false }
+        return gitError == .cancelled
     }
 
     /// Whether a failed operation is worth offering again. Pulled out as a pure
@@ -560,6 +663,10 @@ struct GitPanelView: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
+            if let operation = model.activeOperation {
+                operationBanner(operation)
+                Divider()
+            }
             // An error shows as a banner ABOVE the content — it must never
             // replace the staged/unstaged lists, commit box, and PR section
             // (a transient op failure would otherwise blank the whole panel
@@ -634,6 +741,45 @@ struct GitPanelView: View {
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    private func operationBanner(_ operation: GitPanelOperation) -> some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.isCancellingOperation ? "Canceling \(operation.name)…" : operation.name)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(operation.cancellationDescription)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Git operation")
+            .accessibilityValue(
+                operation.accessibilityValue(cancellationRequested: model.isCancellingOperation)
+            )
+            .accessibilityIdentifier("git.operation")
+            Button(model.isCancellingOperation ? "Canceling…" : "Cancel") {
+                model.cancelActiveOperation()
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+            .disabled(model.isCancellingOperation)
+            .accessibilityLabel(model.isCancellingOperation ? "Canceling Git operation" : "Cancel Git operation")
+            .accessibilityHint(operation.cancellationDescription)
+            .accessibilityIdentifier("git.operation.cancel")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentColor.opacity(0.08))
+        .accessibilityElement(children: .contain)
     }
 
     private var header: some View {

@@ -608,6 +608,43 @@ final class GitPanelModelTests: XCTestCase {
         )
     }
 
+    func testGitOperationPresentationNamesWorkAndCancellationPolicy() {
+        let refresh = GitPanelOperation.refresh
+        let stage = GitPanelOperation.stage("Client/Models/Status.swift")
+
+        XCTAssertEqual(refresh.name, "Refreshing Git status")
+        XCTAssertEqual(refresh.cancellationDescription, "Safe to cancel; the repository is unchanged.")
+        XCTAssertEqual(
+            refresh.accessibilityValue(cancellationRequested: false),
+            "Refreshing Git status in progress. Safe to cancel; the repository is unchanged."
+        )
+        XCTAssertEqual(stage.name, "Staging Client/Models/Status.swift")
+        XCTAssertEqual(stage.cancellationDescription, "Cancel stops the command; completed Git changes remain.")
+        XCTAssertEqual(
+            GitPanelOperation.unstage("Client/Models/Status.swift").name,
+            "Unstaging Client/Models/Status.swift"
+        )
+        XCTAssertEqual(GitPanelOperation.stageAll.name, "Staging all changes")
+        XCTAssertEqual(GitPanelOperation.unstageAll.name, "Unstaging all changes")
+        XCTAssertEqual(GitPanelOperation.pull.name, "Pulling latest changes")
+        XCTAssertEqual(GitPanelOperation.commit.name, "Committing changes")
+        XCTAssertEqual(
+            GitPanelOperation.diff("Client/Models/Status.swift").name,
+            "Loading diff for Client/Models/Status.swift"
+        )
+        XCTAssertEqual(GitPanelOperation.history.name, "Loading recent history")
+        XCTAssertEqual(
+            GitPanelOperation.restore("Client/Models/Status.swift").name,
+            "Discarding changes to Client/Models/Status.swift"
+        )
+        XCTAssertEqual(GitPanelOperation.preparePullRequest.name, "Preparing pull request review")
+        XCTAssertEqual(GitPanelOperation.createPullRequest.name, "Pushing and creating pull request")
+        XCTAssertEqual(
+            stage.accessibilityValue(cancellationRequested: true),
+            "Canceling Staging Client/Models/Status.swift. Completed Git changes remain."
+        )
+    }
+
     @MainActor
     func testRejectingCommitMessageHookKeepsDraftAndStagedIndexVisible() throws {
         try write("base.txt", "base\n")
@@ -630,14 +667,60 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertTrue(pump(until: { model.status?.staged.map(\.path) == ["pending.txt"] }, timeout: 10))
         model.commitMessage = "keep my draft"
         model.commit()
+        XCTAssertEqual(model.activeOperation?.name, "Committing changes")
         XCTAssertTrue(pump(until: { model.errorMessage != nil && !model.isBusy }, timeout: 10))
 
+        XCTAssertNil(model.activeOperation, "a failed command must clear its progress state")
         XCTAssertEqual(model.commitMessage, "keep my draft")
         XCTAssertEqual(model.status?.staged.map(\.path), ["pending.txt"])
         XCTAssertFalse(model.errorIsRetryable)
         XCTAssertTrue(model.errorMessage?.contains("git commit exited with status 1") == true)
         XCTAssertTrue(model.errorMessage?.contains("panel hook stdout") == true)
         XCTAssertTrue(model.errorMessage?.contains("panel hook stderr") == true)
+        XCTAssertEqual(try gitOutput(["rev-parse", "HEAD"]), headBeforeCommit)
+        XCTAssertEqual(
+            try gitOutput(["diff", "--cached", "--name-only"])
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "pending.txt"
+        )
+    }
+
+    @MainActor
+    func testCancelingCommitClearsProgressWithoutReportingAFailure() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let headBeforeCommit = try gitOutput(["rev-parse", "HEAD"])
+        try write("pending.txt", "keep staged\n")
+        try git(["add", "pending.txt"])
+        try installCommitMessageHook(
+            """
+            #!/bin/sh
+            : > .git/cancel-hook-started
+            sleep 30
+            """
+        )
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.commitMessage = "cancel me"
+        model.commit()
+        XCTAssertEqual(model.activeOperation?.name, "Committing changes")
+        XCTAssertTrue(
+            pump(until: {
+                FileManager.default.fileExists(
+                    atPath: self.repo.appendingPathComponent(".git/cancel-hook-started").path
+                )
+            }, timeout: 5),
+            "the hook must be running before cancellation is requested"
+        )
+
+        model.cancelActiveOperation()
+        XCTAssertTrue(model.isCancellingOperation)
+        XCTAssertTrue(pump(until: { !model.isBusy }, timeout: 5), "cancellation should stop the Git process")
+
+        XCTAssertNil(model.activeOperation)
+        XCTAssertFalse(model.isCancellingOperation)
+        XCTAssertNil(model.errorMessage, "user cancellation is an outcome, not an error banner")
         XCTAssertEqual(try gitOutput(["rev-parse", "HEAD"]), headBeforeCommit)
         XCTAssertEqual(
             try gitOutput(["diff", "--cached", "--name-only"])
@@ -745,12 +828,14 @@ final class GitPanelModelTests: XCTestCase {
         // An unrelated operation (loading history) holds the model busy...
         model.loadLog()
         XCTAssertTrue(model.isBusy, "loadLog should mark the model busy synchronously, before its Task runs")
+        XCTAssertEqual(model.activeOperation?.name, "Loading recent history")
 
         // ...while an external change lands and is noted.
         try write("b.txt", "two\n")
         model.noteRepositoryEvent()
 
         XCTAssertTrue(pump(until: { !model.isBusy }, timeout: 10), "the busy operation should complete")
+        XCTAssertNil(model.activeOperation, "a successful command must clear its progress state")
         XCTAssertTrue(
             pump(until: { model.status?.untracked == ["b.txt"] }, timeout: 10),
             "an event noted while busy must still produce a refresh once isBusy clears"

@@ -3,6 +3,11 @@ import Combine
 import Foundation
 import KaisolaBrokerProtocol
 
+struct TerminalPasteProgress: Equatable, Sendable {
+    let sentBytes: Int
+    let totalBytes: Int
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     struct MissingSessionRecovery: Equatable, Sendable {
@@ -303,6 +308,8 @@ final class AppModel: ObservableObject {
         let data: String
         let opensAgentTurn: Bool
         let generation: UInt64
+        let pasteGeneration: UInt64?
+        let byteCount: Int
     }
     private var terminalInputQueues: [String: [PendingTerminalInput]] = [:]
     private var terminalInputDrainTasks: [String: Task<Void, Never>] = [:]
@@ -310,6 +317,13 @@ final class AppModel: ObservableObject {
     /// generation must never drain after that capability disappears and a
     /// later controller reattaches to the same PTY.
     private var terminalInputGenerations: [String: UInt64] = [:]
+    /// Keep individual broker writes below the documented node-pty boundary.
+    /// Ordinary keystrokes stay one packet; an intentional large paste is
+    /// streamed in UTF-8-safe chunks and exposes acknowledged progress.
+    nonisolated static let terminalWritePayloadByteLimit = BrokerWire.terminalWritePayloadBytes
+    private var nextTerminalPasteGeneration: UInt64 = 0
+    private var terminalPasteGenerationByTerminalID: [String: UInt64] = [:]
+    @Published private(set) var terminalPasteProgressByTerminalID: [String: TerminalPasteProgress] = [:]
     static let terminalInputDiscardNoticeSuffix =
         ": unsent input was discarded. Try again after input reconnects."
     static let terminalInputDiscardAggregateNotice =
@@ -5313,12 +5327,39 @@ final class AppModel: ObservableObject {
             return
         }
         let inputGeneration = terminalInputGenerations[terminalID, default: 0]
-        terminalInputQueues[terminalID, default: []].append(PendingTerminalInput(
-            projectID: projectID,
-            data: data,
-            opensAgentTurn: opensAgentTurn,
-            generation: inputGeneration
-        ))
+        let chunks = Self.terminalWriteChunks(data)
+        let pasteGeneration: UInt64?
+        if chunks.count > 1 {
+            let generation: UInt64
+            if let current = terminalPasteGenerationByTerminalID[terminalID] {
+                generation = current
+            } else {
+                nextTerminalPasteGeneration &+= 1
+                generation = nextTerminalPasteGeneration
+                terminalPasteGenerationByTerminalID[terminalID] = generation
+            }
+            pasteGeneration = generation
+            let current = terminalPasteProgressByTerminalID[terminalID]
+                ?? TerminalPasteProgress(sentBytes: 0, totalBytes: 0)
+            terminalPasteProgressByTerminalID[terminalID] = TerminalPasteProgress(
+                sentBytes: current.sentBytes,
+                totalBytes: current.totalBytes + chunks.reduce(0) { $0 + $1.utf8.count }
+            )
+        } else {
+            pasteGeneration = nil
+        }
+        terminalInputQueues[terminalID, default: []].append(contentsOf:
+            chunks.enumerated().map { index, chunk in
+                PendingTerminalInput(
+                    projectID: projectID,
+                    data: chunk,
+                    opensAgentTurn: opensAgentTurn && index == chunks.count - 1,
+                    generation: inputGeneration,
+                    pasteGeneration: pasteGeneration,
+                    byteCount: chunk.utf8.count
+                )
+            }
+        )
         guard terminalInputDrainTasks[terminalID] == nil else { return }
         terminalInputDrainTasks[terminalID] = Task { [weak self] in
             await self?.drainTerminalInputQueue(
@@ -5412,6 +5453,7 @@ final class AppModel: ObservableObject {
                       controlAvailable,
                       isOwned(terminalID) else { return }
                 trackTerminalDraftInput(packet.data, terminalID: terminalID)
+                acknowledgeTerminalPaste(packet, terminalID: terminalID)
                 if packet.opensAgentTurn {
                     // Deliberately not part of the write's error path: a
                     // refused turn signal is an activity-tracking failure, not
@@ -5455,6 +5497,98 @@ final class AppModel: ObservableObject {
         if terminalInputGenerations[terminalID, default: 0] == generation,
            terminalInputQueues[terminalID]?.isEmpty == true {
             terminalInputQueues.removeValue(forKey: terminalID)
+        }
+    }
+
+    /// The broker enforces this same cap immediately before node-pty. Split on
+    /// Unicode-scalar boundaries keep every chunk a valid String. A bracketed
+    /// paste closes and reopens around each body chunk so cancellation between
+    /// acknowledgements cannot strand the receiving TUI in paste mode; the
+    /// concatenated body remains byte-exact.
+    nonisolated static func terminalWriteChunks(_ data: String) -> [String] {
+        guard data.utf8.count > terminalWritePayloadByteLimit else { return [data] }
+        let bracketedPasteOpening = "\u{1B}[200~"
+        let bracketedPasteClosing = "\u{1B}[201~"
+        if data.hasPrefix(bracketedPasteOpening),
+           data.hasSuffix(bracketedPasteClosing) {
+            let body = String(
+                data.dropFirst(bracketedPasteOpening.count)
+                    .dropLast(bracketedPasteClosing.count)
+            )
+            let bodyLimit = terminalWritePayloadByteLimit
+                - bracketedPasteOpening.utf8.count
+                - bracketedPasteClosing.utf8.count
+            return terminalWriteScalarChunks(body, maximumBytes: bodyLimit).map {
+                bracketedPasteOpening + $0 + bracketedPasteClosing
+            }
+        }
+        return terminalWriteScalarChunks(
+            data,
+            maximumBytes: terminalWritePayloadByteLimit
+        )
+    }
+
+    nonisolated private static func terminalWriteScalarChunks(
+        _ data: String,
+        maximumBytes: Int
+    ) -> [String] {
+        var chunks: [String] = []
+        chunks.reserveCapacity((data.utf8.count / maximumBytes) + 1)
+        var current = ""
+        var currentBytes = 0
+        for scalar in data.unicodeScalars {
+            let scalarBytes = scalar.utf8.count
+            if currentBytes + scalarBytes > maximumBytes,
+               !current.isEmpty {
+                chunks.append(current)
+                current = ""
+                currentBytes = 0
+            }
+            current.unicodeScalars.append(scalar)
+            currentBytes += scalarBytes
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
+    }
+
+    func terminalPasteProgress(for terminalID: String) -> TerminalPasteProgress? {
+        terminalPasteProgressByTerminalID[terminalID]
+    }
+
+    /// Cancel only chunks the controller has not started. The current write has
+    /// an ambiguous outcome until its reply arrives and must never be aborted
+    /// or replayed; ordinary keyboard packets queued behind the paste survive.
+    func cancelTerminalPaste(for terminalID: String) {
+        guard let pasteGeneration = terminalPasteGenerationByTerminalID.removeValue(
+            forKey: terminalID
+        ) else { return }
+        terminalPasteProgressByTerminalID.removeValue(forKey: terminalID)
+        terminalInputQueues[terminalID]?.removeAll {
+            $0.pasteGeneration == pasteGeneration
+        }
+        ToastCenter.shared.show(
+            "Paste cancelled; a chunk already being sent may still finish.",
+            style: .info,
+            duration: 4
+        )
+    }
+
+    private func acknowledgeTerminalPaste(
+        _ packet: PendingTerminalInput,
+        terminalID: String
+    ) {
+        guard let pasteGeneration = packet.pasteGeneration,
+              terminalPasteGenerationByTerminalID[terminalID] == pasteGeneration,
+              let progress = terminalPasteProgressByTerminalID[terminalID] else { return }
+        let sentBytes = min(progress.totalBytes, progress.sentBytes + packet.byteCount)
+        if sentBytes == progress.totalBytes {
+            terminalPasteGenerationByTerminalID.removeValue(forKey: terminalID)
+            terminalPasteProgressByTerminalID.removeValue(forKey: terminalID)
+        } else {
+            terminalPasteProgressByTerminalID[terminalID] = TerminalPasteProgress(
+                sentBytes: sentBytes,
+                totalBytes: progress.totalBytes
+            )
         }
     }
 
@@ -5539,6 +5673,8 @@ final class AppModel: ObservableObject {
         terminalInputGenerations[terminalID, default: 0] &+= 1
         terminalInputDrainTasks.removeValue(forKey: terminalID)?.cancel()
         terminalInputQueues.removeValue(forKey: terminalID)
+        terminalPasteGenerationByTerminalID.removeValue(forKey: terminalID)
+        terminalPasteProgressByTerminalID.removeValue(forKey: terminalID)
         return discardedQueuedInput
     }
 

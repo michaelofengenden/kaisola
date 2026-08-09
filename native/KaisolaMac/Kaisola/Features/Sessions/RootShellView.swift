@@ -2406,6 +2406,31 @@ struct RootShellView: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Input paused for \(surfaceTitle(id))")
                 .accessibilityHint("The last write could not be confirmed. Other terminals remain connected. Resume input revalidates only this terminal.")
+            } else if let progress = model.terminalPasteProgress(for: id) {
+                HStack(spacing: 8) {
+                    ProgressView(
+                        value: Double(progress.sentBytes),
+                        total: Double(progress.totalBytes)
+                    )
+                    .controlSize(.small)
+                    .frame(width: 72)
+                    Text("Pasting \(progress.sentBytes) of \(progress.totalBytes) bytes")
+                    Button("Cancel") { model.cancelTerminalPaste(for: id) }
+                        .buttonStyle(.borderless)
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.regularMaterial, in: Capsule())
+                .overlay {
+                    Capsule().stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+                }
+                .padding(10)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Pasting into \(surfaceTitle(id))")
+                .accessibilityValue("\(progress.sentBytes) of \(progress.totalBytes) bytes sent")
+                .accessibilityHint("Cancel stops chunks that have not started sending")
             } else if case let .reconnecting(attempt) = model.connectionState {
                 Label("Reconnecting…", systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption.weight(.semibold))

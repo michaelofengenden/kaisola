@@ -34,6 +34,7 @@ public enum BrokerWire {
     ]
     public static let maximumFrameBytes = 56 * 1_024 * 1_024
     public static let terminalHistoryPageBytes = 4 * 1_024 * 1_024
+    public static let terminalWritePayloadBytes = 64 * 1_024
 
     /// The transport ceiling only exists for the two snapshot-shaped replies
     /// which may contain an 8 MiB terminal tail after worst-case JSON escaping.

@@ -5,6 +5,7 @@ const assert = require('node:assert/strict')
 const {
   MAX_FRAME,
   TERMINAL_HISTORY_PAGE_BYTES,
+  TERMINAL_WRITE_PAYLOAD_BYTES,
   BROKER_INVENTORY_RESPONSE_BYTES,
   HELLO_FRAME_BYTES,
   DEFAULT_REQUEST_FRAME_BYTES,
@@ -19,6 +20,7 @@ const {
 test('method frame limits stay below the global transport ceiling', () => {
   assert.equal(MAX_FRAME, 56 * 1024 * 1024)
   assert.equal(TERMINAL_HISTORY_PAGE_BYTES, 4 * 1024 * 1024)
+  assert.equal(TERMINAL_WRITE_PAYLOAD_BYTES, 64 * 1024)
   assert.equal(BROKER_INVENTORY_RESPONSE_BYTES, 12 * 1024 * 1024)
   assert.equal(HELLO_FRAME_BYTES, 64 * 1024)
   assert.equal(DEFAULT_REQUEST_FRAME_BYTES, 64 * 1024)

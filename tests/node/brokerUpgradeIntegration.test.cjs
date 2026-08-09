@@ -9,6 +9,7 @@ const path = require('node:path')
 const { spawn, spawnSync } = require('node:child_process')
 
 const brokerScript = path.resolve(__dirname, '../../runtime/node-broker/session-broker.cjs')
+const { MAX_TERMINAL_WRITE_BYTES } = require('../../runtime/node-broker/ipc/terminalManager.cjs')
 const oldDigest = 'a'.repeat(64)
 const newDigest = 'b'.repeat(64)
 
@@ -261,6 +262,69 @@ test('broker mutation ids replay one terminal.write outcome without duplicate in
   const reused = await controller.request('terminal.write', { ...params, data: 'different-input\n' })
   assert.equal(reused.ok, false)
   assert.equal(reused.code, 'mutation_id_reused')
+
+  await controller.request('terminal.release', {
+    mutationId: crypto.randomUUID(), ownerId, projectId, id: terminalId,
+  })
+  controller.socket.destroy()
+})
+
+test('terminal.write rejects coercible and oversized wire payloads before node-pty', async (t) => {
+  const fixture = startBroker()
+  t.after(() => {
+    try { fixture.child.kill('SIGKILL') } catch {}
+    try { spawnSync('/usr/bin/pkill', ['-9', '-f', fixture.root]) } catch {}
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  })
+  await waitFor(() => fs.existsSync(fixture.config.infoFile), 'broker metadata')
+  const controller = await connectClient(fixture.config)
+  const ownerId = 'bounded-write-owner'
+  const projectId = 'bounded-write-project'
+  const terminalId = 'bounded-write-terminal'
+  const created = await controller.request('terminal.create', {
+    mutationId: crypto.randomUUID(),
+    ownerId,
+    projectId,
+    id: terminalId,
+    command: '/bin/cat',
+    args: [],
+    cwd: fixture.root,
+  })
+  assert.equal(created.result.ok, true)
+
+  const nonString = await controller.request('terminal.write', {
+    mutationId: crypto.randomUUID(), ownerId, projectId, id: terminalId, data: 42,
+  })
+  assert.deepEqual(nonString.result, {
+    ok: false,
+    code: 'invalid_terminal_write_payload',
+    message: 'terminal.write data must be a string',
+    maximumBytes: MAX_TERMINAL_WRITE_BYTES,
+  })
+
+  const oversized = await controller.request('terminal.write', {
+    mutationId: crypto.randomUUID(),
+    ownerId,
+    projectId,
+    id: terminalId,
+    data: 'x'.repeat(MAX_TERMINAL_WRITE_BYTES + 1),
+  })
+  assert.deepEqual(oversized.result, {
+    ok: false,
+    code: 'terminal_write_payload_too_large',
+    message: `terminal.write data exceeds ${MAX_TERMINAL_WRITE_BYTES} UTF-8 bytes`,
+    maximumBytes: MAX_TERMINAL_WRITE_BYTES,
+    actualBytes: MAX_TERMINAL_WRITE_BYTES + 1,
+  })
+
+  const exact = await controller.request('terminal.write', {
+    mutationId: crypto.randomUUID(),
+    ownerId,
+    projectId,
+    id: terminalId,
+    data: 'é'.repeat(MAX_TERMINAL_WRITE_BYTES / 2),
+  })
+  assert.deepEqual(exact.result, { ok: true })
 
   await controller.request('terminal.release', {
     mutationId: crypto.randomUUID(), ownerId, projectId, id: terminalId,

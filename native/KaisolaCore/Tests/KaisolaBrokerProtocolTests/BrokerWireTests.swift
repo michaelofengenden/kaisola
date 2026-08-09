@@ -31,6 +31,7 @@ final class BrokerWireTests: XCTestCase {
         ])
         XCTAssertEqual(BrokerWire.maximumFrameBytes, 56 * 1_024 * 1_024)
         XCTAssertEqual(BrokerWire.terminalHistoryPageBytes, 4 * 1_024 * 1_024)
+        XCTAssertEqual(BrokerWire.terminalWritePayloadBytes, 64 * 1_024)
         XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .hello), 64 * 1_024)
         XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .request("terminal.write")), 1 * 1_024 * 1_024)
         XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .request("terminal.create")), 256 * 1_024)

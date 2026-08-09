@@ -17,7 +17,13 @@ const {
   DEFAULT_MAX_LIVE_TERMINALS,
   MAX_CONFIGURABLE_LIVE_TERMINALS,
   TERMINAL_HISTORY_PAGE_BYTES,
+  TERMINAL_WRITE_PAYLOAD_BYTES,
 } = require('./brokerWire.cjs')
+
+// One terminal.write is deliberately much smaller than the broker's framing
+// ceiling. Large paste is split by the controller so the broker event loop and
+// node-pty queue never have to absorb one unbounded mutation.
+const MAX_TERMINAL_WRITE_BYTES = TERMINAL_WRITE_PAYLOAD_BYTES
 
 let pty = null
 let ptyLoadAttempted = false
@@ -882,6 +888,24 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
 }
 
 function write(id, data) {
+  if (typeof data !== 'string') {
+    return {
+      ok: false,
+      code: 'invalid_terminal_write_payload',
+      message: 'terminal.write data must be a string',
+      maximumBytes: MAX_TERMINAL_WRITE_BYTES,
+    }
+  }
+  const actualBytes = Buffer.byteLength(data, 'utf8')
+  if (actualBytes > MAX_TERMINAL_WRITE_BYTES) {
+    return {
+      ok: false,
+      code: 'terminal_write_payload_too_large',
+      message: `terminal.write data exceeds ${MAX_TERMINAL_WRITE_BYTES} UTF-8 bytes`,
+      maximumBytes: MAX_TERMINAL_WRITE_BYTES,
+      actualBytes,
+    }
+  }
   const r = terms.get(id)
   if (!r) return { ok: false }
   if (r.exited || !r.pty) return { ok: false, message: 'terminal already ended' }
@@ -1506,4 +1530,4 @@ function diagnostics() {
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, configureCapacity, capacity, setEventSink, setActivitySink, diagnostics, DEFAULT_MAX_LIVE_TERMINALS, MAX_CONFIGURABLE_LIVE_TERMINALS, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, liveTerminalCount, validatedMaximumLiveTerminals, TerminalCapacityError, MAX_EXIT_WAITERS } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, configureCapacity, capacity, setEventSink, setActivitySink, diagnostics, DEFAULT_MAX_LIVE_TERMINALS, MAX_CONFIGURABLE_LIVE_TERMINALS, MAX_TERMINAL_WRITE_BYTES, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, liveTerminalCount, validatedMaximumLiveTerminals, TerminalCapacityError, MAX_EXIT_WAITERS } }

@@ -18,6 +18,8 @@ const {
   maxRows: MAX_TERMINAL_ROWS,
 } = TERMINAL_GEOMETRY_LIMITS
 
+const TERMINAL_WRITE_PAYLOAD_LIMIT = 64 * 1024
+
 const managerSpoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-manager-'))
 manager.configureStorage(managerSpoolDir, { asyncWrites: false })
 after(() => {
@@ -137,6 +139,39 @@ test('terminal resize applies the create validator maxima before node-pty', () =
   ])
   assert.equal(record.cols, MAX_TERMINAL_COLS)
   assert.equal(record.rows, MAX_TERMINAL_ROWS)
+})
+
+test('terminal write admits only strings within the documented UTF-8 byte cap', (t) => {
+  assert.equal(manager.MAX_TERMINAL_WRITE_BYTES, TERMINAL_WRITE_PAYLOAD_LIMIT)
+
+  const id = 'bounded-terminal-write'
+  t.after(() => manager.release(id))
+  assert.ok(manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+
+  assert.deepEqual(manager.write(id, { toString: () => 'coerced-secret' }), {
+    ok: false,
+    code: 'invalid_terminal_write_payload',
+    message: 'terminal.write data must be a string',
+    maximumBytes: TERMINAL_WRITE_PAYLOAD_LIMIT,
+  })
+
+  const exactMultibytePayload = 'é'.repeat(TERMINAL_WRITE_PAYLOAD_LIMIT / 2)
+  assert.equal(Buffer.byteLength(exactMultibytePayload, 'utf8'), TERMINAL_WRITE_PAYLOAD_LIMIT)
+  assert.deepEqual(manager.write(id, exactMultibytePayload), { ok: true })
+
+  const oversized = `${exactMultibytePayload}x`
+  assert.deepEqual(manager.write(id, oversized), {
+    ok: false,
+    code: 'terminal_write_payload_too_large',
+    message: `terminal.write data exceeds ${TERMINAL_WRITE_PAYLOAD_LIMIT} UTF-8 bytes`,
+    maximumBytes: TERMINAL_WRITE_PAYLOAD_LIMIT,
+    actualBytes: TERMINAL_WRITE_PAYLOAD_LIMIT + 1,
+  })
 })
 
 function spawnKillTestRecord(t, id) {

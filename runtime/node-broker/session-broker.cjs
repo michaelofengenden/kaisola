@@ -565,7 +565,7 @@ async function dispatch(client, method, params = {}) {
     case 'terminal.write': {
       const id = terminalId()
       requireAllowed(id)
-      return mgr.write(id, String(params.data ?? ''))
+      return mgr.write(id, params.data)
     }
     case 'terminal.agentTurn': {
       const id = terminalId()

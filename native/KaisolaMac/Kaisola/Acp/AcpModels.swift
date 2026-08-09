@@ -234,6 +234,10 @@ enum AcpClientError: Error, Equatable, LocalizedError {
     case adapterExited(code: Int32)
     case spawnFailed(String)
     case malformedResponse
+    /// A frame that never reached the JSON-RPC layer: unparsable JSON, invalid
+    /// UTF-8, a stream that ended mid-message. The payload is a short excerpt of
+    /// the offending bytes (see `AcpClient.framePreview`), never the whole frame.
+    case malformedFrame(String)
     case requestFailed(String)
     case frameTooLarge
     case unsupportedProtocol(Int)
@@ -244,6 +248,7 @@ enum AcpClientError: Error, Equatable, LocalizedError {
         case let .adapterExited(code): "The agent process exited (code \(code))."
         case let .spawnFailed(message): "Could not start the agent: \(message)"
         case .malformedResponse: "The agent sent a malformed message."
+        case let .malformedFrame(detail): "The agent sent a malformed message: \(detail)"
         case let .requestFailed(message): message
         case .frameTooLarge: "The agent sent an oversized message."
         case let .unsupportedProtocol(version):

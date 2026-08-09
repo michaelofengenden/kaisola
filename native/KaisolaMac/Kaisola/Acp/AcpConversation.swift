@@ -13,6 +13,10 @@ enum AcpTranscriptRow: Codable, Identifiable, Equatable, Sendable {
     case thought(id: String, text: String)
     case tool(AcpToolCall)
     case plan(id: String, entries: [AcpPlanEntry])
+    /// A client-owned lifecycle event. Permission overflow/expiry uses this
+    /// instead of impersonating an assistant message, and retains no raw
+    /// permission payload.
+    case permissionDecision(id: String, text: String)
 
     var id: String {
         switch self {
@@ -21,7 +25,16 @@ enum AcpTranscriptRow: Codable, Identifiable, Equatable, Sendable {
         case let .thought(id, _): "thought-\(id)"
         case let .tool(call): "tool-\(call.id)"
         case let .plan(id, _): "plan-\(id)"
+        case let .permissionDecision(id, _): "permission-decision-\(id)"
         }
+    }
+
+    /// Permission decisions are live timeline evidence only. Persisting an
+    /// event per hostile overflow would move the same exhaustion risk to disk
+    /// across relaunches, where a tail-only restore cannot prune older pages.
+    var isDurable: Bool {
+        if case .permissionDecision = self { return false }
+        return true
     }
 }
 
@@ -111,6 +124,98 @@ struct AcpUserMessageLedger: Equatable, Sendable {
     }
 }
 
+/// In-memory retry material for failed prompts. This is intentionally separate
+/// from the durable transcript: attachments can be large or sensitive, and a
+/// relaunch must never silently restore bytes the user did not stage again.
+struct AcpFailedSendPayloadStore: Sendable {
+    struct Payload: Equatable, Sendable {
+        let text: String
+        let attachments: [AcpAttachment]
+        let retainedBytes: Int
+    }
+
+    struct Retention: Equatable, Sendable {
+        let retained: Bool
+        let evictedRowIDs: [String]
+    }
+
+    let maximumCount: Int
+    let maximumBytes: Int
+    private var payloads: [String: Payload] = [:]
+    private var rowOrder: [String] = []
+    private(set) var retainedBytes = 0
+
+    var count: Int { payloads.count }
+
+    init(maximumCount: Int, maximumBytes: Int) {
+        self.maximumCount = max(0, maximumCount)
+        self.maximumBytes = max(0, maximumBytes)
+    }
+
+    /// Retain a value snapshot and evict the oldest snapshots until both
+    /// aggregate limits hold. A single over-budget payload is not retained and
+    /// does not evict unrelated, still-retryable messages.
+    mutating func retain(
+        rowID: String,
+        text: String,
+        attachments: [AcpAttachment]
+    ) -> Retention {
+        _ = remove(rowID: rowID)
+        let byteCount = Self.payloadByteCount(text: text, attachments: attachments)
+        guard maximumCount > 0, byteCount <= maximumBytes else {
+            return Retention(retained: false, evictedRowIDs: [])
+        }
+
+        var evicted: [String] = []
+        while payloads.count >= maximumCount || retainedBytes > maximumBytes - byteCount {
+            guard let oldest = rowOrder.first else { break }
+            rowOrder.removeFirst()
+            if let payload = payloads.removeValue(forKey: oldest) {
+                retainedBytes -= payload.retainedBytes
+                evicted.append(oldest)
+            }
+        }
+
+        let payload = Payload(text: text, attachments: attachments, retainedBytes: byteCount)
+        payloads[rowID] = payload
+        rowOrder.append(rowID)
+        retainedBytes += byteCount
+        return Retention(retained: true, evictedRowIDs: evicted)
+    }
+
+    mutating func remove(rowID: String) -> Payload? {
+        guard let payload = payloads.removeValue(forKey: rowID) else { return nil }
+        rowOrder.removeAll { $0 == rowID }
+        retainedBytes -= payload.retainedBytes
+        return payload
+    }
+
+    mutating func removeAll() {
+        payloads.removeAll(keepingCapacity: false)
+        rowOrder.removeAll(keepingCapacity: false)
+        retainedBytes = 0
+    }
+
+    static func payloadByteCount(text: String, attachments: [AcpAttachment]) -> Int {
+        var result = text.utf8.count
+        for attachment in attachments {
+            let byteCounts: [Int]
+            switch attachment {
+            case let .image(data, mimeType, name):
+                byteCounts = [data.count, mimeType.utf8.count, name.utf8.count]
+            case let .textFile(path, contents, name):
+                byteCounts = [path.utf8.count, contents.utf8.count, name.utf8.count]
+            }
+            for count in byteCounts {
+                let (sum, overflow) = result.addingReportingOverflow(count)
+                if overflow { return Int.max }
+                result = sum
+            }
+        }
+        return result
+    }
+}
+
 /// Drives one ACP agent conversation and accumulates its streaming turn into a
 /// transcript the chat view renders. Owns the AcpClient; runs on the main actor
 /// so published transcript mutations are UI-safe.
@@ -121,9 +226,11 @@ final class AcpConversation: ObservableObject {
             contentVersion &+= 1
             if isApplyingPersistedPage {
                 lastHistoryInsertionContentVersion = contentVersion
+            } else if isApplyingEphemeralTimelineEvent {
+                lastHistoryInsertionContentVersion = nil
             } else {
                 lastHistoryInsertionContentVersion = nil
-                onTranscriptChanged?(rows, loadedRowStartOrdinal)
+                onTranscriptChanged?(rows.filter(\.isDurable), loadedRowStartOrdinal)
             }
         }
     }
@@ -144,6 +251,10 @@ final class AcpConversation: ObservableObject {
     @Published private(set) var modes: [AcpSessionInfo.Mode] = []
     @Published private(set) var currentModeID: String?
     @Published private(set) var configOptions: [AcpConfigOption] = []
+    /// The one adapter-owned setting currently awaiting confirmation. Keeping
+    /// the prior value visible until this clears prevents a rejected effort
+    /// level from masquerading as the value the next prompt will use.
+    @Published private(set) var pendingConfigOptionID: String?
     @Published private(set) var commands: [AcpCommand] = []
     /// Whether this adapter advertised `_session/steering` at `initialize`.
     /// Reset on every connect so a swapped agent can never inherit the previous
@@ -175,10 +286,11 @@ final class AcpConversation: ObservableObject {
     /// durability; ACP capability negotiation decides whether this id can load.
     @Published private(set) var providerSessionID: String?
 
-    /// Original text + attachment blocks for failed sends, keyed by the failed
-    /// row's Identifiable id, so `retryFailed` can re-send the exact payload
-    /// (attachments included) rather than a text-only prompt.
-    private var failedSends: [String: (text: String, attachments: [AcpAttachment])] = [:]
+    /// Original text + attachment blocks for a bounded tail of failed sends.
+    /// The store owns value snapshots and is never serialized with transcript
+    /// rows, so Retry is exact in-process without turning failure into an
+    /// unbounded or durable attachment cache.
+    private var failedSends: AcpFailedSendPayloadStore
 
     /// Streams client events to `consume` IN ORDER. The client fires its handler
     /// from an actor off the main thread; yielding into one AsyncStream (drained
@@ -212,9 +324,13 @@ final class AcpConversation: ObservableObject {
     }
 
     struct TurnCheckpoint: Identifiable, Equatable, Sendable {
-        let id: String       // stash commit hash
+        let checkpoint: GitService.Checkpoint
         let turn: Int
         let at: Date
+
+        /// A stash commit can be identical across owners or turns. The exact
+        /// owner ref is the durable UI identity and cleanup capability.
+        var id: String { checkpoint.keepAliveRef }
     }
 
     @Published var title: String
@@ -245,6 +361,11 @@ final class AcpConversation: ObservableObject {
     /// parameter. Nil disables persistence: `loadDraft` returns "" and
     /// `saveDraft` is a no-op.
     var draftStorageKey: String?
+    /// Stable chat/column identity plus a per-live-instance incarnation keep
+    /// checkpoint refs independent across windows and concurrently running app
+    /// builds that restore the same durable conversation.
+    private let checkpointOwnerID: String
+    private let checkpointIncarnationID: UUID
     private var client: AcpClient
     /// Reconciles adapter-reported user messages against the rows already shown.
     private var userMessageLedger: AcpUserMessageLedger
@@ -274,6 +395,7 @@ final class AcpConversation: ObservableObject {
     private let clientFactory: @MainActor () -> AcpClient
     private let command: String
     private let arguments: [String]
+    private let containment: CustomAdapterContainment?
     private let environment: [String: String]
     private let cwd: String
     private let mcpServers: [JSONValue]
@@ -283,6 +405,7 @@ final class AcpConversation: ObservableObject {
     private var restoredDraft: String?
     private(set) var loadedRowStartOrdinal: Int64 = 0
     private var isApplyingPersistedPage = false
+    private var isApplyingEphemeralTimelineEvent = false
     private var earlierPageLoadInFlight = false
     private var hasStarted = false
     private var turnCounter = 0
@@ -299,10 +422,45 @@ final class AcpConversation: ObservableObject {
     private var attachmentCounter = 0
     private var draftPersistenceTask: Task<Void, Never>?
     private var pendingDraftPersistence: String?
+    /// Fences a late setting response after stop, restart, or adapter exit.
+    private var configOptionRequestGeneration: UInt64 = 0
+    /// Lets a later successful retry clear only the failure this setting path
+    /// published, without erasing an unrelated turn or reconnect notice.
+    private var lastConfigOptionFailureMessage: String?
     /// ACP adapters may issue several permission requests before the user has
     /// answered the first. Keep one visible request and preserve the remainder
     /// in arrival order instead of replacing the on-screen card.
-    @Published private var permissionQueue: [AcpPermissionRequest] = []
+    private struct QueuedPermission: Sendable {
+        let request: AcpPermissionRequest
+        let receivedAt: Date
+        let retainedBytes: Int
+
+        func isExpired(at now: Date) -> Bool {
+            now.timeIntervalSince(receivedAt) >= AcpConversation.permissionPromptLifetime
+        }
+    }
+
+    private enum AutomaticPermissionDenial {
+        case countLimit
+        case byteLimit
+        case expired
+        case responderSaturated
+    }
+
+    private struct AutomaticPermissionResolution: Sendable {
+        let requestID: Int
+        let denyOnceOptionID: String?
+    }
+
+    @Published private var permissionQueue: [QueuedPermission] = []
+    private var presentedPermission: QueuedPermission?
+    private var retainedPermissionBytes = 0
+    private var permissionExpiryTask: Task<Void, Never>?
+    private var permissionDecisionCounter = 0
+    private var automaticPermissionResolutions: [AutomaticPermissionResolution] = []
+    private var automaticPermissionResolutionTask: Task<Void, Never>?
+    private var automaticPermissionCancellationGeneration: UInt64 = 0
+    private var activeAutomaticPermissionCancellationGeneration: UInt64?
 
     /// Default transcript render window: only the last 120 rows paint until the
     /// the user reaches the top. Each top crossing reveals `expandStep` more.
@@ -310,11 +468,31 @@ final class AcpConversation: ObservableObject {
     private static let expandStep = 200
     static let maxPendingAttachmentCount = 8
     static let maxPendingAttachmentBytes = 20 * 1_048_576
+    /// Failed prompts retain only this aggregate tail for explicit Retry. The
+    /// byte cap allows one maximum-size attachment plus bounded prompt metadata
+    /// while repeated near-limit failures deterministically evict older data.
+    static let maximumRetainedFailedSendCount = 8
+    static let maximumRetainedFailedSendBytes = 32 * 1_048_576
+    /// Per-conversation limits. These are deliberately independent of adapter
+    /// frame limits: a valid adapter message must not become an unbounded UI
+    /// approval backlog.
+    static let maximumOutstandingPermissionCount = 32
+    static let maximumRetainedPermissionBytes = 1_048_576
+    nonisolated static let permissionPromptLifetime: TimeInterval = 5 * 60
+    /// Automatic-denial rows are evidence, not another attacker-growable log.
+    /// Each event is published in the live timeline; it is intentionally not
+    /// persisted, and only this bounded tail remains in memory.
+    static let maximumRetainedPermissionDecisionRows = 64
+    /// A response record contains only a local integer id and optional small
+    /// option id. Saturation cancels the turn once, which makes AcpClient
+    /// resolve every active permission as cancelled without growing a backlog.
+    static let maximumPendingAutomaticPermissionResolutions = 64
 
     init(
         title: String,
         command: String,
         arguments: [String],
+        containment: CustomAdapterContainment? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         cwd: String,
         mcpServers: [JSONValue] = [],
@@ -323,6 +501,7 @@ final class AcpConversation: ObservableObject {
         ruleStore: PermissionRuleStore = PermissionRuleStore(),
         sensitiveGlobs: [String] = AcpPermissionRules.defaultSensitiveGlobs,
         draftKey: String? = nil,
+        checkpointIncarnationID: UUID = UUID(),
         resumeSessionID: String? = nil,
         initialRows: [AcpTranscriptRow] = [],
         initialRowStartOrdinal: Int64 = 0,
@@ -331,11 +510,14 @@ final class AcpConversation: ObservableObject {
         initialDraft: String? = nil,
         initialAttachments: [AcpAttachment] = [],
         initialUsage: AcpUsage? = nil,
-        initialQueuedPrompts: [String] = []
+        initialQueuedPrompts: [String] = [],
+        failedSendPayloadMaximumCount: Int = AcpConversation.maximumRetainedFailedSendCount,
+        failedSendPayloadMaximumBytes: Int = AcpConversation.maximumRetainedFailedSendBytes
     ) {
         self.title = title
         self.command = command
         self.arguments = arguments
+        self.containment = containment
         self.environment = environment
         self.cwd = cwd
         self.mcpServers = mcpServers
@@ -345,7 +527,18 @@ final class AcpConversation: ObservableObject {
         self.ownsClient = client == nil
         self.ruleStore = ruleStore
         self.sensitiveGlobs = sensitiveGlobs
+        self.failedSends = AcpFailedSendPayloadStore(
+            maximumCount: failedSendPayloadMaximumCount,
+            maximumBytes: failedSendPayloadMaximumBytes
+        )
         self.draftStorageKey = draftKey
+        self.checkpointIncarnationID = checkpointIncarnationID
+        if let draftKey,
+           !draftKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            self.checkpointOwnerID = draftKey
+        } else {
+            self.checkpointOwnerID = "ephemeral-\(checkpointIncarnationID.uuidString.lowercased())"
+        }
         self.resumeSessionID = resumeSessionID
         self.rows = initialRows
         self.userMessageLedger = AcpUserMessageLedger(rows: initialRows)
@@ -368,11 +561,13 @@ final class AcpConversation: ObservableObject {
         // integers, but it can never collide with a retained row identifier.
         self.turnCounter = max(loadedTurnCount, durableRowCount)
         self.segmentCounter = durableRowCount
+        self.permissionDecisionCounter = durableRowCount
     }
 
     func start(resumeQueuedPrompts: Bool = false) async {
         guard !hasStarted else { return }
         hasStarted = true
+        invalidateConfigOptionRequest()
         // One ordered pipe from the client's (off-main) event handler to the
         // MainActor consumer: yields preserve order, and a single draining task
         // consumes them serially. The handler captures the continuation (not
@@ -387,13 +582,24 @@ final class AcpConversation: ObservableObject {
         }
         await client.configureFsGuard(sensitiveGlobs: sensitiveGlobs)
         do {
-            let info = try await client.start(
+            let launch = try containment.map {
+                try $0.prepare(environment: environment, cwd: cwd)
+            } ?? AcpAdapterLaunch(
                 command: command,
                 arguments: arguments,
                 environment: environment,
                 cwd: cwd,
+                access: .unrestricted,
+                sandboxProfile: nil
+            )
+            let info = try await client.start(
+                command: launch.command,
+                arguments: launch.arguments,
+                environment: launch.environment,
+                cwd: launch.cwd,
                 mcpServers: mcpServers,
-                resumeSessionID: providerSessionID ?? resumeSessionID
+                resumeSessionID: providerSessionID ?? resumeSessionID,
+                access: launch.access
             )
             providerSessionID = info.sessionID
             onProviderSessionID?(info.sessionID)
@@ -405,6 +611,7 @@ final class AcpConversation: ObservableObject {
             supportsSteering = info.supportsSteering
             isConnected = true
             statusMessage = nil
+            lastConfigOptionFailureMessage = nil
             // Only entries still in `queued` are known never to have been
             // dispatched. An explicit adapter restart resumes them; ordinary
             // app restoration leaves them paused until the user chooses Resume
@@ -431,6 +638,7 @@ final class AcpConversation: ObservableObject {
     /// offered back through ACP load/resume negotiation when supported.
     func restart() async {
         guard canRestart else { return }
+        invalidateConfigOptionRequest()
         isReconnecting = true
         statusMessage = "Restarting agent…"
         eventContinuation?.finish()
@@ -558,7 +766,7 @@ final class AcpConversation: ObservableObject {
         guard let index = rows.firstIndex(where: { $0.id == rowID }),
               case let .user(_, text, failed) = rows[index], failed else { return }
         rows.remove(at: index)
-        let stashed = failedSends.removeValue(forKey: rowID)
+        let stashed = failedSends.remove(rowID: rowID)
         let originalText = stashed?.text ?? text
         let attachments = stashed?.attachments ?? []
         if isRunning {
@@ -752,15 +960,25 @@ final class AcpConversation: ObservableObject {
                 // Identifiable id) so Retry re-sends them faithfully.
                 if let index = rows.firstIndex(where: { $0.id == "user-\(rowID)" }) {
                     rows[index] = .user(id: rowID, text: displayText, failed: true)
-                    failedSends["user-\(rowID)"] = (text: trimmed, attachments: attachments)
+                    let retention = failedSends.retain(
+                        rowID: "user-\(rowID)",
+                        text: trimmed,
+                        attachments: attachments
+                    )
+                    if !retention.retained {
+                        statusMessage = "This failed message is too large to retain for Retry; its attachment data was discarded."
+                    } else if !retention.evictedRowIDs.isEmpty {
+                        let count = retention.evictedRowIDs.count
+                        statusMessage = "Retry data for \(count) older failed message\(count == 1 ? " was" : "s were") discarded to keep failed-send storage bounded."
+                    }
                 }
             }
         }
     }
 
     func cancel() {
-        pendingPermission = nil
-        permissionQueue.removeAll()
+        clearPermissionQueue()
+        clearAutomaticPermissionResolutions()
         Task { await client.cancel() }
     }
 
@@ -774,18 +992,50 @@ final class AcpConversation: ObservableObject {
         Task { await client.setMode(id) }
     }
 
-    /// Set an adapter config option (effort level etc.); the client re-emits the
-    /// adapter's normalized option set, which `consume` applies.
+    /// Set an adapter config option (effort level etc.) transactionally.
+    ///
+    /// The adapter's last confirmed value remains on screen while the request
+    /// is in flight. Only the returned option set may replace it; a rejection
+    /// leaves the draft, transcript, running turn, and confirmed value intact.
+    /// One request at a time also makes response order unambiguous.
     func selectConfigOption(_ id: String, value: String) {
-        if let index = configOptions.firstIndex(where: { $0.id == id }) {
-            configOptions[index].currentValue = value   // optimistic
+        guard isConnected, pendingConfigOptionID == nil,
+              let option = configOptions.first(where: { $0.id == id }),
+              option.currentValue != value,
+              let choice = option.choices.first(where: { $0.value == value }) else { return }
+
+        configOptionRequestGeneration &+= 1
+        let generation = configOptionRequestGeneration
+        pendingConfigOptionID = id
+        let requestClient = client
+        Task { [weak self] in
+            do {
+                let confirmed = try await requestClient.setConfigOption(id: id, value: value)
+                guard let self, self.configOptionRequestGeneration == generation else { return }
+                self.pendingConfigOptionID = nil
+                self.configOptions = confirmed
+                if self.statusMessage == self.lastConfigOptionFailureMessage {
+                    self.statusMessage = nil
+                }
+                self.lastConfigOptionFailureMessage = nil
+            } catch {
+                guard let self, self.configOptionRequestGeneration == generation else { return }
+                self.pendingConfigOptionID = nil
+                let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                let message = "Couldn’t change \(option.name) to \(choice.name). \(detail)"
+                self.lastConfigOptionFailureMessage = message
+                self.statusMessage = message
+            }
         }
-        Task { await client.setConfigOption(id: id, value: value) }
+    }
+
+    private func invalidateConfigOptionRequest() {
+        configOptionRequestGeneration &+= 1
+        pendingConfigOptionID = nil
     }
 
     func answerPermission(_ optionID: String) {
-        guard let permission = pendingPermission else { return }
-        pendingPermission = nil
+        guard let permission = removePresentedPermission() else { return }
         Task { await client.resolvePermission(id: permission.id, optionID: optionID) }
         presentNextPermission()
     }
@@ -799,7 +1049,7 @@ final class AcpConversation: ObservableObject {
             answerPermission(option.id)
             return
         }
-        pendingPermission = nil
+        _ = removePresentedPermission()
         Task { await client.cancelPermission(id: permission.id) }
         presentNextPermission()
     }
@@ -831,14 +1081,23 @@ final class AcpConversation: ObservableObject {
 
     /// Route an incoming permission ask: sensitive files always surface a card;
     /// otherwise a matching standing rule auto-allows silently; else surface.
-    private func handlePermission(_ request: AcpPermissionRequest) {
+    private func handlePermission(_ request: AcpPermissionRequest, receivedAt: Date = Date()) {
+        let retainedBytes = Self.retainedPermissionPayloadBytes(request)
+        guard retainedBytes <= Self.maximumRetainedPermissionBytes else {
+            denyAutomatically([request], because: .byteLimit)
+            return
+        }
         if AcpPermissionRules.requestIsSensitive(
             globs: sensitiveGlobs,
             title: request.title,
             paths: request.paths,
             rawInput: request.rawInput
         ) {
-            enqueuePresentedPermission(request)
+            enqueuePresentedPermission(
+                request,
+                receivedAt: receivedAt,
+                retainedBytes: retainedBytes
+            )
             return
         }
         if AcpPermissionRules.requestMatchesRule(
@@ -850,25 +1109,262 @@ final class AcpConversation: ObservableObject {
            answerAllowOnce(request) {
             return
         }
-        enqueuePresentedPermission(request)
+        enqueuePresentedPermission(request, receivedAt: receivedAt, retainedBytes: retainedBytes)
     }
 
-    private func enqueuePresentedPermission(_ request: AcpPermissionRequest) {
+    private func enqueuePresentedPermission(
+        _ request: AcpPermissionRequest,
+        receivedAt: Date,
+        retainedBytes: Int
+    ) {
+        expireStalePermissions(at: receivedAt)
         guard pendingPermission?.id != request.id,
-              !permissionQueue.contains(where: { $0.id == request.id }) else { return }
-        guard pendingPermission == nil else {
-            permissionQueue.append(request)
+              !permissionQueue.contains(where: { $0.request.id == request.id }) else { return }
+        guard activeAutomaticPermissionCancellationGeneration == nil else {
+            denyAutomatically([request], because: .responderSaturated)
             return
         }
+        guard pendingPermissionCount < Self.maximumOutstandingPermissionCount else {
+            denyAutomatically([request], because: .countLimit)
+            return
+        }
+        guard retainedBytes <= Self.maximumRetainedPermissionBytes - retainedPermissionBytes else {
+            denyAutomatically([request], because: .byteLimit)
+            return
+        }
+        let queued = QueuedPermission(
+            request: request,
+            receivedAt: receivedAt,
+            retainedBytes: retainedBytes
+        )
+        retainedPermissionBytes += retainedBytes
+        guard pendingPermission == nil else {
+            permissionQueue.append(queued)
+            schedulePermissionExpiry()
+            return
+        }
+        presentedPermission = queued
         pendingPermission = request
         onAttention?(.permission, request.title)
+        schedulePermissionExpiry()
     }
 
     private func presentNextPermission() {
+        expireStalePermissions(at: Date(), presentNext: false)
         guard pendingPermission == nil, !permissionQueue.isEmpty else { return }
         let next = permissionQueue.removeFirst()
-        pendingPermission = next
-        onAttention?(.permission, next.title)
+        presentedPermission = next
+        pendingPermission = next.request
+        onAttention?(.permission, next.request.title)
+        schedulePermissionExpiry()
+    }
+
+    private func removePresentedPermission() -> AcpPermissionRequest? {
+        guard let presentedPermission else { return nil }
+        self.presentedPermission = nil
+        pendingPermission = nil
+        retainedPermissionBytes = max(0, retainedPermissionBytes - presentedPermission.retainedBytes)
+        permissionExpiryTask?.cancel()
+        permissionExpiryTask = nil
+        return presentedPermission.request
+    }
+
+    private func expireStalePermissions(at now: Date, presentNext: Bool = true) {
+        var expired: [AcpPermissionRequest] = []
+        if presentedPermission?.isExpired(at: now) == true,
+           let request = removePresentedPermission() {
+            expired.append(request)
+        }
+
+        var retained: [QueuedPermission] = []
+        retained.reserveCapacity(permissionQueue.count)
+        for entry in permissionQueue {
+            if entry.isExpired(at: now) {
+                retainedPermissionBytes = max(0, retainedPermissionBytes - entry.retainedBytes)
+                expired.append(entry.request)
+            } else {
+                retained.append(entry)
+            }
+        }
+        permissionQueue = retained
+        if !expired.isEmpty {
+            denyAutomatically(expired, because: .expired)
+        }
+        if presentNext {
+            presentNextPermission()
+        } else {
+            schedulePermissionExpiry()
+        }
+    }
+
+    private func schedulePermissionExpiry() {
+        permissionExpiryTask?.cancel()
+        permissionExpiryTask = nil
+        let nextExpiry = ([presentedPermission].compactMap { $0 } + permissionQueue)
+            .map { $0.receivedAt.addingTimeInterval(Self.permissionPromptLifetime) }
+            .min()
+        guard let nextExpiry else { return }
+        let delay = max(0, nextExpiry.timeIntervalSinceNow)
+        permissionExpiryTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled, let self else { return }
+            self.expireStalePermissions(at: Date())
+        }
+    }
+
+    private func denyAutomatically(
+        _ requests: [AcpPermissionRequest],
+        because reason: AutomaticPermissionDenial
+    ) {
+        guard !requests.isEmpty else { return }
+        for request in requests {
+            appendPermissionDecision(for: request, reason: reason)
+        }
+        enqueueAutomaticPermissionResolutions(requests)
+    }
+
+    private func enqueueAutomaticPermissionResolutions(_ requests: [AcpPermissionRequest]) {
+        guard !requests.isEmpty else { return }
+        if activeAutomaticPermissionCancellationGeneration != nil {
+            automaticPermissionCancellationGeneration &+= 1
+            activeAutomaticPermissionCancellationGeneration = automaticPermissionCancellationGeneration
+            startAutomaticPermissionResolutionDrain()
+            return
+        }
+        guard requests.count <= Self.maximumPendingAutomaticPermissionResolutions
+                - automaticPermissionResolutions.count else {
+            escalateAutomaticPermissionCancellation()
+            return
+        }
+        automaticPermissionResolutions.append(contentsOf: requests.map {
+            AutomaticPermissionResolution(
+                requestID: $0.id,
+                denyOnceOptionID: $0.denyOnceOption?.id
+            )
+        })
+        startAutomaticPermissionResolutionDrain()
+    }
+
+    private func escalateAutomaticPermissionCancellation() {
+        automaticPermissionResolutions.removeAll(keepingCapacity: true)
+        automaticPermissionCancellationGeneration &+= 1
+        activeAutomaticPermissionCancellationGeneration = automaticPermissionCancellationGeneration
+
+        // Cancellation denies every adapter waiter, including the accepted
+        // visible/FIFO asks. Make those denials just as explicit as overflow.
+        let retainedRequests = ([presentedPermission].compactMap { $0 } + permissionQueue)
+            .map(\.request)
+        clearPermissionQueue()
+        for request in retainedRequests {
+            appendPermissionDecision(for: request, reason: .responderSaturated)
+        }
+        startAutomaticPermissionResolutionDrain()
+    }
+
+    private func startAutomaticPermissionResolutionDrain() {
+        guard automaticPermissionResolutionTask == nil else { return }
+        automaticPermissionResolutionTask = Task { @MainActor [weak self] in
+            await self?.drainAutomaticPermissionResolutions()
+        }
+    }
+
+    private func drainAutomaticPermissionResolutions() async {
+        defer {
+            automaticPermissionResolutionTask = nil
+            if !automaticPermissionResolutions.isEmpty
+                || activeAutomaticPermissionCancellationGeneration != nil {
+                startAutomaticPermissionResolutionDrain()
+            }
+        }
+        while !Task.isCancelled {
+            if let generation = activeAutomaticPermissionCancellationGeneration {
+                automaticPermissionResolutions.removeAll(keepingCapacity: true)
+                await client.cancel()
+                if activeAutomaticPermissionCancellationGeneration == generation {
+                    activeAutomaticPermissionCancellationGeneration = nil
+                }
+                continue
+            }
+            guard !automaticPermissionResolutions.isEmpty else { return }
+            let resolution = automaticPermissionResolutions.removeFirst()
+            if let optionID = resolution.denyOnceOptionID {
+                await client.resolvePermission(id: resolution.requestID, optionID: optionID)
+            } else {
+                await client.cancelPermission(id: resolution.requestID)
+            }
+        }
+    }
+
+    private func appendPermissionDecision(
+        for request: AcpPermissionRequest,
+        reason: AutomaticPermissionDenial
+    ) {
+        let title = String(request.title.prefix(160))
+        let explanation: String
+        switch reason {
+        case .countLimit:
+            explanation = "the \(Self.maximumOutstandingPermissionCount)-prompt limit was reached"
+        case .byteLimit:
+            explanation = "the 1 MiB retained-payload limit would be exceeded"
+        case .expired:
+            explanation = "it expired after 5 minutes"
+        case .responderSaturated:
+            explanation = "the bounded permission responder was saturated"
+        }
+        permissionDecisionCounter += 1
+        let event = AcpTranscriptRow.permissionDecision(
+            id: "\(permissionDecisionCounter)",
+            text: "Permission request \"\(title)\" was denied automatically because \(explanation)."
+        )
+        var updatedRows = rows
+        updatedRows.append(event)
+        let decisionIndices = updatedRows.indices.filter {
+            if case .permissionDecision = updatedRows[$0] { return true }
+            return false
+        }
+        let overflow = decisionIndices.count - Self.maximumRetainedPermissionDecisionRows
+        if overflow > 0 {
+            for index in decisionIndices.prefix(overflow).reversed() {
+                updatedRows.remove(at: index)
+            }
+        }
+        isApplyingEphemeralTimelineEvent = true
+        rows = updatedRows
+        isApplyingEphemeralTimelineEvent = false
+    }
+
+    private func clearPermissionQueue() {
+        permissionExpiryTask?.cancel()
+        permissionExpiryTask = nil
+        pendingPermission = nil
+        presentedPermission = nil
+        permissionQueue.removeAll(keepingCapacity: false)
+        retainedPermissionBytes = 0
+    }
+
+    private func clearAutomaticPermissionResolutions() {
+        automaticPermissionResolutionTask?.cancel()
+        automaticPermissionResolutions.removeAll(keepingCapacity: false)
+        activeAutomaticPermissionCancellationGeneration = nil
+    }
+
+    nonisolated static func retainedPermissionPayloadBytes(_ request: AcpPermissionRequest) -> Int {
+        var payload: [String: JSONValue] = [
+            "id": .integer(Int64(request.id)),
+            "sessionId": .string(request.sessionID),
+            "title": .string(request.title),
+            "kind": .string(request.kind),
+            "paths": .array(request.paths.map(JSONValue.string)),
+            "options": .array(request.options.map { option in
+                .object([
+                    "id": .string(option.id),
+                    "name": .string(option.name),
+                    "kind": .string(option.kind),
+                ])
+            }),
+        ]
+        if let rawInput = request.rawInput { payload["rawInput"] = rawInput }
+        return (try? JSONEncoder().encode(JSONValue.object(payload)).count) ?? Int.max
     }
 
     /// Answer only with the request's exact `allow_once` option. A matching
@@ -877,7 +1373,7 @@ final class AcpConversation: ObservableObject {
     private func answerAllowOnce(_ request: AcpPermissionRequest) -> Bool {
         guard let option = request.allowOnceOption else { return false }
         let wasPresented = pendingPermission?.id == request.id
-        if wasPresented { pendingPermission = nil }
+        if wasPresented { _ = removePresentedPermission() }
         Task { await client.resolvePermission(id: request.id, optionID: option.id) }
         if wasPresented { presentNextPermission() }
         return true
@@ -904,15 +1400,33 @@ final class AcpConversation: ObservableObject {
         (pendingPermission == nil ? 0 : 1) + permissionQueue.count
     }
 
+    var pendingPermissionRetainedBytes: Int { retainedPermissionBytes }
+    var pendingAutomaticPermissionResolutionCount: Int {
+        automaticPermissionResolutions.count
+    }
+    var retainedFailedSendPayloadCount: Int { failedSends.count }
+    var retainedFailedSendPayloadBytes: Int { failedSends.retainedBytes }
+
     /// Stop the adapter and every terminal host it owns. Returning the final
     /// debounced composer value lets the window owner durably save it before
     /// AppKit receives the quit reply.
     func stop() async -> String? {
+        invalidateConfigOptionRequest()
         draftPersistenceTask?.cancel()
         draftPersistenceTask = nil
         let finalDraft = pendingDraftPersistence
         pendingDraftPersistence = nil
+        // Release retained prompt/attachment snapshots immediately at the
+        // shared stop/delete boundary, before adapter shutdown can suspend.
+        failedSends.removeAll()
+        clearAutomaticPermissionResolutions()
+        let promptTask = activePromptTask
         await client.stop()
+        await promptTask?.value
+        // Stopping the client rejects an in-flight prompt. Its failure handler
+        // may briefly record retry data after the first clear, so clear again
+        // once that task is quiescent to make teardown the final owner.
+        failedSends.removeAll()
         flushPendingChunk()
         isConnected = false
         isRunning = false
@@ -921,8 +1435,7 @@ final class AcpConversation: ObservableObject {
         statusMessage = queued.isEmpty
             ? "The agent is stopped."
             : "The agent is stopped. \(queued.count) queued follow-up\(queued.count == 1 ? " is" : "s are") ready to resume."
-        pendingPermission = nil
-        permissionQueue.removeAll()
+        clearPermissionQueue()
         eventContinuation?.finish()
         eventContinuation = nil
         let consumer = eventConsumerTask
@@ -944,36 +1457,43 @@ final class AcpConversation: ObservableObject {
     /// Snapshots cover TRACKED files (git stash create semantics).
     private func recordCheckpoint(turn: Int) async {
         let workspace = cwd
-        let hash = await Task.detached(priority: .userInitiated) { () -> String? in
+        let ownerID = checkpointOwnerID
+        let incarnationID = checkpointIncarnationID
+        let checkpoint = await Task.detached(priority: .userInitiated) { () -> GitService.Checkpoint? in
             let service = GitService(repoRoot: URL(fileURLWithPath: workspace, isDirectory: true))
-            return try? service.checkpoint()
+            return try? service.checkpoint(
+                ownerID: ownerID,
+                incarnationID: incarnationID,
+                turn: turn
+            )
         }.value
-        guard let hash else { return }
-        checkpoints.append(TurnCheckpoint(id: hash, turn: turn, at: Date()))
+        guard let checkpoint else { return }
+        checkpoints.append(TurnCheckpoint(checkpoint: checkpoint, turn: turn, at: Date()))
         if checkpoints.count > 20 {
             let dropped = checkpoints.removeFirst()
-            dropCheckpointRef(dropped.id)
+            dropCheckpointRef(dropped.checkpoint)
         }
     }
 
     /// Release a checkpoint's keep-alive ref once it ages out of the menu.
-    private func dropCheckpointRef(_ hash: String) {
+    private func dropCheckpointRef(_ checkpoint: GitService.Checkpoint) {
         let workspace = cwd
         Task.detached(priority: .utility) {
             let service = GitService(repoRoot: URL(fileURLWithPath: workspace, isDirectory: true))
-            try? service.dropCheckpoint(hash)
+            try? service.dropCheckpoint(checkpoint)
         }
     }
 
     /// Restore a checkpoint's files over the current tree (user-confirmed in
     /// the header). Conflicts surface as a status message, never silently.
-    func restoreCheckpoint(_ id: String) {
+    func restoreCheckpoint(_ checkpoint: TurnCheckpoint) {
         let workspace = cwd
+        let snapshot = checkpoint.checkpoint
         Task.detached(priority: .userInitiated) { [weak self] in
             let service = GitService(repoRoot: URL(fileURLWithPath: workspace, isDirectory: true))
             let outcome: Result<Void, any Error>
             do {
-                try service.applyCheckpoint(id)
+                try service.applyCheckpoint(snapshot)
                 outcome = .success(())
             } catch {
                 outcome = .failure(error)
@@ -1115,8 +1635,17 @@ final class AcpConversation: ObservableObject {
     /// Test seam for the FIFO presentation policy. Wire parsing remains covered
     /// separately by `AcpClientTests`; this exercises the UI-facing queue without
     /// spawning an adapter.
-    func receivePermissionForTesting(_ request: AcpPermissionRequest) {
-        handlePermission(request)
+    func receivePermissionForTesting(
+        _ request: AcpPermissionRequest,
+        receivedAt: Date = Date()
+    ) {
+        handlePermission(request, receivedAt: receivedAt)
+    }
+
+    /// Test-only deterministic clock advance. Production expiry remains driven
+    /// by `schedulePermissionExpiry`; tests need not wait five wall-clock minutes.
+    func expirePermissionsForTesting(at now: Date) {
+        expireStalePermissions(at: now)
     }
 
     /// Test seam for transcript segmentation. The JSON-RPC decoder and event
@@ -1238,13 +1767,14 @@ final class AcpConversation: ObservableObject {
             // Leave the queue intact on error — auto-dispatching into a failing
             // agent would loop; the user can retry or clear it.
         case let .exited(code):
+            invalidateConfigOptionRequest()
             flushPendingChunk()
             isConnected = false
             isRunning = false
             supportsSteering = false
             injectingQueuedIDs.removeAll()
-            pendingPermission = nil
-            permissionQueue.removeAll()
+            clearPermissionQueue()
+            clearAutomaticPermissionResolutions()
             // Preserve queued user text for inspection/copying. The adapter is
             // gone so it cannot auto-dispatch, but silently deleting authored
             // follow-ups is worse than leaving them visible.

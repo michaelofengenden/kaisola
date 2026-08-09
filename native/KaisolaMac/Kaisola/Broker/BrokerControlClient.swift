@@ -690,12 +690,42 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         }
         switch type {
         case "hello":
+            guard let info = connectInFlight?.info else { throw BrokerClientError.notConnected }
             guard object["ok"]?.boolValue == true else { throw BrokerClientError.authenticationRejected }
-            guard object["protocol"]?.intValue == Int64(BrokerWire.protocolVersion) else {
+            guard object["protocol"]?.intValue == Int64(info.protocolVersion) else {
                 throw BrokerClientError.protocolMismatch
             }
-            guard object["securityEpoch"]?.intValue == Int64(BrokerWire.securityEpoch) else {
+            guard object["securityEpoch"]?.intValue == Int64(info.securityEpoch) else {
                 throw BrokerClientError.securityEpochMismatch
+            }
+            let advertisedImplementation = object["implementationVersion"]?.intValue
+                .flatMap(Int.init(exactly:))
+            guard BrokerWire.accepts(
+                protocolVersion: info.protocolVersion,
+                securityEpoch: info.securityEpoch,
+                implementationVersion: advertisedImplementation
+            ) else {
+                throw BrokerClientError.implementationMismatch
+            }
+            let implementationVersion = advertisedImplementation ?? 1
+            let packageSchema = object["packageSchema"]?.intValue.flatMap(Int.init(exactly:))
+            let packageVersion = object["packageVersion"]?.stringValue
+            let contentDigest = object["contentDigest"]?.stringValue
+            if let contentDigest,
+               !BrokerHelperPackageVerification.isLowercaseSHA256(contentDigest) {
+                throw BrokerClientError.identityChanged
+            }
+            // The socket path selected the peer and the token authenticated it;
+            // every non-secret immutable field echoed by hello must still bind
+            // that endpoint to the exact BrokerInfo reviewed before connect.
+            guard object["pid"]?.intValue == Int64(info.pid),
+                  object["startedAt"]?.intValue == info.startedAt,
+                  object["version"]?.stringValue == info.version,
+                  info.implementationVersion == nil || info.implementationVersion == implementationVersion,
+                  info.packageSchema == nil || info.packageSchema == packageSchema,
+                  info.packageVersion == nil || info.packageVersion == packageVersion,
+                  info.contentDigest == nil || info.contentDigest == contentDigest else {
+                throw BrokerClientError.identityChanged
             }
             // Control requires a broker modern enough to advertise observation:
             // the same generation that enforces roles server-side. Older live

@@ -5,10 +5,118 @@ import KaisolaCore
 import XCTest
 @testable import Kaisola
 
+private let primaryControlBrokerInfo = BrokerInfo(
+    protocolVersion: BrokerWire.protocolVersion,
+    securityEpoch: BrokerWire.securityEpoch,
+    implementationVersion: BrokerWire.implementationVersion,
+    packageSchema: BrokerWire.helperPackageSchema,
+    packageVersion: "test-package",
+    contentDigest: String(repeating: "c", count: 64),
+    pid: 12_345,
+    socketPath: "/tmp/kaisola-controller-test.sock",
+    token: String(repeating: "a", count: 64),
+    startedAt: 1_784_250_001_000,
+    version: "test"
+)
+
+private let replacementControlBrokerInfo = BrokerInfo(
+    protocolVersion: BrokerWire.protocolVersion,
+    securityEpoch: BrokerWire.securityEpoch,
+    implementationVersion: BrokerWire.implementationVersion,
+    packageSchema: BrokerWire.helperPackageSchema,
+    packageVersion: "test-package",
+    contentDigest: String(repeating: "c", count: 64),
+    pid: 12_346,
+    socketPath: "/tmp/kaisola-controller-test-next.sock",
+    token: String(repeating: "b", count: 64),
+    startedAt: 1_784_250_009_000,
+    version: "test"
+)
+
+private let otherControlBrokerInfoFixture = BrokerInfo(
+    protocolVersion: BrokerWire.protocolVersion,
+    securityEpoch: BrokerWire.securityEpoch,
+    implementationVersion: BrokerWire.implementationVersion,
+    packageSchema: BrokerWire.helperPackageSchema,
+    packageVersion: "test-package",
+    contentDigest: String(repeating: "c", count: 64),
+    pid: 12_346,
+    socketPath: "/tmp/kaisola-controller-test-other.sock",
+    token: String(repeating: "b", count: 64),
+    startedAt: 1_784_250_002_000,
+    version: "test"
+)
+
+private func controlBrokerInfoFixture(for socketPath: String) -> BrokerInfo {
+    switch socketPath {
+    case replacementControlBrokerInfo.socketPath: replacementControlBrokerInfo
+    case otherControlBrokerInfoFixture.socketPath: otherControlBrokerInfoFixture
+    default: primaryControlBrokerInfo
+    }
+}
+
+private func controlHello(
+    for info: BrokerInfo,
+    replacing field: String? = nil,
+    with value: JSONValue? = nil
+) -> JSONValue {
+    var object: [String: JSONValue] = [
+        "type": .string("hello"),
+        "ok": .bool(true),
+        "protocol": .integer(Int64(info.protocolVersion)),
+        "securityEpoch": .integer(Int64(info.securityEpoch)),
+        "implementationVersion": .integer(Int64(info.implementationVersion ?? 1)),
+        "packageSchema": info.packageSchema.map { .integer(Int64($0)) } ?? .null,
+        "packageVersion": info.packageVersion.map(JSONValue.string) ?? .null,
+        "contentDigest": info.contentDigest.map(JSONValue.string) ?? .null,
+        "pid": .integer(Int64(info.pid)),
+        "startedAt": .integer(info.startedAt),
+        "version": .string(info.version),
+        "features": .array([.string(BrokerWire.terminalObserveFeature)]),
+    ]
+    if let field, let value { object[field] = value }
+    return .object(object)
+}
+
 /// The controller lane's contract: its sealed method set is exactly the
 /// mutations the native app needs, every request carries the owner identity,
 /// and the connection refuses brokers that predate role enforcement.
 final class BrokerControlClientTests: XCTestCase {
+    func testHandshakeRejectsEveryImmutableBrokerIdentityMismatch() async throws {
+        let mismatches: [(field: String, value: JSONValue, error: BrokerClientError)] = [
+            ("protocol", .integer(Int64(BrokerWire.protocolVersion + 1)), .protocolMismatch),
+            ("securityEpoch", .integer(Int64(BrokerWire.securityEpoch + 1)), .securityEpochMismatch),
+            ("implementationVersion", .integer(1), .identityChanged),
+            ("packageSchema", .integer(Int64(BrokerWire.helperPackageSchema + 1)), .identityChanged),
+            ("packageVersion", .string("substituted-package"), .identityChanged),
+            ("contentDigest", .string(String(repeating: "d", count: 64)), .identityChanged),
+            ("pid", .integer(Int64(primaryControlBrokerInfo.pid + 1)), .identityChanged),
+            ("startedAt", .integer(primaryControlBrokerInfo.startedAt + 1), .identityChanged),
+            ("version", .string("substituted-version"), .identityChanged),
+        ]
+
+        for mismatch in mismatches {
+            let transport = IdentityControlBrokerTransport(
+                hello: controlHello(
+                    for: primaryControlBrokerInfo,
+                    replacing: mismatch.field,
+                    with: mismatch.value
+                )
+            )
+            let client = BrokerControlClient(
+                transport: transport,
+                operationTimeoutNanoseconds: 100_000_000
+            )
+            do {
+                try await client.connect(to: primaryControlBrokerInfo, ownerID: "native-test")
+                XCTFail("A mismatched \(mismatch.field) must not authenticate the controller lane.")
+            } catch {
+                XCTAssertEqual(error as? BrokerClientError, mismatch.error, mismatch.field)
+            }
+            await client.disconnect()
+        }
+    }
+
     func testOversizedWriteIsRejectedBeforeTransportSend() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
         let client = BrokerControlClient(
@@ -378,15 +486,7 @@ final class BrokerControlClientTests: XCTestCase {
     }
 
     private var otherControlBrokerInfo: BrokerInfo {
-        BrokerInfo(
-            protocolVersion: BrokerWire.protocolVersion,
-            securityEpoch: BrokerWire.securityEpoch,
-            pid: 12_346,
-            socketPath: "/tmp/kaisola-controller-test-other.sock",
-            token: String(repeating: "b", count: 64),
-            startedAt: 1_784_250_002_000,
-            version: "test"
-        )
+        otherControlBrokerInfoFixture
     }
 
     func testUnixTransportShutdownWakesBlockedReceive() async throws {
@@ -490,28 +590,12 @@ final class BrokerControlClientTests: XCTestCase {
     }
 
     private var controlBrokerInfo: BrokerInfo {
-        BrokerInfo(
-            protocolVersion: BrokerWire.protocolVersion,
-            securityEpoch: BrokerWire.securityEpoch,
-            pid: 12_345,
-            socketPath: "/tmp/kaisola-controller-test.sock",
-            token: String(repeating: "a", count: 64),
-            startedAt: 1_784_250_001_000,
-            version: "test"
-        )
+        primaryControlBrokerInfo
     }
 
     /// A broker that replaced the one above: new process, new socket, new token.
     private var replacementBrokerInfo: BrokerInfo {
-        BrokerInfo(
-            protocolVersion: BrokerWire.protocolVersion,
-            securityEpoch: BrokerWire.securityEpoch,
-            pid: 12_346,
-            socketPath: "/tmp/kaisola-controller-test-next.sock",
-            token: String(repeating: "b", count: 64),
-            startedAt: 1_784_250_009_000,
-            version: "test"
-        )
+        replacementControlBrokerInfo
     }
 
     func testControlMethodSetIsExactlyTheNativeMutationSurface() {
@@ -952,13 +1036,7 @@ private actor GatedControlBrokerTransport: BrokerByteTransport {
         let frame = try JSONDecoder().decode(JSONValue.self, from: data[..<newline])
         frames.append(frame)
         guard frame.objectValue?["type"]?.stringValue == "hello" else { return }
-        var reply = try JSONEncoder().encode(JSONValue.object([
-            "type": .string("hello"),
-            "ok": .bool(true),
-            "protocol": .integer(Int64(BrokerWire.protocolVersion)),
-            "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
-            "features": .array([.string(BrokerWire.terminalObserveFeature)]),
-        ]))
+        var reply = try JSONEncoder().encode(controlHello(for: primaryControlBrokerInfo))
         reply.append(0x0A)
         deliver(reply)
     }
@@ -1006,6 +1084,7 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []
     private var waiter: CheckedContinuation<Data?, Never>?
+    private var connectedInfo = primaryControlBrokerInfo
 
     init(
         resizeAccepted: Bool,
@@ -1017,7 +1096,9 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
         self.failFirstRequestSend = failFirstRequestSend
     }
 
-    func connect(path: String) async throws {}
+    func connect(path: String) async throws {
+        connectedInfo = controlBrokerInfoFixture(for: path)
+    }
 
     func send(_ data: Data) async throws {
         guard let newline = data.firstIndex(of: 0x0A) else {
@@ -1028,13 +1109,7 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
         guard let object = frame.objectValue,
               let type = object["type"]?.stringValue else { return }
         if type == "hello" {
-            deliver(try encoded(.object([
-                "type": .string("hello"),
-                "ok": .bool(true),
-                "protocol": .integer(Int64(BrokerWire.protocolVersion)),
-                "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
-                "features": .array([.string(BrokerWire.terminalObserveFeature)]),
-            ])))
+            deliver(try encoded(controlHello(for: connectedInfo)))
             return
         }
         if failFirstRequestSend {
@@ -1113,13 +1188,7 @@ private actor ScriptedControlResultBrokerTransport: BrokerByteTransport {
         guard let object = frame.objectValue,
               let type = object["type"]?.stringValue else { return }
         if type == "hello" {
-            deliver(try encoded(.object([
-                "type": .string("hello"),
-                "ok": .bool(true),
-                "protocol": .integer(Int64(BrokerWire.protocolVersion)),
-                "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
-                "features": .array([.string(BrokerWire.terminalObserveFeature)]),
-            ])))
+            deliver(try encoded(controlHello(for: primaryControlBrokerInfo)))
             return
         }
         guard type == "request", let id = object["id"]?.stringValue else { return }
@@ -1146,6 +1215,47 @@ private actor ScriptedControlResultBrokerTransport: BrokerByteTransport {
         var data = try JSONEncoder().encode(frame)
         data.append(0x0A)
         return data
+    }
+
+    private func deliver(_ data: Data?) {
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            incoming.append(data)
+        }
+    }
+}
+
+private actor IdentityControlBrokerTransport: BrokerByteTransport {
+    private let hello: JSONValue
+    private var incoming: [Data?] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+
+    init(hello: JSONValue) {
+        self.hello = hello
+    }
+
+    func connect(path: String) async throws {}
+
+    func send(_ data: Data) async throws {
+        guard let newline = data.firstIndex(of: 0x0A) else {
+            throw BrokerClientError.malformedResponse
+        }
+        let frame = try JSONDecoder().decode(JSONValue.self, from: data[..<newline])
+        guard frame.objectValue?["type"]?.stringValue == "hello" else { return }
+        var reply = try JSONEncoder().encode(hello)
+        reply.append(0x0A)
+        deliver(reply)
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !incoming.isEmpty { return incoming.removeFirst() }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func close() async {
+        deliver(nil)
     }
 
     private func deliver(_ data: Data?) {

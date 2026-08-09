@@ -812,16 +812,39 @@ function waitForExit(id) {
   return new Promise((resolve) => r.waiters.push(resolve))
 }
 
-function kill(id) {
-  const r = terms.get(id)
-  if (r) {
-    try {
-      if (r.pty) r.pty.kill()
-    } catch {
-      /* noop */
+function killRecord(record) {
+  if (!record) {
+    return {
+      ok: false,
+      code: 'terminal_not_found',
+      message: 'terminal is no longer available',
     }
   }
-  return !!r
+  // Killing is idempotent once node-pty has already delivered its exit event.
+  // Cold history records also have no pty, but always carry exited=true.
+  if (record.exited) return { ok: true, alreadyExited: true }
+  if (!record.pty) {
+    return {
+      ok: false,
+      code: 'terminal_kill_unavailable',
+      message: 'terminal signal unavailable',
+    }
+  }
+  try {
+    if (record.pty.kill() === false) {
+      return { ok: false, code: 'terminal_kill_failed', message: 'terminal signal failed' }
+    }
+  } catch {
+    // Never reflect a native/backend diagnostic across the authenticated wire:
+    // it can contain process or filesystem details. The fixed code remains
+    // actionable while the unchanged record proves the terminal is still live.
+    return { ok: false, code: 'terminal_kill_failed', message: 'terminal signal failed' }
+  }
+  return { ok: true }
+}
+
+function kill(id) {
+  return killRecord(terms.get(id))
 }
 
 function release(id) {

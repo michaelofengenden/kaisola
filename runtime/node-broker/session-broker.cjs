@@ -12,7 +12,7 @@ const net = require('node:net')
 const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
-const { terminalCreateRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
+const { terminalCreateRoute, terminalKillRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
@@ -503,8 +503,7 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.kill': {
       const id = terminalId()
-      requireAllowed(id)
-      return { ok: mgr.kill(id) }
+      return terminalKillRoute({ manager: mgr, id, requireAllowed })
     }
     case 'terminal.release': {
       const id = terminalId()

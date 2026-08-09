@@ -236,6 +236,13 @@ function terminalResizeRoute({ manager, id, params = {}, requireAllowed }) {
   return manager.resize(id, geometry.value.cols, geometry.value.rows)
 }
 
+/** Preserve the manager's typed kill result exactly. Wrapping it in another
+ * `ok` property would turn `{ ok: false }` into a truthy wire success. */
+function terminalKillRoute({ manager, id, requireAllowed }) {
+  requireAllowed(id)
+  return manager.kill(id)
+}
+
 /** The authenticated `terminal.create` operation after access selection. Kept
  * separate from the executable broker so the additive resurrection wire can
  * be contract-tested without binding its AF_UNIX listener. */
@@ -318,6 +325,7 @@ function terminalCreateRoute({
 
 module.exports = {
   terminalCreateRoute,
+  terminalKillRoute,
   terminalResizeRoute,
   validatedTerminalGeometry,
   TERMINAL_CREATE_LIMITS,

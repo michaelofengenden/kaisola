@@ -30,6 +30,14 @@ const DEFAULT_SNAPSHOT_CAP = intEnv('KAISOLA_TERMINAL_SNAPSHOT_KB', 4096, 256, 1
 const DEFAULT_QUEUE_CAP = intEnv('KAISOLA_TERMINAL_SPOOL_BATCH_KB', 256, 32, 1024) * 1024
 const DEFAULT_COLD_TAIL_CAP = 512 * 1024
 const SPOOL_APPEND_DEBOUNCE_MS = 750
+// Meta is what a restart resurrects a terminal from — exit evidence, cursor
+// epoch, DEC modes, view state — so a failed write cannot be dropped the way a
+// missed cache write can: the next launch would resurrect a still-running
+// terminal from stale state. A failure keeps the spool dirty and retries on a
+// bounded backoff, and the last error stays readable through stats().
+const META_RETRY_BASE_MS = 250
+const META_RETRY_MAX_MS = 8000
+const META_RETRY_ATTEMPTS = 6
 
 function safeBase(id) {
   return crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, 32)
@@ -181,6 +189,10 @@ class TerminalSpool {
     this.fallbackChunks = []
     this.fallbackLen = 0
     this.diskError = null
+    this.metaError = null
+    this.metaDirty = false
+    this.metaRetryTimer = null
+    this.metaRetries = 0
     this.decModes = new Map()
     this.decCarry = ''
     const meta = TerminalSpool.readMeta(this.id, dir)
@@ -370,7 +382,19 @@ class TerminalSpool {
     }
   }
 
+  /** Persist the resurrection metadata now. Every explicit caller (visibility,
+   * exit, epoch, close) is writing newer state, so each one restarts the retry
+   * budget rather than inheriting an exhausted one. */
   persistMeta() {
+    this.metaRetries = 0
+    this._clearMetaRetry()
+    return this._writeMeta()
+  }
+
+  _writeMeta() {
+    // A closed spool has nothing left to resurrect, and close({remove}) already
+    // deleted the meta file: a late retry must not recreate it.
+    if (this.closed) return false
     const exitEvidence = this.exitEvidence()
     try {
       atomicJson(this.metaFile, {
@@ -382,7 +406,39 @@ class TerminalSpool {
         ...(exitEvidence || {}),
         touchedAt: Date.now(),
       })
-    } catch { /* cache failure is non-fatal */ }
+      this.metaDirty = false
+      this.metaError = null
+      this.metaRetries = 0
+      return true
+    } catch (err) {
+      // Never fatal to the live shell, but never silent either: the state stays
+      // dirty, the error stays readable, and the write is retried.
+      this.metaDirty = true
+      this.metaError = String((err && err.code) || (err && err.message) || err || 'meta-write-failed')
+      this._scheduleMetaRetry()
+      return false
+    }
+  }
+
+  _scheduleMetaRetry() {
+    if (this.metaRetryTimer || this.closed) return
+    // Budget exhausted: stop spinning on a disk that is not coming back. The
+    // spool stays dirty and the error stays visible until the next explicit
+    // persistMeta, which is also the next state actually worth writing.
+    if (this.metaRetries >= META_RETRY_ATTEMPTS) return
+    const delay = Math.min(META_RETRY_MAX_MS, META_RETRY_BASE_MS * (2 ** this.metaRetries))
+    this.metaRetries += 1
+    this.metaRetryTimer = setTimeout(() => {
+      this.metaRetryTimer = null
+      this._writeMeta()
+    }, delay)
+    this.metaRetryTimer.unref?.()
+  }
+
+  _clearMetaRetry() {
+    if (!this.metaRetryTimer) return
+    clearTimeout(this.metaRetryTimer)
+    this.metaRetryTimer = null
   }
 
   markExited(status) {
@@ -494,7 +550,7 @@ class TerminalSpool {
     for (const file of [this.prevFile, this.file]) {
       try { diskBytes += fs.statSync(file).size } catch { /* absent */ }
     }
-    return { id: this.id, visible: this.visible, ramBytes: this.chunksLen + this.queuedLen + this.fallbackLen, diskBytes, diskError: this.diskError, viewState: this.viewState }
+    return { id: this.id, visible: this.visible, ramBytes: this.chunksLen + this.queuedLen + this.fallbackLen, diskBytes, diskError: this.diskError, metaError: this.metaError, metaDirty: this.metaDirty, viewState: this.viewState }
   }
 
   close({ remove = false } = {}) {
@@ -510,6 +566,7 @@ class TerminalSpool {
       clearTimeout(this.appendTimer)
       this.appendTimer = null
     }
+    this._clearMetaRetry()
     if (!remove) return
     try { fs.unlinkSync(this.file) } catch { /* absent */ }
     try { fs.unlinkSync(this.prevFile) } catch { /* absent */ }
@@ -525,6 +582,9 @@ module.exports = {
   DEFAULT_QUEUE_CAP,
   DEFAULT_COLD_TAIL_CAP,
   SPOOL_APPEND_DEBOUNCE_MS,
+  META_RETRY_BASE_MS,
+  META_RETRY_MAX_MS,
+  META_RETRY_ATTEMPTS,
   readTail,
   utf8Tail,
   readRange,

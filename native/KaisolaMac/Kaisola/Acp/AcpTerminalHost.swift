@@ -16,6 +16,18 @@ actor AcpTerminalHost {
         let truncated: Bool
         let exitStatus: ExitStatus?
         let outputBufferStats: OutputBufferStats
+
+        init(
+            output: String,
+            truncated: Bool,
+            exitStatus: ExitStatus?,
+            outputBufferStats: OutputBufferStats = .empty
+        ) {
+            self.output = output
+            self.truncated = truncated
+            self.exitStatus = exitStatus
+            self.outputBufferStats = outputBufferStats
+        }
     }
 
     /// Diagnostics for the pipe-to-actor backlog. Each queued element is no
@@ -28,6 +40,15 @@ actor AcpTerminalHost {
         let peakBufferedChunks: Int
         let droppedChunks: UInt64
         let droppedBytes: UInt64
+
+        static let empty = OutputBufferStats(
+            chunkByteLimit: AcpTerminalHost.outputStreamChunkByteLimit,
+            bufferedChunkLimit: AcpTerminalHost.outputStreamBufferedChunkLimit,
+            bufferedByteCeiling: AcpTerminalHost.outputStreamBufferedByteCeiling,
+            peakBufferedChunks: 0,
+            droppedChunks: 0,
+            droppedBytes: 0
+        )
     }
 
     static let defaultOutputByteLimit = 1_048_576
@@ -53,6 +74,181 @@ actor AcpTerminalHost {
     struct OutputBufferState: Sendable {
         let stats: OutputBufferStats
         let latestDroppedSequence: UInt64?
+    }
+
+    struct OutputTailMetrics: Equatable, Sendable {
+        let appendedBytes: UInt64
+        let discardedBytes: UInt64
+        let retainedBytes: Int
+        let storedSegmentBytes: Int
+        let peakRetainedBytes: Int
+        let peakStoredSegmentBytes: Int
+        let enqueuedSegments: UInt64
+        let dequeuedSegments: UInt64
+        let partialHeadAdvances: UInt64
+        let bytesMovedWhileTrimming: UInt64
+    }
+
+    /// A byte-bounded deque whose front trim only releases whole segments or
+    /// advances an offset into the first segment. Appending sustained output
+    /// therefore never shifts the retained tail as `Data.removeFirst` does.
+    struct SegmentedOutputTail {
+        private let byteLimit: Int
+        private var segments: [Data?] = Array(repeating: nil, count: 16)
+        private var headIndex = 0
+        private var segmentCount = 0
+        private var headOffset = 0
+        private var retainedBytes = 0
+        private var storedSegmentBytes = 0
+        private var peakRetainedBytes = 0
+        private var peakStoredSegmentBytes = 0
+        private var appendedBytes: UInt64 = 0
+        private var discardedBytes: UInt64 = 0
+        private var enqueuedSegments: UInt64 = 0
+        private var dequeuedSegments: UInt64 = 0
+        private var partialHeadAdvances: UInt64 = 0
+        private(set) var truncated = false
+
+        init(byteLimit: Int) {
+            precondition(byteLimit > 0)
+            self.byteLimit = byteLimit
+        }
+
+        var isEmpty: Bool { retainedBytes == 0 }
+
+        var metrics: OutputTailMetrics {
+            OutputTailMetrics(
+                appendedBytes: appendedBytes,
+                discardedBytes: discardedBytes,
+                retainedBytes: retainedBytes,
+                storedSegmentBytes: storedSegmentBytes,
+                peakRetainedBytes: peakRetainedBytes,
+                peakStoredSegmentBytes: peakStoredSegmentBytes,
+                enqueuedSegments: enqueuedSegments,
+                dequeuedSegments: dequeuedSegments,
+                partialHeadAdvances: partialHeadAdvances,
+                bytesMovedWhileTrimming: 0
+            )
+        }
+
+        mutating func append(_ data: Data) {
+            guard !data.isEmpty else { return }
+            appendedBytes = Self.saturatingAdd(appendedBytes, UInt64(data.count))
+
+            var payload = data
+            if isEmpty, truncated {
+                // A stream overflow may split a scalar between fixed-size
+                // chunks. Start the new contiguous suffix at a UTF-8 boundary.
+                var start = data.startIndex
+                while start < data.endIndex, data[start] & 0xC0 == 0x80 {
+                    start += 1
+                }
+                let skipped = data.distance(from: data.startIndex, to: start)
+                if skipped > 0 {
+                    discardedBytes = Self.saturatingAdd(discardedBytes, UInt64(skipped))
+                    payload = Data(data[start..<data.endIndex])
+                }
+            }
+
+            if !payload.isEmpty {
+                enqueue(payload)
+                retainedBytes += payload.count
+            }
+
+            if retainedBytes > byteLimit {
+                discardFirst(retainedBytes - byteLimit)
+                // Keep the retained tail on a clean UTF-8 boundary.
+                while let byte = firstByte, byte & 0xC0 == 0x80 {
+                    discardFirst(1)
+                }
+                truncated = true
+            }
+
+            peakRetainedBytes = max(peakRetainedBytes, retainedBytes)
+            peakStoredSegmentBytes = max(peakStoredSegmentBytes, storedSegmentBytes)
+        }
+
+        /// Clears bytes before an AsyncStream overflow gap. The next append
+        /// will re-establish a clean UTF-8 start for the new contiguous suffix.
+        mutating func discardForDiscontinuity() {
+            discardedBytes = Self.saturatingAdd(discardedBytes, UInt64(retainedBytes))
+            while segmentCount > 0 { dequeueFirstSegment() }
+            retainedBytes = 0
+            headOffset = 0
+            truncated = true
+        }
+
+        func materialized() -> Data {
+            guard retainedBytes > 0 else { return Data() }
+            var result = Data()
+            result.reserveCapacity(retainedBytes)
+            for offset in 0..<segmentCount {
+                let index = (headIndex + offset) % segments.count
+                guard let segment = segments[index] else { continue }
+                let startOffset = offset == 0 ? headOffset : 0
+                let start = segment.index(segment.startIndex, offsetBy: startOffset)
+                result.append(contentsOf: segment[start..<segment.endIndex])
+            }
+            return result
+        }
+
+        private var firstByte: UInt8? {
+            guard segmentCount > 0, let segment = segments[headIndex] else { return nil }
+            return segment[segment.index(segment.startIndex, offsetBy: headOffset)]
+        }
+
+        private mutating func enqueue(_ data: Data) {
+            if segmentCount == segments.count { grow() }
+            let index = (headIndex + segmentCount) % segments.count
+            segments[index] = data
+            segmentCount += 1
+            storedSegmentBytes += data.count
+            enqueuedSegments = Self.saturatingAdd(enqueuedSegments, 1)
+        }
+
+        private mutating func discardFirst(_ requestedCount: Int) {
+            var remaining = requestedCount
+            while remaining > 0, segmentCount > 0 {
+                guard let segment = segments[headIndex] else { break }
+                let available = segment.count - headOffset
+                let discarded = min(remaining, available)
+                remaining -= discarded
+                retainedBytes -= discarded
+                discardedBytes = Self.saturatingAdd(discardedBytes, UInt64(discarded))
+
+                if discarded == available {
+                    dequeueFirstSegment()
+                } else {
+                    headOffset += discarded
+                    partialHeadAdvances = Self.saturatingAdd(partialHeadAdvances, 1)
+                }
+            }
+        }
+
+        private mutating func dequeueFirstSegment() {
+            guard segmentCount > 0, let segment = segments[headIndex] else { return }
+            storedSegmentBytes -= segment.count
+            segments[headIndex] = nil
+            headIndex = (headIndex + 1) % segments.count
+            segmentCount -= 1
+            headOffset = 0
+            dequeuedSegments = Self.saturatingAdd(dequeuedSegments, 1)
+            if segmentCount == 0 { headIndex = 0 }
+        }
+
+        private mutating func grow() {
+            var expanded: [Data?] = Array(repeating: nil, count: segments.count * 2)
+            for offset in 0..<segmentCount {
+                expanded[offset] = segments[(headIndex + offset) % segments.count]
+            }
+            segments = expanded
+            headIndex = 0
+        }
+
+        private static func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+            let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? .max : sum
+        }
     }
 
     /// Owns the continuation and synchronously accounts for every overflow.
@@ -129,9 +325,7 @@ actor AcpTerminalHost {
 
     private final class Entry {
         let process: Process
-        var buffer = Data()
-        var truncated = false
-        var byteLimit: Int
+        var buffer: SegmentedOutputTail
         var exitStatus: ExitStatus?
         /// Exit reported by the termination handler, held until the pipe drains
         /// so `wait_for_exit` can never resolve ahead of the final output.
@@ -146,7 +340,7 @@ actor AcpTerminalHost {
 
         init(process: Process, byteLimit: Int, outputStreamBuffer: OutputStreamBuffer) {
             self.process = process
-            self.byteLimit = byteLimit
+            self.buffer = SegmentedOutputTail(byteLimit: byteLimit)
             self.outputStreamBuffer = outputStreamBuffer
         }
     }
@@ -238,8 +432,8 @@ actor AcpTerminalHost {
         guard let entry = entries[id] else { return nil }
         let bufferState = reconcileStreamOverflow(entry)
         return Snapshot(
-            output: String(decoding: entry.buffer, as: UTF8.self),
-            truncated: entry.truncated,
+            output: String(decoding: entry.buffer.materialized(), as: UTF8.self),
+            truncated: entry.buffer.truncated,
             exitStatus: entry.exitStatus,
             outputBufferStats: bufferState.stats
         )
@@ -285,29 +479,7 @@ actor AcpTerminalHost {
         _ = reconcileStreamOverflow(entry)
         guard chunk.sequence >= entry.minimumRetainedSequence else { return }
 
-        let data = chunk.data
-        if entry.buffer.isEmpty, entry.truncated {
-            // Stream overflow can split a scalar between fixed-size chunks.
-            // Skip continuation bytes so the retained suffix still starts on
-            // the same clean UTF-8 boundary as byte-limit truncation.
-            var start = data.startIndex
-            while start < data.endIndex, data[start] & 0xC0 == 0x80 {
-                start += 1
-            }
-            entry.buffer.append(contentsOf: data[start...])
-        } else {
-            entry.buffer.append(data)
-        }
-        if entry.buffer.count > entry.byteLimit {
-            // Keep the tail on a UTF-8 boundary so decoding stays clean.
-            var dropCount = entry.buffer.count - entry.byteLimit
-            while dropCount < entry.buffer.count,
-                  entry.buffer[entry.buffer.startIndex + dropCount] & 0xC0 == 0x80 {
-                dropCount += 1
-            }
-            entry.buffer.removeFirst(dropCount)
-            entry.truncated = true
-        }
+        entry.buffer.append(chunk.data)
     }
 
     /// Applies stream drops before exposing or appending output. Clearing the
@@ -319,8 +491,7 @@ actor AcpTerminalHost {
               latestDropped >= entry.minimumRetainedSequence else {
             return state
         }
-        entry.buffer.removeAll(keepingCapacity: true)
-        entry.truncated = true
+        entry.buffer.discardForDiscontinuity()
         entry.minimumRetainedSequence = latestDropped == .max ? .max : latestDropped + 1
         return state
     }

@@ -6,6 +6,82 @@ import XCTest
 /// semantics the ACP terminal bridge exposes to agents.
 final class AcpTerminalHostTests: XCTestCase {
 
+    func testSnapshotFixtureDefaultsToAnEmptyBacklogState() {
+        let snapshot = AcpTerminalHost.Snapshot(
+            output: "fixture",
+            truncated: false,
+            exitStatus: nil
+        )
+
+        XCTAssertEqual(snapshot.outputBufferStats, .empty)
+    }
+
+    func testSegmentedOutputTailSustainsMaximumCaptureWithoutMovingRetainedBytes() {
+        let chunkByteCount = AcpTerminalHost.outputStreamChunkByteLimit
+        let retainedChunkCount = AcpTerminalHost.maxOutputByteLimit / chunkByteCount
+        let totalChunkCount = retainedChunkCount * 16
+        var tail = AcpTerminalHost.SegmentedOutputTail(
+            byteLimit: AcpTerminalHost.maxOutputByteLimit
+        )
+
+        // Exercise 128 MiB of sustained output while the retained tail remains
+        // pinned at the maximum 8 MiB. The deterministic movement counters are
+        // the primary complexity contract; this generous wall limit catches a
+        // regression to repeated multi-megabyte front shifts without acting as
+        // a microbenchmark.
+        let clock = ContinuousClock()
+        let start = clock.now
+        for sequence in 0..<totalChunkCount {
+            let byte = UInt8(sequence % 95 + 32)
+            tail.append(Data(repeating: byte, count: chunkByteCount))
+        }
+        let elapsed = start.duration(to: clock.now)
+
+        let metrics = tail.metrics
+        XCTAssertEqual(metrics.appendedBytes, UInt64(totalChunkCount * chunkByteCount))
+        XCTAssertEqual(
+            metrics.discardedBytes,
+            UInt64((totalChunkCount - retainedChunkCount) * chunkByteCount)
+        )
+        XCTAssertEqual(metrics.retainedBytes, AcpTerminalHost.maxOutputByteLimit)
+        XCTAssertEqual(metrics.storedSegmentBytes, AcpTerminalHost.maxOutputByteLimit)
+        XCTAssertLessThanOrEqual(metrics.peakRetainedBytes, AcpTerminalHost.maxOutputByteLimit)
+        XCTAssertLessThanOrEqual(
+            metrics.peakStoredSegmentBytes,
+            AcpTerminalHost.maxOutputByteLimit + chunkByteCount
+        )
+        XCTAssertEqual(metrics.enqueuedSegments, UInt64(totalChunkCount))
+        XCTAssertEqual(metrics.dequeuedSegments, UInt64(totalChunkCount - retainedChunkCount))
+        XCTAssertEqual(metrics.partialHeadAdvances, 0)
+        XCTAssertEqual(metrics.bytesMovedWhileTrimming, 0)
+        XCTAssertLessThan(elapsed, .seconds(15), "sustained bounded capture took \(elapsed)")
+
+        var expected = Data()
+        expected.reserveCapacity(AcpTerminalHost.maxOutputByteLimit)
+        for sequence in (totalChunkCount - retainedChunkCount)..<totalChunkCount {
+            let byte = UInt8(sequence % 95 + 32)
+            expected.append(
+                Data(repeating: byte, count: chunkByteCount)
+            )
+        }
+        XCTAssertEqual(tail.materialized(), expected)
+        XCTAssertTrue(tail.truncated)
+    }
+
+    func testSegmentedOutputTailPreservesContiguousUTF8SuffixAcrossSegmentsAndGaps() {
+        var tail = AcpTerminalHost.SegmentedOutputTail(byteLimit: 5)
+        tail.append(Data([0x78, 0x78, 0xF0, 0x9F]))
+        tail.append(Data([0x8C, 0x8D, 0x21]))
+        XCTAssertEqual(String(decoding: tail.materialized(), as: UTF8.self), "🌍!")
+        XCTAssertEqual(tail.metrics.retainedBytes, 5)
+        XCTAssertTrue(tail.truncated)
+
+        tail.discardForDiscontinuity()
+        tail.append(Data([0x80, 0x81, 0x6E, 0x65, 0x77]))
+        XCTAssertEqual(String(decoding: tail.materialized(), as: UTF8.self), "new")
+        XCTAssertEqual(tail.metrics.retainedBytes, 3)
+    }
+
     func testHighThroughputOutputBacklogStaysWithinDeclaredCeilingAndAccountsForDrops() async {
         let (stream, buffer) = AcpTerminalHost.makeOutputStream()
         let chunk = Data(repeating: 0x78, count: AcpTerminalHost.outputStreamChunkByteLimit)

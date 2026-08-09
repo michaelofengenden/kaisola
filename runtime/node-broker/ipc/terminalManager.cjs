@@ -118,6 +118,21 @@ function reportActivity(kind, id = null) {
   try { activitySink?.(String(kind || 'terminal'), id == null ? null : String(id)) } catch { /* safety telemetry only */ }
 }
 
+/** Retained history is quota-bounded, and a dropped page is real user-visible
+ * history loss — worth a broker log line both while a quota is being approached
+ * and once something has actually been evicted. The eviction itself is also
+ * stamped into the spool meta, so `snapshot` and `history` keep reporting it
+ * long after the log line has scrolled away. */
+function reportQuota(event) {
+  const surface = event.scope === 'directory' ? 'terminal history directory' : 'terminal history'
+  const id = event.id || 'unknown terminal'
+  if (event.phase === 'warning') {
+    console.warn(`[kaisola] ${surface} quota nearly reached for ${id}: ${event.retainedBytes} of ${event.quotaBytes} bytes retained`)
+    return
+  }
+  console.warn(`[kaisola] ${surface} quota evicted ${event.evictedBytes} bytes of scrollback for ${id}`)
+}
+
 /** terminal:run children (plain child_process, not node-pty) — tracked here so
  *  a non-terminating run command dies on app quit instead of reparenting to
  *  launchd. terminalHandler registers/unregisters each spawned child. */
@@ -354,6 +369,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     dir: spoolDir,
     id,
     fresh: !restoring,
+    onQuota: reportQuota,
     ...(retainedOutputBytes == null ? {} : {
       diskCap: Math.max(1, retainedOutputBytes),
       hotCap: Math.max(1, Math.min(DEFAULT_HOT_CAP, retainedOutputBytes)),
@@ -732,6 +748,9 @@ function history(id, { streamEpoch, beforeOffset, maxBytes } = {}) {
     endOffset,
     hasMore: page.hasMore,
     truncated: page.truncated,
+    // Only present once a quota evicted something — the page that stops short
+    // of byte zero carries the reason it does.
+    ...(page.truncation ? { truncation: page.truncation } : {}),
   }
 }
 

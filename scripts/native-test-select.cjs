@@ -142,6 +142,9 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
   ['native/KaisolaMac/Kaisola/Features/Sessions/CustomThemeStore.swift', [
     'ExtensionsSettingsHubTests', 'TerminalThemeRegistryTests',
   ]],
+  ['native/KaisolaMac/Kaisola/Features/Workspace/CustomGrammarStore.swift', [
+    'CustomGrammarRegistryTests', 'ExtensionsSettingsHubTests', 'SyntaxHighlighterTests',
+  ]],
   ['native/KaisolaMac/Kaisola/Features/Sessions/RootShellView.swift', [
     'AppModelProjectContextTests', 'CommandRegistryTests', 'NativePreviewSettingsTests',
     'SessionPaneLayoutTests', 'TerminalReplayFidelityTests',

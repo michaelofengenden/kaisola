@@ -155,13 +155,16 @@ final class AppModel: ObservableObject {
         let kind: Kind
         let closedAt: Int64
     }
-    /// Project-scoped card geometry shared by terminals, ACP chats, and Mesh.
-    /// A column is horizontal; ids inside a column stack vertically.
-    @Published private(set) var paneLayouts: [String: SessionPaneLayout] = [:]
-    @Published private(set) var focusedPaneID: String?
-    @Published private(set) var keyboardFocusRequest: SurfaceKeyboardFocusRequest?
-    @Published private(set) var maximizedPaneID: String?
-    private var keyboardFocusGeneration: UInt64 = 0
+    /// Focused state machine for project-scoped terminal, chat, and Mesh cards.
+    /// AppModel coordinates async owners; synchronous card transitions live in
+    /// one explicit value API instead of being repeated across lifecycle code.
+    @Published private var unifiedSessionCards = UnifiedSessionCardState()
+    var paneLayouts: [String: SessionPaneLayout] { unifiedSessionCards.layouts }
+    var focusedPaneID: String? { unifiedSessionCards.focusedPaneID }
+    var keyboardFocusRequest: SurfaceKeyboardFocusRequest? {
+        unifiedSessionCards.keyboardFocusRequest
+    }
+    var maximizedPaneID: String? { unifiedSessionCards.maximizedPaneID }
     /// The project tab shown in the top-bar layout. Nil means the first project.
     @Published var selectedProjectName: String?
     /// Stable project identity used by interactive tabs/headers. Names are user
@@ -809,13 +812,12 @@ final class AppModel: ObservableObject {
     // MARK: - Unified session cards
 
     func paneLayout(for projectID: String?) -> SessionPaneLayout {
-        guard let projectID else { return SessionPaneLayout() }
-        return paneLayouts[projectID] ?? SessionPaneLayout()
+        unifiedSessionCards.layout(for: projectID)
     }
 
     func isSurfaceVisible(_ id: String) -> Bool {
         guard let projectID = projectID(forSurface: id) else { return false }
-        return paneLayouts[projectID]?.contains(id) == true
+        return unifiedSessionCards.contains(id, in: projectID)
     }
 
     /// Window-aware notification routing asks each model before mutating it.
@@ -832,11 +834,7 @@ final class AppModel: ObservableObject {
     /// Normal navigation focuses a card already in the dock; a hidden card
     /// replaces only the primary slot. Explicit "open beside" is separate.
     private func focusPane(_ id: String, projectID: String) {
-        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-        layout.focus(id)
-        paneLayouts[projectID] = layout
-        focusedPaneID = id
-        maximizedPaneID = nil
+        unifiedSessionCards.focus(id, in: projectID)
         scheduleWorkspaceStateSave(projectID: projectID)
     }
 
@@ -864,11 +862,7 @@ final class AppModel: ObservableObject {
         if isTerminal {
             splitIntentTokens[id] = UUID()
         }
-        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-        layout.add(id)
-        paneLayouts[projectID] = layout
-        focusedPaneID = id
-        maximizedPaneID = nil
+        unifiedSessionCards.revealBeside(id, in: projectID)
         focusSurfaceFields(id)
         requestSurfaceKeyboardFocus(id)
         // Opening a card beside the current one is a visit, exactly like
@@ -886,18 +880,17 @@ final class AppModel: ObservableObject {
     func placeSurface(_ id: String, relativeTo targetID: String, edge: SessionPaneLayout.Edge) {
         guard let projectID = projectID(forSurface: targetID),
               self.projectID(forSurface: id) == projectID else { return }
-        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-        layout.place(id, relativeTo: targetID, edge: edge)
-        paneLayouts[projectID] = layout
-        focusedPaneID = id
-        maximizedPaneID = nil
+        unifiedSessionCards.place(id, relativeTo: targetID, edge: edge, in: projectID)
         scheduleWorkspaceStateSave(projectID: projectID)
     }
 
     func resizePaneColumns(projectID: String, boundary: Int, delta: Double, minimumWeight: Double) {
-        guard var layout = paneLayouts[projectID] else { return }
-        layout.resizeColumns(boundary: boundary, delta: delta, minimumWeight: minimumWeight)
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.resizeColumns(
+            in: projectID,
+            boundary: boundary,
+            delta: delta,
+            minimumWeight: minimumWeight
+        )
     }
 
     func resizePaneRows(
@@ -907,14 +900,13 @@ final class AppModel: ObservableObject {
         delta: Double,
         minimumWeight: Double
     ) {
-        guard var layout = paneLayouts[projectID] else { return }
-        layout.resizeRows(
+        unifiedSessionCards.resizeRows(
+            in: projectID,
             columnID: columnID,
             boundary: boundary,
             delta: delta,
             minimumWeight: minimumWeight
         )
-        paneLayouts[projectID] = layout
     }
 
     func finishPaneResize(projectID: String) {
@@ -922,36 +914,29 @@ final class AppModel: ObservableObject {
     }
 
     func resetPaneColumns(projectID: String) {
-        guard var layout = paneLayouts[projectID] else { return }
-        layout.resetColumnWeights()
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.resetColumns(in: projectID)
         scheduleWorkspaceStateSave(projectID: projectID)
     }
 
     func resetPaneRows(projectID: String, columnID: String) {
-        guard var layout = paneLayouts[projectID] else { return }
-        layout.resetRowWeights(columnID: columnID)
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.resetRows(in: projectID, columnID: columnID)
         scheduleWorkspaceStateSave(projectID: projectID)
     }
 
     func toggleMaximizeSurface(_ id: String) {
-        maximizedPaneID = maximizedPaneID == id ? nil : id
-        focusedPaneID = id
+        unifiedSessionCards.toggleMaximize(id)
     }
 
     func minimizeSurface(_ id: String) async {
-        guard let projectID = projectID(forSurface: id), var layout = paneLayouts[projectID] else { return }
+        guard let projectID = projectID(forSurface: id),
+              paneLayouts[projectID] != nil else { return }
         if sessions.contains(where: { $0.id == id }) {
             splitIntentTokens[id] = UUID()
         }
-        layout.remove(id)
-        paneLayouts[projectID] = layout
+        guard let layout = unifiedSessionCards.remove(id, from: projectID) else { return }
         if sessions.contains(where: { $0.id == id }), id != selectedSessionID {
             await unsubscribeSplit(id)
         }
-        if focusedPaneID == id { focusedPaneID = layout.sessionIDs.first }
-        if maximizedPaneID == id { maximizedPaneID = nil }
         if selectedChatID == id { selectedChatID = nil }
         if selectedMeshID == id { selectedMeshID = nil }
         if selectedSessionID == id {
@@ -1004,12 +989,7 @@ final class AppModel: ObservableObject {
             }
             sessionAdoptions[terminalID] = projectID
         }
-        var source = paneLayouts[previousDisplay] ?? SessionPaneLayout()
-        source.remove(terminalID)
-        paneLayouts[previousDisplay] = source
-        var target = paneLayouts[projectID] ?? SessionPaneLayout()
-        if !target.contains(terminalID) { target.add(terminalID) }
-        paneLayouts[projectID] = target
+        unifiedSessionCards.move(terminalID, from: previousDisplay, to: projectID)
         if let project = projects.first(where: { $0.id == projectID }) {
             selectedProjectID = project.id
             selectedProjectName = project.name
@@ -1055,11 +1035,7 @@ final class AppModel: ObservableObject {
     /// and Mesh consume the generation through SwiftUI `FocusState`; terminals
     /// keep their AppKit first-responder bridge.
     private func requestSurfaceKeyboardFocus(_ id: String) {
-        keyboardFocusGeneration &+= 1
-        keyboardFocusRequest = SurfaceKeyboardFocusRequest(
-            targetID: id,
-            generation: keyboardFocusGeneration
-        )
+        unifiedSessionCards.requestKeyboardFocus(for: id)
         if sessions.contains(where: { $0.id == id }) {
             TerminalKeyboardFocus.moveFirstResponder(toSessionID: id)
         }
@@ -1134,7 +1110,6 @@ final class AppModel: ObservableObject {
             await subscribeSplit(previousID)
         }
         focusPane(id, projectID: record.projectID)
-        focusedPaneID = id
     }
 
     /// Switch the top-level workspace context by stable id, then restore a real
@@ -1205,8 +1180,6 @@ final class AppModel: ObservableObject {
         for projectID: String,
         persist: Bool
     ) -> Bool {
-        guard var layout = paneLayouts[projectID] else { return false }
-        let previous = layout
         // Dormant terminals stay: their PTYs died with the broker, but the
         // panes are resurrection targets, not garbage.
         let available = Set(
@@ -1214,17 +1187,10 @@ final class AppModel: ObservableObject {
         ).union(chats(in: projectID).map(\.id))
             .union(meshes(in: projectID).map(\.id))
             .union(dormantTerminalIDs(in: projectID))
-        layout.normalize(availableSessionIDs: available)
-        guard layout != previous else { return false }
-
-        let removed = Set(previous.sessionIDs).subtracting(layout.sessionIDs)
-        paneLayouts[projectID] = layout
-        if let focusedPaneID, removed.contains(focusedPaneID) {
-            self.focusedPaneID = layout.sessionIDs.first
-        }
-        if let maximizedPaneID, removed.contains(maximizedPaneID) {
-            self.maximizedPaneID = nil
-        }
+        guard unifiedSessionCards.reconcile(
+            projectID,
+            availableSurfaceIDs: available
+        ) else { return false }
         if persist { scheduleWorkspaceStateSave(projectID: projectID) }
         return true
     }
@@ -2206,7 +2172,7 @@ final class AppModel: ObservableObject {
     /// overlay's persistence contract is provable without a relaunch.
     /// Test-only layout injection for close/quit races.
     func setPaneLayoutForTesting(_ layout: SessionPaneLayout, projectID: String) {
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.install(layout, for: projectID)
     }
 
     /// Test-only dormant marking (production sets this in restoreOwnedSessions).
@@ -2896,7 +2862,7 @@ final class AppModel: ObservableObject {
             } else {
                 layout.normalize()
             }
-            paneLayouts[projectState.projectID] = layout
+            unifiedSessionCards.install(layout, for: projectState.projectID)
             restoreFileTabs(from: projectState)
         }
 
@@ -2906,8 +2872,7 @@ final class AppModel: ObservableObject {
             selectedProjectName = project.name
             if let state = restoration.projects.first(where: { $0.projectID == projectID }),
                let focused = state.focusedPaneID,
-               paneLayouts[projectID]?.contains(focused) == true {
-                focusedPaneID = focused
+               unifiedSessionCards.restoreFocus(focused, in: projectID) {
                 if chats.contains(where: { $0.id == focused }) {
                     selectedChatID = focused
                     selectedMeshID = nil
@@ -3379,9 +3344,7 @@ final class AppModel: ObservableObject {
         surfaceObservers.removeValue(forKey: chatID)?.cancel()
         attentionCenter.clear(targetID: chatID)
         if selectedChatID == chatID { selectedChatID = nil }
-        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-        layout.remove(chatID)
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.remove(chatID, from: projectID)
         scheduleWorkspaceStateSave(projectID: projectID)
         ToastCenter.shared.show("Moved chat to Recently Closed", style: .success)
         return true
@@ -3427,9 +3390,7 @@ final class AppModel: ObservableObject {
         attentionCenter.clear(targetID: chatID)
         if selectedChatID == chatID { selectedChatID = nil }
         if let projectID = closingChat?.projectID {
-            var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-            layout.remove(chatID)
-            paneLayouts[projectID] = layout
+            unifiedSessionCards.remove(chatID, from: projectID)
             scheduleWorkspaceStateSave(projectID: projectID)
         }
         // Unconditional (§4e): the user deleted the chat, so its transcript
@@ -3610,7 +3571,6 @@ final class AppModel: ObservableObject {
                 focusPane(chatID, projectID: projectID)
             }
             selectedMeshID = nil
-            focusedPaneID = chatID
             attentionCenter.clear(targetID: chatID)
             requestSurfaceKeyboardFocus(chatID)
         }
@@ -3700,9 +3660,7 @@ final class AppModel: ObservableObject {
         Self.claimedRestoredMeshIDs.remove(meshID)
         surfaceObservers.removeValue(forKey: meshID)?.cancel()
         if selectedMeshID == meshID { selectedMeshID = nil }
-        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-        layout.remove(meshID)
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.remove(meshID, from: projectID)
         await persistWorkspaceStateImmediately(projectID: projectID)
         ToastCenter.shared.show("Moved Mesh to Recently Closed", style: .success)
         return .completed
@@ -3727,9 +3685,7 @@ final class AppModel: ObservableObject {
             Self.claimedRestoredMeshIDs.remove(meshID)
             surfaceObservers.removeValue(forKey: meshID)?.cancel()
             if selectedMeshID == meshID { selectedMeshID = nil }
-            var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-            layout.remove(meshID)
-            paneLayouts[projectID] = layout
+            unifiedSessionCards.remove(meshID, from: projectID)
             for columnID in columnIDs { enqueueTranscriptRemoval(chatID: columnID) }
             enqueueDraftRemoval(stableKey: "mesh|\(meshID)")
             await persistWorkspaceStateImmediately(projectID: projectID)
@@ -3752,7 +3708,6 @@ final class AppModel: ObservableObject {
                 focusPane(meshID, projectID: projectID)
             }
             selectedChatID = nil
-            focusedPaneID = meshID
             requestSurfaceKeyboardFocus(meshID)
         }
     }
@@ -4229,8 +4184,11 @@ final class AppModel: ObservableObject {
         publishTerminalSurfaceDocument(document)
         splitDocuments.removeAll()
         splitOrder.removeAll()
-        paneLayouts[project.id] = SessionPaneLayout(sessionID: sessions[0].id)
-        focusedPaneID = sessions[0].id
+        unifiedSessionCards.install(
+            SessionPaneLayout(sessionID: sessions[0].id),
+            for: project.id
+        )
+        unifiedSessionCards.focusPresentation(on: sessions[0].id)
 
         if includeSplit {
             let splitOutput = [
@@ -4258,7 +4216,7 @@ final class AppModel: ObservableObject {
             )
             publishTerminalSurfaceDocument(splitDocuments[sessions[1].id]!)
             splitOrder = [sessions[1].id]
-            paneLayouts[project.id]?.add(sessions[1].id)
+            unifiedSessionCards.add(sessions[1].id, to: project.id)
         }
     }
 
@@ -4353,7 +4311,10 @@ final class AppModel: ObservableObject {
         }
         meshes = [mesh]
         selectedSessionID = nil
-        paneLayouts[mesh.projectID] = SessionPaneLayout(sessionID: mesh.id)
+        unifiedSessionCards.install(
+            SessionPaneLayout(sessionID: mesh.id),
+            for: mesh.projectID
+        )
         selectMesh(mesh.id)
     }
 
@@ -4377,9 +4338,7 @@ final class AppModel: ObservableObject {
                 initialQueuedPrompts: []
               ) else { return }
         chat.conversation.loadVisualFixture(includePermission: includePermission)
-        var layout = paneLayouts[project.id] ?? SessionPaneLayout()
-        layout.add(chat.id)
-        paneLayouts[project.id] = layout
+        unifiedSessionCards.add(chat.id, to: project.id)
         selectChat(chat.id)
     }
 
@@ -6033,9 +5992,7 @@ final class AppModel: ObservableObject {
             // it may follow the synchronous state commit.
             Task { [weak self] in await self?.select(nil) }
         }
-        if focusedPaneID == terminalID {
-            focusedPaneID = nil
-        }
+        unifiedSessionCards.clearFocus(ifMatching: terminalID)
     }
 
     /// Live work that would keep running out of sight if this project closed:
@@ -6132,7 +6089,6 @@ final class AppModel: ObservableObject {
             return
         }
         let originalLayout = paneLayouts[record.projectID]
-        let wasMaximized = maximizedPaneID == terminalID
         reopeningTerminalIDs.insert(terminalID)
         defer { reopeningTerminalIDs.remove(terminalID) }
 
@@ -6149,15 +6105,16 @@ final class AppModel: ObservableObject {
         // so swap against the CURRENT layout, never the pre-await snapshot —
         // overwriting with the stale copy was a lost-update.
         if sessionStore.isTerminalTombstoned(terminalID) {
-            focusedPaneID = createdID
+            unifiedSessionCards.focusPresentation(on: createdID)
             scheduleWorkspaceStateSave(projectID: record.projectID)
             return
         }
-        if var layout = paneLayouts[record.projectID] ?? originalLayout,
-           layout.replace(terminalID, with: createdID) {
-            paneLayouts[record.projectID] = layout
-            focusedPaneID = createdID
-            if wasMaximized { maximizedPaneID = createdID }
+        if unifiedSessionCards.replace(
+            terminalID,
+            with: createdID,
+            in: record.projectID,
+            fallback: originalLayout
+        ) {
             scheduleWorkspaceStateSave(projectID: record.projectID)
         }
         // The replacement owns the pane now; the old record must not linger

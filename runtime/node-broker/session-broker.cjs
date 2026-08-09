@@ -24,6 +24,8 @@ const {
   MAX_FRAME,
   atomicJson,
   brokerMethodAllowedForAccess,
+  negotiateFeatures,
+  eventPayloadForFeatures,
 } = require('./ipc/brokerWire.cjs')
 
 const NO_CLIENT_EXIT_MS = process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_NO_CLIENT_EXIT_MS
@@ -208,7 +210,15 @@ mgr.setEventSink((owner, channel, payload, options) => {
   if (!parts) return false
   const client = clients.get(parts.instanceId)
   if (!client) return false
-  return send(client.socket, { type: 'event', ownerId: parts.ownerId, projectId: parts.projectId, channel, payload }, options)
+  return send(client.socket, {
+    type: 'event',
+    ownerId: parts.ownerId,
+    projectId: parts.projectId,
+    channel,
+    // One live broker serves app lanes of different vintages across a rolling
+    // update, so the shape is per-client, not per-broker.
+    payload: eventPayloadForFeatures(channel, payload, client.features),
+  }, options)
 })
 mgr.setActivitySink(() => noteActivity())
 
@@ -575,6 +585,7 @@ function handleLine(client, line) {
     }
     client.instanceId = instanceId
     client.access = access
+    client.features = negotiateFeatures(frame.features)
     client.authenticated = true
     everConnected = true
     clients.set(instanceId, client)
@@ -589,6 +600,9 @@ function handleLine(client, line) {
       packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
       contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
       features: FEATURES,
+      // What this connection actually asked for and got, so a client never has
+      // to infer its own event shapes from the broker's full capability list.
+      negotiatedFeatures: [...client.features],
       access,
       pid: process.pid,
       startedAt: config.startedAt,
@@ -612,7 +626,15 @@ function handleLine(client, line) {
 
 function acceptClient(socket) {
   socket.setNoDelay(true)
-  const client = { socket, authenticated: false, instanceId: null, access: 'controller', buffer: '', decoder: new StringDecoder('utf8') }
+  const client = {
+    socket,
+    authenticated: false,
+    instanceId: null,
+    access: 'controller',
+    features: new Set(),
+    buffer: '',
+    decoder: new StringDecoder('utf8'),
+  }
   socket.on('data', (chunk) => {
     client.buffer += client.decoder.write(chunk)
     if (Buffer.byteLength(client.buffer) > MAX_FRAME) {

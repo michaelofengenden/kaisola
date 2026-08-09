@@ -7,6 +7,59 @@ import XCTest
 /// parsing (diff / content / terminal), which feed the chat's inline diff cards.
 final class AcpToolArtifactsTests: XCTestCase {
 
+    // MARK: - Tool call accessibility
+
+    func testToolCallAccessibilityNamesEveryTypedStatusAndDisclosureState() {
+        let expectedStatuses: [(AcpToolCall.Status, String)] = [
+            (.pending, "Pending"),
+            (.inProgress, "In progress"),
+            (.completed, "Completed"),
+            (.failed, "Failed"),
+        ]
+
+        for (status, statusLabel) in expectedStatuses {
+            let call = AcpToolCall(
+                id: "tool-\(status.rawValue)",
+                title: "Inspect native project",
+                kind: "read",
+                status: status,
+                content: [.text("one"), .terminal(id: "terminal-1")]
+            )
+
+            let collapsed = ToolCallAccessibility(call: call, expanded: false)
+            XCTAssertEqual(collapsed.label, "Show details for Inspect native project")
+            XCTAssertEqual(
+                collapsed.value,
+                "read tool, \(statusLabel), 2 artifacts, Collapsed"
+            )
+            XCTAssertEqual(collapsed.actionName, "Show details")
+            XCTAssertEqual(collapsed.identifier, "acp.tool.tool-\(status.rawValue)")
+
+            let expanded = ToolCallAccessibility(call: call, expanded: true)
+            XCTAssertEqual(expanded.label, "Hide details for Inspect native project")
+            XCTAssertEqual(
+                expanded.value,
+                "read tool, \(statusLabel), 2 artifacts, Expanded"
+            )
+            XCTAssertEqual(expanded.actionName, "Hide details")
+        }
+    }
+
+    func testToolCallAccessibilityDoesNotExposeDisclosureActionWithoutArtifacts() {
+        let call = AcpToolCall(
+            id: "tool-empty",
+            title: "Check status",
+            kind: "inspect",
+            status: .completed
+        )
+
+        let accessibility = ToolCallAccessibility(call: call, expanded: false)
+        XCTAssertEqual(accessibility.label, "Check status")
+        XCTAssertEqual(accessibility.value, "inspect tool, Completed, 0 artifacts")
+        XCTAssertNil(accessibility.actionName)
+        XCTAssertEqual(accessibility.identifier, "acp.tool.tool-empty")
+    }
+
     // MARK: - AcpDiff
 
     func testFreshFileIsAllAdditions() {

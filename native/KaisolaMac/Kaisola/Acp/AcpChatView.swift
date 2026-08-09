@@ -698,6 +698,43 @@ struct TranscriptRowView: View {
     }
 }
 
+/// One spoken contract for the tool header. The visible row contains a status
+/// symbol, title, disclosure chevron, and kind; exposing those children
+/// separately made the symbol-derived button name opaque and left status
+/// changes silent. Keep the description bounded to metadata already visible in
+/// the row — artifact contents may contain sensitive output and are available
+/// only after the user opens the disclosure.
+struct ToolCallAccessibility: Equatable {
+    let label: String
+    let value: String
+    let actionName: String?
+    let identifier: String
+
+    init(call: AcpToolCall, expanded: Bool) {
+        let artifactCount = call.content.count
+        let artifactLabel = "\(artifactCount) artifact\(artifactCount == 1 ? "" : "s")"
+        let statusLabel: String
+        switch call.status {
+        case .pending: statusLabel = "Pending"
+        case .inProgress: statusLabel = "In progress"
+        case .completed: statusLabel = "Completed"
+        case .failed: statusLabel = "Failed"
+        }
+
+        if artifactCount > 0 {
+            let disclosureLabel = expanded ? "Hide details" : "Show details"
+            label = "\(disclosureLabel) for \(call.title)"
+            value = "\(call.kind) tool, \(statusLabel), \(artifactLabel), \(expanded ? "Expanded" : "Collapsed")"
+            actionName = disclosureLabel
+        } else {
+            label = call.title
+            value = "\(call.kind) tool, \(statusLabel), \(artifactLabel)"
+            actionName = nil
+        }
+        identifier = "acp.tool.\(call.id)"
+    }
+}
+
 struct ToolCallCard: View {
     let call: AcpToolCall
     var workspaceURL: URL?
@@ -705,27 +742,32 @@ struct ToolCallCard: View {
     @State private var expanded = false
 
     private var hasArtifacts: Bool { !call.content.isEmpty }
+    private var accessibility: ToolCallAccessibility {
+        ToolCallAccessibility(call: call, expanded: expanded)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Button {
-                if hasArtifacts { expanded.toggle() }
-            } label: {
-                HStack(spacing: 9) {
-                    Image(systemName: statusSymbol)
-                        .foregroundStyle(statusColor)
-                    Text(call.title).lineLimit(1)
-                    Spacer()
-                    if hasArtifacts {
-                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                            .font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Text(call.kind).font(.caption).foregroundStyle(.secondary)
+            if hasArtifacts {
+                Button {
+                    expanded.toggle()
+                } label: {
+                    header
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(accessibility.label)
+                .accessibilityValue(accessibility.value)
+                .accessibilityIdentifier(accessibility.identifier)
+                .accessibilityAddTraits([.isButton, .updatesFrequently])
+            } else {
+                header
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(accessibility.label)
+                    .accessibilityValue(accessibility.value)
+                    .accessibilityIdentifier(accessibility.identifier)
+                    .accessibilityAddTraits(.updatesFrequently)
             }
-            .buttonStyle(.plain)
-            .disabled(!hasArtifacts)
 
             if !call.locations.isEmpty {
                 Text(AcpTranscriptInlineRendering.attributed(
@@ -753,6 +795,21 @@ struct ToolCallCard: View {
         .environment(\.openURL, OpenURLAction { link in
             AcpTranscriptLinkRouting.open(link, workspaceURL: workspaceURL)
         })
+    }
+
+    private var header: some View {
+        HStack(spacing: 9) {
+            Image(systemName: statusSymbol)
+                .foregroundStyle(statusColor)
+            Text(call.title).lineLimit(1)
+            Spacer()
+            if hasArtifacts {
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+            Text(call.kind).font(.caption).foregroundStyle(.secondary)
+        }
+        .contentShape(Rectangle())
     }
 
     private var statusSymbol: String {

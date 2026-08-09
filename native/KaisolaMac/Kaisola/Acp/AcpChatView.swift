@@ -694,6 +694,19 @@ struct TranscriptRowView: View {
             )
         case let .plan(_, entries):
             PlanCard(entries: entries)
+        case let .permissionDecision(_, text):
+            Label {
+                Text(text)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            } icon: {
+                Image(systemName: "shield.slash")
+                    .foregroundStyle(.orange)
+            }
+            .padding(.vertical, 4)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("acp.transcript.\(row.id)")
         }
     }
 }

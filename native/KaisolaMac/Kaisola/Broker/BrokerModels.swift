@@ -44,9 +44,13 @@ struct BrokerHello: Equatable, Sendable {
 
 struct BrokerStatus: Equatable, Sendable {
     let terminals: [BrokerTerminalRecord]
+    /// Monotonic broker-wide mutation/activity fence sampled with this
+    /// inventory. Nil is reserved for pre-generation legacy brokers.
+    let activityEpoch: Int64?
 
-    init(terminals: [BrokerTerminalRecord]) {
+    init(terminals: [BrokerTerminalRecord], activityEpoch: Int64? = nil) {
         self.terminals = terminals
+        self.activityEpoch = activityEpoch
     }
 
     init(
@@ -90,6 +94,16 @@ struct BrokerStatus: Equatable, Sendable {
            statusObject["contentDigest"]?.stringValue != expectedHello.contentDigest {
             throw BrokerClientError.identityChanged
         }
+        let parsedActivityEpoch: Int64?
+        if statusObject["activityEpoch"] != nil {
+            guard let activityEpoch = statusObject["activityEpoch"]?.intValue,
+                  activityEpoch > 0 else {
+                throw BrokerClientError.malformedResponse
+            }
+            parsedActivityEpoch = activityEpoch
+        } else {
+            parsedActivityEpoch = nil
+        }
         guard let diagnosticValues = diagnostics.arrayValue,
               let liveValues = live.arrayValue else {
             throw BrokerClientError.malformedResponse
@@ -103,6 +117,19 @@ struct BrokerStatus: Equatable, Sendable {
         terminals = diagnosticValues.compactMap { value in
             BrokerTerminalRecord(value: value, liveValue: value.objectValue?["id"]?.stringValue.flatMap { liveByID[$0] })
         }
+        activityEpoch = parsedActivityEpoch
+    }
+
+    static func validatedActivityEpoch(
+        status: JSONValue,
+        expectedHello: BrokerHello
+    ) throws -> Int64? {
+        try BrokerStatus(
+            status: status,
+            diagnostics: .array([]),
+            live: .array([]),
+            expectedHello: expectedHello
+        ).activityEpoch
     }
 }
 

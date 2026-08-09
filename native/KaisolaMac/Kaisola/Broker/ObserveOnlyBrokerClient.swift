@@ -8,6 +8,7 @@ protocol ObserveOnlyBrokerServing: Sendable {
     func connect(to info: BrokerInfo) async throws -> BrokerHello
     func connect(to topology: BrokerGenerationTopology) async throws -> BrokerHello
     func inventory() async throws -> BrokerStatus
+    func inventoryActivityEpoch() async throws -> Int64?
     func subscribe(
         to terminal: BrokerTerminalRecord,
         ownerID: String,
@@ -37,6 +38,9 @@ extension ObserveOnlyBrokerServing {
     func detachEmptyDrainingGenerations() async -> Set<String> { [] }
     func connect(to topology: BrokerGenerationTopology) async throws -> BrokerHello {
         try await connect(to: topology.current.info)
+    }
+    func inventoryActivityEpoch() async throws -> Int64? {
+        try await inventory().activityEpoch
     }
 
     func subscribeBounded(
@@ -224,6 +228,15 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             live: live,
             expectedHello: hello
         )
+    }
+
+    /// Cheap second phase for a multi-generation inventory. The router uses
+    /// this after collecting every child snapshot to prove that none changed
+    /// while another generation was being inventoried.
+    func inventoryActivityEpoch() async throws -> Int64? {
+        guard let hello else { throw BrokerClientError.notConnected }
+        let status = try await request(.status, params: .object(["ownerId": .string("0")]))
+        return try BrokerStatus.validatedActivityEpoch(status: status, expectedHello: hello)
     }
 
     func subscribe(

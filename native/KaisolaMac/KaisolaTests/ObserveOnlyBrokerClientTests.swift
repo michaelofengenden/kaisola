@@ -289,6 +289,29 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testActivityEpochProbeUsesOnlyBrokerStatus() async throws {
+        let transport = ScriptedBrokerTransport(
+            helloAccess: "observer",
+            advertiseObserverRole: true,
+            replyToRequests: true,
+            activityEpoch: 73
+        )
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        _ = try await client.connect(to: brokerInfo)
+
+        let activityEpoch = try await client.inventoryActivityEpoch()
+        let methods = await transport.sentFrames().compactMap {
+            $0.objectValue?["method"]?.stringValue
+        }
+
+        XCTAssertEqual(activityEpoch, 73)
+        XCTAssertEqual(methods, ["broker.status"])
+        await client.disconnect()
+    }
+
     func testHistoryUsesBoundedTypedObserverRequest() async throws {
         let transport = ScriptedBrokerTransport(
             helloAccess: "observer",
@@ -513,6 +536,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     private let packageVersion: String?
     private let contentDigest: String?
     private let statusImplementationVersion: Int?
+    private let activityEpoch: Int64
     private let subscribeOutput: String?
     private let subscribeStartOffset: Int64
     private let historyPageBytes: Int?
@@ -539,6 +563,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         packageVersion: String? = "1.0.0",
         contentDigest: String? = String(repeating: "a", count: 64),
         statusImplementationVersion: Int? = nil,
+        activityEpoch: Int64 = 1,
         subscribeOutput: String? = nil,
         subscribeStartOffset: Int64 = 0,
         historyPageBytes: Int? = nil
@@ -555,6 +580,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         self.packageVersion = packageVersion
         self.contentDigest = contentDigest
         self.statusImplementationVersion = statusImplementationVersion
+        self.activityEpoch = activityEpoch
         self.subscribeOutput = subscribeOutput
         self.subscribeStartOffset = subscribeStartOffset
         self.historyPageBytes = historyPageBytes
@@ -629,6 +655,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
                 "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
                 "pid": .integer(12_345),
                 "startedAt": .integer(1_784_250_001_000),
+                "activityEpoch": .integer(activityEpoch),
             ]
             if let value = statusImplementationVersion ?? implementationVersion {
                 status["implementationVersion"] = .integer(Int64(value))

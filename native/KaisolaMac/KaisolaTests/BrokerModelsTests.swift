@@ -3,6 +3,37 @@ import XCTest
 @testable import Kaisola
 
 final class BrokerModelsTests: XCTestCase {
+    func testStatusParsesPositiveBrokerActivityEpoch() throws {
+        let status = try BrokerStatus(
+            status: .object([
+                "ok": .bool(true),
+                "protocol": .integer(2),
+                "securityEpoch": .integer(1),
+                "activityEpoch": .integer(42),
+            ]),
+            diagnostics: .array([]),
+            live: .array([]),
+            expectedHello: hello
+        )
+
+        XCTAssertEqual(status.activityEpoch, 42)
+    }
+
+    func testStatusRejectsInvalidBrokerActivityEpoch() {
+        for invalid in [JSONValue.integer(0), .integer(-1), .string("42")] {
+            var object = validStatus.objectValue!
+            object["activityEpoch"] = invalid
+            XCTAssertThrowsError(try BrokerStatus(
+                status: .object(object),
+                diagnostics: .array([]),
+                live: .array([]),
+                expectedHello: hello
+            )) { error in
+                XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+            }
+        }
+    }
+
     func testStatusExtractsExactProjectCapabilityFromOwner() throws {
         let status = try BrokerStatus(
             status: validStatus,

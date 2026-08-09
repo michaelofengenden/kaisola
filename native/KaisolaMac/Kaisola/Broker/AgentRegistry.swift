@@ -66,12 +66,17 @@ enum AgentRegistry {
     /// keeping the registry non-isolated preserves every existing call site.
     nonisolated(unsafe) static var customStoreOverride: CustomAgentStore?
 
-    /// User-registered terminal-only agents, loaded from `CustomAgentStore`.
-    /// These deliberately have no ACP adapter — `AcpAdapter.forAgent` returns
-    /// nil for their `custom-…` ids — so they only ever launch into an owned
-    /// terminal, never the chat surface.
-    static var custom: [AgentProfile] {
+    /// Typed custom-agent load state retained at the launch boundary. Callers
+    /// that need to explain a degraded registry can inspect the error; the
+    /// launch-facing `custom` view below fails closed to no custom profiles.
+    static var customLoadResult: Result<[AgentProfile], CustomAgentStore.StoreError> {
         (customStoreOverride ?? CustomAgentStore()).asProfiles()
+    }
+
+    /// User-registered terminal agents. A corrupt, partially decoded, or
+    /// forward-version registry contributes no launchable profiles.
+    static var custom: [AgentProfile] {
+        (try? customLoadResult.get()) ?? []
     }
 
     /// Agents offered in the New menu, in display order: built-ins first, then

@@ -175,7 +175,25 @@ jobs:
           set -euo pipefail
           UDID="${{ steps.companion-simulator.outputs.udid }}"
           xcrun simctl bootstatus "$UDID" -b 2>&1 | tee "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-bootstatus.log"
-          xcrun simctl spawn --arch="$KAISOLA_COMPANION_SIMULATOR_ARCH" "$UDID" uname -m \
+          PROBE_SOURCE="$KAISOLA_COMPANION_DIAGNOSTICS/simulator-architecture-probe.c"
+          PROBE_BINARY="$KAISOLA_COMPANION_DIAGNOSTICS/simulator-architecture-probe"
+          printf '%s\n' \
+            '#include <stdio.h>' \
+            '#include <sys/utsname.h>' \
+            'int main(void) {' \
+            '  struct utsname value;' \
+            '  if (uname(&value) != 0) return 2;' \
+            '  return printf("%s\\n", value.machine) < 0 ? 3 : 0;' \
+            '}' > "$PROBE_SOURCE"
+          xcrun --sdk iphonesimulator clang \
+            -target "$KAISOLA_COMPANION_SIMULATOR_ARCH-apple-ios$KAISOLA_COMPANION_SIMULATOR_OS-simulator" \
+            -Os -Werror \
+            -o "$PROBE_BINARY" \
+            "$PROBE_SOURCE"
+          /usr/bin/codesign --force --sign - "$PROBE_BINARY"
+          /usr/bin/lipo -archs "$PROBE_BINARY" \
+            | tee "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-probe-binary-architecture.txt"
+          xcrun simctl spawn --arch="$KAISOLA_COMPANION_SIMULATOR_ARCH" "$UDID" "$PROBE_BINARY" \
             | tee "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-spawn-architecture.txt"
           node scripts/companion-ci-test-gate.cjs verify-simulator-probe \
             --input "$KAISOLA_COMPANION_DIAGNOSTICS/simulator-spawn-architecture.txt" \

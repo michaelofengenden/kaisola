@@ -116,6 +116,80 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testDisconnectClosesTheSocketAStaleAttemptOpensAfterwards() async throws {
+        let transport = SocketTrackingBrokerTransport(holdFirstConnect: true)
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 2_000_000_000
+        )
+        let info = brokerInfo
+        let stale = Task { try await client.connect(to: info) }
+        await transport.waitUntilConnectEntered(1)
+
+        await client.disconnect()
+        do {
+            _ = try await stale.value
+            XCTFail("Disconnect must fail the in-flight connect")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .connectionClosed)
+        }
+
+        // The socket finishes opening only after the disconnect, which is the
+        // whole hazard: nothing else is left holding a reference to it.
+        await transport.releaseHeldConnect()
+        await waitForClosedSocket(on: transport)
+
+        let opened = await transport.openedSockets()
+        let closed = await transport.closedSockets()
+        let live = await transport.liveSocket()
+        XCTAssertEqual(opened, [1])
+        XCTAssertEqual(closed, [1], "A superseded attempt must close the socket it opened.")
+        XCTAssertNil(live, "No socket may outlive the attempt that opened it.")
+    }
+
+    func testReconnectRacingADelayedConnectKeepsOnlyTheNewSocket() async throws {
+        let transport = SocketTrackingBrokerTransport(holdFirstConnect: true)
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 2_000_000_000
+        )
+        let info = brokerInfo
+        let stale = Task { try await client.connect(to: info) }
+        await transport.waitUntilConnectEntered(1)
+
+        await client.disconnect()
+        do {
+            _ = try await stale.value
+            XCTFail("Disconnect must fail the in-flight connect")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .connectionClosed)
+        }
+
+        // Reconnect while the abandoned socket is still opening, then let it
+        // land. The late arrival must not replace the socket the retry uses.
+        let reconnect = Task { try await client.connect(to: info) }
+        for _ in 0..<100 { await Task.yield() }
+        await transport.releaseHeldConnect()
+
+        let hello = try await reconnect.value
+        XCTAssertTrue(hello.serverEnforcedObserver)
+        let opened = await transport.openedSockets()
+        let closed = await transport.closedSockets()
+        let live = await transport.liveSocket()
+        XCTAssertEqual(opened, [1, 2], "The retry needs a socket of its own.")
+        XCTAssertEqual(closed, [1], "Only the stale attempt's socket may be closed.")
+        XCTAssertEqual(live, 2, "The retry's socket must survive the stale attempt landing.")
+        await client.disconnect()
+    }
+
+    /// Bounded so an unfixed client fails an assertion instead of hanging.
+    private func waitForClosedSocket(on transport: SocketTrackingBrokerTransport) async {
+        for _ in 0..<200 {
+            if await transport.closedSockets().isEmpty == false { return }
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+    }
+
     func testObserverHandshakeIsExplicitAndNewBrokerMustEchoTheRole() async throws {
         let transport = ScriptedBrokerTransport(helloAccess: "observer", advertiseObserverRole: true)
         let client = ObserveOnlyBrokerClient(transport: transport, operationTimeoutNanoseconds: 100_000_000)
@@ -499,6 +573,72 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
             version: "test"
         )
     }
+}
+
+/// Models the one property a shared transport really has: a single socket at a
+/// time, numbered so a test can say whose socket a close landed on. The first
+/// `connect` can be held open to stand in for a slow socket, and the handshake
+/// itself is delegated to the scripted transport below.
+private actor SocketTrackingBrokerTransport: BrokerByteTransport {
+    private let handshake = ScriptedBrokerTransport(
+        helloAccess: "observer",
+        advertiseObserverRole: true
+    )
+    private var enteredConnects = 0
+    private var opened: [Int] = []
+    private var closed: [Int] = []
+    private var live: Int?
+    private var holdNextConnect: Bool
+    private var heldConnect: CheckedContinuation<Void, Never>?
+    private var entryWaiters: [(
+        count: Int,
+        continuation: CheckedContinuation<Void, Never>
+    )] = []
+
+    init(holdFirstConnect: Bool = false) {
+        holdNextConnect = holdFirstConnect
+    }
+
+    func connect(path: String) async throws {
+        enteredConnects += 1
+        let socket = enteredConnects
+        let ready = entryWaiters.filter { enteredConnects >= $0.count }
+        entryWaiters.removeAll { enteredConnects >= $0.count }
+        for observer in ready { observer.continuation.resume() }
+
+        if holdNextConnect {
+            holdNextConnect = false
+            await withCheckedContinuation { heldConnect = $0 }
+        }
+        opened.append(socket)
+        live = socket
+    }
+
+    func waitUntilConnectEntered(_ count: Int) async {
+        guard enteredConnects < count else { return }
+        await withCheckedContinuation { entryWaiters.append((count, $0)) }
+    }
+
+    func releaseHeldConnect() {
+        heldConnect?.resume()
+        heldConnect = nil
+    }
+
+    func send(_ data: Data) async throws { try await handshake.send(data) }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        try await handshake.receive(maximumBytes: maximumBytes)
+    }
+
+    func close() async {
+        if let live { closed.append(live) }
+        live = nil
+        await handshake.close()
+    }
+
+    func openedSockets() -> [Int] { opened }
+    func closedSockets() -> [Int] { closed }
+    func liveSocket() -> Int? { live }
 }
 
 private actor ScriptedBrokerTransport: BrokerByteTransport {

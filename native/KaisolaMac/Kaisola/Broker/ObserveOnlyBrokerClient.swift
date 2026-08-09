@@ -109,6 +109,13 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     private var connectTarget: BrokerInfo?
     private var connectWaiters: [CheckedContinuation<BrokerHello, any Error>] = []
     private var connectAttemptTask: Task<Void, Never>?
+    /// The transport is shared by every attempt and holds one socket at a
+    /// time. `connectAttemptTask` is dropped the moment an attempt is
+    /// superseded, so this second handle is what the next attempt waits on
+    /// before it opens a socket of its own: a superseded attempt always gets
+    /// to close what it opened first. Without that ordering a slow `connect`
+    /// could land after a newer one and quietly replace its socket.
+    private var transportAttemptTask: Task<Void, Never>?
     private var connectionGeneration: UInt64 = 0
     private var handshakeTimeoutTask: Task<Void, Never>?
     private var pending: [String: CheckedContinuation<JSONValue, any Error>] = [:]
@@ -154,9 +161,13 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         connectTarget = requestedInfo
         return try await withCheckedThrowingContinuation { continuation in
             connectWaiters.append(continuation)
-            connectAttemptTask = Task { [weak self] in
+            let supersededAttempt = transportAttemptTask
+            let attempt = Task { [weak self] in
+                await supersededAttempt?.value
                 await self?.performConnect(to: requestedInfo, generation: generation)
             }
+            connectAttemptTask = attempt
+            transportAttemptTask = attempt
         }
     }
 
@@ -169,7 +180,15 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     private func performConnect(to info: BrokerInfo, generation: UInt64) async {
         do {
             try await transport.connect(path: info.socketPath)
-            guard generation == connectionGeneration, connectTarget == info else { return }
+            guard generation == connectionGeneration, connectTarget == info else {
+                // A disconnect superseded this attempt while its socket was
+                // still opening. That socket is this attempt's alone — the
+                // next attempt waits on this task before touching the
+                // transport — so closing it here neither leaks it nor takes
+                // a live connection away from a newer attempt.
+                await transport.close()
+                return
+            }
 
             readerTask = Task { [weak self] in
                 await self?.readLoop(generation: generation)

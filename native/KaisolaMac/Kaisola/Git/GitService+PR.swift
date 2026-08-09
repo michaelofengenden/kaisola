@@ -173,19 +173,19 @@ extension GitService {
         )
         process.currentDirectoryURL = repoRoot
         GitProcessEnvironment.configureNonInteractive(process)
-        let capture: (out: Data, err: Data)
+        let capture: GitProcessCapture.Result
         // `gh` talks to GitHub, so it carries the network budget rather than the
         // shorter local default.
-        do { capture = try GitProcessCapture.run(process, deadline: .network) }
+        do { capture = try GitProcessCapture.run(process, deadline: .network, limits: .network) }
         catch let failure as GitProcessCapture.Failure {
             throw GitError.from(failure, command: "gh pr create")
         }
         catch { throw GitError.commandFailed(error.localizedDescription) }
         if process.terminationStatus != 0 {
-            let message = String(data: capture.err, encoding: .utf8) ?? "gh pr create failed"
+            let message = capture.err.diagnosticText(byteLimit: GitProcessCapture.diagnosticByteLimit)
             throw GitError.commandFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        let stdout = String(data: capture.out, encoding: .utf8) ?? ""
+        let stdout = String(data: capture.out.completeData ?? Data(), encoding: .utf8) ?? ""
         if let url = Self.pullRequestURL(inGhOutput: stdout, repositoryURL: repositoryURL) {
             return .opened(url: url)
         }
@@ -410,9 +410,13 @@ extension GitService {
         process.arguments = ["gh"]
         // `which` either answers immediately or the PATH lookup is wedged; a few
         // seconds is already far past "installed?".
-        guard let capture = try? GitProcessCapture.run(process, deadline: .custom(5)) else { return nil }
+        guard let capture = try? GitProcessCapture.run(
+            process,
+            deadline: .custom(5),
+            limits: .probe
+        ) else { return nil }
         guard process.terminationStatus == 0 else { return nil }
-        let path = (String(data: capture.out, encoding: .utf8) ?? "")
+        let path = (String(data: capture.out.completeData ?? Data(), encoding: .utf8) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return path.isEmpty ? nil : path
     }
@@ -428,18 +432,24 @@ extension GitService {
         process.arguments = arguments
         process.currentDirectoryURL = repoRoot
         GitProcessEnvironment.configureNonInteractive(process)
-        let capture: (out: Data, err: Data)
-        do { capture = try GitProcessCapture.run(process, deadline: .forGitArguments(arguments)) }
+        let capture: GitProcessCapture.Result
+        do {
+            capture = try GitProcessCapture.run(
+                process,
+                deadline: .forGitArguments(arguments),
+                limits: .forGitArguments(arguments)
+            )
+        }
         catch let failure as GitProcessCapture.Failure {
             throw GitError.from(failure, command: Self.commandLabel(arguments))
         }
         catch { throw GitError.commandFailed(error.localizedDescription) }
         if process.terminationStatus != 0 {
-            let message = String(data: capture.err, encoding: .utf8) ?? "git failed"
+            let message = capture.err.diagnosticText(byteLimit: GitProcessCapture.diagnosticByteLimit)
             if message.contains("not a git repository") { throw GitError.notARepository }
             throw GitError.commandFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        return String(data: capture.out, encoding: .utf8) ?? ""
+        return String(data: capture.out.completeData ?? Data(), encoding: .utf8) ?? ""
     }
 
 }

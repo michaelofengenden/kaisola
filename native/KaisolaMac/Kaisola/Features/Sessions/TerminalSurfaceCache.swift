@@ -64,15 +64,16 @@ final class TerminalSurfaceCache {
     /// another pane or another window — an `NSView` has exactly one superview,
     /// so it cannot be shared. In that case this returns nil and the caller
     /// builds a fresh pair, which is the pre-existing behaviour.
-    func claim(sessionID: String, isOwned: Bool? = nil) -> Entry? {
+    func claim(sessionID: String, controllerCapable: Bool? = nil) -> Entry? {
         guard let entry = entries[sessionID] else { return nil }
         guard entry.view.superview == nil else { return nil }
-        // Ownership is a type-level security boundary: ReadOnlyTerminalView
-        // compiles away every outbound byte, while OwnedTerminalView forwards
-        // input to the controller lane. A parked observer must never come back
-        // as an apparently writable terminal (or vice versa). Drop the stale
-        // pair and let NSViewRepresentable build the correct concrete class.
-        if let isOwned, (entry.view is OwnedTerminalView) != isOwned {
+        // Durable controller eligibility is a type-level security boundary:
+        // foreign observers use ReadOnlyTerminalView, while locally managed
+        // sessions use an OwnedTerminalView whose live capability is separately
+        // revocable. A parked foreign observer must never cross that concrete
+        // class boundary (or vice versa).
+        if let controllerCapable,
+           (entry.view is OwnedTerminalView) != controllerCapable {
             remove(sessionID: sessionID)
             return nil
         }
@@ -87,7 +88,11 @@ final class TerminalSurfaceCache {
     /// pinned view is by definition not being read into history. A view the
     /// user left scrolled INTO history keeps its buffer and its position.
     func store(sessionID: String, view: ReadOnlyTerminalView, coordinator: NativeTerminalSurface.Coordinator) {
-        let pinnedToBottom = !view.canScroll || view.scrollPosition >= 0.99
+        // Integer `scrollPosition` can round a tiny-but-real fractional
+        // trackpad move to 0.99+ in deep history. The view owns the exact
+        // sub-row truth; trimming that parked surface would destroy the rows
+        // the user is visibly reading and invalidate its retained viewport.
+        let pinnedToBottom = view.isViewportAtLiveBottom
         if pinnedToBottom,
            view.getTerminal().options.scrollback > Self.parkedScrollbackLines {
             view.changeScrollback(Self.parkedScrollbackLines)

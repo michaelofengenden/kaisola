@@ -8,6 +8,17 @@ extension Notification.Name {
     static let kaisolaCheckForUpdates = Notification.Name("kaisolaCheckForUpdates")
 }
 
+enum SettingsSidebarLayoutPolicy {
+    /// A full-size-content window lets its sidebar paint beneath the titlebar.
+    /// At the minimum Settings width AppKit stops reserving the titlebar inset,
+    /// so the decorative brand would otherwise sit underneath the traffic
+    /// lights. Keep the same vertical rhythm, but leave that compact titlebar
+    /// region visually clear.
+    static func showsBrand(contentWidth: CGFloat) -> Bool {
+        contentWidth >= 900
+    }
+}
+
 /// The native Settings window (⌘,): workspace, terminal, Companion, and tools.
 struct SettingsView: View {
     @EnvironmentObject private var auth: AuthModel
@@ -16,6 +27,7 @@ struct SettingsView: View {
     /// per body evaluation is too slow.
     @State private var fontFamilies = [TerminalFontOptions.systemMonoSentinel]
     @State private var selectedSection: SettingsSection = .general
+    @State private var extensionsRoute: ExtensionsSettingsRoute?
     /// Update affordance from the app delegate (Sparkle).
     var checkForUpdates: (() -> Void)?
     var updateDetail: String?
@@ -93,31 +105,37 @@ struct SettingsView: View {
     var sectionChanged: ((String) -> Void)? = nil
 
     var body: some View {
-        HStack(spacing: 0) {
-            settingsNavigation
-            Divider()
-            VStack(spacing: 0) {
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(selectedSection.title)
-                            .font(.title3.weight(.semibold))
-                        Text(selectedSection.subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+        GeometryReader { geometry in
+            HStack(spacing: 0) {
+                settingsNavigation(
+                    showsBrand: SettingsSidebarLayoutPolicy.showsBrand(
+                        contentWidth: geometry.size.width
+                    )
+                )
+                Divider()
+                VStack(spacing: 0) {
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(selectedSection.title)
+                                .font(.title3.weight(.semibold))
+                            Text(selectedSection.subtitle)
+                                .font(.caption)
+                                .foregroundStyle(.kaisolaSecondary)
+                        }
+                        Spacer()
+                        if let dismiss {
+                            Button("Done", action: dismiss)
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .keyboardShortcut(.defaultAction)
+                        }
                     }
-                    Spacer()
-                    if let dismiss {
-                        Button("Done", action: dismiss)
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                            .keyboardShortcut(.defaultAction)
-                    }
+                    .padding(.horizontal, 20)
+                    .frame(height: 64)
+                    Divider().opacity(0.65)
+                    settingsContent
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .padding(.horizontal, 20)
-                .frame(height: 64)
-                Divider().opacity(0.65)
-                settingsContent
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
         // Settings opens large.
@@ -152,8 +170,11 @@ struct SettingsView: View {
         .onAppear {
             notificationsEnabled = NotificationBridge.shared.enabled
             refreshNotificationAuthorization()
-            if let initialSectionID,
-               let section = SettingsSection(rawValue: initialSectionID) {
+            if let route = ExtensionsSettingsRoute.parse(initialSectionID) {
+                extensionsRoute = route
+                selectedSection = .extensions
+            } else if let initialSectionID,
+                      let section = SettingsSection(rawValue: initialSectionID) {
                 selectedSection = section
             }
         }
@@ -171,18 +192,26 @@ struct SettingsView: View {
         }
     }
 
-    private var settingsNavigation: some View {
+    private func settingsNavigation(showsBrand: Bool) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 9) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 9)
-                        .fill(Color.accentColor.gradient)
-                    Image(systemName: "slider.horizontal.3")
-                        .foregroundStyle(.white)
+            Group {
+                if showsBrand {
+                    HStack(spacing: 9) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 9)
+                                .fill(Color.accentColor.gradient)
+                            Image(systemName: "slider.horizontal.3")
+                                .foregroundStyle(.white)
+                                .accessibilityHidden(true)
+                        }
+                        .frame(width: 30, height: 30)
+                        Text("Settings").font(.headline)
+                    }
+                } else {
+                    Color.clear
+                        .frame(height: 30)
                         .accessibilityHidden(true)
                 }
-                .frame(width: 30, height: 30)
-                Text("Settings").font(.headline)
             }
             .padding(.horizontal, 14)
             .padding(.bottom, 16)
@@ -192,7 +221,7 @@ struct SettingsView: View {
             ForEach(SettingsGroup.allCases) { group in
                 Text(group.title.uppercased())
                     .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .padding(.horizontal, 14)
                     .padding(.top, group == SettingsGroup.allCases.first ? 0 : 10)
                     .accessibilityAddTraits(.isHeader)
@@ -204,7 +233,7 @@ struct SettingsView: View {
             Spacer()
             Text("Changes apply instantly")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.kaisolaTertiary)
                 .padding(.horizontal, 14)
         }
         .padding(.vertical, 14)
@@ -233,7 +262,7 @@ struct SettingsView: View {
                 Spacer(minLength: 0)
             }
             .font(.callout.weight(selectedSection == section ? .semibold : .regular))
-            .foregroundStyle(selectedSection == section ? Color.primary : .secondary)
+            .foregroundStyle(selectedSection == section ? Color.primary : .kaisolaSecondary)
             .padding(.horizontal, 11)
             .frame(height: 34)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -255,7 +284,13 @@ struct SettingsView: View {
         case .terminal: terminal
         case .companion: CompanionSettingsTab()
         case .guardrails: guardrails.scrollContentBackground(.hidden)
-        case .mcp: McpSettingsTab(workspace: workspace).scrollContentBackground(.hidden)
+        case .extensions:
+            ExtensionsSettingsHub(
+                settings: settings,
+                workspace: workspace,
+                initialRoute: extensionsRoute,
+                routeChanged: { route in sectionChanged?(route) }
+            )
         case .accounts: accounts.scrollContentBackground(.hidden)
         case .agents: agents.scrollContentBackground(.hidden)
         case .models: ApiKeysSettingsTab(settings: settings).scrollContentBackground(.hidden)
@@ -587,7 +622,7 @@ struct SettingsView: View {
                         .accessibilityValue("\(Int(settings.terminalFontSize)) points")
                         Text("\(Int(settings.terminalFontSize))")
                             .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .frame(width: 24)
                     }
                     SettingsDivider()
@@ -602,7 +637,7 @@ struct SettingsView: View {
                         .accessibilityValue(String(format: "%.2f times", settings.terminalLineSpacing))
                         Text(String(format: "%.2f×", settings.terminalLineSpacing))
                             .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .frame(width: 42, alignment: .trailing)
                     }
                     SettingsDivider()
@@ -618,7 +653,7 @@ struct SettingsView: View {
                         ) {
                             Text(settings.terminalScrollbackLines.formatted(.number.grouping(.automatic)))
                                 .font(.callout.monospacedDigit())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .frame(width: 64, alignment: .trailing)
                         }
                         .accessibilityLabel("Terminal scrollback")
@@ -673,7 +708,7 @@ struct SettingsView: View {
                     }
                     Text("Full terminal output stays append-only until you close that terminal. This threshold warns; changing it never removes history.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 16)
                         .padding(.bottom, 14)
@@ -713,7 +748,7 @@ struct SettingsView: View {
                         }
                         Text("Terminal applications can never read your clipboard; Kaisola refuses those requests whether or not this is on.")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 16)
                             .padding(.bottom, 14)
@@ -818,21 +853,41 @@ struct SettingsView: View {
 
     private var agents: some View {
         Form {
-            CustomAgentsSection()
-            Section("ACP Adapters") {
+            Section("Built-in ACP Adapters") {
                 ForEach(AgentRegistry.all) { agent in
                     if let adapter = AcpAdapter.forAgent(agent.id) {
                         LabeledContent(agent.name) {
                             Text(([adapter.command] + adapter.arguments).joined(separator: " "))
                                 .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
                     }
                 }
-                Text("Adapters resolve @latest on every chat, so they stay current automatically.")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text("Built-in adapters resolve @latest. Custom adapters are pinned and launch only through their reviewed containment grant.")
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
+            }
+            Section("Extension Management") {
+                Text("Custom agents and project MCP servers now live with themes, grammars, and preview mappings in Extensions.")
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                HStack {
+                    Button("Manage Custom Agents…") {
+                        NSApp.sendAction(
+                            #selector(KaisolaMacAppDelegate.openAgentSettings(_:)),
+                            to: nil,
+                            from: nil
+                        )
+                    }
+                    Button("Manage MCP Servers…") {
+                        NSApp.sendAction(
+                            #selector(KaisolaMacAppDelegate.openMcpSettings(_:)),
+                            to: nil,
+                            from: nil
+                        )
+                    }
+                }
             }
         }
         .formStyle(.grouped)
@@ -866,14 +921,14 @@ enum SettingsGroup: String, CaseIterable, Identifiable {
 }
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, terminal, companion, guardrails, mcp, accounts, agents, models, shortcuts, usage, updates
+    case general, terminal, companion, guardrails, extensions, accounts, agents, models, shortcuts, usage, updates
     var id: String { rawValue }
 
     var group: SettingsGroup {
         switch self {
         case .general, .updates: .app
         case .terminal, .guardrails, .shortcuts: .workspace
-        case .agents, .models, .accounts, .mcp, .usage: .agents
+        case .agents, .models, .accounts, .extensions, .usage: .agents
         case .companion: .device
         }
     }
@@ -883,7 +938,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .terminal: "Terminal"
         case .companion: "Companion"
         case .guardrails: "Guardrails"
-        case .mcp: "MCP"
+        case .extensions: "Extensions"
         case .accounts: "Accounts"
         case .agents: "Agents"
         case .models: "Models & Keys"
@@ -898,9 +953,9 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .terminal: "Typography, palette, and interaction"
         case .companion: "Pair nearby devices and stay connected anywhere"
         case .guardrails: "Standing rules and sensitive files"
-        case .mcp: "Project tool servers"
+        case .extensions: "Agents, servers, themes, grammars, and previews"
         case .accounts: "Sign-ins, named accounts, and project overrides"
-        case .agents: "Custom agents and ACP adapters"
+        case .agents: "Built-in agents and ACP adapters"
         case .models: "Provider credentials, models, and routing"
         case .shortcuts: "Shortcuts and keymap.json overrides"
         case .usage: "Provider limits and live context"
@@ -913,7 +968,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .terminal: "terminal"
         case .companion: "iphone.and.arrow.forward"
         case .guardrails: "shield.lefthalf.filled"
-        case .mcp: "puzzlepiece.extension"
+        case .extensions: "puzzlepiece.extension"
         case .accounts: "person.crop.circle"
         case .agents: "sparkles"
         case .models: "key"
@@ -933,7 +988,7 @@ struct SettingsCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 0) {
             Label(title, systemImage: symbol)
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .padding(.horizontal, 16)
                 .frame(height: 40)
             Divider().opacity(0.65)
@@ -954,12 +1009,12 @@ struct SettingsRow<Trailing: View>: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: symbol)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: 22)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.callout.weight(.medium))
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+                Text(detail).font(.caption).foregroundStyle(.kaisolaSecondary)
             }
             Spacer(minLength: 16)
             trailing
@@ -981,7 +1036,7 @@ private struct SettingsChoiceLabel: View {
             Text(title).lineLimit(1)
             Image(systemName: "chevron.up.chevron.down")
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.kaisolaTertiary)
         }
         .font(.callout)
         .padding(.horizontal, 10)
@@ -990,10 +1045,8 @@ private struct SettingsChoiceLabel: View {
     }
 }
 
-/// The Color card: theme picker over the registry, a live preview drawn from
-/// the selected theme's own palette, and the custom-theme roster — import,
-/// remove, and an explanation line for any theme that cannot install (PR 6's
-/// disabled-with-a-reason contract).
+/// The affected terminal surface keeps selection and a live preview here, then
+/// deep-links registry management to the consolidated Extensions destination.
 private struct TerminalColorCard: View {
     @ObservedObject var settings: NativePreviewSettings
     @Environment(\.colorScheme) private var colorScheme
@@ -1027,92 +1080,55 @@ private struct TerminalColorCard: View {
                 light: colorScheme == .light
             )
                 .padding(.horizontal, 16)
-                .padding(.bottom, customSpecs.isEmpty ? 14 : 6)
-            customThemeRoster
+                .padding(.bottom, 8)
+            if let invalidTheme = customSpecs.first(where: { $0.validationError != nil }),
+               let reason = invalidTheme.validationError {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Label(reason, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                    Spacer()
+                    Button("Review") {
+                        let route = ExtensionsSettingsRoute(
+                            category: .terminalThemes,
+                            itemID: invalidTheme.id
+                        ).rawValue
+                        NSApp.sendAction(
+                            #selector(KaisolaMacAppDelegate.openExtensionSettings(_:)),
+                            to: nil,
+                            from: route
+                        )
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Review invalid theme \(invalidTheme.title)")
+                    .accessibilityHint("Opens its validation error in Extensions settings")
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 6)
+            }
+            HStack {
+                Label(
+                    "Import, validate, and remove palettes in Extensions.",
+                    systemImage: "puzzlepiece.extension"
+                )
+                .font(.caption)
+                .foregroundStyle(.kaisolaSecondary)
+                Spacer()
+                Button("Manage Themes…") {
+                    NSApp.sendAction(
+                        #selector(KaisolaMacAppDelegate.openTerminalThemeSettings(_:)),
+                        to: nil,
+                        from: nil
+                    )
+                }
+                .buttonStyle(.borderless)
+                .accessibilityHint("Opens Extensions settings at Terminal Themes")
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 14)
         }
         .onAppear { customSpecs = store.specs() }
-    }
-
-    @ViewBuilder
-    private var customThemeRoster: some View {
-        ForEach(customSpecs) { spec in
-            HStack(spacing: 8) {
-                if let reason = spec.validationError {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(spec.title.isEmpty ? spec.id : spec.title)
-                            .foregroundStyle(.secondary)
-                        Text(reason)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                } else {
-                    Image(systemName: "paintpalette")
-                        .foregroundStyle(.secondary)
-                    Text(spec.title)
-                }
-                Spacer()
-                Button("Remove") {
-                    store.remove(id: spec.id)
-                    customSpecs = store.specs()
-                    // Removing the selected theme falls back at resolve time;
-                    // the stored choice is left alone so re-importing the
-                    // theme restores it.
-                }
-                .buttonStyle(.link)
-            }
-            .font(.system(size: 12))
-            .padding(.horizontal, 16)
-            .padding(.vertical, 3)
-        }
-        HStack {
-            Button {
-                importCustomTheme()
-            } label: {
-                Label("Import Theme…", systemImage: "square.and.arrow.down")
-            }
-            .buttonStyle(.link)
-            .help("A JSON file with id, title, and light/dark palettes (hex colors, 16 ANSI slots)")
-            Spacer()
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 4)
-        .padding(.bottom, 14)
-    }
-
-    private func importCustomTheme() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.json]
-        panel.prompt = "Import Theme"
-        panel.begin { response in
-            guard response == .OK, let url = panel.urls.first else { return }
-            Task { @MainActor in
-                guard let data = try? Data(contentsOf: url),
-                      let spec = try? JSONDecoder().decode(CustomThemeSpec.self, from: data) else {
-                    ToastCenter.shared.show(
-                        "That file is not a theme: it must be JSON with id, title, and light/dark palettes.",
-                        style: .error,
-                        duration: 5
-                    )
-                    return
-                }
-                if let reason = store.upsert(spec) {
-                    ToastCenter.shared.show(
-                        "Imported, but it cannot be used yet: \(reason)",
-                        style: .info,
-                        duration: 6
-                    )
-                } else {
-                    settings.terminalThemeID = spec.id
-                    ToastCenter.shared.show("Imported \(spec.title) and switched to it", style: .success)
-                }
-                customSpecs = store.specs()
-            }
-        }
     }
 }
 
@@ -1179,7 +1195,7 @@ private struct GuardrailsSettings: View {
             Section("Standing Allow Rules") {
                 if rules.isEmpty {
                     Text("No rules yet — \"Always Allow\" on a permission ask creates one.")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(.kaisolaSecondary)
                 }
                 ForEach(rules) { rule in
                     HStack {
@@ -1187,7 +1203,7 @@ private struct GuardrailsSettings: View {
                             Text(AcpPermissionRules.ruleLabel(action: rule.action, resource: rule.resource))
                                 .font(.callout)
                             Text(rule.workspace)
-                                .font(.caption2).foregroundStyle(.secondary)
+                                .font(.caption2).foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1).truncationMode(.middle)
                         }
                         Spacer()

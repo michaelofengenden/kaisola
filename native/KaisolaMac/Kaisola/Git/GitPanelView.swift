@@ -644,8 +644,8 @@ struct GitPanelView: View {
         HStack(spacing: 8) {
             Image(systemName: "arrow.triangle.branch")
             Text(model.status?.branch ?? "—").font(.subheadline.weight(.medium))
-            if let s = model.status, s.ahead > 0 { Text("↑\(s.ahead)").font(.caption).foregroundStyle(.secondary) }
-            if let s = model.status, s.behind > 0 { Text("↓\(s.behind)").font(.caption).foregroundStyle(.secondary) }
+            if let s = model.status, s.ahead > 0 { Text("↑\(s.ahead)").font(.caption).foregroundStyle(.kaisolaSecondary) }
+            if let s = model.status, s.behind > 0 { Text("↓\(s.behind)").font(.caption).foregroundStyle(.kaisolaSecondary) }
             Spacer()
             Button(action: model.pull) {
                 Label("Pull", systemImage: "arrow.down.circle")
@@ -728,7 +728,7 @@ struct GitPanelView: View {
             Spacer()
             if let summary = GitStatsRendering.summary(status.combinedStats) {
                 Text("Total \(summary)")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .accessibilityIdentifier("git.stats.combined")
             }
         }
@@ -744,7 +744,7 @@ struct GitPanelView: View {
             HStack {
                 Text("History")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Spacer()
                 Button(model.log.isEmpty ? "Show" : "Refresh") { model.loadLog() }
                     .buttonStyle(.borderless).font(.caption)
@@ -752,7 +752,7 @@ struct GitPanelView: View {
             .padding(.top, 8)
             ForEach(model.log) { commit in
                 HStack(spacing: 8) {
-                    Text(commit.shortHash).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    Text(commit.shortHash).font(.caption.monospaced()).foregroundStyle(.kaisolaSecondary)
                     Text(commit.subject).font(.caption).lineLimit(1)
                     Spacer()
                 }
@@ -771,7 +771,7 @@ struct GitPanelView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Pull Request")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 10)
 
@@ -790,11 +790,11 @@ struct GitPanelView: View {
                 }
             }
             if let note = model.prState {
-                Text(note).font(.caption2).foregroundStyle(.secondary)
+                Text(note).font(.caption2).foregroundStyle(.kaisolaSecondary)
             }
             if !model.ghAvailable {
                 Text("GitHub CLI (gh) not found — the confirm step opens a browser compare page instead.")
-                    .font(.caption2).foregroundStyle(.tertiary)
+                    .font(.caption2).foregroundStyle(.kaisolaTertiary)
             }
         }
         .padding(.horizontal, model.status?.isClean == true ? 12 : 0)
@@ -806,22 +806,22 @@ struct GitPanelView: View {
     private var prepareStage: some View {
         if let prep = model.prPrepInfo {
             HStack(spacing: 6) {
-                Image(systemName: "arrow.triangle.branch").font(.caption2).foregroundStyle(.secondary)
+                Image(systemName: "arrow.triangle.branch").font(.caption2).foregroundStyle(.kaisolaSecondary)
                 Text(prep.branch).font(.caption.monospaced())
                 if prep.aheadCount > 0 {
                     Text("· \(prep.aheadCount) PR \(prep.aheadCount == 1 ? "commit" : "commits")")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 } else {
                     Text("· no pull request commits")
                         .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.kaisolaTertiary)
                 }
                 Spacer()
             }
             if prep.isDefaultBranch, prep.aheadCount > 0 {
                 Text("On \(prep.branch) — the review proposes a new branch for the pull request.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.caption2).foregroundStyle(.kaisolaSecondary)
             }
         }
 
@@ -848,9 +848,9 @@ struct GitPanelView: View {
             }
 
             HStack(spacing: 6) {
-                Image(systemName: "arrow.triangle.pull").font(.caption2).foregroundStyle(.secondary)
+                Image(systemName: "arrow.triangle.pull").font(.caption2).foregroundStyle(.kaisolaSecondary)
                 Text(plan.baseBranch).font(.caption.monospaced())
-                Image(systemName: "arrow.left").font(.caption2).foregroundStyle(.tertiary)
+                Image(systemName: "arrow.left").font(.caption2).foregroundStyle(.kaisolaTertiary)
                 Text(plan.headBranch).font(.caption.monospaced())
                 if plan.createsBranch {
                     Text("new branch")
@@ -864,12 +864,12 @@ struct GitPanelView: View {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("Remote")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Text(plan.destination.remoteName)
                     .font(.caption2.monospaced())
                 Text("·")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                 Text(plan.destination.remoteDisplayURL)
                     .font(.caption2.monospaced())
                     .lineLimit(1)
@@ -885,7 +885,7 @@ struct GitPanelView: View {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("Destination")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Text("\(plan.destination.webURL ?? plan.destination.remoteDisplayURL) · \(plan.baseBranch)")
                     .font(.caption2.monospaced())
                     .lineLimit(1)
@@ -908,14 +908,14 @@ struct GitPanelView: View {
             Text("\(plan.commitCount) \(plan.commitCount == 1 ? "commit" : "commits") · "
                  + "\(plan.changedFileCount) \(plan.changedFileCount == 1 ? "file" : "files") changed")
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
 
             ForEach(Array(plan.commitSubjects.prefix(6).enumerated()), id: \.offset) { _, subject in
-                Text("• \(subject)").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                Text("• \(subject)").font(.caption2).foregroundStyle(.kaisolaSecondary).lineLimit(1)
             }
             if plan.commitSubjects.count > 6 {
                 Text("+ \(plan.commitSubjects.count - 6) more")
-                    .font(.caption2).foregroundStyle(.tertiary)
+                    .font(.caption2).foregroundStyle(.kaisolaTertiary)
             }
 
             if !plan.changedFiles.isEmpty {
@@ -967,7 +967,7 @@ struct GitPanelView: View {
                         + "\(plan.destination.remoteName) and open the pull request against \(plan.baseBranch)."
                 )
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
 
             HStack(spacing: 8) {
@@ -1028,12 +1028,12 @@ struct GitPanelView: View {
                     .fontWeight(.semibold)
                 if let stats, let summary = GitStatsRendering.summary(stats) {
                     Text(summary)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.kaisolaTertiary)
                         .accessibilityIdentifier("git.stats.\(staged ? "staged" : "unstaged")")
                 }
             }
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .padding(.top, 4)
             ForEach(files, id: \.0) { path, code in
                 VStack(alignment: .leading, spacing: 2) {
@@ -1045,7 +1045,7 @@ struct GitPanelView: View {
                             HStack(spacing: 4) {
                                 Text((path as NSString).lastPathComponent).lineLimit(1)
                                 Text((path as NSString).deletingLastPathComponent)
-                                    .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                                    .font(.caption2).foregroundStyle(.kaisolaTertiary).lineLimit(1)
                             }
                             .contentShape(Rectangle())
                         }
@@ -1152,7 +1152,7 @@ private struct PatchText: View {
             if rendered.isTruncated {
                 Label("Large diff truncated in this view", systemImage: "ellipsis.rectangle")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.horizontal, 8)
                     .padding(.bottom, 5)
             }

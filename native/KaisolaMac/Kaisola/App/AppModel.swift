@@ -306,6 +306,15 @@ final class AppModel: ObservableObject {
     private var terminalInputQueues: [String: [PendingTerminalInput]] = [:]
     private var terminalInputDrainTasks: [String: Task<Void, Never>] = [:]
     private var terminalInputFailureNoticeAt: [String: Date] = [:]
+    /// Terminals whose open agent turn the broker acknowledged. Local activity
+    /// state only advances on a positive `terminal.agentTurn` reply, so the app
+    /// never claims a turn the broker did not record.
+    private var acknowledgedAgentTurnTerminalIDs: Set<String> = []
+    /// Terminals whose last agent-turn signal the broker refused (or never
+    /// answered). The broker counts these idle while a turn is really running,
+    /// so a rolling cutover could retire their generation underneath the agent.
+    @Published private(set) var agentTurnSignalFailureTerminalIDs: Set<String> = []
+    private var agentTurnSignalFailureNoticeAt: [String: Date] = [:]
     /// Broker PTYs can emit hundreds of small packets in one display interval.
     /// Merge contiguous packets for 16 ms so a 64 MiB retained document is
     /// copied and published at most once per frame, while offsets and ordering
@@ -5246,10 +5255,13 @@ final class AppModel: ObservableObject {
                     data: packet.data
                 )
                 if packet.opensAgentTurn {
-                    try? await controlClient.setAgentTurn(
+                    // Deliberately not part of the write's error path: a
+                    // refused turn signal is an activity-tracking failure, not
+                    // a broken connection, so it must not drop queued bytes.
+                    await signalAgentTurn(
+                        busy: true,
                         projectID: packet.projectID,
-                        terminalID: terminalID,
-                        busy: true
+                        terminalID: terminalID
                     )
                 }
             } catch {
@@ -5265,6 +5277,78 @@ final class AppModel: ObservableObject {
         if terminalInputQueues[terminalID]?.isEmpty == true {
             terminalInputQueues.removeValue(forKey: terminalID)
         }
+    }
+
+    /// Tells the broker a turn opened or closed and only then moves local
+    /// activity state. The broker replies `{ok:false}` for a record it no
+    /// longer holds; treating that as success is what let the app protect a
+    /// turn the broker had already written off as idle.
+    private func signalAgentTurn(
+        busy: Bool,
+        projectID: String,
+        terminalID: String
+    ) async {
+        do {
+            try await controlClient.setAgentTurn(
+                projectID: projectID,
+                terminalID: terminalID,
+                busy: busy
+            )
+            if busy {
+                acknowledgedAgentTurnTerminalIDs.insert(terminalID)
+            } else {
+                acknowledgedAgentTurnTerminalIDs.remove(terminalID)
+            }
+            if agentTurnSignalFailureTerminalIDs.remove(terminalID) != nil {
+                agentTurnSignalFailureNoticeAt.removeValue(forKey: terminalID)
+            }
+        } catch {
+            acknowledgedAgentTurnTerminalIDs.remove(terminalID)
+            agentTurnSignalFailureTerminalIDs.insert(terminalID)
+            reportAgentTurnSignalFailure(terminalID)
+        }
+    }
+
+    /// Terminals whose open agent turn the broker confirmed and has not yet
+    /// reported finished. Only positive acknowledgements land here.
+    var openAgentTurnTerminalIDs: Set<String> {
+        guard !acknowledgedAgentTurnTerminalIDs.isEmpty else { return [] }
+        let live = Set(sessions.lazy.filter { !$0.exited }.map(\.id))
+        return acknowledgedAgentTurnTerminalIDs.intersection(live)
+    }
+
+    /// Terminals the app believes are mid-turn while the broker does not.
+    /// Rows that already left the live inventory clear themselves: a terminal
+    /// the broker no longer holds cannot be cut over underneath anything.
+    var unprotectedAgentTurnTerminalIDs: Set<String> {
+        guard !agentTurnSignalFailureTerminalIDs.isEmpty else { return [] }
+        let live = Set(sessions.lazy.filter { !$0.exited }.map(\.id))
+        return agentTurnSignalFailureTerminalIDs.intersection(live)
+    }
+
+    /// The native half of the terminal-continuity update gate. While a live
+    /// terminal's activity is unsignalled the broker would read it as idle and
+    /// accept a rolling cutover, so the app stops asking for one.
+    var brokerUpdateGateBlockedDetail: String? {
+        let blocked = unprotectedAgentTurnTerminalIDs
+        guard !blocked.isEmpty else { return nil }
+        let subject = blocked.count == 1
+            ? "1 terminal's agent activity"
+            : "\(blocked.count) terminals' agent activity"
+        return "Terminal-continuity updates are paused: \(subject) could not be reported to the "
+            + "background service, which would read those sessions as idle."
+    }
+
+    private func reportAgentTurnSignalFailure(_ terminalID: String) {
+        let now = Date()
+        if let last = agentTurnSignalFailureNoticeAt[terminalID],
+           now.timeIntervalSince(last) < 2 { return }
+        agentTurnSignalFailureNoticeAt[terminalID] = now
+        ToastCenter.shared.show(
+            "Agent activity could not be reported; terminal-continuity updates are paused",
+            style: .error,
+            duration: 6
+        )
     }
 
     private func reportTerminalInputFailure(_ terminalID: String) {
@@ -5420,10 +5504,10 @@ final class AppModel: ObservableObject {
                 || detectedAgentNamesByTerminalID[current.id] != nil
         ) && data.contains("\r")
         if opensAgentTurn {
-            try? await controlClient.setAgentTurn(
+            await signalAgentTurn(
+                busy: true,
                 projectID: current.projectID,
-                terminalID: current.id,
-                busy: true
+                terminalID: current.id
             )
         }
     }
@@ -5721,7 +5805,12 @@ final class AppModel: ObservableObject {
                 await controlClient.detachGenerations(emptyDrains)
                 brokerRollbackCandidates.removeAll { emptyDrains.contains($0.id) }
             }
-            if let activeBrokerUpgradeMonitor {
+            // A refused agent-turn signal leaves the broker reading a working
+            // terminal as idle, and the broker's own quiescence check is the
+            // only thing standing between a rolling cutover and that turn.
+            // Hold the gate shut here rather than ask for an update the broker
+            // would wrongly consider safe.
+            if let activeBrokerUpgradeMonitor, unprotectedAgentTurnTerminalIDs.isEmpty {
                 let next = await activeBrokerUpgradeMonitor.attemptUpgradeIfNeeded()
                 if next != brokerUpgradeState { brokerUpgradeState = next }
                 if case let .current(contentDigest) = next,
@@ -6828,6 +6917,9 @@ final class AppModel: ObservableObject {
     }
 
     private func applyActivity(busy: Bool, completedAt: Int64?, to terminalID: String) {
+        // The broker is authoritative for when a turn ends, so its idle edge
+        // retires the local acknowledgement the app opened the turn with.
+        if !busy { acknowledgedAgentTurnTerminalIDs.remove(terminalID) }
         guard let index = sessions.firstIndex(where: { $0.id == terminalID }) else { return }
         let wasWorking = { if case .working = sessions[index].agentActivity { return true }; return false }()
         if busy {

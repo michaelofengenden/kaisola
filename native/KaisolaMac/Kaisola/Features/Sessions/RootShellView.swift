@@ -1482,6 +1482,7 @@ struct RootShellView: View {
             state: model.connectionState,
             brokerUpgradeState: model.brokerUpgradeState,
             brokerGenerationDetail: model.brokerGenerationDetail,
+            brokerUpdateGateBlockedDetail: model.brokerUpdateGateBlockedDetail,
             brokerRollbackCandidates: model.brokerRollbackCandidates,
             rollbackBrokerGeneration: { generationID in
                 Task { await model.rollbackBrokerGeneration(generationID) }
@@ -4634,6 +4635,11 @@ private struct ConnectionFooter: View {
     let state: AppModel.ConnectionState
     let brokerUpgradeState: BrokerUpgradeState
     let brokerGenerationDetail: String
+    /// Non-nil while the app is holding terminal-continuity updates back
+    /// because a live terminal's agent activity never reached the broker. The
+    /// toast that announced it is long gone by the time anyone wonders why
+    /// updates stopped, so the reason lives here too.
+    var brokerUpdateGateBlockedDetail: String?
     let brokerRollbackCandidates: [BrokerRollbackCandidate]
     let rollbackBrokerGeneration: (String) -> Void
     let reload: () -> Void
@@ -4885,6 +4891,9 @@ private struct ConnectionFooter: View {
                 EmptyView()
             } else {
                 Text(brokerUpgradeState.detail)
+            }
+            if let brokerUpdateGateBlockedDetail {
+                Text(brokerUpdateGateBlockedDetail)
             }
             if usage.totalPeakTokens > 0 {
                 Text("Usage: \(usage.totalPeakTokens / 1000)k tokens · \(Int((usage.contextPressure * 100).rounded()))% context")

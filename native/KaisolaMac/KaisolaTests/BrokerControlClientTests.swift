@@ -52,6 +52,52 @@ final class BrokerControlClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testAgentTurnRequiresPositiveBrokerAcknowledgement() async throws {
+        let transport = ScriptedControlBrokerTransport(
+            resizeAccepted: true,
+            agentTurnAccepted: false
+        )
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        do {
+            try await client.setAgentTurn(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                busy: true
+            )
+            XCTFail("A refused turn leaves the broker eligible for rolling cutover.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .requestFailed("terminal.agentTurn"))
+        }
+        await client.disconnect()
+    }
+
+    func testAgentTurnAcceptsExplicitPositiveBrokerAcknowledgement() async throws {
+        let transport = ScriptedControlBrokerTransport(
+            resizeAccepted: true,
+            agentTurnAccepted: true
+        )
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.setAgentTurn(
+            projectID: "project.one",
+            terminalID: "terminal-one",
+            busy: true
+        )
+        let frames = await transport.sentFrames()
+        let request = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(request["method"]?.stringValue, "terminal.agentTurn")
+        XCTAssertEqual(request["params"]?.objectValue?["busy"]?.boolValue, true)
+        await client.disconnect()
+    }
+
     func testControllerLaneReportsUnexpectedPeerDisconnect() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
         let client = BrokerControlClient(
@@ -363,12 +409,14 @@ private actor DisconnectSignal {
 
 private actor ScriptedControlBrokerTransport: BrokerByteTransport {
     private let resizeAccepted: Bool
+    private let agentTurnAccepted: Bool
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []
     private var waiter: CheckedContinuation<Data?, Never>?
 
-    init(resizeAccepted: Bool) {
+    init(resizeAccepted: Bool, agentTurnAccepted: Bool = true) {
         self.resizeAccepted = resizeAccepted
+        self.agentTurnAccepted = agentTurnAccepted
     }
 
     func connect(path: String) async throws {}
@@ -393,9 +441,12 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
         }
         guard type == "request", let id = object["id"]?.stringValue else { return }
         let result: JSONValue
-        if object["method"]?.stringValue == "terminal.resize" {
+        switch object["method"]?.stringValue {
+        case "terminal.resize":
             result = .object(["ok": .bool(resizeAccepted)])
-        } else {
+        case "terminal.agentTurn":
+            result = .object(["ok": .bool(agentTurnAccepted)])
+        default:
             result = .object(["ok": .bool(true)])
         }
         deliver(try encoded(.object([

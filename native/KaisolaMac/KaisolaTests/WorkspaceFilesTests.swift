@@ -480,6 +480,244 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: collidingSource.path))
     }
 
+    func testDescriptorAnchoredRenameMoveTrashAndRestoreSucceed() throws {
+        let trashDirectory = root.deletingLastPathComponent()
+            .appendingPathComponent("kaisola-trash-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: trashDirectory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: trashDirectory) }
+
+        let renamed = try WorkspaceFileOperations.rename(
+            item: root.appendingPathComponent("README.md"),
+            to: "GUIDE.md",
+            workspaceRoot: root
+        )
+        let moved = try WorkspaceFileOperations.move(
+            item: renamed.destination,
+            to: root.appendingPathComponent("src/GUIDE.md"),
+            workspaceRoot: root
+        )
+        try "keep me".write(
+            to: trashDirectory.appendingPathComponent("GUIDE.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let trashed = try WorkspaceFileOperations.moveToTrash(
+            item: moved.destination,
+            workspaceRoot: root,
+            trashDirectory: trashDirectory
+        )
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: moved.destination.path))
+        XCTAssertEqual(trashed.trashed.deletingLastPathComponent(), trashDirectory.standardizedFileURL)
+        XCTAssertEqual(trashed.trashed.lastPathComponent, "GUIDE 2.md")
+        XCTAssertEqual(try String(contentsOf: trashed.trashed, encoding: .utf8), "hello")
+        XCTAssertEqual(
+            try String(contentsOf: trashDirectory.appendingPathComponent("GUIDE.md"), encoding: .utf8),
+            "keep me"
+        )
+
+        try WorkspaceFileOperations.restoreFromTrash(trashed, workspaceRoot: root)
+        XCTAssertEqual(try String(contentsOf: moved.destination, encoding: .utf8), "hello")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: trashed.trashed.path))
+    }
+
+    func testDescriptorAnchoredRenamePreservesCaseOnlyRenames() throws {
+        let source = root.appendingPathComponent("CaseName.md")
+        try "case".write(to: source, atomically: true, encoding: .utf8)
+
+        let move = try WorkspaceFileOperations.rename(
+            item: source,
+            to: "casename.md",
+            workspaceRoot: root
+        )
+
+        XCTAssertEqual(try String(contentsOf: move.destination, encoding: .utf8), "case")
+        XCTAssertTrue(try FileManager.default.contentsOfDirectory(atPath: root.path).contains("casename.md"))
+        XCTAssertFalse(try FileManager.default.contentsOfDirectory(atPath: root.path).contains("CaseName.md"))
+    }
+
+    func testDescriptorAnchoredMutationsRejectSymlinkLeafAndParents() throws {
+        let outside = root.deletingLastPathComponent()
+            .appendingPathComponent("kaisola-linked-parent-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: outside) }
+
+        let linkedLeaf = root.appendingPathComponent("linked-leaf.md")
+        try FileManager.default.createSymbolicLink(
+            at: linkedLeaf,
+            withDestinationURL: root.appendingPathComponent("README.md")
+        )
+        XCTAssertThrowsError(try WorkspaceFileOperations.rename(
+            item: linkedLeaf,
+            to: "renamed.md",
+            workspaceRoot: root
+        )) { error in
+            XCTAssertEqual(error as? WorkspaceFileOperations.OperationError, .symbolicLink)
+        }
+        XCTAssertThrowsError(try WorkspaceFileOperations.moveToTrash(
+            item: linkedLeaf,
+            workspaceRoot: root,
+            trashDirectory: outside
+        )) { error in
+            XCTAssertEqual(error as? WorkspaceFileOperations.OperationError, .symbolicLink)
+        }
+
+        let linkedParent = root.appendingPathComponent("linked-parent", isDirectory: true)
+        try FileManager.default.createSymbolicLink(
+            at: linkedParent,
+            withDestinationURL: root.appendingPathComponent("src", isDirectory: true)
+        )
+        XCTAssertThrowsError(try WorkspaceFileOperations.move(
+            item: root.appendingPathComponent("README.md"),
+            to: linkedParent.appendingPathComponent("moved.md"),
+            workspaceRoot: root
+        )) { error in
+            XCTAssertEqual(error as? WorkspaceFileOperations.OperationError, .symbolicLink)
+        }
+        XCTAssertThrowsError(try WorkspaceFileOperations.moveToTrash(
+            item: linkedParent.appendingPathComponent("main.swift"),
+            workspaceRoot: root,
+            trashDirectory: outside
+        )) { error in
+            XCTAssertEqual(error as? WorkspaceFileOperations.OperationError, .symbolicLink)
+        }
+        XCTAssertEqual(
+            try String(contentsOf: root.appendingPathComponent("src/main.swift"), encoding: .utf8),
+            "swift"
+        )
+    }
+
+    func testDescriptorAnchoredMoveRejectsOutOfRootDestination() throws {
+        let outside = root.deletingLastPathComponent()
+            .appendingPathComponent("kaisola-outside-move-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: outside) }
+
+        XCTAssertThrowsError(try WorkspaceFileOperations.move(
+            item: root.appendingPathComponent("README.md"),
+            to: outside.appendingPathComponent("README.md"),
+            workspaceRoot: root
+        )) { error in
+            XCTAssertEqual(error as? WorkspaceFileOperations.OperationError, .outsideWorkspace)
+        }
+        XCTAssertEqual(
+            try String(contentsOf: root.appendingPathComponent("README.md"), encoding: .utf8),
+            "hello"
+        )
+    }
+
+    func testDescriptorAnchoredRenameIgnoresParentSymlinkSwapAfterReview() throws {
+        let parent = root.appendingPathComponent("rename-parent", isDirectory: true)
+        let parkedParent = root.appendingPathComponent("rename-parent-parked", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        try "authorized".write(
+            to: parent.appendingPathComponent("source.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let outside = root.deletingLastPathComponent()
+            .appendingPathComponent("kaisola-rename-swap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+        try "outside".write(
+            to: outside.appendingPathComponent("source.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        defer { try? FileManager.default.removeItem(at: outside) }
+
+        _ = try WorkspaceFileOperations.rename(
+            item: parent.appendingPathComponent("source.md"),
+            to: "renamed.md",
+            workspaceRoot: root,
+            beforeMutation: {
+                try FileManager.default.moveItem(at: parent, to: parkedParent)
+                try FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+            }
+        )
+
+        XCTAssertEqual(
+            try String(contentsOf: parkedParent.appendingPathComponent("renamed.md"), encoding: .utf8),
+            "authorized"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: outside.appendingPathComponent("source.md"), encoding: .utf8),
+            "outside"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("renamed.md").path))
+    }
+
+    func testDescriptorAnchoredMoveIgnoresDestinationSymlinkSwapAfterReview() throws {
+        let source = root.appendingPathComponent("move-source.md")
+        try "authorized".write(to: source, atomically: true, encoding: .utf8)
+        let destinationParent = root.appendingPathComponent("move-destination", isDirectory: true)
+        let parkedDestination = root.appendingPathComponent("move-destination-parked", isDirectory: true)
+        try FileManager.default.createDirectory(at: destinationParent, withIntermediateDirectories: false)
+        let outside = root.deletingLastPathComponent()
+            .appendingPathComponent("kaisola-move-swap-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: outside) }
+
+        _ = try WorkspaceFileOperations.move(
+            item: source,
+            to: destinationParent.appendingPathComponent("move-source.md"),
+            workspaceRoot: root,
+            beforeMutation: {
+                try FileManager.default.moveItem(at: destinationParent, to: parkedDestination)
+                try FileManager.default.createSymbolicLink(at: destinationParent, withDestinationURL: outside)
+            }
+        )
+
+        XCTAssertEqual(
+            try String(contentsOf: parkedDestination.appendingPathComponent("move-source.md"), encoding: .utf8),
+            "authorized"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outside.appendingPathComponent("move-source.md").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    func testDescriptorAnchoredTrashIgnoresParentSymlinkSwapAfterReview() throws {
+        let parent = root.appendingPathComponent("trash-parent", isDirectory: true)
+        let parkedParent = root.appendingPathComponent("trash-parent-parked", isDirectory: true)
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+        try "authorized".write(
+            to: parent.appendingPathComponent("source.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let outside = root.deletingLastPathComponent()
+            .appendingPathComponent("kaisola-trash-swap-\(UUID().uuidString)", isDirectory: true)
+        let trashDirectory = root.deletingLastPathComponent()
+            .appendingPathComponent("kaisola-trash-stage-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(at: trashDirectory, withIntermediateDirectories: false)
+        try "outside".write(
+            to: outside.appendingPathComponent("source.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        defer {
+            try? FileManager.default.removeItem(at: outside)
+            try? FileManager.default.removeItem(at: trashDirectory)
+        }
+
+        let move = try WorkspaceFileOperations.moveToTrash(
+            item: parent.appendingPathComponent("source.md"),
+            workspaceRoot: root,
+            trashDirectory: trashDirectory,
+            beforeMutation: {
+                try FileManager.default.moveItem(at: parent, to: parkedParent)
+                try FileManager.default.createSymbolicLink(at: parent, withDestinationURL: outside)
+            }
+        )
+
+        XCTAssertEqual(try String(contentsOf: move.trashed, encoding: .utf8), "authorized")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: parkedParent.appendingPathComponent("source.md").path))
+        XCTAssertEqual(
+            try String(contentsOf: outside.appendingPathComponent("source.md"), encoding: .utf8),
+            "outside"
+        )
+    }
+
     func testWorkspaceMoveRejectsSameLocationDescendantsAndSymlinkParents() throws {
         let source = root.appendingPathComponent("src", isDirectory: true)
         let nested = source.appendingPathComponent("nested", isDirectory: true)

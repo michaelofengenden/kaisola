@@ -15,6 +15,11 @@ struct FileNode: Identifiable, Equatable, Sendable {
 /// only target the mounted workspace, existing-item actions never target its
 /// root, creation is leaf-only, and moves never overwrite or traverse links.
 enum WorkspaceFileOperations {
+    /// Test seams execute only after every workspace directory descriptor and
+    /// source leaf have been verified, but before the descriptor-relative
+    /// mutation. Production callers use the default `nil` hook.
+    typealias BeforeMutation = () throws -> Void
+
     struct Move: Equatable, Sendable {
         let source: URL
         let destination: URL
@@ -97,11 +102,22 @@ enum WorkspaceFileOperations {
         )
     }
 
-    /// Performs the already-validated same-directory rename. `moveItem` keeps
-    /// Finder/APFS collision behavior authoritative and never overwrites.
-    static func rename(item: URL, to proposedName: String, workspaceRoot: URL) throws -> Move {
+    /// Performs the already-validated same-directory rename relative to an
+    /// opened parent descriptor. An ancestor replaced after validation cannot
+    /// redirect this mutation, and `RENAME_EXCL` preserves no-overwrite
+    /// behavior if a destination appears concurrently.
+    static func rename(
+        item: URL,
+        to proposedName: String,
+        workspaceRoot: URL,
+        beforeMutation: BeforeMutation? = nil
+    ) throws -> Move {
         let move = try renameMove(item: item, to: proposedName, workspaceRoot: workspaceRoot)
-        try FileManager.default.moveItem(at: move.source, to: move.destination)
+        try descriptorAnchoredMove(
+            move,
+            workspaceRoot: workspaceRoot,
+            beforeMutation: beforeMutation
+        )
         return move
     }
 
@@ -122,11 +138,20 @@ enum WorkspaceFileOperations {
         )
     }
 
-    /// Move one item to an exact validated destination. FileManager remains the
-    /// final collision authority if the filesystem changes after planning.
-    static func move(item: URL, to destination: URL, workspaceRoot: URL) throws -> Move {
+    /// Move one item to an exact validated destination. Both source and
+    /// destination parents remain pinned by descriptors through the mutation.
+    static func move(
+        item: URL,
+        to destination: URL,
+        workspaceRoot: URL,
+        beforeMutation: BeforeMutation? = nil
+    ) throws -> Move {
         let move = try movePlan(item: item, to: destination, workspaceRoot: workspaceRoot)
-        try FileManager.default.moveItem(at: move.source, to: move.destination)
+        try descriptorAnchoredMove(
+            move,
+            workspaceRoot: workspaceRoot,
+            beforeMutation: beforeMutation
+        )
         return move
     }
 
@@ -183,21 +208,51 @@ enum WorkspaceFileOperations {
     }
 
     /// Moves one validated file or directory to Trash and returns its actual
-    /// resulting URL. macOS can change the name to avoid a Trash collision.
-    static func moveToTrash(item: URL, workspaceRoot: URL) throws -> TrashMove {
+    /// resulting URL. The source parent and the volume-appropriate Trash
+    /// directory are pinned before the exclusive rename. The injectable Trash
+    /// directory and hook keep adversarial tests deterministic and never send
+    /// fixtures to the user's real Trash.
+    static func moveToTrash(
+        item: URL,
+        workspaceRoot: URL,
+        trashDirectory injectedTrashDirectory: URL? = nil,
+        beforeMutation: BeforeMutation? = nil
+    ) throws -> TrashMove {
         let candidate = try trashCandidate(item: item, workspaceRoot: workspaceRoot)
-        var resultingURL: NSURL?
-        try FileManager.default.trashItem(at: candidate, resultingItemURL: &resultingURL)
-        guard let trashed = resultingURL as URL? else {
-            throw CocoaError(.fileWriteUnknown)
-        }
-        return TrashMove(original: candidate, trashed: trashed.standardizedFileURL)
+        let trashDirectory = try injectedTrashDirectory?.standardizedFileURL
+            ?? FileManager.default.url(
+                for: .trashDirectory,
+                in: .userDomainMask,
+                appropriateFor: candidate,
+                create: true
+            ).standardizedFileURL
+        let rootDescriptor = try openWorkspaceRoot(workspaceRoot)
+        let source = try anchoredItem(
+            candidate,
+            workspaceRoot: workspaceRoot,
+            rootDescriptor: rootDescriptor
+        )
+        let trashDescriptor = try openAbsoluteDirectory(trashDirectory)
+        try beforeMutation?()
+
+        let trashedLeaf = try exclusiveTrashRename(
+            source: source,
+            destinationDirectory: trashDescriptor
+        )
+        return TrashMove(
+            original: candidate,
+            trashed: trashDirectory.appendingPathComponent(trashedLeaf).standardizedFileURL
+        )
     }
 
     /// Restores only a Trash URL captured from `moveToTrash`. The destination
     /// parent is independently revalidated and collisions never overwrite a
     /// newer file that appeared after the original move.
-    static func restoreFromTrash(_ move: TrashMove, workspaceRoot: URL) throws {
+    static func restoreFromTrash(
+        _ move: TrashMove,
+        workspaceRoot: URL,
+        beforeMutation: BeforeMutation? = nil
+    ) throws {
         guard FileManager.default.fileExists(atPath: move.trashed.path) else {
             throw OperationError.missingItem
         }
@@ -206,7 +261,25 @@ enum WorkspaceFileOperations {
         guard !FileManager.default.fileExists(atPath: move.original.path) else {
             throw OperationError.destinationExists
         }
-        try FileManager.default.moveItem(at: move.trashed, to: move.original)
+
+        let trashParent = try openAbsoluteDirectory(move.trashed.deletingLastPathComponent())
+        let source = try anchoredItem(
+            leaf: move.trashed.lastPathComponent,
+            parent: trashParent,
+            original: move.trashed
+        )
+        let rootDescriptor = try openWorkspaceRoot(workspaceRoot)
+        let destinationParent = try anchoredDirectory(
+            parent,
+            workspaceRoot: workspaceRoot,
+            rootDescriptor: rootDescriptor
+        )
+        try beforeMutation?()
+        try exclusiveRename(
+            source: source,
+            destinationParent: destinationParent,
+            destinationLeaf: move.original.lastPathComponent
+        )
     }
 
     /// Maps an open document beneath a renamed item onto the corresponding new
@@ -242,6 +315,362 @@ enum WorkspaceFileOperations {
         default:
             return "Kaisola couldn't \(action) that item. Check its permissions and try again."
         }
+    }
+
+    /// Owns one directory descriptor for exactly as long as a mutation needs
+    /// it. `openat` descendants retain the directory inode even if another
+    /// process renames an ancestor and installs a symlink at its old path.
+    private final class DirectoryDescriptor {
+        let rawValue: Int32
+
+        init(rawValue: Int32) {
+            self.rawValue = rawValue
+        }
+
+        deinit {
+            _ = Darwin.close(rawValue)
+        }
+    }
+
+    private struct AnchoredItem {
+        let parent: DirectoryDescriptor
+        let leaf: String
+        let metadata: stat
+        let original: URL
+    }
+
+    private static func descriptorAnchoredMove(
+        _ move: Move,
+        workspaceRoot: URL,
+        beforeMutation: BeforeMutation?
+    ) throws {
+        let rootDescriptor = try openWorkspaceRoot(workspaceRoot)
+        let source = try anchoredItem(
+            move.source,
+            workspaceRoot: workspaceRoot,
+            rootDescriptor: rootDescriptor
+        )
+        let destinationParent = try anchoredDirectory(
+            move.destination.deletingLastPathComponent(),
+            workspaceRoot: workspaceRoot,
+            rootDescriptor: rootDescriptor
+        )
+
+        if isDirectory(source.metadata),
+           contains(move.destination.deletingLastPathComponent(), in: move.source) {
+            throw OperationError.destinationInsideItem
+        }
+
+        let destinationMetadata = try metadataIfPresent(
+            leaf: move.destination.lastPathComponent,
+            parent: destinationParent
+        )
+        let sameParent = sameDirectory(source.parent, destinationParent)
+        let caseOnlyRename = sameParent
+            && source.leaf != move.destination.lastPathComponent
+            && source.leaf.compare(
+                move.destination.lastPathComponent,
+                options: [.caseInsensitive, .diacriticInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            ) == .orderedSame
+            && destinationMetadata.map { sameFile(source.metadata, $0) } == true
+        if destinationMetadata != nil, !caseOnlyRename {
+            throw OperationError.destinationExists
+        }
+
+        try beforeMutation?()
+        if caseOnlyRename {
+            try exclusiveCaseOnlyRename(
+                source: source,
+                destinationLeaf: move.destination.lastPathComponent
+            )
+        } else {
+            try exclusiveRename(
+                source: source,
+                destinationParent: destinationParent,
+                destinationLeaf: move.destination.lastPathComponent
+            )
+        }
+    }
+
+    private static func openWorkspaceRoot(_ workspaceRoot: URL) throws -> DirectoryDescriptor {
+        let root = workspaceRoot.standardizedFileURL
+        let descriptor = root.path.withCString { path in
+            Darwin.open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            switch errno {
+            case ELOOP:
+                throw OperationError.symbolicLink
+            case EACCES, EPERM:
+                throw CocoaError(.fileReadNoPermission)
+            default:
+                throw OperationError.workspaceUnavailable
+            }
+        }
+        return DirectoryDescriptor(rawValue: descriptor)
+    }
+
+    private static func openAbsoluteDirectory(_ directory: URL) throws -> DirectoryDescriptor {
+        let descriptor = directory.standardizedFileURL.path.withCString { path in
+            Darwin.open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else {
+            switch errno {
+            case ELOOP:
+                throw OperationError.symbolicLink
+            case ENOENT:
+                throw OperationError.missingItem
+            case ENOTDIR:
+                throw OperationError.notDirectory
+            case EACCES, EPERM:
+                throw CocoaError(.fileReadNoPermission)
+            default:
+                throw CocoaError(.fileReadUnknown)
+            }
+        }
+        return DirectoryDescriptor(rawValue: descriptor)
+    }
+
+    private static func anchoredItem(
+        _ item: URL,
+        workspaceRoot: URL,
+        rootDescriptor: DirectoryDescriptor
+    ) throws -> AnchoredItem {
+        let components = try relativeComponents(of: item, workspaceRoot: workspaceRoot)
+        guard let leaf = components.last else { throw OperationError.workspaceRoot }
+        let parent = try openDescendantDirectory(
+            components: components.dropLast(),
+            rootDescriptor: rootDescriptor
+        )
+        return try anchoredItem(leaf: leaf, parent: parent, original: item)
+    }
+
+    private static func anchoredItem(
+        leaf: String,
+        parent: DirectoryDescriptor,
+        original: URL
+    ) throws -> AnchoredItem {
+        var metadata = stat()
+        let result = leaf.withCString { name in
+            Darwin.fstatat(parent.rawValue, name, &metadata, AT_SYMLINK_NOFOLLOW)
+        }
+        guard result == 0 else {
+            try throwDescriptorError(errno, missingIsWorkspaceUnavailable: false)
+        }
+        guard !isSymbolicLink(metadata) else { throw OperationError.symbolicLink }
+        return AnchoredItem(
+            parent: parent,
+            leaf: leaf,
+            metadata: metadata,
+            original: original.standardizedFileURL
+        )
+    }
+
+    private static func anchoredDirectory(
+        _ directory: URL,
+        workspaceRoot: URL,
+        rootDescriptor: DirectoryDescriptor
+    ) throws -> DirectoryDescriptor {
+        let components = try relativeComponents(of: directory, workspaceRoot: workspaceRoot)
+        return try openDescendantDirectory(
+            components: components[...],
+            rootDescriptor: rootDescriptor
+        )
+    }
+
+    private static func openDescendantDirectory<C: Collection>(
+        components: C,
+        rootDescriptor: DirectoryDescriptor
+    ) throws -> DirectoryDescriptor where C.Element == String {
+        var current = rootDescriptor
+        for component in components {
+            let descriptor = component.withCString { name in
+                Darwin.openat(
+                    current.rawValue,
+                    name,
+                    O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+                )
+            }
+            guard descriptor >= 0 else {
+                if errno == ELOOP || descriptorEntryIsSymbolicLink(component, parent: current) {
+                    throw OperationError.symbolicLink
+                }
+                try throwDescriptorError(errno, missingIsWorkspaceUnavailable: false)
+            }
+            current = DirectoryDescriptor(rawValue: descriptor)
+        }
+        return current
+    }
+
+    private static func relativeComponents(of candidate: URL, workspaceRoot: URL) throws -> [String] {
+        let candidatePath = candidate.standardizedFileURL.path
+        let rootPath = workspaceRoot.standardizedFileURL.path
+        guard candidatePath == rootPath || candidatePath.hasPrefix(rootPath + "/") else {
+            throw OperationError.outsideWorkspace
+        }
+        guard candidatePath != rootPath else { return [] }
+        return candidatePath
+            .dropFirst(rootPath.count + 1)
+            .split(separator: "/", omittingEmptySubsequences: true)
+            .map(String.init)
+    }
+
+    private static func metadataIfPresent(
+        leaf: String,
+        parent: DirectoryDescriptor
+    ) throws -> stat? {
+        var metadata = stat()
+        let result = leaf.withCString { name in
+            Darwin.fstatat(parent.rawValue, name, &metadata, AT_SYMLINK_NOFOLLOW)
+        }
+        if result == 0 { return metadata }
+        if errno == ENOENT { return nil }
+        try throwDescriptorError(errno, missingIsWorkspaceUnavailable: false)
+    }
+
+    private static func descriptorEntryIsSymbolicLink(
+        _ leaf: String,
+        parent: DirectoryDescriptor
+    ) -> Bool {
+        var metadata = stat()
+        let result = leaf.withCString { name in
+            Darwin.fstatat(parent.rawValue, name, &metadata, AT_SYMLINK_NOFOLLOW)
+        }
+        return result == 0 && isSymbolicLink(metadata)
+    }
+
+    private static func exclusiveRename(
+        source: AnchoredItem,
+        destinationParent: DirectoryDescriptor,
+        destinationLeaf: String
+    ) throws {
+        let result = source.leaf.withCString { sourceName in
+            destinationLeaf.withCString { destinationName in
+                Darwin.renameatx_np(
+                    source.parent.rawValue,
+                    sourceName,
+                    destinationParent.rawValue,
+                    destinationName,
+                    UInt32(RENAME_EXCL)
+                )
+            }
+        }
+        guard result == 0 else {
+            try throwDescriptorError(errno, missingIsWorkspaceUnavailable: false)
+        }
+    }
+
+    private static func exclusiveCaseOnlyRename(
+        source: AnchoredItem,
+        destinationLeaf: String
+    ) throws {
+        let temporaryLeaf = ".kaisola-rename-\(UUID().uuidString)"
+        try exclusiveRename(
+            source: source,
+            destinationParent: source.parent,
+            destinationLeaf: temporaryLeaf
+        )
+        let temporary = try anchoredItem(
+            leaf: temporaryLeaf,
+            parent: source.parent,
+            original: source.original
+        )
+        do {
+            try exclusiveRename(
+                source: temporary,
+                destinationParent: source.parent,
+                destinationLeaf: destinationLeaf
+            )
+        } catch {
+            try? exclusiveRename(
+                source: temporary,
+                destinationParent: source.parent,
+                destinationLeaf: source.leaf
+            )
+            throw error
+        }
+    }
+
+    private static func exclusiveTrashRename(
+        source: AnchoredItem,
+        destinationDirectory: DirectoryDescriptor
+    ) throws -> String {
+        for attempt in 0..<10_000 {
+            let candidate = trashLeafName(source.leaf, attempt: attempt)
+            let result = source.leaf.withCString { sourceName in
+                candidate.withCString { destinationName in
+                    Darwin.renameatx_np(
+                        source.parent.rawValue,
+                        sourceName,
+                        destinationDirectory.rawValue,
+                        destinationName,
+                        UInt32(RENAME_EXCL)
+                    )
+                }
+            }
+            if result == 0 { return candidate }
+            if errno == EEXIST || errno == ENOTEMPTY { continue }
+            try throwDescriptorError(errno, missingIsWorkspaceUnavailable: false)
+        }
+        throw OperationError.destinationExists
+    }
+
+    private static func trashLeafName(_ original: String, attempt: Int) -> String {
+        guard attempt > 0 else { return original }
+        let name = original as NSString
+        let extensionName = name.pathExtension
+        let stem = name.deletingPathExtension
+        let suffix = " \(attempt + 1)"
+        if extensionName.isEmpty { return stem + suffix }
+        return stem + suffix + "." + extensionName
+    }
+
+    private static func throwDescriptorError(
+        _ code: Int32,
+        missingIsWorkspaceUnavailable: Bool
+    ) throws -> Never {
+        switch code {
+        case EEXIST, ENOTEMPTY:
+            throw OperationError.destinationExists
+        case ENOENT:
+            throw missingIsWorkspaceUnavailable
+                ? OperationError.workspaceUnavailable
+                : OperationError.missingItem
+        case ELOOP:
+            throw OperationError.symbolicLink
+        case ENOTDIR:
+            throw OperationError.notDirectory
+        case EACCES, EPERM:
+            throw CocoaError(.fileWriteNoPermission)
+        default:
+            throw CocoaError(.fileWriteUnknown)
+        }
+    }
+
+    private static func sameDirectory(
+        _ first: DirectoryDescriptor,
+        _ second: DirectoryDescriptor
+    ) -> Bool {
+        var firstMetadata = stat()
+        var secondMetadata = stat()
+        guard Darwin.fstat(first.rawValue, &firstMetadata) == 0,
+              Darwin.fstat(second.rawValue, &secondMetadata) == 0 else {
+            return false
+        }
+        return sameFile(firstMetadata, secondMetadata)
+    }
+
+    private static func sameFile(_ first: stat, _ second: stat) -> Bool {
+        first.st_dev == second.st_dev && first.st_ino == second.st_ino
+    }
+
+    private static func isSymbolicLink(_ metadata: stat) -> Bool {
+        metadata.st_mode & S_IFMT == S_IFLNK
+    }
+
+    private static func isDirectory(_ metadata: stat) -> Bool {
+        metadata.st_mode & S_IFMT == S_IFDIR
     }
 
     private static func validatedItem(_ item: URL, workspaceRoot: URL) throws -> URL {

@@ -288,4 +288,108 @@ final class PermissionRuleStoreTests: XCTestCase {
         try Data("not json".utf8).write(to: fileURL)
         XCTAssertTrue(store.rules().isEmpty)
     }
+
+    // MARK: - Concurrent mutations
+
+    /// Overlapping adds from separate store instances — two windows answering
+    /// permission asks at the same time — must all land: an unserialized
+    /// read-modify-write drops whichever grant lost the race.
+    func testConcurrentAddsFromSeparateInstancesAllPersist() {
+        let url = fileURL!
+        let workers = 8
+        let perWorker = 12
+        DispatchQueue.concurrentPerform(iterations: workers) { worker in
+            let window = PermissionRuleStore(fileURL: url)
+            for index in 0..<perWorker {
+                _ = window.add(PermissionRule(
+                    id: "w\(worker)-\(index)",
+                    workspace: "/w",
+                    action: "execute",
+                    resource: "cmd-\(worker)-\(index) *",
+                    at: 0
+                ))
+            }
+        }
+        let resources = Set(store.rules().map(\.resource))
+        for worker in 0..<workers {
+            for index in 0..<perWorker {
+                XCTAssertTrue(resources.contains("cmd-\(worker)-\(index) *"), "lost added rule cmd-\(worker)-\(index)")
+            }
+        }
+        XCTAssertEqual(store.rules().count, workers * perWorker)
+    }
+
+    /// Adds racing removals: neither a new grant nor a revocation may be undone
+    /// by a writer that read an older generation.
+    func testConcurrentAddAndRemoveKeepBothDecisions() {
+        let url = fileURL!
+        let slots = 0..<24
+        for slot in slots {
+            _ = store.add(rule("seed-\(slot)", "seed-\(slot) *"))
+        }
+        XCTAssertEqual(store.rules().count, slots.count)
+
+        // Even workers add fresh rules, odd workers revoke seeds — each worker
+        // owns its own slots, so the expected end state is exact.
+        DispatchQueue.concurrentPerform(iterations: 8) { worker in
+            let window = PermissionRuleStore(fileURL: url)
+            for index in 0..<3 {
+                let slot = worker * 3 + index
+                if worker.isMultiple(of: 2) {
+                    _ = window.add(PermissionRule(
+                        id: "new-\(slot)",
+                        workspace: "/w",
+                        action: "execute",
+                        resource: "new-\(slot) *",
+                        at: 0
+                    ))
+                } else {
+                    window.remove(id: "seed-\(slot)")
+                }
+            }
+        }
+
+        let ids = Set(store.rules().map(\.id))
+        for slot in slots {
+            let addedByThisSlotsWorker = (slot / 3).isMultiple(of: 2)
+            if addedByThisSlotsWorker {
+                XCTAssertTrue(ids.contains("new-\(slot)"), "lost added rule new-\(slot)")
+                XCTAssertTrue(ids.contains("seed-\(slot)"), "untouched seed-\(slot) disappeared")
+            } else {
+                XCTAssertFalse(ids.contains("seed-\(slot)"), "revoked rule seed-\(slot) came back")
+            }
+        }
+        XCTAssertEqual(store.rules().count, slots.count, "12 seeds survive + 12 new rules")
+    }
+
+    /// A mutation waits for whoever already holds the rules lock — the same
+    /// sidecar lock another Kaisola process would take — instead of racing it.
+    func testMutationWaitsForAnotherLockHolder() throws {
+        let directory = fileURL.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let lockPath = directory.appendingPathComponent(".\(fileURL.lastPathComponent).lock").path
+        let descriptor = open(lockPath, O_RDONLY | O_CREAT, 0o600)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        XCTAssertEqual(flock(descriptor, LOCK_EX | LOCK_NB), 0, "test could not take the rules lock")
+
+        let window = PermissionRuleStore(fileURL: fileURL)
+        let pending = rule("1", "git *")
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            _ = window.add(pending)
+            finished.signal()
+        }
+
+        XCTAssertEqual(
+            finished.wait(timeout: .now() + 0.5),
+            .timedOut,
+            "add mutated the rules while another holder owned the lock"
+        )
+        XCTAssertTrue(store.rules().isEmpty)
+
+        XCTAssertEqual(flock(descriptor, LOCK_UN), 0)
+        close(descriptor)
+        XCTAssertEqual(finished.wait(timeout: .now() + 5), .success, "add never completed after the lock was released")
+        XCTAssertEqual(store.rules().map(\.resource), ["git *"])
+    }
 }

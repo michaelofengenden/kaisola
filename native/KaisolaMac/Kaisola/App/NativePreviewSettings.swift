@@ -461,6 +461,7 @@ final class NativePreviewSettings: ObservableObject {
     nonisolated static func isIsolatedFixture(environment: [String: String]) -> Bool {
         environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
             || environment["KAISOLA_NATIVE_RESOURCE_WORKLOAD"] != nil
+            || environment["KAISOLA_NATIVE_PDF_PREVIEW_BUDGET"] != nil
     }
 
     nonisolated static func isolatedFixtureSuiteName(
@@ -468,9 +469,14 @@ final class NativePreviewSettings: ObservableObject {
         processIdentifier: Int32
     ) -> String? {
         guard isIsolatedFixture(environment: environment) else { return nil }
-        let kind = environment["KAISOLA_NATIVE_RESOURCE_WORKLOAD"] == nil
-            ? "visual-fixture"
-            : "resource-fixture"
+        let kind: String
+        if environment["KAISOLA_NATIVE_RESOURCE_WORKLOAD"] != nil {
+            kind = "resource-fixture"
+        } else if environment["KAISOLA_NATIVE_PDF_PREVIEW_BUDGET"] != nil {
+            kind = "pdf-preview-budget"
+        } else {
+            kind = "visual-fixture"
+        }
         return "com.kaisola.mac.\(kind).\(processIdentifier)"
     }
 

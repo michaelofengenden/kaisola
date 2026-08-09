@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import KaisolaCore
 import XCTest
@@ -7,6 +8,369 @@ import XCTest
 /// protocol (initialize → session/new → session/prompt → session/update
 /// stream, plus a permission callback) is verified without spawning a process.
 final class AcpClientTests: XCTestCase {
+    func testCustomAdapterLaunchUsesSeatbeltAndAProviderScopedEnvironment() throws {
+        let fixture = try CustomContainmentFixture()
+        let containment = CustomAdapterContainment(
+            agentID: "custom-probe",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: CustomAdapterApproval(
+                credentials: .claude,
+                privileges: [.network, .workspaceRead]
+            ),
+            runtime: .fixed(executableURL: fixture.runtime, trustedRoot: fixture.runtimeRoot),
+            sandboxExecutableURL: URL(fileURLWithPath: "/usr/bin/sandbox-exec"),
+            stateRoot: fixture.stateRoot
+        )
+        let source = [
+            "ANTHROPIC_API_KEY": "anthropic-secret",
+            "ANTHROPIC_BASE_URL": "https://api.anthropic.com",
+            "ANTHROPIC_MODEL": "sonnet",
+            "CLAUDE_CODE_OAUTH_TOKEN": "oauth-secret",
+            "CLAUDE_CONFIG_DIR": fixture.claudeConfig.path,
+            "OPENAI_API_KEY": "unrelated-openai-secret",
+            "CODEX_HOME": fixture.codexHome.path,
+            "AWS_SECRET_ACCESS_KEY": "cloud-secret",
+            "GITHUB_TOKEN": "github-secret",
+            "SSH_AUTH_SOCK": "/private/tmp/ssh-agent.sock",
+            "DYLD_INSERT_LIBRARIES": "/private/tmp/inject.dylib",
+            "NODE_OPTIONS": "--require=/private/tmp/inject.js",
+            "PATH": "/attacker/bin:/usr/bin",
+            "SHELL": "/attacker/shell",
+            "HOME": "/host-home",
+            "CFFIXED_USER_HOME": "/host-fixed-home",
+            "TMPDIR": "/host-tmp/",
+            "XDG_CONFIG_HOME": "/host-config",
+            "LANG": "en_US.UTF-8",
+            "TERM": "xterm-256color",
+            "KAISOLA": "1",
+            "KAISOLA_SESSION_ID": "chat-26",
+        ]
+
+        let launch = try containment.prepare(environment: source, cwd: fixture.workspace.path)
+
+        XCTAssertEqual(launch.command, "/usr/bin/sandbox-exec")
+        XCTAssertEqual(
+            Array(launch.arguments.suffix(2)),
+            [try fixture.canonicalPath(fixture.runtime), try fixture.canonicalPath(fixture.adapter)]
+        )
+        XCTAssertFalse(launch.arguments.joined(separator: "\n").contains("anthropic-secret"))
+        XCTAssertFalse(launch.arguments.joined(separator: "\n").contains("github-secret"))
+        XCTAssertEqual(launch.environment["ANTHROPIC_API_KEY"], "anthropic-secret")
+        XCTAssertEqual(launch.environment["CLAUDE_CODE_OAUTH_TOKEN"], "oauth-secret")
+        XCTAssertEqual(
+            launch.environment["CLAUDE_CONFIG_DIR"],
+            try fixture.canonicalPath(fixture.claudeConfig)
+        )
+        XCTAssertNil(launch.environment["OPENAI_API_KEY"])
+        XCTAssertNil(launch.environment["CODEX_HOME"])
+        XCTAssertNil(launch.environment["AWS_SECRET_ACCESS_KEY"])
+        XCTAssertNil(launch.environment["GITHUB_TOKEN"])
+        XCTAssertNil(launch.environment["SSH_AUTH_SOCK"])
+        XCTAssertNil(launch.environment["DYLD_INSERT_LIBRARIES"])
+        XCTAssertNil(launch.environment["NODE_OPTIONS"])
+        XCTAssertNil(launch.environment["SHELL"])
+        XCTAssertEqual(launch.environment["PATH"], "/usr/bin:/bin:/usr/sbin:/sbin")
+        XCTAssertEqual(launch.environment["HOME"], try fixture.canonicalPath(fixture.privateHome))
+        XCTAssertEqual(launch.environment["CFFIXED_USER_HOME"], try fixture.canonicalPath(fixture.privateHome))
+        XCTAssertEqual(launch.environment["TMPDIR"], try fixture.canonicalPath(fixture.privateTemporary) + "/")
+        XCTAssertEqual(launch.environment["KAISOLA_ACP_CONTAINMENT"], "1")
+        XCTAssertEqual(
+            Set(launch.environment.keys),
+            Set([
+                "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",
+                "CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR", "LANG", "TERM",
+                "KAISOLA", "KAISOLA_SESSION_ID", "KAISOLA_ACP_CONTAINMENT", "PATH",
+                "HOME", "CFFIXED_USER_HOME", "TMPDIR", "XDG_CACHE_HOME",
+                "XDG_CONFIG_HOME", "XDG_DATA_HOME", "NPM_CONFIG_CACHE",
+                "NODE_REPL_HISTORY", "NO_UPDATE_NOTIFIER",
+            ])
+        )
+        XCTAssertTrue(launch.access.workspaceRead)
+        XCTAssertFalse(launch.access.workspaceWrite)
+        XCTAssertTrue(launch.access.network)
+        XCTAssertFalse(launch.access.childProcess)
+        XCTAssertFalse(launch.access.hostTerminal)
+
+        let profile = try XCTUnwrap(launch.sandboxProfile)
+        XCTAssertTrue(profile.contains("(deny default)"))
+        XCTAssertTrue(profile.contains("(system-network)"))
+        XCTAssertTrue(profile.contains("(subpath (param \"KAISOLA_WORKSPACE\"))"))
+        XCTAssertFalse(profile.contains("(allow process-fork)"))
+        XCTAssertFalse(profile.contains("(allow file-write* (subpath (param \"KAISOLA_WORKSPACE\")))"))
+    }
+
+    func testCustomAdapterProfileOpensOnlyReviewedCapabilities() {
+        let minimal = CustomAdapterContainment.profile(privileges: [])
+        XCTAssertTrue(minimal.contains("(deny default)"))
+        XCTAssertTrue(minimal.contains("(deny network-outbound (literal \"/private/var/run/syslog\"))"))
+        XCTAssertFalse(minimal.contains("(system-network)"))
+        XCTAssertFalse(minimal.contains("(allow file-read* (subpath (param \"KAISOLA_WORKSPACE\")))"))
+        XCTAssertFalse(minimal.contains("(allow process-fork)"))
+
+        let reviewed = CustomAdapterContainment.profile(
+            privileges: [.network, .workspaceRead, .workspaceWrite, .childProcess]
+        )
+        XCTAssertTrue(reviewed.contains("(system-network)"))
+        XCTAssertTrue(reviewed.contains("(allow network-outbound"))
+        XCTAssertTrue(reviewed.contains("(allow file-read* (subpath (param \"KAISOLA_WORKSPACE\")))"))
+        XCTAssertTrue(reviewed.contains("(allow file-write* (subpath (param \"KAISOLA_WORKSPACE\")))"))
+        XCTAssertTrue(reviewed.contains("(allow process-fork)"))
+        XCTAssertTrue(reviewed.contains("(allow process-exec)"))
+    }
+
+    func testCustomAdapterContainmentFailsClosedWithActionableReasons() throws {
+        let fixture = try CustomContainmentFixture()
+        let approval = CustomAdapterApproval(credentials: .claude, privileges: [])
+
+        XCTAssertThrowsError(try CustomAdapterContainment(
+            agentID: "custom-probe",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: approval,
+            runtime: .fixed(executableURL: fixture.runtime, trustedRoot: fixture.runtimeRoot),
+            sandboxExecutableURL: fixture.root.appending(path: "missing-sandbox"),
+            stateRoot: fixture.stateRoot
+        ).prepare(environment: ["CLAUDE_CONFIG_DIR": fixture.claudeConfig.path], cwd: fixture.workspace.path)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("sandbox-exec"), error.localizedDescription)
+        }
+
+        XCTAssertThrowsError(try CustomAdapterContainment(
+            agentID: "custom-probe",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: approval,
+            runtime: .fixed(
+                executableURL: fixture.root.appending(path: "missing-runtime"),
+                trustedRoot: fixture.runtimeRoot
+            ),
+            stateRoot: fixture.stateRoot
+        ).prepare(environment: ["CLAUDE_CONFIG_DIR": fixture.claudeConfig.path], cwd: fixture.workspace.path)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("runtime"), error.localizedDescription)
+        }
+
+        XCTAssertThrowsError(try CustomAdapterContainment(
+            agentID: "custom-probe",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: approval,
+            runtime: .fixed(executableURL: fixture.runtime, trustedRoot: fixture.runtimeRoot),
+            stateRoot: fixture.stateRoot
+        ).prepare(
+            environment: ["CLAUDE_CONFIG_DIR": FileManager.default.homeDirectoryForCurrentUser.path],
+            cwd: fixture.workspace.path
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("too broad"), error.localizedDescription)
+        }
+
+        XCTAssertThrowsError(try CustomAdapterContainment(
+            agentID: "custom-probe",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: approval,
+            runtime: .fixed(executableURL: fixture.runtime, trustedRoot: fixture.runtimeRoot),
+            stateRoot: fixture.stateRoot
+        ).prepare(
+            environment: ["CLAUDE_CONFIG_DIR": fixture.installRoot.path],
+            cwd: fixture.workspace.path
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("overlaps protected"), error.localizedDescription)
+        }
+
+        XCTAssertThrowsError(try CustomAdapterContainment(
+            agentID: "custom-probe",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: CustomAdapterApproval(credentials: .none, privileges: []),
+            runtime: .fixed(executableURL: fixture.runtime, trustedRoot: fixture.runtimeRoot),
+            stateRoot: fixture.workspace.appending(path: "adapter-state", directoryHint: .isDirectory)
+        ).prepare(environment: [:], cwd: fixture.workspace.path)) { error in
+            XCTAssertTrue(error.localizedDescription.contains("overlaps"), error.localizedDescription)
+        }
+    }
+
+    func testSeatbeltRuntimeBlocksUnreviewedFilesAndProcesses() throws {
+        let fixture = try CustomContainmentFixture(scriptedProbe: true)
+        let minimal = CustomAdapterContainment(
+            agentID: "custom-probe",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: CustomAdapterApproval(credentials: .none, privileges: []),
+            runtime: .fixed(executableURL: fixture.runtime, trustedRoot: fixture.runtimeRoot),
+            stateRoot: fixture.stateRoot
+        )
+        let minimalResult = try fixture.run(minimal.prepare(environment: [:], cwd: fixture.workspace.path))
+        XCTAssertNotEqual(minimalResult.status, 0)
+        XCTAssertTrue(minimalResult.stdout.contains("private-home=allowed"), minimalResult.stdout)
+        XCTAssertTrue(minimalResult.stderr.contains("fork failed"), minimalResult.stderr)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.workspaceOutput.path))
+
+        let fileRestricted = CustomAdapterContainment(
+            agentID: "custom-probe-files-restricted",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: CustomAdapterApproval(credentials: .none, privileges: [.childProcess]),
+            runtime: .fixed(executableURL: fixture.runtime, trustedRoot: fixture.runtimeRoot),
+            stateRoot: fixture.fileRestrictedStateRoot
+        )
+        let fileRestrictedResult = try fixture.run(
+            fileRestricted.prepare(environment: [:], cwd: fixture.workspace.path)
+        )
+        XCTAssertEqual(fileRestrictedResult.status, 0, fileRestrictedResult.stderr)
+        XCTAssertTrue(fileRestrictedResult.stdout.contains("secret=blocked"), fileRestrictedResult.stdout)
+        XCTAssertTrue(fileRestrictedResult.stdout.contains("install-symlink=blocked"), fileRestrictedResult.stdout)
+        XCTAssertTrue(fileRestrictedResult.stdout.contains("workspace-read=blocked"), fileRestrictedResult.stdout)
+        XCTAssertTrue(fileRestrictedResult.stdout.contains("workspace-list=blocked"), fileRestrictedResult.stdout)
+        XCTAssertTrue(fileRestrictedResult.stdout.contains("workspace-write=blocked"), fileRestrictedResult.stdout)
+        XCTAssertTrue(fileRestrictedResult.stdout.contains("process=allowed"), fileRestrictedResult.stdout)
+        XCTAssertTrue(fileRestrictedResult.stdout.contains("private-home=allowed"), fileRestrictedResult.stdout)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.workspaceOutput.path))
+
+        let reviewed = CustomAdapterContainment(
+            agentID: "custom-probe-reviewed",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: CustomAdapterApproval(
+                credentials: .none,
+                privileges: [.workspaceRead, .workspaceWrite, .childProcess]
+            ),
+            runtime: .fixed(executableURL: fixture.runtime, trustedRoot: fixture.runtimeRoot),
+            stateRoot: fixture.reviewedStateRoot
+        )
+        let reviewedResult = try fixture.run(reviewed.prepare(environment: [:], cwd: fixture.workspace.path))
+        XCTAssertEqual(reviewedResult.status, 0, reviewedResult.stderr)
+        XCTAssertTrue(reviewedResult.stdout.contains("secret=blocked"), reviewedResult.stdout)
+        XCTAssertTrue(reviewedResult.stdout.contains("install-symlink=blocked"), reviewedResult.stdout)
+        XCTAssertTrue(reviewedResult.stdout.contains("workspace-read=allowed"), reviewedResult.stdout)
+        XCTAssertTrue(reviewedResult.stdout.contains("workspace-list=allowed"), reviewedResult.stdout)
+        XCTAssertTrue(reviewedResult.stdout.contains("workspace-write=allowed"), reviewedResult.stdout)
+        XCTAssertTrue(reviewedResult.stdout.contains("process=allowed"), reviewedResult.stdout)
+    }
+
+    func testSeatbeltNetworkGrantControlsOutboundIPConnections() throws {
+        let listener = try LoopbackListener()
+        let fixture = try CustomContainmentFixture(networkProbePort: listener.port)
+        let denied = CustomAdapterContainment(
+            agentID: "custom-network-denied",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: CustomAdapterApproval(credentials: .none, privileges: [.childProcess]),
+            runtime: .fixed(executableURL: fixture.runtime, trustedRoot: fixture.runtimeRoot),
+            stateRoot: fixture.stateRoot
+        )
+        let deniedResult = try fixture.run(denied.prepare(environment: [:], cwd: fixture.workspace.path))
+        XCTAssertEqual(deniedResult.status, 0, deniedResult.stderr)
+        XCTAssertTrue(deniedResult.stdout.contains("network=blocked"), deniedResult.stdout)
+
+        let allowed = CustomAdapterContainment(
+            agentID: "custom-network-allowed",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: CustomAdapterApproval(
+                credentials: .none,
+                privileges: [.childProcess, .network]
+            ),
+            runtime: .fixed(executableURL: fixture.runtime, trustedRoot: fixture.runtimeRoot),
+            stateRoot: fixture.reviewedStateRoot
+        )
+        let allowedResult = try fixture.run(allowed.prepare(environment: [:], cwd: fixture.workspace.path))
+        XCTAssertEqual(allowedResult.status, 0, allowedResult.stderr)
+        XCTAssertTrue(allowedResult.stdout.contains("network=allowed"), allowedResult.stdout)
+    }
+
+    func testPinnedNodeRuntimeExecutesJavaScriptInsideTheBoundary() throws {
+        let configuredRuntime = ProcessInfo.processInfo.environment["KAISOLA_TEST_NODE_RUNTIME"]
+            .map { URL(fileURLWithPath: $0) }
+        let repositoryRuntime = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appending(path: ".artifacts/node-v22.23.1-darwin-arm64/bin/node")
+        let runtime = configuredRuntime ?? repositoryRuntime
+        guard FileManager.default.isExecutableFile(atPath: runtime.path) else {
+            throw XCTSkip("checksum-pinned Node fixture is unavailable; run download-native-node-runtime.cjs")
+        }
+        let canonicalRuntime = runtime.resolvingSymlinksInPath()
+
+        let fixture = try CustomContainmentFixture(javascriptProbe: true)
+        let containment = CustomAdapterContainment(
+            agentID: "custom-node-probe",
+            executableURL: fixture.adapter,
+            installRoot: fixture.installRoot,
+            approval: CustomAdapterApproval(credentials: .none, privileges: []),
+            runtime: .fixed(
+                executableURL: canonicalRuntime,
+                trustedRoot: canonicalRuntime.deletingLastPathComponent()
+            ),
+            stateRoot: fixture.stateRoot
+        )
+        let launch = try containment.prepare(
+            environment: ["GITHUB_TOKEN": "must-not-reach-node"],
+            cwd: fixture.workspace.path
+        )
+        let result = try fixture.run(launch)
+
+        XCTAssertEqual(result.status, 0, result.stderr)
+        XCTAssertTrue(result.stdout.contains("secret=blocked"), result.stdout)
+        XCTAssertTrue(result.stdout.contains("workspace-read=blocked"), result.stdout)
+        XCTAssertTrue(result.stdout.contains("private-home=allowed"), result.stdout)
+        XCTAssertTrue(result.stdout.contains("github-token=absent"), result.stdout)
+    }
+
+    func testContainedClientAdvertisesAndEnforcesOnlyReviewedHostBridges() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-acp-contained-client-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("readable".utf8).write(to: directory.appending(path: "input.txt"))
+
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        _ = try await client.start(
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: directory.path,
+            mcpServers: [
+                .object(["name": .string("local"), "command": .string("tool")]),
+                .object(["type": .string("http"), "name": .string("remote"), "url": .string("https://example.com")]),
+                .object(["type": .string("future"), "name": .string("unknown")]),
+            ],
+            access: .contained(privileges: [.workspaceRead, .childProcess])
+        )
+
+        let receivedCapabilities = await transport.receivedClientCapabilities()
+        let advertised = try XCTUnwrap(receivedCapabilities?.objectValue)
+        XCTAssertEqual(advertised["fs"]?.objectValue?["readTextFile"], .bool(true))
+        XCTAssertEqual(advertised["fs"]?.objectValue?["writeTextFile"], .bool(false))
+        XCTAssertEqual(advertised["terminal"], .bool(false))
+        let receivedMCPServers = await transport.receivedSessionMcpServers()
+        XCTAssertEqual(receivedMCPServers.map { $0.objectValue?["name"]?.stringValue }, ["local"])
+
+        await transport.sendAgentRequest(
+            id: 901,
+            method: "fs/write_text_file",
+            params: .object(["path": .string("blocked.txt"), "content": .string("blocked")])
+        )
+        let writeResponse = try await transport.waitForClientResponse(id: 901)
+        XCTAssertTrue(
+            writeResponse.objectValue?["error"]?.objectValue?["message"]?.stringValue?
+                .contains("workspace write was not approved") == true
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appending(path: "blocked.txt").path))
+
+        await transport.sendAgentRequest(
+            id: 902,
+            method: "terminal/create",
+            params: .object(["command": .string("/usr/bin/env")])
+        )
+        let terminalResponse = try await transport.waitForClientResponse(id: 902)
+        XCTAssertTrue(
+            terminalResponse.objectValue?["error"]?.objectValue?["message"]?.stringValue?
+                .contains("host terminals are unavailable") == true
+        )
+        await client.stop()
+    }
+
     @MainActor
     func testOwnedConversationCanRestartAfterAdapterExit() async {
         let conversation = AcpConversation(
@@ -808,6 +1172,8 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
+    private var clientCapabilities: JSONValue?
+    private var clientResponses: [Int64: JSONValue] = [:]
 
     init(
         protocolVersion: Int64 = 1,
@@ -841,6 +1207,25 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func receivedPromptTexts() -> [String] { promptTexts }
     func receivedSteerRequests() -> [JSONValue] { steerRequests }
     func terminationCount() -> Int { terminations }
+    func receivedClientCapabilities() -> JSONValue? { clientCapabilities }
+
+    func sendAgentRequest(id: Int64, method: String, params: JSONValue) {
+        enqueue(.object([
+            "jsonrpc": .string("2.0"),
+            "id": .integer(id),
+            "method": .string(method),
+            "params": params,
+        ]))
+    }
+
+    func waitForClientResponse(id: Int64) async throws -> JSONValue {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while ContinuousClock.now < deadline {
+            if let response = clientResponses[id] { return response }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw AcpClientError.requestFailed("Timed out waiting for contained client response \(id)")
+    }
 
     func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
         started = true
@@ -848,9 +1233,14 @@ private actor ScriptedAcpTransport: AcpByteTransport {
 
     func send(_ data: Data) async throws {
         guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else { return }
+        if object["method"] == nil, let id = object["id"]?.intValue {
+            clientResponses[id] = .object(object)
+            return
+        }
         let id = object["id"]
         switch object["method"]?.stringValue {
         case "initialize":
+            clientCapabilities = object["params"]?.objectValue?["clientCapabilities"]
             reply(id: id, result: .object([
                 "protocolVersion": .integer(protocolVersion),
                 "agentCapabilities": .object([
@@ -1050,5 +1440,171 @@ private actor ScriptedAcpTransport: AcpByteTransport {
 
     private func trimmed(_ data: Data) -> Data {
         data.last == 0x0A ? data.dropLast() : data
+    }
+}
+
+private final class CustomContainmentFixture {
+    let root: URL
+    let installRoot: URL
+    let adapter: URL
+    let runtime: URL
+    let runtimeRoot: URL
+    let stateRoot: URL
+    let fileRestrictedStateRoot: URL
+    let reviewedStateRoot: URL
+    let workspace: URL
+    let workspaceInput: URL
+    let workspaceOutput: URL
+    let secret: URL
+    let claudeConfig: URL
+    let codexHome: URL
+
+    var privateHome: URL { stateRoot.appending(path: "home", directoryHint: .isDirectory) }
+    var privateTemporary: URL { stateRoot.appending(path: "tmp", directoryHint: .isDirectory) }
+
+    init(
+        scriptedProbe: Bool = false,
+        networkProbePort: UInt16? = nil,
+        javascriptProbe: Bool = false
+    ) throws {
+        root = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-custom-containment-\(UUID().uuidString)", directoryHint: .isDirectory)
+        installRoot = root.appending(path: "install", directoryHint: .isDirectory)
+        adapter = installRoot.appending(path: javascriptProbe ? "adapter.js" : "adapter.zsh")
+        runtime = URL(fileURLWithPath: "/bin/zsh")
+        runtimeRoot = URL(fileURLWithPath: "/bin", isDirectory: true)
+        stateRoot = root.appending(path: "state", directoryHint: .isDirectory)
+        fileRestrictedStateRoot = root.appending(path: "file-restricted-state", directoryHint: .isDirectory)
+        reviewedStateRoot = root.appending(path: "reviewed-state", directoryHint: .isDirectory)
+        workspace = root.appending(path: "workspace", directoryHint: .isDirectory)
+        workspaceInput = workspace.appending(path: "input.txt")
+        workspaceOutput = workspace.appending(path: "output.txt")
+        secret = root.appending(path: "host-secret.txt")
+        claudeConfig = root.appending(path: "claude-account", directoryHint: .isDirectory)
+        codexHome = root.appending(path: "codex-account", directoryHint: .isDirectory)
+
+        for directory in [installRoot, workspace, claudeConfig, codexHome] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        try Data("workspace-input\n".utf8).write(to: workspaceInput)
+        try Data("host-secret\n".utf8).write(to: secret)
+        try FileManager.default.createSymbolicLink(
+            at: installRoot.appending(path: "escape-to-secret"),
+            withDestinationURL: secret
+        )
+        let script: String
+        if javascriptProbe {
+            script = """
+            #!/usr/bin/env node
+            const fs = require('node:fs')
+            function readable(path) {
+              try { fs.readFileSync(path); return 'allowed' } catch { return 'blocked' }
+            }
+            let privateHome = 'blocked'
+            try { fs.writeFileSync(process.env.HOME + '/node-probe.txt', 'state'); privateHome = 'allowed' } catch {}
+            console.log('secret=' + readable('\(secret.path)'))
+            console.log('workspace-read=' + readable('\(workspaceInput.path)'))
+            console.log('private-home=' + privateHome)
+            console.log('github-token=' + (process.env.GITHUB_TOKEN === undefined ? 'absent' : 'leaked'))
+            """
+        } else if let networkProbePort {
+            script = """
+            #!/bin/zsh
+            if /usr/bin/nc -n -z -w 1 127.0.0.1 \(networkProbePort); then print -r -- 'network=allowed'; else print -r -- 'network=blocked'; fi
+            exit 0
+            """
+        } else if scriptedProbe {
+            script = """
+            #!/bin/zsh
+            if print -r -- state > "$HOME/probe.txt"; then print -r -- 'private-home=allowed'; else print -r -- 'private-home=blocked'; fi
+            if /usr/bin/true; then print -r -- 'process=allowed'; else print -r -- 'process=blocked'; fi
+            if /bin/cat '\(secret.path)' >/dev/null; then print -r -- 'secret=allowed'; else print -r -- 'secret=blocked'; fi
+            if /bin/cat '\(installRoot.appending(path: "escape-to-secret").path)' >/dev/null; then print -r -- 'install-symlink=allowed'; else print -r -- 'install-symlink=blocked'; fi
+            if /bin/cat '\(workspaceInput.path)' >/dev/null; then print -r -- 'workspace-read=allowed'; else print -r -- 'workspace-read=blocked'; fi
+            if /bin/ls '\(workspace.path)' >/dev/null; then print -r -- 'workspace-list=allowed'; else print -r -- 'workspace-list=blocked'; fi
+            if /bin/sh -c 'printf "%s\\n" output > "$1"' probe '\(workspaceOutput.path)'; then print -r -- 'workspace-write=allowed'; else print -r -- 'workspace-write=blocked'; fi
+            exit 0
+            """
+        } else {
+            script = "#!/bin/zsh\nexit 0\n"
+        }
+        try Data(script.utf8).write(to: adapter)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: adapter.path)
+    }
+
+    deinit { try? FileManager.default.removeItem(at: root) }
+
+    func run(_ launch: AcpAdapterLaunch) throws -> (status: Int32, stdout: String, stderr: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: launch.command)
+        process.arguments = launch.arguments
+        process.environment = launch.environment
+        process.currentDirectoryURL = URL(fileURLWithPath: launch.cwd, isDirectory: true)
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+        try process.run()
+        process.waitUntilExit()
+        return (
+            process.terminationStatus,
+            String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self),
+            String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        )
+    }
+
+    func canonicalPath(_ url: URL) throws -> String {
+        var buffer = [CChar](repeating: 0, count: Int(PATH_MAX))
+        guard realpath(url.path, &buffer) != nil else {
+            throw CocoaError(.fileReadNoSuchFile)
+        }
+        let terminator = buffer.firstIndex(of: 0) ?? buffer.endIndex
+        return String(decoding: buffer[..<terminator].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+}
+
+private final class LoopbackListener {
+    let descriptor: Int32
+    let port: UInt16
+
+    init() throws {
+        let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw Self.posixError() }
+        self.descriptor = descriptor
+
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_port = 0
+        address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+        let bindResult = withUnsafePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bindResult == 0, Darwin.listen(descriptor, 2) == 0 else {
+            let error = Self.posixError()
+            Darwin.close(descriptor)
+            throw error
+        }
+
+        var addressLength = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let nameResult = withUnsafeMutablePointer(to: &address) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.getsockname(descriptor, $0, &addressLength)
+            }
+        }
+        guard nameResult == 0 else {
+            let error = Self.posixError()
+            Darwin.close(descriptor)
+            throw error
+        }
+        port = UInt16(bigEndian: address.sin_port)
+    }
+
+    deinit { Darwin.close(descriptor) }
+
+    private static func posixError() -> NSError {
+        NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
     }
 }

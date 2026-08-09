@@ -12,7 +12,7 @@ const net = require('node:net')
 const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
-const { terminalCreateRoute } = require('./ipc/terminalCreateRoute.cjs')
+const { terminalCreateRoute, terminalIdLengthRejection } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
@@ -222,8 +222,18 @@ async function dispatch(client, method, params = {}) {
   const admin = String(params.ownerId ?? '0') === '0'
   const requestProject = projectScope(params.projectId)
   const owner = ownerKey(client.instanceId, params.ownerId, requestProject)
-  const terminalId = () => String(params.id || '').slice(0, 240)
-  if (drainingTarget && method === 'terminal.create' && !mgr.has(terminalId())) {
+  const rawTerminalId = String(params.id || '')
+  // The follow-on terminal methods share `terminal.create`'s id cap: an id
+  // truncated to a prefix here would reach whatever terminal already owns that
+  // prefix. Rejecting keeps one caller id bound to one terminal.
+  const terminalId = () => {
+    const rejection = terminalIdLengthRejection(rawTerminalId)
+    if (rejection) throw new Error(rejection.message)
+    return rawTerminalId
+  }
+  // The drain gate is a plain liveness lookup, so it reads the id as sent and
+  // leaves the structured over-length rejection to the create route below.
+  if (drainingTarget && method === 'terminal.create' && !mgr.has(rawTerminalId)) {
     throw new Error('broker generation is draining; create on the current generation')
   }
   const allowed = (id, adopt = false) => {

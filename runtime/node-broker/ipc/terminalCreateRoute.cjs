@@ -2,6 +2,25 @@
 
 const os = require('node:os')
 
+// Terminal ids are caller-supplied. Truncating an overlong one to a fixed
+// prefix silently aliases every id sharing that prefix onto a single terminal
+// and a single ownership record, which crosses projects and owners. The cap is
+// therefore a validation boundary, not a formatting step: real ids are
+// `term-<project>-<hex8>` (~31 characters), so nothing legitimate approaches it.
+const TERMINAL_ID_MAX_LENGTH = 240
+
+/** The structured rejection for an id past the cap, or `null` when it fits. */
+function terminalIdLengthRejection(id) {
+  if (id.length <= TERMINAL_ID_MAX_LENGTH) return null
+  return {
+    ok: false,
+    code: 'terminal_id_too_long',
+    message: `terminal id exceeds ${TERMINAL_ID_MAX_LENGTH} characters`,
+    limit: TERMINAL_ID_MAX_LENGTH,
+    length: id.length,
+  }
+}
+
 /** The authenticated `terminal.create` operation after access selection. Kept
  * separate from the executable broker so the additive resurrection wire can
  * be contract-tested without binding its AF_UNIX listener. */
@@ -14,8 +33,12 @@ function terminalCreateRoute({
   brokerPid = process.pid,
   now = Date.now,
 }) {
-  const id = String(params.id || '').slice(0, 240)
+  const id = String(params.id || '')
   if (!id) return { ok: false, message: 'terminal id required' }
+  const overlong = terminalIdLengthRejection(id)
+  // Reject before `has`/`requireAllowed` so an overlong id never reaches the
+  // ownership record it would otherwise have aliased.
+  if (overlong) return overlong
   if (manager.has(id)) requireAllowed(id, true)
 
   const existed = manager.isLive(id)
@@ -67,4 +90,4 @@ function terminalCreateRoute({
   }
 }
 
-module.exports = { terminalCreateRoute }
+module.exports = { terminalCreateRoute, terminalIdLengthRejection, TERMINAL_ID_MAX_LENGTH }

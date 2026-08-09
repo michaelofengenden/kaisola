@@ -192,6 +192,85 @@ final class BrokerControlClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testWriteMapsEndedAndMissingResultsToDistinctUserVisibleErrors() async throws {
+        let failures: [(result: JSONValue, error: TerminalWriteError, description: String)] = [
+            (
+                .object([
+                    "ok": .bool(false),
+                    "message": .string("terminal already ended"),
+                ]),
+                .ended,
+                "This terminal has ended and cannot accept input."
+            ),
+            (
+                .object(["ok": .bool(false)]),
+                .missing,
+                "This terminal is no longer available."
+            ),
+        ]
+
+        for failure in failures {
+            let transport = ScriptedControlResultBrokerTransport(result: failure.result)
+            let client = BrokerControlClient(
+                transport: transport,
+                operationTimeoutNanoseconds: 100_000_000
+            )
+            try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+            do {
+                try await client.write(
+                    projectID: "project.one",
+                    terminalID: "terminal-one",
+                    data: "whoami\n"
+                )
+                XCTFail("A broker-rejected write must not be reported as delivered.")
+            } catch {
+                XCTAssertEqual(error as? TerminalWriteError, failure.error)
+                XCTAssertEqual(error.localizedDescription, failure.description)
+            }
+            await client.disconnect()
+        }
+        XCTAssertNotEqual(failures[0].description, failures[1].description)
+    }
+
+    func testWriteRequiresExplicitPositiveBrokerAcknowledgement() async throws {
+        for result in [
+            JSONValue.object([:]),
+            .object(["ok": .string("true")]),
+            .string("accepted"),
+        ] {
+            let transport = ScriptedControlResultBrokerTransport(result: result)
+            let client = BrokerControlClient(
+                transport: transport,
+                operationTimeoutNanoseconds: 100_000_000
+            )
+            try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+            do {
+                try await client.write(
+                    projectID: "project.one",
+                    terminalID: "terminal-one",
+                    data: "pwd\n"
+                )
+                XCTFail("Malformed terminal.write acknowledgement must fail closed.")
+            } catch {
+                XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+            }
+            await client.disconnect()
+        }
+
+        let transport = ScriptedControlResultBrokerTransport(result: .object(["ok": .bool(true)]))
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.write(
+            projectID: "project.one",
+            terminalID: "terminal-one",
+            data: "pwd\n"
+        )
+        await client.disconnect()
+    }
+
     func testResizeAcceptsExplicitPositiveBrokerAcknowledgement() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
         let client = BrokerControlClient(

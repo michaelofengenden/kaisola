@@ -20,6 +20,18 @@ enum ControlBrokerMethod: String, CaseIterable, Sendable {
     case controlLease = "terminal.controlLease"
 }
 
+enum TerminalWriteError: Error, Equatable, LocalizedError {
+    case ended
+    case missing
+
+    var errorDescription: String? {
+        switch self {
+        case .ended: "This terminal has ended and cannot accept input."
+        case .missing: "This terminal is no longer available."
+        }
+    }
+}
+
 struct TerminalCreation: Equatable, Sendable {
     let terminalID: String
     let projectID: String
@@ -324,7 +336,20 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.malformedResponse
         }
         params["data"] = .string(data)
-        _ = try await request(.write, params: .object(params))
+        let result = try await request(.write, params: .object(params))
+        guard let object = result.objectValue,
+              let accepted = object["ok"]?.boolValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        guard accepted else {
+            if object["message"]?.stringValue == "terminal already ended" {
+                throw TerminalWriteError.ended
+            }
+            if object["message"] == nil {
+                throw TerminalWriteError.missing
+            }
+            throw BrokerClientError.requestFailed("terminal.write")
+        }
     }
 
     func resize(projectID: String, terminalID: String, columns: Int, rows: Int) async throws {

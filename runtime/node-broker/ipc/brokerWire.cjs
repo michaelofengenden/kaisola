@@ -49,6 +49,162 @@ const OBSERVER_METHODS = Object.freeze([
 // 8 MiB * 6 plus framing slack. Undersizing this turns a valid snapshot into
 // a socket teardown + reconnect loop on the durability-critical reattach path.
 const MAX_FRAME = 56 * 1024 * 1024
+const TERMINAL_HISTORY_PAGE_BYTES = 4 * 1024 * 1024
+const HELLO_FRAME_BYTES = 64 * 1024
+const DEFAULT_REQUEST_FRAME_BYTES = 64 * 1024
+const DEFAULT_RESPONSE_FRAME_BYTES = 256 * 1024
+const DEFAULT_EVENT_FRAME_BYTES = 64 * 1024
+
+function requestFrameBytes(method) {
+  switch (method) {
+    case 'terminal.write': return 1 * 1024 * 1024
+    case 'terminal.create': return 256 * 1024
+    default: return DEFAULT_REQUEST_FRAME_BYTES
+  }
+}
+
+function responseFrameBytes(method) {
+  switch (method) {
+    case 'terminal.create':
+    case 'terminal.attach':
+    case 'terminal.snapshot':
+    case 'terminal.output':
+      return 50 * 1024 * 1024
+    case 'terminal.history':
+    case 'terminal.subscribe':
+      return 26 * 1024 * 1024
+    case 'broker.status':
+    case 'terminal.list':
+    case 'terminal.diagnostics':
+      return 4 * 1024 * 1024
+    default:
+      return DEFAULT_RESPONSE_FRAME_BYTES
+  }
+}
+
+function eventFrameBytes(channel) {
+  return channel === 'terminal:observer-output' ? 512 * 1024 : DEFAULT_EVENT_FRAME_BYTES
+}
+
+function maximumEncodedFrameBytes({ type, method, channel } = {}) {
+  switch (type) {
+    case 'hello': return HELLO_FRAME_BYTES
+    case 'request': return requestFrameBytes(method)
+    case 'response': return responseFrameBytes(method)
+    case 'event': return eventFrameBytes(channel)
+    default: return DEFAULT_REQUEST_FRAME_BYTES
+  }
+}
+
+// Scan only the top-level routing strings. Large params/results/payload values
+// are skipped without JSON.parse, so their method cap is enforced before a
+// synchronous object graph allocation. Full JSON validation remains at the
+// existing dispatch boundary after this preflight succeeds.
+function inspectBrokerFrame(value) {
+  const input = String(value ?? '')
+  let cursor = 0
+  const envelope = { type: null, id: null, method: null, channel: null }
+
+  const whitespace = () => {
+    while (cursor < input.length && /[\x20\t\r\n]/.test(input[cursor])) cursor++
+  }
+  const scanString = () => {
+    if (input[cursor] !== '"') throw new Error('invalid broker envelope')
+    const start = cursor++
+    let escaped = false
+    while (cursor < input.length) {
+      const character = input[cursor++]
+      if (escaped) escaped = false
+      else if (character === '\\') escaped = true
+      else if (character === '"') return input.slice(start, cursor)
+    }
+    throw new Error('invalid broker envelope')
+  }
+  const decodedString = (token, maximumCharacters) => {
+    if (token.length > maximumCharacters) return null
+    const result = JSON.parse(token)
+    if (typeof result !== 'string') throw new Error('invalid broker envelope')
+    return result
+  }
+  const skipValue = () => {
+    if (input[cursor] === '"') {
+      scanString()
+      return
+    }
+    if (input[cursor] === '{' || input[cursor] === '[') {
+      let depth = 0
+      while (cursor < input.length) {
+        const character = input[cursor]
+        if (character === '"') {
+          scanString()
+          continue
+        }
+        cursor++
+        if (character === '{' || character === '[') depth++
+        else if (character === '}' || character === ']') {
+          depth--
+          if (depth === 0) return
+        }
+      }
+      throw new Error('invalid broker envelope')
+    }
+    const start = cursor
+    while (cursor < input.length && input[cursor] !== ',' && input[cursor] !== '}') cursor++
+    if (cursor === start) throw new Error('invalid broker envelope')
+  }
+
+  whitespace()
+  if (input[cursor++] !== '{') throw new Error('invalid broker envelope')
+  let first = true
+  while (true) {
+    whitespace()
+    if (input[cursor] === '}') {
+      cursor++
+      break
+    }
+    if (first) first = false
+    else {
+      if (input[cursor++] !== ',') throw new Error('invalid broker envelope')
+      whitespace()
+    }
+    const key = decodedString(scanString(), 96)
+    whitespace()
+    if (input[cursor++] !== ':') throw new Error('invalid broker envelope')
+    whitespace()
+    if ((key === 'type' || key === 'id' || key === 'method' || key === 'channel') && input[cursor] === '"') {
+      envelope[key] = decodedString(scanString(), 512)
+    } else {
+      skipValue()
+    }
+  }
+  whitespace()
+  if (cursor !== input.length) throw new Error('invalid broker envelope')
+  return envelope
+}
+
+function validateEncodedBrokerFrame(encoded, { method, envelope: suppliedEnvelope } = {}) {
+  const envelope = suppliedEnvelope || inspectBrokerFrame(encoded)
+  const maximumBytes = maximumEncodedFrameBytes({
+    type: envelope.type,
+    method: envelope.type === 'response' ? method : envelope.method,
+    channel: envelope.channel,
+  })
+  const encodedBytes = Buffer.byteLength(encoded, 'utf8')
+  if (encodedBytes > maximumBytes) {
+    const error = new RangeError(`broker ${envelope.type || 'unknown'} frame exceeds ${maximumBytes} bytes`)
+    error.code = 'BROKER_FRAME_TOO_LARGE'
+    error.maximumBytes = maximumBytes
+    error.encodedBytes = encodedBytes
+    throw error
+  }
+  return { envelope, maximumBytes, encodedBytes }
+}
+
+function encodeBrokerFrame(frame, context = {}) {
+  const encoded = JSON.stringify(frame)
+  validateEncodedBrokerFrame(encoded, context)
+  return `${encoded}\n`
+}
 
 function atomicJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
@@ -90,6 +246,15 @@ module.exports = {
   OBSERVER_ACCESS,
   OBSERVER_METHODS,
   MAX_FRAME,
+  TERMINAL_HISTORY_PAGE_BYTES,
+  HELLO_FRAME_BYTES,
+  DEFAULT_REQUEST_FRAME_BYTES,
+  DEFAULT_RESPONSE_FRAME_BYTES,
+  DEFAULT_EVENT_FRAME_BYTES,
+  maximumEncodedFrameBytes,
+  inspectBrokerFrame,
+  validateEncodedBrokerFrame,
+  encodeBrokerFrame,
   atomicJson,
   observerMethodAllowed,
   brokerMethodAllowedForAccess,

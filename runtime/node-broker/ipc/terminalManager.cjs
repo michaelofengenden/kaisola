@@ -13,6 +13,7 @@ const { TerminalSpool, DEFAULT_HOT_CAP, DEFAULT_SNAPSHOT_CAP } = require('./term
 const { TerminalObservers } = require('./terminalObservers.cjs')
 const { TerminalCursor, isUtf8Boundary } = require('../companion/terminalCursor.cjs')
 const { validatedTerminalGeometry } = require('./terminalCreateRoute.cjs')
+const { TERMINAL_HISTORY_PAGE_BYTES } = require('./brokerWire.cjs')
 
 let pty = null
 let ptyLoadAttempted = false
@@ -722,7 +723,7 @@ function history(id, { streamEpoch, beforeOffset, maxBytes } = {}) {
   if (!Number.isSafeInteger(beforeOffset) || beforeOffset < 0 || beforeOffset > r.cursor.nextOffset) {
     throw new Error('invalid terminal history offset')
   }
-  const cap = Math.min(4 * 1024 * 1024, Math.max(64 * 1024, Math.floor(Number(maxBytes) || DEFAULT_SNAPSHOT_CAP)))
+  const cap = Math.min(TERMINAL_HISTORY_PAGE_BYTES, Math.max(64 * 1024, Math.floor(Number(maxBytes) || DEFAULT_SNAPSHOT_CAP)))
   const page = r.spool.historyPage(r.cursor.nextOffset - beforeOffset, cap)
   const retainedStart = Math.max(0, r.cursor.nextOffset - page.totalBytes)
   const startOffset = retainedStart + page.startByte

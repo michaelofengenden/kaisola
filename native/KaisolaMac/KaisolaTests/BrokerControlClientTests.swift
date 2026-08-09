@@ -9,6 +9,59 @@ import XCTest
 /// mutations the native app needs, every request carries the owner identity,
 /// and the connection refuses brokers that predate role enforcement.
 final class BrokerControlClientTests: XCTestCase {
+    func testOversizedWriteIsRejectedBeforeTransportSend() async throws {
+        let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        let framesBeforeWrite = await transport.sentFrames().count
+
+        do {
+            try await client.write(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                data: String(repeating: "x", count: BrokerWire.maximumEncodedBytes(for: .request("terminal.write")))
+            )
+            XCTFail("The request envelope must not widen the terminal.write byte contract.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .frameRejected)
+        }
+
+        let framesAfterWrite = await transport.sentFrames().count
+        XCTAssertEqual(framesAfterWrite, framesBeforeWrite)
+        await client.disconnect()
+    }
+
+    func testSmallMethodResponseIsRejectedBeforeJSONValueDecode() async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: .object([
+            "ok": .bool(true),
+            "padding": .string(String(repeating: "x", count: 300 * 1_024)),
+        ]))
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 500_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+
+        do {
+            try await client.resize(
+                projectID: "project.one",
+                terminalID: "terminal-one",
+                columns: 120,
+                rows: 40
+            )
+            XCTFail("A terminal.resize response must use the small response contract.")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerWireError,
+                .frameTooLarge(maximum: BrokerWire.maximumEncodedBytes(for: .response("terminal.resize")))
+            )
+        }
+        await client.disconnect()
+    }
+
     func testResizeRequiresPositiveBrokerAcknowledgement() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: false)
         let client = BrokerControlClient(

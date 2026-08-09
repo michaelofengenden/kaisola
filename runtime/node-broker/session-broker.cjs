@@ -22,6 +22,9 @@ const {
   FEATURES,
   OBSERVER_ACCESS,
   MAX_FRAME,
+  encodeBrokerFrame,
+  inspectBrokerFrame,
+  validateEncodedBrokerFrame,
   atomicJson,
   brokerMethodAllowedForAccess,
 } = require('./ipc/brokerWire.cjs')
@@ -133,10 +136,10 @@ function waitMilliseconds(milliseconds) {
   })
 }
 
-function send(socket, frame, { maxQueueBytes, force = false } = {}) {
+function send(socket, frame, { maxQueueBytes, force = false, method } = {}) {
   if (!socket || socket.destroyed) return false
   try {
-    const encoded = `${JSON.stringify(frame)}\n`
+    const encoded = encodeBrokerFrame(frame, { method })
     const frameBytes = Buffer.byteLength(encoded, 'utf8')
     if (!force && Number.isFinite(maxQueueBytes) && socket.writableLength + frameBytes > maxQueueBytes) return false
     return socket.write(encoded)
@@ -551,6 +554,24 @@ async function dispatch(client, method, params = {}) {
 }
 
 function handleLine(client, line) {
+  let envelope
+  try {
+    envelope = inspectBrokerFrame(line)
+    validateEncodedBrokerFrame(line, { envelope })
+  } catch (error) {
+    if (client.authenticated && error?.code === 'BROKER_FRAME_TOO_LARGE'
+        && envelope?.type === 'request' && envelope.id && envelope.method) {
+      send(client.socket, {
+        type: 'response',
+        id: envelope.id,
+        ok: false,
+        message: `broker request exceeds ${error.maximumBytes} byte limit`,
+      }, { method: envelope.method })
+    } else if (!client.authenticated) {
+      client.socket.destroy()
+    }
+    return
+  }
   let frame
   try { frame = JSON.parse(line) } catch { return }
   if (!client.authenticated) {
@@ -601,10 +622,14 @@ function handleLine(client, line) {
     if (mutating) endMutation()
   }).then(
     (result) => {
-      send(client.socket, { type: 'response', id: frame.id, ok: true, result })
+      send(client.socket, { type: 'response', id: frame.id, ok: true, result }, { method: frame.method })
       scheduleNoClientExit()
     },
-    (error) => send(client.socket, { type: 'response', id: frame.id, ok: false, message: String(error?.message || error) }),
+    (error) => send(
+      client.socket,
+      { type: 'response', id: frame.id, ok: false, message: String(error?.message || error) },
+      { method: frame.method },
+    ),
   )
 }
 

@@ -59,6 +59,12 @@ test('required Mesh workflow pins the runtime, selector, receipt gate, and artif
   assert.match(source, /KAISOLA_REQUIRE_MESH_INTEGRATION:\s*['"]1['"]/)
   assert.match(source, /KAISOLA_EXPECTED_NODE_VERSION:\s*['"]22\.23\.1['"]/)
   assert.match(source, /KAISOLA_MESH_LIFECYCLE_RECEIPT:/)
+  const jobEnvironment = source.slice(source.indexOf('    env:'), source.indexOf('    steps:'))
+  assert.doesNotMatch(
+    jobEnvironment,
+    /runner\.temp/,
+    'runner context is unavailable while GitHub evaluates a job-level environment'
+  )
   assert.match(source, /required-mesh-lifecycle\.json/)
   assert.match(source, /pull_request:\s*\n\s+push:/, 'the required lane must run on every pull request')
   assert.match(

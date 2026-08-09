@@ -16,7 +16,6 @@ jobs:
     env:
       KAISOLA_REQUIRE_MESH_INTEGRATION: '1'
       KAISOLA_EXPECTED_NODE_VERSION: '22.23.1'
-      KAISOLA_MESH_LIFECYCLE_RECEIPT: ${{ runner.temp }}/kaisola-mesh-lifecycle/receipt.json
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -25,6 +24,8 @@ jobs:
 
       - name: Prepare pinned runtime and evidence directory
         shell: bash
+        env:
+          KAISOLA_MESH_LIFECYCLE_RECEIPT: ${{ runner.temp }}/kaisola-mesh-lifecycle/receipt.json
         run: |
           set -euo pipefail
           evidence="$RUNNER_TEMP/kaisola-mesh-lifecycle"
@@ -73,6 +74,8 @@ jobs:
 
       - name: Validate redacted Mesh lifecycle receipt
         shell: bash
+        env:
+          KAISOLA_MESH_LIFECYCLE_RECEIPT: ${{ runner.temp }}/kaisola-mesh-lifecycle/receipt.json
         run: |
           set -euo pipefail
           node scripts/native-mesh-lifecycle-receipt.cjs \

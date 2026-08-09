@@ -62,12 +62,93 @@ enum GitDeadline: Equatable, Sendable {
 /// The wait is bounded on both sides: the child is stopped when it outlives its
 /// deadline, and when the surrounding Task is cancelled.
 enum GitProcessCapture {
+    /// Maximum child output rendered into a single diagnostic. Capture budgets
+    /// may be larger for successful protocol responses, but an error banner is
+    /// always a small head/tail excerpt.
+    static let diagnosticByteLimit = 16 * 1_024
+
+    /// Maximum bytes retained from each child stream. The command may write more
+    /// to its private spool file, but Kaisola never materializes more than this
+    /// amount in memory. Commands that legitimately return tree-sized data get a
+    /// larger stdout allowance than hooks, probes, or network diagnostics.
+    struct Limits: Equatable, Sendable {
+        let stdoutBytes: Int
+        let stderrBytes: Int
+
+        static let local = Limits(stdoutBytes: 8 * 1_024 * 1_024, stderrBytes: 2 * 1_024 * 1_024)
+        static let bulk = Limits(stdoutBytes: 32 * 1_024 * 1_024, stderrBytes: 4 * 1_024 * 1_024)
+        static let hooked = Limits(stdoutBytes: 2 * 1_024 * 1_024, stderrBytes: 2 * 1_024 * 1_024)
+        static let network = Limits(stdoutBytes: 8 * 1_024 * 1_024, stderrBytes: 8 * 1_024 * 1_024)
+        static let probe = Limits(stdoutBytes: 64 * 1_024, stderrBytes: 64 * 1_024)
+
+        static func forGitArguments(_ arguments: [String]) -> Limits {
+            switch GitDeadline.subcommand(of: arguments) {
+            case "apply", "checkout", "diff", "log", "ls-files", "rev-list", "show", "stash", "status", "worktree": .bulk
+            case "commit": .hooked
+            case "clone", "fetch", "ls-remote", "pull", "push": .network
+            default: .local
+            }
+        }
+    }
+
+    /// A bounded head/tail view of one output file. `totalByteCount` comes from
+    /// the file itself, so diagnostics can state exactly how much was omitted
+    /// without ever loading the omitted middle into memory.
+    struct Stream: Equatable, Sendable {
+        let head: Data
+        let tail: Data
+        let totalByteCount: UInt64
+
+        var retainedByteCount: Int { head.count + tail.count }
+        var isTruncated: Bool { UInt64(retainedByteCount) < totalByteCount }
+
+        /// The complete bytes are available only when the operation stayed
+        /// inside its capture limit. Successful commands are rejected by
+        /// `run` before a caller could accidentally parse a truncated value.
+        var completeData: Data? {
+            guard !isTruncated else { return nil }
+            return head
+        }
+
+        /// Render a bounded diagnostic, retaining both the start and end. The
+        /// marker reports original and retained byte counts rather than merely
+        /// saying "truncated".
+        func diagnosticText(byteLimit: Int? = nil) -> String {
+            let limit = max(0, byteLimit ?? retainedByteCount)
+            let segments = diagnosticSegments(byteLimit: limit)
+            let retained = segments.head.count + segments.tail.count
+            guard UInt64(retained) < totalByteCount else {
+                return String(decoding: segments.head, as: UTF8.self)
+            }
+            let marker = "\n… output truncated; retained \(retained) of \(totalByteCount) bytes "
+                + "(\(segments.head.count) head + \(segments.tail.count) tail) …\n"
+            return String(decoding: segments.head, as: UTF8.self)
+                + marker
+                + String(decoding: segments.tail, as: UTF8.self)
+        }
+
+        private func diagnosticSegments(byteLimit: Int) -> (head: Data, tail: Data) {
+            guard totalByteCount > UInt64(byteLimit) else { return (head, Data()) }
+            let headBudget = (byteLimit + 1) / 2
+            let tailBudget = byteLimit - headBudget
+            let retainedHead = Data(head.prefix(headBudget))
+            let tailSource = tail.isEmpty ? head : tail
+            return (retainedHead, Data(tailSource.suffix(tailBudget)))
+        }
+    }
+
+    struct Result: Equatable, Sendable {
+        let out: Stream
+        let err: Stream
+    }
+
     /// The child was stopped rather than allowed to finish. Callers map this
     /// onto `GitService.GitError` so the UI can tell "nothing responded" apart
     /// from a command that genuinely failed.
     enum Failure: Error, Equatable {
         case timedOut(seconds: TimeInterval)
         case cancelled
+        case outputLimitExceeded(stream: String, totalBytes: UInt64, retainedBytes: Int)
     }
 
     /// How often the wait wakes to notice cancellation and the deadline. Git
@@ -84,8 +165,9 @@ enum GitProcessCapture {
     static func run(
         _ process: Process,
         standardInput: Data? = nil,
-        deadline: GitDeadline = .local
-    ) throws -> (out: Data, err: Data) {
+        deadline: GitDeadline = .local,
+        limits: Limits = .local
+    ) throws -> Result {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-process-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -122,10 +204,52 @@ enum GitProcessCapture {
         try wait(for: process, exited: exited, budget: deadline.seconds)
         try? output.synchronize()
         try? errors.synchronize()
-        return (
-            (try? Data(contentsOf: outputURL)) ?? Data(),
-            (try? Data(contentsOf: errorURL)) ?? Data()
+        let result = Result(
+            out: try boundedStream(at: outputURL, byteLimit: limits.stdoutBytes),
+            err: try boundedStream(at: errorURL, byteLimit: limits.stderrBytes)
         )
+        // A failed command may still return bounded diagnostics for the caller
+        // to classify. A successful command must never be parsed as if its
+        // truncated head and tail were the complete protocol response.
+        if process.terminationStatus == 0 {
+            if result.out.isTruncated {
+                throw Failure.outputLimitExceeded(
+                    stream: "stdout",
+                    totalBytes: result.out.totalByteCount,
+                    retainedBytes: result.out.retainedByteCount
+                )
+            }
+            if result.err.isTruncated {
+                throw Failure.outputLimitExceeded(
+                    stream: "stderr",
+                    totalBytes: result.err.totalByteCount,
+                    retainedBytes: result.err.retainedByteCount
+                )
+            }
+        }
+        return result
+    }
+
+    private static func boundedStream(at url: URL, byteLimit: Int) throws -> Stream {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let total = try handle.seekToEnd()
+        let limit = max(0, byteLimit)
+        guard total > UInt64(limit) else {
+            try handle.seek(toOffset: 0)
+            return Stream(
+                head: try handle.read(upToCount: Int(total)) ?? Data(),
+                tail: Data(),
+                totalByteCount: total
+            )
+        }
+        let headLimit = (limit + 1) / 2
+        let tailLimit = limit - headLimit
+        try handle.seek(toOffset: 0)
+        let head = try handle.read(upToCount: headLimit) ?? Data()
+        try handle.seek(toOffset: total - UInt64(tailLimit))
+        let tail = try handle.read(upToCount: tailLimit) ?? Data()
+        return Stream(head: head, tail: tail, totalByteCount: total)
     }
 
     /// Block until the child exits, its budget runs out, or the surrounding Task
@@ -191,7 +315,7 @@ struct GitService: Sendable {
     /// Failure diagnostics are rendered in the Git panel, so a noisy hook must
     /// not turn one rejection into an unbounded banner. The allowance is shared
     /// fairly when Git gives us both streams, while a lone stream can use it all.
-    private static let failureOutputByteLimit = 16 * 1024
+    private static let failureOutputByteLimit = GitProcessCapture.diagnosticByteLimit
 
     init(repoRoot: URL) {
         self.repoRoot = repoRoot
@@ -258,6 +382,14 @@ struct GitService: Sendable {
     struct Entry: Equatable, Identifiable, Sendable {
         let path: String
         let code: String
+        let originalPath: String?
+
+        init(path: String, code: String, originalPath: String? = nil) {
+            self.path = path
+            self.code = code
+            self.originalPath = originalPath
+        }
+
         var id: String { path }
     }
 
@@ -297,6 +429,12 @@ struct GitService: Sendable {
             switch failure {
             case let .timedOut(seconds): .timedOut(command: command, seconds: Int(seconds.rounded()))
             case .cancelled: .cancelled
+            case let .outputLimitExceeded(stream, totalBytes, retainedBytes):
+                .commandFailed(
+                    "\(command) produced \(totalBytes) \(stream) bytes; "
+                        + "retained \(retainedBytes) bytes at its output limit. "
+                        + "Narrow the operation and try again."
+                )
             }
         }
     }
@@ -310,7 +448,7 @@ struct GitService: Sendable {
     /// class of caller.
     func status() throws -> Status {
         let statusArguments = [
-            "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--find-renames=50%"
+            "--no-optional-locks", "status", "--porcelain=v2", "-z", "--branch", "--find-renames=50%"
         ]
         // Stats require three independent Git views. Fence them with the same
         // porcelain snapshot: if an external stage/commit lands between those
@@ -860,43 +998,92 @@ struct GitService: Sendable {
             unstagedStats: unstagedStats,
             combinedStats: combinedStats
         )
-        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
-            if line.hasPrefix("# branch.head ") {
-                status.branch = String(line.dropFirst("# branch.head ".count))
-            } else if line.hasPrefix("# branch.ab ") {
-                let fields = line.dropFirst("# branch.ab ".count).split(separator: " ")
-                for field in fields {
-                    if field.hasPrefix("+") { status.ahead = Int(field.dropFirst()) ?? 0 }
-                    if field.hasPrefix("-") { status.behind = Int(field.dropFirst()) ?? 0 }
-                }
-            } else if line.hasPrefix("1 ") {
-                // "1 XY ... path"
-                let fields = line.split(separator: " ", maxSplits: 8, omittingEmptySubsequences: false)
-                guard fields.count >= 9 else { continue }
-                let xy = String(fields[1])
-                let pathField = fields[8...].joined(separator: " ")
-                let path = String(pathField)
-                let x = xy.first.map(String.init) ?? "."
-                let y = xy.dropFirst().first.map(String.init) ?? "."
-                if x != "." { status.staged.append(Entry(path: path, code: x)) }
-                if y != "." { status.unstaged.append(Entry(path: path, code: y)) }
-            } else if line.hasPrefix("2 ") {
-                // "2 XY ... R100 destination\tsource". The similarity token
-                // is its own field, not part of the destination pathname.
-                let fields = line.split(separator: " ", maxSplits: 9, omittingEmptySubsequences: false)
-                guard fields.count >= 10 else { continue }
-                let xy = String(fields[1])
-                let pathField = fields[9...].joined(separator: " ")
-                let path = String(pathField.split(separator: "\t").first ?? Substring(pathField))
-                let x = xy.first.map(String.init) ?? "."
-                let y = xy.dropFirst().first.map(String.init) ?? "."
-                if x != "." { status.staged.append(Entry(path: path, code: x)) }
-                if y != "." { status.unstaged.append(Entry(path: path, code: y)) }
-            } else if line.hasPrefix("? ") {
-                status.untracked.append(String(line.dropFirst(2)))
+        let records = output.split(separator: "\0", omittingEmptySubsequences: false)
+        var index = 0
+        while index < records.count {
+            let record = records[index]
+            if record.hasPrefix("# branch.head "),
+               let (_, value) = statusFields(record, fixedFieldCount: 2) {
+                status.branch = String(value)
+            } else if record.hasPrefix("# branch.ab "),
+                      let (fields, behind) = statusFields(record, fixedFieldCount: 3) {
+                status.ahead = Int(fields[2].dropFirst()) ?? 0
+                status.behind = Int(behind.dropFirst()) ?? 0
+            } else if record.hasPrefix("1 "),
+                      let (fields, path) = statusFields(record, fixedFieldCount: 8) {
+                appendStatusEntries(
+                    xy: fields[1],
+                    path: String(path),
+                    originalPath: nil,
+                    to: &status
+                )
+            } else if record.hasPrefix("2 "),
+                      let (fields, path) = statusFields(record, fixedFieldCount: 9),
+                      index + 1 < records.count {
+                let originalPath = String(records[index + 1])
+                appendStatusEntries(
+                    xy: fields[1],
+                    path: String(path),
+                    originalPath: originalPath,
+                    to: &status
+                )
+                // With `-z`, Git writes the rename/copy source as the next NUL
+                // record. Consume it even when it resembles another status row.
+                index += 1
+            } else if record.hasPrefix("u "),
+                      let (fields, path) = statusFields(record, fixedFieldCount: 10) {
+                appendStatusEntries(
+                    xy: fields[1],
+                    path: String(path),
+                    originalPath: nil,
+                    to: &status
+                )
+            } else if record.hasPrefix("? "),
+                      let (_, path) = statusFields(record, fixedFieldCount: 1) {
+                status.untracked.append(String(path))
             }
+            // `!` records are ignored by design. This status command does not
+            // request ignored files, but accepting them keeps parsing aligned
+            // if the caller ever adds `--ignored`.
+            index += 1
         }
         return status
+    }
+
+    /// Consume exactly the fixed ASCII-space-delimited fields at the front of
+    /// a porcelain record and leave the decoded remainder unchanged as its
+    /// path or value. Newlines, tabs, quotes, backslashes, and leading spaces
+    /// in paths are data, never separators in `-z` mode.
+    private static func statusFields(
+        _ record: Substring,
+        fixedFieldCount: Int
+    ) -> (fields: [Substring], remainder: Substring)? {
+        var fields: [Substring] = []
+        var remainder = record
+        for _ in 0 ..< fixedFieldCount {
+            guard let separator = remainder.firstIndex(of: " ") else { return nil }
+            let field = remainder[..<separator]
+            guard !field.isEmpty else { return nil }
+            fields.append(field)
+            remainder = remainder[remainder.index(after: separator)...]
+        }
+        return (fields, remainder)
+    }
+
+    private static func appendStatusEntries(
+        xy: Substring,
+        path: String,
+        originalPath: String?,
+        to status: inout Status
+    ) {
+        let x = xy.first.map(String.init) ?? "."
+        let y = xy.dropFirst().first.map(String.init) ?? "."
+        if x != "." {
+            status.staged.append(Entry(path: path, code: x, originalPath: originalPath))
+        }
+        if y != "." {
+            status.unstaged.append(Entry(path: path, code: y, originalPath: originalPath))
+        }
     }
 
     /// Parse NUL-delimited numstat records. A rename has an empty pathname in
@@ -994,12 +1181,13 @@ struct GitService: Sendable {
             for (key, value) in environmentOverrides { environment[key] = value }
             process.environment = environment
         }
-        let capture: (out: Data, err: Data)
+        let capture: GitProcessCapture.Result
         do {
             capture = try GitProcessCapture.run(
                 process,
                 standardInput: standardInput.map { Data($0.utf8) },
-                deadline: .forGitArguments(arguments)
+                deadline: .forGitArguments(arguments),
+                limits: .forGitArguments(arguments)
             )
         }
         catch let failure as GitProcessCapture.Failure {
@@ -1007,8 +1195,8 @@ struct GitService: Sendable {
         }
         catch { throw GitError.commandFailed(error.localizedDescription) }
         if process.terminationStatus != 0 {
-            let stdout = String(decoding: capture.out, as: UTF8.self)
-            let stderr = String(decoding: capture.err, as: UTF8.self)
+            let stdout = capture.out.diagnosticText(byteLimit: GitProcessCapture.diagnosticByteLimit)
+            let stderr = capture.err.diagnosticText(byteLimit: GitProcessCapture.diagnosticByteLimit)
             if stdout.contains("not a git repository") || stderr.contains("not a git repository") {
                 throw GitError.notARepository
             }
@@ -1019,7 +1207,7 @@ struct GitService: Sendable {
                 stderr: capture.err
             ))
         }
-        return String(data: capture.out, encoding: .utf8) ?? ""
+        return String(data: capture.out.completeData ?? Data(), encoding: .utf8) ?? ""
     }
 
     /// A stable, bounded explanation for a Git rejection. Both stdout and
@@ -1028,10 +1216,13 @@ struct GitService: Sendable {
     private static func commandFailureMessage(
         arguments: [String],
         status: Int32,
-        stdout: Data,
-        stderr: Data
+        stdout: GitProcessCapture.Stream,
+        stderr: GitProcessCapture.Stream
     ) -> String {
-        let budgets = failureOutputBudgets(stdoutBytes: stdout.count, stderrBytes: stderr.count)
+        let budgets = failureOutputBudgets(
+            stdoutBytes: Int(min(UInt64(Int.max), stdout.totalByteCount)),
+            stderrBytes: Int(min(UInt64(Int.max), stderr.totalByteCount))
+        )
         var sections = ["\(commandLabel(arguments)) exited with status \(status)."]
         if let rendered = boundedFailureOutput(stdout, byteLimit: budgets.stdout) {
             sections.append("stdout:\n\(rendered)")
@@ -1060,15 +1251,15 @@ struct GitService: Sendable {
         return (stdoutBudget, stderrBudget)
     }
 
-    private static func boundedFailureOutput(_ data: Data, byteLimit: Int) -> String? {
-        guard !data.isEmpty, byteLimit > 0 else { return nil }
-        let prefix = data.prefix(byteLimit)
-        let rendered = String(decoding: prefix, as: UTF8.self)
+    private static func boundedFailureOutput(
+        _ stream: GitProcessCapture.Stream,
+        byteLimit: Int
+    ) -> String? {
+        guard stream.totalByteCount > 0, byteLimit > 0 else { return nil }
+        let rendered = stream.diagnosticText(byteLimit: byteLimit)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !rendered.isEmpty else { return nil }
-        return data.count > prefix.count
-            ? "\(rendered)\n… (output truncated)"
-            : rendered
+        return rendered
     }
 
     /// "git status", "git push" — what a stopped command is called in the UI.

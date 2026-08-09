@@ -10,76 +10,134 @@ final class DataPreviewsTests: XCTestCase {
     // MARK: - CSV parsing
 
     func testParsesSimpleRows() {
-        let (rows, truncated) = CsvTable.parse("a,b,c\n1,2,3")
-        XCTAssertEqual(rows, [["a", "b", "c"], ["1", "2", "3"]])
-        XCTAssertFalse(truncated)
+        let result = CsvTable.parse("a,b,c\n1,2,3")
+        XCTAssertEqual(result.rows, [["a", "b", "c"], ["1", "2", "3"]])
+        XCTAssertFalse(result.truncated)
     }
 
     func testQuotedFieldWithEmbeddedCommaAndNewline() {
-        let (rows, _) = CsvTable.parse("name,note\n\"Doe, Jane\",\"line1\nline2\"")
-        XCTAssertEqual(rows, [["name", "note"], ["Doe, Jane", "line1\nline2"]])
+        let result = CsvTable.parse("name,note\n\"Doe, Jane\",\"line1\nline2\"")
+        XCTAssertEqual(result.rows, [["name", "note"], ["Doe, Jane", "line1\nline2"]])
     }
 
     func testEscapedQuotesInsideQuotedField() {
         // Source field: "He said ""hi"""  ->  He said "hi"
-        let (rows, _) = CsvTable.parse("q\n\"He said \"\"hi\"\"\"")
-        XCTAssertEqual(rows, [["q"], ["He said \"hi\""]])
+        let result = CsvTable.parse("q\n\"He said \"\"hi\"\"\"")
+        XCTAssertEqual(result.rows, [["q"], ["He said \"hi\""]])
     }
 
     func testMidFieldQuoteIsLiteralAndDoesNotSwallowRest() {
         // A stray quote NOT at field start (3"5) is a literal character; it must
         // not open a quoted field that eats every later delimiter/newline.
-        let (rows, _) = CsvTable.parse("a,b\n3\"5,tail\nx,y")
-        XCTAssertEqual(rows, [["a", "b"], ["3\"5", "tail"], ["x", "y"]])
+        let result = CsvTable.parse("a,b\n3\"5,tail\nx,y")
+        XCTAssertEqual(result.rows, [["a", "b"], ["3\"5", "tail"], ["x", "y"]])
     }
 
     func testCRLFLineEndings() {
-        let (rows, _) = CsvTable.parse("a,b\r\n1,2\r\n")
-        XCTAssertEqual(rows, [["a", "b"], ["1", "2"]])
+        let result = CsvTable.parse("a,b\r\n1,2\r\n")
+        XCTAssertEqual(result.rows, [["a", "b"], ["1", "2"]])
     }
 
     func testTrailingNewlineDoesNotAddEmptyRow() {
-        let (rows, _) = CsvTable.parse("a\nb\n")
-        XCTAssertEqual(rows, [["a"], ["b"]])
+        let result = CsvTable.parse("a\nb\n")
+        XCTAssertEqual(result.rows, [["a"], ["b"]])
     }
 
     func testTrailingEmptyFieldIsPreserved() {
-        let (rows, _) = CsvTable.parse("a,")
-        XCTAssertEqual(rows, [["a", ""]])
+        let result = CsvTable.parse("a,")
+        XCTAssertEqual(result.rows, [["a", ""]])
     }
 
     func testEmptyInputYieldsNoRows() {
-        let (rows, truncated) = CsvTable.parse("")
-        XCTAssertTrue(rows.isEmpty)
-        XCTAssertFalse(truncated)
+        let result = CsvTable.parse("")
+        XCTAssertTrue(result.rows.isEmpty)
+        XCTAssertFalse(result.truncated)
+        XCTAssertEqual(result.truncation, .empty)
     }
 
     func testSemicolonDelimiterParsing() {
-        let (rows, _) = CsvTable.parse("a;b;c", delimiter: ";")
-        XCTAssertEqual(rows, [["a", "b", "c"]])
+        let result = CsvTable.parse("a;b;c", delimiter: ";")
+        XCTAssertEqual(result.rows, [["a", "b", "c"]])
     }
 
     // MARK: - CSV caps
 
     func testRowCapAndTruncatedFlag() {
         let text = (0..<(CsvTable.maxRows + 500)).map(String.init).joined(separator: "\n")
-        let (rows, truncated) = CsvTable.parse(text)
-        XCTAssertEqual(rows.count, CsvTable.maxRows)
-        XCTAssertTrue(truncated)
+        let result = CsvTable.parse(text)
+        XCTAssertEqual(result.rows.count, CsvTable.maxRows)
+        XCTAssertTrue(result.truncated)
     }
 
     func testColumnCapAndTruncatedFlag() {
         let wideRow = (0..<(CsvTable.maxCols + 30)).map { "c\($0)" }.joined(separator: ",")
-        let (rows, truncated) = CsvTable.parse(wideRow)
-        XCTAssertEqual(rows.first?.count, CsvTable.maxCols)
-        XCTAssertTrue(truncated)
+        let result = CsvTable.parse(wideRow)
+        XCTAssertEqual(result.rows.first?.count, CsvTable.maxCols)
+        XCTAssertTrue(result.truncated)
     }
 
     func testWithinCapsIsNotTruncated() {
         let text = (0..<10).map { "\($0),x,y" }.joined(separator: "\n")
-        let (rows, truncated) = CsvTable.parse(text)
-        XCTAssertEqual(rows.count, 10)
-        XCTAssertFalse(truncated)
+        let result = CsvTable.parse(text)
+        XCTAssertEqual(result.rows.count, 10)
+        XCTAssertFalse(result.truncated)
+    }
+
+    func testRowOnlyTruncationReportsActualAndDisplayedCounts() {
+        let text = (0...CsvTable.maxRows).map(String.init).joined(separator: "\n")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows + 1)
+        XCTAssertEqual(result.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.actualColumnCount, 1)
+        XCTAssertEqual(result.truncation.displayedColumnCount, 1)
+        XCTAssertTrue(result.truncation.rowsWereTruncated)
+        XCTAssertFalse(result.truncation.columnsWereTruncated)
+        XCTAssertEqual(result.truncation.notice, "Showing 2000 of 2001 rows.")
+    }
+
+    func testColumnOnlyTruncationReportsActualAndDisplayedCounts() {
+        let text = (0...CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, 1)
+        XCTAssertEqual(result.truncation.displayedRowCount, 1)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols + 1)
+        XCTAssertEqual(result.truncation.displayedColumnCount, CsvTable.maxCols)
+        XCTAssertFalse(result.truncation.rowsWereTruncated)
+        XCTAssertTrue(result.truncation.columnsWereTruncated)
+        XCTAssertEqual(result.truncation.notice, "Showing 64 of 65 columns.")
+    }
+
+    func testRowAndColumnTruncationReportsBothDimensions() {
+        let row = (0...CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let text = Array(repeating: row, count: CsvTable.maxRows + 1).joined(separator: "\n")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows + 1)
+        XCTAssertEqual(result.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols + 1)
+        XCTAssertEqual(result.truncation.displayedColumnCount, CsvTable.maxCols)
+        XCTAssertTrue(result.truncation.rowsWereTruncated)
+        XCTAssertTrue(result.truncation.columnsWereTruncated)
+        XCTAssertEqual(
+            result.truncation.notice,
+            "Showing 2000 of 2001 rows and 64 of 65 columns."
+        )
+    }
+
+    func testExactRowAndColumnBoundariesDoNotReportTruncation() {
+        let row = (0..<CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let text = Array(repeating: row, count: CsvTable.maxRows).joined(separator: "\n")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols)
+        XCTAssertEqual(result.truncation.displayedColumnCount, CsvTable.maxCols)
+        XCTAssertFalse(result.truncation.rowsWereTruncated)
+        XCTAssertFalse(result.truncation.columnsWereTruncated)
+        XCTAssertNil(result.truncation.notice)
     }
 
     // MARK: - Delimiter detection
@@ -269,9 +327,14 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertEqual(model.columnWidths[1], CsvPreviewModel.maximumColumnWidth)
     }
 
-    func testCsvPreviewModelCarriesTheTruncationFlag() {
+    func testCsvPreviewModelCarriesTheTruncationSummary() {
         let text = (0..<(CsvTable.maxRows + 10)).map(String.init).joined(separator: "\n")
-        XCTAssertTrue(CsvPreviewModel.make(text).truncated)
+        let model = CsvPreviewModel.make(text)
+
+        XCTAssertTrue(model.truncated)
+        XCTAssertEqual(model.truncation.actualRowCount, CsvTable.maxRows + 10)
+        XCTAssertEqual(model.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(model.truncation.notice, "Showing 2000 of 2010 rows.")
     }
 
     func testJsonPreviewOutcomeIsBuiltOncePerContentIdentity() async {

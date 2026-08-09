@@ -12,13 +12,23 @@ const guardTestFile = 'tests/node/brokerRuntimeManifest.test.cjs'
 // runtime makes the guard fail until the new path is reviewed and listed here.
 const brokerRuntimeTestFiles = Object.freeze([
   'tests/node/brokerCompatibility.test.cjs',
+  'tests/node/brokerExitStatus.test.cjs',
+  'tests/node/brokerFrameLimits.test.cjs',
   'tests/node/brokerRendezvous.test.cjs',
+  'tests/node/brokerRequestGate.test.cjs',
   'tests/node/brokerUpgrade.test.cjs',
   'tests/node/brokerUpgradeIntegration.test.cjs',
+  'tests/node/brokerWire.test.cjs',
   'tests/node/companionProtocolTables.test.cjs',
+  'tests/node/sessionBrokerExitWaits.test.cjs',
   'tests/node/shellEnv.test.cjs',
+  'tests/node/terminalAttachRoute.test.cjs',
   'tests/node/terminalCreateRoute.test.cjs',
+  'tests/node/terminalDetachOwnerRoute.test.cjs',
+  'tests/node/terminalKillRoute.test.cjs',
   'tests/node/terminalManager.test.cjs',
+  'tests/node/terminalObservers.test.cjs',
+  'tests/node/terminalResizeRoute.test.cjs',
   'tests/node/terminalSpool.test.cjs',
   'tests/node/terminalWarning.test.cjs',
 ])

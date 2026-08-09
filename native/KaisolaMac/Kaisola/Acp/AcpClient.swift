@@ -925,6 +925,11 @@ actor AcpClient {
     /// exits or a client is stopped/restarted. Without this guard, a resumed
     /// permission task could write its JSON-RPC response into the next adapter.
     private var connectionGeneration: UInt64 = 0
+    /// The reader and callback writers can discover the same broken connection
+    /// concurrently. Claim the generation before terminating it so exactly one
+    /// path owns the health transition and a stale send failure cannot close a
+    /// replacement adapter.
+    private var failingConnectionGeneration: UInt64?
     private var sessionID: String?
     private struct ScopedSessionIdentity: Sendable {
         let sessionID: String
@@ -1051,6 +1056,7 @@ actor AcpClient {
     ) async throws -> AcpSessionInfo {
         connectionGeneration &+= 1
         let startGeneration = connectionGeneration
+        failingConnectionGeneration = nil
         decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
         sessionID = nil
         activeSessionIdentity = nil
@@ -1372,6 +1378,7 @@ actor AcpClient {
 
     func stop() async {
         connectionGeneration &+= 1
+        failingConnectionGeneration = nil
         let reader = readerTask
         readerTask = nil
         reader?.cancel()
@@ -1463,23 +1470,90 @@ actor AcpClient {
         }
     }
 
+    private enum OutboundCallbackKind {
+        case notification
+        case response
+
+        var failure: AcpClientError {
+            switch self {
+            case .notification:
+                .requestFailed(
+                    "Kaisola could not send an ACP notification. The agent connection was closed."
+                )
+            case .response:
+                .requestFailed(
+                    "Kaisola could not send an ACP callback response. The agent connection was closed."
+                )
+            }
+        }
+    }
+
+    /// Callback delivery is part of connection health, not best-effort
+    /// telemetry. A failed notification can leave cancellation unapplied and a
+    /// failed response leaves the adapter waiting forever, so either failure
+    /// retires only the generation that attempted the write.
+    private func sendCallbackFrame(
+        _ frame: Data,
+        kind: OutboundCallbackKind,
+        sourceConnectionGeneration: UInt64
+    ) {
+        Task {
+            do {
+                try await transport.send(frame)
+            } catch {
+                await failConnection(
+                    kind.failure,
+                    sourceConnectionGeneration: sourceConnectionGeneration
+                )
+            }
+        }
+    }
+
+    private func failCallbackEncoding(
+        kind: OutboundCallbackKind,
+        sourceConnectionGeneration: UInt64
+    ) {
+        Task {
+            await failConnection(
+                kind.failure,
+                sourceConnectionGeneration: sourceConnectionGeneration
+            )
+        }
+    }
+
     private func notify(_ method: String, params: JSONValue) {
-        guard let frame = try? encode(.object([
-            "jsonrpc": .string("2.0"),
-            "method": .string(method),
-            "params": params,
-        ]), purpose: .notification(method: method)) else { return }
-        Task { try? await transport.send(frame) }
+        let generation = connectionGeneration
+        let frame: Data
+        do {
+            frame = try encode(.object([
+                "jsonrpc": .string("2.0"),
+                "method": .string(method),
+                "params": params,
+            ]), purpose: .notification(method: method))
+        } catch {
+            failCallbackEncoding(kind: .notification, sourceConnectionGeneration: generation)
+            return
+        }
+        sendCallbackFrame(
+            frame,
+            kind: .notification,
+            sourceConnectionGeneration: generation
+        )
     }
 
     private func respond(id: JSONValue, method: String, result: JSONValue) {
+        let generation = connectionGeneration
         do {
             let frame = try encode(.object([
                 "jsonrpc": .string("2.0"),
                 "id": id,
                 "result": result,
             ]), purpose: .response(method: method))
-            Task { try? await transport.send(frame) }
+            sendCallbackFrame(
+                frame,
+                kind: .response,
+                sourceConnectionGeneration: generation
+            )
         } catch {
             respondError(
                 id: id,
@@ -1498,6 +1572,7 @@ actor AcpClient {
         message: String,
         data: JSONValue? = nil
     ) {
+        let generation = connectionGeneration
         var error: [String: JSONValue] = [
             "code": .integer(Int64(code)),
             "message": .string(message),
@@ -1525,10 +1600,20 @@ actor AcpClient {
                     "data": outboundFrameRejectionData(error),
                 ]),
             ])
-            guard let bounded = try? encode(fallback, purpose: purpose) else { return }
+            guard let bounded = try? encode(fallback, purpose: purpose) else {
+                failCallbackEncoding(
+                    kind: .response,
+                    sourceConnectionGeneration: generation
+                )
+                return
+            }
             frame = bounded
         }
-        Task { try? await transport.send(frame) }
+        sendCallbackFrame(
+            frame,
+            kind: .response,
+            sourceConnectionGeneration: generation
+        )
     }
 
     private func encode(
@@ -1598,6 +1683,10 @@ actor AcpClient {
                 guard let data = try await transport.receive(maximumBytes: 256 * 1_024) else {
                     guard sourceConnectionGeneration == connectionGeneration else { return }
                     guard !Task.isCancelled else { return }
+                    // A callback writer already owns this generation's health
+                    // transition. Its terminate() wakes receive with EOF; the
+                    // reader must not emit a second exit or terminate twice.
+                    guard failingConnectionGeneration != sourceConnectionGeneration else { return }
                     // EOF is the transport connection closing. Reap the whole
                     // adapter-owned process group before publishing the exit;
                     // the adapter may have closed stdout while remaining alive.
@@ -1653,14 +1742,27 @@ actor AcpClient {
         sourceConnectionGeneration: UInt64
     ) async {
         guard !Task.isCancelled,
-              sourceConnectionGeneration == connectionGeneration else { return }
+              sourceConnectionGeneration == connectionGeneration,
+              failingConnectionGeneration == nil else { return }
+        failingConnectionGeneration = sourceConnectionGeneration
         await transport.terminate()
         guard !Task.isCancelled,
-              sourceConnectionGeneration == connectionGeneration else { return }
+              sourceConnectionGeneration == connectionGeneration else {
+            if failingConnectionGeneration == sourceConnectionGeneration {
+                failingConnectionGeneration = nil
+            }
+            return
+        }
         let code = await transport.exitCode() ?? -1
         guard !Task.isCancelled,
-              sourceConnectionGeneration == connectionGeneration else { return }
+              sourceConnectionGeneration == connectionGeneration else {
+            if failingConnectionGeneration == sourceConnectionGeneration {
+                failingConnectionGeneration = nil
+            }
+            return
+        }
         connectionGeneration &+= 1
+        failingConnectionGeneration = nil
         cancelPermissionRequests()
         sessionID = nil
         activeSessionIdentity = nil

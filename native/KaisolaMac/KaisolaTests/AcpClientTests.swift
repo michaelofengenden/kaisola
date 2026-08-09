@@ -3553,6 +3553,120 @@ final class AcpClientTests: XCTestCase {
         await client.stop()
     }
 
+    // MARK: - Callback delivery health
+
+    func testFailedNotificationSendClosesTheConnectionWithAVisibleReason() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.failClientNotifications(true)
+        await client.cancel()
+
+        try await Self.untilAsync("the failed notification to retire the connection") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        let errors = collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message }
+            return nil
+        }
+        XCTAssertEqual(
+            errors,
+            ["Kaisola could not send an ACP notification. The agent connection was closed."]
+        )
+        XCTAssertEqual(
+            collector.events.filter { if case .exited = $0 { return true } else { return false } }.count,
+            1
+        )
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(terminationCount, 1)
+    }
+
+    func testFailedCallbackResponsesShareOneConnectionHealthTransition() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.failClientResponses(true)
+        await transport.sendAgentRequest(
+            id: 37_001,
+            method: "test/first_unhandled_callback",
+            params: .object([:])
+        )
+        await transport.sendAgentRequest(
+            id: 37_002,
+            method: "test/second_unhandled_callback",
+            params: .object([:])
+        )
+
+        try await Self.untilAsync("the failed responses to retire the connection once") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        let errors = collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message }
+            return nil
+        }
+        XCTAssertEqual(
+            errors,
+            ["Kaisola could not send an ACP callback response. The agent connection was closed."]
+        )
+        XCTAssertEqual(
+            collector.events.filter { if case .exited = $0 { return true } else { return false } }.count,
+            1
+        )
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(terminationCount, 1)
+    }
+
+    func testUnencodableRequiredCallbackResponseClosesTheConnection() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(
+            transport: transport,
+            outboundFrameLimits: AcpOutboundFrameLimits(
+                globalMaximumBytes: 4 * 1_024,
+                promptMaximumBytes: 4 * 1_024,
+                toolResponseMaximumBytes: 1
+            )
+        )
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.sendAgentRequest(
+            id: 37_003,
+            method: "fs/read_text_file",
+            params: .object(["path": .string("/var/empty/kaisola-callback-fixture")])
+        )
+
+        try await Self.untilAsync("the rejected callback encoding to retire the connection") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        XCTAssertTrue(collector.events.contains { event in
+            if case let .error(message) = event {
+                return message
+                    == "Kaisola could not send an ACP callback response. The agent connection was closed."
+            }
+            return false
+        })
+        let responseCount = await transport.receivedProtocolResponses().count
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(responseCount, 0)
+        XCTAssertEqual(terminationCount, 1)
+    }
+
     func testAdapterExitCancelsEveryInFlightTimeout() async throws {
         let (client, transport) = try await Self.connectedClient()
 
@@ -4015,6 +4129,8 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
+    private var failingClientNotifications = false
+    private var failingClientResponses = false
     private var clientCapabilities: JSONValue?
     private var clientResponses: [Int64: JSONValue] = [:]
 
@@ -4071,6 +4187,8 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func receivedProtocolResponses() -> [JSONValue] { protocolResponses }
     func terminationCount() -> Int { terminations }
     func receivedClientCapabilities() -> JSONValue? { clientCapabilities }
+    func failClientNotifications(_ failing: Bool) { failingClientNotifications = failing }
+    func failClientResponses(_ failing: Bool) { failingClientResponses = failing }
 
     func sendAgentRequest(id: Int64, method: String, params: JSONValue) {
         enqueue(.object([
@@ -4189,6 +4307,12 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func send(_ data: Data) async throws {
         guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else { return }
         let id = object["id"]
+        if object["method"] == nil, failingClientResponses {
+            throw AcpClientError.notRunning
+        }
+        if id == nil, object["method"] != nil, failingClientNotifications {
+            throw AcpClientError.notRunning
+        }
         if object["method"] == nil {
             protocolResponses.append(.object(object))
             if let wireID = id?.intValue {

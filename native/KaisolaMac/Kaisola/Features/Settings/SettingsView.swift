@@ -8,6 +8,124 @@ extension Notification.Name {
     static let kaisolaCheckForUpdates = Notification.Name("kaisolaCheckForUpdates")
 }
 
+/// What the Settings window owes AppKit: the style mask, the sizes it opens at,
+/// and the band of the content view the three standard window buttons live in.
+///
+/// Settings draws a full-size content view under a hidden, transparent title
+/// bar, so nothing but this type keeps custom content off the traffic lights.
+/// Nothing did: the 30pt Settings mark was drawn straight over the minimize and
+/// zoom controls, on every tab and in both appearances, and the window was not
+/// even `.miniaturizable`, so the control it buried would have done nothing if
+/// you had found it (#306).
+///
+/// The numbers the navigation column lays out with live here rather than inline
+/// in the view, so `NativeVisualWindowControlGate` and its tests measure the
+/// shipped layout instead of a copy of it.
+enum SettingsWindowChrome {
+    /// `.miniaturizable` is not decoration. AppKit draws the yellow control for
+    /// any titled window and simply refuses to run it when the mask omits it.
+    static let styleMask: NSWindow.StyleMask = [
+        .titled, .closable, .miniaturizable, .resizable, .fullSizeContentView,
+    ]
+
+    /// SettingsView's own frame contract, stated once so the ⌘, window, the
+    /// visual fixtures, and the tests cannot drift from it.
+    static let minimumContentSize = NSSize(width: 820, height: 560)
+    static let idealContentSize = NSSize(width: 1_100, height: 800)
+
+    /// The top band of the content view that belongs to AppKit.
+    ///
+    /// A standard title bar centres the three buttons in it, so reserving the
+    /// whole band clears every button *and* leaves the drag and
+    /// double-click-to-zoom region AppKit runs there empty. The bar is 28pt on
+    /// macOS 14–15 and 32 on macOS 26, which is why
+    /// `testSettingsReservesTheTitleBarBandAppKitOwns` measures a real window's
+    /// `contentLayoutRect` instead of trusting this literal: 28 passed every
+    /// review and failed that test on the first run.
+    ///
+    /// A sheet presentation reserves nothing. It has no window buttons and
+    /// carries its own Done action.
+    static let titleBarSafeArea: CGFloat = 32
+
+    static let navigationColumnWidth: CGFloat = 176
+    static let navigationOuterPadding: CGFloat = 8
+    static let navigationContentPadding: CGFloat = 14
+    static let navigationVerticalPadding: CGFloat = 14
+    static let identityMarkSize: CGFloat = 30
+
+    /// The Settings mark's frame in window points measured from the *top-left*
+    /// corner of the content view — the corner the traffic lights sit in.
+    ///
+    /// Parameterised on the reserved band so a test can ask what the pre-fix
+    /// layout did (pass 0) and what the shipped one does.
+    static func identityMarkFrame(titleBarSafeArea: CGFloat = titleBarSafeArea) -> CGRect {
+        CGRect(
+            x: navigationOuterPadding + navigationContentPadding,
+            y: titleBarSafeArea + navigationVerticalPadding,
+            width: identityMarkSize,
+            height: identityMarkSize
+        )
+    }
+
+    /// The visual-fixture surfaces that open Settings instead of the workspace
+    /// shell. Stated once because the app delegate asks twice: to build the
+    /// content and to size the window.
+    ///
+    /// `settings-minimum` and `settings-ideal` are the two ends of the size
+    /// contract above. Both open the General tab, which is where the mark that
+    /// used to cover the traffic lights lives.
+    static let visualSurfaces: Set<String> = [
+        "settings",
+        "settings-minimum",
+        "settings-ideal",
+        "settings-terminal",
+        "settings-terminal-history",
+        "settings-terminal-interaction",
+        "settings-companion",
+        "settings-mcp",
+        "settings-extensions",
+        "settings-extensions-narrow",
+        "settings-accounts",
+        "settings-models",
+        "settings-shortcuts",
+        "settings-account-recovery",
+        "usage",
+    ]
+
+    /// What a fixture surface opens at. Every surface except `settings-ideal`
+    /// captures the *minimum* window, which is the size the chrome is tightest
+    /// at — and which the old 810×540 fixture sat below, so CI was inspecting a
+    /// window the product cannot actually be resized to.
+    static func visualContentSize(surface: String) -> NSSize {
+        ["settings-ideal", "settings-extensions"].contains(surface)
+            ? idealContentSize
+            : minimumContentSize
+    }
+
+    /// Custom content the layout can name outright in the traffic-light corner.
+    /// The gate walks the accessibility tree for everything it cannot know
+    /// about; these are the rects the view declares.
+    static func topLeadingContentFrames(
+        titleBarSafeArea: CGFloat = titleBarSafeArea
+    ) -> [(name: String, frame: CGRect)] {
+        [(
+            name: "settings-identity-mark",
+            frame: identityMarkFrame(titleBarSafeArea: titleBarSafeArea)
+        )]
+    }
+}
+
+enum SettingsSidebarLayoutPolicy {
+    /// A full-size-content window lets its sidebar paint beneath the titlebar.
+    /// At the minimum Settings width AppKit stops reserving the titlebar inset,
+    /// so the decorative brand would otherwise sit underneath the traffic
+    /// lights. Keep the same vertical rhythm, but leave that compact titlebar
+    /// region visually clear.
+    static func showsBrand(contentWidth: CGFloat) -> Bool {
+        contentWidth >= 900
+    }
+}
+
 /// The native Settings window (⌘,): workspace, terminal, Companion, and tools.
 struct SettingsView: View {
     @EnvironmentObject private var auth: AuthModel
@@ -16,6 +134,7 @@ struct SettingsView: View {
     /// per body evaluation is too slow.
     @State private var fontFamilies = [TerminalFontOptions.systemMonoSentinel]
     @State private var selectedSection: SettingsSection = .general
+    @State private var extensionsRoute: ExtensionsSettingsRoute?
     /// Update affordance from the app delegate (Sparkle).
     var checkForUpdates: (() -> Void)?
     var updateDetail: String?
@@ -92,39 +211,50 @@ struct SettingsView: View {
     /// switch rebuilds workspace-scoped Settings content.
     var sectionChanged: ((String) -> Void)? = nil
 
-    /// Extra top inset for the standalone window's sidebar. 14 (the sidebar's
-    /// own vertical padding) plus this clears the 28-point titlebar strip and
-    /// the six points of breathing room the layout gate reserves around the
-    /// window buttons.
-    static let windowControlReserve: CGFloat = 18
+    /// The window presentation hands its title-bar band back to AppKit. The
+    /// in-workspace sheet has no window buttons to clear and would only be
+    /// paying for an empty strip.
+    private var titleBarSafeArea: CGFloat {
+        dismiss == nil ? SettingsWindowChrome.titleBarSafeArea : 0
+    }
 
     var body: some View {
-        HStack(spacing: 0) {
-            settingsNavigation
-            Divider()
-            VStack(spacing: 0) {
-                HStack(spacing: 10) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(selectedSection.title)
-                            .font(.title3.weight(.semibold))
-                        Text(selectedSection.subtitle)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+        GeometryReader { geometry in
+            HStack(spacing: 0) {
+                settingsNavigation(
+                    showsBrand: SettingsSidebarLayoutPolicy.showsBrand(
+                        contentWidth: geometry.size.width
+                    )
+                )
+                Divider()
+                VStack(spacing: 0) {
+                    HStack(spacing: 10) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(selectedSection.title)
+                                .font(.title3.weight(.semibold))
+                            Text(selectedSection.subtitle)
+                                .font(.caption)
+                                .foregroundStyle(.kaisolaSecondary)
+                        }
+                        Spacer()
+                        if let dismiss {
+                            Button("Done", action: dismiss)
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .keyboardShortcut(.defaultAction)
+                        }
                     }
-                    Spacer()
-                    if let dismiss {
-                        Button("Done", action: dismiss)
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-                            .keyboardShortcut(.defaultAction)
-                    }
+                    .padding(.horizontal, 20)
+                    .frame(height: 64)
+                    Divider().opacity(0.65)
+                    settingsContent
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .padding(.horizontal, 20)
-                .frame(height: 64)
-                Divider().opacity(0.65)
-                settingsContent
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            // The detail column starts below the title bar for the same reason
+            // the navigation column does: everything above this line is the
+            // band AppKit drags and double-click-zooms the window by.
+            .padding(.top, titleBarSafeArea)
         }
         // Settings opens large.
         //
@@ -134,11 +264,11 @@ struct SettingsView: View {
         // display without pinning a larger one, and the account grid spends the
         // extra width on columns rather than margins.
         .frame(
-            minWidth: 820,
-            idealWidth: 1_100,
+            minWidth: SettingsWindowChrome.minimumContentSize.width,
+            idealWidth: SettingsWindowChrome.idealContentSize.width,
             maxWidth: .infinity,
-            minHeight: 560,
-            idealHeight: 800,
+            minHeight: SettingsWindowChrome.minimumContentSize.height,
+            idealHeight: SettingsWindowChrome.idealContentSize.height,
             maxHeight: .infinity
         )
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.82))
@@ -158,8 +288,11 @@ struct SettingsView: View {
         .onAppear {
             notificationsEnabled = NotificationBridge.shared.enabled
             refreshNotificationAuthorization()
-            if let initialSectionID,
-               let section = SettingsSection(rawValue: initialSectionID) {
+            if let route = ExtensionsSettingsRoute.parse(initialSectionID) {
+                extensionsRoute = route
+                selectedSection = .extensions
+            } else if let initialSectionID,
+                      let section = SettingsSection(rawValue: initialSectionID) {
                 selectedSection = section
             }
         }
@@ -177,36 +310,50 @@ struct SettingsView: View {
         }
     }
 
-    private var settingsNavigation: some View {
+    private func settingsNavigation(showsBrand: Bool) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack(spacing: 9) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 9)
-                        .fill(Color.accentColor.gradient)
-                    Image(systemName: "slider.horizontal.3")
-                        .foregroundStyle(.white)
+            Group {
+                if showsBrand {
+                    HStack(spacing: 9) {
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 9)
+                                .fill(Color.accentColor.gradient)
+                            Image(systemName: "slider.horizontal.3")
+                                .foregroundStyle(.white)
+                                .accessibilityHidden(true)
+                        }
+                        .frame(width: 30, height: 30)
+                        Text("Settings").font(.headline)
+                    }
+                } else {
+                    Color.clear
+                        .frame(height: SettingsWindowChrome.identityMarkSize)
                         .accessibilityHidden(true)
                 }
-                .frame(width: 30, height: 30)
-                Text("Settings").font(.headline)
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
             .padding(.bottom, 16)
+            // A mark and the window's own name: nothing here answers a click.
+            // Saying so keeps this row from claiming one near the controls even
+            // if it ever drifts back up the column.
+            .allowsHitTesting(false)
 
-            // Eleven rows in four families are taller than a short window. An
-            // overflowing VStack centres itself, which pushed the mark and the
-            // headline up off the top of the sidebar and straight onto the
-            // window buttons (issue #309). Scroll the rows instead so the
-            // header keeps the position the layout gives it.
+            // Grouped clusters (spec §3a): quiet headers, eleven sections in
+            // four families instead of one flat run.
+            //
+            // Eleven 34pt rows and their headers want about 600pt; the window's
+            // own minimum is 560, and the reserved title-bar band takes 32 of
+            // those. The run scrolls rather than being clipped, so every section
+            // stays reachable at the minimum size — the column overflowed even
+            // before the band was reserved. It carries no indicator at rest and
+            // does not bounce when the list already fits.
             ScrollView(.vertical, showsIndicators: false) {
-                // Grouped clusters (spec §3a): quiet headers, eleven sections
-                // in four families instead of one flat run.
                 VStack(alignment: .leading, spacing: 5) {
                     ForEach(SettingsGroup.allCases) { group in
                         Text(group.title.uppercased())
                             .font(.system(size: 10.5, weight: .semibold))
-                            .foregroundStyle(.tertiary)
-                            .padding(.horizontal, 14)
+                            .foregroundStyle(.kaisolaTertiary)
+                            .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
                             .padding(.top, group == SettingsGroup.allCases.first ? 0 : 10)
                             .accessibilityAddTraits(.isHeader)
                         ForEach(group.sections) { section in
@@ -218,22 +365,18 @@ struct SettingsView: View {
             }
             .scrollBounceBehavior(.basedOnSize)
 
-            Spacer(minLength: 0)
             Text("Changes apply instantly")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
-                .padding(.horizontal, 14)
+                .foregroundStyle(.kaisolaTertiary)
+                .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
         }
-        .padding(.vertical, 14)
-        // The standalone Command-comma window is `fullSizeContentView` with a
-        // transparent titlebar, so its first row lands underneath the close,
-        // minimise and zoom buttons — the mark and the "Settings" headline were
-        // printed over them in every captured screenshot (issue #309). Reserve
-        // the titlebar strip there. The in-workspace sheet has no window
-        // controls and keeps the tight inset.
-        .padding(.top, dismiss == nil ? Self.windowControlReserve : 0)
-        .padding(.horizontal, 8)
-        .frame(width: 176)
+        // The sidebar material still runs to the window's top edge; only its
+        // content starts below the traffic lights. The mark used to sit 14pt
+        // down, which put it on top of the minimize and zoom buttons.
+        .padding(.top, titleBarSafeArea + SettingsWindowChrome.navigationVerticalPadding)
+        .padding(.bottom, SettingsWindowChrome.navigationVerticalPadding)
+        .padding(.horizontal, SettingsWindowChrome.navigationOuterPadding)
+        .frame(width: SettingsWindowChrome.navigationColumnWidth)
         .background {
             ZStack {
                 NativeVisualEffectView(material: .sidebar)
@@ -257,7 +400,7 @@ struct SettingsView: View {
                 Spacer(minLength: 0)
             }
             .font(.callout.weight(selectedSection == section ? .semibold : .regular))
-            .foregroundStyle(selectedSection == section ? Color.primary : .secondary)
+            .foregroundStyle(selectedSection == section ? Color.primary : .kaisolaSecondary)
             .padding(.horizontal, 11)
             .frame(height: 34)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -279,7 +422,13 @@ struct SettingsView: View {
         case .terminal: terminal
         case .companion: CompanionSettingsTab()
         case .guardrails: guardrails.scrollContentBackground(.hidden)
-        case .mcp: McpSettingsTab(workspace: workspace).scrollContentBackground(.hidden)
+        case .extensions:
+            ExtensionsSettingsHub(
+                settings: settings,
+                workspace: workspace,
+                initialRoute: extensionsRoute,
+                routeChanged: { route in sectionChanged?(route) }
+            )
         case .accounts: accounts.scrollContentBackground(.hidden)
         case .agents: agents.scrollContentBackground(.hidden)
         case .models: ApiKeysSettingsTab(settings: settings).scrollContentBackground(.hidden)
@@ -611,7 +760,7 @@ struct SettingsView: View {
                         .accessibilityValue("\(Int(settings.terminalFontSize)) points")
                         Text("\(Int(settings.terminalFontSize))")
                             .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .frame(width: 24)
                     }
                     SettingsDivider()
@@ -626,7 +775,7 @@ struct SettingsView: View {
                         .accessibilityValue(String(format: "%.2f times", settings.terminalLineSpacing))
                         Text(String(format: "%.2f×", settings.terminalLineSpacing))
                             .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .frame(width: 42, alignment: .trailing)
                     }
                     SettingsDivider()
@@ -642,7 +791,7 @@ struct SettingsView: View {
                         ) {
                             Text(settings.terminalScrollbackLines.formatted(.number.grouping(.automatic)))
                                 .font(.callout.monospacedDigit())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .frame(width: 64, alignment: .trailing)
                         }
                         .accessibilityLabel("Terminal scrollback")
@@ -697,7 +846,7 @@ struct SettingsView: View {
                     }
                     Text("Full terminal output stays append-only until you close that terminal. This threshold warns; changing it never removes history.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 16)
                         .padding(.bottom, 14)
@@ -737,7 +886,7 @@ struct SettingsView: View {
                         }
                         Text("Terminal applications can never read your clipboard; Kaisola refuses those requests whether or not this is on.")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 16)
                             .padding(.bottom, 14)
@@ -842,21 +991,41 @@ struct SettingsView: View {
 
     private var agents: some View {
         Form {
-            CustomAgentsSection()
-            Section("ACP Adapters") {
+            Section("Built-in ACP Adapters") {
                 ForEach(AgentRegistry.all) { agent in
                     if let adapter = AcpAdapter.forAgent(agent.id) {
                         LabeledContent(agent.name) {
                             Text(([adapter.command] + adapter.arguments).joined(separator: " "))
                                 .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
                     }
                 }
-                Text("Adapters resolve @latest on every chat, so they stay current automatically.")
-                    .font(.caption).foregroundStyle(.secondary)
+                Text("Built-in adapters resolve @latest. Custom adapters are pinned and launch only through their reviewed containment grant.")
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
+            }
+            Section("Extension Management") {
+                Text("Custom agents and project MCP servers now live with themes, grammars, and preview mappings in Extensions.")
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                HStack {
+                    Button("Manage Custom Agents…") {
+                        NSApp.sendAction(
+                            #selector(KaisolaMacAppDelegate.openAgentSettings(_:)),
+                            to: nil,
+                            from: nil
+                        )
+                    }
+                    Button("Manage MCP Servers…") {
+                        NSApp.sendAction(
+                            #selector(KaisolaMacAppDelegate.openMcpSettings(_:)),
+                            to: nil,
+                            from: nil
+                        )
+                    }
+                }
             }
         }
         .formStyle(.grouped)
@@ -890,14 +1059,14 @@ enum SettingsGroup: String, CaseIterable, Identifiable {
 }
 
 enum SettingsSection: String, CaseIterable, Identifiable {
-    case general, terminal, companion, guardrails, mcp, accounts, agents, models, shortcuts, usage, updates
+    case general, terminal, companion, guardrails, extensions, accounts, agents, models, shortcuts, usage, updates
     var id: String { rawValue }
 
     var group: SettingsGroup {
         switch self {
         case .general, .updates: .app
         case .terminal, .guardrails, .shortcuts: .workspace
-        case .agents, .models, .accounts, .mcp, .usage: .agents
+        case .agents, .models, .accounts, .extensions, .usage: .agents
         case .companion: .device
         }
     }
@@ -907,7 +1076,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .terminal: "Terminal"
         case .companion: "Companion"
         case .guardrails: "Guardrails"
-        case .mcp: "MCP"
+        case .extensions: "Extensions"
         case .accounts: "Accounts"
         case .agents: "Agents"
         case .models: "Models & Keys"
@@ -922,9 +1091,9 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .terminal: "Typography, palette, and interaction"
         case .companion: "Pair nearby devices and stay connected anywhere"
         case .guardrails: "Standing rules and sensitive files"
-        case .mcp: "Project tool servers"
+        case .extensions: "Agents, servers, themes, grammars, and previews"
         case .accounts: "Sign-ins, named accounts, and project overrides"
-        case .agents: "Custom agents and ACP adapters"
+        case .agents: "Built-in agents and ACP adapters"
         case .models: "Provider credentials, models, and routing"
         case .shortcuts: "Shortcuts and keymap.json overrides"
         case .usage: "Provider limits and live context"
@@ -937,7 +1106,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .terminal: "terminal"
         case .companion: "iphone.and.arrow.forward"
         case .guardrails: "shield.lefthalf.filled"
-        case .mcp: "puzzlepiece.extension"
+        case .extensions: "puzzlepiece.extension"
         case .accounts: "person.crop.circle"
         case .agents: "sparkles"
         case .models: "key"
@@ -957,7 +1126,7 @@ struct SettingsCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 0) {
             Label(title, systemImage: symbol)
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .padding(.horizontal, 16)
                 .frame(height: 40)
             Divider().opacity(0.65)
@@ -978,12 +1147,12 @@ struct SettingsRow<Trailing: View>: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: symbol)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: 22)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.callout.weight(.medium))
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+                Text(detail).font(.caption).foregroundStyle(.kaisolaSecondary)
             }
             Spacer(minLength: 16)
             trailing
@@ -1005,7 +1174,7 @@ private struct SettingsChoiceLabel: View {
             Text(title).lineLimit(1)
             Image(systemName: "chevron.up.chevron.down")
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.kaisolaTertiary)
         }
         .font(.callout)
         .padding(.horizontal, 10)
@@ -1014,10 +1183,8 @@ private struct SettingsChoiceLabel: View {
     }
 }
 
-/// The Color card: theme picker over the registry, a live preview drawn from
-/// the selected theme's own palette, and the custom-theme roster — import,
-/// remove, and an explanation line for any theme that cannot install (PR 6's
-/// disabled-with-a-reason contract).
+/// The affected terminal surface keeps selection and a live preview here, then
+/// deep-links registry management to the consolidated Extensions destination.
 private struct TerminalColorCard: View {
     @ObservedObject var settings: NativePreviewSettings
     @Environment(\.colorScheme) private var colorScheme
@@ -1051,92 +1218,55 @@ private struct TerminalColorCard: View {
                 light: colorScheme == .light
             )
                 .padding(.horizontal, 16)
-                .padding(.bottom, customSpecs.isEmpty ? 14 : 6)
-            customThemeRoster
+                .padding(.bottom, 8)
+            if let invalidTheme = customSpecs.first(where: { $0.validationError != nil }),
+               let reason = invalidTheme.validationError {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Label(reason, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .lineLimit(2)
+                    Spacer()
+                    Button("Review") {
+                        let route = ExtensionsSettingsRoute(
+                            category: .terminalThemes,
+                            itemID: invalidTheme.id
+                        ).rawValue
+                        NSApp.sendAction(
+                            #selector(KaisolaMacAppDelegate.openExtensionSettings(_:)),
+                            to: nil,
+                            from: route
+                        )
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Review invalid theme \(invalidTheme.title)")
+                    .accessibilityHint("Opens its validation error in Extensions settings")
+                }
+                .padding(.horizontal, 16)
+                .padding(.bottom, 6)
+            }
+            HStack {
+                Label(
+                    "Import, validate, and remove palettes in Extensions.",
+                    systemImage: "puzzlepiece.extension"
+                )
+                .font(.caption)
+                .foregroundStyle(.kaisolaSecondary)
+                Spacer()
+                Button("Manage Themes…") {
+                    NSApp.sendAction(
+                        #selector(KaisolaMacAppDelegate.openTerminalThemeSettings(_:)),
+                        to: nil,
+                        from: nil
+                    )
+                }
+                .buttonStyle(.borderless)
+                .accessibilityHint("Opens Extensions settings at Terminal Themes")
+            }
+            .padding(.horizontal, 16)
+            .padding(.bottom, 14)
         }
         .onAppear { customSpecs = store.specs() }
-    }
-
-    @ViewBuilder
-    private var customThemeRoster: some View {
-        ForEach(customSpecs) { spec in
-            HStack(spacing: 8) {
-                if let reason = spec.validationError {
-                    Image(systemName: "exclamationmark.triangle")
-                        .foregroundStyle(.orange)
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(spec.title.isEmpty ? spec.id : spec.title)
-                            .foregroundStyle(.secondary)
-                        Text(reason)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                } else {
-                    Image(systemName: "paintpalette")
-                        .foregroundStyle(.secondary)
-                    Text(spec.title)
-                }
-                Spacer()
-                Button("Remove") {
-                    store.remove(id: spec.id)
-                    customSpecs = store.specs()
-                    // Removing the selected theme falls back at resolve time;
-                    // the stored choice is left alone so re-importing the
-                    // theme restores it.
-                }
-                .buttonStyle(.link)
-            }
-            .font(.system(size: 12))
-            .padding(.horizontal, 16)
-            .padding(.vertical, 3)
-        }
-        HStack {
-            Button {
-                importCustomTheme()
-            } label: {
-                Label("Import Theme…", systemImage: "square.and.arrow.down")
-            }
-            .buttonStyle(.link)
-            .help("A JSON file with id, title, and light/dark palettes (hex colors, 16 ANSI slots)")
-            Spacer()
-        }
-        .padding(.horizontal, 16)
-        .padding(.top, 4)
-        .padding(.bottom, 14)
-    }
-
-    private func importCustomTheme() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = true
-        panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [.json]
-        panel.prompt = "Import Theme"
-        panel.begin { response in
-            guard response == .OK, let url = panel.urls.first else { return }
-            Task { @MainActor in
-                guard let data = try? Data(contentsOf: url),
-                      let spec = try? JSONDecoder().decode(CustomThemeSpec.self, from: data) else {
-                    ToastCenter.shared.show(
-                        "That file is not a theme: it must be JSON with id, title, and light/dark palettes.",
-                        style: .error,
-                        duration: 5
-                    )
-                    return
-                }
-                if let reason = store.upsert(spec) {
-                    ToastCenter.shared.show(
-                        "Imported, but it cannot be used yet: \(reason)",
-                        style: .info,
-                        duration: 6
-                    )
-                } else {
-                    settings.terminalThemeID = spec.id
-                    ToastCenter.shared.show("Imported \(spec.title) and switched to it", style: .success)
-                }
-                customSpecs = store.specs()
-            }
-        }
     }
 }
 
@@ -1203,7 +1333,7 @@ private struct GuardrailsSettings: View {
             Section("Standing Allow Rules") {
                 if rules.isEmpty {
                     Text("No rules yet — \"Always Allow\" on a permission ask creates one.")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(.kaisolaSecondary)
                 }
                 ForEach(rules) { rule in
                     HStack {
@@ -1211,7 +1341,7 @@ private struct GuardrailsSettings: View {
                             Text(AcpPermissionRules.ruleLabel(action: rule.action, resource: rule.resource))
                                 .font(.callout)
                             Text(rule.workspace)
-                                .font(.caption2).foregroundStyle(.secondary)
+                                .font(.caption2).foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1).truncationMode(.middle)
                         }
                         Spacer()

@@ -92,7 +92,7 @@ struct TerminalTranscriptView: View {
                     ? "Continuing beyond the live scroll buffer"
                     : "Read-only terminal transcript")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             Spacer()
             TextField("Search loaded", text: $searchText)
@@ -138,7 +138,7 @@ struct TerminalTranscriptView: View {
     private var statusBar: some View {
         HStack(spacing: 7) {
             Image(systemName: "lock.open.display")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityHidden(true)
             Text(statusText)
                 .lineLimit(1)
@@ -150,14 +150,14 @@ struct TerminalTranscriptView: View {
                 if searchRequest.hasQuery {
                     Text(searchStatus(for: searchRequest))
                         .monospacedDigit()
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
                 Text(ByteCountFormatter.string(
                     fromByteCount: Int64(pages.reduce(0) { $0 + $1.output.utf8.count }),
                     countStyle: .file
                 ))
                 .monospacedDigit()
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             }
             if context.diskBytes > 0 {
                 Label(
@@ -167,7 +167,7 @@ struct TerminalTranscriptView: View {
                 .foregroundStyle(
                     historyStorageExceeded
                         ? KaisolaStatusTone.needsYou.foregroundColor
-                        : Color.secondary
+                        : Color.kaisolaSecondary
                 )
                 .help(TerminalHistoryStoragePolicy.help(
                     diskBytes: context.diskBytes,
@@ -239,7 +239,7 @@ struct TerminalTranscriptView: View {
                 ProgressView().controlSize(.small)
                 Text(isLoading ? "Loading earlier output…" : "Earlier output")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             .frame(maxWidth: .infinity)
             .padding(.vertical, 10)
@@ -255,7 +255,7 @@ struct TerminalTranscriptView: View {
                 systemImage: first.startOffset == 0 && !first.truncated ? "checkmark.circle" : "exclamationmark.triangle"
             )
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 10)
         } else if let errorMessage {

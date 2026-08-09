@@ -8,6 +8,34 @@ import Foundation
 struct AcpAdapter: Equatable, Sendable {
     let command: String
     let arguments: [String]
+    /// Present only for user-installed adapters. Built-ins keep their shipped
+    /// launch behavior; custom code must cross this boundary as one atomic
+    /// command/environment/access plan.
+    let containment: CustomAdapterContainment?
+
+    init(
+        command: String,
+        arguments: [String],
+        containment: CustomAdapterContainment? = nil
+    ) {
+        self.command = command
+        self.arguments = arguments
+        self.containment = containment
+    }
+
+    func prepare(environment: [String: String], cwd: String) throws -> AcpAdapterLaunch {
+        if let containment {
+            return try containment.prepare(environment: environment, cwd: cwd)
+        }
+        return AcpAdapterLaunch(
+            command: command,
+            arguments: arguments,
+            environment: environment,
+            cwd: cwd,
+            access: .unrestricted,
+            sandboxProfile: nil
+        )
+    }
 
     /// Resolve the adapter for an agent id (AgentRegistry ids). Returns nil for
     /// agents with no ACP adapter. `packageOverride` lets the version updater
@@ -44,7 +72,7 @@ struct AcpAdapter: Equatable, Sendable {
             // pinned, integrity-verified install — never through `npx` and a
             // mutable tag. Built-in ids never fall through to here, so the
             // shipped adapters above are untouched (review finding 4).
-            return forCustomAgent(agentID, shell: shell)
+            return forCustomAgent(agentID)
         }
         let resolved = packageOverride ?? package
         // -ilc keeps the interactive login environment; the ACP adapter then
@@ -55,28 +83,40 @@ struct AcpAdapter: Equatable, Sendable {
     /// The custom-agent path: the roster says chat is enabled, and the
     /// recorded install still verifies (review finding 2 — approval is
     /// durable because what runs is exactly what was approved). The spawned
-    /// command is the resolved executable itself; the login shell is only for
-    /// PATH, so a JS adapter's `node` shebang resolves.
+    /// command is the integrity-verified executable under Kaisola's sealed Node
+    /// runtime. No login shell or inherited PATH participates in the launch.
     static func forCustomAgent(
         _ agentID: String,
-        shell: String = ProcessInfo.processInfo.environment["SHELL"] ?? "/bin/zsh",
         store: CustomAgentStore = CustomAgentStore(),
         installs: AdapterInstallManager = AdapterInstallManager()
     ) -> AcpAdapter? {
-        guard let spec = store.all().first(where: { $0.id == agentID }),
+        guard case let .success(specs) = store.load(),
+              let spec = specs.first(where: { $0.id == agentID }),
               spec.chatEnabled == true,
               let package = spec.acpPackage, !package.isEmpty,
               spec.acpPackageValidationError == nil,
+              let approval = spec.containmentApproval,
               // `expectedPackage` binds the install record to *this* spec's
               // declaration — an approval recorded for a different package
               // (or a duplicate-id sibling) never satisfies it.
-              case let .verified(binURL) = installs.verify(
+              case let .verified(binURL, installRecord) = installs.verify(
                   agentID: agentID,
-                  expectedPackage: package.trimmingCharacters(in: .whitespacesAndNewlines)
+                  expectedPackage: package.trimmingCharacters(in: .whitespacesAndNewlines),
+                  expectedApproval: approval
               ) else {
             return nil
         }
-        let quoted = "'" + binURL.path.replacingOccurrences(of: "'", with: "'\\''") + "'"
-        return AcpAdapter(command: shell, arguments: ["-ilc", "exec \(quoted)"])
+        let containment = CustomAdapterContainment(
+            agentID: agentID,
+            executableURL: binURL,
+            installRoot: installs.installRoot(agentID: agentID),
+            approval: approval,
+            installRecord: installRecord
+        )
+        return AcpAdapter(
+            command: "/usr/bin/sandbox-exec",
+            arguments: ["<sealed-node>", binURL.path],
+            containment: containment
+        )
     }
 }

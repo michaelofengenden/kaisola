@@ -262,7 +262,7 @@ struct SettingsView: View {
                 Spacer(minLength: 0)
             }
             .font(.callout.weight(selectedSection == section ? .semibold : .regular))
-            .foregroundStyle(selectedSection == section ? Color.primary : .secondary)
+            .foregroundStyle(selectedSection == section ? Color.primary : .kaisolaSecondary)
             .padding(.horizontal, 11)
             .frame(height: 34)
             .frame(maxWidth: .infinity, alignment: .leading)

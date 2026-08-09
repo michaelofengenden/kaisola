@@ -609,7 +609,7 @@ struct WorkspaceRailView: View {
                 }
                 Image(systemName: node.isDirectory ? "folder" : "doc.text")
                     .font(.caption)
-                    .foregroundStyle(node.isDirectory ? Color.accentColor : .secondary)
+                    .foregroundStyle(node.isDirectory ? Color.accentColor : .kaisolaSecondary)
                 fileName(node.name)
                 Spacer(minLength: 0)
             }
@@ -787,7 +787,7 @@ private struct WorkspaceMoveSheet: View {
                                         Image(systemName: directory.path == root.standardizedFileURL.path
                                             ? "shippingbox"
                                             : "folder")
-                                            .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                                            .foregroundStyle(isSelected ? Color.accentColor : .kaisolaSecondary)
                                             .frame(width: 18)
                                         Text(destinationLabel(directory))
                                             .font(.callout)

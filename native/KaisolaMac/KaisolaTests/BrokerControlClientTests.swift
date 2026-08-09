@@ -207,7 +207,7 @@ final class BrokerControlClientTests: XCTestCase {
     }
 
     func testKillAcceptsAlreadyExitedForTheExactTerminal() async throws {
-        let transport = ScriptedKillBrokerTransport(result: .object([
+        let transport = ScriptedControlResultBrokerTransport(result: .object([
             "id": .string("terminal-one"),
             "ok": .bool(true),
             "alreadyExited": .bool(true),
@@ -228,7 +228,7 @@ final class BrokerControlClientTests: XCTestCase {
     }
 
     private func assertKillFails(result: JSONValue, context: String) async throws {
-        let transport = ScriptedKillBrokerTransport(result: result)
+        let transport = ScriptedControlResultBrokerTransport(result: result)
         let client = BrokerControlClient(
             transport: transport,
             operationTimeoutNanoseconds: 100_000_000
@@ -239,6 +239,83 @@ final class BrokerControlClientTests: XCTestCase {
             XCTFail("\(context) must not be reported as a successful terminal kill")
         } catch {
             XCTAssertEqual(error as? BrokerClientError, .requestFailed("terminal.kill"), context)
+        }
+        await client.disconnect()
+    }
+
+    func testAttachPropagatesMissingTerminalResult() async throws {
+        try await assertAttachFails(
+            result: .object([
+                "id": .string("terminal-one"),
+                "ok": .bool(false),
+                "code": .string("terminal_not_found"),
+            ]),
+            context: "missing terminal"
+        )
+    }
+
+    func testAttachFailsClosedOnInvalidAcknowledgementOrIdentity() async throws {
+        for (name, result) in [
+            (
+                "missing identity",
+                JSONValue.object(["ok": .bool(true)])
+            ),
+            (
+                "mismatched identity",
+                JSONValue.object([
+                    "id": .string("terminal-two"),
+                    "ok": .bool(true),
+                ])
+            ),
+            (
+                "non-string identity",
+                JSONValue.object([
+                    "id": .integer(1),
+                    "ok": .bool(true),
+                ])
+            ),
+            (
+                "missing acknowledgement",
+                JSONValue.object(["id": .string("terminal-one")])
+            ),
+        ] {
+            try await assertAttachFails(result: result, context: name)
+        }
+    }
+
+    func testAttachAcceptsExplicitExistingTerminalIdentity() async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: .object([
+            "id": .string("terminal-one"),
+            "ok": .bool(true),
+            "exited": .bool(false),
+        ]))
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.attach(projectID: "project.one", terminalID: "terminal-one")
+
+        let frames = await transport.sentFrames()
+        let request = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(request["method"]?.stringValue, "terminal.attach")
+        XCTAssertEqual(request["params"]?.objectValue?["projectId"]?.stringValue, "project.one")
+        XCTAssertEqual(request["params"]?.objectValue?["id"]?.stringValue, "terminal-one")
+        await client.disconnect()
+    }
+
+    private func assertAttachFails(result: JSONValue, context: String) async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: result)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        do {
+            try await client.attach(projectID: "project.one", terminalID: "terminal-one")
+            XCTFail("\(context) must not be reported as a successful terminal attach")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .requestFailed("terminal.attach"), context)
         }
         await client.disconnect()
     }
@@ -526,9 +603,9 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
     }
 }
 
-/// Dedicated fixture for terminal.kill keeps result-shape tests independent
-/// from the shared controller fixture used by other mutation contracts.
-private actor ScriptedKillBrokerTransport: BrokerByteTransport {
+/// Dedicated fixture keeps nested result-shape tests independent from the
+/// shared controller fixture used by transport and resize contracts.
+private actor ScriptedControlResultBrokerTransport: BrokerByteTransport {
     private let result: JSONValue
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []

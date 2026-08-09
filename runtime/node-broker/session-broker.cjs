@@ -12,7 +12,7 @@ const net = require('node:net')
 const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
-const { terminalCreateRoute, terminalKillRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
+const { terminalAttachRoute, terminalCreateRoute, terminalKillRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
@@ -415,13 +415,13 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.attach': {
       const id = terminalId()
-      requireAllowed(id, true)
-      const continuity = mgr.setSender(id, owner)
-      const previousInstance = continuity?.previousOwner?.split('|')[0]
-      const continuation = continuity && previousInstance && previousInstance !== client.instanceId
-        ? { ...continuity, acrossRestart: true, reattachedAt: Date.now(), brokerPid: process.pid }
-        : null
-      return { ...mgr.snapshot(id), continuation }
+      return terminalAttachRoute({
+        manager: mgr,
+        id,
+        owner,
+        clientInstanceId: client.instanceId,
+        requireAllowed,
+      })
     }
     case 'terminal.subscribe': {
       if (admin) throw new Error('terminal observer requires an exact project capability')

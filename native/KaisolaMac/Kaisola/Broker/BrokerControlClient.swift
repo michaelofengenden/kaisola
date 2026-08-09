@@ -256,7 +256,15 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     func attach(projectID: String, terminalID: String) async throws {
-        _ = try await request(.attach, params: identity(projectID: projectID, terminalID: terminalID))
+        let result = try await request(
+            .attach,
+            params: identity(projectID: projectID, terminalID: terminalID)
+        )
+        guard let object = result.objectValue,
+              object["ok"]?.boolValue == true,
+              object["id"]?.stringValue == terminalID else {
+            throw BrokerClientError.requestFailed("terminal.attach")
+        }
     }
 
     func write(projectID: String, terminalID: String, data: String) async throws {

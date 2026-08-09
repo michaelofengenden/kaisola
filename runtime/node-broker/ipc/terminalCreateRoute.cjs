@@ -243,6 +243,44 @@ function terminalKillRoute({ manager, id, requireAllowed }) {
   return manager.kill(id)
 }
 
+/** Attach is an ownership mutation, so absence must be decided explicitly
+ * before setSender can make the caller believe it adopted a terminal. */
+function terminalAttachRoute({
+  manager,
+  id,
+  owner,
+  clientInstanceId,
+  requireAllowed,
+  brokerPid = process.pid,
+  now = Date.now,
+}) {
+  // Authorize first so an unauthorized caller cannot use the distinct missing
+  // result as an existence oracle for another project's terminal.
+  requireAllowed(id, true)
+  if (!manager.has(id)) {
+    return {
+      id,
+      ok: false,
+      code: 'terminal_not_found',
+      message: 'terminal is no longer available',
+    }
+  }
+
+  const continuity = manager.setSender(id, owner)
+  const previousInstance = continuity?.previousOwner?.split('|')[0]
+  const continuation = continuity && previousInstance && previousInstance !== clientInstanceId
+    ? { ...continuity, acrossRestart: true, reattachedAt: now(), brokerPid }
+    : null
+  return {
+    ...manager.snapshot(id),
+    // Seal the authority-bearing fields after the snapshot so a future
+    // snapshot extension cannot accidentally override the attach contract.
+    id,
+    ok: true,
+    continuation,
+  }
+}
+
 /** The authenticated `terminal.create` operation after access selection. Kept
  * separate from the executable broker so the additive resurrection wire can
  * be contract-tested without binding its AF_UNIX listener. */
@@ -324,6 +362,7 @@ function terminalCreateRoute({
 }
 
 module.exports = {
+  terminalAttachRoute,
   terminalCreateRoute,
   terminalKillRoute,
   terminalResizeRoute,

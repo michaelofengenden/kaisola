@@ -92,6 +92,83 @@ final class BrokerModelsTests: XCTestCase {
         XCTAssertTrue(status.terminals.isEmpty)
     }
 
+    func testStatusRejectsDuplicateLiveTerminalIDsAsMalformedResponse() {
+        let duplicate: JSONValue = .object([
+            "id": .string("terminal:duplicate"),
+            "pid": .integer(1_234),
+        ])
+
+        XCTAssertThrowsError(
+            try BrokerStatus(
+                status: validStatus,
+                diagnostics: .array([]),
+                live: .array([duplicate, duplicate]),
+                expectedHello: hello
+            )
+        ) { error in
+            XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+        }
+    }
+
+    func testStatusRejectsDuplicateDiagnosticTerminalIDsAsMalformedResponse() {
+        let duplicate: JSONValue = .object([
+            "id": .string("terminal:duplicate"),
+            "owner": .string("instance|owner|kaisola.project-1"),
+        ])
+
+        XCTAssertThrowsError(
+            try BrokerStatus(
+                status: validStatus,
+                diagnostics: .array([duplicate, duplicate]),
+                live: .array([]),
+                expectedHello: hello
+            )
+        ) { error in
+            XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+        }
+    }
+
+    func testDuplicateLiveTerminalIDCorpusAlwaysReturnsMalformedResponse() {
+        let identifiers = [
+            "terminal:a",
+            "terminal:with spaces",
+            "terminal:unicode-研究-🙂",
+            "terminal:control-\u{1B}[31m",
+            String(repeating: "x", count: 240),
+        ]
+
+        for (index, identifier) in identifiers.enumerated() {
+            let first: JSONValue = .object([
+                "id": .string(identifier),
+                "pid": .integer(Int64(index + 1)),
+            ])
+            let different: JSONValue = .object([
+                "id": .string("terminal:other-\(index)"),
+                "pid": .integer(Int64(index + 100)),
+            ])
+            let duplicate: JSONValue = .object([
+                "id": .string(identifier),
+                "pid": .integer(Int64(index + 200)),
+            ])
+
+            XCTAssertThrowsError(
+                try BrokerStatus(
+                    status: validStatus,
+                    diagnostics: .array([]),
+                    live: .array([first, different, duplicate]),
+                    expectedHello: hello
+                ),
+                "duplicate corpus index \(index)"
+            ) { error in
+                XCTAssertEqual(
+                    error as? BrokerClientError,
+                    .malformedResponse,
+                    "duplicate corpus index \(index)"
+                )
+            }
+        }
+    }
+
     func testSnapshotRequiresByteExactOffsets() {
         let invalid: JSONValue = .object([
             "streamEpoch": .string("epoch"),

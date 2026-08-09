@@ -35,6 +35,54 @@ function safeBase(id) {
   return crypto.createHash('sha256').update(String(id)).digest('hex').slice(0, 32)
 }
 
+const { O_APPEND, O_CREAT, O_NOFOLLOW, O_NONBLOCK, O_RDONLY, O_WRONLY } = fs.constants
+
+function spoolPathRefused(code, file) {
+  const error = new Error(`refusing unsafe terminal spool path ${file}`)
+  error.code = code
+  return error
+}
+
+// Segment paths are a hash of the terminal id under a directory any local
+// process can name, so they are predictable long before the terminal exists.
+// Opening one by name would follow a planted symlink and let the broker read
+// or overwrite whatever the link points at — with broker authority, not the
+// planter's. Every open of a segment therefore refuses to follow a link on the
+// final path component (a symlinked spool *directory* still works) and the
+// descriptor must be a regular file this uid owns before a byte moves.
+// O_NONBLOCK keeps a planted fifo from parking the broker inside open().
+function openSegment(file, flags, mode) {
+  const fd = fs.openSync(file, flags | O_NOFOLLOW | O_NONBLOCK, mode)
+  try {
+    const stat = fs.fstatSync(fd)
+    if (!stat.isFile()) throw spoolPathRefused('ESPOOLNOTFILE', file)
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) {
+      throw spoolPathRefused('ESPOOLNOTOWNED', file)
+    }
+    return fd
+  } catch (err) {
+    try { fs.closeSync(fd) } catch { /* noop */ }
+    throw err
+  }
+}
+
+/** Retained size of one segment, or null when the path is absent, is a
+ * symlink, or is not a regular file this uid owns. Callers treat null exactly
+ * like "no retained segment", so a swapped-in link contributes neither bytes
+ * to a byte count nor a read to a snapshot. lstat never resolves the final
+ * component; the reads that follow are O_NOFOLLOW anyway, so a race between
+ * the two loses nothing. */
+function segmentSize(file) {
+  try {
+    const stat = fs.lstatSync(file)
+    if (!stat.isFile()) return null
+    if (typeof process.getuid === 'function' && stat.uid !== process.getuid()) return null
+    return stat.size
+  } catch {
+    return null
+  }
+}
+
 // Private DEC modes that change how the terminal interprets INPUT (bracketed
 // paste, cursor keys, mouse, focus) or renders the cursor. They are tracked
 // out-of-band because snapshot output must remain an exact stream tail for
@@ -74,15 +122,15 @@ function utf8Tail(value, bytes) {
 }
 
 function readTail(file, bytes) {
-  if (!bytes || !fs.existsSync(file)) return ''
+  if (!bytes) return ''
   let fd
   try {
-    const size = fs.statSync(file).size
+    fd = openSegment(file, O_RDONLY)
+    const size = fs.fstatSync(fd).size
     const cap = Math.max(0, Math.floor(Number(bytes) || 0))
     const take = Math.min(size, cap + 3)
     if (!take) return ''
     const b = Buffer.allocUnsafe(take)
-    fd = fs.openSync(file, 'r')
     fs.readSync(fd, b, 0, take, size - take)
     return utf8Tail(b, cap)
   } catch {
@@ -93,15 +141,15 @@ function readTail(file, bytes) {
 }
 
 function readRange(file, start, length) {
-  if (!length || !fs.existsSync(file)) return Buffer.alloc(0)
+  if (!length) return Buffer.alloc(0)
   let fd
   try {
-    const size = fs.statSync(file).size
+    fd = openSegment(file, O_RDONLY)
+    const size = fs.fstatSync(fd).size
     const offset = Math.max(0, Math.min(size, Math.floor(Number(start) || 0)))
     const take = Math.max(0, Math.min(size - offset, Math.floor(Number(length) || 0)))
     if (!take) return Buffer.alloc(0)
     const buffer = Buffer.allocUnsafe(take)
-    fd = fs.openSync(file, 'r')
     const read = fs.readSync(fd, buffer, 0, take, offset)
     return read === take ? buffer : buffer.subarray(0, read)
   } catch {
@@ -115,12 +163,19 @@ class TerminalSpool {
   static readMeta(id, dir) {
     const terminalId = String(id)
     const metaFile = path.join(dir, `${safeBase(terminalId)}.json`)
+    let fd
     try {
-      const meta = JSON.parse(fs.readFileSync(metaFile, 'utf8'))
+      // The meta path is as predictable as the log; a link planted there would
+      // otherwise hand arbitrary JSON — or an unrelated file's bytes — to a
+      // restoring terminal.
+      fd = openSegment(metaFile, O_RDONLY)
+      const meta = JSON.parse(fs.readFileSync(fd, 'utf8'))
       if (!meta || meta.id !== terminalId || (meta.v != null && meta.v !== META_VERSION)) return null
       return meta
     } catch {
       return null
+    } finally {
+      if (fd != null) try { fs.closeSync(fd) } catch { /* noop */ }
     }
   }
 
@@ -130,10 +185,8 @@ class TerminalSpool {
     const prevFile = path.join(dir, `${base}.prev.log`)
     const segments = []
     for (const file of [prevFile, currentFile]) {
-      try {
-        const size = fs.statSync(file).size
-        segments.push({ file, size })
-      } catch { /* no retained segment */ }
+      const size = segmentSize(file)
+      if (size != null) segments.push({ file, size }) // absent or unsafe: no retained segment
     }
     if (!segments.length) return null
 
@@ -174,6 +227,8 @@ class TerminalSpool {
     this.prevFile = path.join(dir, `${base}.prev.log`)
     this.metaFile = path.join(dir, `${base}.json`)
     if (fresh) {
+      // unlink removes the directory entry, never what a link points at, so a
+      // planted link is cleared here without touching its target.
       for (const file of [this.file, this.prevFile, this.metaFile]) {
         try { fs.unlinkSync(file) } catch { /* absent or already unavailable */ }
       }
@@ -254,25 +309,28 @@ class TerminalSpool {
     const payload = recovery + text
     let appended = false
     try {
-      fs.appendFileSync(this.file, payload, { mode: 0o600 })
+      // Never appendFileSync/chmodSync by path: both follow a symlink, so a
+      // planted link would take the append — and the 0600 chmod — to whatever
+      // file it names. openSegment refuses the link and this write goes to a
+      // regular file we own, or nowhere.
+      const size = this._writeSegment(payload)
       appended = true
       this.fallbackChunks = []
       this.fallbackLen = 0
       this.diskError = null
-      try { fs.chmodSync(this.file, 0o600) } catch { /* noop */ }
-      const size = fs.statSync(this.file).size
       // Interactive terminals are append-only until the user explicitly closes
       // the session. That is what makes terminal.history able to reach the
       // literal first byte. ACP-created capture terminals can request an
       // explicit retentionCap; only those use the bounded two-segment rotation.
       if (this.retentionCap != null && size > Math.max(1, Math.floor(this.diskCap / 2))) {
-        const discarded = fs.existsSync(this.prevFile)
-        let discardedBytes = 0
-        if (discarded) try { discardedBytes = fs.statSync(this.prevFile).size } catch { /* unavailable */ }
+        // unlink and rename act on the link itself, never its target, so
+        // rotation cannot clobber a file a planted prevFile link points at.
+        // The rotated-in current segment already passed openSegment above.
+        const discardedBytes = segmentSize(this.prevFile)
         try { fs.unlinkSync(this.prevFile) } catch { /* first segment */ }
         if (discardedBytes) this.epochStartOffset = Math.max(0, this.epochStartOffset - discardedBytes)
         fs.renameSync(this.file, this.prevFile)
-        if (discarded) this.truncated = true
+        if (discardedBytes != null) this.truncated = true
       }
     } catch (err) {
       this.diskError = String((err && err.code) || (err && err.message) || err || 'disk-write-failed')
@@ -280,6 +338,25 @@ class TerminalSpool {
       // Disk-full/permission errors must never crash Electron main. If append
       // did not land, retain a bounded hot tail so the live shell stays usable.
       if (!appended) this._retainFallback(text)
+    }
+  }
+
+  /** Append `payload` to the current segment through a no-follow descriptor
+   * and return the segment's new size. Throws when the path is not a regular
+   * file this uid owns, which `_append` reports as a disk error. */
+  _writeSegment(payload) {
+    const buffer = Buffer.from(payload, 'utf8')
+    const fd = openSegment(this.file, O_WRONLY | O_APPEND | O_CREAT, 0o600)
+    try {
+      let written = 0
+      while (written < buffer.length) {
+        written += fs.writeSync(fd, buffer, written, buffer.length - written)
+      }
+      // Re-assert 0600 on a segment that predates this process (or this fix).
+      try { fs.fchmodSync(fd, 0o600) } catch { /* noop */ }
+      return fs.fstatSync(fd).size
+    } finally {
+      try { fs.closeSync(fd) } catch { /* noop */ }
     }
   }
 
@@ -297,12 +374,11 @@ class TerminalSpool {
     const segments = []
     let skip = Math.max(0, Math.floor(Number(startOffset) || 0))
     for (const file of [this.prevFile, this.file]) {
-      try {
-        const size = fs.statSync(file).size
-        const fileStart = Math.min(size, skip)
-        skip -= fileStart
-        if (size > fileStart) segments.push({ file, fileStart, length: size - fileStart })
-      } catch { /* absent */ }
+      const size = segmentSize(file)
+      if (size == null) continue // absent, or a path we refuse to read
+      const fileStart = Math.min(size, skip)
+      skip -= fileStart
+      if (size > fileStart) segments.push({ file, fileStart, length: size - fileStart })
     }
     return segments
   }
@@ -399,13 +475,17 @@ class TerminalSpool {
     return { exitedAt: this.exitedAt, exitStatus: this.exitStatus }
   }
 
+  /** Bytes held by the segments we are willing to read. A refused path counts
+   * as zero, exactly as an absent one does. */
+  _diskByteCount() {
+    let diskBytes = 0
+    for (const file of [this.prevFile, this.file]) diskBytes += segmentSize(file) || 0
+    return diskBytes
+  }
+
   retainedByteCount() {
     this.flush()
-    let diskBytes = 0
-    for (const file of [this.prevFile, this.file]) {
-      try { diskBytes += fs.statSync(file).size } catch { /* absent */ }
-    }
-    return diskBytes + this.fallbackLen
+    return this._diskByteCount() + this.fallbackLen
   }
 
   startEpoch(offset = this.retainedByteCount()) {
@@ -427,11 +507,7 @@ class TerminalSpool {
     const output = !fallbackBytes && !this.diskError && hotBytes >= cap
       ? utf8Tail(hot, cap)
       : utf8Tail(this._diskTail(cap, this.epochStartOffset) + fallback, cap)
-    let diskBytes = 0
-    for (const file of [this.prevFile, this.file]) {
-      try { diskBytes += fs.statSync(file).size } catch { /* absent */ }
-    }
-    const liveDiskBytes = Math.max(0, diskBytes - this.epochStartOffset)
+    const liveDiskBytes = Math.max(0, this._diskByteCount() - this.epochStartOffset)
     return { output, truncated: this.truncated || liveDiskBytes + fallbackBytes > cap, viewState: this.viewState, modePrefix: this._modePrefix() }
   }
 
@@ -490,10 +566,7 @@ class TerminalSpool {
   }
 
   stats() {
-    let diskBytes = 0
-    for (const file of [this.prevFile, this.file]) {
-      try { diskBytes += fs.statSync(file).size } catch { /* absent */ }
-    }
+    const diskBytes = this._diskByteCount()
     return { id: this.id, visible: this.visible, ramBytes: this.chunksLen + this.queuedLen + this.fallbackLen, diskBytes, diskError: this.diskError, viewState: this.viewState }
   }
 
@@ -511,6 +584,8 @@ class TerminalSpool {
       this.appendTimer = null
     }
     if (!remove) return
+    // Same as the fresh-start wipe: unlink drops our entry, so a swapped-in
+    // link dies with the terminal and the file it named survives untouched.
     try { fs.unlinkSync(this.file) } catch { /* absent */ }
     try { fs.unlinkSync(this.prevFile) } catch { /* absent */ }
     try { fs.unlinkSync(this.metaFile) } catch { /* absent */ }

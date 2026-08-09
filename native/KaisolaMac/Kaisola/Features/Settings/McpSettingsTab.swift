@@ -199,6 +199,27 @@ private struct McpServerEditor: View {
                                 : Color.secondary
                         )
                         .accessibilityElement(children: .combine)
+
+                        let authentication = result.authentication.presentation
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(authenticationColor(result.authentication))
+                                .frame(width: 7, height: 7)
+                                .accessibilityHidden(true)
+                            Text(authentication.copy)
+                            Spacer(minLength: 4)
+                            if authentication.action == .retryProbe,
+                               let title = authentication.action.title {
+                                Button(title) { probe(server) }
+                                    .buttonStyle(.borderless)
+                                    .disabled(probingNames.contains(server.name))
+                            } else if let title = authentication.action.title {
+                                Text(title).foregroundStyle(.tertiary)
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(authenticationColor(result.authentication))
+                        .accessibilityElement(children: .combine)
                     }
                 }
             }
@@ -235,10 +256,20 @@ private struct McpServerEditor: View {
 
     private func probe(_ server: McpServerConfig) {
         guard probingNames.insert(server.name).inserted else { return }
+        probeResults[server.name] = .probing
         Task {
             let result = await McpProbeService.shared.probe(server)
             probeResults[server.name] = result
             probingNames.remove(server.name)
+        }
+    }
+
+    private func authenticationColor(_ state: McpAuthenticationState) -> Color {
+        switch state {
+        case .signedIn: .green
+        case .signedOut, .expired: .red
+        case .probing: .secondary
+        case .unknown: .orange
         }
     }
 

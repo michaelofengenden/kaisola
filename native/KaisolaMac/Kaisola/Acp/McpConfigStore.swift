@@ -472,6 +472,109 @@ enum McpConfigDiscovery {
 
 // MARK: - Non-executing health probe
 
+/// Authentication is independent of MCP reachability. In particular, a probe
+/// that times out or cannot interpret a server response has not proven that the
+/// user is signed out. Unknown reasons stay explicit so Settings can offer a
+/// safe follow-up without inventing an OAuth or credential-clearing side effect.
+enum McpAuthenticationState: Equatable, Sendable {
+    enum UnknownReason: String, CaseIterable, Sendable {
+        case timeout
+        case keychainDenied
+        case unsupported
+        case connectionFailure
+        case credentialRejected
+    }
+
+    case probing
+    case signedIn
+    case signedOut
+    case expired
+    case unknown(UnknownReason)
+
+    var presentation: McpAuthenticationPresentation {
+        switch self {
+        case .probing:
+            .init(copy: "Checking authentication", action: .none)
+        case .signedIn:
+            .init(copy: "Signed in", action: .none)
+        case .signedOut:
+            .init(copy: "Signed out", action: .reviewCredentialSetup)
+        case .expired:
+            .init(copy: "Credentials expired", action: .replaceExpiredCredential)
+        case .unknown(.timeout):
+            .init(copy: "Authentication unknown · server timed out", action: .retryProbe)
+        case .unknown(.keychainDenied):
+            .init(copy: "Authentication unknown · Keychain access denied", action: .reviewKeychainAccess)
+        case .unknown(.unsupported):
+            .init(copy: "Authentication unknown · status unsupported", action: .reviewCompatibility)
+        case .unknown(.connectionFailure):
+            .init(copy: "Authentication unknown · connection failed", action: .retryProbe)
+        case .unknown(.credentialRejected):
+            .init(copy: "Authentication unknown · credentials rejected", action: .reviewCredentialSetup)
+        }
+    }
+}
+
+/// User-directed follow-ups only. There is deliberately no launch-OAuth or
+/// clear-credential action: probes report evidence and leave configuration
+/// untouched. The current MCP architecture has neither an OAuth controller nor
+/// a Keychain-backed MCP credential provider.
+enum McpAuthenticationAction: Equatable, Sendable {
+    case none
+    case reviewCredentialSetup
+    case replaceExpiredCredential
+    case retryProbe
+    case reviewKeychainAccess
+    case reviewCompatibility
+
+    var title: String? {
+        switch self {
+        case .none: nil
+        case .reviewCredentialSetup: "Review credential setup"
+        case .replaceExpiredCredential: "Replace credentials"
+        case .retryProbe: "Check again"
+        case .reviewKeychainAccess: "Review Keychain access"
+        case .reviewCompatibility: "Review compatibility"
+        }
+    }
+
+    var launchesOAuth: Bool { false }
+    var clearsCredentials: Bool { false }
+}
+
+struct McpAuthenticationPresentation: Equatable, Sendable {
+    let copy: String
+    let action: McpAuthenticationAction
+}
+
+/// Evidence-only classification shared by the probe and focused tests. A bare
+/// 401 proves signed-out only when no credential was sent. A rejected credential
+/// is called expired solely when the challenge says so; otherwise it remains
+/// unknown rather than prompting a destructive login loop.
+enum McpAuthenticationPolicy {
+    static func hasConfiguredCredential(_ headers: [McpServerConfig.Pair]) -> Bool {
+        let credentialNames = Set(["authorization", "proxy-authorization", "x-api-key", "api-key"])
+        return headers.contains {
+            credentialNames.contains($0.name.lowercased())
+                && !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    static func stateForHTTPFailure(
+        statusCode: Int,
+        authenticateHeader: String?,
+        hasConfiguredCredential: Bool
+    ) -> McpAuthenticationState {
+        guard statusCode == 401 else { return .unknown(.unsupported) }
+        guard hasConfiguredCredential else { return .signedOut }
+        let challenge = authenticateHeader?.lowercased() ?? ""
+        if challenge.contains("expired") {
+            return .expired
+        }
+        return .unknown(.credentialRejected)
+    }
+}
+
 struct McpProbeResult: Equatable, Sendable {
     enum Status: String, Sendable {
         case configured
@@ -482,10 +585,38 @@ struct McpProbeResult: Equatable, Sendable {
     let status: Status
     let verified: Bool
     let message: String
+    let authentication: McpAuthenticationState
     var serverName: String?
     var serverVersion: String?
     var toolCount: Int?
     var hasMoreTools = false
+
+    init(
+        status: Status,
+        verified: Bool,
+        message: String,
+        authentication: McpAuthenticationState = .unknown(.unsupported),
+        serverName: String? = nil,
+        serverVersion: String? = nil,
+        toolCount: Int? = nil,
+        hasMoreTools: Bool = false
+    ) {
+        self.status = status
+        self.verified = verified
+        self.message = message
+        self.authentication = authentication
+        self.serverName = serverName
+        self.serverVersion = serverVersion
+        self.toolCount = toolCount
+        self.hasMoreTools = hasMoreTools
+    }
+
+    static let probing = McpProbeResult(
+        status: .configured,
+        verified: false,
+        message: "Checking MCP server",
+        authentication: .probing
+    )
 }
 
 /// Pure MCP `initialize` revision negotiation: given the server's reply,
@@ -531,8 +662,14 @@ actor McpProbeService {
         let sessionID: String?
     }
 
-    private enum ProbeFailure: Error {
-        case message(String)
+    private struct ProbeFailure: Error {
+        let message: String
+        let authentication: McpAuthenticationState
+
+        init(_ message: String, authentication: McpAuthenticationState = .unknown(.unsupported)) {
+            self.message = message
+            self.authentication = authentication
+        }
     }
 
     private static let maximumResponseBytes = 200_000
@@ -589,16 +726,16 @@ actor McpProbeService {
                 negotiatedVersion: nil,
                 allowEmpty: false
             )
-            guard let response = initialize.object else { throw ProbeFailure.message("Empty initialize response") }
+            guard let response = initialize.object else { throw ProbeFailure("Empty initialize response") }
             if let error = response["error"] as? [String: Any] {
-                throw ProbeFailure.message("Initialize failed: \(safeServerMessage(error["message"]))")
+                throw ProbeFailure("Initialize failed: \(safeServerMessage(error["message"]))")
             }
             guard let result = response["result"] as? [String: Any],
                   let negotiated = result["protocolVersion"] as? String else {
-                throw ProbeFailure.message("Malformed initialize response")
+                throw ProbeFailure("Malformed initialize response")
             }
             guard McpProtocolRevision.isAccepted(negotiated) else {
-                throw ProbeFailure.message("Unsupported protocol version \(safeInline(negotiated))")
+                throw ProbeFailure("Unsupported protocol version \(safeInline(negotiated))")
             }
             let info = result["serverInfo"] as? [String: Any]
             let serverName = safeOptionalInline(info?["name"] as? String)
@@ -624,6 +761,7 @@ actor McpProbeService {
                     status: .ready,
                     verified: true,
                     message: "Ready · server declares no tools capability",
+                    authentication: authenticationAfterSuccessfulProbe(server),
                     serverName: serverName,
                     serverVersion: serverVersion
                 )
@@ -641,31 +779,53 @@ actor McpProbeService {
                 negotiatedVersion: negotiated,
                 allowEmpty: false
             )
-            guard let toolsResponse = tools.object else { throw ProbeFailure.message("Empty tools response") }
+            guard let toolsResponse = tools.object else { throw ProbeFailure("Empty tools response") }
             if let error = toolsResponse["error"] as? [String: Any] {
-                throw ProbeFailure.message("Tool listing failed: \(safeServerMessage(error["message"]))")
+                throw ProbeFailure("Tool listing failed: \(safeServerMessage(error["message"]))")
             }
             guard let toolsResult = toolsResponse["result"] as? [String: Any],
                   let listedTools = toolsResult["tools"] as? [Any] else {
-                throw ProbeFailure.message("Malformed tools response")
+                throw ProbeFailure("Malformed tools response")
             }
             let hasMore = toolsResult["nextCursor"] is String
             return .init(
                 status: .ready,
                 verified: true,
                 message: hasMore ? "Ready · \(listedTools.count)+ tools" : "Ready · \(listedTools.count) tools",
+                authentication: authenticationAfterSuccessfulProbe(server),
                 serverName: serverName,
                 serverVersion: serverVersion,
                 toolCount: listedTools.count,
                 hasMoreTools: hasMore
             )
-        } catch let ProbeFailure.message(message) {
-            return .init(status: .failed, verified: true, message: message)
+        } catch let failure as ProbeFailure {
+            return .init(
+                status: .failed,
+                verified: true,
+                message: failure.message,
+                authentication: failure.authentication
+            )
         } catch let error as URLError where error.code == .timedOut {
-            return .init(status: .failed, verified: true, message: "Timed out after 3.5 seconds")
+            return .init(
+                status: .failed,
+                verified: true,
+                message: "Timed out after 3.5 seconds",
+                authentication: .unknown(.timeout)
+            )
         } catch {
-            return .init(status: .failed, verified: true, message: "Connection failed")
+            return .init(
+                status: .failed,
+                verified: true,
+                message: "Connection failed",
+                authentication: .unknown(.connectionFailure)
+            )
         }
+    }
+
+    private func authenticationAfterSuccessfulProbe(_ server: McpServerConfig) -> McpAuthenticationState {
+        McpAuthenticationPolicy.hasConfiguredCredential(server.headerPairs)
+            ? .signedIn
+            : .unknown(.unsupported)
     }
 
     private func post(
@@ -689,25 +849,32 @@ actor McpProbeService {
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw ProbeFailure.message("Non-HTTP response") }
+        guard let http = response as? HTTPURLResponse else { throw ProbeFailure("Non-HTTP response") }
         guard (200..<300).contains(http.statusCode) else {
-            throw ProbeFailure.message("Server returned HTTP \(http.statusCode)")
+            throw ProbeFailure(
+                "Server returned HTTP \(http.statusCode)",
+                authentication: McpAuthenticationPolicy.stateForHTTPFailure(
+                    statusCode: http.statusCode,
+                    authenticateHeader: http.value(forHTTPHeaderField: "WWW-Authenticate"),
+                    hasConfiguredCredential: McpAuthenticationPolicy.hasConfiguredCredential(configuredHeaders)
+                )
+            )
         }
-        guard data.count <= Self.maximumResponseBytes else { throw ProbeFailure.message("Response exceeded 200 KB") }
+        guard data.count <= Self.maximumResponseBytes else { throw ProbeFailure("Response exceeded 200 KB") }
         let sessionID = http.value(forHTTPHeaderField: "Mcp-Session-Id") ?? sessionID
         guard !data.isEmpty else {
             if allowEmpty { return RPCReply(object: nil, sessionID: sessionID) }
-            throw ProbeFailure.message("Empty server response")
+            throw ProbeFailure("Empty server response")
         }
         let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? ""
         let object: Any
         if contentType.localizedCaseInsensitiveContains("text/event-stream") {
-            guard let eventData = lastSSEData(in: data) else { throw ProbeFailure.message("Invalid SSE response") }
+            guard let eventData = lastSSEData(in: data) else { throw ProbeFailure("Invalid SSE response") }
             object = try JSONSerialization.jsonObject(with: eventData)
         } else {
             object = try JSONSerialization.jsonObject(with: data)
         }
-        guard let dictionary = object as? [String: Any] else { throw ProbeFailure.message("Non-object JSON response") }
+        guard let dictionary = object as? [String: Any] else { throw ProbeFailure("Non-object JSON response") }
         return RPCReply(object: dictionary, sessionID: sessionID)
     }
 

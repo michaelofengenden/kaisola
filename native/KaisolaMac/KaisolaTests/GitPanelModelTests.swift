@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -491,6 +492,58 @@ final class GitPanelModelTests: XCTestCase {
         let sawStage = pump(until: { model.status?.staged.isEmpty == false }, timeout: 12)
         XCTAssertTrue(sawStage, "an external `git add` must refresh the panel through the watcher")
         XCTAssertEqual(model.status?.staged.map(\.path), ["b.txt"])
+    }
+
+    @MainActor
+    func testExternalStagePublishesFileStateAndAllCountersAtomically() throws {
+        try write("tracked.txt", "one\ntwo\n")
+        try git(["add", "tracked.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("tracked.txt", "ONE\ntwo\n")
+        try git(["add", "tracked.txt"])
+        try write("tracked.txt", "ONE\nTWO\n")
+
+        let model = GitPanelModel(repoRoot: repo)
+        var published: [GitService.Status] = []
+        let observation = model.$status.compactMap { $0 }.sink { published.append($0) }
+        defer { observation.cancel() }
+        model.startWatching()
+        defer { model.stopWatching() }
+        XCTAssertTrue(pump(until: { model.status != nil }, timeout: 10))
+        let before = try XCTUnwrap(model.status)
+        XCTAssertEqual(before.stagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(before.unstagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(before.combinedStats, .init(additions: 2, deletions: 2, textFiles: 1))
+
+        try git(["add", "tracked.txt"])
+        XCTAssertTrue(
+            pump(until: {
+                model.status?.stagedStats == .init(additions: 2, deletions: 2, textFiles: 1)
+                    && model.status?.unstaged.isEmpty == true
+            }, timeout: 12),
+            "the Git-directory watcher should publish the externally staged snapshot"
+        )
+        let after = try XCTUnwrap(model.status)
+        XCTAssertEqual(after.staged.map(\.path), ["tracked.txt"])
+        XCTAssertTrue(after.unstaged.isEmpty)
+        XCTAssertEqual(after.unstagedStats, .empty)
+        XCTAssertEqual(after.combinedStats, .init(additions: 2, deletions: 2, textFiles: 1))
+        XCTAssertTrue(
+            published.allSatisfy { $0 == before || $0 == after },
+            "status lists and all counters must move as one published value"
+        )
+    }
+
+    func testBinaryStatsRenderingNeverInventsLineCounts() {
+        XCTAssertEqual(
+            GitStatsRendering.summary(.init(binaryFiles: 1)),
+            "1 binary"
+        )
+        XCTAssertEqual(
+            GitStatsRendering.summary(.init(additions: 3, deletions: 2, textFiles: 1, binaryFiles: 1)),
+            "+3 −2 · 1 binary"
+        )
+        XCTAssertNil(GitStatsRendering.summary(.empty))
     }
 
     @MainActor

@@ -229,8 +229,30 @@ struct GitService: Sendable {
         var staged: [Entry]
         var unstaged: [Entry]
         var untracked: [String]
+        var stagedStats: ChangeStats = .empty
+        var unstagedStats: ChangeStats = .empty
+        var combinedStats: ChangeStats = .empty
 
         var isClean: Bool { staged.isEmpty && unstaged.isEmpty && untracked.isEmpty }
+    }
+
+    /// Line counts from one `git diff --numstat` view. Binary entries are
+    /// tracked separately because Git deliberately reports `-\t-`; turning
+    /// those markers into zero lines would invent precision the diff lacks.
+    struct ChangeStats: Equatable, Sendable {
+        let additions: Int
+        let deletions: Int
+        let textFiles: Int
+        let binaryFiles: Int
+
+        init(additions: Int = 0, deletions: Int = 0, textFiles: Int = 0, binaryFiles: Int = 0) {
+            self.additions = additions
+            self.deletions = deletions
+            self.textFiles = textFiles
+            self.binaryFiles = binaryFiles
+        }
+
+        static let empty = ChangeStats()
     }
 
     struct Entry: Equatable, Identifiable, Sendable {
@@ -287,8 +309,37 @@ struct GitService: Sendable {
     /// back as a change, refreshing again. Git ships this flag for exactly this
     /// class of caller.
     func status() throws -> Status {
-        let output = try run(["--no-optional-locks", "status", "--porcelain=v2", "--branch"])
-        return Self.parseStatus(output)
+        let statusArguments = [
+            "--no-optional-locks", "status", "--porcelain=v2", "--branch", "--find-renames=50%"
+        ]
+        // Stats require three independent Git views. Fence them with the same
+        // porcelain snapshot: if an external stage/commit lands between those
+        // reads, retry instead of publishing counters from different index
+        // generations together. The model then assigns this whole value once.
+        for _ in 0 ..< 3 {
+            let before = try run(statusArguments)
+            let stagedStats = try numstat(staged: true)
+            let unstagedStats = try numstat(staged: false)
+            let combinedStats: ChangeStats
+            do {
+                combinedStats = try numstatAgainstHead()
+            } catch let GitError.commandFailed(message)
+                where message.contains("ambiguous argument 'HEAD'") || message.contains("bad revision 'HEAD'") {
+                // `git diff HEAD` has no base in an unborn repository. Diff
+                // against this repository's own empty-tree object so a file
+                // split across index and worktree is still one combined entry.
+                combinedStats = try numstatAgainstEmptyTree()
+            }
+            let after = try run(statusArguments)
+            guard before == after else { continue }
+            return Self.parseStatus(
+                before,
+                stagedStats: stagedStats,
+                unstagedStats: unstagedStats,
+                combinedStats: combinedStats
+            )
+        }
+        throw GitError.commandFailed("Repository changed repeatedly while Git status was refreshing. Refresh again.")
     }
 
     func diff(path: String, staged: Bool) throws -> String {
@@ -792,8 +843,23 @@ struct GitService: Sendable {
 
     // MARK: - Parsing
 
-    static func parseStatus(_ output: String) -> Status {
-        var status = Status(branch: nil, ahead: 0, behind: 0, staged: [], unstaged: [], untracked: [])
+    static func parseStatus(
+        _ output: String,
+        stagedStats: ChangeStats = .empty,
+        unstagedStats: ChangeStats = .empty,
+        combinedStats: ChangeStats = .empty
+    ) -> Status {
+        var status = Status(
+            branch: nil,
+            ahead: 0,
+            behind: 0,
+            staged: [],
+            unstaged: [],
+            untracked: [],
+            stagedStats: stagedStats,
+            unstagedStats: unstagedStats,
+            combinedStats: combinedStats
+        )
         for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
             if line.hasPrefix("# branch.head ") {
                 status.branch = String(line.dropFirst("# branch.head ".count))
@@ -803,12 +869,24 @@ struct GitService: Sendable {
                     if field.hasPrefix("+") { status.ahead = Int(field.dropFirst()) ?? 0 }
                     if field.hasPrefix("-") { status.behind = Int(field.dropFirst()) ?? 0 }
                 }
-            } else if line.hasPrefix("1 ") || line.hasPrefix("2 ") {
-                // "1 XY ... path"  or renamed "2 XY ... path\tsrc"
+            } else if line.hasPrefix("1 ") {
+                // "1 XY ... path"
                 let fields = line.split(separator: " ", maxSplits: 8, omittingEmptySubsequences: false)
                 guard fields.count >= 9 else { continue }
                 let xy = String(fields[1])
                 let pathField = fields[8...].joined(separator: " ")
+                let path = String(pathField)
+                let x = xy.first.map(String.init) ?? "."
+                let y = xy.dropFirst().first.map(String.init) ?? "."
+                if x != "." { status.staged.append(Entry(path: path, code: x)) }
+                if y != "." { status.unstaged.append(Entry(path: path, code: y)) }
+            } else if line.hasPrefix("2 ") {
+                // "2 XY ... R100 destination\tsource". The similarity token
+                // is its own field, not part of the destination pathname.
+                let fields = line.split(separator: " ", maxSplits: 9, omittingEmptySubsequences: false)
+                guard fields.count >= 10 else { continue }
+                let xy = String(fields[1])
+                let pathField = fields[9...].joined(separator: " ")
                 let path = String(pathField.split(separator: "\t").first ?? Substring(pathField))
                 let x = xy.first.map(String.init) ?? "."
                 let y = xy.dropFirst().first.map(String.init) ?? "."
@@ -821,7 +899,74 @@ struct GitService: Sendable {
         return status
     }
 
+    /// Parse NUL-delimited numstat records. A rename has an empty pathname in
+    /// its stat record followed by separate old/new path records; skipping both
+    /// keeps tabs inside filenames from ever being mistaken for another stat.
+    static func parseNumstat(_ output: String) throws -> ChangeStats {
+        let records = output.split(separator: "\0", omittingEmptySubsequences: false)
+        var additions = 0
+        var deletions = 0
+        var textFiles = 0
+        var binaryFiles = 0
+        var index = 0
+        while index < records.count {
+            let record = records[index]
+            if record.isEmpty {
+                index += 1
+                continue
+            }
+            let fields = record.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+            guard fields.count == 3 else {
+                throw GitError.commandFailed("Could not parse Git diff statistics.")
+            }
+            if fields[0] == "-", fields[1] == "-" {
+                binaryFiles += 1
+            } else {
+                guard let added = Int(fields[0]), let deleted = Int(fields[1]) else {
+                    throw GitError.commandFailed("Could not parse Git diff statistics.")
+                }
+                additions += added
+                deletions += deleted
+                textFiles += 1
+            }
+            index += fields[2].isEmpty ? 3 : 1
+        }
+        return ChangeStats(
+            additions: additions,
+            deletions: deletions,
+            textFiles: textFiles,
+            binaryFiles: binaryFiles
+        )
+    }
+
     // MARK: - Process
+
+    private func numstat(staged: Bool) throws -> ChangeStats {
+        var arguments = [
+            "--no-optional-locks", "diff", "--numstat", "-z", "--no-ext-diff", "--no-textconv",
+            "--find-renames=50%"
+        ]
+        if staged { arguments.append("--cached") }
+        return try Self.parseNumstat(run(arguments))
+    }
+
+    private func numstatAgainstHead() throws -> ChangeStats {
+        try Self.parseNumstat(run([
+            "--no-optional-locks", "diff", "--numstat", "-z", "--no-ext-diff", "--no-textconv",
+            "--find-renames=50%", "HEAD"
+        ]))
+    }
+
+    private func numstatAgainstEmptyTree() throws -> ChangeStats {
+        // Derive this rather than baking in SHA-1's well-known empty-tree OID;
+        // repositories initialized with SHA-256 have a different object ID.
+        let emptyTree = try run(["hash-object", "-t", "tree", "/dev/null"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return try Self.parseNumstat(run([
+            "--no-optional-locks", "diff", "--numstat", "-z", "--no-ext-diff", "--no-textconv",
+            "--find-renames=50%", emptyTree
+        ]))
+    }
 
     private func guardPath(_ path: String) throws {
         // Join under the repo root, then standardize (resolves any ".." in the

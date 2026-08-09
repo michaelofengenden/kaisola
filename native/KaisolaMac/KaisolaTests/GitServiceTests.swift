@@ -578,6 +578,103 @@ final class GitServiceTests: XCTestCase {
         XCTAssertFalse(status.isClean)
     }
 
+    func testStatusMatchesNumstatForPartiallyStagedNoNewlineEdits() throws {
+        try write("partial.txt", "alpha\nkeep\nomega")
+        try git(["add", "partial.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("partial.txt", "ALPHA\nkeep\nomega")
+        try git(["add", "partial.txt"])
+        try write("partial.txt", "ALPHA\nkeep\nOMEGA")
+
+        let status = try GitService(repoRoot: repo).status()
+
+        XCTAssertEqual(status.staged.map(\.path), ["partial.txt"])
+        XCTAssertEqual(status.unstaged.map(\.path), ["partial.txt"])
+        try assertStatsMatchGit(status.stagedStats, arguments: ["diff", "--cached", "--numstat"])
+        try assertStatsMatchGit(status.unstagedStats, arguments: ["diff", "--numstat"])
+        try assertStatsMatchGit(status.combinedStats, arguments: ["diff", "HEAD", "--numstat"])
+        XCTAssertEqual(status.stagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(status.unstagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(status.combinedStats, .init(additions: 2, deletions: 2, textFiles: 1))
+    }
+
+    func testStatusMatchesNumstatForPartiallyStagedAdditionsAndDeletions() throws {
+        try git(["commit", "-q", "--allow-empty", "-m", "empty base"])
+        try write("added.txt", "staged line\n")
+        try git(["add", "added.txt"])
+        try write("added.txt", "staged line\nunstaged line\n")
+        var status = try GitService(repoRoot: repo).status()
+        XCTAssertEqual(status.stagedStats, .init(additions: 1, textFiles: 1))
+        XCTAssertEqual(status.unstagedStats, .init(additions: 1, textFiles: 1))
+        XCTAssertEqual(status.combinedStats, .init(additions: 2, textFiles: 1))
+        try assertStatsMatchGit(status.stagedStats, arguments: ["diff", "--cached", "--numstat"])
+        try assertStatsMatchGit(status.unstagedStats, arguments: ["diff", "--numstat"])
+        try assertStatsMatchGit(status.combinedStats, arguments: ["diff", "HEAD", "--numstat"])
+
+        try git(["reset", "-q"])
+        try FileManager.default.removeItem(at: repo.appendingPathComponent("added.txt"))
+        try write("deleted.txt", "one\ntwo\nkeep\nseven\neight\n")
+        try git(["add", "deleted.txt"])
+        try git(["commit", "-q", "-m", "deletion base"])
+        try write("deleted.txt", "one\nkeep\nseven\neight\n")
+        try git(["add", "deleted.txt"])
+        try write("deleted.txt", "one\nkeep\nseven\n")
+
+        status = try GitService(repoRoot: repo).status()
+        XCTAssertEqual(status.stagedStats, .init(deletions: 1, textFiles: 1))
+        XCTAssertEqual(status.unstagedStats, .init(deletions: 1, textFiles: 1))
+        XCTAssertEqual(status.combinedStats, .init(deletions: 2, textFiles: 1))
+        try assertStatsMatchGit(status.stagedStats, arguments: ["diff", "--cached", "--numstat"])
+        try assertStatsMatchGit(status.unstagedStats, arguments: ["diff", "--numstat"])
+        try assertStatsMatchGit(status.combinedStats, arguments: ["diff", "HEAD", "--numstat"])
+    }
+
+    func testStatusMatchesNumstatForAStagedRenameWithUnstagedEdits() throws {
+        try write("old.txt", (1 ... 10).map { "line \($0)" }.joined(separator: "\n") + "\n")
+        try git(["add", "old.txt"])
+        try git(["commit", "-q", "-m", "rename base"])
+        try git(["mv", "old.txt", "new.txt"])
+        try write("new.txt", "STAGED\n" + (2 ... 10).map { "line \($0)" }.joined(separator: "\n") + "\n")
+        try git(["add", "-A"])
+        try write("new.txt", "STAGED\n" + (2 ... 9).map { "line \($0)" }.joined(separator: "\n") + "\nUNSTAGED\n")
+
+        let status = try GitService(repoRoot: repo).status()
+
+        XCTAssertEqual(status.staged, [.init(path: "new.txt", code: "R")])
+        XCTAssertEqual(status.unstaged, [.init(path: "new.txt", code: "M")])
+        try assertStatsMatchGit(
+            status.stagedStats,
+            arguments: ["diff", "--cached", "--numstat", "--find-renames=50%"]
+        )
+        try assertStatsMatchGit(status.unstagedStats, arguments: ["diff", "--numstat"])
+        try assertStatsMatchGit(
+            status.combinedStats,
+            arguments: ["diff", "HEAD", "--numstat", "--find-renames=50%"]
+        )
+        XCTAssertEqual(status.stagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(status.unstagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(status.combinedStats, .init(additions: 2, deletions: 2, textFiles: 1))
+    }
+
+    func testBinaryStatsRemainBinaryAcrossStagedUnstagedAndCombinedViews() throws {
+        try Data([0, 1, 2, 3]).write(to: repo.appendingPathComponent("image.bin"))
+        try git(["add", "image.bin"])
+        try git(["commit", "-q", "-m", "binary base"])
+        try Data([0, 4, 5, 6]).write(to: repo.appendingPathComponent("image.bin"))
+        try git(["add", "image.bin"])
+        try Data([0, 7, 8, 9]).write(to: repo.appendingPathComponent("image.bin"))
+
+        let status = try GitService(repoRoot: repo).status()
+        let binary = GitService.ChangeStats(binaryFiles: 1)
+
+        XCTAssertEqual(status.stagedStats, binary)
+        XCTAssertEqual(status.unstagedStats, binary)
+        XCTAssertEqual(status.combinedStats, binary)
+        try assertStatsMatchGit(status.stagedStats, arguments: ["diff", "--cached", "--numstat"])
+        try assertStatsMatchGit(status.unstagedStats, arguments: ["diff", "--numstat"])
+        try assertStatsMatchGit(status.combinedStats, arguments: ["diff", "HEAD", "--numstat"])
+    }
+
     func testGitPatchRenderingIsBoundedButPreservesSmallDiffs() {
         let small = "@@ -1 +1 @@\n-old\n+new"
         XCTAssertEqual(
@@ -801,6 +898,45 @@ final class GitServiceTests: XCTestCase {
         let hook = repo.appendingPathComponent(".git/hooks/commit-msg")
         try script.write(to: hook, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
+    }
+
+    private func assertStatsMatchGit(
+        _ actual: GitService.ChangeStats,
+        arguments: [String],
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let output = try gitOutput(arguments)
+        var additions = 0
+        var deletions = 0
+        var textFiles = 0
+        var binaryFiles = 0
+        for record in output.split(separator: "\n") {
+            let fields = record.split(separator: "\t", maxSplits: 2, omittingEmptySubsequences: false)
+            guard fields.count == 3 else {
+                return XCTFail("unexpected independent numstat: \(record)", file: file, line: line)
+            }
+            if fields[0] == "-", fields[1] == "-" {
+                binaryFiles += 1
+            } else if let added = Int(fields[0]), let deleted = Int(fields[1]) {
+                additions += added
+                deletions += deleted
+                textFiles += 1
+            } else {
+                return XCTFail("unexpected independent numstat: \(record)", file: file, line: line)
+            }
+        }
+        XCTAssertEqual(
+            actual,
+            .init(
+                additions: additions,
+                deletions: deletions,
+                textFiles: textFiles,
+                binaryFiles: binaryFiles
+            ),
+            file: file,
+            line: line
+        )
     }
 
     @discardableResult

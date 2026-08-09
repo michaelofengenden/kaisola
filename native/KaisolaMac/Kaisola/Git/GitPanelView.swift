@@ -60,6 +60,37 @@ struct GitPanelOperation: Equatable, Sendable {
     }
 }
 
+/// Field-local validity for the editable pull-request review. Kept pure so the
+/// view, confirmation guard, and tests all apply the same rules while a user is
+/// typing instead of discovering them only after pressing Confirm.
+struct GitPRDraftValidation: Equatable, Sendable {
+    let branchMessage: String?
+    let titleMessage: String?
+
+    var isValid: Bool { branchMessage == nil && titleMessage == nil }
+
+    static let valid = GitPRDraftValidation(branchMessage: nil, titleMessage: nil)
+
+    static func evaluate(plan: PRPlan, branch: String, title: String) -> Self {
+        let branchMessage: String?
+        if plan.createsBranch {
+            do {
+                _ = try GitPRPlanner.validatedBranchName(branch)
+                branchMessage = nil
+            } catch {
+                branchMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+        } else {
+            branchMessage = nil
+        }
+
+        let titleMessage = title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Enter a title for the pull request."
+            : nil
+        return GitPRDraftValidation(branchMessage: branchMessage, titleMessage: titleMessage)
+    }
+}
+
 /// A compact Git panel: branch + ahead/behind, staged / unstaged / untracked
 /// files with one-click stage/unstage, and a commit box. Backed by GitService
 /// (git as a child process). Operations are serialized so an older status cannot
@@ -113,6 +144,33 @@ final class GitPanelModel: ObservableObject {
     @Published var prBranchDraft = "kaisola/pr-branch"
     @Published var prTitleDraft = ""
     @Published var prBodyDraft = ""
+
+    var prDraftValidation: GitPRDraftValidation? {
+        guard let prPlan else { return nil }
+        return .evaluate(plan: prPlan, branch: prBranchDraft, title: prTitleDraft)
+    }
+
+    var canConfirmPR: Bool {
+        guard let plan = prPlan, let validation = prDraftValidation else { return false }
+        return !isBusy
+            && !prPlanStale
+            && plan.destination.isReadyForPullRequest
+            && validation.isValid
+    }
+
+    var prConfirmationHelp: String {
+        if isBusy { return "Wait for the current Git operation to finish." }
+        if prPlanStale { return "Review the pull request again because the repository changed." }
+        guard let plan = prPlan, let validation = prDraftValidation else {
+            return "Review the pull request before confirming."
+        }
+        if !plan.destination.isReadyForPullRequest {
+            return "Add a web origin remote, then review the pull request again."
+        }
+        if let branchMessage = validation.branchMessage { return branchMessage }
+        if let titleMessage = validation.titleMessage { return titleMessage }
+        return "Push the reviewed branch and create the pull request."
+    }
     /// The title/body this model itself last wrote into the drafts above, so
     /// a later re-prepare ("Review Again", once the reviewed plan goes stale)
     /// can tell a user's edit apart from its own previous default and never
@@ -449,20 +507,13 @@ final class GitPanelModel: ObservableObject {
     /// commit or checkout landing between the two clicks (an agent, a terminal)
     /// can never silently turn into a pull request nobody looked at.
     func confirmPR() {
-        guard let reviewed = prPlan else { return }
-        let plan: PRPlan
-        do {
-            plan = try reviewed.applyingEdits(
+        guard let reviewed = prPlan,
+              prDraftValidation?.isValid == true,
+              let plan = try? reviewed.applyingEdits(
                 headBranch: prBranchDraft,
                 title: prTitleDraft,
                 body: prBodyDraft
-            )
-        } catch {
-            errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-            errorIsRetryable = false
-            retryOperation = nil
-            return
-        }
+              ) else { return }
         prState = nil
         prURL = nil
         perform(.createPullRequest) { service -> PROutcome in
@@ -981,6 +1032,8 @@ struct GitPanelView: View {
     /// The review itself: nothing here has run yet.
     @ViewBuilder
     private func reviewStage(_ plan: PRPlan) -> some View {
+        let validation = model.prDraftValidation ?? .valid
+
         VStack(alignment: .leading, spacing: 6) {
             if model.prPlanStale {
                 Label("Repository changed — Review again", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
@@ -1090,12 +1143,30 @@ struct GitPanelView: View {
                     .font(.caption)
                     .accessibilityIdentifier("git.pr.branch")
                     .accessibilityLabel("Pull request branch name")
+                    .accessibilityHint(
+                        validation.branchMessage ?? "Required branch that will be created when the pull request is confirmed"
+                    )
+                if let branchMessage = validation.branchMessage {
+                    draftFieldError(
+                        branchMessage,
+                        fieldName: "Branch name",
+                        identifier: "git.pr.branch.error"
+                    )
+                }
             }
             TextField("Title", text: $model.prTitleDraft)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .accessibilityIdentifier("git.pr.title")
                 .accessibilityLabel("Pull request title")
+                .accessibilityHint(validation.titleMessage ?? "Required pull request title")
+            if let titleMessage = validation.titleMessage {
+                draftFieldError(
+                    titleMessage,
+                    fieldName: "Title",
+                    identifier: "git.pr.title.error"
+                )
+            }
             TextEditor(text: $model.prBodyDraft)
                 .font(.caption)
                 .frame(height: 68)
@@ -1119,12 +1190,10 @@ struct GitPanelView: View {
                     Label("Push and Create PR", systemImage: "arrow.up.forward.square")
                         .font(.caption)
                 }
-                .disabled(
-                    model.isBusy
-                        || model.prPlanStale
-                        || !plan.destination.isReadyForPullRequest
-                )
+                .disabled(!model.canConfirmPR)
                 .accessibilityIdentifier("git.pr.confirm")
+                .accessibilityHint(model.prConfirmationHelp)
+                .help(model.prConfirmationHelp)
                 if model.prPlanStale {
                     Button {
                         model.preparePR()
@@ -1146,6 +1215,15 @@ struct GitPanelView: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("git.pr.reviewStage")
         .accessibilityLabel(model.prPlanStale ? "Pull request review, repository changed, review again" : "Pull request review")
+    }
+
+    private func draftFieldError(_ message: String, fieldName: String, identifier: String) -> some View {
+        Label(message, systemImage: "exclamationmark.circle.fill")
+            .font(.caption2)
+            .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+            .accessibilityElement(children: .ignore)
+            .accessibilityIdentifier(identifier)
+            .accessibilityLabel("\(fieldName) error: \(message)")
     }
 
     private var reviewDisabled: Bool {

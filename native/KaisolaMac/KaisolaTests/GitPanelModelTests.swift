@@ -303,6 +303,44 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertEqual(try onBranch.applyingEdits(headBranch: "junk value", title: "t", body: "b").headBranch, "feature/x")
     }
 
+    func testPullRequestDraftValidationTracksEditableFieldsAsTheyChange() throws {
+        let reviewed = try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "f", count: 40),
+            requestedBranchName: "kaisola/pr-branch", commitSubjects: ["work"], changedFileCount: 1
+        )
+
+        let empty = GitPRDraftValidation.evaluate(plan: reviewed, branch: "   ", title: "\n\t")
+        XCTAssertEqual(empty.branchMessage, "Enter a branch name for the pull request.")
+        XCTAssertEqual(empty.titleMessage, "Enter a title for the pull request.")
+        XCTAssertFalse(empty.isValid)
+
+        let unsafe = GitPRDraftValidation.evaluate(plan: reviewed, branch: "bad branch;", title: "A title")
+        XCTAssertEqual(unsafe.branchMessage, "Invalid branch name — use letters, digits, and . _ / - only.")
+        XCTAssertNil(unsafe.titleMessage)
+        XCTAssertFalse(unsafe.isValid)
+
+        XCTAssertEqual(
+            GitPRDraftValidation.evaluate(plan: reviewed, branch: "  feature/reviewed  ", title: "  A title  "),
+            .valid
+        )
+
+        // Existing branches do not expose an editable branch field, so a stale
+        // value left in the shared draft must neither surface nor block confirm.
+        let existingBranch = try GitPRPlanner.assemble(
+            prep: prep(branch: "feature/x", isDefault: false, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "f", count: 40),
+            requestedBranchName: "", commitSubjects: ["work"], changedFileCount: 1
+        )
+        let hiddenBranch = GitPRDraftValidation.evaluate(
+            plan: existingBranch,
+            branch: "bad branch;",
+            title: "A title"
+        )
+        XCTAssertNil(hiddenBranch.branchMessage)
+        XCTAssertTrue(hiddenBranch.isValid)
+    }
+
     func testAReviewedPlanIsRefusedOnceTheRepositoryMovesPastIt() throws {
         let plan = try GitPRPlanner.assemble(
             prep: prep(branch: "feature/x", isDefault: false, hasUpstream: true, ahead: 1),
@@ -470,6 +508,66 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
         XCTAssertEqual(try gitOutput(["branch", "--format=%(refname:short)"]).split(separator: "\n").sorted(),
                        ["feature/live", "main"])
+    }
+
+    @MainActor
+    func testInvalidDefaultBranchDraftCannotConfirmAndPreservesEveryDraft() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let baseOID = try gitOutput(["rev-parse", "HEAD"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Model a default branch that is one commit ahead of its reviewed
+        // origin without contacting a remote. The destination is still a real
+        // web identity, so validity—not missing setup—is what gates confirm.
+        try git(["remote", "add", "origin", "git@github.com:acme/widget.git"])
+        try git(["update-ref", "refs/remotes/origin/main", baseOID])
+        try git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"])
+        try write("work.txt", "review me\n")
+        try git(["add", "work.txt"])
+        try git(["commit", "-q", "-m", "feature work"])
+        let reviewedHead = try gitOutput(["rev-parse", "HEAD"])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.preparePR()
+        XCTAssertTrue(pump(until: { model.prPlan != nil || model.errorMessage != nil }, timeout: 10))
+        XCTAssertTrue(try XCTUnwrap(model.prPlan).createsBranch)
+        XCTAssertTrue(try XCTUnwrap(model.prPlan).destination.isReadyForPullRequest)
+
+        model.prBranchDraft = "bad branch;"
+        model.prTitleDraft = " \n\t "
+        model.prBodyDraft = "Keep this exact body.\n\nIncluding spacing."
+        let preserved = (model.prBranchDraft, model.prTitleDraft, model.prBodyDraft)
+
+        XCTAssertEqual(
+            model.prDraftValidation?.branchMessage,
+            "Invalid branch name — use letters, digits, and . _ / - only."
+        )
+        XCTAssertEqual(model.prDraftValidation?.titleMessage, "Enter a title for the pull request.")
+        XCTAssertFalse(model.canConfirmPR)
+
+        model.confirmPR()
+
+        XCTAssertNil(model.activeOperation, "invalid drafts must not start push/PR work")
+        XCTAssertNil(model.errorMessage, "field validation must not become a detached panel banner")
+        XCTAssertNotNil(model.prPlan, "the editable review must stay open")
+        XCTAssertEqual(model.prBranchDraft, preserved.0)
+        XCTAssertEqual(model.prTitleDraft, preserved.1)
+        XCTAssertEqual(model.prBodyDraft, preserved.2)
+        XCTAssertEqual(try gitOutput(["rev-parse", "HEAD"]), reviewedHead)
+        XCTAssertEqual(
+            try gitOutput(["branch", "--format=%(refname:short)"])
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "main"
+        )
+
+        model.prBranchDraft = "feature/reviewed"
+        XCTAssertFalse(model.canConfirmPR, "the independently invalid title must still gate confirm")
+        model.prTitleDraft = " Reviewed title "
+        XCTAssertEqual(model.prDraftValidation, .valid)
+        XCTAssertTrue(model.canConfirmPR, "confirmation should unlock immediately when both fields become valid")
+        XCTAssertEqual(model.prBodyDraft, preserved.2)
     }
 
     /// Event-driven refresh: an external `git add` (an agent, a terminal) must

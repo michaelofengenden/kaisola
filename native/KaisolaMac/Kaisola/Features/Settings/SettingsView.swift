@@ -103,7 +103,7 @@ struct SettingsView: View {
                             .font(.title3.weight(.semibold))
                         Text(selectedSection.subtitle)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                     }
                     Spacer()
                     if let dismiss {
@@ -192,7 +192,7 @@ struct SettingsView: View {
             ForEach(SettingsGroup.allCases) { group in
                 Text(group.title.uppercased())
                     .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .padding(.horizontal, 14)
                     .padding(.top, group == SettingsGroup.allCases.first ? 0 : 10)
                     .accessibilityAddTraits(.isHeader)
@@ -204,7 +204,7 @@ struct SettingsView: View {
             Spacer()
             Text("Changes apply instantly")
                 .font(.caption2)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.kaisolaTertiary)
                 .padding(.horizontal, 14)
         }
         .padding(.vertical, 14)
@@ -587,7 +587,7 @@ struct SettingsView: View {
                         .accessibilityValue("\(Int(settings.terminalFontSize)) points")
                         Text("\(Int(settings.terminalFontSize))")
                             .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .frame(width: 24)
                     }
                     SettingsDivider()
@@ -602,7 +602,7 @@ struct SettingsView: View {
                         .accessibilityValue(String(format: "%.2f times", settings.terminalLineSpacing))
                         Text(String(format: "%.2f×", settings.terminalLineSpacing))
                             .font(.callout.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .frame(width: 42, alignment: .trailing)
                     }
                     SettingsDivider()
@@ -618,7 +618,7 @@ struct SettingsView: View {
                         ) {
                             Text(settings.terminalScrollbackLines.formatted(.number.grouping(.automatic)))
                                 .font(.callout.monospacedDigit())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .frame(width: 64, alignment: .trailing)
                         }
                         .accessibilityLabel("Terminal scrollback")
@@ -673,7 +673,7 @@ struct SettingsView: View {
                     }
                     Text("Full terminal output stays append-only until you close that terminal. This threshold warns; changing it never removes history.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 16)
                         .padding(.bottom, 14)
@@ -713,7 +713,7 @@ struct SettingsView: View {
                         }
                         Text("Terminal applications can never read your clipboard; Kaisola refuses those requests whether or not this is on.")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 16)
                             .padding(.bottom, 14)
@@ -825,14 +825,14 @@ struct SettingsView: View {
                         LabeledContent(agent.name) {
                             Text(([adapter.command] + adapter.arguments).joined(separator: " "))
                                 .font(.caption.monospaced())
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1)
                                 .truncationMode(.middle)
                         }
                     }
                 }
                 Text("Adapters resolve @latest on every chat, so they stay current automatically.")
-                    .font(.caption).foregroundStyle(.secondary)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary)
             }
         }
         .formStyle(.grouped)
@@ -933,7 +933,7 @@ struct SettingsCard<Content: View>: View {
         VStack(alignment: .leading, spacing: 0) {
             Label(title, systemImage: symbol)
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .padding(.horizontal, 16)
                 .frame(height: 40)
             Divider().opacity(0.65)
@@ -954,12 +954,12 @@ struct SettingsRow<Trailing: View>: View {
     var body: some View {
         HStack(spacing: 12) {
             Image(systemName: symbol)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: 22)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.callout.weight(.medium))
-                Text(detail).font(.caption).foregroundStyle(.secondary)
+                Text(detail).font(.caption).foregroundStyle(.kaisolaSecondary)
             }
             Spacer(minLength: 16)
             trailing
@@ -981,7 +981,7 @@ private struct SettingsChoiceLabel: View {
             Text(title).lineLimit(1)
             Image(systemName: "chevron.up.chevron.down")
                 .font(.caption2.weight(.semibold))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.kaisolaTertiary)
         }
         .font(.callout)
         .padding(.horizontal, 10)
@@ -1042,14 +1042,14 @@ private struct TerminalColorCard: View {
                         .foregroundStyle(.orange)
                     VStack(alignment: .leading, spacing: 1) {
                         Text(spec.title.isEmpty ? spec.id : spec.title)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                         Text(reason)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                     }
                 } else {
                     Image(systemName: "paintpalette")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     Text(spec.title)
                 }
                 Spacer()
@@ -1179,7 +1179,7 @@ private struct GuardrailsSettings: View {
             Section("Standing Allow Rules") {
                 if rules.isEmpty {
                     Text("No rules yet — \"Always Allow\" on a permission ask creates one.")
-                        .font(.caption).foregroundStyle(.secondary)
+                        .font(.caption).foregroundStyle(.kaisolaSecondary)
                 }
                 ForEach(rules) { rule in
                     HStack {
@@ -1187,7 +1187,7 @@ private struct GuardrailsSettings: View {
                             Text(AcpPermissionRules.ruleLabel(action: rule.action, resource: rule.resource))
                                 .font(.callout)
                             Text(rule.workspace)
-                                .font(.caption2).foregroundStyle(.secondary)
+                                .font(.caption2).foregroundStyle(.kaisolaSecondary)
                                 .lineLimit(1).truncationMode(.middle)
                         }
                         Spacer()

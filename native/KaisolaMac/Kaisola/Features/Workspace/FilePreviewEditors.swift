@@ -336,7 +336,7 @@ struct MarkdownEditingStyle: Sendable {
         guard revealed, role == .syntax else { return attributes(for: role) }
         return [
             .font: NSFont.systemFont(ofSize: max(11, bodySize * 0.85)),
-            .foregroundColor: NSColor.tertiaryLabelColor,
+            .foregroundColor: KaisolaInk.nsColor(.tertiary, on: .solid),
         ]
     }
 }

@@ -790,7 +790,7 @@ struct RootShellView: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: NativeWorkspaceChrome.detailChromeGlyphSize, weight: .regular))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: 24, height: 20)
                 .contentShape(Rectangle())
         }
@@ -953,7 +953,7 @@ struct RootShellView: View {
                     .font(.callout)
                 Spacer(minLength: 0)
             }
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .padding(.leading, 12)
             .frame(height: QuietRailMetrics.rowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -988,7 +988,7 @@ struct RootShellView: View {
                 } label: {
                     HStack(spacing: 7) {
                         Circle()
-                            .fill(device.presence == .online ? Color.green : Color.secondary.opacity(0.45))
+                            .fill(device.presence == .online ? Color.green : Color.kaisolaTertiary)
                             .frame(width: 6, height: 6)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(device.deviceName)
@@ -996,7 +996,7 @@ struct RootShellView: View {
                                 .lineLimit(1)
                             Text("\(device.sessions.count) remembered \(device.sessions.count == 1 ? "session" : "sessions")")
                                 .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                         }
                     }
                 }
@@ -1013,7 +1013,7 @@ struct RootShellView: View {
                     ? "clock.arrow.circlepath"
                     : "checkmark.icloud")
                     .font(.system(size: 9.5))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .lineLimit(1)
                     .help("Remembered-session catalog freshness")
                     .accessibilityLabel("Remembered sessions, \(freshness)")
@@ -1048,7 +1048,7 @@ struct RootShellView: View {
                     .lineLimit(1)
                 Text("\(session.projectName) · \(rememberedSessionActivityTitle(session.activity))")
                     .font(.system(size: 9.5))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(1)
             }
         }
@@ -1984,7 +1984,7 @@ struct RootShellView: View {
                             .foregroundStyle(
                                 surfaceLive(id)
                                     ? KaisolaStatusTone.done.foregroundColor
-                                    : Color.secondary
+                                    : Color.kaisolaSecondary
                             )
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel(surfaceStatusLabel(id))
@@ -2021,7 +2021,7 @@ struct RootShellView: View {
                     .frame(width: 24, height: 22)
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .help(model.maximizedPaneID == id ? "Restore pane" : "Maximize pane")
             if model.sessions.contains(where: { $0.id == id }) {
                 Button {
@@ -2031,7 +2031,7 @@ struct RootShellView: View {
                         .frame(width: 24, height: 22)
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .disabled(model.terminalTranscriptContext(for: id) == nil)
                 .help("Open the full retained terminal transcript")
                 popOutTerminalButton(id)
@@ -2041,7 +2041,7 @@ struct RootShellView: View {
                     .frame(width: 24, height: 22)
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .help("Hide this session; keep it running")
         }
         .padding(.leading, 10)
@@ -2159,7 +2159,7 @@ struct RootShellView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.kaisolaSecondary)
         .help("Account: \(currentLabel) · Model: \(chat.modelOverride ?? "default") — switch either, even mid-conversation")
         .accessibilityLabel("Account and model: \(currentLabel), \(chat.modelOverride ?? "default model")")
     }
@@ -2252,7 +2252,7 @@ struct RootShellView: View {
                 .fontWeight(.semibold)
             Text(command)
                 .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             Button {
                 Task { await model.runPendingAgentResume(for: id) }
             } label: {
@@ -2368,7 +2368,7 @@ struct RootShellView: View {
                         .disabled(model.terminalTranscriptContext(for: id) == nil)
                 }
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .background(.regularMaterial, in: Capsule())
@@ -2382,7 +2382,7 @@ struct RootShellView: View {
             } else if case let .reconnecting(attempt) = model.connectionState {
                 Label("Reconnecting…", systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
                     .background(.regularMaterial, in: Capsule())
@@ -2505,7 +2505,7 @@ struct RootShellView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.kaisolaSecondary)
         .help("Open this session in a new window")
     }
 }
@@ -4236,7 +4236,7 @@ private struct SessionStrip: View {
                 if sessions.isEmpty, chats.isEmpty, meshes.isEmpty, recentlyClosed.isEmpty {
                     Text("No activity in this project")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .padding(.horizontal, 8)
                 }
                 ForEach(chats) { chat in
@@ -4255,7 +4255,7 @@ private struct SessionStrip: View {
                                ) {
                                 Text(cost)
                                     .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                             }
                         }
                         .font(.callout)
@@ -4287,7 +4287,7 @@ private struct SessionStrip: View {
                             if mesh.stage != "Idle" {
                                 Text(mesh.stage)
                                     .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                             }
                         }
                         .font(.callout)
@@ -4355,7 +4355,7 @@ private struct SessionStrip: View {
                             Circle()
                                 .fill(visible || working
                                       ? WorkspacePalette.terminal
-                                      : Color.secondary.opacity(0.45))
+                                      : Color.kaisolaTertiary)
                                 .frame(width: 6, height: 6)
                             Text(model.sessionTitle(for: session)).lineLimit(1)
                         }
@@ -4698,7 +4698,7 @@ private struct ConnectionFooter: View {
         Button(action: showSettings) {
             Image(systemName: "gearshape")
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
                 .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
         }
@@ -4823,7 +4823,7 @@ private struct ConnectionFooter: View {
         } label: {
             Image(systemName: "ellipsis")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
                 .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
         }
@@ -5011,7 +5011,7 @@ private struct ConnectionFooter: View {
                         if attentionContext != nil {
                             Text(section.title)
                                 .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .textCase(.uppercase)
                                 .padding(.horizontal, 12)
                                 .padding(.top, 8)
@@ -5024,7 +5024,7 @@ private struct ConnectionFooter: View {
                     if sections.isEmpty {
                         Text("Nothing needs you in this filter.")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .padding(12)
                     }
                 }
@@ -5045,7 +5045,7 @@ private struct ConnectionFooter: View {
         return Button(label) { inboxFilter = kinds }
             .buttonStyle(.borderless)
             .font(.caption2.weight(selected ? .semibold : .regular))
-            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+            .foregroundStyle(selected ? Color.accentColor : Color.kaisolaSecondary)
             .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
@@ -5070,7 +5070,7 @@ private struct ConnectionFooter: View {
                     attention.clear(targetID: row.entry.targetID)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
                 .buttonStyle(.plain)
                 .help("This session is gone; clear the entry")
@@ -5087,7 +5087,7 @@ private struct ConnectionFooter: View {
             )
             VStack(alignment: .leading, spacing: 1) {
                 Text(row.entry.title).font(.callout).lineLimit(1)
-                Text(row.entry.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(row.entry.detail).font(.caption).foregroundStyle(.kaisolaSecondary).lineLimit(1)
             }
             Spacer()
         }

@@ -172,7 +172,7 @@ struct FilePreviewView: View {
                             ProgressView().controlSize(.small)
                             Text("Opening \((loadingURL ?? url).lastPathComponent)…")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                         }
                         .padding(18)
                         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
@@ -508,7 +508,7 @@ struct FilePreviewView: View {
     private var documentTabs: some View {
         if tabs.isEmpty {
             Image(systemName: "doc.text")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             Text((loadingURL ?? loadedURL ?? url).lastPathComponent)
                 .font(.subheadline.weight(.medium))
                 .lineLimit(1)
@@ -540,7 +540,7 @@ struct FilePreviewView: View {
                                     HStack(spacing: 5) {
                                         Image(systemName: tab.isPinned ? "doc.fill" : "doc")
                                             .font(.system(size: 10, weight: .medium))
-                                            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                                            .foregroundStyle(selected ? Color.accentColor : Color.kaisolaSecondary)
                                         Text(displayTitle)
                                             .font(.caption.weight(selected ? .semibold : .regular))
                                             .italic(!tab.isPinned)
@@ -576,7 +576,7 @@ struct FilePreviewView: View {
                                         .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .opacity(closeVisible ? 1 : 0)
                                 .allowsHitTesting(closeVisible)
                                 .accessibilityHidden(!closeVisible)

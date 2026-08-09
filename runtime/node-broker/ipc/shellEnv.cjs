@@ -10,6 +10,45 @@ const path = require('node:path')
 const DEFAULT_SHELLS = Object.freeze(['/bin/zsh', '/bin/bash', '/bin/sh'])
 const SAFE_EXECUTABLE_PATH = /^\/(?:[A-Za-z0-9._+@%=-]+\/)*[A-Za-z0-9._+@%=-]+$/
 const PATH_COMMAND = 'printf "PZPATH:%s" "$PATH"'
+// The detached broker can inherit signing, CI, provider, or debugging secrets
+// from its launcher. Child processes receive only ordinary user-session
+// compatibility values from that ambient environment. Account/provider values
+// are added separately through the explicit `extra` argument below.
+const COMPATIBILITY_ENVIRONMENT_KEYS = Object.freeze([
+  'HOME',
+  'USER',
+  'LOGNAME',
+  'SHELL',
+  'TMPDIR',
+  'LANG',
+  'LANGUAGE',
+  'LC_ALL',
+  'LC_COLLATE',
+  'LC_CTYPE',
+  'LC_MESSAGES',
+  'LC_MONETARY',
+  'LC_NUMERIC',
+  'LC_TIME',
+  'LC_PAPER',
+  'LC_NAME',
+  'LC_ADDRESS',
+  'LC_TELEPHONE',
+  'LC_MEASUREMENT',
+  'LC_IDENTIFICATION',
+  'TZ',
+  'SSH_AUTH_SOCK',
+  'DISPLAY',
+  'XAUTHORITY',
+  'XDG_CONFIG_HOME',
+  'XDG_CACHE_HOME',
+  'XDG_DATA_HOME',
+  'XDG_STATE_HOME',
+  'XDG_RUNTIME_DIR',
+  'EDITOR',
+  'VISUAL',
+  'PAGER',
+  '__CF_USER_TEXT_ENCODING',
+])
 
 let cachedPath // undefined = not computed; null = failed
 
@@ -74,12 +113,31 @@ function loginShellPath() {
   return cachedPath
 }
 
-/** process.env merged with the login-shell PATH + common bin dirs (+ extra env). */
-function agentEnv(extra) {
-  const home = os.homedir()
+function compatibleInheritedEnvironment(environment) {
+  const inherited = {}
+  if (!environment || typeof environment !== 'object') return inherited
+  for (const key of COMPATIBILITY_ENVIRONMENT_KEYS) {
+    if (typeof environment[key] === 'string') inherited[key] = environment[key]
+  }
+  return inherited
+}
+
+/**
+ * Explicit compatibility environment + login-shell PATH + caller-approved
+ * overrides. `options` is an injection seam for deterministic tests; normal
+ * callers always use the broker's launch environment and discovered PATH.
+ */
+function agentEnv(extra, options = {}) {
+  const environment = options.environment && typeof options.environment === 'object'
+    ? options.environment
+    : process.env
+  const home = typeof options.home === 'string' ? options.home : os.homedir()
+  const discoveredPath = Object.prototype.hasOwnProperty.call(options, 'loginShellPath')
+    ? options.loginShellPath
+    : loginShellPath()
   const common = [
-    loginShellPath(),
-    process.env.PATH,
+    discoveredPath,
+    environment.PATH,
     '/opt/homebrew/bin',
     '/opt/homebrew/sbin',
     '/usr/local/bin',
@@ -98,7 +156,14 @@ function agentEnv(extra) {
     .split(':')
     .filter((p) => p && !seen.has(p) && seen.add(p))
     .join(':')
-  return { ...process.env, ...(extra || {}), PATH }
+  const inherited = compatibleInheritedEnvironment(environment)
+  if (!inherited.HOME && home) inherited.HOME = home
+  return { ...inherited, ...(extra || {}), PATH }
 }
 
-module.exports = { agentEnv, discoverLoginShellPath, resolveLoginShell }
+module.exports = {
+  agentEnv,
+  COMPATIBILITY_ENVIRONMENT_KEYS,
+  discoverLoginShellPath,
+  resolveLoginShell,
+}

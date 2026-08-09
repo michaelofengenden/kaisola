@@ -57,8 +57,9 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
     'TerminalDocumentTests', 'TerminalLinkRoutingTests', 'TerminalScrollPinTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/', [
-    'DataPreviewsTests', 'LocalhostDetectorTests', 'QuickActionStoreTests',
-    'SyntaxHighlighterTests', 'WorkspaceFilesTests', 'WorkspaceWatcherTests',
+    'BrowserCardAddressTests', 'DataPreviewsTests', 'LocalhostDetectorTests',
+    'QuickActionStoreTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+    'WorkspaceWatcherTests',
   ]],
   ['native/KaisolaMac/Kaisola/Git/', ['GitPRTests', 'GitPanelModelTests', 'GitServiceTests']],
   ['native/KaisolaMac/Kaisola/Mesh/', ['MeshSessionTests', 'MeshStagedTests']],
@@ -118,7 +119,7 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
     'SessionPaneLayoutTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/BrowserCardView.swift', [
-    'AppModelProjectContextTests', 'LocalhostDetectorTests',
+    'AppModelProjectContextTests', 'BrowserCardAddressTests', 'LocalhostDetectorTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/AgentFileFollow.swift', [
     'AcpToolArtifactsTests', 'AppModelProjectContextTests', 'WorkspaceFilesTests',

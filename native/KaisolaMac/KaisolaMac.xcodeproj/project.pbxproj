@@ -108,6 +108,7 @@
 		564D45F6C7CAD6E523055578 /* GitRefreshPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = E49280DD117D97BF6CBB23B5 /* GitRefreshPolicy.swift */; };
 		5729303DDAE35AC5A424D440 /* BrokerGenerationRouting.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58E98EB49F192C275F6621D9 /* BrokerGenerationRouting.swift */; };
 		5760827CF9F4168466291A60 /* CustomAgentsSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = F962ED6ABB7DF6857352C351 /* CustomAgentsSection.swift */; };
+		57B40F00F1584DBDA1E3CB89 /* BrowserCardAddressTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 133BE05F0FBA11EF908C3F6B /* BrowserCardAddressTests.swift */; };
 		595E74C762DF125BE0076FEF /* NativeUpdateConfigurationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA616801D125F0ACE1E5A177 /* NativeUpdateConfigurationTests.swift */; };
 		5B9D83461433539D662A2E0E /* MarkdownIncrementalStyleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5C7A4F2FAC61FD9BED492FAD /* MarkdownIncrementalStyleTests.swift */; };
 		5BF12B4AEA260B658F89B865 /* PreviewPreparationBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F31D5C02E5186D5E22284E23 /* PreviewPreparationBudgetTests.swift */; };
@@ -346,6 +347,7 @@
 		0B4786B001B694E8168114CB /* KaisolaBrokerBootstrap */ = {isa = PBXFileReference; includeInIndex = 0; path = KaisolaBrokerBootstrap; sourceTree = BUILT_PRODUCTS_DIR; };
 		0D0C0AB93E53CC4CC7AA3A38 /* AccountSignInControllerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountSignInControllerTests.swift; sourceTree = "<group>"; };
 		1186936559305BAEF5106851 /* AccountHeadroomTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountHeadroomTests.swift; sourceTree = "<group>"; };
+		133BE05F0FBA11EF908C3F6B /* BrowserCardAddressTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrowserCardAddressTests.swift; sourceTree = "<group>"; };
 		13BFA68C0E2E3E83379B2835 /* TerminalDocument.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalDocument.swift; sourceTree = "<group>"; };
 		13EBC07FC170BBA533902C87 /* CustomAgentStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomAgentStoreTests.swift; sourceTree = "<group>"; };
 		1423BFC7C8A3FCE35B4366C9 /* AdapterInstallManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdapterInstallManager.swift; sourceTree = "<group>"; };
@@ -971,6 +973,7 @@
 				991FCF32D009E1236EBF19A5 /* BrokerModelsTests.swift */,
 				A451FC25E152BC8B61FB5702 /* BrokerReconnectBackoffTests.swift */,
 				A7E57351BA3A72C99024DAEC /* BrokerStartupCoordinatorTests.swift */,
+				133BE05F0FBA11EF908C3F6B /* BrowserCardAddressTests.swift */,
 				2D50688D03104371F2AEF0CA /* ClosedLifecycleQuitTests.swift */,
 				464ED169861ADF834D75A7E3 /* ClosedLifecycleStoreTests.swift */,
 				5B7E991B45873080FAD43C47 /* CodeEditorViewTests.swift */,
@@ -1512,6 +1515,7 @@
 				AE16DBA9C3C56992F46A611A /* BrokerModelsTests.swift in Sources */,
 				6654B3A1CE2F11C7026F61B2 /* BrokerReconnectBackoffTests.swift in Sources */,
 				5EA24E714C9FF79494C0DDFA /* BrokerStartupCoordinatorTests.swift in Sources */,
+				57B40F00F1584DBDA1E3CB89 /* BrowserCardAddressTests.swift in Sources */,
 				181D98C2AE14BD88EDCA6458 /* ClosedLifecycleQuitTests.swift in Sources */,
 				380F8D745A8FFB7E44651A98 /* ClosedLifecycleStoreTests.swift in Sources */,
 				2B0106FB232612C7046A680A /* CodeEditorViewTests.swift in Sources */,

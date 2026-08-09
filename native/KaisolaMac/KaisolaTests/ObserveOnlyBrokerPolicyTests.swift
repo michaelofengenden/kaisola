@@ -5,6 +5,7 @@ import KaisolaBrokerProtocol
 final class ObserveOnlyBrokerPolicyTests: XCTestCase {
     func testOnlyTypedInventoryAndObserverLifecycleAreAllowed() throws {
         XCTAssertEqual(try ObserveOnlyBrokerPolicy.validate("broker.status"), .status)
+        XCTAssertEqual(try ObserveOnlyBrokerPolicy.validate("broker.inventory"), .inventory)
         XCTAssertEqual(try ObserveOnlyBrokerPolicy.validate("terminal.list"), .list)
         XCTAssertEqual(try ObserveOnlyBrokerPolicy.validate("terminal.diagnostics"), .diagnostics)
         XCTAssertEqual(try ObserveOnlyBrokerPolicy.validate("terminal.history"), .history)

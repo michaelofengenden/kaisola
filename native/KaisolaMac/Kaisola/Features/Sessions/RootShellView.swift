@@ -33,6 +33,7 @@ struct RootShellView: View {
     /// Chat id awaiting a typed model id (the menu's "Custom Model…").
     @State private var customModelTarget: String?
     @State private var customModelText: String = ""
+    @State private var signingInChatAccount: UsageAccountProfile?
     @State private var renameProjectTarget: String?
     @State private var renameText: String = ""
     @State private var gitRepo: URL?
@@ -328,6 +329,11 @@ struct RootShellView: View {
                 customModelTarget = nil
             }
         }
+        .sheet(item: $signingInChatAccount) { profile in
+            AccountSignInSheet(profile: profile) {
+                signingInChatAccount = nil
+            }
+        }
         .sheet(item: Binding(get: { gitRepo.map(GitRepoID.init) }, set: { gitRepo = $0?.url })) { repo in
             VStack(spacing: 0) {
                 HStack {
@@ -505,9 +511,52 @@ struct RootShellView: View {
 
     // MARK: - Layouts
 
+    /// The one action surface injected into either navigation shell. Layout
+    /// switching changes presentation only; it cannot select a different
+    /// implementation of project, session, or destructive actions.
+    private var shellActions: RootShellActionModel {
+        RootShellActionModel(
+            openDroppedProjects: { urls in
+                let folders = urls.filter(\.hasDirectoryPath)
+                guard !folders.isEmpty else { return false }
+                for folder in folders { model.openProject(directory: folder) }
+                return true
+            },
+            openProject: { runCommand(.openProject) },
+            useLeftTreeNavigation: { runCommand(.navigationLayout(.leftTree)) },
+            moveProject: { model.moveProject(id: $0, toIndex: $1) },
+            runQuickAction: { action, directory in
+                Task { await model.runQuickAction(action, inProject: directory) }
+            },
+            selectSession: { session in
+                if KaisolaMacAppDelegate.focusWindow(displayingSurface: session.id) { return }
+                guard SurfaceSelectionPolicy.shouldRequestFocus(
+                    focusedPaneID: model.focusedPaneID,
+                    targetID: session.id,
+                    browserOpen: model.browserCardURL != nil,
+                    activeProjectID: model.selectedProjectID,
+                    targetProjectID: session.projectID
+                ) else { return }
+                Task { await model.focusSurface(session.id) }
+            },
+            projectLaunchMenu: { AnyView(projectLaunchMenu($0)) },
+            projectContextMenu: { AnyView(projectContextMenu($0)) },
+            sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
+            chatContextMenu: { AnyView(chatContextMenuContent($0)) },
+            meshContextMenu: { AnyView(meshContextMenuContent($0)) },
+            renameSurface: { renameTarget = $0 },
+            closeChat: { model.closeChat($0.id) },
+            deleteChat: requestDeleteChat,
+            closeMesh: requestMoveMeshToRecentlyClosed,
+            deleteMesh: requestDeleteMesh,
+            deleteRecentlyClosed: requestDeleteRecentlyClosed
+        )
+    }
+
     /// Nested project→session tree in a left sidebar (the default).
     private var leftTreeLayout: some View {
-        NavigationSplitView {
+        let actions = shellActions
+        return RootLeftTreeShell(actions: actions) { actions in
             VStack(spacing: 0) {
                 // No "Projects" title row: the chrome panel already starts below
                 // the traffic lights, the rail's own pinned project names the
@@ -528,23 +577,13 @@ struct RootShellView: View {
                         // uses, so the rail always pins exactly the project
                         // whose sessions are expanded.
                         isActiveProject: { activeProjectID == $0 },
-                        selectSession: { session in
-                            if KaisolaMacAppDelegate.focusWindow(displayingSurface: session.id) { return }
-                            guard SurfaceSelectionPolicy.shouldRequestFocus(
-                                focusedPaneID: model.focusedPaneID,
-                                targetID: session.id,
-                                browserOpen: model.browserCardURL != nil,
-                                activeProjectID: model.selectedProjectID,
-                                targetProjectID: session.projectID
-                            ) else { return }
-                            Task { await model.focusSurface(session.id) }
-                        },
-                        launchMenu: { AnyView(projectLaunchMenu($0)) },
-                        contextMenu: { AnyView(projectContextMenu($0)) },
-                        sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
-                        chatContextMenu: { AnyView(chatContextMenuContent($0)) },
-                        meshContextMenu: { AnyView(meshContextMenuContent($0)) },
-                        deleteRecentlyClosed: requestDeleteRecentlyClosed
+                        selectSession: actions.selectSession,
+                        launchMenu: actions.projectLaunchMenu,
+                        contextMenu: actions.projectContextMenu,
+                        sessionContextMenu: actions.sessionContextMenu,
+                        chatContextMenu: actions.chatContextMenu,
+                        meshContextMenu: actions.meshContextMenu,
+                        deleteRecentlyClosed: actions.deleteRecentlyClosed
                     )
                     addProjectRow
                         .listRowInsets(QuietRailMetrics.listRowBleed)
@@ -558,12 +597,7 @@ struct RootShellView: View {
                 // Typed to URLs, so the rail's own internal text drags (project
                 // reorder) never collide with it.
                 .dropDestination(for: URL.self) { urls, _ in
-                    let folders = urls.filter(\.hasDirectoryPath)
-                    guard !folders.isEmpty else { return false }
-                    for folder in folders {
-                        model.openProject(directory: folder)
-                    }
-                    return true
+                    actions.openDroppedProjects(urls)
                 } isTargeted: { sidebarDropTargeted = $0 }
                 .overlay {
                     if sidebarDropTargeted {
@@ -671,10 +705,9 @@ struct RootShellView: View {
                 ideal: NativeWorkspaceChrome.projectSidebarIdealWidth,
                 max: NativeWorkspaceChrome.projectSidebarMaximumWidth
             )
-        } detail: {
+        } detail: { _ in
             detailArea
         }
-        .navigationSplitViewStyle(.balanced)
     }
 
     /// The detail column: the content on its own inset floating card, gutters
@@ -1085,39 +1118,39 @@ struct RootShellView: View {
     /// A project tab strip over a session row, then the detail pane (Electron's
     /// "Top bar" mode).
     private var topBarLayout: some View {
-        VStack(spacing: 0) {
+        let actions = shellActions
+        return RootTopBarShell(actions: actions) { actions in
             ProjectTabStripView(
                 projects: model.projects,
                 selected: activeProjectBinding,
-                menu: { project in AnyView(self.projectContextMenu(project)) },
-                openFolder: { runCommand(.openProject) },
-                useSidebar: { runCommand(.navigationLayout(.leftTree)) },
-                reorder: { model.moveProject(id: $0, toIndex: $1) }
+                menu: actions.projectContextMenu,
+                openFolder: actions.openProject,
+                useSidebar: actions.useLeftTreeNavigation,
+                reorder: actions.moveProject
             )
             .padding(.leading, NativeWorkspaceChrome.topBarTrafficLightClearance)
-            Divider()
+        } quickActions: { actions in
             if let active = model.projects.first(where: { $0.id == activeProjectID }),
                let activeDir = active.directory {
                 QuickActionsBar(projectID: active.id, projectName: active.name) { action in
-                    Task { await model.runQuickAction(action, inProject: activeDir) }
+                    actions.runQuickAction(action, activeDir)
                 }
             }
+        } sessions: { actions in
             SessionStrip(
                 model: model,
                 projectID: activeProjectID,
-                rename: { renameTarget = $0 },
-                closeChat: { model.closeChat($0.id) },
-                deleteChat: requestDeleteChat,
-                closeMesh: requestMoveMeshToRecentlyClosed,
-                deleteMesh: requestDeleteMesh,
-                deleteRecentlyClosed: requestDeleteRecentlyClosed
+                rename: actions.renameSurface,
+                closeChat: actions.closeChat,
+                deleteChat: actions.deleteChat,
+                closeMesh: actions.closeMesh,
+                deleteMesh: actions.deleteMesh,
+                deleteRecentlyClosed: actions.deleteRecentlyClosed
             )
-            Divider()
+        } detail: { _ in
             detailArea
-            HStack(spacing: 0) {
-                footer.frame(width: 235)
-                Spacer(minLength: 0)
-            }
+        } footer: { _ in
+            footer
         }
     }
 
@@ -1739,6 +1772,79 @@ struct RootShellView: View {
         }
     }
 
+    /// Choose only the provider account for an already-restored chat. Its
+    /// execution location is fixed by the existing session, so presenting the
+    /// Run on picker here would incorrectly imply that switching credentials
+    /// can also move the continuation to another project or worktree.
+    @MainActor
+    private static func chooseSessionAccount(
+        for agent: AgentProfile,
+        then handle: @escaping @MainActor (UsageAccountProfile?) -> Void
+    ) {
+        guard let provider = SessionAccountBinding.provider(forAgentID: agent.id) else {
+            handle(nil)
+            return
+        }
+        var profiles = UsageAccountStore().profiles()
+            .filter { $0.provider == provider }
+        if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+           ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "account-picker" {
+            profiles = [
+                UsageAccountProfile(
+                    id: "visual-work",
+                    provider: provider,
+                    label: "Work",
+                    directory: "/Users/example/.\(provider.rawValue)-work"
+                ),
+                UsageAccountProfile(
+                    id: "visual-research",
+                    provider: provider,
+                    label: "Research",
+                    directory: "/Users/example/.\(provider.rawValue)-research"
+                ),
+            ]
+        }
+        profiles.sort {
+            $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending
+        }
+        guard !profiles.isEmpty else {
+            handle(nil)
+            return
+        }
+
+        let picker = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 340, height: 26))
+        picker.addItem(withTitle: "Project/default")
+        picker.item(at: 0)?.toolTip = "Use this project's effective \(provider.environmentKey)"
+        for profile in profiles {
+            picker.addItem(withTitle: profile.label)
+            picker.item(at: picker.numberOfItems - 1)?.toolTip = profile.expandedDirectory
+        }
+        picker.setAccessibilityLabel("Account")
+
+        let alert = NSAlert()
+        alert.messageText = "Choose \(agent.name) account"
+        alert.informativeText = "This account stays locked to the restored session and its continuations. Credentials remain in the provider's own config directory."
+        alert.alertStyle = .informational
+        alert.accessoryView = picker
+        alert.addButton(withTitle: "Switch")
+        alert.addButton(withTitle: "Cancel")
+
+        let finish: @MainActor (NSApplication.ModalResponse) -> Void = { response in
+            guard response == .alertFirstButtonReturn else { return }
+            let selected = picker.indexOfSelectedItem
+            handle(selected > 0 ? profiles[selected - 1] : nil)
+        }
+        if let window = NSApp.keyWindow
+            ?? NSApp.mainWindow
+            ?? NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) }) {
+            alert.beginSheetModal(for: window) { response in
+                Task { @MainActor in finish(response) }
+            }
+        } else {
+            finish(alert.runModal())
+        }
+    }
+
     /// New Mesh belongs to the active project. The project-scoped plus menu is
     /// the place to create one; a global folder picker would make its ACP/MCP
     /// account and configuration context ambiguous.
@@ -2227,6 +2333,26 @@ struct RootShellView: View {
         .accessibilityLabel("Account and model: \(currentLabel), \(chat.modelOverride ?? "default model")")
     }
 
+    private func signInToRestoredChatAccount(_ chat: AcpChatHandle) {
+        guard let profile = model.accountSignInProfile(for: chat.id) else {
+            settingsSectionID = "accounts"
+            showSettings = true
+            ToastCenter.shared.show(
+                "Open Accounts to add or repair this provider account.",
+                style: .info
+            )
+            return
+        }
+        signingInChatAccount = profile
+    }
+
+    private func chooseRestoredChatAccount(_ chat: AcpChatHandle) {
+        guard let agent = AgentRegistry.profile(id: chat.agentID) else { return }
+        Self.chooseSessionAccount(for: agent) { profile in
+            Task { await model.switchChatAccount(chat.id, to: profile) }
+        }
+    }
+
     @ViewBuilder
     private func accountMenuRow(
         title: String,
@@ -2275,9 +2401,15 @@ struct RootShellView: View {
         } else if let chat = model.chats.first(where: { $0.id == id }) {
             AcpChatView(
                 conversation: chat.conversation,
+                accountAccess: chat.accountAccess,
                 presentation: .embedded,
                 focusRequestGeneration: keyboardFocusGeneration(for: id),
-                onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) }
+                onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) },
+                onSignIn: { signInToRestoredChatAccount(chat) },
+                onChooseAccount: { chooseRestoredChatAccount(chat) },
+                onPreserveTranscript: {
+                    Task { await model.preserveBlockedChat(chat.id) }
+                }
             )
                 .id(chat.id)
         } else if let mesh = model.meshes.first(where: { $0.id == id }) {

@@ -368,6 +368,103 @@ final class CompanionHostFoundationTests: XCTestCase {
         XCTAssertNil(CompanionQRCode.image(for: ""))
     }
 
+    func testCompanionSettingsFailuresRemainIsolatedUntilTheirOwnAction() {
+        var failures = CompanionSettingsFailureStore()
+        let offer = CompanionSettingsFailure(
+            message: "Could not create a code.",
+            retryTitle: "Try Again",
+            retry: .createOffer
+        )
+        let confirmation = CompanionSettingsFailure(
+            message: "The phrases could not be confirmed.",
+            retryTitle: "Create New Code",
+            retry: .createReplacementOffer
+        )
+        let phoneA = CompanionSettingsFailure(
+            message: "Phone A still has access.",
+            retryTitle: "Retry Revoke",
+            retry: .revoke(deviceID: "phone-a")
+        )
+        let phoneB = CompanionSettingsFailure(
+            message: "Phone B access did not change.",
+            retryTitle: "Retry Access Change",
+            retry: .updateCapabilities(
+                deviceID: "phone-b",
+                capabilities: [.observe, .agentControl]
+            )
+        )
+
+        failures.record(offer, for: .offer)
+        failures.record(confirmation, for: .confirmation)
+        failures.record(phoneA, for: .device("phone-a"))
+        failures.record(phoneB, for: .device("phone-b"))
+
+        failures.clear(.confirmation)
+        XCTAssertEqual(failures.failure(for: .offer), offer)
+        XCTAssertNil(failures.failure(for: .confirmation))
+        XCTAssertEqual(failures.failure(for: .device("phone-a")), phoneA)
+        XCTAssertEqual(failures.failure(for: .device("phone-b")), phoneB)
+
+        failures.clear(.device("phone-a"))
+        XCTAssertNil(failures.failure(for: .device("phone-a")))
+        XCTAssertEqual(failures.failure(for: .device("phone-b")), phoneB)
+
+        failures.record(phoneA, for: .device("phone-a"))
+        failures.retainDeviceFailures(for: ["phone-b"])
+        XCTAssertNil(failures.failure(for: .device("phone-a")))
+        XCTAssertEqual(failures.failure(for: .device("phone-b")), phoneB)
+    }
+
+    func testCompanionSettingsFailureMessagesAreBounded() {
+        let failure = CompanionSettingsFailure(
+            message: String(repeating: "x", count: 5_000),
+            retryTitle: "Try Again",
+            retry: .createOffer
+        )
+        XCTAssertEqual(
+            failure.message.count,
+            CompanionSettingsFailure.maximumMessageCharacters
+        )
+    }
+
+    func testCompanionSettingsFailureTargetsExposeStableLocalAnchors() {
+        XCTAssertEqual(
+            CompanionSettingsFailureTarget.offer.accessibilityIdentifier,
+            "companion.error.offer"
+        )
+        XCTAssertEqual(
+            CompanionSettingsFailureTarget.confirmation.accessibilityIdentifier,
+            "companion.error.confirmation"
+        )
+        XCTAssertEqual(
+            CompanionSettingsFailureTarget.device("phone-a").accessibilityIdentifier,
+            "companion.error.device"
+        )
+        XCTAssertNotEqual(
+            CompanionSettingsFailureTarget.device("phone-a").anchorID,
+            CompanionSettingsFailureTarget.device("phone-b").anchorID
+        )
+    }
+
+    func testCompanionSettingsRendersAndFocusesEveryFailureAtItsAction() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Kaisola/Features/Settings/CompanionSettingsTab.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertFalse(source.contains("@State private var operationError"))
+        XCTAssertTrue(source.contains("ScrollViewReader { proxy in"))
+        XCTAssertTrue(source.contains("@FocusState private var focusedFailure"))
+        XCTAssertTrue(source.contains("proxy.scrollTo(target.anchorID, anchor: .center)"))
+        XCTAssertTrue(source.contains("inlineFailure(for: .offer)"))
+        XCTAssertTrue(source.contains("inlineFailure(for: .confirmation)"))
+        XCTAssertTrue(source.contains("inlineFailure(for: .device(device.id))"))
+        XCTAssertTrue(source.contains("Button(failure.retryTitle)"))
+    }
+
     @MainActor
     func testPairNewDeviceIgnoresRepeatActivationWhileAnOfferIsInFlight() throws {
         let activation = CompanionPairingOfferActivation()
@@ -523,13 +620,15 @@ final class CompanionHostFoundationTests: XCTestCase {
             "let attempt = confirmationActivation.begin(pairingID: phrase.pairingID)"
         ))
         XCTAssertTrue(source.contains(
-            "operationError = CompanionPairingConfirmationActivation.failureMessage(error)"
+            "message: CompanionPairingConfirmationActivation.failureMessage(error)"
         ))
         XCTAssertTrue(source.contains(
             "guard confirmationActivation.fail(attempt) else { return }\n"
                 + "                host.cancelPairing()\n"
-                + "                operationError = CompanionPairingConfirmationActivation.failureMessage(error)"
+                + "                recordFailure("
         ))
+        XCTAssertTrue(source.contains("retry: .createReplacementOffer"))
+        XCTAssertTrue(source.contains("at: .confirmation"))
     }
 
     @MainActor

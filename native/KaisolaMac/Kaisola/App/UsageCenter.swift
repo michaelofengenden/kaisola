@@ -804,6 +804,9 @@ final class UsageCenter: ObservableObject {
     /// Disk backing for `planUsageCache`, so cards render on launch instead of
     /// after a multi-second probe. Hydrated lazily on first access.
     private let planUsageSnapshots = PlanUsageSnapshotStore()
+    private lazy var planUsageSnapshotSaveQueue = PlanUsageSnapshotSaveQueue { [planUsageSnapshots] snapshot in
+        planUsageSnapshots.save(snapshot)
+    }
     private var hasHydratedPlanUsageSnapshots = false
     private let now: () -> Date
     private let persistenceStore: AcpTranscriptStore?
@@ -1191,8 +1194,7 @@ final class UsageCenter: ObservableObject {
         let snapshot = planUsageCache.mapValues {
             PlanUsageSnapshotStore.Entry(providers: $0.providers, fetchedAt: $0.fetchedAt)
         }
-        let store = planUsageSnapshots
-        Task.detached(priority: .utility) { store.save(snapshot) }
+        planUsageSnapshotSaveQueue.enqueue(snapshot)
     }
 
     /// Seed the in-memory cache from disk once per process.

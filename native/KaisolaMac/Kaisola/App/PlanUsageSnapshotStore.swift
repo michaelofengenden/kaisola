@@ -83,3 +83,35 @@ struct PlanUsageSnapshotStore: Sendable {
         }
     }
 }
+
+/// Orders fire-and-forget cache saves without moving disk I/O back onto the
+/// caller's actor. Each task depends on the exact prior tail, so a slow older
+/// save cannot finish after and overwrite a newer snapshot.
+final class PlanUsageSnapshotSaveQueue: @unchecked Sendable {
+    typealias Snapshot = [String: PlanUsageSnapshotStore.Entry]
+    typealias Saver = @Sendable (Snapshot) async -> Void
+
+    private let lock = NSLock()
+    private let saver: Saver
+    private var tail: Task<Void, Never>?
+
+    init(saver: @escaping Saver) {
+        self.saver = saver
+    }
+
+    func enqueue(_ snapshot: Snapshot) {
+        lock.withLock {
+            let previous = tail
+            let save = saver
+            tail = Task.detached(priority: .utility) {
+                await previous?.value
+                await save(snapshot)
+            }
+        }
+    }
+
+    func flush() async {
+        let pending = lock.withLock { tail }
+        await pending?.value
+    }
+}

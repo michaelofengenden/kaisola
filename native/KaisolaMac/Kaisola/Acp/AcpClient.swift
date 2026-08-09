@@ -26,6 +26,128 @@ enum AcpEvent: Sendable {
     case exited(code: Int32)
 }
 
+/// Hard limits for one adapter-originated plan update. Plans live in the
+/// transcript and render on the main path, so their retained budget is much
+/// smaller than the transport's framing ceiling.
+struct AcpPlanPayloadLimits: Equatable, Sendable {
+    let maximumEntries: Int
+    let maximumEntryBytes: Int
+    let maximumAggregateBytes: Int
+
+    static let production = AcpPlanPayloadLimits(
+        maximumEntries: 64,
+        maximumEntryBytes: 8 * 1_024,
+        maximumAggregateBytes: 128 * 1_024
+    )
+}
+
+enum AcpPlanParser {
+    private static let contentTruncationSuffix = "\n[truncated]"
+    private static let entriesTruncationNotice = "Plan entries truncated."
+
+    /// Converts an untrusted plan array into one bounded transcript item. A
+    /// content suffix identifies an individually shortened entry; a single
+    /// reserved sentinel identifies omitted entries. The sentinel's stable,
+    /// non-numeric id cannot collide with the wire-index ids, and callers still
+    /// emit exactly one `.plan`, so truncation never creates a second plan row.
+    static func parseEntries(
+        _ value: JSONValue?,
+        limits: AcpPlanPayloadLimits = .production
+    ) -> [AcpPlanEntry] {
+        let suffixBytes = contentTruncationSuffix.utf8.count
+        let noticeBytes = entriesTruncationNotice.utf8.count
+        guard limits.maximumEntries > 0,
+              limits.maximumEntryBytes >= max(suffixBytes, noticeBytes),
+              limits.maximumAggregateBytes >= noticeBytes else { return [] }
+
+        let source = value?.arrayValue ?? []
+        let countOverflow = source.count > limits.maximumEntries
+        let maximumRealEntries = countOverflow
+            ? limits.maximumEntries - 1
+            : limits.maximumEntries
+        // Always reserve the fixed notice bytes. That makes the failure path
+        // bounded without first scanning every attacker-controlled string.
+        let realContentBudget = limits.maximumAggregateBytes - noticeBytes
+        var retainedBytes = 0
+        var omittedEntries = countOverflow
+        var entries: [AcpPlanEntry] = []
+        entries.reserveCapacity(min(source.count, limits.maximumEntries))
+
+        for (index, value) in source.prefix(maximumRealEntries).enumerated() {
+            guard let entry = value.objectValue,
+                  let content = entry["content"]?.stringValue else { continue }
+            let remainingBytes = realContentBudget - retainedBytes
+            guard remainingBytes >= suffixBytes else {
+                omittedEntries = true
+                break
+            }
+            let entryBudget = min(limits.maximumEntryBytes, remainingBytes)
+            let bounded = boundedContent(content, maximumBytes: entryBudget)
+            entries.append(AcpPlanEntry(
+                id: "\(index)",
+                content: bounded.text,
+                priority: entry["priority"]?.stringValue ?? "medium",
+                status: entry["status"]?.stringValue ?? "pending"
+            ))
+            retainedBytes += bounded.text.utf8.count
+
+            // A per-entry truncation can continue to the next entry. If the
+            // aggregate remainder was the tighter bound, later entries must be
+            // represented by the one reserved sentinel instead.
+            if bounded.truncated,
+               entryBudget < limits.maximumEntryBytes,
+               index + 1 < source.count {
+                omittedEntries = true
+                break
+            }
+        }
+
+        if omittedEntries {
+            entries.append(AcpPlanEntry(
+                id: "truncation",
+                content: entriesTruncationNotice,
+                priority: "medium",
+                status: "truncated"
+            ))
+        }
+        return entries
+    }
+
+    /// Copies only the UTF-8 prefix that can be retained. Iteration stops at
+    /// the first scalar beyond the limit, so a multi-megabyte string does not
+    /// turn validation itself into an unbounded pre-scan and no scalar is split.
+    private static func boundedContent(
+        _ content: String,
+        maximumBytes: Int
+    ) -> (text: String, truncated: Bool) {
+        var scalars: [Unicode.Scalar] = []
+        scalars.reserveCapacity(min(maximumBytes, 1_024))
+        var retainedBytes = 0
+        var truncated = false
+        for scalar in content.unicodeScalars {
+            let scalarBytes = String(scalar).utf8.count
+            guard scalarBytes <= maximumBytes - retainedBytes else {
+                truncated = true
+                break
+            }
+            scalars.append(scalar)
+            retainedBytes += scalarBytes
+        }
+        guard truncated else {
+            return (String(String.UnicodeScalarView(scalars)), false)
+        }
+
+        let prefixBudget = maximumBytes - contentTruncationSuffix.utf8.count
+        while retainedBytes > prefixBudget, let removed = scalars.popLast() {
+            retainedBytes -= String(removed).utf8.count
+        }
+        return (
+            String(String.UnicodeScalarView(scalars)) + contentTruncationSuffix,
+            true
+        )
+    }
+}
+
 /// A file or image the user attached to a prompt, carried into the ACP prompt
 /// as a real content block (never merely a path). `image` becomes an ACP
 /// `image` block (base64 pixels + mime); `textFile` becomes an embedded
@@ -1641,15 +1763,7 @@ actor AcpClient {
                 ))
             }
         case "plan":
-            let entries = (object["entries"]?.arrayValue ?? []).enumerated().compactMap { index, value -> AcpPlanEntry? in
-                guard let e = value.objectValue, let content = e["content"]?.stringValue else { return nil }
-                return AcpPlanEntry(
-                    id: "\(index)",
-                    content: content,
-                    priority: e["priority"]?.stringValue ?? "medium",
-                    status: e["status"]?.stringValue ?? "pending"
-                )
-            }
+            let entries = AcpPlanParser.parseEntries(object["entries"])
             eventHandler?(.turnItem(.plan(entries: entries)))
         case "usage_update":
             // ACP 1.x standardized these fields as `used` + `size`. Older

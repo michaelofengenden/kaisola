@@ -2559,6 +2559,119 @@ final class AcpClientTests: XCTestCase {
         await client.stop()
     }
 
+    func testPlanParserUsesExactUTF8PerEntryAndAggregateBoundaries() {
+        let limits = AcpPlanPayloadLimits(
+            maximumEntries: 4,
+            maximumEntryBytes: 24,
+            maximumAggregateBytes: 96
+        )
+        let exact = String(repeating: "é", count: 12)
+        XCTAssertEqual(exact.utf8.count, 24)
+        let entries = AcpPlanParser.parseEntries(.array([
+            .object(["content": .string(exact), "status": .string("pending")]),
+            .object(["content": .string(exact + "é"), "status": .string("pending")]),
+        ]), limits: limits)
+
+        XCTAssertEqual(entries.count, 2)
+        guard entries.count == 2 else { return }
+        XCTAssertEqual(entries[0].content, exact)
+        XCTAssertEqual(entries[0].content.utf8.count, limits.maximumEntryBytes)
+        XCTAssertTrue(entries[1].content.hasSuffix("\n[truncated]"))
+        XCTAssertLessThanOrEqual(entries[1].content.utf8.count, limits.maximumEntryBytes)
+        XCTAssertLessThanOrEqual(
+            entries.reduce(0) { $0 + $1.content.utf8.count },
+            limits.maximumAggregateBytes
+        )
+
+        let aggregateLimits = AcpPlanPayloadLimits(
+            maximumEntries: 4,
+            maximumEntryBytes: 40,
+            maximumAggregateBytes: 64
+        )
+        let aggregateBounded = AcpPlanParser.parseEntries(.array([
+            .object(["content": .string(String(repeating: "a", count: 20))]),
+            .object(["content": .string(String(repeating: "b", count: 30))]),
+            .object(["content": .string("must be omitted")]),
+        ]), limits: aggregateLimits)
+        XCTAssertEqual(aggregateBounded.map(\.id), ["0", "1", "truncation"])
+        XCTAssertTrue(aggregateBounded[1].content.hasSuffix("\n[truncated]"))
+        XCTAssertEqual(
+            aggregateBounded.reduce(0) { $0 + $1.content.utf8.count },
+            aggregateLimits.maximumAggregateBytes
+        )
+    }
+
+    func testPlanWireBoundaryCapsEntriesAndBytesWithOneExplicitSentinel() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        defer { Task { await client.stop() } }
+
+        let oversizedContent = String(repeating: "é", count: 5_000)
+        await transport.emitSessionUpdate(.object([
+            "sessionUpdate": .string("plan"),
+            "entries": .array((0 ..< 100).map { index in
+                .object([
+                    "content": .string("\(index):" + oversizedContent),
+                    "priority": .string("high"),
+                    "status": .string("pending"),
+                ])
+            }),
+        ]))
+        // FIFO request/response barrier: the update is fully dispatched before
+        // assertions without a scheduler sleep or timing-dependent poll.
+        await client.setConfigOption(id: "reasoning_effort", value: "high")
+
+        let plans = collector.events.compactMap { event -> [AcpPlanEntry]? in
+            if case let .turnItem(.plan(entries)) = event { return entries }
+            return nil
+        }
+        let plan = try XCTUnwrap(plans.last)
+        XCTAssertEqual(plans.count, 1, "truncation must not emit a second plan identity")
+        XCTAssertLessThanOrEqual(plan.count, AcpPlanPayloadLimits.production.maximumEntries)
+        XCTAssertEqual(Set(plan.map(\.id)).count, plan.count)
+        XCTAssertTrue(plan.dropLast().allSatisfy {
+            $0.content.utf8.count <= AcpPlanPayloadLimits.production.maximumEntryBytes
+                && $0.content.hasSuffix("\n[truncated]")
+        })
+        XCTAssertEqual(plan.last?.id, "truncation")
+        XCTAssertEqual(plan.last?.status, "truncated")
+        XCTAssertEqual(plan.last?.content, "Plan entries truncated.")
+        XCTAssertLessThanOrEqual(
+            plan.reduce(0) { $0 + $1.content.utf8.count },
+            AcpPlanPayloadLimits.production.maximumAggregateBytes
+        )
+    }
+
+    @MainActor
+    func testRepeatedTruncatedPlanUpdatesReplaceOneConversationPlanIdentity() {
+        let conversation = AcpConversation(
+            title: "Plan", command: "mock", arguments: [], environment: [:], cwd: "/tmp"
+        )
+        let first = AcpPlanParser.parseEntries(.array((0 ..< 80).map {
+            .object(["content": .string("step \($0)")])
+        }))
+        let second = AcpPlanParser.parseEntries(.array((0 ..< 90).map {
+            .object(["content": .string("updated \($0)")])
+        }))
+
+        conversation.receiveTurnItemForTesting(.plan(entries: first))
+        conversation.receiveTurnItemForTesting(.plan(entries: second))
+
+        let plans = conversation.rows.compactMap { row -> (String, [AcpPlanEntry])? in
+            if case let .plan(id, entries) = row { return (id, entries) }
+            return nil
+        }
+        XCTAssertEqual(plans.count, 1)
+        XCTAssertEqual(plans.first?.0, "0")
+        XCTAssertEqual(plans.first?.1.last?.id, "truncation")
+        XCTAssertEqual(plans.first?.1.filter { $0.id == "truncation" }.count, 1)
+    }
+
     func testHandshakeAndStreamedTurn() async throws {
         let transport = ScriptedAcpTransport()
         let client = AcpClient(transport: transport)

@@ -904,6 +904,73 @@ struct AcpOutboundFrameEncoder: Sendable {
     }
 }
 
+/// The Kaisola-owned read boundary for ACP `fs/read_text_file` requests. The
+/// path is opened once, and every later size, type, and payload decision is
+/// made against that descriptor. Reading one byte beyond the retained budget
+/// detects files that grow after the initial metadata check without ever
+/// allocating or decoding the unbounded payload.
+enum AcpWorkspaceFileReader {
+    typealias AfterOpen = () throws -> Void
+
+    static func readTextFile(
+        at path: String,
+        maximumBytes: Int,
+        afterOpen: AfterOpen? = nil
+    ) throws -> String {
+        guard maximumBytes >= 0, maximumBytes < Int.max else {
+            throw AcpClientError.requestFailed("Text file has an invalid ACP byte limit")
+        }
+
+        let descriptor = path.withCString {
+            Darwin.open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard descriptor >= 0 else { throw posixError() }
+        defer { _ = Darwin.close(descriptor) }
+
+        var metadata = stat()
+        guard Darwin.fstat(descriptor, &metadata) == 0 else { throw posixError() }
+        guard (metadata.st_mode & mode_t(S_IFMT)) == mode_t(S_IFREG) else {
+            throw AcpClientError.requestFailed("Text file is not a regular file")
+        }
+        guard metadata.st_size <= off_t(maximumBytes) else {
+            throw tooLarge(maximumBytes)
+        }
+
+        try afterOpen?()
+
+        var payload = Data()
+        payload.reserveCapacity(min(maximumBytes, 64 * 1_024))
+        while true {
+            let remaining = maximumBytes - payload.count
+            let requestCount = min(64 * 1_024, remaining + 1)
+            var buffer = [UInt8](repeating: 0, count: requestCount)
+            let bytesRead = buffer.withUnsafeMutableBytes { bytes in
+                Darwin.read(descriptor, bytes.baseAddress, requestCount)
+            }
+            if bytesRead == 0 { break }
+            if bytesRead < 0 {
+                if errno == EINTR { continue }
+                throw posixError()
+            }
+            guard bytesRead <= remaining else { throw tooLarge(maximumBytes) }
+            payload.append(contentsOf: buffer.prefix(bytesRead))
+        }
+
+        guard let content = String(data: payload, encoding: .utf8) else {
+            throw AcpClientError.requestFailed("Text file is not valid UTF-8")
+        }
+        return content
+    }
+
+    private static func tooLarge(_ maximumBytes: Int) -> AcpClientError {
+        .requestFailed("Text file exceeds the \(maximumBytes)-byte ACP limit")
+    }
+
+    private static func posixError() -> POSIXError {
+        POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+    }
+}
+
 /// A serial filesystem executor for adapter callbacks. Foundation's file APIs
 /// are synchronous; keeping them on this private utility queue prevents a slow
 /// volume from occupying `AcpClient`'s actor while it must continue decoding
@@ -950,14 +1017,11 @@ final class AcpFilesystemWorker: @unchecked Sendable {
                             "Blocked: sensitive file (Kaisola guardrails)"
                         )
                     }
-                    let attributes = try FileManager.default.attributesOfItem(atPath: confined)
-                    if let size = attributes[.size] as? Int, size > AcpClient.maxTextFileBytes {
-                        throw AcpClientError.requestFailed(
-                            "Text file exceeds the \(AcpClient.maxTextFileBytes)-byte ACP limit"
-                        )
-                    }
                     continuation.resume(
-                        returning: try String(contentsOfFile: confined, encoding: .utf8)
+                        returning: try AcpWorkspaceFileReader.readTextFile(
+                            at: confined,
+                            maximumBytes: AcpClient.maxTextFileBytes
+                        )
                     )
                 } catch {
                     continuation.resume(throwing: error)

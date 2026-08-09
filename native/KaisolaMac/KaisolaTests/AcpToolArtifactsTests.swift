@@ -354,7 +354,89 @@ final class AcpToolArtifactsTests: XCTestCase {
         XCTAssertTrue(real.hasSuffix("/sub/new.txt"))
     }
 
-    // MARK: - Agent-owned fs/write_text_file mutation boundary
+    // MARK: - Agent-owned filesystem descriptor boundaries
+
+    func testAgentReadRejectsGrowthAfterDescriptorReview() throws {
+        let fixture = try agentWriteFixture()
+        let target = fixture.workspace.appendingPathComponent("growing.txt")
+        try Data("small".utf8).write(to: target)
+
+        XCTAssertThrowsError(
+            try AcpWorkspaceFileReader.readTextFile(
+                at: target.path,
+                maximumBytes: 8,
+                afterOpen: {
+                    let handle = try FileHandle(forWritingTo: target)
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: Data("-overflow".utf8))
+                    try handle.close()
+                }
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? AcpClientError,
+                .requestFailed("Text file exceeds the 8-byte ACP limit")
+            )
+        }
+    }
+
+    func testAgentReadReturnsTruncatedDescriptorSnapshot() throws {
+        let fixture = try agentWriteFixture()
+        let target = fixture.workspace.appendingPathComponent("truncated.txt")
+        try Data("truncate me".utf8).write(to: target)
+
+        let content = try AcpWorkspaceFileReader.readTextFile(
+            at: target.path,
+            maximumBytes: 32,
+            afterOpen: {
+                guard Darwin.truncate(target.path, 4) == 0 else { throw self.posixError() }
+            }
+        )
+
+        XCTAssertEqual(content, "trun")
+    }
+
+    func testAgentReadKeepsOpenedFileWhenPathIsReplaced() throws {
+        let fixture = try agentWriteFixture()
+        let target = fixture.workspace.appendingPathComponent("reviewed.txt")
+        let parked = fixture.workspace.appendingPathComponent("reviewed-open.txt")
+        let replacement = fixture.workspace.appendingPathComponent("replacement.txt")
+        try Data("opened snapshot".utf8).write(to: target)
+        try Data("replacement path".utf8).write(to: replacement)
+
+        let content = try AcpWorkspaceFileReader.readTextFile(
+            at: target.path,
+            maximumBytes: 32,
+            afterOpen: {
+                try FileManager.default.moveItem(at: target, to: parked)
+                try FileManager.default.moveItem(at: replacement, to: target)
+            }
+        )
+
+        XCTAssertEqual(content, "opened snapshot")
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "replacement path")
+    }
+
+    func testAgentReadCountsMultibyteUTF8BytesAtExactBoundary() throws {
+        let fixture = try agentWriteFixture()
+        let exact = fixture.workspace.appendingPathComponent("exact-utf8.txt")
+        let oversized = fixture.workspace.appendingPathComponent("oversized-utf8.txt")
+        try Data("😀😀".utf8).write(to: exact)
+        try Data("😀😀x".utf8).write(to: oversized)
+
+        XCTAssertEqual(
+            try AcpWorkspaceFileReader.readTextFile(at: exact.path, maximumBytes: 8),
+            "😀😀"
+        )
+        XCTAssertThrowsError(
+            try AcpWorkspaceFileReader.readTextFile(at: oversized.path, maximumBytes: 8)
+        ) { error in
+            XCTAssertEqual(
+                error as? AcpClientError,
+                .requestFailed("Text file exceeds the 8-byte ACP limit")
+            )
+        }
+    }
 
     func testAgentWriteUpdatesRegularFilesAndCreatesSafeParents() throws {
         let fixture = try agentWriteFixture()

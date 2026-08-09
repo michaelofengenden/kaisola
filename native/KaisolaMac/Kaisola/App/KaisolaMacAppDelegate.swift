@@ -868,6 +868,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private let visualWorkspace = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_WORKSPACE"]
     private let visualDocument = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_DOCUMENT"]
     private let visualCapturePath = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_CAPTURE_PATH"]
+    private let visualLargeText = ProcessInfo.processInfo.environment[
+        "KAISOLA_NATIVE_VISUAL_LARGE_TEXT"
+    ] == "1"
     /// Pixels per point the capture is written at. Unset (0) keeps whatever the
     /// host renders; `1` is the non-Retina inspection.
     private let visualCaptureScale: CGFloat = ProcessInfo.processInfo.environment[
@@ -1469,7 +1472,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 workspace: workspace,
                 initialSectionID: initialSectionID,
                 initialContentAnchorID: initialContentAnchorID
-            ).environmentObject(auth))
+            )
+            .environment(\.dynamicTypeSize, visualLargeText ? .accessibility1 : .large)
+            .environmentObject(auth))
         } else {
             content = AnyView(
                 RootShellView()
@@ -2004,6 +2009,28 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                     "KAISOLA_NATIVE_VISUAL_WINDOW_CONTROLS=PASS "
                         + "surface=\(visualSurface) controls=\(report.controls) "
                         + "accessibilityElements=\(report.accessibilityElements)"
+                )
+            }
+
+            if visualSurface == "settings-account-recovery" {
+                let size: DynamicTypeSize = visualLargeText ? .accessibility1 : .large
+                let layout = AppAccountRecoveryLayout.resolve(
+                    hasRecoveryNotice: true,
+                    dynamicTypeSize: size
+                )
+                guard layout.stacksActionBelowIdentity,
+                      layout.headlineLineLimit == nil,
+                      layout.dynamicTypeSize == size else {
+                    print(
+                        "KAISOLA_NATIVE_ACCOUNT_RECOVERY_LAYOUT=FAIL "
+                            + "largeText=\(visualLargeText)"
+                    )
+                    requestVisualFixtureTermination()
+                    return
+                }
+                print(
+                    "KAISOLA_NATIVE_ACCOUNT_RECOVERY_LAYOUT=PASS "
+                        + "largeText=\(visualLargeText) verticalAction=true unclampedHeadline=true"
                 )
             }
 

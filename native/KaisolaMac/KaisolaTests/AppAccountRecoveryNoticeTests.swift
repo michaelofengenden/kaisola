@@ -113,6 +113,35 @@ final class AppAccountRecoveryNoticeTests: XCTestCase {
         XCTAssertEqual(notice.palette, KaisolaStatusTone.needsYou.palette)
     }
 
+    // MARK: - Recovery layout
+
+    func testRecoveryActionStacksAndHeadlineWrapsAtOrdinaryAndLargeTextSizes() {
+        for size in [DynamicTypeSize.large, .accessibility1] {
+            let layout = AppAccountRecoveryLayout.resolve(
+                hasRecoveryNotice: true,
+                dynamicTypeSize: size
+            )
+            XCTAssertTrue(
+                layout.stacksActionBelowIdentity,
+                "the sign-in action competes horizontally with recovery copy at \(size)"
+            )
+            XCTAssertNil(
+                layout.headlineLineLimit,
+                "the recovery headline truncates at \(size)"
+            )
+            XCTAssertEqual(layout.dynamicTypeSize, size)
+        }
+    }
+
+    func testOrdinaryAccountRowKeepsItsCompactHorizontalLayout() {
+        let layout = AppAccountRecoveryLayout.resolve(
+            hasRecoveryNotice: false,
+            dynamicTypeSize: .large
+        )
+        XCTAssertFalse(layout.stacksActionBelowIdentity)
+        XCTAssertEqual(layout.headlineLineLimit, 1)
+    }
+
     // MARK: - VoiceOver
 
     func testNoticeSpeaksAsOneCoherentSentence() {

@@ -6,39 +6,62 @@ import SwiftUI
 struct AppAccountSettingsView: View {
     @ObservedObject var auth: AuthModel
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
+    @Environment(\.dynamicTypeSize) private var dynamicTypeSize
 
     var body: some View {
-        HStack(spacing: 12) {
-            AccountAvatarView(account: auth.account, size: 36)
-
-            identityLines
-
-            Spacer(minLength: 12)
-
-            switch auth.phase {
-            case .restoring:
-                ProgressView().controlSize(.small)
-            case .signedOut:
-                googleSignInButton
-            case .signingIn:
-                Button("Cancel") { Task { await auth.signOut() } }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            case .signedIn:
-                Button("Sign Out") { Task { await auth.signOut() } }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-            case .failed:
-                Button("Try Again") {
-                    auth.clearError()
-                    Task { await auth.signInWithGoogle() }
+        Group {
+            if recoveryLayout.stacksActionBelowIdentity {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(alignment: .top, spacing: 12) {
+                        AccountAvatarView(account: auth.account, size: 36)
+                        identityLines
+                    }
+                    accountAction
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                 }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.small)
+            } else {
+                HStack(spacing: 12) {
+                    AccountAvatarView(account: auth.account, size: 36)
+                    identityLines
+                    Spacer(minLength: 12)
+                    accountAction
+                }
             }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 13)
+    }
+
+    private var recoveryLayout: AppAccountRecoveryLayout {
+        AppAccountRecoveryLayout.resolve(
+            hasRecoveryNotice: recoveryNotice != nil,
+            dynamicTypeSize: dynamicTypeSize
+        )
+    }
+
+    @ViewBuilder
+    private var accountAction: some View {
+        switch auth.phase {
+        case .restoring:
+            ProgressView().controlSize(.small)
+        case .signedOut:
+            googleSignInButton
+        case .signingIn:
+            Button("Cancel") { Task { await auth.signOut() } }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        case .signedIn:
+            Button("Sign Out") { Task { await auth.signOut() } }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        case .failed:
+            Button("Try Again") {
+                auth.clearError()
+                Task { await auth.signInWithGoogle() }
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.small)
+        }
     }
 
     /// The headline plus either the ordinary caption or the recovery strip.
@@ -50,7 +73,7 @@ struct AppAccountSettingsView: View {
             VStack(alignment: .leading, spacing: 4) {
                 Text(notice.title)
                     .font(.callout.weight(.semibold))
-                    .lineLimit(1)
+                    .lineLimit(recoveryLayout.headlineLineLimit)
                 recoveryStrip(notice)
             }
             .accessibilityElement(children: .ignore)
@@ -113,6 +136,7 @@ struct AppAccountSettingsView: View {
         }
         .buttonStyle(.borderedProminent)
         .controlSize(.small)
+        .accessibilityIdentifier("settings.account.sign-in-google")
     }
 
     private var title: String {
@@ -146,6 +170,30 @@ struct AppAccountSettingsView: View {
     private var detailColor: Color {
         if case .failed = auth.phase { return .red }
         return .secondary
+    }
+}
+
+/// The migration-recovery row has substantially more copy than an ordinary
+/// account identity. Keeping its action beside that copy lets the warning take
+/// all available width and collapses "Sign In with Google" to an icon and an
+/// ellipsis. Its action therefore sits on a second row at every text size, and
+/// the headline is never clamped. The dynamic type value is retained in the
+/// contract so both the ordinary and accessibility-size fixture assert the
+/// exact layout they render.
+struct AppAccountRecoveryLayout: Equatable {
+    let stacksActionBelowIdentity: Bool
+    let headlineLineLimit: Int?
+    let dynamicTypeSize: DynamicTypeSize
+
+    static func resolve(
+        hasRecoveryNotice: Bool,
+        dynamicTypeSize: DynamicTypeSize
+    ) -> AppAccountRecoveryLayout {
+        AppAccountRecoveryLayout(
+            stacksActionBelowIdentity: hasRecoveryNotice,
+            headlineLineLimit: hasRecoveryNotice ? nil : 1,
+            dynamicTypeSize: dynamicTypeSize
+        )
     }
 }
 

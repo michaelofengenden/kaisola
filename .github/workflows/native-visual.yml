@@ -407,6 +407,9 @@ jobs:
             if [[ "$surface" == settings-extensions || "$surface" == settings-extensions-narrow ]]; then
               verify_extensions_receipt "$surface" "$log"
             fi
+            if [[ "$surface" == settings-account-recovery ]]; then
+              grep -Fq 'KAISOLA_NATIVE_ACCOUNT_RECOVERY_LAYOUT=PASS largeText=false verticalAction=true unclampedHeadline=true' "$log"
+            fi
           done
 
           # settings-account-recovery is included because its migration notice
@@ -420,7 +423,20 @@ jobs:
             if [[ "$surface" == settings-extensions ]]; then
               verify_extensions_receipt "$surface" "$log"
             fi
+            if [[ "$surface" == settings-account-recovery ]]; then
+              grep -Fq 'KAISOLA_NATIVE_ACCOUNT_RECOVERY_LAYOUT=PASS largeText=false verticalAction=true unclampedHeadline=true' "$log"
+            fi
           done
+
+          # Exercise the real recovery row with accessibility-sized text. The
+          # in-app receipt asserts the vertical action layout and unclamped
+          # headline before the screenshot is accepted.
+          recovery_large_capture="$output/large-text-settings-account-recovery.png"
+          recovery_large_log="$output/large-text-settings-account-recovery.log"
+          run_fixture settings-account-recovery "$recovery_large_capture" "$recovery_large_log" \
+            /usr/bin/env KAISOLA_NATIVE_VISUAL_LARGE_TEXT=1 "$binary"
+          verify_capture "$recovery_large_capture" settings-account-recovery
+          grep -Fq 'KAISOLA_NATIVE_ACCOUNT_RECOVERY_LAYOUT=PASS largeText=true verticalAction=true unclampedHeadline=true' "$recovery_large_log"
 
           # The traffic-light clearance, the sidebar hairline and a 30pt mark
           # are all decided at one pixel per point. This runner already renders

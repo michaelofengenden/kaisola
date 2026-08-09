@@ -46,6 +46,7 @@ struct QuickActionStore: Sendable {
         if trimmed.count > capPerProject {
             trimmed.removeFirst(trimmed.count - capPerProject)
         }
+        trimmed = Self.normalizingIdentifiers(in: trimmed)
         if trimmed.isEmpty {
             payload.actionsByProject.removeValue(forKey: projectID)
         } else {
@@ -56,7 +57,44 @@ struct QuickActionStore: Sendable {
 
     private func read() -> Payload? {
         guard let data = try? Data(contentsOf: fileURL) else { return nil }
-        return try? JSONDecoder().decode(Payload.self, from: data)
+        guard var payload = try? JSONDecoder().decode(Payload.self, from: data) else { return nil }
+        payload.actionsByProject = payload.actionsByProject.mapValues {
+            Self.normalizingIdentifiers(in: $0)
+        }
+        return payload
+    }
+
+    /// Canonicalizes row identity at the persistence boundary. The first
+    /// occurrence of each nonempty identifier keeps that identifier; later
+    /// duplicates and whitespace-only values receive deterministic fallback
+    /// identifiers. Reserving every imported identifier before allocating a
+    /// fallback means repair never steals a valid identifier from a later row.
+    private static func normalizingIdentifiers(in actions: [QuickAction]) -> [QuickAction] {
+        let canonicalIDs = actions.map {
+            $0.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let reservedIDs = Set(canonicalIDs.filter { !$0.isEmpty })
+        var claimedIDs = Set<String>()
+        var nextFallbackOrdinal = 1
+
+        return actions.indices.map { index in
+            var action = actions[index]
+            let canonicalID = canonicalIDs[index]
+            if !canonicalID.isEmpty, claimedIDs.insert(canonicalID).inserted {
+                action.id = canonicalID
+                return action
+            }
+
+            var fallbackID: String
+            repeat {
+                fallbackID = "quick-action-\(nextFallbackOrdinal)"
+                nextFallbackOrdinal += 1
+            } while reservedIDs.contains(fallbackID) || claimedIDs.contains(fallbackID)
+
+            claimedIDs.insert(fallbackID)
+            action.id = fallbackID
+            return action
+        }
     }
 
     private func write(_ payload: Payload) {

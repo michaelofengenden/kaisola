@@ -6,6 +6,10 @@ import XCTest
 /// round-trip across instances, the cap-8 oldest-first eviction, corrupt-file
 /// degradation, and cross-project isolation.
 final class QuickActionStoreTests: XCTestCase {
+    private struct FixturePayload: Codable {
+        var actionsByProject: [String: [QuickAction]]
+    }
+
     private var fileURL: URL!
     private var store: QuickActionStore!
 
@@ -66,6 +70,67 @@ final class QuickActionStoreTests: XCTestCase {
         XCTAssertEqual(store.actions(forProject: "p").count, 8)
     }
 
+    // MARK: - Stable identifiers
+
+    func testLoadNormalizesDuplicateAndWhitespaceOnlyIdentifiersDeterministically() throws {
+        let imported = [
+            QuickAction(id: " duplicate ", title: "Build", command: "make"),
+            QuickAction(id: "duplicate", title: "Test", command: "make test"),
+            QuickAction(id: " \n ", title: "Deploy", command: "make deploy"),
+            QuickAction(id: "quick-action-2", title: "Reserved", command: "make reserved"),
+        ]
+        try writeFixture(imported, forProject: "p")
+
+        let firstLoad = store.actions(forProject: "p")
+        let secondLoad = store.actions(forProject: "p")
+        let reopenedLoad = QuickActionStore(fileURL: fileURL).actions(forProject: "p")
+
+        XCTAssertEqual(
+            firstLoad.map(\.id),
+            ["duplicate", "quick-action-1", "quick-action-3", "quick-action-2"]
+        )
+        XCTAssertEqual(firstLoad.map(\.title), imported.map(\.title), "normalization must preserve every row and its order")
+        XCTAssertEqual(secondLoad, firstLoad, "repeated loads must not churn synthesized row identity")
+        XCTAssertEqual(reopenedLoad, firstLoad, "synthesized identity must be stable across store instances")
+    }
+
+    func testSavePersistsNormalizedIdentifiers() throws {
+        store.save(
+            [
+                QuickAction(id: "same", title: "First", command: "first"),
+                QuickAction(id: "same", title: "Second", command: "second"),
+                QuickAction(id: "", title: "Third", command: "third"),
+            ],
+            forProject: "p"
+        )
+
+        let persisted = try readFixture().actionsByProject["p"]
+        XCTAssertEqual(persisted?.map(\.id), ["same", "quick-action-1", "quick-action-2"])
+        XCTAssertEqual(Set(persisted?.map(\.id) ?? []).count, 3)
+    }
+
+    func testNormalizedIdentifierScopesEditingToExactlyOneRow() throws {
+        try writeFixture(
+            [
+                QuickAction(id: "same", title: "First", command: "first"),
+                QuickAction(id: "same", title: "Second", command: "second"),
+                QuickAction(id: "", title: "Third", command: "third"),
+            ],
+            forProject: "p"
+        )
+        var actions = store.actions(forProject: "p")
+        let editedID = try XCTUnwrap(actions.dropFirst().first?.id)
+        let matchingRows = actions.indices.filter { actions[$0].id == editedID }
+
+        XCTAssertEqual(matchingRows.count, 1)
+        actions[try XCTUnwrap(matchingRows.first)].title = "Edited second"
+        store.save(actions, forProject: "p")
+
+        let reopened = QuickActionStore(fileURL: fileURL).actions(forProject: "p")
+        XCTAssertEqual(reopened.map(\.id), actions.map(\.id), "editing and saving must retain normalized row identity")
+        XCTAssertEqual(reopened.map(\.title), ["First", "Edited second", "Third"])
+    }
+
     // MARK: - Corrupt file
 
     func testCorruptFileDegradesToEmpty() throws {
@@ -96,5 +161,18 @@ final class QuickActionStoreTests: XCTestCase {
         store.save([], forProject: "projA")
         XCTAssertTrue(store.actions(forProject: "projA").isEmpty)
         XCTAssertEqual(store.actions(forProject: "projB").map(\.id), ["2"])
+    }
+
+    private func writeFixture(_ actions: [QuickAction], forProject projectID: String) throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let payload = FixturePayload(actionsByProject: [projectID: actions])
+        try JSONEncoder().encode(payload).write(to: fileURL)
+    }
+
+    private func readFixture() throws -> FixturePayload {
+        try JSONDecoder().decode(FixturePayload.self, from: Data(contentsOf: fileURL))
     }
 }

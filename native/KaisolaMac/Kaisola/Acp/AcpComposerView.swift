@@ -238,12 +238,19 @@ struct AcpComposerCard: View {
             menuGeneration += 1
             menuPresented = true
         } label: {
-            AcpComposerPillLabel(primary: values.primary, secondary: values.secondary) {
+            AcpComposerPillLabel(
+                primary: values.primary,
+                secondary: values.secondary,
+                isPending: conversation.pendingConfigOptionID != nil
+            ) {
                 QuietIdentityMarkView(identity: identity, size: 13)
             }
         }
         .buttonStyle(AcpComposerChipButtonStyle(shape: AnyShape(Capsule()), restingOpacity: 0.32))
-        .help("Agent, model, and the settings this chat runs on")
+        .disabled(conversation.pendingConfigOptionID != nil)
+        .help(conversation.pendingConfigOptionID == nil
+            ? "Agent, model, and the settings this chat runs on"
+            : "Waiting for the agent to confirm this setting")
         .accessibilityLabel(pillAccessibilityLabel(values))
         .accessibilityIdentifier("acp.composer.settings")
         .popover(isPresented: $menuPresented, arrowEdge: .top) {
@@ -281,7 +288,8 @@ struct AcpComposerCard: View {
 
     private func pillAccessibilityLabel(_ values: (primary: String, secondary: String?)) -> String {
         let tail = values.secondary.map { ", \($0)" } ?? ""
-        return "Chat settings: \(values.primary)\(tail)"
+        let pending = conversation.pendingConfigOptionID == nil ? "" : ", change pending"
+        return "Chat settings: \(values.primary)\(tail)\(pending)"
     }
 
     private func submenu(_ target: AcpComposerMenuRow.Target) -> AcpComposerSubmenu {
@@ -467,11 +475,18 @@ struct AcpComposerChipLabel<Leading: View>: View {
 struct AcpComposerPillLabel<Leading: View>: View {
     let primary: String
     var secondary: String?
+    var isPending = false
     @ViewBuilder var leading: () -> Leading
 
-    init(primary: String, secondary: String? = nil, @ViewBuilder leading: @escaping () -> Leading) {
+    init(
+        primary: String,
+        secondary: String? = nil,
+        isPending: Bool = false,
+        @ViewBuilder leading: @escaping () -> Leading
+    ) {
         self.primary = primary
         self.secondary = secondary
+        self.isPending = isPending
         self.leading = leading
     }
 
@@ -488,9 +503,16 @@ struct AcpComposerPillLabel<Leading: View>: View {
                     .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(1)
             }
-            Image(systemName: "chevron.down")
-                .font(.system(size: 7, weight: .semibold))
-                .foregroundStyle(.kaisolaTertiary)
+            if isPending {
+                ProgressView()
+                    .controlSize(.mini)
+                    .frame(width: 9, height: 9)
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundStyle(.kaisolaTertiary)
+            }
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 5)

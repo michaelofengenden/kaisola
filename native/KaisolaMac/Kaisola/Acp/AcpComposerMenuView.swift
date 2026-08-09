@@ -225,6 +225,16 @@ struct AcpComposerMenuView: View {
                 .accessibilityAddTraits(.isHeader)
                 .accessibilityIdentifier("acp.composer.menu.submenu.title")
 
+            if let note = panel.note {
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, 9)
+                    .padding(.bottom, 4)
+                    .accessibilityIdentifier("acp.composer.menu.submenu.note")
+            }
+
             if panel.showsSearch {
                 searchField
             }

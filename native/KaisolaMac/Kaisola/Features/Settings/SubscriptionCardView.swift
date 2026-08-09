@@ -29,14 +29,30 @@ struct SubscriptionCardView: View {
             header
             authLine
             if let usage, !usage.windows.isEmpty {
-                ForEach(usage.windows) { window in
-                    SubscriptionUsageMeter(window: window, now: now)
+                ForEach(usage.windowRows) { row in
+                    SubscriptionUsageMeter(window: row.window, now: now)
                 }
             } else if let message = usage?.message, !message.isEmpty {
                 Label(message, systemImage: "exclamationmark.circle")
                     .font(.caption)
                     .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(2)
+            }
+            if let usage {
+                let provenance = Self.provenanceCaption(
+                    sourceLabel: usage.sourceLabel,
+                    updatedAt: usage.updatedAt,
+                    now: now
+                )
+                if !provenance.isEmpty {
+                    Text(provenance)
+                        .font(.caption2)
+                        .foregroundStyle(.kaisolaSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(provenance)
+                        .accessibilityLabel("Usage source: \(provenance)")
+                }
             }
         }
         .padding(10)
@@ -198,6 +214,36 @@ struct SubscriptionCardView: View {
         if elapsed < 86_400 { return "\(Int(elapsed / 3_600))h ago" }
         return "\(Int(elapsed / 86_400))d ago"
     }
+
+    /// The visible provenance line shared by named and provider-default cards.
+    /// A missing timestamp stays omitted instead of masquerading as a fresh read.
+    nonisolated static func provenanceCaption(
+        sourceLabel: String,
+        updatedAt: Double?,
+        now: Date
+    ) -> String {
+        let source = String(sourceLabel.trimmingCharacters(in: .whitespacesAndNewlines).prefix(160))
+        var parts = source.isEmpty ? [] : [source]
+        if let age = updateAgeCaption(updatedAt: updatedAt, now: now) {
+            parts.append("updated \(age)")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    nonisolated private static func updateAgeCaption(
+        updatedAt: Double?,
+        now: Date
+    ) -> String? {
+        guard let updatedAt, updatedAt.isFinite, updatedAt > 0 else { return nil }
+        let epochSeconds = updatedAt > 10_000_000_000 ? updatedAt / 1_000 : updatedAt
+        let elapsed = now.timeIntervalSince1970 - epochSeconds
+        guard elapsed >= -60 else { return nil }
+        let age = max(0, elapsed)
+        if age < 90 { return "just now" }
+        if age < 3_600 { return "\(Int(age / 60))m ago" }
+        if age < 86_400 { return "\(Int(age / 3_600))h ago" }
+        return "\(Int(age / 86_400))d ago"
+    }
 }
 
 /// A single plan window (5-hour, weekly) with its reset countdown.
@@ -206,7 +252,7 @@ struct SubscriptionUsageMeter: View {
     let now: Date
 
     private var fraction: Double {
-        min(max((window.usedPercent ?? 0) / 100, 0), 1)
+        min((window.reportedUsedPercent ?? 0) / 100, 1)
     }
 
     private var tint: Color { UsageMeterPalette.color(for: fraction) }
@@ -217,7 +263,7 @@ struct SubscriptionUsageMeter: View {
     /// makes the eye re-find the start of every bar. Sized for the real
     /// content: "Weekly" is the longest label, "100%" the widest number.
     private static let labelWidth: CGFloat = 44
-    private static let percentWidth: CGFloat = 34
+    private static let percentWidth: CGFloat = 42
     /// Wide enough for the longest form the caption can take ("Wed 11:59 PM").
     private static let resetWidth: CGFloat = 68
 
@@ -240,12 +286,14 @@ struct SubscriptionUsageMeter: View {
             GeometryReader { geometry in
                 ZStack(alignment: .leading) {
                     Capsule().fill(.quaternary.opacity(0.55))
-                    Capsule()
-                        .fill(UsageMeterPalette.fill(for: fraction))
-                        .frame(width: max(3, geometry.size.width * fraction))
-                        // A meter running out should look like it is running
-                        // hot, so the glow rises with the fill.
-                        .shadow(color: tint.opacity(0.35 * fraction), radius: 3, y: 0.5)
+                    if window.reportedUsedPercent != nil {
+                        Capsule()
+                            .fill(UsageMeterPalette.fill(for: fraction))
+                            .frame(width: max(3, geometry.size.width * fraction))
+                            // A meter running out should look like it is running
+                            // hot, so the glow rises with the fill.
+                            .shadow(color: tint.opacity(0.35 * fraction), radius: 3, y: 0.5)
+                    }
                 }
                 .frame(height: 6)
                 .frame(maxHeight: .infinity)
@@ -254,12 +302,10 @@ struct SubscriptionUsageMeter: View {
 
             // The number is the point of the row, so it carries the weight
             // rather than sharing the label's grey.
-            if let percent = window.usedPercent {
-                Text("\(Int(percent.rounded()))%")
-                    .font(.caption.weight(.semibold).monospacedDigit())
-                    .foregroundStyle(.primary)
-                    .frame(width: Self.percentWidth, alignment: .trailing)
-            }
+            Text(Self.percentCaption(window.usedPercent))
+                .font(.caption.weight(.semibold).monospacedDigit())
+                .foregroundStyle(window.reportedUsedPercent == nil ? .kaisolaSecondary : .primary)
+                .frame(width: Self.percentWidth, alignment: .trailing)
             // When a limit comes back is genuinely useful, so it gets a column
             // of its own rather than whatever the bar leaves over. It had
             // negative layout priority, which in a narrow card let it truncate
@@ -267,7 +313,7 @@ struct SubscriptionUsageMeter: View {
             // The bar flexes instead; it has a floor of its own.
             Text(resetCaption ?? "")
                 .font(.caption2.monospacedDigit())
-                .foregroundStyle(.kaisolaTertiary)
+                .foregroundStyle(.kaisolaSecondary)
                 .lineLimit(1)
                 .frame(width: Self.resetWidth, alignment: .trailing)
                 .help(resetDescription ?? "")
@@ -275,12 +321,25 @@ struct SubscriptionUsageMeter: View {
         .frame(height: 18)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel("\(window.label) usage")
-        .accessibilityValue(accessibilityValue)
+        .accessibilityValue(Self.accessibilityValue(for: window, now: now))
     }
 
-    private var accessibilityValue: String {
-        let percent = "\(Int((window.usedPercent ?? 0).rounded())) percent used"
-        return resetCaption.map { "\(percent), \($0)" } ?? percent
+    nonisolated static func percentCaption(_ value: Double?) -> String {
+        UsageCenter.PlanWindow.percentCaption(value)
+    }
+
+    nonisolated static func accessibilityValue(
+        for window: UsageCenter.PlanWindow,
+        now: Date
+    ) -> String {
+        let usage: String
+        if let percent = window.reportedUsedPercent {
+            usage = "\(UsageCenter.PlanWindow.percentCaption(percent).dropLast()) percent used"
+        } else {
+            usage = "Usage unavailable"
+        }
+        return resetDescription(resetsAt: window.resetsAt, now: now)
+            .map { "\(usage). \($0)" } ?? usage
     }
 
     /// When this window resets, said the way that horizon is actually useful.
@@ -310,7 +369,7 @@ struct SubscriptionUsageMeter: View {
         now: Date,
         calendar: Calendar = .autoupdatingCurrent
     ) -> String? {
-        guard let resetsAt, resetsAt > 0 else { return nil }
+        guard let resetsAt, resetsAt.isFinite, resetsAt > 0 else { return nil }
         let date = Date(timeIntervalSince1970: resetsAt)
         let remaining = date.timeIntervalSince(now)
         guard remaining > 0 else { return nil }
@@ -354,7 +413,7 @@ struct SubscriptionUsageMeter: View {
         now: Date,
         calendar: Calendar = .autoupdatingCurrent
     ) -> String? {
-        guard let resetsAt, resetsAt > 0 else { return nil }
+        guard let resetsAt, resetsAt.isFinite, resetsAt > 0 else { return nil }
         let date = Date(timeIntervalSince1970: resetsAt)
         guard date > now else { return nil }
 

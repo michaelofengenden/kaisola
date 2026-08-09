@@ -101,6 +101,11 @@ jobs:
             elif [[ "$surface" == settings || "$surface" == settings-terminal || "$surface" == settings-terminal-history || "$surface" == settings-terminal-interaction || "$surface" == settings-companion || "$surface" == settings-mcp || "$surface" == settings-models || "$surface" == settings-shortcuts || "$surface" == settings-account-recovery || "$surface" == usage ]]; then
               test "$width" -ge 800
               test "$height" -ge 540
+            elif [[ "$surface" == mesh-*-min* ]]; then
+              # The Mesh minimum-width fixtures declare the app's own 760-point
+              # minimum window, not the workspace-wide footprint.
+              test "$width" -ge 700
+              test "$height" -ge 600
             else
               test "$width" -ge 1000
               test "$height" -ge 660
@@ -146,6 +151,28 @@ jobs:
             run_fixture "$surface" "$capture" \
               /usr/bin/env KAISOLA_NATIVE_VISUAL_APPEARANCE=dark "$binary"
             verify_capture "$capture" "$surface"
+          done
+
+          # The Mesh column deck, across the shapes that decide it: 2, 3, and 4
+          # agents at the app's minimum window width, an ordinary laptop width,
+          # and a full-screen width, each in both appearances, plus a
+          # large-text pass at every agent count. GitHub's headless
+          # WindowServer constrains a window to its ~1024-point virtual
+          # display, so `typical` and `full` land on that clamp here; which
+          # deck each real width resolves to is pinned by MeshColumnDeckTests.
+          for agents in 2 3 4; do
+            for shape in "$agents-min" "$agents-typical" "$agents-full" "$agents-typical-large-text"; do
+              surface="mesh-$shape"
+              capture="$output/$surface.png"
+              run_fixture "$surface" "$capture" \
+                "$binary" -ApplePersistenceIgnoreState YES
+              verify_capture "$capture" "$surface"
+
+              capture="$output/dark-$surface.png"
+              run_fixture "$surface" "$capture" \
+                /usr/bin/env KAISOLA_NATIVE_VISUAL_APPEARANCE=dark "$binary"
+              verify_capture "$capture" "$surface"
+            done
           done
 
           # Dimension and file-size checks cannot distinguish a real capture

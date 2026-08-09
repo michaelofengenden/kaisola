@@ -4237,9 +4237,14 @@ final class AppModel: ObservableObject {
         )
     }
 
-    func loadVisualMeshFixture(workspace: URL) {
+    /// `agentCount` drives the 2/3/4-column visual fixtures; the deck the Mesh
+    /// picks for that many columns is a function of the window width the
+    /// fixture declares.
+    func loadVisualMeshFixture(workspace: URL, agentCount: Int = 3) {
         let mesh = MeshSession(baseDirectory: workspace.standardizedFileURL)
-        mesh.loadVisualFixture()
+        mesh.loadVisualFixture(
+            agents: Array(AgentRegistry.builtIns.prefix(max(1, agentCount)))
+        )
         surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }

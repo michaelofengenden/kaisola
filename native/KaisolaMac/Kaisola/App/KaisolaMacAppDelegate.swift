@@ -1181,8 +1181,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 if !data.isEmpty, (try? data.write(to: document, options: .atomic)) != nil {
                     model.openFilePreview(document)
                 }
-            } else if visualSurface == "mesh" {
-                model.loadVisualMeshFixture(workspace: workspace)
+            } else if let mesh = NativeVisualMeshFixture.parse(visualSurface) {
+                model.loadVisualMeshFixture(workspace: workspace, agentCount: mesh.agentCount)
             }
         }
         if let initialProjectDirectory, !visualFixture {
@@ -1197,7 +1197,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             // real project id or leaves the ordinary restored selection alone.
             model.selectedProjectName = legacyInitialProjectName
         }
-        let content: AnyView
+        var content: AnyView
         if visualFixture, visualSurface == "onboarding" {
             UsageCenter.shared.loadVisualFixture()
             content = AnyView(OnboardingView(
@@ -1253,12 +1253,19 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let visualSettings = visualFixture
             && ["settings", "settings-terminal", "settings-terminal-history", "settings-terminal-interaction", "settings-companion", "settings-mcp", "settings-accounts", "settings-models", "settings-shortcuts", "settings-account-recovery", "usage"].contains(visualSurface)
         let visualOnboarding = visualFixture && visualSurface == "onboarding"
+        let visualMesh = visualFixture ? NativeVisualMeshFixture.parse(visualSurface) : nil
+        if visualMesh?.usesLargeText == true {
+            // The accessibility text sizes are what actually strand a Mesh
+            // column, so the large-text fixtures ask for one rather than
+            // nudging the ordinary steps.
+            content = AnyView(content.dynamicTypeSize(.accessibility1))
+        }
 
         let window = NSWindow(
             contentRect: NSRect(
                 x: 0,
                 y: 0,
-                width: visualSettings ? 810 : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualFixture ? 1_360 : 1_080))),
+                width: visualSettings ? 810 : (visualOnboarding ? 760 : (resourceWorkload != nil ? 1_280 : (visualMesh?.width.points ?? (visualFixture ? 1_360 : 1_080)))),
                 height: visualSettings ? 540 : (visualOnboarding ? 560 : (resourceWorkload != nil ? 800 : (visualFixture ? 860 : 700)))
             ),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
@@ -1687,7 +1694,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             // hosted. Their generation-based request must survive that mount
             // and land on the real composer field editor, or the visible focus
             // ring and keyboard target have drifted again.
-            if ["mixed", "mesh"].contains(visualSurface) {
+            if visualSurface == "mixed" || NativeVisualMeshFixture.parse(visualSurface) != nil {
                 guard captureWindow.firstResponder is NSText else {
                     let responder = captureWindow.firstResponder
                         .map { String(describing: type(of: $0)) }
@@ -3712,6 +3719,57 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         let item = NSMenuItem(title: title, action: nil, keyEquivalent: "")
         item.isEnabled = false
         return item
+    }
+}
+
+/// Mesh visual fixtures carry their own shape in the surface name:
+/// `mesh-<agents>-<width>`, optionally suffixed `-large-text`. Bare `mesh`
+/// stays the three-agent, typical-width fixture the workflow already captures.
+/// Parsing it here keeps the capture matrix data in the workflow rather than
+/// one Swift branch per cell.
+struct NativeVisualMeshFixture: Equatable {
+    enum Width: String, CaseIterable {
+        case min
+        case typical
+        case full
+
+        /// Content widths: the app's own minimum window, an ordinary laptop
+        /// window, and a full-screen one on an external display. A hosted
+        /// runner whose virtual display is narrower than these constrains the
+        /// window to its own width.
+        var points: CGFloat {
+            switch self {
+            case .min: 760
+            case .typical: 1_360
+            case .full: 1_920
+            }
+        }
+    }
+
+    var agentCount = 3
+    var width = Width.typical
+    var usesLargeText = false
+
+    static let largeTextSuffix = "-large-text"
+    static let supportedAgentCounts = 2...4
+
+    static func parse(_ surface: String) -> NativeVisualMeshFixture? {
+        if surface == "mesh" { return NativeVisualMeshFixture() }
+        guard surface.hasPrefix("mesh-") else { return nil }
+        var remainder = String(surface.dropFirst("mesh-".count))
+        var fixture = NativeVisualMeshFixture()
+        if remainder.hasSuffix(largeTextSuffix) {
+            fixture.usesLargeText = true
+            remainder = String(remainder.dropLast(largeTextSuffix.count))
+        }
+        let parts = remainder.split(separator: "-", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let agents = Int(parts[0]),
+              supportedAgentCounts.contains(agents),
+              let width = Width(rawValue: String(parts[1])) else { return nil }
+        fixture.agentCount = agents
+        fixture.width = width
+        return fixture
     }
 }
 

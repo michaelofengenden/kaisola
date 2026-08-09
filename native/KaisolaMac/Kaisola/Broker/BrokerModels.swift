@@ -108,20 +108,19 @@ struct BrokerStatus: Equatable, Sendable {
               let liveValues = live.arrayValue else {
             throw BrokerClientError.malformedResponse
         }
-        let liveByID = Dictionary(
-            uniqueKeysWithValues: liveValues.compactMap { value -> (String, JSONValue)? in
-                guard let object = value.objectValue, let id = object["id"]?.stringValue else { return nil }
-                return (id, value)
-            }
-        )
+        let liveByID = try Self.valuesByUniqueTerminalID(liveValues)
         var decodedTerminals: [BrokerTerminalRecord] = []
         decodedTerminals.reserveCapacity(diagnosticValues.count)
+        var diagnosticIDs: Set<String> = []
         for (index, value) in diagnosticValues.enumerated() {
             guard let terminal = BrokerTerminalRecord(
                 value: value,
                 liveValue: value.objectValue?["id"]?.stringValue.flatMap { liveByID[$0] }
             ) else {
                 throw BrokerInventoryError.invalidDiagnosticRow(index: index)
+            }
+            guard diagnosticIDs.insert(terminal.id).inserted else {
+                throw BrokerClientError.malformedResponse
             }
             decodedTerminals.append(terminal)
         }
@@ -139,6 +138,22 @@ struct BrokerStatus: Equatable, Sendable {
             live: .array([]),
             expectedHello: expectedHello
         ).activityEpoch
+    }
+
+    private static func valuesByUniqueTerminalID(_ values: [JSONValue]) throws -> [String: JSONValue] {
+        var valuesByID: [String: JSONValue] = [:]
+        for value in values {
+            // Preserve the existing partial-response handling for rows that do
+            // not carry a parseable ID; repeated parseable IDs are ambiguous.
+            guard let object = value.objectValue,
+                  let id = object["id"]?.stringValue else {
+                continue
+            }
+            guard valuesByID.updateValue(value, forKey: id) == nil else {
+                throw BrokerClientError.malformedResponse
+            }
+        }
+        return valuesByID
     }
 }
 

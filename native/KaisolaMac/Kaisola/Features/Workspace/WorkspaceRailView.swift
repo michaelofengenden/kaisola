@@ -135,13 +135,17 @@ struct WorkspaceRailView: View {
             }
 
             if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        nodeRows(for: root, depth: 0)
+                if let emptyState = tree.emptyState(for: root) {
+                    projectEmptyState(emptyState)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            nodeRows(for: root, depth: 0)
+                        }
+                        .padding(.vertical, 6)
                     }
-                    .padding(.vertical, 6)
+                    .scrollBounceBehavior(.basedOnSize)
                 }
-                .scrollBounceBehavior(.basedOnSize)
             } else if tree.isSearching {
                 VStack(spacing: 10) {
                     ProgressView().controlSize(.small)
@@ -301,7 +305,6 @@ struct WorkspaceRailView: View {
         } message: {
             Text("This is recoverable from the macOS Trash.")
         }
-        .accessibilityLabel("Project files")
     }
 
     /// The index is deliberately bounded; when one of those bounds wins, do
@@ -629,6 +632,45 @@ struct WorkspaceRailView: View {
             .padding(.vertical, 6)
             .task { tree.load(directory) }
         }
+    }
+
+    private func projectEmptyState(_ state: WorkspaceFilesEmptyState) -> some View {
+        VStack(spacing: 12) {
+            Spacer(minLength: 12)
+            VStack(spacing: 8) {
+                Image(systemName: state.systemImageName)
+                    .font(.system(size: 34, weight: .light))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Text(state.title)
+                    .font(.title3.weight(.semibold))
+                    .multilineTextAlignment(.center)
+                Text(state.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(state.title)
+            .accessibilityValue(state.message)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier(state.accessibilityIdentifier)
+            VStack(spacing: 8) {
+                Button(WorkspaceFilesEmptyState.newFileLabel) {
+                    beginCreate(.file, in: root)
+                }
+                .accessibilityLabel("New File in project")
+                .accessibilityIdentifier("files.empty.new-file")
+                Button(WorkspaceFilesEmptyState.newFolderLabel) {
+                    beginCreate(.folder, in: root)
+                }
+                .accessibilityLabel("New Folder in project")
+                .accessibilityIdentifier("files.empty.new-folder")
+            }
+            Spacer(minLength: 12)
+        }
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     /// The one row a failed directory gets: what went wrong, and a way back.

@@ -10,6 +10,48 @@ struct FileNode: Identifiable, Equatable, Sendable {
     var name: String { url.lastPathComponent }
 }
 
+/// A successfully loaded project root can still have nothing Kaisola should
+/// render. Keep a genuinely empty folder distinct from one whose remaining
+/// entries are hidden or deliberately ignored so a blank rail never leaves the
+/// user guessing whether loading failed.
+enum WorkspaceFilesEmptyState: Equatable, Sendable {
+    case emptyProject
+    case hiddenOrIgnoredContent
+
+    static let newFileLabel = "New File…"
+    static let newFolderLabel = "New Folder…"
+
+    var title: String {
+        switch self {
+        case .emptyProject: "Empty project"
+        case .hiddenOrIgnoredContent: "No visible files"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .emptyProject:
+            "Create a new file or folder to get started."
+        case .hiddenOrIgnoredContent:
+            "This project contains only hidden or ignored items."
+        }
+    }
+
+    var systemImageName: String {
+        switch self {
+        case .emptyProject: "doc.badge.plus"
+        case .hiddenOrIgnoredContent: "eye.slash"
+        }
+    }
+
+    var accessibilityIdentifier: String {
+        switch self {
+        case .emptyProject: "files.empty-project"
+        case .hiddenOrIgnoredContent: "files.hidden-or-ignored"
+        }
+    }
+}
+
 /// The filesystem mutation boundary used by the workspace rail. File actions
 /// are intentionally narrower than a general-purpose file manager: they may
 /// only target the mounted workspace, existing-item actions never target its
@@ -559,11 +601,34 @@ enum ProjectFiles {
     struct DirectoryListing: Equatable, Sendable {
         var nodes: [FileNode]
         var failure: DirectoryLoadFailure?
+        /// Whether a successful empty listing omitted at least one raw entry.
+        /// The entry itself is never retained or shown; this only distinguishes
+        /// a truly empty folder from one containing hidden, ignored, or unsafe
+        /// items.
+        var hasOmittedEntries: Bool
+        var reachedLimit: Bool
+
+        init(
+            nodes: [FileNode],
+            failure: DirectoryLoadFailure?,
+            hasOmittedEntries: Bool = false,
+            reachedLimit: Bool = false
+        ) {
+            self.nodes = nodes
+            self.failure = failure
+            self.hasOmittedEntries = hasOmittedEntries
+            self.reachedLimit = reachedLimit
+        }
 
         static let empty = DirectoryListing(nodes: [], failure: nil)
 
         /// A legitimately empty folder — nothing for the rail to report.
         var isEmptyAndReadable: Bool { nodes.isEmpty && failure == nil }
+
+        var emptyState: WorkspaceFilesEmptyState? {
+            guard nodes.isEmpty, failure == nil, !reachedLimit else { return nil }
+            return hasOmittedEntries ? .hiddenOrIgnoredContent : .emptyProject
+        }
     }
 
     /// Immediate children of a directory: folders first, then files, both
@@ -588,7 +653,25 @@ enum ProjectFiles {
         isCancelled: () -> Bool = { Task.isCancelled }
     ) -> DirectoryListing {
         let scan = scanChildren(of: directory, limit: limit, isCancelled: isCancelled)
-        return DirectoryListing(nodes: scan.nodes, failure: scan.failure)
+        let hasOmittedEntries: Bool
+        if scan.nodes.isEmpty, scan.failure == nil, !scan.reachedLimit {
+            // Only presence matters. A second lazy, top-level enumerator can
+            // see hidden entries without materializing an adversarially large
+            // directory into memory.
+            hasOmittedEntries = FileManager.default.enumerator(
+                at: directory,
+                includingPropertiesForKeys: nil,
+                options: [.skipsSubdirectoryDescendants]
+            )?.nextObject() != nil
+        } else {
+            hasOmittedEntries = false
+        }
+        return DirectoryListing(
+            nodes: scan.nodes,
+            failure: scan.failure,
+            hasOmittedEntries: hasOmittedEntries,
+            reachedLimit: scan.reachedLimit
+        )
     }
 
     private static func scanChildren(
@@ -596,7 +679,7 @@ enum ProjectFiles {
         limit: Int,
         isCancelled: () -> Bool
     ) -> (nodes: [FileNode], failure: DirectoryLoadFailure?, visited: Int, reachedLimit: Bool) {
-        guard limit > 0 else { return ([], nil, 0, false) }
+        guard limit > 0 else { return ([], nil, 0, true) }
         guard !isCancelled() else { return ([], .cancelled, 0, false) }
         // The error-handling enumerator is the only way to learn *why* a
         // directory refused to list. The plain one hands back an empty
@@ -1286,6 +1369,10 @@ final class WorkspaceTreeModel: ObservableObject {
 
     func children(of directory: URL) -> [FileNode]? {
         listingsByDirectory[directory.standardizedFileURL.path]?.nodes
+    }
+
+    func emptyState(for directory: URL) -> WorkspaceFilesEmptyState? {
+        listingsByDirectory[directory.standardizedFileURL.path]?.emptyState
     }
 
     /// Why a loaded directory's list is short, if it is. `nil` covers healthy

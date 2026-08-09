@@ -3439,9 +3439,67 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(lockedListing.nodes, [])
         XCTAssertEqual(lockedListing.failure, .permissionDenied)
         XCTAssertFalse(lockedListing.isEmptyAndReadable)
+        XCTAssertNil(lockedListing.emptyState)
 
         // The legacy accessor keeps its old shape for the fuzzy index.
         XCTAssertEqual(ProjectFiles.children(of: locked), [])
+    }
+
+    func testDirectoryListingDistinguishesEmptyFromOnlyHiddenOrIgnoredContent() throws {
+        let empty = root.appendingPathComponent("empty-project", isDirectory: true)
+        let ignored = root.appendingPathComponent("ignored-project", isDirectory: true)
+        let visible = root.appendingPathComponent("visible-project", isDirectory: true)
+        for directory in [empty, ignored, visible] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        try FileManager.default.createDirectory(
+            at: ignored.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: ignored.appendingPathComponent("node_modules", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try "secret".write(
+            to: ignored.appendingPathComponent(".env"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "visible".write(
+            to: visible.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertEqual(ProjectFiles.listing(of: empty).emptyState, .emptyProject)
+        let ignoredListing = ProjectFiles.listing(of: ignored)
+        XCTAssertEqual(ignoredListing.nodes, [])
+        XCTAssertNil(ignoredListing.failure)
+        XCTAssertEqual(ignoredListing.emptyState, .hiddenOrIgnoredContent)
+        XCTAssertNil(ProjectFiles.listing(of: visible).emptyState)
+        XCTAssertNil(ProjectFiles.listing(of: root, limit: 0).emptyState)
+    }
+
+    func testWorkspaceFilesEmptyStatesNameCauseAndCreationActions() {
+        XCTAssertEqual(WorkspaceFilesEmptyState.emptyProject.title, "Empty project")
+        XCTAssertEqual(
+            WorkspaceFilesEmptyState.emptyProject.message,
+            "Create a new file or folder to get started."
+        )
+        XCTAssertEqual(
+            WorkspaceFilesEmptyState.hiddenOrIgnoredContent.title,
+            "No visible files"
+        )
+        XCTAssertEqual(
+            WorkspaceFilesEmptyState.hiddenOrIgnoredContent.message,
+            "This project contains only hidden or ignored items."
+        )
+        XCTAssertEqual(WorkspaceFilesEmptyState.newFileLabel, "New File…")
+        XCTAssertEqual(WorkspaceFilesEmptyState.newFolderLabel, "New Folder…")
+        XCTAssertNotEqual(
+            WorkspaceFilesEmptyState.emptyProject.accessibilityIdentifier,
+            WorkspaceFilesEmptyState.hiddenOrIgnoredContent.accessibilityIdentifier
+        )
     }
 
     func testDirectoryListingNamesMissingReplacedCancelledAndBoundedFolders() throws {

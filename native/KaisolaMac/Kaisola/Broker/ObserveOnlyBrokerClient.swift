@@ -101,8 +101,10 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     typealias DisconnectHandler = @Sendable (any Error) -> Void
     private static let historyPageBytes = ObserverHistoryTailPolicy.maximumPageBytes
 
-    private let transport: any BrokerByteTransport
+    private let transportFactory: @Sendable () -> any BrokerByteTransport
     private let operationTimeoutNanoseconds: UInt64
+    private var transport: (any BrokerByteTransport)?
+    private var connectingTransport: (any BrokerByteTransport)?
     private var decoder = BrokerLineFrameDecoder()
     private var info: BrokerInfo?
     private var hello: BrokerHello?
@@ -118,11 +120,23 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     private var disconnectHandler: DisconnectHandler?
 
     init(
-        transport: any BrokerByteTransport = UnixBrokerTransport(),
+        transportFactory: @escaping @Sendable () -> any BrokerByteTransport = { UnixBrokerTransport() },
         operationTimeoutNanoseconds: UInt64 = 5_000_000_000
     ) {
         precondition(operationTimeoutNanoseconds > 0)
-        self.transport = transport
+        self.transportFactory = transportFactory
+        self.operationTimeoutNanoseconds = operationTimeoutNanoseconds
+    }
+
+    /// A source-compatible injection seam for focused tests which need only
+    /// one transport. Production uses the factory initializer above so every
+    /// connection generation owns a distinct socket transport.
+    init(
+        transport: any BrokerByteTransport,
+        operationTimeoutNanoseconds: UInt64 = 5_000_000_000
+    ) {
+        precondition(operationTimeoutNanoseconds > 0)
+        self.transportFactory = { transport }
         self.operationTimeoutNanoseconds = operationTimeoutNanoseconds
     }
 
@@ -150,12 +164,18 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
 
         connectionGeneration &+= 1
         let generation = connectionGeneration
+        let attemptTransport = transportFactory()
         info = requestedInfo
         connectTarget = requestedInfo
+        connectingTransport = attemptTransport
         return try await withCheckedThrowingContinuation { continuation in
             connectWaiters.append(continuation)
             connectAttemptTask = Task { [weak self] in
-                await self?.performConnect(to: requestedInfo, generation: generation)
+                await self?.performConnect(
+                    to: requestedInfo,
+                    generation: generation,
+                    transport: attemptTransport
+                )
             }
         }
     }
@@ -166,13 +186,23 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         }
     }
 
-    private func performConnect(to info: BrokerInfo, generation: UInt64) async {
+    private func performConnect(
+        to info: BrokerInfo,
+        generation: UInt64,
+        transport attemptTransport: any BrokerByteTransport
+    ) async {
         do {
-            try await transport.connect(path: info.socketPath)
-            guard generation == connectionGeneration, connectTarget == info else { return }
+            try await attemptTransport.connect(path: info.socketPath)
+            guard generation == connectionGeneration, connectTarget == info else {
+                await attemptTransport.close()
+                return
+            }
+
+            transport = attemptTransport
+            connectingTransport = nil
 
             readerTask = Task { [weak self] in
-                await self?.readLoop(generation: generation)
+                await self?.readLoop(transport: attemptTransport, generation: generation)
             }
             let frame: JSONValue = .object([
                 "type": .string("hello"),
@@ -195,9 +225,13 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
                 guard !Task.isCancelled else { return }
                 await self?.handshakeTimedOut(generation: generation)
             }
-            try await transport.send(encoded)
+            try await attemptTransport.send(encoded)
         } catch {
-            await abortConnection(with: error, generation: generation)
+            if generation == connectionGeneration {
+                await abortConnection(with: error, generation: generation)
+            } else {
+                await attemptTransport.close()
+            }
         }
     }
 
@@ -425,6 +459,10 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
 
     func disconnect() async {
         connectionGeneration &+= 1
+        let activeTransport = transport
+        let pendingTransport = connectingTransport
+        transport = nil
+        connectingTransport = nil
         connectAttemptTask?.cancel()
         connectAttemptTask = nil
         connectTarget = nil
@@ -438,11 +476,12 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         decoder = BrokerLineFrameDecoder()
         info = nil
         hello = nil
-        await transport.close()
+        await activeTransport?.close()
+        await pendingTransport?.close()
     }
 
     private func request(_ method: ObserveOnlyBrokerMethod, params: JSONValue) async throws -> JSONValue {
-        guard hello != nil else { throw BrokerClientError.notConnected }
+        guard hello != nil, let transport else { throw BrokerClientError.notConnected }
         _ = try ObserveOnlyBrokerPolicy.validate(method.rawValue)
         let requestID = UUID().uuidString.lowercased()
         let frame: JSONValue = .object([
@@ -470,7 +509,10 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         }
     }
 
-    private func readLoop(generation: UInt64) async {
+    private func readLoop(
+        transport: any BrokerByteTransport,
+        generation: UInt64
+    ) async {
         do {
             while !Task.isCancelled {
                 guard let data = try await transport.receive(maximumBytes: 64 * 1_024) else {
@@ -495,6 +537,10 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     private func abortConnection(with error: any Error, generation: UInt64) async {
         guard generation == connectionGeneration else { return }
         connectionGeneration &+= 1
+        let activeTransport = transport
+        let pendingTransport = connectingTransport
+        transport = nil
+        connectingTransport = nil
         connectAttemptTask?.cancel()
         connectAttemptTask = nil
         connectTarget = nil
@@ -503,7 +549,8 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         decoder = BrokerLineFrameDecoder()
         failConnection(with: error)
         info = nil
-        await transport.close()
+        await activeTransport?.close()
+        await pendingTransport?.close()
         disconnectHandler?(error)
     }
 

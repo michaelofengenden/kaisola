@@ -116,6 +116,60 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testDelayedStaleConnectClosesOnlyItsOwnTransportAfterReconnect() async throws {
+        let staleTransport = ScriptedBrokerTransport(
+            suspendConnect: true,
+            closeReleasesConnect: false,
+            helloAccess: "observer",
+            advertiseObserverRole: true
+        )
+        let replacementTransport = ScriptedBrokerTransport(
+            helloAccess: "observer",
+            advertiseObserverRole: true
+        )
+        let transports = BrokerTransportSequence([staleTransport, replacementTransport])
+        let client = ObserveOnlyBrokerClient(
+            transportFactory: { transports.next() },
+            operationTimeoutNanoseconds: 500_000_000
+        )
+        let info = brokerInfo
+
+        let staleConnect = Task { try await client.connect(to: info) }
+        await staleTransport.waitUntilConnectCallCount(1)
+        await client.disconnect()
+
+        let replacementHello = try await client.connect(to: info)
+        let replacementConnected = await replacementTransport.isConnected()
+        let replacementCloseCalls = await replacementTransport.closeCalls()
+        XCTAssertTrue(replacementHello.serverEnforcedObserver)
+        XCTAssertTrue(replacementConnected)
+        XCTAssertEqual(replacementCloseCalls, 0)
+
+        await staleTransport.releaseConnect()
+        await staleTransport.waitUntilCloseCallCount(2)
+        do {
+            _ = try await staleConnect.value
+            XCTFail("Disconnect must fail the stale generation's caller")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .connectionClosed)
+        }
+
+        let staleConnected = await staleTransport.isConnected()
+        let staleCloseCalls = await staleTransport.closeCalls()
+        let replacementStillConnected = await replacementTransport.isConnected()
+        let replacementStillCloseCalls = await replacementTransport.closeCalls()
+        XCTAssertFalse(staleConnected)
+        XCTAssertEqual(staleCloseCalls, 2)
+        XCTAssertTrue(replacementStillConnected)
+        XCTAssertEqual(replacementStillCloseCalls, 0)
+
+        await client.disconnect()
+        let replacementConnectedAfterDisconnect = await replacementTransport.isConnected()
+        let replacementCloseCallsAfterDisconnect = await replacementTransport.closeCalls()
+        XCTAssertFalse(replacementConnectedAfterDisconnect)
+        XCTAssertEqual(replacementCloseCallsAfterDisconnect, 1)
+    }
+
     func testObserverHandshakeIsExplicitAndNewBrokerMustEchoTheRole() async throws {
         let transport = ScriptedBrokerTransport(helloAccess: "observer", advertiseObserverRole: true)
         let client = ObserveOnlyBrokerClient(transport: transport, operationTimeoutNanoseconds: 100_000_000)
@@ -503,6 +557,7 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
 
 private actor ScriptedBrokerTransport: BrokerByteTransport {
     private let suspendConnect: Bool
+    private let closeReleasesConnect: Bool
     private let replyToHello: Bool
     private let helloAccess: String?
     private let advertiseObserverRole: Bool
@@ -518,8 +573,14 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     private let historyPageBytes: Int?
     private var connectCallCount = 0
     private var connectReleased: Bool
+    private var connected = false
+    private var closeCallCount = 0
     private var connectGates: [CheckedContinuation<Void, Never>] = []
     private var connectCallWaiters: [(
+        count: Int,
+        continuation: CheckedContinuation<Void, Never>
+    )] = []
+    private var closeCallWaiters: [(
         count: Int,
         continuation: CheckedContinuation<Void, Never>
     )] = []
@@ -529,6 +590,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
 
     init(
         suspendConnect: Bool = false,
+        closeReleasesConnect: Bool = true,
         replyToHello: Bool = true,
         helloAccess: String? = nil,
         advertiseObserverRole: Bool = false,
@@ -544,6 +606,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         historyPageBytes: Int? = nil
     ) {
         self.suspendConnect = suspendConnect
+        self.closeReleasesConnect = closeReleasesConnect
         connectReleased = !suspendConnect
         self.replyToHello = replyToHello
         self.helloAccess = helloAccess
@@ -566,8 +629,10 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         connectCallWaiters.removeAll { connectCallCount >= $0.count }
         for observer in ready { observer.continuation.resume() }
 
-        guard suspendConnect, !connectReleased else { return }
-        await withCheckedContinuation { connectGates.append($0) }
+        if suspendConnect, !connectReleased {
+            await withCheckedContinuation { connectGates.append($0) }
+        }
+        connected = true
     }
 
     func waitUntilConnectCallCount(_ count: Int) async {
@@ -585,6 +650,15 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     }
 
     func connectCalls() -> Int { connectCallCount }
+    func closeCalls() -> Int { closeCallCount }
+    func isConnected() -> Bool { connected }
+
+    func waitUntilCloseCallCount(_ count: Int) async {
+        guard closeCallCount < count else { return }
+        await withCheckedContinuation { continuation in
+            closeCallWaiters.append((count, continuation))
+        }
+    }
 
     func send(_ data: Data) async throws {
         guard let newline = data.firstIndex(of: 0x0A) else { throw BrokerClientError.malformedResponse }
@@ -707,7 +781,12 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     }
 
     func close() async {
-        releaseConnect()
+        closeCallCount += 1
+        connected = false
+        let ready = closeCallWaiters.filter { closeCallCount >= $0.count }
+        closeCallWaiters.removeAll { closeCallCount >= $0.count }
+        for observer in ready { observer.continuation.resume() }
+        if closeReleasesConnect { releaseConnect() }
         waiter?.resume(returning: nil)
         waiter = nil
     }
@@ -727,5 +806,21 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         } else {
             incoming.append(data)
         }
+    }
+}
+
+private final class BrokerTransportSequence: @unchecked Sendable {
+    private let lock = NSLock()
+    private var transports: [any BrokerByteTransport]
+
+    init(_ transports: [any BrokerByteTransport]) {
+        self.transports = transports
+    }
+
+    func next() -> any BrokerByteTransport {
+        lock.lock()
+        defer { lock.unlock() }
+        precondition(!transports.isEmpty, "Unexpected observer transport request")
+        return transports.removeFirst()
     }
 }

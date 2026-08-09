@@ -390,7 +390,7 @@ final class McpConfigStoreTests: XCTestCase {
                 XCTAssertEqual(request.value(forHTTPHeaderField: "MCP-Protocol-Version"), "2025-06-18")
                 XCTAssertEqual(request.value(forHTTPHeaderField: "Mcp-Session-Id"), "probe-session")
                 headers = ["Content-Type": "text/event-stream"]
-                data = Data("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"one\"}],\"nextCursor\":\"more\"}}\n\n".utf8)
+                data = Data("event: message\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"tools\":[{\"name\":\"one\",\"inputSchema\":{\"type\":\"object\"}}],\"nextCursor\":\"more\"}}\n\n".utf8)
             default:
                 XCTFail("Unexpected MCP method \(method)")
                 headers = [:]
@@ -484,6 +484,157 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertEqual(result.status, .failed)
         XCTAssertTrue(result.verified)
         XCTAssertTrue(result.message.contains("Unsupported protocol version"))
+    }
+
+    // MARK: - Provider-facing tool schema normalization
+
+    func testToolSchemaNormalizerResolvesNestedDefinitionsArraysUnionsAndEscapedPointers() throws {
+        let schema: [String: Any] = [
+            "type": "object",
+            "properties": [
+                "payload": ["$ref": "#/$defs/envelope"],
+                "legacy": ["$ref": "#/definitions/a~1b~0c"],
+            ],
+            "$defs": [
+                "envelope": [
+                    "type": "object",
+                    "properties": [
+                        "values": [
+                            "type": "array",
+                            "items": [
+                                "anyOf": [
+                                    ["$ref": "#/$defs/scalar"],
+                                    ["type": "null"],
+                                ],
+                            ],
+                        ],
+                    ],
+                    "required": ["values"],
+                ],
+                "scalar": ["oneOf": [["type": "string"], ["type": "integer"]]],
+            ],
+            "definitions": [
+                "a/b~c": ["type": "string", "minLength": 2],
+            ],
+        ]
+
+        let first = McpToolSchemaNormalizer.normalizeTools([
+            ["name": "nested", "description": "fixture", "inputSchema": schema],
+        ])
+        let second = McpToolSchemaNormalizer.normalizeTools([
+            ["inputSchema": schema, "description": "fixture", "name": "nested"],
+        ])
+
+        XCTAssertEqual(first.usable.count, 1)
+        XCTAssertTrue(first.disabled.isEmpty)
+        let normalized = try XCTUnwrap(first.usable[0]["inputSchema"] as? [String: Any])
+        XCTAssertNil(normalized["$defs"])
+        XCTAssertNil(normalized["definitions"])
+        let properties = try XCTUnwrap(normalized["properties"] as? [String: Any])
+        let legacy = try XCTUnwrap(properties["legacy"] as? [String: Any])
+        XCTAssertEqual(legacy["type"] as? String, "string")
+        XCTAssertEqual(legacy["minLength"] as? Int, 2)
+        XCTAssertFalse(try McpToolSchemaNormalizer.stableData(normalized).isEmpty)
+        XCTAssertEqual(
+            try McpToolSchemaNormalizer.stableData(normalized),
+            try McpToolSchemaNormalizer.stableData(
+                XCTUnwrap(second.usable[0]["inputSchema"] as? [String: Any])
+            )
+        )
+    }
+
+    func testToolSchemaNormalizerDisablesOnlyInvalidToolsWithBoundedVisibleReasons() throws {
+        let cycle: [String: Any] = [
+            "type": "object",
+            "properties": ["node": ["$ref": "#/$defs/node"]],
+            "$defs": ["node": ["$ref": "#/$defs/node"]],
+        ]
+        let result = McpToolSchemaNormalizer.normalizeTools([
+            ["name": "healthy", "inputSchema": ["type": "object", "additionalProperties": false]],
+            ["name": "missing", "inputSchema": ["$ref": "#/$defs/absent", "$defs": [:]]],
+            ["name": "cycle", "inputSchema": cycle],
+            ["name": "remote", "inputSchema": ["$ref": "https://example.test/schema.json"]],
+            ["name": "unsupported", "inputSchema": ["type": "object", "unevaluatedProperties": false]],
+        ])
+
+        XCTAssertEqual(result.usable.compactMap { $0["name"] as? String }, ["healthy"])
+        XCTAssertEqual(result.disabled.map(\.name), ["missing", "cycle", "remote", "unsupported"])
+        XCTAssertTrue(result.disabled[0].reason.localizedCaseInsensitiveContains("missing"))
+        XCTAssertTrue(result.disabled[1].reason.localizedCaseInsensitiveContains("cycle"))
+        XCTAssertTrue(result.disabled[2].reason.localizedCaseInsensitiveContains("local"))
+        XCTAssertTrue(result.disabled[3].reason.localizedCaseInsensitiveContains("unsupported"))
+        XCTAssertTrue(result.disabled.allSatisfy { !$0.reason.isEmpty && $0.reason.count <= 160 })
+    }
+
+    func testToolSchemaNormalizerStopsAtDepthNodeAndByteBudgets() {
+        var deep: [String: Any] = ["type": "string"]
+        for _ in 0..<8 { deep = ["type": "array", "items": deep] }
+        let manyProperties = Dictionary(uniqueKeysWithValues: (0..<20).map {
+            ("p\($0)", ["type": "string"] as [String: Any])
+        })
+        let oversizedDescription = String(repeating: "x", count: 1_024)
+        let limits = McpToolSchemaNormalizer.Limits(
+            maximumInputBytes: 800,
+            maximumOutputBytes: 800,
+            maximumDepth: 4,
+            maximumNodes: 12
+        )
+
+        let result = McpToolSchemaNormalizer.normalizeTools([
+            ["name": "deep", "inputSchema": deep],
+            ["name": "nodes", "inputSchema": ["type": "object", "properties": manyProperties]],
+            ["name": "bytes", "inputSchema": ["type": "string", "description": oversizedDescription]],
+            ["name": "healthy", "inputSchema": ["type": "boolean"]],
+        ], limits: limits)
+
+        XCTAssertEqual(result.usable.compactMap { $0["name"] as? String }, ["healthy"])
+        XCTAssertEqual(result.disabled.map(\.name), ["deep", "nodes", "bytes"])
+        XCTAssertTrue(result.disabled[0].reason.localizedCaseInsensitiveContains("depth"))
+        XCTAssertTrue(result.disabled[1].reason.localizedCaseInsensitiveContains("node"))
+        XCTAssertTrue(result.disabled[2].reason.localizedCaseInsensitiveContains("byte"))
+    }
+
+    func testHTTPProbeReportsUsableAndDisabledToolsWithoutFailingHealthySibling() async throws {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [McpProbeURLProtocol.self]
+        McpProbeURLProtocol.handler = { request in
+            let request = try request.materializingBody()
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: try XCTUnwrap(request.httpBody)) as? [String: Any])
+            let method = try XCTUnwrap(object["method"] as? String)
+            let data: Data
+            switch method {
+            case "initialize":
+                data = Data(#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}"#.utf8)
+            case "notifications/initialized":
+                data = Data()
+            case "tools/list":
+                data = Data(##"{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"healthy","inputSchema":{"type":"object","properties":{"value":{"$ref":"#/$defs/value"}},"$defs":{"value":{"type":"string"}}}},{"name":"broken","inputSchema":{"$ref":"#/$defs/missing"}}]}}"##.utf8)
+            default:
+                throw URLError(.badServerResponse)
+            }
+            return (
+                HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: method == "notifications/initialized" ? 202 : 200,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: data.isEmpty ? [:] : ["Content-Type": "application/json"]
+                )!,
+                data
+            )
+        }
+        defer { McpProbeURLProtocol.handler = nil }
+
+        let result = await McpProbeService(session: URLSession(configuration: configuration)).probe(
+            McpServerConfig(name: "remote", kind: .http, url: "https://example.com/mcp")
+        )
+
+        XCTAssertEqual(result.status, .ready)
+        XCTAssertEqual(result.toolCount, 1)
+        XCTAssertEqual(result.disabledTools.map(\.name), ["broken"])
+        XCTAssertTrue(result.message.contains("1 usable"))
+        XCTAssertTrue(result.message.contains("1 disabled"))
+        XCTAssertTrue(result.message.contains("broken"))
+        XCTAssertLessThanOrEqual(result.message.count, 240)
     }
 
     private func write(_ value: String, relativePath: String, home: URL) throws {

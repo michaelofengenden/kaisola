@@ -213,6 +213,16 @@ function encodeBrokerFrame(frame, context = {}) {
   return `${encoded}\n`
 }
 
+// The scratch path is as guessable as the destination, so a symlink planted at
+// either would take the write to another file. O_NOFOLLOW fails the open on a
+// linked scratch path instead, and the rename replaces a linked destination
+// rather than writing through it — the chmod that follows lands on the regular
+// file this call just created.
+const ATOMIC_JSON_FLAGS = fs.constants.O_WRONLY
+  | fs.constants.O_CREAT
+  | fs.constants.O_TRUNC
+  | fs.constants.O_NOFOLLOW
+
 // Queue one newline-delimited frame on a client socket. `maxQueueBytes` drops
 // deltas a slow consumer has not drained; `force` bypasses that cap for the
 // recovery marker a paused subscriber must still receive.
@@ -239,7 +249,7 @@ function writeFrame(socket, frame, { maxQueueBytes, force = false, method } = {}
 function atomicJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   const tmp = `${file}.${process.pid}.tmp`
-  fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600 })
+  fs.writeFileSync(tmp, JSON.stringify(value), { mode: 0o600, flag: ATOMIC_JSON_FLAGS })
   fs.renameSync(tmp, file)
   try { fs.chmodSync(file, 0o600) } catch { /* best effort */ }
 }

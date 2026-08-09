@@ -393,6 +393,107 @@ struct GitService: Sendable {
         var id: String { path }
     }
 
+    enum ReviewKind: String, CaseIterable, Identifiable, Sendable {
+        case staged
+        case unstaged
+
+        var id: String { rawValue }
+        var title: String { self == .staged ? "Staged" : "Unstaged" }
+    }
+
+    enum ReviewFileState: Equatable, Sendable {
+        case text
+        case binary
+        case renamed(from: String)
+        case conflicted
+        case submodule
+        case untracked
+        case noTextualChanges
+
+        var summary: String {
+            switch self {
+            case .text: "Text changes"
+            case .binary: "Binary file — review and act on the whole file"
+            case let .renamed(from): "Renamed from \(from)"
+            case .conflicted: "Resolve the conflict before reviewing hunks"
+            case .submodule: "Submodule commit changed — review and act on the whole entry"
+            case .untracked: "Untracked file — stage the whole file to review it"
+            case .noTextualChanges: "No textual hunks — review and act on the whole file"
+            }
+        }
+    }
+
+    struct ReviewHunk: Equatable, Identifiable, Sendable {
+        let id: String
+        let path: String
+        let kind: ReviewKind
+        let header: String
+        let oldStart: Int
+        let newStart: Int
+        let sectionHeading: String
+        let lines: [String]
+        fileprivate let patch: String
+
+        var anchorID: String { "hunk:\(id)" }
+        var displayPatch: String { ([header] + lines).joined(separator: "\n") }
+    }
+
+    struct ReviewFile: Equatable, Identifiable, Sendable {
+        let path: String
+        let code: String
+        let originalPath: String?
+        let state: ReviewFileState
+        let hunks: [ReviewHunk]
+
+        init(
+            path: String,
+            code: String,
+            originalPath: String? = nil,
+            state: ReviewFileState,
+            hunks: [ReviewHunk]
+        ) {
+            self.path = path
+            self.code = code
+            self.originalPath = originalPath
+            self.state = state
+            self.hunks = hunks
+        }
+
+        var id: String { path }
+        var anchorID: String { "file:\(path)" }
+    }
+
+    struct ReviewSurface: Equatable, Sendable {
+        let repoName: String
+        let kind: ReviewKind
+        let files: [ReviewFile]
+
+        var hunkCount: Int { files.reduce(0) { $0 + $1.hunks.count } }
+    }
+
+    struct ReviewSurfaces: Equatable, Sendable {
+        let staged: ReviewSurface
+        let unstaged: ReviewSurface
+
+        subscript(kind: ReviewKind) -> ReviewSurface {
+            kind == .staged ? staged : unstaged
+        }
+    }
+
+    enum ReviewAction: String, Sendable {
+        case stage
+        case unstage
+        case restore
+
+        var operationVerb: String {
+            switch self {
+            case .stage: "Staging"
+            case .unstage: "Unstaging"
+            case .restore: "Discarding"
+            }
+        }
+    }
+
     enum GitError: Error, LocalizedError, Equatable {
         case notARepository
         case commandFailed(String)
@@ -488,6 +589,76 @@ struct GitService: Sendable {
         let text = try run(args)
         let limit = 200_000
         return text.count > limit ? String(text.prefix(limit)) + "\n… (diff truncated)" : text
+    }
+
+    /// One repository-wide staged/unstaged review snapshot. Each side is
+    /// derived from the same porcelain status value, so a rename, conflict, or
+    /// untracked entry cannot disappear merely because Git emits no ordinary
+    /// unified hunk for it.
+    func reviewSurfaces(status suppliedStatus: Status? = nil) throws -> ReviewSurfaces {
+        let snapshot = try suppliedStatus ?? status()
+        let repoName = repoRoot.lastPathComponent.isEmpty ? repoRoot.path : repoRoot.lastPathComponent
+        return ReviewSurfaces(
+            staged: try reviewSurface(repoName: repoName, kind: .staged, status: snapshot),
+            unstaged: try reviewSurface(repoName: repoName, kind: .unstaged, status: snapshot)
+        )
+    }
+
+    private func reviewSurface(repoName: String, kind: ReviewKind, status: Status) throws -> ReviewSurface {
+        var arguments = [
+            "--no-optional-locks", "diff", "--no-ext-diff", "--no-textconv", "--no-color",
+            "--find-renames=50%", "--submodule=short", "--unified=3",
+        ]
+        if kind == .staged { arguments.append("--cached") }
+        let patch = try run(arguments)
+        return Self.parseReviewSurface(
+            repoName: repoName,
+            kind: kind,
+            patch: patch,
+            entries: kind == .staged ? status.staged : status.unstaged,
+            untracked: kind == .unstaged ? status.untracked : []
+        )
+    }
+
+    /// Apply only the exact Git-produced hunk the reviewer selected. Context
+    /// verification makes a stale hunk fail rather than touching newer bytes.
+    /// The patch is generated internally and the path is separately confined
+    /// before Git sees stdin.
+    func applyReviewAction(_ action: ReviewAction, to hunk: ReviewHunk) throws {
+        try guardPath(hunk.path)
+        let valid: Bool
+        switch (action, hunk.kind) {
+        case (.stage, .unstaged), (.restore, .unstaged), (.unstage, .staged): valid = true
+        default: valid = false
+        }
+        guard valid else {
+            throw GitError.commandFailed("That hunk action is not valid in the \(hunk.kind.title.lowercased()) review.")
+        }
+
+        var arguments = ["apply", "--recount", "--whitespace=nowarn"]
+        if action == .stage || action == .unstage { arguments.append("--cached") }
+        if action == .unstage || action == .restore { arguments.append("--reverse") }
+        arguments.append("--")
+        _ = try run(arguments, standardInput: hunk.patch)
+    }
+
+    /// Whole-file fallback for entries that do not have truthful textual hunks.
+    /// A rename is one logical row but two index paths; stage/unstage both in a
+    /// single Git invocation so it can never become half-applied.
+    func applyReviewAction(_ action: ReviewAction, to file: ReviewFile) throws {
+        let paths = [file.originalPath, file.path].compactMap { $0 }
+        for path in paths { try guardPath(path) }
+        switch action {
+        case .stage:
+            _ = try run(["add", "--all", "--"] + paths)
+        case .unstage:
+            _ = try run(["restore", "--staged", "--"] + paths)
+        case .restore:
+            guard file.originalPath == nil, file.state != .untracked, file.state != .conflicted else {
+                throw GitError.commandFailed("That file cannot be discarded safely from this review state.")
+            }
+            _ = try run(["restore", "--", file.path])
+        }
     }
 
     func log(limit: Int = 20) throws -> [Commit] {
@@ -980,6 +1151,221 @@ struct GitService: Sendable {
     }
 
     // MARK: - Parsing
+
+    private struct ReviewPatchSection {
+        let lines: [String]
+
+        var text: String { lines.joined(separator: "\n") }
+    }
+
+    static func parseReviewSurface(
+        repoName: String,
+        kind: ReviewKind,
+        patch: String,
+        entries: [Entry],
+        untracked: [String] = []
+    ) -> ReviewSurface {
+        let sections = reviewPatchSections(patch)
+        var unusedSections = Set(sections.indices)
+        var files: [ReviewFile] = []
+
+        for entry in entries {
+            let sectionIndex = unusedSections.first(where: { index in
+                let paths = reviewPaths(in: sections[index])
+                return paths.contains(entry.path) || entry.originalPath.map(paths.contains) == true
+            })
+            let section = sectionIndex.map { sections[$0] }
+            if let sectionIndex { unusedSections.remove(sectionIndex) }
+            let state = reviewFileState(entry: entry, section: section)
+            let hunks = state == .text
+                ? reviewHunks(path: entry.path, kind: kind, section: section)
+                : []
+            files.append(ReviewFile(
+                path: entry.path,
+                code: entry.code,
+                originalPath: entry.originalPath,
+                state: state,
+                hunks: hunks
+            ))
+        }
+        if kind == .unstaged {
+            files.append(contentsOf: untracked.map {
+                ReviewFile(path: $0, code: "?", state: .untracked, hunks: [])
+            })
+        }
+        return ReviewSurface(repoName: repoName, kind: kind, files: files)
+    }
+
+    private static func reviewPatchSections(_ patch: String) -> [ReviewPatchSection] {
+        guard !patch.isEmpty else { return [] }
+        var sections: [ReviewPatchSection] = []
+        var current: [String] = []
+        for line in patch.split(separator: "\n", omittingEmptySubsequences: false).map(String.init) {
+            let beginsSection = line.hasPrefix("diff --git ")
+                || line.hasPrefix("diff --cc ")
+                || line.hasPrefix("diff --combined ")
+            if beginsSection, !current.isEmpty {
+                sections.append(ReviewPatchSection(lines: current))
+                current = []
+            }
+            if beginsSection || !current.isEmpty { current.append(line) }
+        }
+        if !current.isEmpty { sections.append(ReviewPatchSection(lines: current)) }
+        return sections
+    }
+
+    private static func reviewPaths(in section: ReviewPatchSection) -> Set<String> {
+        var paths: Set<String> = []
+        for line in section.lines {
+            if line.hasPrefix("+++ "), let path = reviewPathField(String(line.dropFirst(4))) {
+                paths.insert(path)
+            } else if line.hasPrefix("--- "), let path = reviewPathField(String(line.dropFirst(4))) {
+                paths.insert(path)
+            } else if line.hasPrefix("rename to "),
+                      let path = decodedGitQuotedPath(String(line.dropFirst("rename to ".count))) {
+                paths.insert(path)
+            } else if line.hasPrefix("rename from "),
+                      let path = decodedGitQuotedPath(String(line.dropFirst("rename from ".count))) {
+                paths.insert(path)
+            } else if line.hasPrefix("diff --cc "),
+                      let path = decodedGitQuotedPath(String(line.dropFirst("diff --cc ".count))) {
+                paths.insert(path)
+            } else if line.hasPrefix("diff --combined "),
+                      let path = decodedGitQuotedPath(String(line.dropFirst("diff --combined ".count))) {
+                paths.insert(path)
+            } else if line.hasPrefix("diff --git "),
+                      let destination = line.range(of: " b/", options: .backwards),
+                      let path = reviewPathField(String(line[destination.lowerBound...].dropFirst())) {
+                paths.insert(path)
+            }
+        }
+        return paths
+    }
+
+    private static func reviewPathField(_ field: String) -> String? {
+        let value: String
+        if field.hasPrefix("\"") {
+            value = field
+        } else {
+            value = field.split(separator: "\t", maxSplits: 1, omittingEmptySubsequences: false)
+                .first.map(String.init) ?? field
+        }
+        guard let decoded = decodedGitQuotedPath(value), decoded != "/dev/null" else { return nil }
+        if decoded.hasPrefix("a/") || decoded.hasPrefix("b/") { return String(decoded.dropFirst(2)) }
+        return decoded
+    }
+
+    /// Git C-quotes paths containing control, tab, quote, backslash, or
+    /// non-ASCII bytes. Decode the exact byte grammar instead of splitting a
+    /// user-controlled filename on whitespace.
+    private static func decodedGitQuotedPath(_ value: String) -> String? {
+        guard value.hasPrefix("\"") else { return value }
+        let bytes = Array(value.utf8)
+        guard bytes.count >= 2, bytes.last == 34 else { return nil }
+        var decoded: [UInt8] = []
+        var index = 1
+        while index < bytes.count - 1 {
+            let byte = bytes[index]
+            guard byte == 92 else {
+                decoded.append(byte)
+                index += 1
+                continue
+            }
+            index += 1
+            guard index < bytes.count - 1 else { return nil }
+            let escaped = bytes[index]
+            switch escaped {
+            case 110: decoded.append(0x0A); index += 1
+            case 114: decoded.append(0x0D); index += 1
+            case 116: decoded.append(0x09); index += 1
+            case 92, 34:
+                decoded.append(escaped); index += 1
+            case 48 ... 55:
+                var octal = 0
+                var digits = 0
+                while index < bytes.count - 1,
+                      digits < 3,
+                      bytes[index] >= 48,
+                      bytes[index] <= 55 {
+                    octal = (octal * 8) + Int(bytes[index] - 48)
+                    index += 1
+                    digits += 1
+                }
+                guard octal <= 255 else { return nil }
+                decoded.append(UInt8(octal))
+            default:
+                decoded.append(escaped)
+                index += 1
+            }
+        }
+        return String(decoding: decoded, as: UTF8.self)
+    }
+
+    private static func reviewFileState(entry: Entry, section: ReviewPatchSection?) -> ReviewFileState {
+        let text = section?.text ?? ""
+        if entry.code == "U" || text.hasPrefix("diff --cc ") || text.hasPrefix("diff --combined ") {
+            return .conflicted
+        }
+        if let originalPath = entry.originalPath {
+            return .renamed(from: originalPath)
+        }
+        if entry.code == "R" || entry.code == "C" || text.contains("\nrename from ") {
+            return .renamed(from: "another path")
+        }
+        if text.contains(" 160000\n") || text.contains("Subproject commit ") {
+            return .submodule
+        }
+        if text.contains("Binary files ") || text.contains("GIT binary patch") {
+            return .binary
+        }
+        guard let section else { return .noTextualChanges }
+        return section.lines.contains(where: { $0.hasPrefix("@@ ") }) ? .text : .noTextualChanges
+    }
+
+    private static func reviewHunks(
+        path: String,
+        kind: ReviewKind,
+        section: ReviewPatchSection?
+    ) -> [ReviewHunk] {
+        guard let section,
+              let firstHunk = section.lines.firstIndex(where: { $0.hasPrefix("@@ ") }) else { return [] }
+        let prefix = Array(section.lines[..<firstHunk])
+        let starts = section.lines.indices.filter { section.lines[$0].hasPrefix("@@ ") }
+        let regex = try! NSRegularExpression(
+            pattern: #"^@@ -([0-9]+)(?:,[0-9]+)? \+([0-9]+)(?:,[0-9]+)? @@(?: ?(.*))?$"#
+        )
+        return starts.enumerated().compactMap { ordinal, start in
+            let end = ordinal + 1 < starts.count ? starts[ordinal + 1] : section.lines.endIndex
+            let header = section.lines[start]
+            let range = NSRange(header.startIndex..., in: header)
+            guard let match = regex.firstMatch(in: header, range: range),
+                  let oldRange = Range(match.range(at: 1), in: header),
+                  let newRange = Range(match.range(at: 2), in: header),
+                  let oldStart = Int(header[oldRange]),
+                  let newStart = Int(header[newRange]) else { return nil }
+            let heading: String
+            if match.range(at: 3).location != NSNotFound,
+               let headingRange = Range(match.range(at: 3), in: header) {
+                heading = header[headingRange].trimmingCharacters(in: .whitespaces)
+            } else {
+                heading = ""
+            }
+            let lines = Array(section.lines[section.lines.index(after: start) ..< end])
+            var patch = (prefix + [header] + lines).joined(separator: "\n")
+            if !patch.hasSuffix("\n") { patch.append("\n") }
+            return ReviewHunk(
+                id: "\(kind.rawValue):\(path):\(oldStart):\(newStart):\(ordinal)",
+                path: path,
+                kind: kind,
+                header: header,
+                oldStart: oldStart,
+                newStart: newStart,
+                sectionHeading: heading,
+                lines: lines,
+                patch: patch
+            )
+        }
+    }
 
     static func parseStatus(
         _ output: String,

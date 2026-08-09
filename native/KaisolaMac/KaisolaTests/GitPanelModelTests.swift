@@ -33,6 +33,82 @@ final class GitPanelModelTests: XCTestCase {
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
     private let policy = GitRefreshPolicy()
 
+    func testHunkReviewAccessibilityNamesRepositoryFileAndHunk() {
+        let surface = GitService.parseReviewSurface(
+            repoName: "Widget",
+            kind: .unstaged,
+            patch: """
+            diff --git a/Sources/Feature.swift b/Sources/Feature.swift
+            index 1111111..2222222 100644
+            --- a/Sources/Feature.swift
+            +++ b/Sources/Feature.swift
+            @@ -7,3 +7,3 @@ func run() {
+             context
+            -old
+            +new
+            """,
+            entries: [.init(path: "Sources/Feature.swift", code: "M")]
+        )
+        let file = try! XCTUnwrap(surface.files.first)
+        let hunk = try! XCTUnwrap(file.hunks.first)
+
+        XCTAssertEqual(
+            GitReviewAccessibility.fileLabel(repoName: surface.repoName, file: file),
+            "Widget repository, Sources/Feature.swift, Modified text file, 1 hunk"
+        )
+        XCTAssertEqual(
+            GitReviewAccessibility.hunkLabel(repoName: surface.repoName, file: file, hunk: hunk),
+            "Widget repository, Sources/Feature.swift, hunk at new line 7, func run() {"
+        )
+    }
+
+    func testHunkReviewNavigationKeepsTheFileAnchorWhenAnActedHunkDisappears() {
+        let before = GitService.parseReviewSurface(
+            repoName: "Widget",
+            kind: .unstaged,
+            patch: """
+            diff --git a/a.txt b/a.txt
+            index 1111111..2222222 100644
+            --- a/a.txt
+            +++ b/a.txt
+            @@ -1 +1 @@
+            -old
+            +new
+            """,
+            entries: [.init(path: "a.txt", code: "M")]
+        )
+        let hunkAnchor = try! XCTUnwrap(before.files.first?.hunks.first?.anchorID)
+        let after = GitService.ReviewSurface(
+            repoName: "Widget",
+            kind: .unstaged,
+            files: [GitService.ReviewFile(path: "a.txt", code: "M", state: .binary, hunks: [])]
+        )
+
+        XCTAssertEqual(
+            GitReviewNavigation.reconciledAnchor(previous: hunkAnchor, surface: after),
+            after.files[0].anchorID
+        )
+        XCTAssertNil(
+            GitReviewNavigation.reconciledAnchor(
+                previous: hunkAnchor,
+                surface: .init(repoName: "Widget", kind: .unstaged, files: [])
+            )
+        )
+    }
+
+    func testHunkReviewCapabilitiesOfferOnlyValidWholeFileActions() {
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .staged, state: .binary), [.unstage])
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .unstaged, state: .text), [.restore, .stage])
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .unstaged, state: .binary), [.restore, .stage])
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .unstaged, state: .submodule), [.restore, .stage])
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .unstaged, state: .untracked), [.stage])
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .unstaged, state: .conflicted), [.stage])
+        XCTAssertEqual(
+            GitReviewCapabilities.fileActions(kind: .unstaged, state: .renamed(from: "old.txt")),
+            [.stage]
+        )
+    }
+
     func testNoPendingEventIsIdle() {
         XCTAssertEqual(
             policy.decide(pendingEventAt: nil, lastRefreshAt: now.addingTimeInterval(-60), isBusy: false, now: now),
@@ -632,6 +708,37 @@ final class GitPanelModelTests: XCTestCase {
     }
 
     // MARK: - Live model behavior
+
+    @MainActor
+    func testHunkActionRefreshesBothReviewSurfacesWithoutClosingTheSelectedView() throws {
+        let original = (1 ... 40).map { "line \($0)" }
+        try write("review.txt", original.joined(separator: "\n") + "\n")
+        try git(["add", "review.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        var working = original
+        working[1] = "changed line 2"
+        working[34] = "changed line 35"
+        try write("review.txt", working.joined(separator: "\n") + "\n")
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.openReview(.unstaged)
+        XCTAssertTrue(pump(
+            until: { model.reviewSurfaces != nil || model.errorMessage != nil },
+            timeout: 12
+        ))
+        let firstHunk = try XCTUnwrap(model.reviewSurfaces?.unstaged.files.first?.hunks.first)
+
+        model.applyReviewHunkAction(.stage, hunk: firstHunk)
+        XCTAssertTrue(pump(
+            until: {
+                !model.isBusy
+                    && model.reviewSurfaces?.staged.files.first?.hunks.count == 1
+                    && model.reviewSurfaces?.unstaged.files.first?.hunks.count == 1
+            },
+            timeout: 12
+        ), "expected both review surfaces to update, error: \(model.errorMessage ?? "none")")
+        XCTAssertEqual(model.reviewKind, .unstaged, "the active review stays open across a hunk mutation")
+    }
 
     /// The first click must assemble a review and execute NOTHING: no fork, no
     /// push, no `gh`, even with a real web destination configured.

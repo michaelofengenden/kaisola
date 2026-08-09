@@ -2,6 +2,64 @@ import AppKit
 import Combine
 import SwiftUI
 
+enum GitReviewAccessibility {
+    static func fileLabel(repoName: String, file: GitService.ReviewFile) -> String {
+        let status: String
+        switch (file.code, file.state) {
+        case ("M", .text): status = "Modified text file"
+        case ("A", .text): status = "Added text file"
+        case ("D", .text): status = "Deleted text file"
+        case (_, .text): status = "Text file"
+        default: status = file.state.summary
+        }
+        let count = file.hunks.count
+        return "\(repoName) repository, \(file.path), \(status), \(count) \(count == 1 ? "hunk" : "hunks")"
+    }
+
+    static func hunkLabel(
+        repoName: String,
+        file: GitService.ReviewFile,
+        hunk: GitService.ReviewHunk
+    ) -> String {
+        let heading = hunk.sectionHeading.isEmpty ? "" : ", \(hunk.sectionHeading)"
+        return "\(repoName) repository, \(file.path), hunk at new line \(hunk.newStart)\(heading)"
+    }
+}
+
+enum GitReviewNavigation {
+    /// Stable file/hunk identities let SwiftUI retain the visible position when
+    /// both review surfaces refresh. If the acted-on hunk vanished, keep its
+    /// file at the top; if that file moved to the other surface, use the next
+    /// available file instead of jumping to an arbitrary offset.
+    static func reconciledAnchor(previous: String?, surface: GitService.ReviewSurface) -> String? {
+        guard let first = surface.files.first else { return nil }
+        guard let previous else { return first.anchorID }
+        if surface.files.contains(where: { $0.anchorID == previous }) { return previous }
+        if surface.files.contains(where: { file in file.hunks.contains(where: { $0.anchorID == previous }) }) {
+            return previous
+        }
+        if let file = surface.files.first(where: {
+            previous.hasPrefix("hunk:\(surface.kind.rawValue):\($0.path):")
+        }) {
+            return file.anchorID
+        }
+        return first.anchorID
+    }
+}
+
+enum GitReviewCapabilities {
+    static func fileActions(
+        kind: GitService.ReviewKind,
+        state: GitService.ReviewFileState
+    ) -> [GitService.ReviewAction] {
+        if kind == .staged { return [.unstage] }
+        switch state {
+        case .text, .binary, .submodule, .noTextualChanges: return [.restore, .stage]
+        case .renamed, .conflicted, .untracked: return [.stage]
+        }
+    }
+}
+
 /// User-facing identity and cancellation truth for one serialized Git command.
 /// Read-only work can be abandoned without changing the repository; mutating
 /// work may have completed an earlier Git step before cancellation is observed.
@@ -50,6 +108,15 @@ struct GitPanelOperation: Equatable, Sendable {
     static func unstage(_ path: String) -> Self { mutating("Unstaging \(path)") }
     static func diff(_ path: String) -> Self { readOnly("Loading diff for \(path)") }
     static func restore(_ path: String) -> Self { mutating("Discarding changes to \(path)") }
+    static func review(_ kind: GitService.ReviewKind) -> Self {
+        readOnly("Loading \(kind.title.lowercased()) hunk review")
+    }
+    static func reviewHunk(_ action: GitService.ReviewAction, path: String) -> Self {
+        mutating("\(action.operationVerb) hunk in \(path)")
+    }
+    static func reviewFile(_ action: GitService.ReviewAction, path: String) -> Self {
+        mutating("\(action.operationVerb) \(path)")
+    }
 
     private static func readOnly(_ name: String) -> Self {
         .init(name: name, cancellationPolicy: .readOnly)
@@ -117,6 +184,8 @@ final class GitPanelModel: ObservableObject {
     @Published var commitMessage = ""
     @Published private(set) var activeOperation: GitPanelOperation?
     @Published private(set) var isCancellingOperation = false
+    @Published var reviewKind: GitService.ReviewKind?
+    @Published private(set) var reviewSurfaces: GitService.ReviewSurfaces?
     var isBusy: Bool { activeOperation != nil }
 
     /// Re-runs exactly the operation the timeout interrupted. Nil unless the
@@ -287,6 +356,7 @@ final class GitPanelModel: ObservableObject {
 
     func refresh() {
         let requests = diffRequests
+        let includeReviews = reviewKind != nil
         perform(.refresh) { svc -> GitRefreshSnapshot in
             let status = try svc.status()
             let livePaths = Set(
@@ -304,12 +374,14 @@ final class GitPanelModel: ObservableObject {
                 prep: try? svc.prPrep(),
                 headOID: try? svc.headOID(),
                 destination: svc.prDestination(),
-                diffs: patches
+                diffs: patches,
+                reviews: includeReviews ? try svc.reviewSurfaces(status: status) : nil
             )
         } apply: { snapshot in
             self.status = snapshot.status
             self.prPrepInfo = snapshot.prep
             self.diffs = snapshot.diffs
+            if let reviews = snapshot.reviews { self.reviewSurfaces = reviews }
             self.diffRequests = self.diffRequests.filter { snapshot.diffs[$0.key] != nil }
             // An open review card must not silently outlive the repository it
             // was assembled against: once a background refresh sees the HEAD
@@ -339,7 +411,66 @@ final class GitPanelModel: ObservableObject {
             self.diffs.removeAll()
             self.diffRequests.removeAll()
             self.log.removeAll()
+            if self.reviewKind != nil { self.reviewSurfaces = nil }
         }
+    }
+
+    func openReview(_ kind: GitService.ReviewKind) {
+        reviewKind = kind
+        reviewSurfaces = nil
+        loadReviewSurfaces(kind: kind)
+    }
+
+    func closeReview() {
+        reviewKind = nil
+    }
+
+    func loadReviewSurfaces(kind: GitService.ReviewKind? = nil) {
+        let selected = kind ?? reviewKind ?? .unstaged
+        perform(.review(selected)) { service -> GitReviewMutationSnapshot in
+            let status = try service.status()
+            return GitReviewMutationSnapshot(
+                status: status,
+                reviews: try service.reviewSurfaces(status: status)
+            )
+        } apply: { snapshot in
+            self.status = snapshot.status
+            self.reviewSurfaces = snapshot.reviews
+        } onError: { _ in
+            self.reviewSurfaces = nil
+        }
+    }
+
+    func applyReviewHunkAction(_ action: GitService.ReviewAction, hunk: GitService.ReviewHunk) {
+        perform(.reviewHunk(action, path: hunk.path)) { service -> GitReviewMutationSnapshot in
+            try service.applyReviewAction(action, to: hunk)
+            let status = try service.status()
+            return GitReviewMutationSnapshot(
+                status: status,
+                reviews: try service.reviewSurfaces(status: status)
+            )
+        } apply: { snapshot in
+            self.applyReviewMutation(snapshot, path: hunk.path)
+        }
+    }
+
+    func applyReviewFileAction(_ action: GitService.ReviewAction, file: GitService.ReviewFile) {
+        perform(.reviewFile(action, path: file.path)) { service -> GitReviewMutationSnapshot in
+            try service.applyReviewAction(action, to: file)
+            let status = try service.status()
+            return GitReviewMutationSnapshot(
+                status: status,
+                reviews: try service.reviewSurfaces(status: status)
+            )
+        } apply: { snapshot in
+            self.applyReviewMutation(snapshot, path: file.path)
+        }
+    }
+
+    private func applyReviewMutation(_ snapshot: GitReviewMutationSnapshot, path: String) {
+        status = snapshot.status
+        reviewSurfaces = snapshot.reviews
+        closeDiff(path)
     }
 
     func stage(_ path: String) {
@@ -776,6 +907,12 @@ private struct GitRefreshSnapshot: Sendable {
     let headOID: String?
     let destination: GitService.PRDestination
     let diffs: [String: String]
+    let reviews: GitService.ReviewSurfaces?
+}
+
+private struct GitReviewMutationSnapshot: Sendable {
+    let status: GitService.Status
+    let reviews: GitService.ReviewSurfaces
 }
 
 private struct GitPullOutcome: Sendable {
@@ -888,6 +1025,9 @@ struct GitPanelView: View {
             )
             .textSelection(.enabled)
             .fixedSize(horizontal: false, vertical: true)
+        }
+        .sheet(item: $model.reviewKind) { kind in
+            GitHunkReviewSheet(model: model, initialKind: kind)
         }
     }
 
@@ -1047,6 +1187,20 @@ struct GitPanelView: View {
                 .accessibilityIdentifier("git.stageAll")
             }
             Spacer()
+            Button {
+                model.openReview(.staged)
+            } label: {
+                Label("Review Staged", systemImage: "rectangle.stack")
+            }
+            .disabled(status.staged.isEmpty)
+            .accessibilityIdentifier("git.review.staged")
+            Button {
+                model.openReview(.unstaged)
+            } label: {
+                Label("Review Unstaged", systemImage: "rectangle.stack.badge.minus")
+            }
+            .disabled(status.unstaged.isEmpty && status.untracked.isEmpty)
+            .accessibilityIdentifier("git.review.unstaged")
             if let summary = GitStatsRendering.summary(status.combinedStats) {
                 Text("Total \(summary)")
                     .foregroundStyle(.kaisolaSecondary)
@@ -1478,6 +1632,236 @@ struct GitPanelView: View {
         case "D": .red
         case "?": .secondary
         default: .primary
+        }
+    }
+}
+
+private struct GitHunkReviewSheet: View {
+    @ObservedObject var model: GitPanelModel
+    let initialKind: GitService.ReviewKind
+    @State private var selectedKind: GitService.ReviewKind
+    @State private var scrollAnchor: String?
+    @State private var restoreTarget: GitReviewRestoreTarget?
+
+    init(model: GitPanelModel, initialKind: GitService.ReviewKind) {
+        self.model = model
+        self.initialKind = initialKind
+        _selectedKind = State(initialValue: initialKind)
+    }
+
+    private var surface: GitService.ReviewSurface? {
+        model.reviewSurfaces.map { $0[selectedKind] }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Git Hunk Review")
+                        .font(.headline)
+                    if let surface {
+                        Text("\(surface.repoName) · \(surface.files.count) files · \(surface.hunkCount) hunks")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                Picker("Review surface", selection: $selectedKind) {
+                    ForEach(GitService.ReviewKind.allCases) { kind in
+                        Text(kind.title).tag(kind)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 220)
+                .accessibilityIdentifier("git.review.surface")
+                Button("Close") { model.closeReview() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(14)
+            Divider()
+
+            if let error = model.errorMessage, surface == nil {
+                ContentUnavailableView(
+                    "Review unavailable",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text(error)
+                )
+            } else if let surface {
+                review(surface)
+            } else {
+                ProgressView("Loading \(selectedKind.title.lowercased()) changes…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(minWidth: 720, idealWidth: 900, minHeight: 520, idealHeight: 700)
+        .overlay(alignment: .topTrailing) {
+            if model.isBusy {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(12)
+                    .accessibilityLabel(model.activeOperation?.name ?? "Git operation in progress")
+            }
+        }
+        .onAppear {
+            selectedKind = initialKind
+            if let surface { scrollAnchor = GitReviewNavigation.reconciledAnchor(previous: nil, surface: surface) }
+        }
+        .onChange(of: selectedKind) { _, _ in
+            if let surface { scrollAnchor = GitReviewNavigation.reconciledAnchor(previous: nil, surface: surface) }
+        }
+        .onChange(of: model.reviewSurfaces) { _, _ in
+            if let surface {
+                scrollAnchor = GitReviewNavigation.reconciledAnchor(previous: scrollAnchor, surface: surface)
+            }
+        }
+        .confirmationDialog(
+            "Discard selected changes?",
+            isPresented: Binding(get: { restoreTarget != nil }, set: { if !$0 { restoreTarget = nil } })
+        ) {
+            Button("Discard Changes", role: .destructive) {
+                guard let target = restoreTarget else { return }
+                switch target {
+                case let .file(file): model.applyReviewFileAction(.restore, file: file)
+                case let .hunk(hunk): model.applyReviewHunkAction(.restore, hunk: hunk)
+                }
+                restoreTarget = nil
+            }
+            Button("Cancel", role: .cancel) { restoreTarget = nil }
+        } message: {
+            Text(restoreTarget?.message ?? "The selected unstaged changes will be discarded permanently.")
+                .textSelection(.enabled)
+        }
+    }
+
+    private func review(_ surface: GitService.ReviewSurface) -> some View {
+        Group {
+            if surface.files.isEmpty {
+                ContentUnavailableView(
+                    "No \(surface.kind.title.lowercased()) changes",
+                    systemImage: "checkmark.seal"
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(surface.files) { file in
+                            reviewFile(surface: surface, file: file)
+                        }
+                    }
+                    .padding(14)
+                    .scrollTargetLayout()
+                }
+                .scrollPosition(id: $scrollAnchor, anchor: .top)
+                .scrollBounceBehavior(.basedOnSize)
+            }
+        }
+    }
+
+    private func reviewFile(
+        surface: GitService.ReviewSurface,
+        file: GitService.ReviewFile
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(file.code)
+                    .font(.caption.monospaced().weight(.bold))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(surface.repoName) / \(file.path)")
+                        .font(.subheadline.monospaced().weight(.semibold))
+                        .textSelection(.enabled)
+                    if file.state != .text {
+                        Text(file.state.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                reviewFileActions(surface: surface, file: file)
+            }
+            .id(file.anchorID)
+            .focusable()
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(GitReviewAccessibility.fileLabel(repoName: surface.repoName, file: file))
+
+            ForEach(file.hunks) { hunk in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("\(surface.repoName) / \(file.path)")
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                            Text(hunk.header)
+                                .font(.caption.monospaced().weight(.semibold))
+                                .textSelection(.enabled)
+                        }
+                        Spacer()
+                        reviewHunkActions(hunk)
+                    }
+                    PatchText(patch: hunk.displayPatch)
+                }
+                .padding(8)
+                .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+                .id(hunk.anchorID)
+                .focusable()
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel(
+                    GitReviewAccessibility.hunkLabel(repoName: surface.repoName, file: file, hunk: hunk)
+                )
+            }
+        }
+        .padding(10)
+        .background(.background, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary))
+    }
+
+    @ViewBuilder
+    private func reviewFileActions(
+        surface: GitService.ReviewSurface,
+        file: GitService.ReviewFile
+    ) -> some View {
+        if surface.kind == .staged {
+            Button("Unstage File") { model.applyReviewFileAction(.unstage, file: file) }
+                .accessibilityLabel("Unstage \(file.path) from \(surface.repoName)")
+                .disabled(model.isBusy)
+        } else {
+            if GitReviewCapabilities.fileActions(kind: surface.kind, state: file.state).contains(.restore) {
+                Button("Discard File") { restoreTarget = .file(file) }
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                    .accessibilityLabel("Discard unstaged changes to \(file.path) in \(surface.repoName)")
+                    .disabled(model.isBusy)
+            }
+            Button("Stage File") { model.applyReviewFileAction(.stage, file: file) }
+                .accessibilityLabel("Stage \(file.path) from \(surface.repoName)")
+                .disabled(model.isBusy)
+        }
+    }
+
+    @ViewBuilder
+    private func reviewHunkActions(_ hunk: GitService.ReviewHunk) -> some View {
+        if hunk.kind == .staged {
+            Button("Unstage Hunk") { model.applyReviewHunkAction(.unstage, hunk: hunk) }
+                .accessibilityLabel("Unstage hunk in \(hunk.path)")
+                .disabled(model.isBusy)
+        } else {
+            Button("Discard Hunk") { restoreTarget = .hunk(hunk) }
+                .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                .accessibilityLabel("Discard unstaged hunk in \(hunk.path)")
+                .disabled(model.isBusy)
+            Button("Stage Hunk") { model.applyReviewHunkAction(.stage, hunk: hunk) }
+                .accessibilityLabel("Stage hunk in \(hunk.path)")
+                .disabled(model.isBusy)
+        }
+    }
+}
+
+private enum GitReviewRestoreTarget: Equatable {
+    case file(GitService.ReviewFile)
+    case hunk(GitService.ReviewHunk)
+
+    var message: String {
+        switch self {
+        case let .file(file): "All unstaged changes to \(file.path) will be discarded permanently (git restore)."
+        case let .hunk(hunk): "Only the selected hunk in \(hunk.path) will be discarded permanently."
         }
     }
 }

@@ -186,6 +186,10 @@ const MAX_EXIT_WAITERS = 32
 // instant timeout. Unbounded stays the default: a wait is how the agent learns
 // a command finished, and cutting it short would report a false non-exit.
 const MAX_EXIT_WAIT_MS = 6 * 60 * 60 * 1_000
+// A normal node-pty kill reports exit promptly, so release can preserve its
+// historic awaitable-success contract. A backend that accepted the signal but
+// never confirms exit must not hold an RPC forever or erase recovery evidence.
+const RELEASE_CONFIRM_MS = 2_000
 // A single detached broker serves every open project, so PTYs need a broker-
 // wide ceiling in addition to per-terminal byte and waiter limits. The launch
 // request may lower or raise the production default, but never remove the
@@ -646,6 +650,10 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       agentRespondedAt: null,
       agentQuietTimer: null,
       agentMarkCarry: '',
+      releasePending: false,
+      releaseSignalAccepted: false,
+      releaseConfirmation: null,
+      releaseFinalizing: null,
     }
     rec.observers = new TerminalObservers({
       terminalId: id,
@@ -729,6 +737,13 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     agentRespondedAt: null,
     agentQuietTimer: null,
     agentMarkCarry: '', // straddle buffer for OSC 133 marks split across chunks
+    // A release request is only a tombstone until node-pty reports exit or the
+    // exact child pid is absent. Keeping the live record and spool here is the
+    // recovery evidence when signaling fails or races process teardown.
+    releasePending: false,
+    releaseSignalAccepted: false,
+    releaseConfirmation: null,
+    releaseFinalizing: null,
   }
   rec.observers = new TerminalObservers({
     terminalId: id,
@@ -867,6 +882,13 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
         exitStatus: rec.exitStatus,
       }, { streamEpoch: rec.cursor.streamEpoch, endOffset: rec.cursor.nextOffset })
       resolveExitWaiters(rec, rec.exitStatus)
+      if (rec.releasePending && terms.get(id) === rec) {
+        const finalized = finalizeReleasedRecord(rec, 'exit-event')
+        // Async spool writers drain before deletion. The receipt has no caller
+        // once an earlier release returned its retained-tombstone result, but
+        // cleanup must still finish and must never become an unhandled reject.
+        if (finalized && typeof finalized.then === 'function') void finalized.catch(() => {})
+      }
     }
     const persisted = !shuttingDown ? rec.spool.markExited(rec.exitStatus) : null
     if (persisted && typeof persisted.then === 'function') persisted.then(finishExit, finishExit)
@@ -1330,6 +1352,104 @@ function kill(id) {
   return { id, ...killRecord(terms.get(id)) }
 }
 
+/** `kill(pid, 0)` sends no signal. Only ESRCH proves the exact numeric child is
+ * absent; EPERM and every other diagnostic mean "not confirmed" and therefore
+ * retain the spool. We never signal by pid here, so a recycled pid can at worst
+ * preserve a tombstone longer, never terminate an unrelated process. */
+function terminalProcessMissing(record) {
+  let pid
+  try { pid = record?.pty?.pid } catch { return false }
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return false
+  } catch (error) {
+    return error?.code === 'ESRCH'
+  }
+}
+
+function releaseResult(id, receipt, terminationEvidence) {
+  return {
+    id,
+    ok: receipt.complete,
+    released: true,
+    termination: { confirmed: true, evidence: terminationEvidence },
+    deletion: receipt,
+    cleanup: receipt.complete ? null : { method: 'terminal.release', id },
+  }
+}
+
+function finalizeReleasedRecord(record, terminationEvidence) {
+  if (record.releaseFinalizing) return record.releaseFinalizing
+  const { id } = record
+  const confirmation = record.releaseConfirmation
+  if (confirmation?.timer) clearTimeout(confirmation.timer)
+  record.releaseConfirmation = null
+  if (record.flushTimer) clearTimeout(record.flushTimer)
+  if (record.agentQuietTimer) clearTimeout(record.agentQuietTimer)
+  record.flushTimer = null
+  record.agentQuietTimer = null
+  const finish = (receipt) => {
+    if (terms.get(id) === record) terms.delete(id)
+    // Once termination is confirmed, no future exit event is needed to answer
+    // these closures. Refuse them explicitly rather than stranding callers on
+    // a record that has now been durably retired.
+    rejectExitWaiters(takeExitWaiters(record), 'Terminal is no longer available.')
+    record.releaseFinalizing = null
+    return releaseResult(id, receipt, terminationEvidence)
+  }
+  const deletion = record.spool.close({ remove: true })
+  if (deletion && typeof deletion.then === 'function') {
+    record.releaseFinalizing = deletion.then(finish)
+    if (confirmation) record.releaseFinalizing.then(confirmation.resolve, confirmation.reject)
+    return record.releaseFinalizing
+  }
+  const result = finish(deletion)
+  confirmation?.resolve(result)
+  return result
+}
+
+function unconfirmedReleaseResult(id, code) {
+  return {
+    id,
+    ok: false,
+    released: false,
+    termination: {
+      confirmed: false,
+      retryable: true,
+      code,
+      message: 'terminal termination is not confirmed',
+    },
+    deletion: null,
+    cleanup: { method: 'terminal.release', id },
+  }
+}
+
+function waitForReleaseConfirmation(record) {
+  if (record.releaseConfirmation) return record.releaseConfirmation.promise
+  const confirmation = {
+    timer: null,
+    resolve: null,
+    reject: null,
+    promise: null,
+  }
+  confirmation.promise = new Promise((resolve, reject) => {
+    confirmation.resolve = resolve
+    confirmation.reject = reject
+  })
+  confirmation.timer = setTimeout(() => {
+    if (record.releaseConfirmation !== confirmation) return
+    record.releaseConfirmation = null
+    // A retry may signal again: an accepted signal is not a durable fact about
+    // the still-live child, and the first delivery may have been lost.
+    record.releaseSignalAccepted = false
+    confirmation.resolve(unconfirmedReleaseResult(record.id, 'terminal_exit_unconfirmed'))
+  }, RELEASE_CONFIRM_MS)
+  confirmation.timer.unref?.()
+  record.releaseConfirmation = confirmation
+  return confirmation.promise
+}
+
 function release(id) {
   cancelRelease(id)
   const r = terms.get(id)
@@ -1343,21 +1463,26 @@ function release(id) {
       cleanup: deletion.complete ? null : { method: 'terminal.release', id },
     }
   }
-  if (r.flushTimer) clearTimeout(r.flushTimer)
-  if (r.agentQuietTimer) clearTimeout(r.agentQuietTimer)
-  kill(id)
-  const deletion = r.spool.close({ remove: true })
-  terms.delete(id)
-  // The record is gone, so its pty exit can no longer reach these resolvers.
-  rejectExitWaiters(takeExitWaiters(r), 'Terminal is no longer available.')
-  const result = (receipt) => ({
+  if (r.releaseFinalizing) return r.releaseFinalizing
+  if (r.releaseConfirmation) return r.releaseConfirmation.promise
+  if (r.exited) return finalizeReleasedRecord(r, 'exit-event')
+  if (terminalProcessMissing(r)) return finalizeReleasedRecord(r, 'pid-missing')
+
+  r.releasePending = true
+  reportActivity('terminal-release-pending', id)
+  const termination = r.releaseSignalAccepted ? { ok: true } : killRecord(r)
+  if (termination.ok) r.releaseSignalAccepted = true
+
+  // node-pty may deliver onExit synchronously for an already-dead child. Check
+  // both authoritative forms again after signaling before retaining the
+  // tombstone. A merely accepted signal is not evidence of termination.
+  if (r.exited) return finalizeReleasedRecord(r, 'exit-event')
+  if (terminalProcessMissing(r)) return finalizeReleasedRecord(r, 'pid-missing')
+  if (termination.ok) return waitForReleaseConfirmation(r)
+  return unconfirmedReleaseResult(
     id,
-    ok: receipt.complete,
-    released: true,
-    deletion: receipt,
-    cleanup: receipt.complete ? null : { method: 'terminal.release', id },
-  })
-  return deletion && typeof deletion.then === 'function' ? deletion.then(result) : result(deletion)
+    termination.code,
+  )
 }
 
 /** Broker-owned close grace survives renderer crashes, appearance swaps, and
@@ -1527,7 +1652,8 @@ function diagnostics() {
     observerCount: r.observers.stats().subscribers,
     pausedObserverCount: r.observers.stats().paused,
     exitWaiterCount: r.waiters.length,
+    releasePending: r.releasePending === true,
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, configureCapacity, capacity, setEventSink, setActivitySink, diagnostics, DEFAULT_MAX_LIVE_TERMINALS, MAX_CONFIGURABLE_LIVE_TERMINALS, MAX_TERMINAL_WRITE_BYTES, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, liveTerminalCount, validatedMaximumLiveTerminals, TerminalCapacityError, MAX_EXIT_WAITERS } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, configureCapacity, capacity, setEventSink, setActivitySink, diagnostics, DEFAULT_MAX_LIVE_TERMINALS, MAX_CONFIGURABLE_LIVE_TERMINALS, MAX_TERMINAL_WRITE_BYTES, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, liveTerminalCount, validatedMaximumLiveTerminals, TerminalCapacityError, MAX_EXIT_WAITERS, RELEASE_CONFIRM_MS } }

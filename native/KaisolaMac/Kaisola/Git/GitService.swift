@@ -188,6 +188,11 @@ struct GitService: Sendable {
     let repoRoot: URL
     private let checkpointDate: String?
 
+    /// Failure diagnostics are rendered in the Git panel, so a noisy hook must
+    /// not turn one rejection into an unbounded banner. The allowance is shared
+    /// fairly when Git gives us both streams, while a lone stream can use it all.
+    private static let failureOutputByteLimit = 16 * 1024
+
     init(repoRoot: URL) {
         self.repoRoot = repoRoot
         self.checkpointDate = nil
@@ -857,11 +862,68 @@ struct GitService: Sendable {
         }
         catch { throw GitError.commandFailed(error.localizedDescription) }
         if process.terminationStatus != 0 {
-            let message = String(data: capture.err, encoding: .utf8) ?? "git failed"
-            if message.contains("not a git repository") { throw GitError.notARepository }
-            throw GitError.commandFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
+            let stdout = String(decoding: capture.out, as: UTF8.self)
+            let stderr = String(decoding: capture.err, as: UTF8.self)
+            if stdout.contains("not a git repository") || stderr.contains("not a git repository") {
+                throw GitError.notARepository
+            }
+            throw GitError.commandFailed(Self.commandFailureMessage(
+                arguments: arguments,
+                status: process.terminationStatus,
+                stdout: capture.out,
+                stderr: capture.err
+            ))
         }
         return String(data: capture.out, encoding: .utf8) ?? ""
+    }
+
+    /// A stable, bounded explanation for a Git rejection. Both stdout and
+    /// stderr are retained because hooks legitimately use either; the exit
+    /// status distinguishes a policy rejection from an ordinary Git message.
+    private static func commandFailureMessage(
+        arguments: [String],
+        status: Int32,
+        stdout: Data,
+        stderr: Data
+    ) -> String {
+        let budgets = failureOutputBudgets(stdoutBytes: stdout.count, stderrBytes: stderr.count)
+        var sections = ["\(commandLabel(arguments)) exited with status \(status)."]
+        if let rendered = boundedFailureOutput(stdout, byteLimit: budgets.stdout) {
+            sections.append("stdout:\n\(rendered)")
+        }
+        if let rendered = boundedFailureOutput(stderr, byteLimit: budgets.stderr) {
+            sections.append("stderr:\n\(rendered)")
+        }
+        if sections.count == 1 { sections.append("No output was produced.") }
+        return sections.joined(separator: "\n\n")
+    }
+
+    private static func failureOutputBudgets(
+        stdoutBytes: Int,
+        stderrBytes: Int
+    ) -> (stdout: Int, stderr: Int) {
+        guard stdoutBytes > 0 else { return (0, min(stderrBytes, failureOutputByteLimit)) }
+        guard stderrBytes > 0 else { return (min(stdoutBytes, failureOutputByteLimit), 0) }
+
+        var stdoutBudget = min(stdoutBytes, failureOutputByteLimit / 2)
+        var stderrBudget = min(stderrBytes, failureOutputByteLimit / 2)
+        var spare = failureOutputByteLimit - stdoutBudget - stderrBudget
+        let extraStdout = min(spare, stdoutBytes - stdoutBudget)
+        stdoutBudget += extraStdout
+        spare -= extraStdout
+        stderrBudget += min(spare, stderrBytes - stderrBudget)
+        return (stdoutBudget, stderrBudget)
+    }
+
+    private static func boundedFailureOutput(_ data: Data, byteLimit: Int) -> String? {
+        guard !data.isEmpty, byteLimit > 0 else { return nil }
+        let prefix = data.prefix(byteLimit)
+        let rendered = String(decoding: prefix, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rendered.isEmpty else { return nil }
+        return data.count > prefix.count
+            ? "\(rendered)\n… (output truncated)"
+            : rendered
     }
 
     /// "git status", "git push" — what a stopped command is called in the UI.

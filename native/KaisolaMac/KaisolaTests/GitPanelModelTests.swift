@@ -493,6 +493,44 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertEqual(model.status?.staged.map(\.path), ["b.txt"])
     }
 
+    @MainActor
+    func testRejectingCommitMessageHookKeepsDraftAndStagedIndexVisible() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let headBeforeCommit = try gitOutput(["rev-parse", "HEAD"])
+        try write("pending.txt", "keep staged\n")
+        try git(["add", "pending.txt"])
+        try installCommitMessageHook(
+            """
+            #!/bin/sh
+            printf '%s\n' 'panel hook stdout'
+            printf '%s\n' 'panel hook stderr' >&2
+            exit 41
+            """
+        )
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.refresh()
+        XCTAssertTrue(pump(until: { model.status?.staged.map(\.path) == ["pending.txt"] }, timeout: 10))
+        model.commitMessage = "keep my draft"
+        model.commit()
+        XCTAssertTrue(pump(until: { model.errorMessage != nil && !model.isBusy }, timeout: 10))
+
+        XCTAssertEqual(model.commitMessage, "keep my draft")
+        XCTAssertEqual(model.status?.staged.map(\.path), ["pending.txt"])
+        XCTAssertFalse(model.errorIsRetryable)
+        XCTAssertTrue(model.errorMessage?.contains("git commit exited with status 1") == true)
+        XCTAssertTrue(model.errorMessage?.contains("panel hook stdout") == true)
+        XCTAssertTrue(model.errorMessage?.contains("panel hook stderr") == true)
+        XCTAssertEqual(try gitOutput(["rev-parse", "HEAD"]), headBeforeCommit)
+        XCTAssertEqual(
+            try gitOutput(["diff", "--cached", "--name-only"])
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "pending.txt"
+        )
+    }
+
     /// The review card must self-invalidate: a background refresh (an external
     /// commit landing between the review and confirm clicks) marks the open
     /// plan stale so Confirm gets disabled instead of waiting for the user's
@@ -628,6 +666,12 @@ final class GitPanelModelTests: XCTestCase {
 
     private func write(_ name: String, _ contents: String) throws {
         try contents.write(to: repo.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
+    private func installCommitMessageHook(_ script: String) throws {
+        let hook = repo.appendingPathComponent(".git/hooks/commit-msg")
+        try script.write(to: hook, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
     }
 
     @discardableResult

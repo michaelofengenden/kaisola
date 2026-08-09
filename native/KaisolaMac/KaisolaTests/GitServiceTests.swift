@@ -605,6 +605,73 @@ final class GitServiceTests: XCTestCase {
         XCTAssertEqual(try service.log(limit: 5).first?.subject, "add a")
     }
 
+    func testCommitMessageHookCanRewriteTheCreatedCommitInTheRepositoryEnvironment() throws {
+        try write("a.txt", "hello\n")
+        let service = GitService(repoRoot: repo)
+        try service.stage(path: "a.txt")
+        try installCommitMessageHook(
+            """
+            #!/bin/sh
+            set -eu
+            root="$(git rev-parse --show-toplevel)"
+            test "$(pwd -P)" = "$(cd "$root" && pwd -P)"
+            test "$(git config --get user.email)" = "test@example.com"
+            test -f "$1"
+            printf '%s\n' 'rewritten by commit-msg' > "$1"
+            """
+        )
+
+        let hash = try service.commit(message: "original draft")
+
+        XCTAssertEqual(hash, try gitOutput(["rev-parse", "HEAD"]))
+        XCTAssertEqual(try gitOutput(["log", "-1", "--pretty=%B"]), "rewritten by commit-msg")
+        XCTAssertTrue(try service.status().isClean)
+    }
+
+    func testRejectingCommitMessageHookReportsBoundedCombinedOutputAndPreservesIndex() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let headBeforeCommit = try gitOutput(["rev-parse", "HEAD"])
+        try write("pending.txt", "keep staged\n")
+        let service = GitService(repoRoot: repo)
+        try service.stage(path: "pending.txt")
+        try installCommitMessageHook(
+            """
+            #!/bin/sh
+            printf '%s\n' 'hook stdout marker'
+            printf '%s\n' 'hook stderr marker' >&2
+            i=0
+            while [ "$i" -lt 20000 ]; do
+              printf 'o'
+              printf 'e' >&2
+              i=$((i + 1))
+            done
+            exit 73
+            """
+        )
+
+        XCTAssertThrowsError(try service.commit(message: "keep this draft")) { error in
+            guard case let GitService.GitError.commandFailed(message) = error else {
+                return XCTFail("expected commandFailed, got \(error)")
+            }
+            // Git reports a hook rejection as its own status 1; the hook's
+            // arbitrary status is intentionally not propagated by Git.
+            XCTAssertTrue(message.contains("git commit exited with status 1"), message)
+            XCTAssertTrue(message.contains("hook stdout marker"), message)
+            XCTAssertTrue(message.contains("hook stderr marker"), message)
+            XCTAssertTrue(message.contains("output truncated"), message)
+            XCTAssertLessThan(message.utf8.count, 18_000, "hook output shown in the panel must stay bounded")
+        }
+
+        XCTAssertEqual(try gitOutput(["rev-parse", "HEAD"]), headBeforeCommit)
+        XCTAssertEqual(try gitOutput(["diff", "--cached", "--name-only"]), "pending.txt")
+        XCTAssertEqual(
+            try String(contentsOf: repo.appendingPathComponent("pending.txt"), encoding: .utf8),
+            "keep staged\n"
+        )
+    }
+
     func testStageAllAndUnstageAllRoundTripEveryChangeKind() throws {
         try write("modified.txt", "before\n")
         try write("deleted.txt", "delete me\n")
@@ -728,6 +795,12 @@ final class GitServiceTests: XCTestCase {
 
     private func write(_ name: String, _ contents: String) throws {
         try contents.write(to: repo.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
+    private func installCommitMessageHook(_ script: String) throws {
+        let hook = repo.appendingPathComponent(".git/hooks/commit-msg")
+        try script.write(to: hook, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
     }
 
     @discardableResult

@@ -12,7 +12,7 @@ const net = require('node:net')
 const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
-const { terminalCreateRoute } = require('./ipc/terminalCreateRoute.cjs')
+const { terminalAttachRoute, terminalCreateRoute, terminalKillRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
@@ -24,6 +24,11 @@ const {
   MAX_FRAME,
   atomicJson,
   brokerMethodAllowedForAccess,
+  negotiateFeatures,
+  eventPayloadForFeatures,
+  // Framing and queue accounting live in brokerWire so the observer layer can
+  // be exercised against the exact delivery verdict a real socket produces.
+  writeFrame: send,
 } = require('./ipc/brokerWire.cjs')
 
 const NO_CLIENT_EXIT_MS = process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_NO_CLIENT_EXIT_MS
@@ -133,18 +138,6 @@ function waitMilliseconds(milliseconds) {
   })
 }
 
-function send(socket, frame, { maxQueueBytes, force = false } = {}) {
-  if (!socket || socket.destroyed) return false
-  try {
-    const encoded = `${JSON.stringify(frame)}\n`
-    const frameBytes = Buffer.byteLength(encoded, 'utf8')
-    if (!force && Number.isFinite(maxQueueBytes) && socket.writableLength + frameBytes > maxQueueBytes) return false
-    return socket.write(encoded)
-  } catch {
-    return false // reconnect replays snapshots
-  }
-}
-
 const LEGACY_PROJECT_SCOPE = 'legacy'
 
 function projectScope(value) {
@@ -200,6 +193,9 @@ function detachInstance(instanceId) {
   if (!instanceId) return
   mgr.detachSenderPrefix(`${instanceId}|`)
   mgr.unsubscribeSubscriberPrefix(`${instanceId}|`)
+  // A pending exit wait can never be answered once the socket is gone, and the
+  // pty it watches may run for hours: drop those closures with the connection.
+  mgr.cancelExitWaitersPrefix(`${instanceId}|`)
   scheduleNoClientExit()
 }
 
@@ -208,7 +204,15 @@ mgr.setEventSink((owner, channel, payload, options) => {
   if (!parts) return false
   const client = clients.get(parts.instanceId)
   if (!client) return false
-  return send(client.socket, { type: 'event', ownerId: parts.ownerId, projectId: parts.projectId, channel, payload }, options)
+  return send(client.socket, {
+    type: 'event',
+    ownerId: parts.ownerId,
+    projectId: parts.projectId,
+    channel,
+    // One live broker serves app lanes of different vintages across a rolling
+    // update, so the shape is per-client, not per-broker.
+    payload: eventPayloadForFeatures(channel, payload, client.features),
+  }, options)
 })
 mgr.setActivitySink(() => noteActivity())
 
@@ -415,13 +419,13 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.attach': {
       const id = terminalId()
-      requireAllowed(id, true)
-      const continuity = mgr.setSender(id, owner)
-      const previousInstance = continuity?.previousOwner?.split('|')[0]
-      const continuation = continuity && previousInstance && previousInstance !== client.instanceId
-        ? { ...continuity, acrossRestart: true, reattachedAt: Date.now(), brokerPid: process.pid }
-        : null
-      return { ...mgr.snapshot(id), continuation }
+      return terminalAttachRoute({
+        manager: mgr,
+        id,
+        owner,
+        clientInstanceId: client.instanceId,
+        requireAllowed,
+      })
     }
     case 'terminal.subscribe': {
       if (admin) throw new Error('terminal observer requires an exact project capability')
@@ -483,8 +487,7 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.resize': {
       const id = terminalId()
-      requireAllowed(id)
-      return mgr.resize(id, Number(params.cols), Number(params.rows))
+      return terminalResizeRoute({ manager: mgr, id, params, requireAllowed })
     }
     case 'terminal.snapshot':
     case 'terminal.output': {
@@ -495,7 +498,9 @@ async function dispatch(client, method, params = {}) {
     case 'terminal.waitForExit': {
       const id = terminalId()
       requireAllowed(id)
-      return await mgr.waitForExit(id)
+      // The owner key is the wait's identity: it collapses a client's repeat
+      // asks onto one resolver and is what a socket close cancels by prefix.
+      return await mgr.waitForExit(id, { owner, timeoutMs: params.timeoutMs })
     }
     case 'terminal.signal': {
       const id = terminalId()
@@ -504,8 +509,7 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.kill': {
       const id = terminalId()
-      requireAllowed(id)
-      return { ok: mgr.kill(id) }
+      return terminalKillRoute({ manager: mgr, id, requireAllowed })
     }
     case 'terminal.release': {
       const id = terminalId()
@@ -575,6 +579,7 @@ function handleLine(client, line) {
     }
     client.instanceId = instanceId
     client.access = access
+    client.features = negotiateFeatures(frame.features)
     client.authenticated = true
     everConnected = true
     clients.set(instanceId, client)
@@ -589,6 +594,9 @@ function handleLine(client, line) {
       packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
       contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
       features: FEATURES,
+      // What this connection actually asked for and got, so a client never has
+      // to infer its own event shapes from the broker's full capability list.
+      negotiatedFeatures: [...client.features],
       access,
       pid: process.pid,
       startedAt: config.startedAt,
@@ -612,7 +620,15 @@ function handleLine(client, line) {
 
 function acceptClient(socket) {
   socket.setNoDelay(true)
-  const client = { socket, authenticated: false, instanceId: null, access: 'controller', buffer: '', decoder: new StringDecoder('utf8') }
+  const client = {
+    socket,
+    authenticated: false,
+    instanceId: null,
+    access: 'controller',
+    features: new Set(),
+    buffer: '',
+    decoder: new StringDecoder('utf8'),
+  }
   socket.on('data', (chunk) => {
     client.buffer += client.decoder.write(chunk)
     if (Buffer.byteLength(client.buffer) > MAX_FRAME) {

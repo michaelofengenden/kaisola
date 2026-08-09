@@ -777,6 +777,10 @@ actor AcpClient {
     /// Sensitive globs the fs bridge refuses to read or write (set by the
     /// conversation from the user's guardrails; defaults applied otherwise).
     private var fsSensitiveGlobs = AcpPermissionRules.defaultSensitiveGlobs
+    /// Built-ins retain the historical full client bridge. A custom adapter's
+    /// reviewed containment grant narrows advertised MCP/fs/terminal services
+    /// and is enforced again when a request arrives.
+    private var access = AcpAdapterAccess.unrestricted
     /// Mirrors Electron's MAX_TEXT_FILE_BYTES ACP fs limit.
     static let maxTextFileBytes = 8 * 1024 * 1024
 
@@ -811,7 +815,40 @@ actor AcpClient {
         environment: [String: String],
         cwd: String,
         mcpServers: [JSONValue],
-        resumeSessionID: String? = nil
+        resumeSessionID: String? = nil,
+        access: AcpAdapterAccess = .unrestricted
+    ) async throws -> AcpSessionInfo {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let session = try await startConnection(
+                command: command,
+                arguments: arguments,
+                environment: environment,
+                cwd: cwd,
+                mcpServers: mcpServers,
+                resumeSessionID: resumeSessionID,
+                access: access
+            )
+            if Task.isCancelled {
+                await stop()
+                throw CancellationError()
+            }
+            return session
+        } onCancel: {
+            // GUI task cancellation is an ownership close, including while the
+            // initialize/session handshake is still waiting for its first byte.
+            Task { await self.stop() }
+        }
+    }
+
+    private func startConnection(
+        command: String,
+        arguments: [String],
+        environment: [String: String],
+        cwd: String,
+        mcpServers: [JSONValue],
+        resumeSessionID: String?,
+        access: AcpAdapterAccess
     ) async throws -> AcpSessionInfo {
         connectionGeneration &+= 1
         let startGeneration = connectionGeneration
@@ -824,6 +861,7 @@ actor AcpClient {
         cancelPermissionRequests()
         toolCallReviewContextStore.removeAll(keepingCapacity: true)
         workspaceRoot = (cwd as NSString).standardizingPath
+        self.access = access
         do {
             try await transport.start(command: command, arguments: arguments, environment: environment, cwd: cwd)
             readerTask = Task { await readLoop(sourceConnectionGeneration: startGeneration) }
@@ -831,10 +869,13 @@ actor AcpClient {
             let initResult = try await request("initialize", params: .object([
             "protocolVersion": .integer(Int64(AcpWire.protocolVersion)),
             "clientCapabilities": .object([
-                "fs": .object(["readTextFile": .bool(true), "writeTextFile": .bool(true)]),
-                "terminal": .bool(true),
-                "auth": .object(["terminal": .bool(true)]),
-                "_meta": .object(["terminal-auth": .bool(true)]),
+                "fs": .object([
+                    "readTextFile": .bool(access.workspaceRead),
+                    "writeTextFile": .bool(access.workspaceWrite),
+                ]),
+                "terminal": .bool(access.hostTerminal),
+                "auth": .object(["terminal": .bool(access.hostTerminal)]),
+                "_meta": .object(["terminal-auth": .bool(access.hostTerminal)]),
             ]),
         ]))
         // ACP requires the client to disconnect when the negotiated protocol is
@@ -941,6 +982,7 @@ actor AcpClient {
             // reader task behind. This is especially important while users swap
             // agent profiles rapidly from the project menu.
             await stop()
+            if Task.isCancelled { throw CancellationError() }
             throw error
         }
     }
@@ -1077,19 +1119,22 @@ actor AcpClient {
         }
     }
 
-    /// Set an adapter config option (e.g. reasoning effort). The response echoes
-    /// the full option set, which is re-emitted so the UI reflects adapter-side
-    /// normalization.
-    func setConfigOption(id: String, value: String) async {
-        guard let sessionID else { return }
-        let result = try? await request("session/set_config_option", params: .object([
+    /// Set an adapter config option (e.g. reasoning effort) and return only the
+    /// option set the adapter confirmed. Callers must not present the requested
+    /// value before this succeeds: adapters can reject a level for one model or
+    /// normalize it to another supported value.
+    func setConfigOption(id: String, value: String) async throws -> [AcpConfigOption] {
+        guard let sessionID else { throw AcpClientError.notRunning }
+        let result = try await request("session/set_config_option", params: .object([
             "sessionId": .string(sessionID),
             "configId": .string(id),
             "value": .string(value),
         ]))
-        if let options = result?.objectValue?["configOptions"] {
-            eventHandler?(.configOptions(Self.parseConfigOptions(options)))
+        let options = Self.parseConfigOptions(result.objectValue?["configOptions"])
+        guard options.contains(where: { $0.id == id && $0.currentValue != nil }) else {
+            throw AcpClientError.malformedResponse
         }
+        return options
     }
 
     /// Resolve a pending permission request with the user's chosen option.
@@ -1165,9 +1210,14 @@ actor AcpClient {
     private func sessionMcpServers(_ servers: [JSONValue]) -> [JSONValue] {
         servers.filter { entry in
             switch entry.objectValue?["type"]?.stringValue {
-            case "http": capabilities.mcpHTTP
-            case "sse": capabilities.mcpSSE
-            default: true
+            case "http": access.network && capabilities.mcpHTTP
+            case "sse": access.network && capabilities.mcpSSE
+            case nil: access.childProcess
+            default:
+                // Preserve the historical pass-through for built-ins, but a
+                // contained adapter must never gain an unclassified transport
+                // through the broader child-process grant.
+                access == .unrestricted
             }
         }
     }
@@ -1256,12 +1306,14 @@ actor AcpClient {
             while !Task.isCancelled {
                 guard sourceConnectionGeneration == connectionGeneration else { return }
                 guard let data = try await transport.receive(maximumBytes: 256 * 1_024) else {
+                    guard sourceConnectionGeneration == connectionGeneration else { return }
                     guard !Task.isCancelled else { return }
                     // EOF is the transport connection closing. Reap the whole
                     // adapter-owned process group before publishing the exit;
                     // the adapter may have closed stdout while remaining alive.
                     await transport.terminate()
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled,
+                          sourceConnectionGeneration == connectionGeneration else { return }
                     let code = await transport.exitCode() ?? 0
                     connectionGeneration &+= 1
                     cancelPermissionRequests()
@@ -1295,7 +1347,8 @@ actor AcpClient {
             guard !Task.isCancelled,
                   sourceConnectionGeneration == connectionGeneration else { return }
             await transport.terminate()
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled,
+                  sourceConnectionGeneration == connectionGeneration else { return }
             connectionGeneration &+= 1
             cancelPermissionRequests()
             sessionID = nil
@@ -1593,6 +1646,14 @@ actor AcpClient {
 
     private func handleTerminalMethod(_ method: String, id: JSONValue?, params: JSONValue?) {
         guard let id else { return }
+        guard access.hostTerminal else {
+            respondError(
+                id: id,
+                code: -32000,
+                message: "Blocked by custom adapter containment: host terminals are unavailable; use a reviewed in-sandbox child-process grant instead."
+            )
+            return
+        }
         let object = params?.objectValue ?? [:]
         Task {
             do {
@@ -2274,6 +2335,14 @@ actor AcpClient {
 
     private func handleReadTextFile(id: JSONValue?, params: JSONValue?) {
         guard let id else { return }
+        guard access.workspaceRead else {
+            respondError(
+                id: id,
+                code: -32000,
+                message: "Blocked by custom adapter containment: workspace read was not approved."
+            )
+            return
+        }
         do {
             let path = try workspacePath(params?.objectValue?["path"]?.stringValue, mustExist: true)
             guard !AcpPermissionRules.pathIsSensitive(globs: fsSensitiveGlobs, pathish: path) else {
@@ -2292,6 +2361,14 @@ actor AcpClient {
 
     private func handleWriteTextFile(id: JSONValue?, params: JSONValue?) {
         guard let id else { return }
+        guard access.workspaceWrite else {
+            respondError(
+                id: id,
+                code: -32000,
+                message: "Blocked by custom adapter containment: workspace write was not approved."
+            )
+            return
+        }
         do {
             let content = params?.objectValue?["content"]?.stringValue ?? ""
             guard content.utf8.count <= Self.maxTextFileBytes else {

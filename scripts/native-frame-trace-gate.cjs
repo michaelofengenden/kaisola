@@ -36,6 +36,7 @@ function parseArguments(argv) {
     }
     if (argument === '--trace') options.trace = path.resolve(next())
     else if (argument === '--label') options.label = next()
+    else if (argument === '--target-pid') options.targetPid = Number(next())
     else if (argument === '--steady-start-s') options.steadyStartSeconds = Number(next())
     else if (argument === '--steady-end-s') options.steadyEndSeconds = Number(next())
     else if (argument === '--max-hitch-rate-ms-per-s') options.maximumHitchRateMsPerSecond = Number(next())
@@ -48,6 +49,10 @@ function parseArguments(argv) {
   }
   if (options.help) return options
   if (!options.trace || !options.output || !options.label) fail('--trace, --label, and --output are required')
+  if (options.targetPid != null
+      && (!Number.isSafeInteger(options.targetPid) || options.targetPid <= 0)) {
+    fail('--target-pid must be a positive integer')
+  }
   if (!(options.steadyStartSeconds >= 0)
       || !(options.steadyEndSeconds > options.steadyStartSeconds)) {
     fail('steady-state interval must be positive and ordered')
@@ -216,6 +221,7 @@ function analyzeTrace(options) {
     return {
       schemaVersion: SCHEMA_VERSION,
       label: options.label,
+      ...(options.targetPid == null ? {} : { targetPid: options.targetPid }),
       trace: options.trace,
       source: 'Xcode Animation Hitches trace exported by xctrace',
       recordingDurationSeconds: durationSeconds,
@@ -235,7 +241,8 @@ function analyzeTrace(options) {
 function usage() {
   return `Usage: node scripts/native-frame-trace-gate.cjs \\
   --trace /path/recording.trace --label native-streaming \\
-  --output /path/report.json [--steady-start-s 10] [--steady-end-s 20] \\
+  --output /path/report.json [--target-pid PID] \\
+  [--steady-start-s 10] [--steady-end-s 20] \\
   [--max-hitch-rate-ms-per-s 10] [--max-potential-hangs 0] \\
   [--max-update-p95-ms 8.33] [--max-render-p95-ms 8.33]`
 }

@@ -36,9 +36,9 @@ function parseArguments(argv) {
   return options
 }
 
-function validateReport(report) {
+function validateReport(report, expectedWorkload = workloadAliases.get('streaming')) {
   if (!report || report.schemaVersion !== 1) fail('frame cadence receipt schema drifted')
-  if (report.workload !== workloadAliases.get('streaming')) fail('frame cadence workload drifted')
+  if (report.workload !== expectedWorkload) fail('frame cadence workload drifted')
   if (!(report.measurementDurationSeconds >= 29.5 && report.measurementDurationSeconds <= 35)) {
     fail('frame cadence measurement duration drifted')
   }
@@ -73,8 +73,18 @@ function validateReport(report) {
     if (report.thresholds?.[key] !== value) fail(`frame cadence threshold drifted: ${key}`)
   }
   const checks = report.checks || {}
-  const calculatedPass = ['deadlineLossRate', 'p95Interval', 'maximumInterval', 'callbackCoverage']
-    .every((key) => checks[key] === true)
+  const calculatedChecks = {
+    deadlineLossRate:
+      report.deadlineLossRateMsPerSecond <= expectedThresholds.maximumDeadlineLossRateMsPerSecond,
+    p95Interval:
+      report.p95IntervalMs <= report.nominalFrameDurationMs * expectedThresholds.maximumP95IntervalFrames,
+    maximumInterval: report.maximumIntervalMs <= expectedThresholds.maximumIntervalMs,
+    callbackCoverage: report.callbackCoverage >= expectedThresholds.minimumCallbackCoverage,
+  }
+  for (const [key, expected] of Object.entries(calculatedChecks)) {
+    if (checks[key] !== expected) fail(`frame cadence check is inconsistent: ${key}`)
+  }
+  const calculatedPass = Object.values(calculatedChecks).every(Boolean)
   if (report.pass !== calculatedPass) fail('frame cadence pass receipt is inconsistent')
   return report
 }

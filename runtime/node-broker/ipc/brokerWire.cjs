@@ -25,6 +25,11 @@ const TERMINAL_HISTORY_CONTINUOUS_FEATURE = 'terminal-history-continuous-v1'
 const OBSERVER_ROLE_FEATURE = 'observer-role-v1'
 const BROKER_UPDATE_FEATURE = 'broker-update-v1'
 const BROKER_ROLLING_UPDATE_FEATURE = 'broker-rolling-update-v1'
+// terminal:exit:<id> shipped as a bare exit code, so a signal-killed session
+// arrived as an ordinary numeric exit and the cause was lost. Clients that
+// declare this feature receive the same { exitCode, signal } record the
+// observer channel already carries.
+const TERMINAL_EXIT_STATUS_FEATURE = 'terminal-exit-status-v1'
 const FEATURES = Object.freeze([
   TERMINAL_OBSERVE_FEATURE,
   TERMINAL_HISTORY_FEATURE,
@@ -32,7 +37,9 @@ const FEATURES = Object.freeze([
   OBSERVER_ROLE_FEATURE,
   BROKER_UPDATE_FEATURE,
   BROKER_ROLLING_UPDATE_FEATURE,
+  TERMINAL_EXIT_STATUS_FEATURE,
 ])
+const TERMINAL_EXIT_CHANNEL_PREFIX = 'terminal:exit:'
 const OBSERVER_ACCESS = 'observer'
 const OBSERVER_METHODS = Object.freeze([
   'broker.status',
@@ -66,6 +73,30 @@ function brokerMethodAllowedForAccess(access, method) {
   return access !== OBSERVER_ACCESS || observerMethodAllowed(method)
 }
 
+/** A client names the event shapes it can decode in its `hello` frame. Only
+ * features this broker actually implements survive, so a client can never talk
+ * an older broker into emitting a shape it does not know how to build. A
+ * client that names nothing keeps every legacy shape. */
+function negotiateFeatures(requested) {
+  const negotiated = new Set()
+  if (!Array.isArray(requested)) return negotiated
+  for (const value of requested) {
+    const name = String(value ?? '')
+    if (FEATURES.includes(name)) negotiated.add(name)
+  }
+  return negotiated
+}
+
+/** Downgrade one outbound event to what this client negotiated. The manager
+ * always emits the structured exit status; a client predating
+ * terminal-exit-status-v1 still receives the bare code it parses. */
+function eventPayloadForFeatures(channel, payload, features) {
+  if (!String(channel ?? '').startsWith(TERMINAL_EXIT_CHANNEL_PREFIX)) return payload
+  if (features?.has(TERMINAL_EXIT_STATUS_FEATURE)) return payload
+  if (payload && typeof payload === 'object') return payload.exitCode ?? 0
+  return payload
+}
+
 function brokerVersionsCompatible({ protocol, securityEpoch, implementationVersion }) {
   if (Number(protocol) !== PROTOCOL || Number(securityEpoch) !== SECURITY_EPOCH) return false
   // Protocol-2 brokers predating this additive field are implementation N.
@@ -86,6 +117,8 @@ module.exports = {
   OBSERVER_ROLE_FEATURE,
   BROKER_UPDATE_FEATURE,
   BROKER_ROLLING_UPDATE_FEATURE,
+  TERMINAL_EXIT_STATUS_FEATURE,
+  TERMINAL_EXIT_CHANNEL_PREFIX,
   FEATURES,
   OBSERVER_ACCESS,
   OBSERVER_METHODS,
@@ -94,4 +127,6 @@ module.exports = {
   observerMethodAllowed,
   brokerMethodAllowedForAccess,
   brokerVersionsCompatible,
+  negotiateFeatures,
+  eventPayloadForFeatures,
 }

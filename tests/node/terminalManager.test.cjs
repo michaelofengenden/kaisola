@@ -316,3 +316,32 @@ test('spool hot cache lives only while observed', async (t) => {
   manager.unsubscribeSubscriberPrefix('window-b|')
   assert.equal(record.spool.visible, false)
 })
+
+test('the renderer exit channel carries the signal that killed the session', async (t) => {
+  const id = 'signal-exit-keeps-its-cause'
+  const events = []
+  manager.setEventSink((sender, channel, payload) => {
+    events.push({ sender, channel, payload })
+    return true
+  })
+  t.after(() => {
+    manager.setEventSink(null)
+    manager.release(id)
+  })
+  manager.spawn({
+    id,
+    command: '/bin/sh',
+    args: ['-c', 'kill -TERM $$'],
+    cwd: managerSpoolDir,
+    sender: 'instance-a|1|project',
+  })
+
+  const exitStatus = await manager.waitForExit(id)
+  // SIGTERM leaves exitCode 0, so the code alone reads as a clean exit.
+  assert.deepEqual(exitStatus, { exitCode: 0, signal: 15 })
+  assert.deepEqual(events.filter((event) => event.channel === `terminal:exit:${id}`), [{
+    sender: 'instance-a|1|project',
+    channel: `terminal:exit:${id}`,
+    payload: { exitCode: 0, signal: 15 },
+  }])
+})

@@ -539,7 +539,11 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     rec.exitStatus = { exitCode: exitCode ?? 0, signal: signal ?? null }
     if (!shuttingDown) rec.spool.markExited(rec.exitStatus)
     settleAgentTurn()
-    send(rec.sender, `terminal:exit:${id}`, rec.exitStatus.exitCode)
+    // The whole status, not just the code: a signal-killed session exits 0 and
+    // would otherwise be indistinguishable from a clean one. Clients that never
+    // negotiated terminal-exit-status-v1 are downgraded back to the bare code
+    // by the broker's event sink — the manager does not track features.
+    send(rec.sender, `terminal:exit:${id}`, rec.exitStatus)
     rec.observers.broadcast('terminal:observer-exit', {
       id,
       streamEpoch: rec.cursor.streamEpoch,

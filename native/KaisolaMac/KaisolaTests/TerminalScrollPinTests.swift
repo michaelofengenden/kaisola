@@ -438,7 +438,7 @@ final class TerminalScrollPinTests: XCTestCase {
         )
         let claimed = try XCTUnwrap(cache.claim(
             sessionID: "continuous-scroll-cache",
-            isOwned: false
+            controllerCapable: false
         ))
         XCTAssertEqual(ObjectIdentifier(claimed.view), identity)
         XCTAssertEqual(claimed.view.continuousScrollSnapshot, afterResize)

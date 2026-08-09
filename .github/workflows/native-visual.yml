@@ -148,6 +148,7 @@ jobs:
             local surface="$1"
             local capture="$2"
             local profile
+            local log="$output/$surface.log"
             shift 2
             profile="$(mktemp -d "$fixture_profiles/$surface.XXXXXX")"
             mkdir -p "$profile/home" "$profile/tmp" "$profile/workspace"
@@ -168,7 +169,35 @@ jobs:
               KAISOLA_NATIVE_VISUAL_SURFACE="$surface" \
               KAISOLA_NATIVE_VISUAL_WORKSPACE="$profile/workspace" \
               KAISOLA_NATIVE_VISUAL_CAPTURE_PATH="$capture" \
-              "$@"; then
+              "$@" 2>&1 | tee "$log"; then
+              if [[ "$surface" == terminal-ownership-flap ]]; then
+                node - "$log" <<'NODE'
+          const fs = require('node:fs')
+          const prefix = 'KAISOLA_NATIVE_VISUAL_OWNERSHIP_FLAP='
+          const line = fs.readFileSync(process.argv[2], 'utf8')
+            .split(/\r?\n/u)
+            .find((entry) => entry.startsWith(prefix))
+          if (!line) throw new Error('missing terminal ownership-flap receipt')
+          const receipt = JSON.parse(line.slice(prefix.length))
+          if (receipt.ok !== true
+              || receipt.bytes !== 5 * 1024 * 1024
+              || receipt.sameView !== true
+              || receipt.sameCoordinator !== true
+              || receipt.sameTerminal !== true
+              || receipt.mountedView !== true
+              || receipt.selectionStable !== true
+              || receipt.scrollStable !== true
+              || receipt.cursorStable !== true
+              || receipt.linkStable !== true
+              || receipt.liveFollowStable !== true
+              || receipt.revokedPresentationObserved !== true
+              || receipt.discardNoticeVisible !== true
+              || receipt.discardNoticeRedacted !== true
+              || receipt.additionalReplayStarts !== 0) {
+            throw new Error(`invalid terminal ownership-flap receipt: ${JSON.stringify(receipt)}`)
+          }
+          NODE
+              fi
               echo "KAISOLA_NATIVE_VISUAL_SURFACE_END=$surface"
             else
               local status="$?"
@@ -259,7 +288,7 @@ jobs:
             "$output/dark-terminal-continuous-scroll.png" \
             "$output/dark-terminal-continuous-scroll.log"
 
-          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-transcript account-picker attention-completed companion-control mixed permission palette preview preview-narrow preview-code-editor preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file workspace-move topbar topbar-attention mesh onboarding settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-models settings-shortcuts settings-account-recovery usage; do
+          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-ownership-flap terminal-transcript account-picker attention-completed companion-control mixed permission palette preview preview-narrow preview-code-editor preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file workspace-move topbar topbar-attention mesh onboarding settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-models settings-shortcuts settings-account-recovery usage; do
             capture="$output/$surface.png"
             run_fixture "$surface" "$capture" \
               "$binary" -ApplePersistenceIgnoreState YES

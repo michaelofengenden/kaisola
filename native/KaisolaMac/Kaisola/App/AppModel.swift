@@ -269,7 +269,10 @@ final class AppModel: ObservableObject {
     private let workspaceStateStore: NativeWorkspaceStateStore
     private let transcriptStore: AcpTranscriptStore
     private let usageCenter: UsageCenter
+    private let usageAccountStore: UsageAccountStore
     private let attentionCenter: AttentionCenter
+    private let chatDraftDefaults: UserDefaults
+    private let migratedChatDraftDefaults: UserDefaults?
     private let reconnectBackoff: BrokerReconnectBackoff
     private let sleep: @Sendable (UInt64) async throws -> Void
     private let jitter: @Sendable () -> Double
@@ -363,7 +366,12 @@ final class AppModel: ObservableObject {
         transcriptStore: AcpTranscriptStore = .live,
         adoptionStore: SessionAdoptionStore = SessionAdoptionStore(),
         usageCenter: UsageCenter = .shared,
+        usageAccountStore: UsageAccountStore = UsageAccountStore(),
         attentionCenter: AttentionCenter = .shared,
+        chatDraftDefaults: UserDefaults = .standard,
+        migratedChatDraftDefaults: UserDefaults? = UserDefaults(
+            suiteName: KaisolaProductMigration.legacyBundleIdentifier
+        ),
         reconnectBackoff: BrokerReconnectBackoff = BrokerReconnectBackoff(),
         sleep: @escaping @Sendable (UInt64) async throws -> Void = {
             try await Task.sleep(nanoseconds: $0)
@@ -383,7 +391,10 @@ final class AppModel: ObservableObject {
         self.transcriptStore = transcriptStore
         self.adoptionStore = adoptionStore
         self.usageCenter = usageCenter
+        self.usageAccountStore = usageAccountStore
         self.attentionCenter = attentionCenter
+        self.chatDraftDefaults = chatDraftDefaults
+        self.migratedChatDraftDefaults = migratedChatDraftDefaults
         self.reconnectBackoff = reconnectBackoff
         self.sleep = sleep
         self.jitter = jitter
@@ -407,11 +418,17 @@ final class AppModel: ObservableObject {
         persistedSessionAliases = navigation.sessionAliases
         persistedPinnedIDs = SessionPinStore().pins()
         sessionAdoptions = adoptionStore.adoptions()
+        observeChatAccountAvailability()
     }
 
     /// Keeps each chat's usage observers alive only while that chat exists.
     /// Keying by id avoids retaining closed conversations and stale Usage rows.
     private var usageObservers: [String: Set<AnyCancellable>] = [:]
+    /// Account registry/auth changes can invalidate an adapter while its pane
+    /// remains open. Keep those non-destructive replacements alive through
+    /// window teardown, one ordered task per affected chat.
+    private var chatAccountInvalidationTasks: [String: Task<Void, Never>] = [:]
+    private var chatAccountObservers = Set<AnyCancellable>()
     private let usageSourceID = UUID().uuidString.lowercased()
     /// Serializes transcript actor enqueues so an immediate quit cannot overtake
     /// the final streaming row or an explicit chat removal.
@@ -2403,7 +2420,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func enqueueTranscriptSessionID(_ sessionID: String, chatID: String) {
+    private func enqueueTranscriptSessionID(_ sessionID: String?, chatID: String) {
         guard !explicitlyClosedChatIDs.contains(chatID) else { return }
         let previous = transcriptPersistenceTask
         let transcriptStore = transcriptStore
@@ -2413,19 +2430,36 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func enqueueTranscriptRemoval(chatID: String) {
+    @discardableResult
+    func enqueueTranscriptRemoval(
+        chatID: String
+    ) -> Task<AcpTranscriptStore.RemovalResult, Never> {
         explicitlyClosedChatIDs.insert(chatID)
         let previous = transcriptPersistenceTask
         let transcriptStore = transcriptStore
         let usageCenter = usageCenter
-        transcriptPersistenceTask = Task {
+        let removalTask = Task {
             await previous?.value
             // Usage and transcript writes use separate coalescing queues during
             // normal streaming. On explicit close, drain usage first and make
             // the full transcript deletion the final actor operation.
             await usageCenter.flushPersistence()
-            await transcriptStore.remove(chatID: chatID)
+            return await transcriptStore.remove(chatID: chatID)
         }
+        transcriptPersistenceTask = Task {
+            _ = await removalTask.value
+        }
+        return removalTask
+    }
+
+    private func removeTranscripts(
+        chatIDs: [String]
+    ) async -> AcpTranscriptStore.RemovalResult {
+        for chatID in chatIDs {
+            let result = await enqueueTranscriptRemoval(chatID: chatID).value
+            if case .failed = result { return result }
+        }
+        return .removed
     }
 
     func flushTranscriptPersistence() async {
@@ -2564,17 +2598,34 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func enqueueDraftRemoval(chatID: String) {
+    @discardableResult
+    private func enqueueDraftRemoval(chatID: String) -> Task<Void, Never> {
         enqueueDraftRemoval(stableKey: "chat|\(chatID)")
     }
 
-    private func enqueueDraftRemoval(stableKey: String) {
+    @discardableResult
+    private func enqueueDraftRemoval(stableKey: String) -> Task<Void, Never> {
         let previous = draftPersistenceTask
         let workspaceStateStore = workspaceStateStore
-        draftPersistenceTask = Task {
+        let removalTask = Task {
             await previous?.value
             try? await workspaceStateStore.removeDraft(stableKey: stableKey)
         }
+        draftPersistenceTask = removalTask
+        return removalTask
+    }
+
+    /// The durable deletion intent has already committed before this runs.
+    /// Serialize the workspace removal behind older saves, and synchronously
+    /// clear AcpConversation's current and migrated UserDefaults copies so no
+    /// superseded location can restore plaintext on relaunch.
+    private func removeChatDraftsAfterDeletionCommit(chatID: String) async {
+        AcpConversation.removePersistedDraft(
+            for: chatID,
+            currentDefaults: chatDraftDefaults,
+            migratedDefaults: migratedChatDraftDefaults
+        )
+        await enqueueDraftRemoval(chatID: chatID).value
     }
 
     private static func terminalDraftStableKey(_ terminalID: String) -> String {
@@ -2726,8 +2777,10 @@ final class AppModel: ObservableObject {
                       chats.contains(where: { $0.id == descriptor.id }) == false,
                       // A tombstoned chat was deleted; a stale archived pane
                       // (crash between phases, another window) must not
-                      // revive it (§4e).
-                      await transcriptStore.isTombstoned(chatID: descriptor.id) == false,
+                      // revive it (§4e). Only a proven `.absent` restores, so a
+                      // lookup the store cannot complete on a busy, corrupt, or
+                      // unreadable database leaves the pane out instead.
+                      await transcriptStore.tombstoneState(chatID: descriptor.id) == .absent,
                       let agent = AgentRegistry.profile(id: descriptor.agentID) else { continue }
                 let directory = URL(fileURLWithPath: descriptor.workspacePath, isDirectory: true)
                     .standardizedFileURL
@@ -2749,6 +2802,7 @@ final class AppModel: ObservableObject {
                     resumeSessionID: descriptor.acpSessionID ?? transcript?.sessionID,
                     accountBinding: descriptor.accountBinding,
                     modelOverride: descriptor.modelOverride,
+                    requiresAccountResolution: true,
                     initialTranscript: transcript,
                     initialDraft: draft,
                     initialQueuedPrompts: descriptor.queuedPrompts
@@ -3104,6 +3158,8 @@ final class AppModel: ObservableObject {
         resumeSessionID: String?,
         accountBinding: SessionAccountBinding?,
         modelOverride: String? = nil,
+        accountAccess: ChatAccountAccess? = nil,
+        requiresAccountResolution: Bool = false,
         initialTranscript: AcpTranscriptStore.Restoration?,
         initialDraft: String?,
         initialQueuedPrompts: [String]
@@ -3252,17 +3308,29 @@ final class AppModel: ObservableObject {
         conversation.onQueueChanged = { [weak self] _ in
             self?.scheduleWorkspaceStateSave(projectID: projectID)
         }
+        let accountAccess = accountAccess ?? ChatAccountAccess(
+            binding: accountBinding,
+            requiresResolution: requiresAccountResolution
+        )
         let handle = AcpChatHandle(
             id: chatID,
             agentID: agent.id,
             workspaceDirectory: directory,
             accountBinding: accountBinding,
             modelOverride: modelOverride,
+            accountAccess: accountAccess,
             conversation: conversation
         )
+        accountAccess.onResumeInvalidationRequired = { [weak self] in
+            self?.scheduleChatResumeInvalidation(chatID)
+        }
         chats.append(handle)
         surfaceObservers[chatID] = conversation.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
+        }
+        reconcileChatAccountAvailability(for: handle)
+        if requiresAccountResolution, accountAccess.phase == .resolving {
+            usageCenter.refreshPlanUsage(workspace: directory, force: false)
         }
         return handle
     }
@@ -3342,20 +3410,20 @@ final class AppModel: ObservableObject {
     }
 
     /// The explicit permanent-delete boundary for a live chat.
-    func deleteChat(_ chatID: String) async {
+    @discardableResult
+    func deleteChat(_ chatID: String) async -> AcpTranscriptStore.RemovalResult {
         // Tombstone FIRST (§4e): the durable record of intent that every
         // later phase — and every other window sharing the database —
         // converges on, even across a crash. A failed write aborts the
         // delete instead of reporting success. If the app dies before this
         // lands, the delete simply didn't happen — never half-happened.
-        do {
-            try await transcriptStore.tombstone(chatID: chatID)
-        } catch {
+        let tombstoneResult = await transcriptStore.tombstone(chatID: chatID)
+        if case let .failed(error) = tombstoneResult {
             ToastCenter.shared.show(
                 "Couldn't delete the chat: \(error.kaisolaSafeDescription)",
                 style: .error
             )
-            return
+            return .failed(error)
         }
         let closingChat = chats.first(where: { $0.id == chatID })
         if let closingChat {
@@ -3390,13 +3458,190 @@ final class AppModel: ObservableObject {
         // goes — the old forgetDurableChat gate could leave tombstoned
         // content on disk forever when usage bookkeeping said "shared".
         _ = forgetDurableChat
-        enqueueTranscriptRemoval(chatID: chatID)
-        enqueueDraftRemoval(chatID: chatID)
+        let removalResult = await enqueueTranscriptRemoval(chatID: chatID).value
+        await removeChatDraftsAfterDeletionCommit(chatID: chatID)
         // The workspace archive must reflect the deletion durably NOW, not
         // after a 220 ms debounce a crash can beat (§4e).
         if let projectID = closingChat?.projectID {
             Task { await persistWorkspaceStateImmediately(projectID: projectID) }
         }
+        if case let .failed(error) = removalResult {
+            ToastCenter.shared.show(
+                "Chat deletion is saved, but transcript removal will retry: \(error.kaisolaSafeDescription)",
+                style: .error
+            )
+        }
+        return removalResult
+    }
+
+    /// Keep restored chat startup and live-account invalidation on the same
+    /// local truth used by Usage settings. Published readings cover logout;
+    /// the account-list notification covers removal and successful sign-in.
+    private func observeChatAccountAvailability() {
+        usageCenter.$planUsage
+            .combineLatest(usageCenter.$isRefreshingPlanUsage)
+            .sink { [weak self] readings, isRefreshing in
+                guard let self else { return }
+                self.reconcileChatAccountAvailability(
+                    profiles: self.usageAccountStore.profiles(),
+                    readings: readings,
+                    isRefreshing: isRefreshing
+                )
+            }
+            .store(in: &chatAccountObservers)
+        NotificationCenter.default.publisher(for: .kaisolaUsageAccountsChanged)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                // An add/remove/sign-in changes the credential fingerprint.
+                // Do not let the preceding context's cached success unlock a
+                // continuation before the forced probe returns.
+                self.reconcileChatAccountAvailability(
+                    profiles: self.usageAccountStore.profiles(),
+                    readings: [],
+                    isRefreshing: true
+                )
+                self.usageCenter.refreshPlanUsage(
+                    workspace: self.currentProjectDirectory,
+                    force: true
+                )
+            }
+            .store(in: &chatAccountObservers)
+    }
+
+    private func reconcileChatAccountAvailability(
+        profiles: [UsageAccountProfile]? = nil,
+        readings: [UsageCenter.ProviderPlanUsage]? = nil,
+        isRefreshing: Bool? = nil,
+        now: Date = Date()
+    ) {
+        let profiles = profiles ?? usageAccountStore.profiles()
+        let readings = readings ?? usageCenter.planUsage
+        let isRefreshing = isRefreshing ?? usageCenter.isRefreshingPlanUsage
+        for chat in chats {
+            reconcileChatAccountAvailability(
+                for: chat,
+                profiles: profiles,
+                readings: readings,
+                isRefreshing: isRefreshing,
+                now: now
+            )
+        }
+    }
+
+    private func reconcileChatAccountAvailability(
+        for chat: AcpChatHandle,
+        profiles: [UsageAccountProfile]? = nil,
+        readings: [UsageCenter.ProviderPlanUsage]? = nil,
+        isRefreshing: Bool? = nil,
+        now: Date = Date()
+    ) {
+        let transition = chat.accountAccess.reconcile(.init(
+            profiles: profiles ?? usageAccountStore.profiles(),
+            readings: readings ?? usageCenter.planUsage,
+            isRefreshing: isRefreshing ?? usageCenter.isRefreshingPlanUsage,
+            now: now
+        ))
+        if transition == .requiresResumeInvalidation {
+            scheduleChatResumeInvalidation(chat.id)
+        }
+    }
+
+    private func scheduleChatResumeInvalidation(_ chatID: String) {
+        guard chats.contains(where: { $0.id == chatID }),
+              chatAccountInvalidationTasks[chatID] == nil else { return }
+        chatAccountInvalidationTasks[chatID] = Task { @MainActor [weak self] in
+            await self?.invalidateChatResumeIdentity(chatID)
+            self?.chatAccountInvalidationTasks[chatID] = nil
+        }
+    }
+
+    /// Replace only the adapter-bearing handle, with no provider resume id.
+    /// The stable chat id, pane, selection, transcript, draft, attachments and
+    /// queued follow-ups survive; the stopped process cannot become a zombie.
+    private func invalidateChatResumeIdentity(_ chatID: String) async {
+        guard let chat = chats.first(where: { $0.id == chatID }),
+              let agent = AgentRegistry.profile(id: chat.agentID) else { return }
+        let finalDraft = await chat.conversation.stop()
+        if let finalDraft {
+            enqueueDraftSave(
+                finalDraft,
+                chatID: chatID,
+                projectID: chat.projectID,
+                agentID: chat.agentID,
+                workspacePath: chat.workspaceDirectory.path
+            )
+        }
+        await flushTranscriptPersistence()
+        let transcript = await restoredTranscript(for: chatID)
+        guard let live = chats.first(where: { $0.id == chatID }),
+              live.conversation === chat.conversation else { return }
+
+        let queued = chat.conversation.queued.map(\.text)
+        chats.removeAll { $0.id == chatID }
+        usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
+        usageCenter.unregister(chatID: chatID, sourceID: usageSourceID, forgetWhenLast: false)
+        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        enqueueTranscriptSessionID(nil, chatID: chatID)
+        guard appendChat(
+            id: chatID,
+            agent: agent,
+            directory: chat.workspaceDirectory,
+            title: chat.conversation.title,
+            resumeSessionID: nil,
+            accountBinding: chat.accountBinding,
+            modelOverride: chat.modelOverride,
+            accountAccess: chat.accountAccess,
+            initialTranscript: transcript,
+            initialDraft: finalDraft ?? transcript?.draft,
+            initialQueuedPrompts: queued
+        ) != nil else { return }
+        scheduleWorkspaceStateSave(projectID: chat.projectID)
+    }
+
+    /// Profile used by the recovery card's direct Sign In sheet. If the user
+    /// had removed the registry entry, this explicit action re-registers the
+    /// exact immutable id/path before authentication begins.
+    func accountSignInProfile(for chatID: String) -> UsageAccountProfile? {
+        guard let chat = chats.first(where: { $0.id == chatID }),
+              let binding = chat.accountBinding,
+              let accountID = binding.accountID else { return nil }
+        let requested = UsageAccountProfile(
+            id: accountID,
+            provider: binding.provider,
+            label: binding.label,
+            directory: binding.configDirectory
+        )
+        let profile = usageAccountStore.profiles().first(where: {
+            guard $0.id == accountID, $0.provider == binding.provider else { return false }
+            return SessionAccountBinding.resolve(
+                provider: $0.provider,
+                profile: $0,
+                fallbackEnvironment: [:]
+            )?.continuationKey == binding.continuationKey
+        }) ?? usageAccountStore.restore(requested)
+        guard let profile else { return nil }
+        chat.accountAccess.beginRecovery()
+        NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+        return profile
+    }
+
+    /// Explicitly confirms the non-destructive path advertised by the blocked
+    /// state. This never removes the pane or transcript; it only makes sure the
+    /// adapter is stopped and the latest debounced draft is durable.
+    func preserveBlockedChat(_ chatID: String) async {
+        if let task = chatAccountInvalidationTasks[chatID] { await task.value }
+        guard let chat = chats.first(where: { $0.id == chatID }) else { return }
+        if let finalDraft = await chat.conversation.stop() {
+            enqueueDraftSave(
+                finalDraft,
+                chatID: chatID,
+                projectID: chat.projectID,
+                agentID: chat.agentID,
+                workspacePath: chat.workspaceDirectory.path
+            )
+            await draftPersistenceTask?.value
+        }
+        ToastCenter.shared.show("Transcript and draft kept. No agent is running.", style: .success)
     }
 
     /// Stop the adapter without deleting the surface, transcript, or draft.
@@ -3420,6 +3665,7 @@ final class AppModel: ObservableObject {
     /// is what asking to switch *now* means — and the queue then flushes into
     /// the new session.
     func switchChatAccount(_ chatID: String, to profile: UsageAccountProfile?) async {
+        if let task = chatAccountInvalidationTasks[chatID] { await task.value }
         guard let chat = chats.first(where: { $0.id == chatID }),
               let agent = AgentRegistry.profile(id: chat.agentID) else { return }
         let projectID = chat.projectID
@@ -3450,6 +3696,7 @@ final class AppModel: ObservableObject {
         let directory = chat.workspaceDirectory
         let title = chat.conversation.title
         let queued = chat.conversation.queued.map(\.text)
+        let requiresAccountResolution = !chat.accountAccess.allowsAdapterStart
         // Stop the adapter and let every buffered row and the draft reach the
         // store before the transcript is read back for the new handle.
         let finalDraft = await chat.conversation.stop()
@@ -3474,6 +3721,7 @@ final class AppModel: ObservableObject {
             resumeSessionID: nil,
             accountBinding: binding,
             modelOverride: chat.modelOverride,
+            requiresAccountResolution: requiresAccountResolution,
             initialTranscript: transcript,
             initialDraft: finalDraft ?? transcript?.draft,
             initialQueuedPrompts: queued
@@ -3486,8 +3734,10 @@ final class AppModel: ObservableObject {
         }
         scheduleWorkspaceStateSave(projectID: projectID)
         ToastCenter.shared.show(
-            "Switched to \(binding.label). Fresh provider session; the transcript stays.",
-            style: .success
+            requiresAccountResolution
+                ? "Checking \(binding.label) before starting. The transcript stays."
+                : "Switched to \(binding.label). Fresh provider session; the transcript stays.",
+            style: requiresAccountResolution ? .info : .success
         )
     }
 
@@ -3678,7 +3928,12 @@ final class AppModel: ObservableObject {
             var layout = paneLayouts[projectID] ?? SessionPaneLayout()
             layout.remove(meshID)
             paneLayouts[projectID] = layout
-            for columnID in columnIDs { enqueueTranscriptRemoval(chatID: columnID) }
+            let transcriptRemoval = await removeTranscripts(chatIDs: columnIDs)
+            if case let .failed(error) = transcriptRemoval {
+                return .blocked(
+                    "Mesh cleanup is saved, but transcript removal will retry: \(error.kaisolaSafeDescription)"
+                )
+            }
             enqueueDraftRemoval(stableKey: "mesh|\(meshID)")
             await persistWorkspaceStateImmediately(projectID: projectID)
             return .closed
@@ -3752,6 +4007,7 @@ final class AppModel: ObservableObject {
                 resumeSessionID: descriptor.acpSessionID ?? transcript?.sessionID,
                 accountBinding: descriptor.accountBinding,
                 modelOverride: descriptor.modelOverride,
+                requiresAccountResolution: true,
                 initialTranscript: transcript,
                 initialDraft: draft,
                 initialQueuedPrompts: descriptor.queuedPrompts
@@ -3835,9 +4091,14 @@ final class AppModel: ObservableObject {
             _ = removeRecentlyClosedPane(id: surfaceID)
             explicitlyClosedChatIDs.insert(surfaceID)
             usageCenter.remove(chatID: surfaceID)
-            enqueueTranscriptRemoval(chatID: surfaceID)
-            enqueueDraftRemoval(chatID: surfaceID)
+            let transcriptRemoval = await enqueueTranscriptRemoval(chatID: surfaceID).value
+            await removeChatDraftsAfterDeletionCommit(chatID: surfaceID)
             await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
+            if case let .failed(error) = transcriptRemoval {
+                return .blocked(
+                    "The deletion is saved, but transcript removal will retry: \(error.kaisolaSafeDescription)"
+                )
+            }
             ToastCenter.shared.show("Permanently deleted chat", style: .success)
             return .completed
         }
@@ -3856,7 +4117,12 @@ final class AppModel: ObservableObject {
         case .safe:
             // The user crossed the permanent-delete boundary. Remove column
             // data even if writing the final archive tombstone needs a retry.
-            for columnID in columnIDs { enqueueTranscriptRemoval(chatID: columnID) }
+            let transcriptRemoval = await removeTranscripts(chatIDs: columnIDs)
+            if case let .failed(error) = transcriptRemoval {
+                return .blocked(
+                    "Mesh cleanup is saved, but transcript removal will retry: \(error.kaisolaSafeDescription)"
+                )
+            }
             enqueueDraftRemoval(stableKey: "mesh|\(surfaceID)")
             do {
                 try await workspaceStateStore.removeMeshState(
@@ -3932,6 +4198,8 @@ final class AppModel: ObservableObject {
     /// and drop broker connections. Mesh Git worktrees deliberately remain
     /// registered; only an explicit, safety-checked permanent Delete may destroy them.
     func teardown() async {
+        for task in chatAccountInvalidationTasks.values { await task.value }
+        chatAccountInvalidationTasks.removeAll()
         // Save the user's restorable truth before asking any adapter or mesh to
         // stop. A provider shutdown can stall, but a bounded application quit
         // must still retain the latest file deck, cursor, drafts, transcripts,

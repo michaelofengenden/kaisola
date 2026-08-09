@@ -97,6 +97,246 @@ final class AcpClientTests: XCTestCase {
         _ = await conversation.stop()
     }
 
+    func testFailedSendPayloadStoreEvictsOldestAtExactAggregateBudget() throws {
+        let attachment = AcpAttachment.image(
+            data: Data(repeating: 0xA5, count: 1_024),
+            mimeType: "image/png",
+            name: "near-limit.png"
+        )
+        let payloadBytes = AcpFailedSendPayloadStore.payloadByteCount(
+            text: "retry",
+            attachments: [attachment]
+        )
+        var store = AcpFailedSendPayloadStore(
+            maximumCount: 3,
+            maximumBytes: payloadBytes * 2
+        )
+
+        XCTAssertEqual(
+            store.retain(rowID: "user-1", text: "retry", attachments: [attachment]),
+            .init(retained: true, evictedRowIDs: [])
+        )
+        XCTAssertEqual(
+            store.retain(rowID: "user-2", text: "retry", attachments: [attachment]),
+            .init(retained: true, evictedRowIDs: [])
+        )
+        XCTAssertEqual(store.count, 2)
+        XCTAssertEqual(store.retainedBytes, payloadBytes * 2)
+
+        XCTAssertEqual(
+            store.retain(rowID: "user-3", text: "retry", attachments: [attachment]),
+            .init(retained: true, evictedRowIDs: ["user-1"])
+        )
+        XCTAssertEqual(store.count, 2)
+        XCTAssertEqual(store.retainedBytes, payloadBytes * 2)
+        XCTAssertNil(store.remove(rowID: "user-1"))
+        XCTAssertEqual(store.remove(rowID: "user-2")?.attachments, [attachment])
+        XCTAssertEqual(store.count, 1)
+        XCTAssertEqual(store.retainedBytes, payloadBytes)
+
+        let oversized = AcpAttachment.image(
+            data: Data(repeating: 0x5A, count: payloadBytes * 2),
+            mimeType: "image/png",
+            name: "too-large.png"
+        )
+        XCTAssertFalse(
+            store.retain(rowID: "user-4", text: "retry", attachments: [oversized]).retained
+        )
+        XCTAssertEqual(store.count, 1, "an oversized new payload must not evict a safe older one")
+        XCTAssertEqual(store.retainedBytes, payloadBytes)
+        store.removeAll()
+        XCTAssertEqual(store.count, 0)
+        XCTAssertEqual(store.retainedBytes, 0)
+
+        var countBoundStore = AcpFailedSendPayloadStore(
+            maximumCount: 2,
+            maximumBytes: payloadBytes * 3
+        )
+        _ = countBoundStore.retain(rowID: "user-1", text: "retry", attachments: [attachment])
+        _ = countBoundStore.retain(rowID: "user-2", text: "retry", attachments: [attachment])
+        XCTAssertEqual(
+            countBoundStore.retain(rowID: "user-3", text: "retry", attachments: [attachment]),
+            .init(retained: true, evictedRowIDs: ["user-1"])
+        )
+        XCTAssertEqual(countBoundStore.count, 2)
+        XCTAssertEqual(countBoundStore.retainedBytes, payloadBytes * 2)
+    }
+
+    @MainActor
+    func testRepeatedFailedAttachmentsPublishBoundedEvictionStatusAndStopReleasesThem() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-failed-send-budget-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("near-limit.txt")
+        let contents = String(repeating: "x", count: 4_096)
+        try contents.write(to: fileURL, atomically: true, encoding: .utf8)
+        let retainedAttachment = AcpAttachment.textFile(
+            path: fileURL.path,
+            contents: contents,
+            name: fileURL.lastPathComponent
+        )
+        let payloadBytes = AcpFailedSendPayloadStore.payloadByteCount(
+            text: "retry",
+            attachments: [retainedAttachment]
+        )
+        let transport = ScriptedAcpTransport(promptErrorMessage: "synthetic prompt failure")
+        let conversation = AcpConversation(
+            title: "Failed-send budget",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: directory.path,
+            client: AcpClient(transport: transport),
+            failedSendPayloadMaximumCount: 3,
+            failedSendPayloadMaximumBytes: payloadBytes * 2
+        )
+        await conversation.start()
+
+        for expectedFailureCount in 1...3 {
+            conversation.addAttachment(fileURL: fileURL)
+            XCTAssertEqual(conversation.pendingAttachments.count, 1)
+            XCTAssertTrue(conversation.send("retry"))
+            try await Self.until("failed prompt \(expectedFailureCount) settled") {
+                !conversation.isRunning && conversation.rows.filter { row in
+                    if case let .user(_, _, failed) = row { return failed }
+                    return false
+                }.count == expectedFailureCount
+            }
+        }
+
+        XCTAssertEqual(conversation.retainedFailedSendPayloadCount, 2)
+        XCTAssertEqual(conversation.retainedFailedSendPayloadBytes, payloadBytes * 2)
+        XCTAssertEqual(
+            conversation.statusMessage,
+            "Retry data for 1 older failed message was discarded to keep failed-send storage bounded."
+        )
+        XCTAssertLessThanOrEqual(conversation.statusMessage?.utf8.count ?? .max, 128)
+
+        _ = await conversation.stop()
+        XCTAssertEqual(conversation.retainedFailedSendPayloadCount, 0)
+        XCTAssertEqual(conversation.retainedFailedSendPayloadBytes, 0)
+    }
+
+    @MainActor
+    func testStopReleasesPayloadRecordedByAnInFlightPromptFailure() async throws {
+        let transport = ScriptedAcpTransport(holdPromptOpen: true)
+        let conversation = AcpConversation(
+            title: "Stop during prompt",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+        XCTAssertTrue(conversation.send("in flight"))
+        try await Self.until("the prompt reached the adapter") {
+            await transport.receivedPromptBlocks().count == 1
+        }
+
+        _ = await conversation.stop()
+        XCTAssertEqual(conversation.retainedFailedSendPayloadCount, 0)
+        XCTAssertEqual(conversation.retainedFailedSendPayloadBytes, 0)
+    }
+
+    @MainActor
+    func testFailedAttachmentRetryUsesTheCapturedSnapshotAfterTheSourceIsDeleted() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-failed-send-snapshot-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("evidence.txt")
+        let originalContents = "original private snapshot"
+        try originalContents.write(to: fileURL, atomically: true, encoding: .utf8)
+
+        let crashedTransport = ScriptedAcpTransport(
+            crashOnFirstPrompt: true,
+            promptEmbeddedContext: true
+        )
+        let recoveredTransport = ScriptedAcpTransport(promptEmbeddedContext: true)
+        let clients = [
+            AcpClient(transport: crashedTransport),
+            AcpClient(transport: recoveredTransport),
+        ]
+        var clientIndex = 0
+        let conversation = AcpConversation(
+            title: "Retry snapshot",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: directory.path,
+            clientFactory: {
+                let client = clients[clientIndex]
+                clientIndex += 1
+                return client
+            }
+        )
+        await conversation.start()
+        conversation.addAttachment(fileURL: fileURL)
+        XCTAssertTrue(conversation.send("review evidence"))
+        try await Self.until("the attachment prompt failed") {
+            !conversation.isConnected && !conversation.isRunning
+        }
+        XCTAssertEqual(conversation.retainedFailedSendPayloadCount, 1)
+        let failedRowID = try XCTUnwrap(conversation.rows.first(where: { row in
+            if case let .user(_, _, failed) = row { return failed }
+            return false
+        })?.id)
+
+        try "replacement contents".write(to: fileURL, atomically: true, encoding: .utf8)
+        try FileManager.default.removeItem(at: fileURL)
+        await conversation.restart()
+        conversation.retryFailed(failedRowID)
+        try await Self.until("the captured attachment retry completed") {
+            !conversation.isRunning
+        }
+
+        let recoveredPromptBlocks = await recoveredTransport.receivedPromptBlocks()
+        let blocks = try XCTUnwrap(recoveredPromptBlocks.first)
+        XCTAssertEqual(blocks.count, 2)
+        XCTAssertEqual(
+            blocks[1].objectValue?["resource"]?.objectValue?["text"],
+            .string(originalContents),
+            "Retry must use the captured value, never reread a changed or deleted path"
+        )
+        XCTAssertEqual(conversation.retainedFailedSendPayloadCount, 0)
+        XCTAssertEqual(conversation.retainedFailedSendPayloadBytes, 0)
+        _ = await conversation.stop()
+    }
+
+    @MainActor
+    func testPersistedFailedRowRestoresNoRetryAttachmentPayload() async throws {
+        let transport = ScriptedAcpTransport(promptEmbeddedContext: true)
+        let conversation = AcpConversation(
+            title: "Durable transcript",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            client: AcpClient(transport: transport),
+            initialRows: [
+                .user(id: "persisted", text: "review evidence\n📎 secret.txt", failed: true),
+            ]
+        )
+        await conversation.start()
+        XCTAssertEqual(conversation.retainedFailedSendPayloadCount, 0)
+        XCTAssertEqual(conversation.retainedFailedSendPayloadBytes, 0)
+
+        conversation.retryFailed("user-persisted")
+        try await Self.until("the restored text-only retry completed") {
+            !conversation.isRunning
+        }
+        let receivedPromptBlocks = await transport.receivedPromptBlocks()
+        let blocks = try XCTUnwrap(receivedPromptBlocks.first)
+        XCTAssertEqual(blocks.count, 1, "failed-send attachments must never be restored from transcript state")
+        XCTAssertEqual(
+            blocks.first?.objectValue?["text"],
+            .string("review evidence\n📎 secret.txt")
+        )
+        _ = await conversation.stop()
+    }
+
     @MainActor
     func testInjectingQueuedMessageLeavesTheTurnAndItsPermissionsAlone() async throws {
         let transport = ScriptedAcpTransport()
@@ -904,6 +1144,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private let resumeCapability: Bool
     private let rejectRestoration: Bool
     private let crashOnFirstPrompt: Bool
+    private let promptErrorMessage: String?
+    private let holdPromptOpen: Bool
+    private let promptEmbeddedContext: Bool
     private let steeringSupported: Bool
     private let steerOutcome: String?
     private let steerErrorMessage: String?
@@ -912,6 +1155,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var sessionMcpAttempts: [[JSONValue]] = []
     private var sessionMethods: [String] = []
     private var promptTexts: [String] = []
+    private var promptBlocks: [[JSONValue]] = []
     private var steerRequests: [JSONValue] = []
     private var permissionResponses: [Int64: JSONValue] = [:]
     private var didCrashPrompt = false
@@ -926,6 +1170,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         resumeCapability: Bool = false,
         rejectRestoration: Bool = false,
         crashOnFirstPrompt: Bool = false,
+        promptErrorMessage: String? = nil,
+        holdPromptOpen: Bool = false,
+        promptEmbeddedContext: Bool = false,
         steeringSupported: Bool = true,
         steerOutcome: String? = "injected",
         steerErrorMessage: String? = nil,
@@ -938,6 +1185,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         self.resumeCapability = resumeCapability
         self.rejectRestoration = rejectRestoration
         self.crashOnFirstPrompt = crashOnFirstPrompt
+        self.promptErrorMessage = promptErrorMessage
+        self.holdPromptOpen = holdPromptOpen
+        self.promptEmbeddedContext = promptEmbeddedContext
         self.steeringSupported = steeringSupported
         self.steerOutcome = steerOutcome
         self.steerErrorMessage = steerErrorMessage
@@ -948,6 +1198,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func receivedSessionMcpAttempts() -> [[JSONValue]] { sessionMcpAttempts }
     func receivedSessionMethods() -> [String] { sessionMethods }
     func receivedPromptTexts() -> [String] { promptTexts }
+    func receivedPromptBlocks() -> [[JSONValue]] { promptBlocks }
     func receivedSteerRequests() -> [JSONValue] { steerRequests }
     func permissionResponse(for wireID: Int64) -> JSONValue? { permissionResponses[wireID] }
     func terminationCount() -> Int { terminations }
@@ -1016,6 +1267,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                     "mcpCapabilities": .object([
                         "http": .bool(mcpHTTP),
                         "sse": .bool(mcpSSE),
+                    ]),
+                    "promptCapabilities": .object([
+                        "embeddedContext": .bool(promptEmbeddedContext),
                     ]),
                 ]),
                 // Sibling of `agentCapabilities`, exactly where both shipping
@@ -1108,8 +1362,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                 ]),
             ]))
         case "session/prompt":
-            if let text = object["params"]?.objectValue?["prompt"]?.arrayValue?
-                .first?.objectValue?["text"]?.stringValue {
+            let blocks = object["params"]?.objectValue?["prompt"]?.arrayValue ?? []
+            promptBlocks.append(blocks)
+            if let text = blocks.first?.objectValue?["text"]?.stringValue {
                 promptTexts.append(text)
             }
             if crashOnFirstPrompt, !didCrashPrompt {
@@ -1120,6 +1375,11 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                 waiter = nil
                 return
             }
+            if let promptErrorMessage {
+                replyError(id: id, message: promptErrorMessage)
+                return
+            }
+            if holdPromptOpen { return }
             streamTurn()
             reply(id: id, result: .object(["stopReason": .string("end_turn")]))
         default:

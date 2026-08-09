@@ -124,6 +124,98 @@ struct AcpUserMessageLedger: Equatable, Sendable {
     }
 }
 
+/// In-memory retry material for failed prompts. This is intentionally separate
+/// from the durable transcript: attachments can be large or sensitive, and a
+/// relaunch must never silently restore bytes the user did not stage again.
+struct AcpFailedSendPayloadStore: Sendable {
+    struct Payload: Equatable, Sendable {
+        let text: String
+        let attachments: [AcpAttachment]
+        let retainedBytes: Int
+    }
+
+    struct Retention: Equatable, Sendable {
+        let retained: Bool
+        let evictedRowIDs: [String]
+    }
+
+    let maximumCount: Int
+    let maximumBytes: Int
+    private var payloads: [String: Payload] = [:]
+    private var rowOrder: [String] = []
+    private(set) var retainedBytes = 0
+
+    var count: Int { payloads.count }
+
+    init(maximumCount: Int, maximumBytes: Int) {
+        self.maximumCount = max(0, maximumCount)
+        self.maximumBytes = max(0, maximumBytes)
+    }
+
+    /// Retain a value snapshot and evict the oldest snapshots until both
+    /// aggregate limits hold. A single over-budget payload is not retained and
+    /// does not evict unrelated, still-retryable messages.
+    mutating func retain(
+        rowID: String,
+        text: String,
+        attachments: [AcpAttachment]
+    ) -> Retention {
+        _ = remove(rowID: rowID)
+        let byteCount = Self.payloadByteCount(text: text, attachments: attachments)
+        guard maximumCount > 0, byteCount <= maximumBytes else {
+            return Retention(retained: false, evictedRowIDs: [])
+        }
+
+        var evicted: [String] = []
+        while payloads.count >= maximumCount || retainedBytes > maximumBytes - byteCount {
+            guard let oldest = rowOrder.first else { break }
+            rowOrder.removeFirst()
+            if let payload = payloads.removeValue(forKey: oldest) {
+                retainedBytes -= payload.retainedBytes
+                evicted.append(oldest)
+            }
+        }
+
+        let payload = Payload(text: text, attachments: attachments, retainedBytes: byteCount)
+        payloads[rowID] = payload
+        rowOrder.append(rowID)
+        retainedBytes += byteCount
+        return Retention(retained: true, evictedRowIDs: evicted)
+    }
+
+    mutating func remove(rowID: String) -> Payload? {
+        guard let payload = payloads.removeValue(forKey: rowID) else { return nil }
+        rowOrder.removeAll { $0 == rowID }
+        retainedBytes -= payload.retainedBytes
+        return payload
+    }
+
+    mutating func removeAll() {
+        payloads.removeAll(keepingCapacity: false)
+        rowOrder.removeAll(keepingCapacity: false)
+        retainedBytes = 0
+    }
+
+    static func payloadByteCount(text: String, attachments: [AcpAttachment]) -> Int {
+        var result = text.utf8.count
+        for attachment in attachments {
+            let byteCounts: [Int]
+            switch attachment {
+            case let .image(data, mimeType, name):
+                byteCounts = [data.count, mimeType.utf8.count, name.utf8.count]
+            case let .textFile(path, contents, name):
+                byteCounts = [path.utf8.count, contents.utf8.count, name.utf8.count]
+            }
+            for count in byteCounts {
+                let (sum, overflow) = result.addingReportingOverflow(count)
+                if overflow { return Int.max }
+                result = sum
+            }
+        }
+        return result
+    }
+}
+
 /// Drives one ACP agent conversation and accumulates its streaming turn into a
 /// transcript the chat view renders. Owns the AcpClient; runs on the main actor
 /// so published transcript mutations are UI-safe.
@@ -190,10 +282,11 @@ final class AcpConversation: ObservableObject {
     /// durability; ACP capability negotiation decides whether this id can load.
     @Published private(set) var providerSessionID: String?
 
-    /// Original text + attachment blocks for failed sends, keyed by the failed
-    /// row's Identifiable id, so `retryFailed` can re-send the exact payload
-    /// (attachments included) rather than a text-only prompt.
-    private var failedSends: [String: (text: String, attachments: [AcpAttachment])] = [:]
+    /// Original text + attachment blocks for a bounded tail of failed sends.
+    /// The store owns value snapshots and is never serialized with transcript
+    /// rows, so Retry is exact in-process without turning failure into an
+    /// unbounded or durable attachment cache.
+    private var failedSends: AcpFailedSendPayloadStore
 
     /// Streams client events to `consume` IN ORDER. The client fires its handler
     /// from an actor off the main thread; yielding into one AsyncStream (drained
@@ -356,6 +449,11 @@ final class AcpConversation: ObservableObject {
     private static let expandStep = 200
     static let maxPendingAttachmentCount = 8
     static let maxPendingAttachmentBytes = 20 * 1_048_576
+    /// Failed prompts retain only this aggregate tail for explicit Retry. The
+    /// byte cap allows one maximum-size attachment plus bounded prompt metadata
+    /// while repeated near-limit failures deterministically evict older data.
+    static let maximumRetainedFailedSendCount = 8
+    static let maximumRetainedFailedSendBytes = 32 * 1_048_576
     /// Per-conversation limits. These are deliberately independent of adapter
     /// frame limits: a valid adapter message must not become an unbounded UI
     /// approval backlog.
@@ -391,7 +489,9 @@ final class AcpConversation: ObservableObject {
         initialDraft: String? = nil,
         initialAttachments: [AcpAttachment] = [],
         initialUsage: AcpUsage? = nil,
-        initialQueuedPrompts: [String] = []
+        initialQueuedPrompts: [String] = [],
+        failedSendPayloadMaximumCount: Int = AcpConversation.maximumRetainedFailedSendCount,
+        failedSendPayloadMaximumBytes: Int = AcpConversation.maximumRetainedFailedSendBytes
     ) {
         self.title = title
         self.command = command
@@ -405,6 +505,10 @@ final class AcpConversation: ObservableObject {
         self.ownsClient = client == nil
         self.ruleStore = ruleStore
         self.sensitiveGlobs = sensitiveGlobs
+        self.failedSends = AcpFailedSendPayloadStore(
+            maximumCount: failedSendPayloadMaximumCount,
+            maximumBytes: failedSendPayloadMaximumBytes
+        )
         self.draftStorageKey = draftKey
         self.resumeSessionID = resumeSessionID
         self.rows = initialRows
@@ -619,7 +723,7 @@ final class AcpConversation: ObservableObject {
         guard let index = rows.firstIndex(where: { $0.id == rowID }),
               case let .user(_, text, failed) = rows[index], failed else { return }
         rows.remove(at: index)
-        let stashed = failedSends.removeValue(forKey: rowID)
+        let stashed = failedSends.remove(rowID: rowID)
         let originalText = stashed?.text ?? text
         let attachments = stashed?.attachments ?? []
         if isRunning {
@@ -813,7 +917,17 @@ final class AcpConversation: ObservableObject {
                 // Identifiable id) so Retry re-sends them faithfully.
                 if let index = rows.firstIndex(where: { $0.id == "user-\(rowID)" }) {
                     rows[index] = .user(id: rowID, text: displayText, failed: true)
-                    failedSends["user-\(rowID)"] = (text: trimmed, attachments: attachments)
+                    let retention = failedSends.retain(
+                        rowID: "user-\(rowID)",
+                        text: trimmed,
+                        attachments: attachments
+                    )
+                    if !retention.retained {
+                        statusMessage = "This failed message is too large to retain for Retry; its attachment data was discarded."
+                    } else if !retention.evictedRowIDs.isEmpty {
+                        let count = retention.evictedRowIDs.count
+                        statusMessage = "Retry data for \(count) older failed message\(count == 1 ? " was" : "s were") discarded to keep failed-send storage bounded."
+                    }
                 }
             }
         }
@@ -1214,6 +1328,8 @@ final class AcpConversation: ObservableObject {
     var pendingAutomaticPermissionResolutionCount: Int {
         automaticPermissionResolutions.count
     }
+    var retainedFailedSendPayloadCount: Int { failedSends.count }
+    var retainedFailedSendPayloadBytes: Int { failedSends.retainedBytes }
 
     /// Stop the adapter and every terminal host it owns. Returning the final
     /// debounced composer value lets the window owner durably save it before
@@ -1223,8 +1339,17 @@ final class AcpConversation: ObservableObject {
         draftPersistenceTask = nil
         let finalDraft = pendingDraftPersistence
         pendingDraftPersistence = nil
+        // Release retained prompt/attachment snapshots immediately at the
+        // shared stop/delete boundary, before adapter shutdown can suspend.
+        failedSends.removeAll()
         clearAutomaticPermissionResolutions()
+        let promptTask = activePromptTask
         await client.stop()
+        await promptTask?.value
+        // Stopping the client rejects an in-flight prompt. Its failure handler
+        // may briefly record retry data after the first clear, so clear again
+        // once that task is quiescent to make teardown the final owner.
+        failedSends.removeAll()
         flushPendingChunk()
         isConnected = false
         isRunning = false

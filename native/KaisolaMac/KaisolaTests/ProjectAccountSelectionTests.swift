@@ -20,6 +20,25 @@ final class ProjectAccountSelectionTests: XCTestCase {
 
     private var profiles: [UsageAccountProfile] { [work, personal, codex] }
 
+    func testStoreRecoveryTakesPrecedenceOverProjectAssignmentRows() {
+        XCTAssertEqual(
+            ProjectAccountCardMode.resolve(hasRecoveryIssue: true, projectID: "project-1"),
+            .recovery
+        )
+        XCTAssertEqual(
+            ProjectAccountCardMode.resolve(hasRecoveryIssue: false, projectID: "project-1"),
+            .project
+        )
+        XCTAssertEqual(
+            ProjectAccountCardMode.resolve(hasRecoveryIssue: false, projectID: nil),
+            .noProject
+        )
+        XCTAssertEqual(
+            ProjectAccountCardMode.resolve(hasRecoveryIssue: true, projectID: nil),
+            .recovery
+        )
+    }
+
     // MARK: - Healthy assignments
 
     func testBlankOverrideIsAppDefault() {

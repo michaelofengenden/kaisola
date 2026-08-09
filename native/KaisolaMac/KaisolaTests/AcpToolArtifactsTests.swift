@@ -352,4 +352,177 @@ final class AcpToolArtifactsTests: XCTestCase {
         XCTAssertTrue(real.hasPrefix(workspace.resolvingSymlinksInPath().path + "/"))
         XCTAssertTrue(real.hasSuffix("/sub/new.txt"))
     }
+
+    // MARK: - Agent-owned fs/write_text_file mutation boundary
+
+    func testAgentWriteUpdatesRegularFilesAndCreatesSafeParents() throws {
+        let fixture = try agentWriteFixture()
+        let existing = fixture.workspace.appendingPathComponent("Sources/App.swift")
+        try FileManager.default.createDirectory(
+            at: existing.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try "old".write(to: existing, atomically: true, encoding: .utf8)
+
+        try AcpWorkspaceFileWriter.write(
+            Data("updated".utf8),
+            to: existing.path,
+            workspaceRoot: fixture.workspace.path
+        )
+        let created = fixture.workspace.appendingPathComponent("Generated/Nested/new.txt")
+        try AcpWorkspaceFileWriter.write(
+            Data("created".utf8),
+            to: created.path,
+            workspaceRoot: fixture.workspace.path
+        )
+
+        XCTAssertEqual(try String(contentsOf: existing, encoding: .utf8), "updated")
+        XCTAssertEqual(try String(contentsOf: created, encoding: .utf8), "created")
+    }
+
+    func testAgentWriteRejectsSymbolicLinkLeafBeforeMutation() throws {
+        let fixture = try agentWriteFixture()
+        let real = fixture.workspace.appendingPathComponent("real.txt")
+        let linked = fixture.workspace.appendingPathComponent("linked.txt")
+        try "unchanged".write(to: real, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(at: linked, withDestinationURL: real)
+
+        assertAgentWriteRejected(containing: "symbolic-link targets") {
+            try AcpWorkspaceFileWriter.write(
+                Data("redirected".utf8),
+                to: linked.path,
+                workspaceRoot: fixture.workspace.path
+            )
+        }
+
+        XCTAssertEqual(try String(contentsOf: real, encoding: .utf8), "unchanged")
+        XCTAssertTrue((try? linked.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) == true)
+    }
+
+    func testAgentWriteRejectsSymbolicLinkParentBeforeMutation() throws {
+        let fixture = try agentWriteFixture()
+        let linkedParent = fixture.workspace.appendingPathComponent("linked-parent")
+        try FileManager.default.createSymbolicLink(
+            at: linkedParent,
+            withDestinationURL: fixture.outside
+        )
+        let outsideTarget = fixture.outside.appendingPathComponent("new.txt")
+
+        assertAgentWriteRejected(containing: "symbolic-link parents") {
+            try AcpWorkspaceFileWriter.write(
+                Data("redirected".utf8),
+                to: linkedParent.appendingPathComponent("new.txt").path,
+                workspaceRoot: fixture.workspace.path
+            )
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outsideTarget.path))
+    }
+
+    func testAgentWriteRejectsOutOfRootTargetBeforeMutation() throws {
+        let fixture = try agentWriteFixture()
+        let outsideTarget = fixture.outside.appendingPathComponent("escape.txt")
+
+        assertAgentWriteRejected(containing: "escapes the session project") {
+            try AcpWorkspaceFileWriter.write(
+                Data("redirected".utf8),
+                to: outsideTarget.path,
+                workspaceRoot: fixture.workspace.path
+            )
+        }
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: outsideTarget.path))
+    }
+
+    func testAgentWriteRejectsLeafSwapAfterReviewWithoutTouchingEitherFile() throws {
+        let fixture = try agentWriteFixture()
+        let target = fixture.workspace.appendingPathComponent("reviewed.txt")
+        let parked = fixture.workspace.appendingPathComponent("reviewed-parked.txt")
+        let outsideTarget = fixture.outside.appendingPathComponent("reviewed.txt")
+        try "authorized".write(to: target, atomically: true, encoding: .utf8)
+        try "outside".write(to: outsideTarget, atomically: true, encoding: .utf8)
+
+        assertAgentWriteRejected(containing: "symbolic-link targets") {
+            try AcpWorkspaceFileWriter.write(
+                Data("redirected".utf8),
+                to: target.path,
+                workspaceRoot: fixture.workspace.path,
+                beforeMutation: {
+                    try FileManager.default.moveItem(at: target, to: parked)
+                    try FileManager.default.createSymbolicLink(
+                        at: target,
+                        withDestinationURL: outsideTarget
+                    )
+                }
+            )
+        }
+
+        XCTAssertEqual(try String(contentsOf: parked, encoding: .utf8), "authorized")
+        XCTAssertEqual(try String(contentsOf: outsideTarget, encoding: .utf8), "outside")
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: fixture.workspace.path)
+                .contains(where: { $0.hasPrefix(".kaisola-acp-write-") })
+        )
+    }
+
+    func testAgentWriteRejectsParentSwapAfterReviewWithoutWritingOutside() throws {
+        let fixture = try agentWriteFixture()
+        let parent = fixture.workspace.appendingPathComponent("reviewed-parent", isDirectory: true)
+        let parked = fixture.workspace.appendingPathComponent("reviewed-parent-parked", isDirectory: true)
+        let target = parent.appendingPathComponent("reviewed.txt")
+        let parkedTarget = parked.appendingPathComponent("reviewed.txt")
+        let outsideTarget = fixture.outside.appendingPathComponent("reviewed.txt")
+        try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+        try "authorized".write(to: target, atomically: true, encoding: .utf8)
+        try "outside".write(to: outsideTarget, atomically: true, encoding: .utf8)
+
+        assertAgentWriteRejected(containing: "symbolic-link parents") {
+            try AcpWorkspaceFileWriter.write(
+                Data("redirected".utf8),
+                to: target.path,
+                workspaceRoot: fixture.workspace.path,
+                beforeMutation: {
+                    try FileManager.default.moveItem(at: parent, to: parked)
+                    try FileManager.default.createSymbolicLink(
+                        at: parent,
+                        withDestinationURL: fixture.outside
+                    )
+                }
+            )
+        }
+
+        XCTAssertEqual(try String(contentsOf: parkedTarget, encoding: .utf8), "authorized")
+        XCTAssertEqual(try String(contentsOf: outsideTarget, encoding: .utf8), "outside")
+        XCTAssertFalse(
+            try FileManager.default.contentsOfDirectory(atPath: parked.path)
+                .contains(where: { $0.hasPrefix(".kaisola-acp-write-") })
+        )
+    }
+
+    private func agentWriteFixture() throws -> (workspace: URL, outside: URL) {
+        let base = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-agent-write-\(UUID().uuidString)", isDirectory: true)
+        let workspace = base.appendingPathComponent("workspace", isDirectory: true)
+        let outside = base.appendingPathComponent("outside", isDirectory: true)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: base) }
+        return (workspace, outside)
+    }
+
+    private func assertAgentWriteRejected(
+        containing expected: String,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        _ operation: () throws -> Void
+    ) {
+        do {
+            try operation()
+            XCTFail("expected the agent write to be rejected", file: file, line: line)
+        } catch let AcpClientError.requestFailed(message) {
+            XCTAssertTrue(message.contains(expected), message, file: file, line: line)
+        } catch {
+            XCTFail("unexpected error: \(error)", file: file, line: line)
+        }
+    }
 }

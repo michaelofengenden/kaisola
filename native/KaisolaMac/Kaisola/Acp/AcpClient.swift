@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import KaisolaBrokerProtocol
 import KaisolaCore
@@ -651,7 +652,9 @@ actor AcpClient {
     /// Resolve a path inside the session workspace, refusing escapes — the
     /// same confinement Electron's `_workspacePath` applies. Symlinks are
     /// resolved on both sides before the containment check, so a link inside
-    /// the workspace cannot smuggle reads/writes outside it.
+    /// the workspace cannot smuggle reads or terminal working directories
+    /// outside it. Agent writes use `AcpWorkspaceFileWriter` instead because a
+    /// resolved path cannot distinguish an ordinary file from a symlink leaf.
     private func workspacePath(_ path: String?, mustExist: Bool = false) throws -> String {
         guard let root = workspaceRoot else { throw AcpClientError.notRunning }
         let raw = path?.isEmpty == false ? path! : root
@@ -970,18 +973,19 @@ actor AcpClient {
             guard content.utf8.count <= Self.maxTextFileBytes else {
                 throw AcpClientError.requestFailed("Text file exceeds the \(Self.maxTextFileBytes)-byte ACP limit")
             }
-            let path = try workspacePath(params?.objectValue?["path"]?.stringValue)
+            guard let workspaceRoot else { throw AcpClientError.notRunning }
+            let path = try AcpWorkspaceFileWriter.normalizedTargetPath(
+                params?.objectValue?["path"]?.stringValue,
+                workspaceRoot: workspaceRoot
+            )
             guard !AcpPermissionRules.pathIsSensitive(globs: fsSensitiveGlobs, pathish: path) else {
                 throw AcpClientError.requestFailed("Blocked: sensitive file (Kaisola guardrails)")
             }
-            try FileManager.default.createDirectory(
-                at: URL(fileURLWithPath: path).deletingLastPathComponent(),
-                withIntermediateDirectories: true
+            try AcpWorkspaceFileWriter.write(
+                Data(content.utf8),
+                to: path,
+                workspaceRoot: workspaceRoot
             )
-            // Re-check after mkdir so a concurrently swapped parent symlink
-            // cannot turn the write into an escape (mirrors acp.cjs).
-            let checked = try workspacePath(path)
-            try content.write(toFile: checked, atomically: true, encoding: .utf8)
             respond(id: id, result: .object([:]))
         } catch {
             respondError(id: id, code: -32000, message: errorText(error))
@@ -1088,5 +1092,394 @@ actor AcpClient {
                 return nil
             }
         }
+    }
+}
+
+/// The Kaisola-owned mutation boundary for ACP `fs/write_text_file` requests.
+/// Paths are reviewed and then walked from an open workspace descriptor one
+/// component at a time. Final replacement is relative to the verified parent,
+/// never a path that can be redirected through a symbolic link after review.
+enum AcpWorkspaceFileWriter {
+    typealias BeforeMutation = () throws -> Void
+
+    private final class Descriptor {
+        private(set) var rawValue: Int32
+
+        init(_ rawValue: Int32) {
+            self.rawValue = rawValue
+        }
+
+        deinit {
+            if rawValue >= 0 { _ = Darwin.close(rawValue) }
+        }
+    }
+
+    /// Resolve only lexical `.`/`..` components. Deliberately do not resolve
+    /// symlinks: doing so would erase the distinction this boundary must reject.
+    static func normalizedTargetPath(_ requestedPath: String?, workspaceRoot: String) throws -> String {
+        let root = (workspaceRoot as NSString).standardizingPath
+        guard root.hasPrefix("/") else {
+            throw rejected("the session project is unavailable")
+        }
+        let raw = requestedPath?.isEmpty == false ? requestedPath! : root
+        let target = raw.hasPrefix("/")
+            ? (raw as NSString).standardizingPath
+            : ((root as NSString).appendingPathComponent(raw) as NSString).standardizingPath
+        guard target != root,
+              target.hasPrefix(root + "/"),
+              !target.unicodeScalars.contains(where: { $0.value == 0 }) else {
+            throw rejected("the target escapes the session project")
+        }
+        return target
+    }
+
+    static func write(
+        _ data: Data,
+        to requestedPath: String,
+        workspaceRoot: String,
+        beforeMutation: BeforeMutation? = nil
+    ) throws {
+        let rootPath = (workspaceRoot as NSString).standardizingPath
+        let targetPath = try normalizedTargetPath(requestedPath, workspaceRoot: rootPath)
+        let suffix = targetPath.dropFirst(rootPath.count + 1)
+        let components = suffix.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
+        guard let leaf = components.last, !leaf.isEmpty else {
+            throw rejected("the target is not a regular file")
+        }
+
+        let root = try openRoot(rootPath)
+        let parentComponents = Array(components.dropLast())
+        let parent = try openParent(
+            components: parentComponents,
+            root: root,
+            createMissingDirectories: true
+        )
+        let reviewedParent = try descriptorMetadata(parent)
+        let reviewedEntry = try entryMetadata(named: leaf, in: parent)
+        if let reviewedEntry {
+            guard !isSymbolicLink(reviewedEntry) else {
+                throw rejected("symbolic-link targets are not writable")
+            }
+            guard isRegularFile(reviewedEntry) else {
+                throw rejected("the target is not a regular file")
+            }
+        }
+
+        // Deterministic test seam: production has no callback. Re-open the
+        // lexical parent afterwards and require it plus the leaf identity to
+        // remain exactly what was reviewed before creating any temporary file.
+        try beforeMutation?()
+        let currentParent = try openParent(
+            components: parentComponents,
+            root: root,
+            createMissingDirectories: false
+        )
+        guard sameIdentity(reviewedParent, try descriptorMetadata(currentParent)) else {
+            throw rejected("the target changed after review")
+        }
+        try validateCurrentEntry(
+            try entryMetadata(named: leaf, in: currentParent),
+            matches: reviewedEntry
+        )
+
+        let mode = reviewedEntry.map { mode_t($0.st_mode & 0o777) }
+            ?? mode_t(S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+        let temporary = try createTemporaryFile(in: parent, mode: mode)
+        do {
+            try writeAll(data, to: temporary.descriptor.rawValue)
+            let installationParent = try openParent(
+                components: parentComponents,
+                root: root,
+                createMissingDirectories: false
+            )
+            guard sameIdentity(
+                reviewedParent,
+                try descriptorMetadata(installationParent)
+            ) else {
+                throw rejected("the target changed after review")
+            }
+            try validateCurrentEntry(
+                try entryMetadata(named: leaf, in: installationParent),
+                matches: reviewedEntry
+            )
+            if let reviewedEntry {
+                try replaceExisting(
+                    leaf: leaf,
+                    reviewedEntry: reviewedEntry,
+                    temporaryLeaf: temporary.leaf,
+                    parent: parent
+                )
+            } else {
+                try installNew(
+                    leaf: leaf,
+                    temporaryLeaf: temporary.leaf,
+                    parent: parent
+                )
+            }
+        } catch {
+            unlinkIfOwned(
+                named: temporary.leaf,
+                descriptor: temporary.descriptor,
+                in: parent
+            )
+            throw error
+        }
+    }
+
+    private static func openRoot(_ rootPath: String) throws -> Descriptor {
+        let raw = rootPath.withCString { path in
+            Darwin.open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard raw >= 0 else {
+            if errno == ELOOP { throw rejected("the session project is a symbolic link") }
+            throw rejected("the session project is unavailable")
+        }
+        return Descriptor(raw)
+    }
+
+    private static func openParent(
+        components: [String],
+        root: Descriptor,
+        createMissingDirectories: Bool
+    ) throws -> Descriptor {
+        var current = root
+        for component in components {
+            var raw = openDirectory(named: component, in: current)
+            if raw < 0, errno == ENOENT, createMissingDirectories {
+                let created = component.withCString { name in
+                    Darwin.mkdirat(current.rawValue, name, 0o777)
+                }
+                if created != 0, errno != EEXIST {
+                    throw descriptorFailure(errno, component: component, parent: current)
+                }
+                raw = openDirectory(named: component, in: current)
+            }
+            guard raw >= 0 else {
+                throw descriptorFailure(errno, component: component, parent: current)
+            }
+            current = Descriptor(raw)
+        }
+        return current
+    }
+
+    private static func openDirectory(named component: String, in parent: Descriptor) -> Int32 {
+        component.withCString { name in
+            Darwin.openat(
+                parent.rawValue,
+                name,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+        }
+    }
+
+    private static func descriptorFailure(
+        _ code: Int32,
+        component: String,
+        parent: Descriptor
+    ) -> AcpClientError {
+        if code == ELOOP || entryIsSymbolicLink(named: component, in: parent) {
+            return rejected("symbolic-link parents are not writable")
+        }
+        if code == ENOENT {
+            return rejected("the target changed after review")
+        }
+        if code == ENOTDIR {
+            return rejected("a target parent is not a directory")
+        }
+        if code == EACCES || code == EPERM {
+            return rejected("the target is not writable")
+        }
+        return rejected("the target could not be safely opened")
+    }
+
+    private static func descriptorMetadata(_ descriptor: Descriptor) throws -> stat {
+        var metadata = stat()
+        guard Darwin.fstat(descriptor.rawValue, &metadata) == 0 else {
+            throw rejected("the target changed after review")
+        }
+        return metadata
+    }
+
+    private static func entryMetadata(named leaf: String, in parent: Descriptor) throws -> stat? {
+        var metadata = stat()
+        let result = leaf.withCString { name in
+            Darwin.fstatat(parent.rawValue, name, &metadata, AT_SYMLINK_NOFOLLOW)
+        }
+        if result == 0 { return metadata }
+        if errno == ENOENT { return nil }
+        throw descriptorFailure(errno, component: leaf, parent: parent)
+    }
+
+    private static func entryIsSymbolicLink(named leaf: String, in parent: Descriptor) -> Bool {
+        var metadata = stat()
+        let result = leaf.withCString { name in
+            Darwin.fstatat(parent.rawValue, name, &metadata, AT_SYMLINK_NOFOLLOW)
+        }
+        return result == 0 && isSymbolicLink(metadata)
+    }
+
+    private static func validateCurrentEntry(_ current: stat?, matches reviewed: stat?) throws {
+        if let current, isSymbolicLink(current) {
+            throw rejected("symbolic-link targets are not writable")
+        }
+        switch (reviewed, current) {
+        case (nil, nil):
+            return
+        case let (.some(expected), .some(actual))
+            where isRegularFile(actual) && sameIdentity(expected, actual):
+            return
+        default:
+            throw rejected("the target changed after review")
+        }
+    }
+
+    private static func createTemporaryFile(
+        in parent: Descriptor,
+        mode: mode_t
+    ) throws -> (leaf: String, descriptor: Descriptor) {
+        for _ in 0..<128 {
+            let leaf = ".kaisola-acp-write-\(UUID().uuidString)"
+            let raw = leaf.withCString { name in
+                Darwin.openat(
+                    parent.rawValue,
+                    name,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                    mode
+                )
+            }
+            if raw >= 0 {
+                let descriptor = Descriptor(raw)
+                guard Darwin.fchmod(raw, mode) == 0 else {
+                    unlinkIfOwned(named: leaf, descriptor: descriptor, in: parent)
+                    throw rejected("the target is not writable")
+                }
+                return (leaf, descriptor)
+            }
+            if errno != EEXIST {
+                throw rejected("the target is not writable")
+            }
+        }
+        throw rejected("the target is not writable")
+    }
+
+    private static func writeAll(_ data: Data, to descriptor: Int32) throws {
+        try data.withUnsafeBytes { bytes in
+            guard let base = bytes.baseAddress else { return }
+            var offset = 0
+            while offset < bytes.count {
+                let count = Darwin.write(
+                    descriptor,
+                    base.advanced(by: offset),
+                    bytes.count - offset
+                )
+                if count < 0, errno == EINTR { continue }
+                guard count > 0 else { throw rejected("the target could not be written") }
+                offset += count
+            }
+        }
+        guard Darwin.fsync(descriptor) == 0 else {
+            throw rejected("the target could not be written")
+        }
+    }
+
+    private static func installNew(
+        leaf: String,
+        temporaryLeaf: String,
+        parent: Descriptor
+    ) throws {
+        let result = temporaryLeaf.withCString { temporaryName in
+            leaf.withCString { destinationName in
+                Darwin.renameatx_np(
+                    parent.rawValue,
+                    temporaryName,
+                    parent.rawValue,
+                    destinationName,
+                    UInt32(RENAME_EXCL)
+                )
+            }
+        }
+        guard result == 0 else {
+            if errno == EEXIST { throw rejected("the target changed after review") }
+            throw rejected("the target could not be written")
+        }
+    }
+
+    private static func replaceExisting(
+        leaf: String,
+        reviewedEntry: stat,
+        temporaryLeaf: String,
+        parent: Descriptor
+    ) throws {
+        guard exchange(temporaryLeaf, leaf, in: parent) == 0 else {
+            if errno == ENOENT { throw rejected("the target changed after review") }
+            throw rejected("the target could not be safely replaced")
+        }
+
+        do {
+            let displaced = try entryMetadata(named: temporaryLeaf, in: parent)
+            guard let displaced,
+                  !isSymbolicLink(displaced),
+                  sameIdentity(reviewedEntry, displaced) else {
+                throw rejected("the target changed after review")
+            }
+            guard unlink(named: temporaryLeaf, in: parent) == 0 else {
+                throw rejected("the target could not be safely replaced")
+            }
+        } catch {
+            _ = exchange(temporaryLeaf, leaf, in: parent)
+            throw error
+        }
+    }
+
+    private static func exchange(_ first: String, _ second: String, in parent: Descriptor) -> Int32 {
+        first.withCString { firstName in
+            second.withCString { secondName in
+                Darwin.renameatx_np(
+                    parent.rawValue,
+                    firstName,
+                    parent.rawValue,
+                    secondName,
+                    UInt32(RENAME_SWAP)
+                )
+            }
+        }
+    }
+
+    private static func unlink(named leaf: String, in parent: Descriptor) -> Int32 {
+        leaf.withCString { name in Darwin.unlinkat(parent.rawValue, name, 0) }
+    }
+
+    /// After an exchange, the temporary *name* can refer to the displaced
+    /// target while the temporary descriptor still refers to our new bytes.
+    /// Cleanup only when both identities match, so a failed rollback can never
+    /// turn error handling into deletion of somebody else's entry.
+    private static func unlinkIfOwned(
+        named leaf: String,
+        descriptor: Descriptor,
+        in parent: Descriptor
+    ) {
+        var owned = stat()
+        guard Darwin.fstat(descriptor.rawValue, &owned) == 0,
+              let named = try? entryMetadata(named: leaf, in: parent),
+              sameIdentity(owned, named) else {
+            return
+        }
+        _ = unlink(named: leaf, in: parent)
+    }
+
+    private static func sameIdentity(_ first: stat, _ second: stat) -> Bool {
+        first.st_dev == second.st_dev && first.st_ino == second.st_ino
+    }
+
+    private static func isSymbolicLink(_ metadata: stat) -> Bool {
+        metadata.st_mode & S_IFMT == S_IFLNK
+    }
+
+    private static func isRegularFile(_ metadata: stat) -> Bool {
+        metadata.st_mode & S_IFMT == S_IFREG
+    }
+
+    private static func rejected(_ reason: String) -> AcpClientError {
+        .requestFailed("Blocked agent file write: \(reason).")
     }
 }

@@ -206,6 +206,29 @@ function encodeBrokerFrame(frame, context = {}) {
   return `${encoded}\n`
 }
 
+// Queue one newline-delimited frame on a client socket. `maxQueueBytes` drops
+// deltas a slow consumer has not drained; `force` bypasses that cap for the
+// recovery marker a paused subscriber must still receive.
+//
+// A forced frame reports delivery from whether the socket ACCEPTED it, not
+// from write()'s return value: Node returns false once the buffer passes the
+// high water mark, and a saturated buffer is exactly the state a recovery
+// marker is sent in. Reading that flow-control hint as loss would retire every
+// slow consumer whose marker is merely still queued. Only a socket that can no
+// longer carry bytes — destroyed, already ended, or throwing — loses one.
+function writeFrame(socket, frame, { maxQueueBytes, force = false, method } = {}) {
+  if (!socket || socket.destroyed || socket.writableEnded) return false
+  try {
+    const encoded = encodeBrokerFrame(frame, { method })
+    const frameBytes = Buffer.byteLength(encoded, 'utf8')
+    if (!force && Number.isFinite(maxQueueBytes) && socket.writableLength + frameBytes > maxQueueBytes) return false
+    const flushed = socket.write(encoded)
+    return force ? true : flushed
+  } catch {
+    return false // reconnect replays snapshots
+  }
+}
+
 function atomicJson(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 })
   const tmp = `${file}.${process.pid}.tmp`
@@ -259,4 +282,5 @@ module.exports = {
   observerMethodAllowed,
   brokerMethodAllowedForAccess,
   brokerVersionsCompatible,
+  writeFrame,
 }

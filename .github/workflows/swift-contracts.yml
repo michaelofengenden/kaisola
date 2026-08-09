@@ -20,6 +20,8 @@ on:
   push:
     branches: [main]
     paths:
+      - '.github/workflows/release-candidate.yml'
+      - '.github/workflows/release.yml'
       - '.github/workflows/swift-contracts.yml'
       - 'native/**'
       - 'mobile/KaisolaCompanion/**'
@@ -28,10 +30,13 @@ on:
       - 'tests/**'
       - 'scripts/download-native-node-runtime.cjs'
       - 'scripts/native-*.cjs'
+      - 'scripts/release-fast.cjs'
       - 'package.json'
       - 'package-lock.json'
   pull_request:
     paths:
+      - '.github/workflows/release-candidate.yml'
+      - '.github/workflows/release.yml'
       - '.github/workflows/swift-contracts.yml'
       - 'native/**'
       - 'mobile/KaisolaCompanion/**'
@@ -40,6 +45,7 @@ on:
       - 'tests/**'
       - 'scripts/download-native-node-runtime.cjs'
       - 'scripts/native-*.cjs'
+      - 'scripts/release-fast.cjs'
       - 'package.json'
       - 'package-lock.json'
 
@@ -77,6 +83,7 @@ jobs:
           tests/node/nativeReleasePreflight.test.cjs
           tests/node/nativeResourceGate.test.cjs
           tests/node/nativeResourceFixtureGate.test.cjs
+          tests/node/swiftContractsPaths.test.cjs
       - name: Test shared Swift contracts
         run: swift test --package-path native/KaisolaCore
       - name: Compile optimized iPhone app against KaisolaCore

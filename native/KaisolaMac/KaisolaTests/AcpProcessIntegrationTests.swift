@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -8,6 +9,193 @@ import XCTest
 /// handshake + streamed turn + permission callback. Skips cleanly if node or
 /// the mock is unavailable so it never fails a machine without the toolchain.
 final class AcpProcessIntegrationTests: XCTestCase {
+    func testTransportStopTerminatesItsAdapterAndAppServerChild() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport()
+
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.ownedTreeScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path
+        )
+        let pids = try await fixture.waitForPIDs()
+        let startedAt = ContinuousClock.now
+
+        await transport.terminate()
+
+        XCTAssertLessThan(
+            startedAt.duration(to: .now),
+            .seconds(1),
+            "ordinary SIGTERM cleanup must not wait for the SIGKILL grace"
+        )
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "adapter and app-server child must both stop")
+    }
+
+    func testStdoutEOFClosesTheOwningConnectionAndTerminatesTheProcessTree() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let client = AcpClient()
+        let collector = IntegrationCollector()
+        await client.setEventHandler { event in collector.append(event) }
+
+        _ = try await client.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.handshakeThenCloseStdoutScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path,
+            mcpServers: []
+        )
+        let pids = try await fixture.waitForPIDs()
+
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "stdout EOF must tear down the adapter tree even when the adapter remains alive")
+        XCTAssertTrue(collector.events.contains { if case .exited = $0 { return true } else { return false } })
+        await client.stop()
+    }
+
+    func testAdapterExitReapsTheAppServerChildItLeavesBehind() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport()
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.exitLeavingChildScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path
+        )
+        let pids = try await fixture.waitForPIDs()
+        let eof = try await transport.receive(maximumBytes: 1_024)
+        XCTAssertNil(eof)
+
+        await transport.terminate()
+
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "an exited adapter must not orphan its surviving app-server child")
+    }
+
+    func testCancellingGUIStartupTaskTerminatesThePartiallyStartedProcessTree() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let client = AcpClient()
+        let environment = fixture.environment
+        let cwd = fixture.directory.path
+        let startup = Task { @Sendable in
+            try await client.start(
+                command: "/bin/sh",
+                arguments: ["-c", Self.ownedTreeScript],
+                environment: environment,
+                cwd: cwd,
+                mcpServers: []
+            )
+        }
+        let pids = try await fixture.waitForPIDs()
+
+        startup.cancel()
+
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "task cancellation must close startup ownership")
+        await client.stop()
+        switch await startup.result {
+        case let .failure(error): XCTAssertTrue(error is CancellationError)
+        case .success: XCTFail("cancelled startup must finish with CancellationError")
+        }
+    }
+
+    func testStartupProtocolFailureTerminatesThePartiallyStartedProcessTree() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let client = AcpClient()
+
+        do {
+            _ = try await client.start(
+                command: "/bin/sh",
+                arguments: ["-c", Self.unsupportedHandshakeScript],
+                environment: fixture.environment,
+                cwd: fixture.directory.path,
+                mcpServers: []
+            )
+            XCTFail("expected unsupported protocol")
+        } catch let AcpClientError.unsupportedProtocol(version) {
+            XCTAssertEqual(version, 2)
+        } catch {
+            XCTFail("unexpected startup error: \(error)")
+        }
+        let pids = try await fixture.waitForPIDs()
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "failed startup must leave no owned children")
+    }
+
+    func testTransportCanRepeatedlyOpenAndCloseWithoutLeakingChildren() async throws {
+        let transport = AcpProcessTransport()
+        var fixtures: [OwnedProcessFixture] = []
+        defer { fixtures.forEach { $0.forceCleanup() } }
+
+        for _ in 0..<3 {
+            let fixture = try OwnedProcessFixture()
+            fixtures.append(fixture)
+            try await transport.start(
+                command: "/bin/sh",
+                arguments: ["-c", Self.ownedTreeScript],
+                environment: fixture.environment,
+                cwd: fixture.directory.path
+            )
+            let pids = try await fixture.waitForPIDs()
+            await transport.terminate()
+            let stopped = await fixture.waitUntilStopped(pids)
+            XCTAssertTrue(stopped)
+        }
+    }
+
+    func testTerminationEscalatesWithinABoundWhenOwnedChildrenIgnoreSIGTERM() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport()
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.termIgnoringTreeScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path
+        )
+        let pids = try await fixture.waitForPIDs()
+        let startedAt = ContinuousClock.now
+
+        await transport.terminate()
+
+        XCTAssertLessThan(startedAt.duration(to: .now), .seconds(4))
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "SIGKILL escalation must reap a stubborn tree")
+    }
+
+    func testTransportTeardownDoesNotTouchAnUnownedDurableProcess() async throws {
+        let durable = Process()
+        durable.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        durable.arguments = ["30"]
+        try durable.run()
+        defer {
+            if durable.isRunning { durable.terminate() }
+            durable.waitUntilExit()
+        }
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport()
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.ownedTreeScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path
+        )
+        let pids = try await fixture.waitForPIDs()
+
+        await transport.terminate()
+
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped)
+        XCTAssertTrue(durable.isRunning, "detached broker PTYs are outside ACP process ownership")
+    }
+
     func testSpawnsMockAgentAndStreamsARealTurn() async throws {
         guard let node = Self.resolveNode(), let mock = Self.resolveMock() else {
             throw XCTSkip("node or the ACP mock agent is unavailable")
@@ -142,6 +330,132 @@ final class AcpProcessIntegrationTests: XCTestCase {
         }
         return nil
     }
+
+    private static let ownedTreeScript = #"""
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" HUP; exec /bin/sleep 60' \
+      </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" > "$KAISOLA_FIXTURE_CHILD_PID"
+    while :; do /bin/sleep 1; done
+    """#
+
+    private static let termIgnoringTreeScript = #"""
+    trap '' TERM
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" TERM; printf "%s\n" "$$" > "$KAISOLA_FIXTURE_CHILD_PID"; while :; do /bin/sleep 1; done' \
+      </dev/null >/dev/null 2>&1 &
+    while :; do /bin/sleep 1; done
+    """#
+
+    private static let exitLeavingChildScript = #"""
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" HUP TERM; printf "%s\n" "$$" > "$KAISOLA_FIXTURE_CHILD_PID"; while :; do /bin/sleep 1; done' \
+      </dev/null >/dev/null 2>&1 &
+    while [ ! -s "$KAISOLA_FIXTURE_CHILD_PID" ]; do /bin/sleep 0.01; done
+    exit 23
+    """#
+
+    private static let unsupportedHandshakeScript = #"""
+    trap '' TERM
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" TERM; printf "%s\n" "$$" > "$KAISOLA_FIXTURE_CHILD_PID"; while :; do /bin/sleep 1; done' \
+      </dev/null >/dev/null 2>&1 &
+    IFS= read -r _
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":2,"agentCapabilities":{}}}'
+    while :; do /bin/sleep 1; done
+    """#
+
+    private static let handshakeThenCloseStdoutScript = #"""
+    trap '' TERM
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" TERM; printf "%s\n" "$$" > "$KAISOLA_FIXTURE_CHILD_PID"; while :; do /bin/sleep 1; done' \
+      </dev/null >/dev/null 2>&1 &
+    IFS= read -r _
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+    IFS= read -r _
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture-session"}}'
+    exec 1>&-
+    while :; do /bin/sleep 1; done
+    """#
+}
+
+private struct OwnedProcessFixture: @unchecked Sendable {
+    let directory: URL
+    private let parentPIDFile: URL
+    private let childPIDFile: URL
+
+    init() throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-acp-owned-\(UUID().uuidString)", isDirectory: true)
+        parentPIDFile = directory.appendingPathComponent("adapter.pid")
+        childPIDFile = directory.appendingPathComponent("app-server.pid")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    var environment: [String: String] {
+        ProcessInfo.processInfo.environment.merging([
+            "KAISOLA_FIXTURE_PARENT_PID": parentPIDFile.path,
+            "KAISOLA_FIXTURE_CHILD_PID": childPIDFile.path,
+        ]) { _, fixture in fixture }
+    }
+
+    func waitForPIDs(timeout: Duration = .seconds(3)) async throws -> (pid_t, pid_t) {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if let parent = pid(from: parentPIDFile), let child = pid(from: childPIDFile) {
+                return (parent, child)
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        throw OwnedProcessFixtureError.didNotPublishPIDs
+    }
+
+    func waitUntilStopped(_ pids: (pid_t, pid_t), timeout: Duration = .seconds(3)) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if !Self.isAlive(pids.0), !Self.isAlive(pids.1) { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return !Self.isAlive(pids.0) && !Self.isAlive(pids.1)
+    }
+
+    func forceCleanup() {
+        let parent = pid(from: parentPIDFile)
+        let child = pid(from: childPIDFile)
+        let verifiedGroup = parent.flatMap { group in
+            if Darwin.getpgid(group) == group || child.map({ Darwin.getpgid($0) == group }) == true {
+                return group
+            }
+            return nil
+        }
+        if let group = verifiedGroup {
+            _ = Darwin.kill(-group, SIGKILL)
+        } else {
+            // Pre-fix/failed-spawn fallback: never group-signal unless the
+            // fixture parent is still the group leader we expect.
+            for file in [parentPIDFile, childPIDFile] {
+                if let process = pid(from: file), Self.isAlive(process) {
+                    _ = Darwin.kill(process, SIGKILL)
+                }
+            }
+        }
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func pid(from file: URL) -> pid_t? {
+        guard let text = try? String(contentsOf: file, encoding: .utf8),
+              let value = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              value > 1 else { return nil }
+        return value
+    }
+
+    private static func isAlive(_ pid: pid_t) -> Bool {
+        Darwin.kill(pid, 0) == 0 || errno == EPERM
+    }
+}
+
+private enum OwnedProcessFixtureError: Error {
+    case didNotPublishPIDs
 }
 
 private final class IntegrationCollector: @unchecked Sendable {

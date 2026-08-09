@@ -117,6 +117,36 @@ actor AcpClient {
         mcpServers: [JSONValue],
         resumeSessionID: String? = nil
     ) async throws -> AcpSessionInfo {
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            let session = try await startConnection(
+                command: command,
+                arguments: arguments,
+                environment: environment,
+                cwd: cwd,
+                mcpServers: mcpServers,
+                resumeSessionID: resumeSessionID
+            )
+            if Task.isCancelled {
+                await stop()
+                throw CancellationError()
+            }
+            return session
+        } onCancel: {
+            // GUI task cancellation is an ownership close, including while the
+            // initialize/session handshake is still waiting for its first byte.
+            Task { await self.stop() }
+        }
+    }
+
+    private func startConnection(
+        command: String,
+        arguments: [String],
+        environment: [String: String],
+        cwd: String,
+        mcpServers: [JSONValue],
+        resumeSessionID: String?
+    ) async throws -> AcpSessionInfo {
         connectionGeneration &+= 1
         decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
         sessionID = nil
@@ -222,6 +252,7 @@ actor AcpClient {
             // reader task behind. This is especially important while users swap
             // agent profiles rapidly from the project menu.
             await stop()
+            if Task.isCancelled { throw CancellationError() }
             throw error
         }
     }
@@ -511,6 +542,12 @@ actor AcpClient {
         do {
             while !Task.isCancelled {
                 guard let data = try await transport.receive(maximumBytes: 256 * 1_024) else {
+                    guard !Task.isCancelled else { return }
+                    // EOF is the transport connection closing. Reap the whole
+                    // adapter-owned process group before publishing the exit;
+                    // the adapter may have closed stdout while remaining alive.
+                    await transport.terminate()
+                    guard !Task.isCancelled else { return }
                     let code = await transport.exitCode() ?? 0
                     connectionGeneration &+= 1
                     cancelPermissionRequests()
@@ -531,6 +568,8 @@ actor AcpClient {
                 decoder = active
             }
         } catch {
+            guard !Task.isCancelled else { return }
+            await transport.terminate()
             guard !Task.isCancelled else { return }
             connectionGeneration &+= 1
             cancelPermissionRequests()

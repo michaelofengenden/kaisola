@@ -90,6 +90,106 @@ final class AcpToolArtifactsTests: XCTestCase {
         XCTAssertEqual(accessibility.identifier, "acp.tool.tool-empty")
     }
 
+    // MARK: - Tool-call density
+
+    private var densityFixture: AcpToolCall {
+        AcpToolCall(
+            id: "density-tool",
+            title: "Update project files",
+            kind: "edit",
+            status: .failed,
+            content: [
+                .diff(path: "Sources/App.swift", oldText: "old", newText: "new"),
+                .text("permission decision: allowed once"),
+                .terminal(id: "terminal-1"),
+            ],
+            locations: ["Tests/AppTests.swift", "Sources/App.swift"]
+        )
+    }
+
+    func testEveryToolCallDensityRetainsCriticalEvidenceAndExpandability() {
+        for density in ToolCallDensity.allCases {
+            let presentation = ToolCallDensityPresentation(
+                call: densityFixture,
+                density: density
+            )
+            XCTAssertEqual(presentation.statusLabel, "Failed", density.title)
+            XCTAssertEqual(presentation.affectedFiles, [
+                "Tests/AppTests.swift", "Sources/App.swift",
+            ], density.title)
+            XCTAssertEqual(presentation.artifactCount, 3, density.title)
+            XCTAssertTrue(presentation.hasExpandableContent, density.title)
+            XCTAssertEqual(presentation.accessibilityOrder, [
+                "Failed",
+                "Update project files",
+                "edit",
+                "Affected files: Tests/AppTests.swift, Sources/App.swift",
+                "3 expandable artifacts",
+            ], density.title)
+        }
+    }
+
+    func testNamedDensitiesExposeIncreasingDetailWithoutExpandingUnboundedOutput() {
+        let presentations = ToolCallDensity.allCases.map {
+            ToolCallDensityPresentation(call: densityFixture, density: $0)
+        }
+
+        XCTAssertEqual(presentations.map(\.visibleDetailLevel), [1, 2, 3])
+        XCTAssertEqual(presentations.map(\.showsArtifactSummary), [false, true, true])
+        XCTAssertEqual(presentations.map(\.wrapsAffectedFiles), [false, false, true])
+        XCTAssertTrue(presentations.allSatisfy { !$0.expandsArtifactsByDefault })
+    }
+
+    func testDensityProjectionNeverMutatesTranscriptRowsOrStableIdentity() {
+        let row = AcpTranscriptRow.tool(densityFixture)
+        let baseline = row
+        for density in ToolCallDensity.allCases {
+            _ = ToolCallDensityPresentation(call: densityFixture, density: density)
+            XCTAssertEqual(row, baseline)
+            XCTAssertEqual(row.id, "tool-density-tool")
+        }
+    }
+
+    func testDensityChangeKeepsStableReadingAnchorIdentity() {
+        let rows: [AcpTranscriptRow] = [
+            .message(id: "before", text: "Before"),
+            .tool(densityFixture),
+            .message(id: "after", text: "After"),
+        ]
+        let readingAnchor = rows[1].id
+
+        for density in ToolCallDensity.allCases {
+            _ = ToolCallDensityPresentation(call: densityFixture, density: density)
+            XCTAssertEqual(rows[1].id, readingAnchor, density.title)
+            XCTAssertEqual(rows.map(\.id), ["msg-before", "tool-density-tool", "msg-after"])
+        }
+    }
+
+    func testLargeChatProjectionIsMeasuredWithinBudgetForEveryDensity() {
+        let calls = (0..<20_000).map { index in
+            AcpToolCall(
+                id: "tool-\(index)",
+                title: "Read source \(index)",
+                kind: index.isMultiple(of: 2) ? "read" : "edit",
+                status: index.isMultiple(of: 7) ? .failed : .completed,
+                content: [.text("bounded output")],
+                locations: ["Sources/File\(index).swift"]
+            )
+        }
+        let clock = ContinuousClock()
+        for density in ToolCallDensity.allCases {
+            var checksum = 0
+            let elapsed = clock.measure {
+                for call in calls {
+                    let presentation = ToolCallDensityPresentation(call: call, density: density)
+                    checksum &+= presentation.accessibilityOrder.count
+                }
+            }
+            XCTAssertEqual(checksum, calls.count * 5, density.title)
+            XCTAssertLessThan(elapsed, .seconds(2), "\(density.title) projection: \(elapsed)")
+        }
+    }
+
     // MARK: - AcpDiff
 
     func testFreshFileIsAllAdditions() {

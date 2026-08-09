@@ -751,6 +751,66 @@ enum AcpChatRendering {
     }
 }
 
+struct ToolCallDensityPresentation: Equatable, Sendable {
+    let call: AcpToolCall
+    let density: ToolCallDensity
+
+    var statusLabel: String {
+        switch call.status {
+        case .pending: "Pending"
+        case .inProgress: "In progress"
+        case .completed: "Completed"
+        case .failed: "Failed"
+        }
+    }
+
+    var affectedFiles: [String] { call.declaredFilePaths }
+    var artifactCount: Int { call.content.count }
+    var hasExpandableContent: Bool { artifactCount > 0 }
+
+    var visibleDetailLevel: Int {
+        switch density {
+        case .compact: 1
+        case .balanced: 2
+        case .detailed: 3
+        }
+    }
+
+    var showsArtifactSummary: Bool { density != .compact }
+    var wrapsAffectedFiles: Bool { density == .detailed }
+    var expandsArtifactsByDefault: Bool { false }
+
+    var accessibilityOrder: [String] {
+        [
+            statusLabel,
+            call.title,
+            call.kind,
+            affectedFiles.isEmpty
+                ? "No affected files"
+                : "Affected files: \(affectedFiles.joined(separator: ", "))",
+            artifactCount == 1
+                ? "1 expandable artifact"
+                : "\(artifactCount) expandable artifacts",
+        ]
+    }
+
+    var cardSpacing: CGFloat {
+        switch density {
+        case .compact: 4
+        case .balanced: 8
+        case .detailed: 10
+        }
+    }
+
+    var cardPadding: CGFloat {
+        switch density {
+        case .compact: 6
+        case .balanced: 9
+        case .detailed: 12
+        }
+    }
+}
+
 struct TranscriptRowView: View {
     let row: AcpTranscriptRow
     var workspaceURL: URL?
@@ -868,15 +928,20 @@ struct ToolCallCard: View {
     let call: AcpToolCall
     var workspaceURL: URL?
     var terminalSnapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
+    @ObservedObject private var settings = NativePreviewSettings.shared
     @State private var expanded = false
 
-    private var hasArtifacts: Bool { !call.content.isEmpty }
+    private var density: ToolCallDensity { settings.toolCallDensity }
+    private var presentation: ToolCallDensityPresentation {
+        ToolCallDensityPresentation(call: call, density: density)
+    }
+    private var hasArtifacts: Bool { presentation.hasExpandableContent }
     private var accessibility: ToolCallAccessibility {
         ToolCallAccessibility(call: call, expanded: expanded)
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: presentation.cardSpacing) {
             if hasArtifacts {
                 Button {
                     expanded.toggle()
@@ -898,12 +963,26 @@ struct ToolCallCard: View {
                     .accessibilityAddTraits(.updatesFrequently)
             }
 
-            if !call.locations.isEmpty {
+            if !presentation.affectedFiles.isEmpty {
                 Text(AcpTranscriptInlineRendering.attributed(
-                    call.locations.joined(separator: ", "),
+                    presentation.affectedFiles.joined(separator: ", "),
                     workspaceURL: workspaceURL
                 ))
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(presentation.wrapsAffectedFiles ? nil : 1)
+                    .accessibilityLabel(presentation.accessibilityOrder[3])
+            }
+
+            if presentation.showsArtifactSummary, presentation.hasExpandableContent {
+                Text(
+                    presentation.artifactCount == 1
+                        ? "1 artifact"
+                        : "\(presentation.artifactCount) artifacts"
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .accessibilityLabel(presentation.accessibilityOrder[4])
             }
 
             if expanded {
@@ -919,7 +998,7 @@ struct ToolCallCard: View {
                 }
             }
         }
-        .padding(9)
+        .padding(presentation.cardPadding)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
         .environment(\.openURL, OpenURLAction { link in
             AcpTranscriptLinkRouting.open(link, workspaceURL: workspaceURL)
@@ -927,10 +1006,15 @@ struct ToolCallCard: View {
     }
 
     private var header: some View {
-        HStack(spacing: 9) {
+        HStack(spacing: density == .compact ? 6 : 9) {
             Image(systemName: statusSymbol)
                 .foregroundStyle(statusColor)
-            Text(call.title).lineLimit(1)
+                .accessibilityHidden(true)
+            Text(presentation.statusLabel)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(statusColor)
+            Text(call.title)
+                .lineLimit(density == .detailed ? 2 : 1)
             Spacer()
             if hasArtifacts {
                 Image(systemName: expanded ? "chevron.down" : "chevron.right")

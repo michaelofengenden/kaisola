@@ -185,6 +185,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertTrue(settings.workspaceRailVisible)
         XCTAssertEqual(settings.workspaceRailWidth, NativePreviewSettings.workspaceRailWidthDefault)
         XCTAssertEqual(settings.filePreviewWidth, NativePreviewSettings.filePreviewWidthDefault)
+        XCTAssertEqual(settings.toolCallDensity, .balanced)
 
         settings.navigationLayout = .topBar
         settings.appearance = .dark
@@ -197,6 +198,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         settings.terminalHistoryWarningMiB = 2_048
         settings.workspaceRailWidth = 300
         settings.filePreviewWidth = 640
+        settings.toolCallDensity = .detailed
 
         let reloaded = NativePreviewSettings(defaults: defaults)
         XCTAssertEqual(reloaded.navigationLayout, .topBar)
@@ -210,6 +212,17 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.terminalHistoryWarningMiB, 2_048)
         XCTAssertEqual(reloaded.workspaceRailWidth, 300)
         XCTAssertEqual(reloaded.filePreviewWidth, 640)
+        XCTAssertEqual(reloaded.toolCallDensity, .detailed)
+    }
+
+    func testToolCallDensityRejectsUnknownPersistedValues() {
+        let defaults = makeDefaults()
+        defaults.set("exhaustive", forKey: "toolCallDensity")
+
+        XCTAssertEqual(NativePreviewSettings(defaults: defaults).toolCallDensity, .balanced)
+        XCTAssertEqual(ToolCallDensity.allCases.map(\.title), [
+            "Compact", "Balanced", "Detailed",
+        ])
     }
 
     func testProviderRoutingPersistsWithoutTouchingProviderDefaults() {

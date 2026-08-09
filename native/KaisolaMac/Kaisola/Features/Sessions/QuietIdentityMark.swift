@@ -128,14 +128,14 @@ struct QuietIdentityMarkView: View {
     private func symbol(_ name: String) -> some View {
         Image(systemName: name)
             .font(.system(size: QuietIdentityMarkView.symbolSize * (size / QuietIdentityMarkView.slot), weight: .regular))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
     }
 
     /// A naked text glyph, for the marks SF has no monoline drawing of.
     private func glyph(_ text: String, size glyphSize: CGFloat) -> some View {
         Text(text)
             .font(.system(size: glyphSize * (size / QuietIdentityMarkView.slot), weight: .regular))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
     }
 }
 

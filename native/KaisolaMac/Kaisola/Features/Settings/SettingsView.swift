@@ -992,13 +992,19 @@ private struct SettingsChoiceLabel: View {
 
 /// The Color card: theme picker over the registry, a live preview drawn from
 /// the selected theme's own palette, and the custom-theme roster — import,
-/// remove, and an explanation line for any theme that cannot install (PR 6's
-/// disabled-with-a-reason contract).
+/// remove, an explanation line for any theme that cannot install (PR 6's
+/// disabled-with-a-reason contract), and a recovery row for a themes file that
+/// cannot be read or written at all.
 private struct TerminalColorCard: View {
     @ObservedObject var settings: NativePreviewSettings
     @Environment(\.colorScheme) private var colorScheme
-    @State private var customSpecs: [CustomThemeSpec] = []
+    @State private var themeLoad = CustomThemeStore.Load.empty
+    /// The last write that did not land, kept on screen until one does — a
+    /// toast that has already faded cannot explain a missing theme.
+    @State private var saveFailure: String?
     private let store = CustomThemeStore()
+
+    private var customSpecs: [CustomThemeSpec] { themeLoad.specs }
 
     var body: some View {
         SettingsCard(title: "Color", symbol: "paintpalette") {
@@ -1030,11 +1036,12 @@ private struct TerminalColorCard: View {
                 .padding(.bottom, customSpecs.isEmpty ? 14 : 6)
             customThemeRoster
         }
-        .onAppear { customSpecs = store.specs() }
+        .onAppear { themeLoad = store.load() }
     }
 
     @ViewBuilder
     private var customThemeRoster: some View {
+        storeProblemRow
         ForEach(customSpecs) { spec in
             HStack(spacing: 8) {
                 if let reason = spec.validationError {
@@ -1054,11 +1061,11 @@ private struct TerminalColorCard: View {
                 }
                 Spacer()
                 Button("Remove") {
-                    store.remove(id: spec.id)
-                    customSpecs = store.specs()
                     // Removing the selected theme falls back at resolve time;
                     // the stored choice is left alone so re-importing the
                     // theme restores it.
+                    if let outcome = store.remove(id: spec.id) { report(outcome) }
+                    themeLoad = store.load()
                 }
                 .buttonStyle(.link)
             }
@@ -1081,6 +1088,93 @@ private struct TerminalColorCard: View {
         .padding(.bottom, 14)
     }
 
+    /// The recovery row: what went wrong with the themes file, what Kaisola did
+    /// about it, and the two things the user can do next. It stays until a read
+    /// and a write both succeed, because "my themes vanished" is precisely the
+    /// state a vanishing toast cannot explain.
+    @ViewBuilder
+    private var storeProblemRow: some View {
+        if themeLoad.failure != nil || saveFailure != nil {
+            HStack(alignment: .top, spacing: 8) {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(themeLoad.failure?.title ?? "Themes Couldn't Be Saved")
+                        .font(.system(size: 12, weight: .medium))
+                    Text(saveFailure ?? themeLoad.failure?.message ?? "")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if themeLoad.isStale {
+                        Text("The themes listed below are the ones Kaisola loaded earlier in this session.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(spacing: 12) {
+                        if themeLoad.failure?.allowsQuarantine == true {
+                            Button("Repair") { repairThemeStore() }
+                                .buttonStyle(.link)
+                                .help("Keep the damaged file beside the original and save a fresh one")
+                        }
+                        Button("Try Again") {
+                            saveFailure = nil
+                            themeLoad = store.load()
+                        }
+                        .buttonStyle(.link)
+                        Button("Reveal in Finder") { revealThemeStore() }
+                            .buttonStyle(.link)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 5)
+        }
+    }
+
+    /// Quarantine the unreadable file and write back what the app is showing.
+    /// The themes on screen are the honest starting point: either the records
+    /// that still decoded, or the set loaded before the file went bad.
+    private func repairThemeStore() {
+        report(store.save(customSpecs))
+        themeLoad = store.load()
+    }
+
+    private func revealThemeStore() {
+        let url = store.fileURL
+        if FileManager.default.fileExists(atPath: url.path) {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            // A repaired file lives beside its kept copy; the folder is the
+            // only target that exists in both cases.
+            NSWorkspace.shared.activateFileViewerSelecting([url.deletingLastPathComponent()])
+        }
+    }
+
+    /// Turn a write outcome into the two things it owes the user: a toast now
+    /// and, when it failed, a line that stays put.
+    private func report(_ outcome: CustomThemeStore.SaveOutcome) {
+        switch outcome {
+        case .saved:
+            saveFailure = nil
+        case .savedAfterQuarantine(let preservedCopy):
+            saveFailure = nil
+            ToastCenter.shared.show(
+                "Your themes file was damaged. Kaisola kept it as \(preservedCopy.lastPathComponent) and saved a fresh one.",
+                style: .info,
+                duration: 6
+            )
+        case .refused(let failure):
+            saveFailure = "Not saved: \(failure.message)"
+            ToastCenter.shared.show(failure.message, style: .error, duration: 6)
+        case .writeFailed(let reason):
+            let message = "Kaisola couldn't write \(store.fileURL.lastPathComponent): \(reason)"
+            saveFailure = message
+            ToastCenter.shared.show(message, style: .error, duration: 6)
+        }
+    }
+
     private func importCustomTheme() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = true
@@ -1100,17 +1194,23 @@ private struct TerminalColorCard: View {
                     )
                     return
                 }
-                if let reason = store.upsert(spec) {
-                    ToastCenter.shared.show(
-                        "Imported, but it cannot be used yet: \(reason)",
-                        style: .info,
-                        duration: 6
-                    )
-                } else {
-                    settings.terminalThemeID = spec.id
-                    ToastCenter.shared.show("Imported \(spec.title) and switched to it", style: .success)
+                let result = store.upsert(spec)
+                // `report` has already explained a write that did not land, and
+                // a theme that was never stored must not be called imported.
+                report(result.outcome)
+                if result.outcome.didSave {
+                    if let reason = result.validationError {
+                        ToastCenter.shared.show(
+                            "Imported, but it cannot be used yet: \(reason)",
+                            style: .info,
+                            duration: 6
+                        )
+                    } else {
+                        settings.terminalThemeID = spec.id
+                        ToastCenter.shared.show("Imported \(spec.title) and switched to it", style: .success)
+                    }
                 }
-                customSpecs = store.specs()
+                themeLoad = store.load()
             }
         }
     }

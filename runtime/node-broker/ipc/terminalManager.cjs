@@ -766,7 +766,8 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     // isolated checkout. Seeded as chunks[0] so the create-reply snapshot
     // carries it — a live send here would fire before Terminal.tsx's data
     // listener is wired (Electron drops it) and never reach the renderer.
-    const warn = `\r\n\x1b[33m⚠ working directory not found:\x1b[0m ${cwd}\r\n\x1b[33m  started in ${os.homedir()} instead — this session is NOT isolated.\x1b[0m\r\n\r\n`
+    const { missingCwdWarning } = require('./terminalText.cjs')
+    const warn = missingCwdWarning(cwd)
     rec.spool.push(warn)
     rec.cursor.append(warn)
   }

@@ -3527,7 +3527,9 @@ final class AcpClientTests: XCTestCase {
             try await client.requestForTesting("session/set_model", timeoutNanoseconds: 30_000_000_000)
         }
         try await Self.untilClient("the request to go in flight") {
-            await client.outstandingRequestTimeoutCountForTesting() == 1
+            let timeoutCount = await client.outstandingRequestTimeoutCountForTesting()
+            let requestIDs = await transport.unansweredRequestIDs()
+            return timeoutCount == 1 && !requestIDs.isEmpty
         }
         let inFlight = await transport.unansweredRequestIDs()
         await transport.answer(id: try XCTUnwrap(inFlight.first))

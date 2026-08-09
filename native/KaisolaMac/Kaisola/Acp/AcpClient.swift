@@ -446,6 +446,10 @@ actor AcpClient {
         timeoutNanoseconds: UInt64 = 30_000_000_000
     ) async throws -> JSONValue {
         nextRequestID += 1
+        // Ids never repeat for the life of a client — not across a stop, a
+        // restart, or a resumed session — so a response that arrives after its
+        // entry is gone (cancelled, timed out, adapter exited) cannot alias a
+        // later request's id. `handle` drops it.
         let id = nextRequestID
         let frame = try encode(.object([
             "jsonrpc": .string("2.0"),
@@ -453,18 +457,33 @@ actor AcpClient {
             "method": .string(method),
             "params": params,
         ]))
-        return try await withCheckedThrowingContinuation { continuation in
-            pending[id] = continuation
-            if timeoutNanoseconds > 0 {
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                // An already-cancelled caller must fail here rather than
+                // register: the handler below reaches this actor on a later
+                // turn, so its removal would have run before the entry existed
+                // and the request would wait on the adapter forever.
+                guard !Task.isCancelled else {
+                    return continuation.resume(throwing: CancellationError())
+                }
+                pending[id] = continuation
+                if timeoutNanoseconds > 0 {
+                    Task {
+                        try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                        failRequest(id, error: AcpClientError.requestFailed("\(method) timed out"))
+                    }
+                }
                 Task {
-                    try? await Task.sleep(nanoseconds: timeoutNanoseconds)
-                    failRequest(id, error: AcpClientError.requestFailed("\(method) timed out"))
+                    do { try await transport.send(frame) }
+                    catch { failRequest(id, error: error) }
                 }
             }
-            Task {
-                do { try await transport.send(frame) }
-                catch { failRequest(id, error: error) }
-            }
+        } onCancel: {
+            // A caller that walked away — a closed chat view cancels its
+            // `.task`, a restart abandons startup — must not leave its entry in
+            // `pending` until the adapter answers. `session/prompt` in
+            // particular has no timeout, so that wait is unbounded.
+            Task { await self.failRequest(id, error: CancellationError()) }
         }
     }
 
@@ -501,6 +520,9 @@ actor AcpClient {
         return data
     }
 
+    /// Remove `id` and fail whoever was waiting on it. A no-op once the entry is
+    /// gone, so a timeout firing after a cancellation (or an adapter exit after
+    /// either) can never resume the same continuation twice.
     private func failRequest(_ id: Int, error: any Error) {
         pending.removeValue(forKey: id)?.resume(throwing: error)
     }
@@ -544,7 +566,10 @@ actor AcpClient {
 
     private func handle(_ message: JSONValue) {
         guard let object = message.objectValue else { return }
-        // Response to one of our requests.
+        // Response to one of our requests. A response with no entry belongs to a
+        // request that was cancelled, timed out, or was torn down, and is
+        // dropped: nothing waits on it, and because ids never repeat it cannot
+        // belong to whatever replaced that flow.
         if let id = object["id"]?.intValue.flatMap(Int.init(exactly:)), object["method"] == nil {
             let continuation = pending.removeValue(forKey: id)
             if let error = object["error"]?.objectValue {

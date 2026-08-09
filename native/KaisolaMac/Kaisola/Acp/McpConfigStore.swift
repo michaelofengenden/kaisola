@@ -55,9 +55,11 @@ struct McpServerConfig: Codable, Equatable, Identifiable, Sendable {
             }
         case .http, .sse:
             guard let url, url.utf8.count <= 4_096,
+                  Self.unambiguousURIText(url),
                   let components = URLComponents(string: url),
                   components.scheme?.lowercased() == "https",
-                  components.host?.isEmpty == false else {
+                  let host = components.host, !host.isEmpty,
+                  Self.unambiguousURIText(host) else {
                 return "Remote MCP servers must use a valid HTTPS URL."
             }
             guard components.user == nil, components.password == nil else {
@@ -65,6 +67,19 @@ struct McpServerConfig: Codable, Equatable, Identifiable, Sendable {
             }
         }
         return nil
+    }
+
+    /// A remote server URL is stored as text and re-read by parsers that
+    /// disagree about these bytes. WHATWG (`new URL` in
+    /// `scripts/native-mcp-registry.cjs`) folds a literal backslash into `/` for
+    /// http(s) and strips TAB/LF/CR before parsing, while RFC 3986 parsers keep
+    /// them, so `https:\\evil.test` and `https://good.test\@evil.test` name a
+    /// different host depending on who reads it. `URLComponents` also
+    /// percent-decodes `host`, so `%09` smuggles a separator past a raw-text
+    /// check; the decoded host goes through here too. Reject the ambiguous
+    /// spelling rather than pick a winner.
+    private static func unambiguousURIText(_ value: String) -> Bool {
+        !value.unicodeScalars.contains { $0 == "\\" || $0.value <= 0x20 || $0.value == 0x7F }
     }
 
     private static func safeRequired(_ value: String) -> Bool {

@@ -102,6 +102,224 @@ final class ApiKeyStoreTests: XCTestCase {
         XCTAssertEqual(ApiKeyStore.Key.allCases.count, 2)
     }
 
+    func testCredentialIdentifiersRejectMalformedOverlongAndConfusableTags() {
+        XCTAssertNil(ApiKeyStore.identifierIssue(ApiKeyStore.defaultService))
+        XCTAssertNil(ApiKeyStore.identifierIssue(ApiKeyStore.Key.anthropic.accountIdentifier))
+        XCTAssertNil(ApiKeyStore.identifierIssue("a"))
+        XCTAssertNil(ApiKeyStore.identifierIssue(
+            String(repeating: "a", count: ApiKeyStore.maximumIdentifierBytes)
+        ))
+
+        for invalid in [
+            "",
+            ".com.kaisola.api-keys",
+            "com.kaisola.api-keys.",
+            "com.kaisola.api keys",
+            "com.kaisola.api\tkeys",
+            "com.kaisola.api-keys\nshadow",
+            "com.kaisola.api-keys\u{001B}[31m",
+            "com.kaisola.\u{0430}pi-keys", // Cyrillic small a, not ASCII a.
+            String(repeating: "a", count: ApiKeyStore.maximumIdentifierBytes + 1),
+        ] {
+            XCTAssertNotNil(
+                ApiKeyStore.identifierIssue(invalid),
+                "expected identifier rejection for \(String(reflecting: invalid))"
+            )
+        }
+    }
+
+    func testCredentialIdentifierCollisionsFailBeforeKeychainAccess() throws {
+        XCTAssertNoThrow(try ApiKeyStore.validateAccountIdentifiers(
+            ApiKeyStore.Key.allCases.map(\.accountIdentifier)
+        ))
+        XCTAssertThrowsError(try ApiKeyStore.validateAccountIdentifiers([
+            "provider.open-ai.api-key",
+            "provider.open_ai.api_key",
+        ]))
+
+        let backend = ApiKeyStoreTestBackend()
+        let invalid = ApiKeyStore(
+            service: "com.kaisola.\u{0430}pi-keys",
+            keychain: backend.access
+        )
+        XCTAssertThrowsError(try invalid.write(.anthropic, value: "fixture-secret")) { error in
+            XCTAssertEqual((error as NSError).code, Int(errSecParam))
+            XCTAssertFalse(error.localizedDescription.contains("fixture-secret"))
+        }
+        XCTAssertNil(invalid.read(.anthropic))
+        invalid.delete(.anthropic)
+        XCTAssertTrue(backend.operations.isEmpty, "invalid identities must fail before Keychain access")
+    }
+
+    func testLegacyMigrationPlanIsDeterministicCollisionFreeAndValueBlind() throws {
+        let first = try ApiKeyStore.legacyMigrationPlan()
+        let second = try ApiKeyStore.legacyMigrationPlan()
+
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(first.map(\.sourceAccount), ApiKeyStore.Key.allCases.map(\.rawValue))
+        XCTAssertEqual(first.map(\.destinationAccount), ApiKeyStore.Key.allCases.map(\.accountIdentifier))
+        XCTAssertEqual(Set(first.map(\.destinationAccount)).count, ApiKeyStore.Key.allCases.count)
+        XCTAssertFalse(String(describing: first).contains("sk-fixture-secret"))
+    }
+
+    func testLegacyRecordMigratesWithoutOverwritingANewerCanonicalCredential() {
+        let backend = ApiKeyStoreTestBackend()
+        let store = ApiKeyStore(service: service, keychain: backend.access)
+        backend.set(
+            "legacy-secret",
+            service: service,
+            account: ApiKeyStore.Key.anthropic.rawValue
+        )
+
+        XCTAssertEqual(store.read(.anthropic), "legacy-secret")
+        XCTAssertEqual(
+            backend.value(service: service, account: ApiKeyStore.Key.anthropic.accountIdentifier),
+            "legacy-secret"
+        )
+        XCTAssertNil(backend.value(service: service, account: ApiKeyStore.Key.anthropic.rawValue))
+
+        backend.set(
+            "canonical-secret",
+            service: service,
+            account: ApiKeyStore.Key.anthropic.accountIdentifier
+        )
+        backend.set(
+            "stale-legacy-secret",
+            service: service,
+            account: ApiKeyStore.Key.anthropic.rawValue
+        )
+        let writesBeforeCollisionRead = backend.insertCount
+
+        XCTAssertEqual(store.read(.anthropic), "canonical-secret")
+        XCTAssertEqual(backend.insertCount, writesBeforeCollisionRead)
+        XCTAssertEqual(
+            backend.value(service: service, account: ApiKeyStore.Key.anthropic.rawValue),
+            "stale-legacy-secret",
+            "a legacy collision must not overwrite or silently delete either value"
+        )
+    }
+
+    func testMigrationFailureKeepsTheLegacyCredentialAvailableAndIntact() {
+        let backend = ApiKeyStoreTestBackend()
+        backend.insertStatus = errSecInteractionNotAllowed
+        backend.set(
+            "legacy-secret",
+            service: service,
+            account: ApiKeyStore.Key.openai.rawValue
+        )
+        let store = ApiKeyStore(service: service, keychain: backend.access)
+
+        XCTAssertEqual(store.read(.openai), "legacy-secret")
+        XCTAssertEqual(
+            backend.value(service: service, account: ApiKeyStore.Key.openai.rawValue),
+            "legacy-secret"
+        )
+        XCTAssertNil(
+            backend.value(service: service, account: ApiKeyStore.Key.openai.accountIdentifier)
+        )
+    }
+
+    func testConcurrentCanonicalWriterWinsMigrationRaceWithoutDeletingLegacy() {
+        let backend = ApiKeyStoreTestBackend()
+        backend.set(
+            "legacy-secret",
+            service: service,
+            account: ApiKeyStore.Key.anthropic.rawValue
+        )
+        backend.beforeInsert = { [weak backend] destinationService, destinationAccount in
+            backend?.set(
+                "concurrent-canonical-secret",
+                service: destinationService,
+                account: destinationAccount
+            )
+        }
+        let store = ApiKeyStore(service: service, keychain: backend.access)
+
+        XCTAssertEqual(store.read(.anthropic), "concurrent-canonical-secret")
+        XCTAssertEqual(
+            backend.value(service: service, account: ApiKeyStore.Key.anthropic.rawValue),
+            "legacy-secret",
+            "a migration race must not delete the losing legacy record"
+        )
+        XCTAssertEqual(backend.insertCount, 1)
+    }
+
+    func testCorruptCanonicalRecordFailsClosedInsteadOfFallingBackToLegacy() {
+        let backend = ApiKeyStoreTestBackend()
+        backend.set(
+            Data([0xFF]),
+            service: service,
+            account: ApiKeyStore.Key.openai.accountIdentifier
+        )
+        backend.set(
+            "legacy-secret",
+            service: service,
+            account: ApiKeyStore.Key.openai.rawValue
+        )
+        let store = ApiKeyStore(service: service, keychain: backend.access)
+
+        XCTAssertNil(store.read(.openai))
+        XCTAssertEqual(backend.insertCount, 0)
+        XCTAssertEqual(
+            backend.value(service: service, account: ApiKeyStore.Key.openai.rawValue),
+            "legacy-secret"
+        )
+    }
+
+    func testCanonicalWriteAndDeleteCleanUpLegacyAccounts() throws {
+        let backend = ApiKeyStoreTestBackend()
+        backend.set(
+            "legacy-secret",
+            service: service,
+            account: ApiKeyStore.Key.openai.rawValue
+        )
+        let store = ApiKeyStore(service: service, keychain: backend.access)
+
+        try store.write(.openai, value: "  canonical-secret\n")
+        XCTAssertEqual(
+            backend.value(service: service, account: ApiKeyStore.Key.openai.accountIdentifier),
+            "canonical-secret"
+        )
+        XCTAssertNil(backend.value(service: service, account: ApiKeyStore.Key.openai.rawValue))
+
+        store.delete(.openai)
+        XCTAssertNil(
+            backend.value(service: service, account: ApiKeyStore.Key.openai.accountIdentifier)
+        )
+        XCTAssertNil(backend.value(service: service, account: ApiKeyStore.Key.openai.rawValue))
+        XCTAssertEqual(
+            Array(backend.operations.suffix(2)),
+            [
+                .delete(service: service, account: ApiKeyStore.Key.openai.rawValue),
+                .delete(service: service, account: ApiKeyStore.Key.openai.accountIdentifier),
+            ],
+            "legacy deletion must precede canonical deletion to prevent resurrection"
+        )
+    }
+
+    func testFailedCanonicalWriteDoesNotDeleteLegacyOrExposeCredential() {
+        let backend = ApiKeyStoreTestBackend()
+        backend.upsertStatus = errSecInteractionNotAllowed
+        backend.set(
+            "last-known-good-secret",
+            service: service,
+            account: ApiKeyStore.Key.anthropic.rawValue
+        )
+        let store = ApiKeyStore(service: service, keychain: backend.access)
+
+        XCTAssertThrowsError(try store.write(.anthropic, value: "new-secret-never-echo")) { error in
+            XCTAssertEqual((error as NSError).code, Int(errSecInteractionNotAllowed))
+            XCTAssertFalse(error.localizedDescription.contains("new-secret-never-echo"))
+        }
+        XCTAssertEqual(
+            backend.value(service: service, account: ApiKeyStore.Key.anthropic.rawValue),
+            "last-known-good-secret"
+        )
+        XCTAssertNil(
+            backend.value(service: service, account: ApiKeyStore.Key.anthropic.accountIdentifier)
+        )
+    }
+
     func testSettingsKeyFormatWarningsAreSoftAndProviderSpecific() {
         XCTAssertNil(ApiKeyFormatPolicy.warning(
             for: .anthropic,
@@ -266,6 +484,25 @@ final class KeychainBoundaryTests: XCTestCase {
             }
         }
 
+        try addKeychainValue(
+            "fixture-legacy",
+            service: firstService,
+            account: ApiKeyStore.Key.anthropic.rawValue
+        )
+        XCTAssertEqual(first.read(.anthropic), "fixture-legacy")
+        XCTAssertEqual(
+            keychainStatus(service: firstService, account: ApiKeyStore.Key.anthropic.rawValue),
+            errSecItemNotFound,
+            "a successful migration removes the legacy account tag"
+        )
+        XCTAssertEqual(
+            try keychainValue(
+                service: firstService,
+                account: ApiKeyStore.Key.anthropic.accountIdentifier
+            ),
+            "fixture-legacy"
+        )
+
         try first.write(.anthropic, value: "  fixture-first  \n")
         try second.write(.anthropic, value: "fixture-second")
         XCTAssertEqual(first.read(.anthropic), "fixture-first")
@@ -292,12 +529,28 @@ final class KeychainBoundaryTests: XCTestCase {
         first.delete(.openai)
         second.delete(.anthropic)
         XCTAssertEqual(
-            keychainStatus(service: firstService, account: ApiKeyStore.Key.openai.rawValue),
+            keychainStatus(
+                service: firstService,
+                account: ApiKeyStore.Key.openai.accountIdentifier
+            ),
             errSecItemNotFound
         )
         XCTAssertEqual(
-            keychainStatus(service: secondService, account: ApiKeyStore.Key.anthropic.rawValue),
+            keychainStatus(
+                service: secondService,
+                account: ApiKeyStore.Key.anthropic.accountIdentifier
+            ),
             errSecItemNotFound
+        )
+        XCTAssertEqual(
+            keychainStatus(service: firstService, account: ApiKeyStore.Key.openai.rawValue),
+            errSecItemNotFound,
+            "delete must also clean up a legacy account"
+        )
+        XCTAssertEqual(
+            keychainStatus(service: secondService, account: ApiKeyStore.Key.anthropic.rawValue),
+            errSecItemNotFound,
+            "delete must also clean up a legacy account"
         )
     }
 
@@ -366,6 +619,40 @@ final class KeychainBoundaryTests: XCTestCase {
         return SecItemCopyMatching(query as CFDictionary, nil)
     }
 
+    private func addKeychainValue(_ value: String, service: String, account: String) throws {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecValueData as String: Data(value.utf8),
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+            kSecUseDataProtectionKeychain as String: true,
+        ]
+        let status = SecItemAdd(query as CFDictionary, nil)
+        guard status == errSecSuccess else {
+            throw ApiKeyStore.keychainError(status, message: "Could not seed the legacy boundary item.")
+        }
+    }
+
+    private func keychainValue(service: String, account: String) throws -> String {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecUseDataProtectionKeychain as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        query[kSecReturnData as String] = true
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let value = String(data: data, encoding: .utf8) else {
+            throw ApiKeyStore.keychainError(status, message: "Could not inspect the migrated boundary item.")
+        }
+        return value
+    }
+
     private func keychainAttributes(service: String, account: String) throws -> [String: Any] {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -386,6 +673,74 @@ final class KeychainBoundaryTests: XCTestCase {
             )
         }
         return attributes
+    }
+}
+
+private final class ApiKeyStoreTestBackend: @unchecked Sendable {
+    enum Operation: Equatable {
+        case read(service: String, account: String)
+        case insert(service: String, account: String)
+        case upsert(service: String, account: String)
+        case delete(service: String, account: String)
+    }
+
+    private var storage: [String: Data] = [:]
+    private(set) var operations: [Operation] = []
+    var insertStatus: OSStatus = errSecSuccess
+    var upsertStatus: OSStatus = errSecSuccess
+    var beforeInsert: (@Sendable (_ service: String, _ account: String) -> Void)?
+
+    var insertCount: Int {
+        operations.reduce(into: 0) { count, operation in
+            if case .insert = operation { count += 1 }
+        }
+    }
+
+    lazy var access = ApiKeyStore.KeychainAccess(
+        read: { [unowned self] service, account in
+            operations.append(.read(service: service, account: account))
+            guard let data = storage[key(service: service, account: account)] else {
+                return (errSecItemNotFound, nil)
+            }
+            return (errSecSuccess, data)
+        },
+        insert: { [unowned self] service, account, data in
+            operations.append(.insert(service: service, account: account))
+            beforeInsert?(service, account)
+            guard insertStatus == errSecSuccess else { return insertStatus }
+            let identifier = key(service: service, account: account)
+            guard storage[identifier] == nil else { return errSecDuplicateItem }
+            storage[identifier] = data
+            return errSecSuccess
+        },
+        upsert: { [unowned self] service, account, data in
+            operations.append(.upsert(service: service, account: account))
+            guard upsertStatus == errSecSuccess else { return upsertStatus }
+            storage[key(service: service, account: account)] = data
+            return errSecSuccess
+        },
+        delete: { [unowned self] service, account in
+            operations.append(.delete(service: service, account: account))
+            storage.removeValue(forKey: key(service: service, account: account))
+            return errSecSuccess
+        }
+    )
+
+    func set(_ value: String, service: String, account: String) {
+        set(Data(value.utf8), service: service, account: account)
+    }
+
+    func set(_ data: Data, service: String, account: String) {
+        storage[key(service: service, account: account)] = data
+    }
+
+    func value(service: String, account: String) -> String? {
+        storage[key(service: service, account: account)]
+            .flatMap { String(data: $0, encoding: .utf8) }
+    }
+
+    private func key(service: String, account: String) -> String {
+        "\(service)\u{0}\(account)"
     }
 }
 

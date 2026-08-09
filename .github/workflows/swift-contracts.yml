@@ -66,6 +66,8 @@ jobs:
           KAISOLA_SKIP_NATIVE_REBUILD: '1'
       - name: Download checksum-pinned Node runtime
         run: node scripts/download-native-node-runtime.cjs arm64
+      - name: Test broker runtime durability manifest
+        run: node tests/node/brokerRuntimeManifest.cjs
       - name: Test native packaging, compatibility, and resource policies
         run: >-
           node --test

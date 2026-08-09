@@ -9,6 +9,24 @@ import XCTest
 /// checked.
 @MainActor
 final class NativePreviewSettingsTests: XCTestCase {
+    func testIsolatedFixtureUpdaterNeverStartsSparkle() {
+        let controller = NativeUpdateController(isolatedFixture: true)
+        XCTAssertFalse(controller.startedUpdater)
+        XCTAssertEqual(
+            controller.availability,
+            .unavailable("Updates are disabled in isolated fixtures.")
+        )
+    }
+
+    func testBrokerFreeFixturePreparerCannotDiscoverOrLaunchABroker() async {
+        do {
+            _ = try await BrokerFreeFixturePreparer().prepare()
+            XCTFail("A broker-free fixture preparer must never return a broker.")
+        } catch {
+            XCTAssertEqual(error as? BrokerDiscoveryError, .notRunning)
+        }
+    }
+
     func testIsolatedFixturesNeverLaunchAutomaticProviderUsageProbes() {
         XCTAssertFalse(RootShellView.shouldAutomaticallyRefreshPlanUsage(
             environment: ["KAISOLA_NATIVE_VISUAL_FIXTURE": "1"]
@@ -133,6 +151,151 @@ final class NativePreviewSettingsTests: XCTestCase {
             NativeVisualTerminalAccessibilityGate.expectedMarkers(for: "terminal-scroll-output"),
             ["historical-anchor-"]
         )
+        XCTAssertEqual(
+            NativeVisualTerminalAccessibilityGate.expectedMarkers(for: "terminal-continuous-scroll"),
+            ["continuous-anchor-"]
+        )
+    }
+
+    func testOptimizedContinuousScrollReceiptIsMachineReadableAndFailClosed() throws {
+        let receipt = VisualTerminalContinuousScrollReceipt(
+            optimizedBuild: true,
+            scheduledHertz: 120,
+            measuredHertz: 120,
+            sampleCount: 120,
+            sampleIntervalCount: 119,
+            sampleTimestampsMilliseconds: (0..<120).map { Double($0) * 1_000 / 120 },
+            sampleDurationMilliseconds: Double(119) * 1_000 / 120,
+            cadenceP95Milliseconds: 9.2,
+            handledSampleCount: 120,
+            momentumSampleCount: 48,
+            distinctOriginCount: 120,
+            maximumAnchorStep: 1,
+            maximumContinuityError: 0,
+            processingP95Milliseconds: 2.5,
+            scrollbarMaximumError: 0,
+            topRubberBand: true,
+            bottomRubberBand: true,
+            edgesSettled: true,
+            selectionPreserved: true,
+            linkPreserved: true,
+            semanticPromptPreserved: true,
+            promptNavigationCoherent: true,
+            keyboardPagingCoherent: true,
+            accessibilityPagingCoherent: true,
+            accessibilityActionsExposed: true,
+            scrollerFramePreserved: true,
+            alternateScreenPreserved: true,
+            appMouseRoutingPreserved: true,
+            liveBottomCoherent: true,
+            viewIdentityPreserved: true,
+            coordinatorIdentityPreserved: true,
+            terminalEngineIdentityPreserved: true,
+            finalFractionalViewport: true,
+            fixtureUpdaterDisabled: true,
+            fixtureBrokerIsolated: true,
+            fixtureBuildNumber: 900_000_001,
+            feedBuildFloor: 900_000_000,
+            cursorBefore: 1_000,
+            cursorAfter: 2_000,
+            expectedCursorAfter: 2_000,
+            finalMarkerPresent: true
+        )
+
+        XCTAssertNil(receipt.failure)
+        let json = try XCTUnwrap(receipt.json)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                VisualTerminalContinuousScrollReceipt.self,
+                from: Data(json.utf8)
+            ),
+            receipt
+        )
+
+        func mutated(_ key: String, to value: Any) throws -> VisualTerminalContinuousScrollReceipt {
+            var object = try XCTUnwrap(
+                try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any]
+            )
+            object[key] = value
+            return try JSONDecoder().decode(
+                VisualTerminalContinuousScrollReceipt.self,
+                from: JSONSerialization.data(withJSONObject: object)
+            )
+        }
+
+        XCTAssertEqual(
+            try mutated("measuredHertz", to: 60).failure,
+            "measured-cadence-out-of-range-60.0"
+        )
+        XCTAssertEqual(
+            try mutated("maximumContinuityError", to: 0.5).failure,
+            "continuity-error-0.5"
+        )
+        XCTAssertEqual(
+            try mutated("processingP95Milliseconds", to: 12.6).failure,
+            "processing-over-budget-12.6"
+        )
+        XCTAssertEqual(
+            try mutated("viewIdentityPreserved", to: false).failure,
+            "view-identity-changed"
+        )
+        XCTAssertEqual(
+            try mutated("fixtureUpdaterDisabled", to: false).failure,
+            "fixture-updater-started"
+        )
+        XCTAssertEqual(
+            try mutated("fixtureBrokerIsolated", to: false).failure,
+            "fixture-broker-route-live"
+        )
+        XCTAssertEqual(
+            try mutated("fixtureBuildNumber", to: receipt.feedBuildFloor).failure,
+            "fixture-build-not-above-feed-900000000-900000000"
+        )
+
+        let debugReceipt = VisualTerminalContinuousScrollReceipt(
+            optimizedBuild: false,
+            scheduledHertz: receipt.scheduledHertz,
+            measuredHertz: receipt.measuredHertz,
+            sampleCount: receipt.sampleCount,
+            sampleIntervalCount: receipt.sampleIntervalCount,
+            sampleTimestampsMilliseconds: receipt.sampleTimestampsMilliseconds,
+            sampleDurationMilliseconds: receipt.sampleDurationMilliseconds,
+            cadenceP95Milliseconds: receipt.cadenceP95Milliseconds,
+            handledSampleCount: receipt.handledSampleCount,
+            momentumSampleCount: receipt.momentumSampleCount,
+            distinctOriginCount: receipt.distinctOriginCount,
+            maximumAnchorStep: receipt.maximumAnchorStep,
+            maximumContinuityError: receipt.maximumContinuityError,
+            processingP95Milliseconds: receipt.processingP95Milliseconds,
+            scrollbarMaximumError: receipt.scrollbarMaximumError,
+            topRubberBand: receipt.topRubberBand,
+            bottomRubberBand: receipt.bottomRubberBand,
+            edgesSettled: receipt.edgesSettled,
+            selectionPreserved: receipt.selectionPreserved,
+            linkPreserved: receipt.linkPreserved,
+            semanticPromptPreserved: receipt.semanticPromptPreserved,
+            promptNavigationCoherent: receipt.promptNavigationCoherent,
+            keyboardPagingCoherent: receipt.keyboardPagingCoherent,
+            accessibilityPagingCoherent: receipt.accessibilityPagingCoherent,
+            accessibilityActionsExposed: receipt.accessibilityActionsExposed,
+            scrollerFramePreserved: receipt.scrollerFramePreserved,
+            alternateScreenPreserved: receipt.alternateScreenPreserved,
+            appMouseRoutingPreserved: receipt.appMouseRoutingPreserved,
+            liveBottomCoherent: receipt.liveBottomCoherent,
+            viewIdentityPreserved: receipt.viewIdentityPreserved,
+            coordinatorIdentityPreserved: receipt.coordinatorIdentityPreserved,
+            terminalEngineIdentityPreserved: receipt.terminalEngineIdentityPreserved,
+            finalFractionalViewport: receipt.finalFractionalViewport,
+            fixtureUpdaterDisabled: receipt.fixtureUpdaterDisabled,
+            fixtureBrokerIsolated: receipt.fixtureBrokerIsolated,
+            fixtureBuildNumber: receipt.fixtureBuildNumber,
+            feedBuildFloor: receipt.feedBuildFloor,
+            cursorBefore: receipt.cursorBefore,
+            cursorAfter: receipt.cursorAfter,
+            expectedCursorAfter: receipt.expectedCursorAfter,
+            finalMarkerPresent: receipt.finalMarkerPresent
+        )
+        XCTAssertEqual(debugReceipt.failure, "not-optimized")
     }
 
     func testVisualTerminalAccessibilityGateRejectsRawControlsMissingTextAndOverflow() {
@@ -352,6 +515,12 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertFalse(NativePreviewSettings.shouldPersistChanges(environment: [
             "KAISOLA_NATIVE_RESOURCE_WORKLOAD": "one-window-streaming-terminal-fresh-broker",
         ]))
+        XCTAssertFalse(NativePreviewSettings.shouldPersistChanges(environment: [
+            "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1",
+        ]))
+        XCTAssertFalse(NativePreviewSettings.shouldPersistChanges(environment: [
+            "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "invalid",
+        ]))
         XCTAssertEqual(
             NativePreviewSettings.isolatedFixtureSuiteName(
                 environment: ["KAISOLA_NATIVE_VISUAL_FIXTURE": "1"],
@@ -365,6 +534,13 @@ final class NativePreviewSettingsTests: XCTestCase {
                 processIdentifier: 42
             ),
             "com.kaisola.mac.resource-fixture.42"
+        )
+        XCTAssertEqual(
+            NativePreviewSettings.isolatedFixtureSuiteName(
+                environment: ["KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1"],
+                processIdentifier: 42
+            ),
+            "com.kaisola.mac.pdf-preview-budget.42"
         )
         XCTAssertTrue(NativePreviewSettings.shouldPersistChanges(environment: [:]))
         XCTAssertNil(NativePreviewSettings.isolatedFixtureSuiteName(
@@ -5248,5 +5424,206 @@ final class NativePreviewSettingsTests: XCTestCase {
             ($0.representedObject as? String) == AppCommandID.appearance(.dark).rawValue
         })
         XCTAssertEqual(darkItem.state, .on)
+    }
+
+    // MARK: - Settings window controls (#306)
+
+    /// A Settings window built the way the product builds it.
+    private func makeSettingsWindow(
+        styleMask: NSWindow.StyleMask = SettingsWindowChrome.styleMask,
+        size: NSSize = SettingsWindowChrome.minimumContentSize
+    ) -> NSWindow {
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: styleMask,
+            backing: .buffered,
+            defer: false
+        )
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        return window
+    }
+
+    /// The reserved band is measured against AppKit's own title bar rather than
+    /// pinned to a literal, so a future macOS that grows that bar fails here
+    /// instead of quietly putting the mark back over the buttons.
+    func testSettingsReservesTheTitleBarBandAppKitOwns() {
+        let window = makeSettingsWindow()
+        let titleBarHeight = window.frame.height - window.contentLayoutRect.height
+        XCTAssertGreaterThan(titleBarHeight, 0)
+        XCTAssertGreaterThanOrEqual(SettingsWindowChrome.titleBarSafeArea, titleBarHeight)
+    }
+
+    /// The bug itself: the 30pt Settings mark sat 14pt below the top of a
+    /// full-size content view, which is on top of the minimize and zoom
+    /// controls. Both halves are asserted — the old geometry still collides, the
+    /// shipped one does not — so this cannot pass by measuring nothing.
+    func testSettingsMarkClearsEveryStandardWindowButton() throws {
+        let window = makeSettingsWindow()
+        let controls = NativeVisualWindowControlGate.controlRegions(in: window)
+        XCTAssertEqual(controls.count, 3)
+
+        let unreserved = SettingsWindowChrome.topLeadingContentFrames(titleBarSafeArea: 0)
+            .map { NativeVisualWindowControlGate.Region(name: $0.name, frame: $0.frame) }
+        let collision = try XCTUnwrap(NativeVisualWindowControlGate.collision(
+            controls: controls,
+            content: unreserved
+        ))
+        XCTAssertTrue(collision.hasPrefix("settings-identity-mark-over-"), collision)
+
+        let shipped = SettingsWindowChrome.topLeadingContentFrames()
+            .map { NativeVisualWindowControlGate.Region(name: $0.name, frame: $0.frame) }
+        XCTAssertNil(NativeVisualWindowControlGate.collision(
+            controls: controls,
+            content: shipped
+        ))
+
+        // Clearance, not a tie: the mark starts below the lowest button edge.
+        let lowestButtonEdge = controls.map(\.frame.maxY).max() ?? 0
+        XCTAssertGreaterThan(
+            SettingsWindowChrome.identityMarkFrame().minY,
+            lowestButtonEdge
+        )
+    }
+
+    /// The whole laid-out window rather than the one rect the layout declares:
+    /// this is the check each Settings fixture runs before writing its PNG.
+    func testSettingsWindowControlGatePassesTheShippedLayout() throws {
+        let suite = "kaisola.tests.settings-chrome.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let window = makeSettingsWindow(size: SettingsWindowChrome.idealContentSize)
+        window.contentView = NSHostingView(
+            rootView: SettingsView(settings: NativePreviewSettings(defaults: defaults))
+                .environmentObject(AuthModel.previewSignedIn())
+        )
+        window.contentView?.layoutSubtreeIfNeeded()
+        let report = NativeVisualWindowControlGate.inspect(window)
+        XCTAssertNil(report.failure)
+        XCTAssertEqual(report.controls, 3)
+    }
+
+    /// Every fixture surface that opens Settings is gated; workspace surfaces
+    /// keep their own chrome and are left alone.
+    func testWindowControlGateAppliesToSettingsSurfacesOnly() {
+        XCTAssertTrue(NativeVisualWindowControlGate.applies(to: "settings"))
+        XCTAssertTrue(NativeVisualWindowControlGate.applies(to: "settings-minimum"))
+        XCTAssertTrue(NativeVisualWindowControlGate.applies(to: "settings-ideal"))
+        XCTAssertTrue(NativeVisualWindowControlGate.applies(to: "usage"))
+        XCTAssertFalse(NativeVisualWindowControlGate.applies(to: "terminal"))
+        XCTAssertFalse(NativeVisualWindowControlGate.applies(to: "mesh"))
+    }
+
+    /// A control you can see but cannot use is the same failure as one you
+    /// cannot see. Settings shipped without `.miniaturizable` for its whole
+    /// life, so the gate is also held against a window that still does.
+    func testSettingsWindowKeepsAllThreeControlsOperable() throws {
+        let window = makeSettingsWindow()
+        XCTAssertNil(NativeVisualWindowControlGate.missingControl(in: window))
+        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            let button = try XCTUnwrap(window.standardWindowButton(kind))
+            XCTAssertFalse(button.isHidden)
+            XCTAssertTrue(button.isEnabled)
+        }
+
+        let withoutMinimize = makeSettingsWindow(
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView]
+        )
+        XCTAssertEqual(
+            NativeVisualWindowControlGate.missingControl(in: withoutMinimize),
+            "disabled-miniaturize"
+        )
+    }
+
+    /// AppKit measures from the bottom-left corner and the layout from the
+    /// top-left one. Everything the gate compares goes through this flip.
+    func testWindowControlGateFlipsAppKitCoordinates() {
+        let window = makeSettingsWindow()
+        let height = window.contentView?.bounds.height ?? window.frame.height
+        XCTAssertEqual(
+            NativeVisualWindowControlGate.topLeftFrame(
+                CGRect(x: 7, y: height - 22, width: 14, height: 16),
+                in: window
+            ),
+            CGRect(x: 7, y: 6, width: 14, height: 16)
+        )
+    }
+
+    func testWindowControlGateOnlyReportsRegionsThatMeetAButton() {
+        let control = NativeVisualWindowControlGate.Region(
+            name: "zoom",
+            frame: CGRect(x: 47, y: 6, width: 14, height: 16)
+        )
+        let below = NativeVisualWindowControlGate.Region(
+            name: "sidebar-row",
+            frame: CGRect(x: 8, y: 42, width: 160, height: 34)
+        )
+        let over = NativeVisualWindowControlGate.Region(
+            name: "mark",
+            frame: CGRect(x: 22, y: 14, width: 30, height: 30)
+        )
+        XCTAssertNil(NativeVisualWindowControlGate.collision(
+            controls: [control],
+            content: [below]
+        ))
+        XCTAssertEqual(
+            NativeVisualWindowControlGate.collision(controls: [control], content: [below, over]),
+            "mark-over-zoom"
+        )
+    }
+
+    /// The two ends of the size contract the fixtures inspect. The old 810×540
+    /// fixture sat below the window's own minimum, so CI was reading a Settings
+    /// window the product cannot be resized to.
+    func testSettingsFixturesCaptureBothEndsOfTheSizeContract() {
+        XCTAssertEqual(
+            SettingsWindowChrome.visualContentSize(surface: "settings-minimum"),
+            SettingsWindowChrome.minimumContentSize
+        )
+        XCTAssertEqual(
+            SettingsWindowChrome.visualContentSize(surface: "settings-ideal"),
+            SettingsWindowChrome.idealContentSize
+        )
+        XCTAssertEqual(
+            SettingsWindowChrome.visualContentSize(surface: "settings"),
+            SettingsWindowChrome.minimumContentSize
+        )
+        XCTAssertGreaterThan(
+            SettingsWindowChrome.idealContentSize.height,
+            SettingsWindowChrome.minimumContentSize.height
+        )
+        XCTAssertTrue(SettingsWindowChrome.visualSurfaces.contains("settings-minimum"))
+        XCTAssertTrue(SettingsWindowChrome.visualSurfaces.contains("settings-ideal"))
+    }
+
+    /// The non-Retina fixture resamples the finished capture to one pixel per
+    /// point, and does nothing at all when it is not asked to.
+    func testNonRetinaCaptureRedrawsAtOnePixelPerPoint() throws {
+        let points = SettingsWindowChrome.minimumContentSize
+        let context = try XCTUnwrap(CGContext(
+            data: nil,
+            width: Int(points.width) * 2,
+            height: Int(points.height) * 2,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.setFillColor(CGColor(red: 0.2, green: 0.4, blue: 0.9, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: points.width * 2, height: points.height * 2))
+        let retina = try XCTUnwrap(context.makeImage())
+
+        let onePoint = try XCTUnwrap(NativeVisualCapture.rescaled(
+            retina,
+            pointSize: points,
+            pointPixelScale: 1
+        ))
+        XCTAssertEqual(onePoint.width, Int(points.width))
+        XCTAssertEqual(onePoint.height, Int(points.height))
+
+        // An unset scale, and an image that is already 1×, are both no-ops.
+        XCTAssertNil(NativeVisualCapture.rescaled(retina, pointSize: points, pointPixelScale: 0))
+        XCTAssertNil(NativeVisualCapture.rescaled(onePoint, pointSize: points, pointPixelScale: 1))
     }
 }

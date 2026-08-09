@@ -7,12 +7,17 @@ import SwiftUI
 /// instead of an editor.
 struct McpSettingsTab: View {
     let workspace: URL?
+    var highlightedID: String? = nil
 
     var body: some View {
         if let workspace {
             // `.id(workspace)` rebuilds the editor — and re-runs its `onAppear`
             // load — whenever the active project changes underneath the window.
-            McpServerEditor(store: McpConfigStore(workspace: workspace))
+            McpServerEditor(
+                store: McpConfigStore(workspace: workspace),
+                projectName: workspace.lastPathComponent,
+                highlightedID: highlightedID
+            )
                 .id(workspace)
         } else {
             Form {
@@ -47,6 +52,8 @@ enum McpSettingsPolicy {
 /// add-form whose visible fields follow the chosen transport.
 private struct McpServerEditor: View {
     let store: McpConfigStore
+    let projectName: String
+    let highlightedID: String?
 
     @State private var servers: [McpServerConfig] = []
     @State private var draft = Draft()
@@ -78,19 +85,27 @@ private struct McpServerEditor: View {
     }
 
     var body: some View {
-        Form {
-            configuredSection
-            discoverySection
-            addSection
-        }
-        .formStyle(.grouped)
-        .padding(6)
-        .onAppear { loadInitialState() }
-        .task(id: recentlyDeleted?.id) {
-            guard recentlyDeleted != nil else { return }
-            try? await Task.sleep(nanoseconds: 8_000_000_000)
-            guard !Task.isCancelled else { return }
-            recentlyDeleted = nil
+        ScrollViewReader { proxy in
+            Form {
+                configuredSection
+                discoverySection
+                addSection
+            }
+            .formStyle(.grouped)
+            .padding(6)
+            .onAppear {
+                loadInitialState()
+                guard let highlightedID else { return }
+                DispatchQueue.main.async {
+                    proxy.scrollTo(highlightedID, anchor: .center)
+                }
+            }
+            .task(id: recentlyDeleted?.id) {
+                guard recentlyDeleted != nil else { return }
+                try? await Task.sleep(nanoseconds: 8_000_000_000)
+                guard !Task.isCancelled else { return }
+                recentlyDeleted = nil
+            }
         }
     }
 
@@ -138,6 +153,7 @@ private struct McpServerEditor: View {
                 Text("No MCP servers yet — add one below.")
                     .font(.caption)
                     .foregroundStyle(.kaisolaSecondary)
+                    .accessibilityIdentifier("extensions.mcp.empty")
             }
             ForEach(servers) { server in
                 VStack(alignment: .leading, spacing: 5) {
@@ -199,8 +215,42 @@ private struct McpServerEditor: View {
                                 : Color.kaisolaSecondary
                         )
                         .accessibilityElement(children: .combine)
+
+                        let authentication = result.authentication.presentation
+                        HStack(spacing: 5) {
+                            Circle()
+                                .fill(authenticationColor(result.authentication))
+                                .frame(width: 7, height: 7)
+                                .accessibilityHidden(true)
+                            Text(authentication.copy)
+                            Spacer(minLength: 4)
+                            if authentication.action == .retryProbe,
+                               let title = authentication.action.title {
+                                Button(title) { probe(server) }
+                                    .buttonStyle(.borderless)
+                                    .disabled(probingNames.contains(server.name))
+                            } else if let title = authentication.action.title {
+                                Text(title).foregroundStyle(.kaisolaTertiary)
+                            }
+                        }
+                        .font(.caption)
+                        .foregroundStyle(authenticationColor(result.authentication))
+                        .accessibilityElement(children: .combine)
+                    }
+                    ExtensionMetadataGrid(
+                        item: .mcpServer(server, projectName: projectName)
+                    )
+                }
+                .padding(.vertical, 4)
+                .id(server.id)
+                .overlay {
+                    if highlightedID == server.id {
+                        RoundedRectangle(cornerRadius: 9)
+                            .stroke(Color.accentColor, lineWidth: 2)
+                            .allowsHitTesting(false)
                     }
                 }
+                .accessibilityIdentifier("extensions.mcp.\(server.id)")
             }
             if let deleted = recentlyDeleted {
                 HStack(spacing: 8) {
@@ -220,6 +270,7 @@ private struct McpServerEditor: View {
         recentlyDeleted = DeletedServer(server: servers.remove(at: index), index: index)
         probeResults[server.name] = nil
         store.save(servers)
+        notifyCatalogChanged()
     }
 
     private func restore(_ deleted: DeletedServer) {
@@ -230,15 +281,26 @@ private struct McpServerEditor: View {
         }
         servers.insert(deleted.server, at: min(deleted.index, servers.count))
         store.save(servers)
+        notifyCatalogChanged()
         recentlyDeleted = nil
     }
 
     private func probe(_ server: McpServerConfig) {
         guard probingNames.insert(server.name).inserted else { return }
+        probeResults[server.name] = .probing
         Task {
             let result = await McpProbeService.shared.probe(server)
             probeResults[server.name] = result
             probingNames.remove(server.name)
+        }
+    }
+
+    private func authenticationColor(_ state: McpAuthenticationState) -> Color {
+        switch state {
+        case .signedIn: .green
+        case .signedOut, .expired: .red
+        case .probing: .secondary
+        case .unknown: .orange
         }
     }
 
@@ -273,6 +335,7 @@ private struct McpServerEditor: View {
                 guard let index = servers.firstIndex(where: { $0.id == server.id }) else { return }
                 servers[index].enabled = newValue
                 store.save(servers)
+                notifyCatalogChanged()
             }
         )
     }
@@ -369,6 +432,7 @@ private struct McpServerEditor: View {
                 store.importDiscovered(selected)
             }.value
             servers = store.servers()
+            notifyCatalogChanged()
             let savedNames = Set(servers.map(\.name))
             discoveries.removeAll { savedNames.contains($0.config.name) }
             selectedDiscoveryIDs = Set(discoveries.map(\.id))
@@ -486,6 +550,7 @@ private struct McpServerEditor: View {
         }
         servers.append(server)
         store.save(servers)
+        notifyCatalogChanged()
         draft = Draft()
         addError = nil
     }
@@ -511,5 +576,9 @@ private struct McpServerEditor: View {
             guard !name.isEmpty else { return nil }
             return McpServerConfig.Pair(name: name, value: value)
         }
+    }
+
+    private func notifyCatalogChanged() {
+        NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
     }
 }

@@ -77,8 +77,60 @@ actor AcpTranscriptStore {
         var sessionID: String?
     }
 
+    /// Why a read produced no transcript when the chat may still have one on
+    /// disk. Corrupt and unavailable are deliberately distinct: the first
+    /// means stored bytes exist and could not be decoded, the second means the
+    /// database itself never answered.
+    struct RestorationFailure: Equatable, Sendable {
+        enum Fault: Equatable, Sendable {
+            case corrupt
+            case unavailable
+        }
+
+        var fault: Fault
+        var detail: String
+        var databasePath: String
+
+        /// Shown verbatim by the caller. It never claims history was lost,
+        /// because a faulted read leaves the stored rows exactly where they
+        /// are and the store refuses further writes for the chat.
+        var guidance: String {
+            let cause = fault == .corrupt
+                ? "This chat's saved history is damaged"
+                : "This chat's saved history could not be read"
+            return """
+            \(cause) (\(detail)). Kaisola kept the stored transcript instead of \
+            replacing it, and will not write to this chat until the history reads \
+            back. Quit Kaisola and back up \(databasePath) before continuing.
+            """
+        }
+    }
+
+    /// A restoration read's three distinguishable answers. Only `.missing`
+    /// means "this chat has nothing stored"; `.failed` means the caller must
+    /// not treat the absent rows as an empty history.
+    enum RestorationOutcome: Equatable, Sendable {
+        case restored(Restoration)
+        case missing
+        case failed(RestorationFailure)
+
+        var restoration: Restoration? {
+            guard case let .restored(restoration) = self else { return nil }
+            return restoration
+        }
+
+        var failure: RestorationFailure? {
+            guard case let .failed(failure) = self else { return nil }
+            return failure
+        }
+    }
+
     enum StoreError: Error, Equatable {
         case database(String)
+        /// Stored bytes that exist but cannot be decoded back into a row or a
+        /// metadata blob. Separate from `database` so a read can report damage
+        /// rather than an unreachable file.
+        case corruptRecord(String)
         case corruptLegacyArchive
         case legacyArchiveTooLarge(maxBytes: Int)
         case invalidSnapshot
@@ -171,6 +223,11 @@ actor AcpTranscriptStore {
     nonisolated let legacyJSONURL: URL?
 
     private var databaseHandle: SQLiteHandle?
+    /// Chats whose last read faulted. A faulted read hands the caller an empty
+    /// transcript; writing that back would delete the rows we could not read
+    /// and overwrite metadata we never saw, so every write for the chat is
+    /// refused until one of its reads succeeds or it is explicitly removed.
+    private var unreadableChatIDs: Set<String> = []
     private var pending: [String: PendingWrite] = [:]
     private var flushTask: Task<Void, Never>?
     private let encoder = JSONEncoder()
@@ -200,40 +257,95 @@ actor AcpTranscriptStore {
     func entry(for chatID: String) -> Entry? {
         guard Self.validChatID(chatID) else { return nil }
         flush()
-        guard let database = try? openDatabase(),
-              let metadata = try? readMetadata(chatID: chatID, database: database) else { return nil }
-        let allRows = (try? readAllRows(chatID: chatID, database: database)) ?? []
-        return Entry(
-            rows: allRows,
-            updatedAt: metadata.updatedAt,
-            usage: metadata.usage,
-            draft: metadata.draft,
-            attachments: metadata.attachments,
-            sessionID: metadata.sessionID
-        )
+        do {
+            let database = try openDatabase()
+            guard let metadata = try readMetadata(chatID: chatID, database: database) else {
+                unreadableChatIDs.remove(chatID)
+                return nil
+            }
+            let allRows = try readAllRows(chatID: chatID, database: database)
+            unreadableChatIDs.remove(chatID)
+            return Entry(
+                rows: allRows,
+                updatedAt: metadata.updatedAt,
+                usage: metadata.usage,
+                draft: metadata.draft,
+                attachments: metadata.attachments,
+                sessionID: metadata.sessionID
+            )
+        } catch {
+            unreadableChatIDs.insert(chatID)
+            return nil
+        }
     }
 
     /// Restore only the newest bounded page plus compact per-chat metadata.
     /// The returned `earlierRowCount` drives repeated top-edge reads without
     /// materializing the rest of the session in memory.
-    func restoration(for chatID: String, tailLimit: Int) -> Restoration? {
-        guard Self.validChatID(chatID) else { return nil }
+    ///
+    /// The outcome is typed on purpose: a chat with no stored transcript and a
+    /// chat whose transcript is locked or damaged used to look identical, and
+    /// the caller would restore the second as an empty history that the next
+    /// save then wrote over.
+    func restoration(for chatID: String, tailLimit: Int) -> RestorationOutcome {
+        guard Self.validChatID(chatID) else { return .missing }
         flush()
-        guard let database = try? openDatabase(),
-              let metadata = try? readMetadata(chatID: chatID, database: database),
-              let page = try? readTailPage(
-                  chatID: chatID,
-                  limit: Self.boundedPageLimit(tailLimit),
-                  database: database
-              ) else { return nil }
-        return Restoration(
-            page: page,
-            updatedAt: metadata.updatedAt,
-            usage: metadata.usage,
-            draft: metadata.draft,
-            attachments: metadata.attachments,
-            sessionID: metadata.sessionID
-        )
+        do {
+            let database = try openDatabase()
+            guard let metadata = try readMetadata(chatID: chatID, database: database) else {
+                unreadableChatIDs.remove(chatID)
+                return .missing
+            }
+            let page = try readTailPage(
+                chatID: chatID,
+                limit: Self.boundedPageLimit(tailLimit),
+                database: database
+            )
+            unreadableChatIDs.remove(chatID)
+            return .restored(Restoration(
+                page: page,
+                updatedAt: metadata.updatedAt,
+                usage: metadata.usage,
+                draft: metadata.draft,
+                attachments: metadata.attachments,
+                sessionID: metadata.sessionID
+            ))
+        } catch {
+            unreadableChatIDs.insert(chatID)
+            return .failed(Self.failure(for: error, databasePath: databaseURL.path))
+        }
+    }
+
+    /// True while this chat's stored state could not be read back, which is
+    /// also exactly while its writes are refused.
+    func hasUnreadableHistory(chatID: String) -> Bool {
+        unreadableChatIDs.contains(chatID)
+    }
+
+    private static func failure(for error: Error, databasePath: String) -> RestorationFailure {
+        let fault: RestorationFailure.Fault
+        let detail: String
+        switch error as? StoreError {
+        case let .corruptRecord(message):
+            fault = .corrupt
+            detail = message
+        case .corruptLegacyArchive:
+            fault = .corrupt
+            detail = "the imported v1 archive could not be decoded"
+        case let .legacyArchiveTooLarge(maxBytes):
+            fault = .unavailable
+            detail = "the v1 archive is larger than \(maxBytes) bytes"
+        case let .database(message):
+            fault = .unavailable
+            detail = message
+        case .invalidSnapshot:
+            fault = .corrupt
+            detail = "the stored row ordinals are inconsistent"
+        case .none:
+            fault = .unavailable
+            detail = (error as NSError).localizedDescription
+        }
+        return RestorationFailure(fault: fault, detail: detail, databasePath: databasePath)
     }
 
     /// Read the bounded page immediately before an already loaded ordinal.
@@ -258,7 +370,8 @@ actor AcpTranscriptStore {
         now: Int64? = nil
     ) {
         guard Self.validChatID(chatID), startOrdinal >= 0,
-              startOrdinal <= Int64.max - Int64(rows.count) else { return }
+              startOrdinal <= Int64.max - Int64(rows.count),
+              !unreadableChatIDs.contains(chatID) else { return }
         let timestamp = Self.timestamp(now)
         var write = pending[chatID] ?? PendingWrite(updatedAt: timestamp)
         write.rows = RowWrite(rows: rows, startOrdinal: startOrdinal)
@@ -268,7 +381,7 @@ actor AcpTranscriptStore {
     }
 
     func scheduleUsage(_ usage: AcpPersistedUsage, for chatID: String, now: Int64? = nil) {
-        guard Self.validChatID(chatID) else { return }
+        guard Self.validChatID(chatID), !unreadableChatIDs.contains(chatID) else { return }
         let timestamp = Self.timestamp(now)
         var write = pending[chatID] ?? PendingWrite(updatedAt: timestamp)
         write.usage = .set(usage)
@@ -278,7 +391,7 @@ actor AcpTranscriptStore {
     }
 
     func scheduleDraft(_ draft: String, for chatID: String, now: Int64? = nil) {
-        guard Self.validChatID(chatID),
+        guard Self.validChatID(chatID), !unreadableChatIDs.contains(chatID),
               draft.lengthOfBytes(using: .utf8) <= Self.maximumDraftBytes else { return }
         let timestamp = Self.timestamp(now)
         var write = pending[chatID] ?? PendingWrite(updatedAt: timestamp)
@@ -293,7 +406,8 @@ actor AcpTranscriptStore {
         for chatID: String,
         now: Int64? = nil
     ) {
-        guard Self.validChatID(chatID), Self.attachmentsAreBounded(attachments) else { return }
+        guard Self.validChatID(chatID), !unreadableChatIDs.contains(chatID),
+              Self.attachmentsAreBounded(attachments) else { return }
         let timestamp = Self.timestamp(now)
         var write = pending[chatID] ?? PendingWrite(updatedAt: timestamp)
         write.attachments = .set(attachments.isEmpty ? nil : attachments)
@@ -303,7 +417,7 @@ actor AcpTranscriptStore {
     }
 
     func scheduleSessionID(_ sessionID: String?, for chatID: String, now: Int64? = nil) {
-        guard Self.validChatID(chatID) else { return }
+        guard Self.validChatID(chatID), !unreadableChatIDs.contains(chatID) else { return }
         let normalized = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard normalized?.lengthOfBytes(using: .utf8) ?? 0 <= 4_096 else { return }
         let timestamp = Self.timestamp(now)
@@ -362,6 +476,9 @@ actor AcpTranscriptStore {
     func remove(chatID: String) {
         guard Self.validChatID(chatID) else { return }
         pending.removeValue(forKey: chatID)
+        // Explicit destruction is the one write an unreadable chat still
+        // accepts, and it ends the refusal along with the rows.
+        unreadableChatIDs.remove(chatID)
         guard let database = try? openDatabase() else { return }
         do {
             try transaction(database) {
@@ -385,6 +502,7 @@ actor AcpTranscriptStore {
     func tombstone(chatID: String) throws {
         guard Self.validChatID(chatID) else { return }
         pending.removeValue(forKey: chatID)
+        unreadableChatIDs.remove(chatID)
         let database = try openDatabase()
         try transaction(database) {
             try execute(
@@ -808,11 +926,11 @@ actor AcpTranscriptStore {
             let draft = Self.columnString(statement, column: 2)
             let sessionID = Self.columnString(statement, column: 4)
             guard Self.attachmentsAreBounded(attachments) else {
-                throw StoreError.database("stored attachments exceed the bounded contract")
+                throw StoreError.corruptRecord("stored attachments exceed the bounded contract")
             }
             guard draft?.lengthOfBytes(using: .utf8) ?? 0 <= Self.maximumDraftBytes,
                   sessionID?.lengthOfBytes(using: .utf8) ?? 0 <= 4_096 else {
-                throw StoreError.database("stored transcript metadata exceeds the bounded contract")
+                throw StoreError.corruptRecord("stored transcript metadata exceeds the bounded contract")
             }
             return StoredMetadata(
                 updatedAt: sqlite3_column_int64(statement, 0),
@@ -837,7 +955,7 @@ actor AcpTranscriptStore {
                 guard result == SQLITE_ROW,
                       let data = Self.columnData(statement, column: 0),
                       let row = try? decoder.decode(AcpTranscriptRow.self, from: data) else {
-                    throw StoreError.database("stored transcript row could not be decoded")
+                    throw StoreError.corruptRecord("stored transcript row could not be decoded")
                 }
                 rows.append(row)
             }
@@ -918,7 +1036,7 @@ actor AcpTranscriptStore {
                 guard result == SQLITE_ROW,
                       let data = Self.columnData(statement, column: 1),
                       let row = try? decoder.decode(AcpTranscriptRow.self, from: data) else {
-                    throw StoreError.database("stored transcript row could not be decoded")
+                    throw StoreError.corruptRecord("stored transcript row could not be decoded")
                 }
                 decoded.append((sqlite3_column_int64(statement, 0), row))
             }
@@ -1051,10 +1169,10 @@ actor AcpTranscriptStore {
     ) throws -> Value? {
         guard sqlite3_column_type(statement, column) != SQLITE_NULL else { return nil }
         guard let data = Self.columnData(statement, column: column) else {
-            throw StoreError.database("stored metadata blob is missing")
+            throw StoreError.corruptRecord("stored metadata blob is missing")
         }
         do { return try decoder.decode(type, from: data) }
-        catch { throw StoreError.database("stored metadata blob could not be decoded") }
+        catch { throw StoreError.corruptRecord("stored metadata blob could not be decoded") }
     }
 
     private func metadataValue(for key: String, database: SQLiteHandle) throws -> String? {

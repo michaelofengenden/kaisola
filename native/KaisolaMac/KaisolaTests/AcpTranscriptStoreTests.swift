@@ -1,5 +1,54 @@
+import SQLite3
 import XCTest
 @testable import Kaisola
+
+/// Reaches the transcript database directly so a test can damage stored bytes
+/// the way a bad page or a hand-edited file would, and can count the rows that
+/// survived a write the store was supposed to refuse.
+enum TranscriptDatabaseProbe {
+    enum ProbeError: Error, Equatable {
+        case open(String)
+        case sql(String)
+    }
+
+    static func execute(_ sql: String, at databaseURL: URL) throws {
+        let handle = try open(databaseURL)
+        defer { sqlite3_close_v2(handle) }
+        var message: UnsafeMutablePointer<CChar>?
+        guard sqlite3_exec(handle, sql, nil, nil, &message) == SQLITE_OK else {
+            let detail = message.map { String(cString: $0) } ?? "unknown SQLite error"
+            sqlite3_free(message)
+            throw ProbeError.sql(detail)
+        }
+    }
+
+    static func rowCount(chatID: String, at databaseURL: URL) throws -> Int {
+        let handle = try open(databaseURL)
+        defer { sqlite3_close_v2(handle) }
+        var statement: OpaquePointer?
+        let sql = "SELECT COUNT(*) FROM transcript_rows WHERE chat_id = ?"
+        guard sqlite3_prepare_v2(handle, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw ProbeError.sql(String(cString: sqlite3_errmsg(handle)))
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, chatID, -1, unsafeBitCast(-1, to: sqlite3_destructor_type.self))
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            throw ProbeError.sql(String(cString: sqlite3_errmsg(handle)))
+        }
+        return Int(sqlite3_column_int64(statement, 0))
+    }
+
+    private static func open(_ databaseURL: URL) throws -> OpaquePointer {
+        var handle: OpaquePointer?
+        guard sqlite3_open_v2(databaseURL.path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
+              let handle else {
+            let detail = handle.map { String(cString: sqlite3_errmsg($0)) } ?? "could not open database"
+            if let handle { sqlite3_close_v2(handle) }
+            throw ProbeError.open(detail)
+        }
+        return handle
+    }
+}
 
 final class AcpTranscriptStoreTests: XCTestCase {
     private struct LegacyPayload: Encodable {
@@ -158,7 +207,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
         await store.scheduleSave(rows, for: "chat-pages", now: 1)
         await store.flush()
 
-        let restoration = await store.restoration(for: "chat-pages", tailLimit: 120)
+        let restoration = await store.restoration(for: "chat-pages", tailLimit: 120).restoration
         let restored = try XCTUnwrap(restoration)
         XCTAssertEqual(restored.page.rows.count, 120)
         XCTAssertEqual(restored.page.startOrdinal, 1_080)
@@ -199,7 +248,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
         await store.scheduleSave(rows, for: "chat-clamp", now: 1)
         await store.flush()
 
-        let restoration = await store.restoration(for: "chat-clamp", tailLimit: 50_000)
+        let restoration = await store.restoration(for: "chat-clamp", tailLimit: 50_000).restoration
         let restored = try XCTUnwrap(restoration)
         XCTAssertEqual(restored.page.rows.count, AcpTranscriptStore.maximumPageSize)
         XCTAssertEqual(restored.page.earlierRowCount, 300)
@@ -211,7 +260,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
         let rows = (0..<1_000).map { AcpTranscriptRow.message(id: "\($0)", text: "row \($0)") }
         await store.scheduleSave(rows, for: "chat-tail", now: 1)
         await store.flush()
-        let restoration = await store.restoration(for: "chat-tail", tailLimit: 120)
+        let restoration = await store.restoration(for: "chat-tail", tailLimit: 120).restoration
         let restored = try XCTUnwrap(restoration)
 
         var changedTail = restored.page.rows
@@ -259,7 +308,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
         await store.flush()
 
         let reopened = AcpTranscriptStore(fileURL: directory.appendingPathComponent("transcripts.json"))
-        let restoration = await reopened.restoration(for: "chat-metadata", tailLimit: 120)
+        let restoration = await reopened.restoration(for: "chat-metadata", tailLimit: 120).restoration
         let restored = try XCTUnwrap(restoration)
         XCTAssertEqual(restored.page.rows, [.message(id: "1", text: "saved")])
         XCTAssertEqual(restored.usage, usage)
@@ -271,7 +320,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
         await reopened.scheduleAttachments([], for: "chat-metadata", now: 7)
         await reopened.scheduleSessionID(nil, for: "chat-metadata", now: 8)
         await reopened.flush()
-        let clearedRestoration = await reopened.restoration(for: "chat-metadata", tailLimit: 120)
+        let clearedRestoration = await reopened.restoration(for: "chat-metadata", tailLimit: 120).restoration
         let cleared = try XCTUnwrap(clearedRestoration)
         XCTAssertNil(cleared.draft)
         XCTAssertTrue(cleared.attachments.isEmpty)
@@ -297,7 +346,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
         try originalBytes.write(to: legacyURL, options: .atomic)
 
         let store = AcpTranscriptStore(fileURL: legacyURL)
-        let restoration = await store.restoration(for: "legacy-chat", tailLimit: 2)
+        let restoration = await store.restoration(for: "legacy-chat", tailLimit: 2).restoration
         let restored = try XCTUnwrap(restoration)
         XCTAssertEqual(restored.page.rows, Array(rows.suffix(2)))
         XCTAssertEqual(restored.page.earlierRowCount, 1)
@@ -330,8 +379,10 @@ final class AcpTranscriptStoreTests: XCTestCase {
         try corruptBytes.write(to: legacyURL, options: .atomic)
         let store = AcpTranscriptStore(fileURL: legacyURL)
 
-        let failedRestoration = await store.restoration(for: "retry-chat", tailLimit: 120)
-        XCTAssertNil(failedRestoration)
+        let failedOutcome = await store.restoration(for: "retry-chat", tailLimit: 120)
+        // A damaged import is reported as damage, never as an empty chat.
+        XCTAssertEqual(try XCTUnwrap(failedOutcome.failure).fault, .corrupt)
+        XCTAssertNil(failedOutcome.restoration)
         XCTAssertEqual(try Data(contentsOf: legacyURL), corruptBytes)
 
         let rows: [AcpTranscriptRow] = [.message(id: "1", text: "recovered source")]
@@ -339,9 +390,20 @@ final class AcpTranscriptStoreTests: XCTestCase {
             "retry-chat": AcpTranscriptStore.Entry(rows: rows, updatedAt: 1),
         ])
         try JSONEncoder().encode(repaired).write(to: legacyURL, options: .atomic)
-        let restoration = await store.restoration(for: "retry-chat", tailLimit: 120)
+        let restoration = await store.restoration(for: "retry-chat", tailLimit: 120).restoration
         let restored = try XCTUnwrap(restoration)
         XCTAssertEqual(restored.page.rows, rows)
+
+        // The write refusal lifts with the fault: a chat that reads back is
+        // durable again.
+        await store.scheduleSave(
+            rows + [.message(id: "2", text: "new turn")],
+            for: "retry-chat",
+            now: 2
+        )
+        await store.flush()
+        let reread = await store.rows(for: "retry-chat")
+        XCTAssertEqual(reread.count, 2)
     }
 
     func testLateLegacySourceImportsWhenV2WasOnlyPrecreatedAndNeverWritten() async throws {
@@ -353,7 +415,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
 
         let precreated = AcpTranscriptStore(fileURL: legacyURL)
         let absent = await precreated.restoration(for: "late-chat", tailLimit: 120)
-        XCTAssertNil(absent)
+        XCTAssertEqual(absent, .missing)
         XCTAssertTrue(FileManager.default.fileExists(atPath: precreated.databaseURL.path))
 
         let rows: [AcpTranscriptRow] = [.message(id: "1", text: "final v1 write")]
@@ -363,7 +425,113 @@ final class AcpTranscriptStoreTests: XCTestCase {
         try JSONEncoder().encode(payload).write(to: legacyURL, options: .atomic)
 
         let relaunched = AcpTranscriptStore(fileURL: legacyURL)
-        let restoration = await relaunched.restoration(for: "late-chat", tailLimit: 120)
+        let restoration = await relaunched.restoration(for: "late-chat", tailLimit: 120).restoration
         XCTAssertEqual(try XCTUnwrap(restoration).page.rows, rows)
+    }
+
+    // MARK: - Typed read failures
+
+    func testAbsentChatReadsAsMissingAndKeepsAcceptingWrites() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let outcome = await store.restoration(for: "chat-fresh", tailLimit: 120)
+        XCTAssertEqual(outcome, .missing)
+        let unreadable = await store.hasUnreadableHistory(chatID: "chat-fresh")
+        XCTAssertFalse(unreadable)
+
+        await store.scheduleSave([.message(id: "1", text: "first")], for: "chat-fresh", now: 1)
+        await store.flush()
+        let saved = await store.rows(for: "chat-fresh")
+        XCTAssertEqual(saved, [.message(id: "1", text: "first")])
+    }
+
+    func testUnopenableDatabaseReadsAsUnavailableRatherThanAnEmptyChat() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-blocked-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let store = AcpTranscriptStore(fileURL: directory.appendingPathComponent("transcripts.json"))
+        // A directory standing where the database file belongs is the
+        // deterministic stand-in for a database this process cannot open.
+        try FileManager.default.createDirectory(at: store.databaseURL, withIntermediateDirectories: true)
+
+        let outcome = await store.restoration(for: "chat-blocked", tailLimit: 120)
+        let failure = try XCTUnwrap(outcome.failure)
+        XCTAssertEqual(failure.fault, .unavailable)
+        XCTAssertNil(outcome.restoration)
+        XCTAssertNotEqual(outcome, .missing)
+        XCTAssertTrue(failure.guidance.contains(store.databaseURL.path))
+    }
+
+    func testCorruptRowReadsAsCorruptAndNeverReplacesTheStoredHistory() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let rows = (0..<3).map { AcpTranscriptRow.message(id: "\($0)", text: "row \($0)") }
+        await store.scheduleSave(rows, for: "chat-damaged", now: 1)
+        await store.flush()
+        let databaseURL = store.databaseURL
+        try TranscriptDatabaseProbe.execute(
+            """
+            UPDATE transcript_rows SET row_json = X'6E6F70'
+            WHERE chat_id = 'chat-damaged' AND ordinal = 2
+            """,
+            at: databaseURL
+        )
+
+        let relaunched = AcpTranscriptStore(
+            fileURL: directory.appendingPathComponent("transcripts.json")
+        )
+        let outcome = await relaunched.restoration(for: "chat-damaged", tailLimit: 120)
+        let failure = try XCTUnwrap(outcome.failure)
+        XCTAssertEqual(failure.fault, .corrupt)
+        XCTAssertEqual(failure.databasePath, databaseURL.path)
+        XCTAssertTrue(failure.guidance.contains(databaseURL.path))
+        let unreadable = await relaunched.hasUnreadableHistory(chatID: "chat-damaged")
+        XCTAssertTrue(unreadable)
+
+        // The empty transcript that failed read produced must not come back as
+        // a whole-history write over the three rows still on disk.
+        await relaunched.scheduleSave(
+            [.message(id: "replacement", text: "fresh turn")],
+            for: "chat-damaged",
+            now: 2
+        )
+        await relaunched.scheduleDraft("", for: "chat-damaged", now: 3)
+        await relaunched.scheduleSessionID(nil, for: "chat-damaged", now: 4)
+        await relaunched.flush()
+        XCTAssertEqual(
+            try TranscriptDatabaseProbe.rowCount(chatID: "chat-damaged", at: databaseURL),
+            3
+        )
+    }
+
+    func testExplicitRemovalStillAppliesToAnUnreadableChat() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        await store.scheduleSave(
+            [.message(id: "1", text: "row"), .message(id: "2", text: "row")],
+            for: "chat-doomed",
+            now: 1
+        )
+        await store.flush()
+        let databaseURL = store.databaseURL
+        try TranscriptDatabaseProbe.execute(
+            "UPDATE transcript_rows SET row_json = X'6E6F70' WHERE chat_id = 'chat-doomed'",
+            at: databaseURL
+        )
+
+        let relaunched = AcpTranscriptStore(
+            fileURL: directory.appendingPathComponent("transcripts.json")
+        )
+        let outcome = await relaunched.restoration(for: "chat-doomed", tailLimit: 120)
+        XCTAssertNotNil(outcome.failure)
+        await relaunched.remove(chatID: "chat-doomed")
+        XCTAssertEqual(
+            try TranscriptDatabaseProbe.rowCount(chatID: "chat-doomed", at: databaseURL),
+            0
+        )
+        let stillRefusing = await relaunched.hasUnreadableHistory(chatID: "chat-doomed")
+        XCTAssertFalse(stillRefusing)
     }
 }

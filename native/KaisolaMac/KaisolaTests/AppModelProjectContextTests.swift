@@ -1156,6 +1156,73 @@ final class AppModelProjectContextTests: XCTestCase {
         await model.teardown()
     }
 
+    /// A chat whose stored rows cannot be decoded keeps its surface, says so,
+    /// and does not have its damaged history overwritten by the empty
+    /// transcript restoration produced.
+    @MainActor
+    func testDamagedTranscriptRestoresWithGuidanceAndKeepsTheStoredRows() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        let projectDirectory = root.appendingPathComponent("damaged-chat-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
+        let projectID = NativeSessionStore.projectID(forDirectory: projectDirectory.path)
+        let chatID = "damaged-chat"
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-damaged-restore.json")
+        )
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: projectID,
+            layout: SessionPaneLayout(sessionID: chatID),
+            panes: [NativeRestorablePaneState(
+                id: chatID,
+                surface: NativeRestorableSurfaceState(agentChat: NativeRestorableAgentChatDescriptor(
+                    id: chatID,
+                    projectID: projectID,
+                    agentID: agent.id,
+                    workspacePath: projectDirectory.path,
+                    acpSessionID: nil,
+                    accountBinding: nil,
+                    title: "Damaged chat"
+                ))
+            )],
+            focusedPaneID: chatID
+        ))
+
+        let transcriptURL = root.appendingPathComponent("transcripts-damaged-restore.json")
+        let seed = AcpTranscriptStore(fileURL: transcriptURL)
+        let rows = (0..<3).map { AcpTranscriptRow.message(id: "\($0)", text: "row \($0)") }
+        await seed.scheduleSave(rows, for: chatID, now: 1)
+        await seed.flush()
+        let databaseURL = seed.databaseURL
+        try TranscriptDatabaseProbe.execute(
+            "UPDATE transcript_rows SET row_json = X'6E6F70' WHERE chat_id = '\(chatID)'",
+            at: databaseURL
+        )
+
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        let model = makeRestoringModel(
+            workspaceStore: workspaceStore,
+            root: root,
+            identity: "damaged-restore",
+            projectDirectory: projectDirectory
+        )
+        await model.restoreWorkspaceStateIfNeeded()
+
+        let conversation = try XCTUnwrap(model.chats.first { $0.id == chatID }?.conversation)
+        XCTAssertTrue(conversation.rows.isEmpty)
+        XCTAssertTrue(ToastCenter.shared.toasts.contains {
+            $0.message.contains("saved history is damaged")
+                && $0.message.contains(databaseURL.path)
+        })
+
+        // The chat keeps streaming into a surface whose history we could not
+        // read; none of that may reach the rows still on disk.
+        model.enqueueTranscriptSave([.message(id: "new", text: "post-damage turn")], chatID: chatID)
+        await model.flushTranscriptPersistence()
+        XCTAssertEqual(try TranscriptDatabaseProbe.rowCount(chatID: chatID, at: databaseURL), 3)
+        await model.teardown()
+    }
+
     @MainActor
     private func makeRestoringModel(
         workspaceStore: NativeWorkspaceStateStore,

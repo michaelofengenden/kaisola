@@ -2433,6 +2433,27 @@ final class AppModel: ObservableObject {
         await transcriptStore.flush()
     }
 
+    /// Chats whose unreadable history has already been reported. One notice
+    /// per chat per launch: restoration, a Recently Closed reopen, and an
+    /// account or model switch can all read the same damaged transcript.
+    private var reportedUnreadableTranscriptIDs: Set<String> = []
+
+    /// Read a chat's stored tail. A chat with nothing saved and a chat whose
+    /// history is damaged or locked no longer look alike here: the second
+    /// surfaces the store's recovery guidance and still returns nil, because
+    /// the store refuses writes for it. The surface stays, and the history we
+    /// could not read is never replaced by the empty one this read produced.
+    private func restoredTranscript(
+        for chatID: String,
+        tailLimit: Int = AcpConversation.defaultVisibleLimit
+    ) async -> AcpTranscriptStore.Restoration? {
+        let outcome = await transcriptStore.restoration(for: chatID, tailLimit: tailLimit)
+        if let failure = outcome.failure, reportedUnreadableTranscriptIDs.insert(chatID).inserted {
+            ToastCenter.shared.show(failure.guidance, style: .error, duration: 8)
+        }
+        return outcome.restoration
+    }
+
     private func wireMeshPersistence(_ mesh: MeshSession, recentlyClosed: Bool = false) {
         let projectID = mesh.projectID
         mesh.onDescriptorChanged = { [weak self, weak mesh] in
@@ -2713,10 +2734,7 @@ final class AppModel: ObservableObject {
                 var isDirectory: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
                       isDirectory.boolValue else { continue }
-                let transcript = await transcriptStore.restoration(
-                    for: descriptor.id,
-                    tailLimit: AcpConversation.defaultVisibleLimit
-                )
+                let transcript = await restoredTranscript(for: descriptor.id)
                 let legacyDraft = try? await workspaceStateStore.draft(for: "chat|\(descriptor.id)")
                 let draft = transcript?.draft ?? legacyDraft
                 if transcript?.draft == nil, let legacyDraft, !legacyDraft.isEmpty {
@@ -2779,10 +2797,7 @@ final class AppModel: ObservableObject {
 
                 var states: [MeshSession.RestoredColumnState] = []
                 for column in descriptor.columns {
-                    let transcript = await transcriptStore.restoration(
-                        for: column.id,
-                        tailLimit: AcpConversation.defaultVisibleLimit
-                    )
+                    let transcript = await restoredTranscript(for: column.id)
                     states.append(MeshSession.RestoredColumnState(
                         descriptor: column,
                         rows: transcript?.page.rows ?? [],
@@ -3439,10 +3454,7 @@ final class AppModel: ObservableObject {
         // store before the transcript is read back for the new handle.
         let finalDraft = await chat.conversation.stop()
         await flushTranscriptPersistence()
-        let transcript = await transcriptStore.restoration(
-            for: chatID,
-            tailLimit: AcpConversation.defaultVisibleLimit
-        )
+        let transcript = await restoredTranscript(for: chatID)
         // Re-check after the awaits: a concurrent close, delete, or second
         // switch may have replaced or removed the handle this call captured.
         guard let live = chats.first(where: { $0.id == chatID }),
@@ -3503,10 +3515,7 @@ final class AppModel: ObservableObject {
         let resumeSessionID = chat.conversation.providerSessionID
         let finalDraft = await chat.conversation.stop()
         await flushTranscriptPersistence()
-        let transcript = await transcriptStore.restoration(
-            for: chatID,
-            tailLimit: AcpConversation.defaultVisibleLimit
-        )
+        let transcript = await restoredTranscript(for: chatID)
         guard let live = chats.first(where: { $0.id == chatID }),
               live.conversation === chat.conversation else { return }
         chats.removeAll { $0.id == chatID }
@@ -3729,10 +3738,7 @@ final class AppModel: ObservableObject {
                   isDirectory.boolValue else {
                 return .blocked("The chat's project folder is unavailable. Nothing was removed.")
             }
-            let transcript = await transcriptStore.restoration(
-                for: descriptor.id,
-                tailLimit: AcpConversation.defaultVisibleLimit
-            )
+            let transcript = await restoredTranscript(for: descriptor.id)
             let legacyDraft = try? await workspaceStateStore.draft(for: "chat|\(descriptor.id)")
             let draft = transcript?.draft ?? legacyDraft
             if transcript?.draft == nil, let legacyDraft, !legacyDraft.isEmpty {
@@ -3899,10 +3905,7 @@ final class AppModel: ObservableObject {
         wireMeshPersistence(mesh, recentlyClosed: true)
         var states: [MeshSession.RestoredColumnState] = []
         for column in descriptor.columns {
-            let transcript = await transcriptStore.restoration(
-                for: column.id,
-                tailLimit: AcpConversation.defaultVisibleLimit
-            )
+            let transcript = await restoredTranscript(for: column.id)
             states.append(MeshSession.RestoredColumnState(
                 descriptor: column,
                 rows: transcript?.page.rows ?? [],

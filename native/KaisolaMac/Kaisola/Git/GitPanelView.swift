@@ -14,13 +14,23 @@ import SwiftUI
 /// an agent's commit and endless on an idle repository.
 ///
 /// **Opening a pull request is two steps.** `preparePR` assembles a `PRPlan` and
-/// shows it; `confirmPR` executes that reviewed plan and nothing else.
+/// shows it; `confirmPR` executes that reviewed plan and nothing else. A confirm
+/// that stops part way keeps its completed phases in `PRExecutionProgress`, so
+/// the panel names them and Retry resumes rather than restarts.
 @MainActor
 final class GitPanelModel: ObservableObject {
     @Published private(set) var status: GitService.Status?
     @Published private(set) var errorMessage: String?
+    /// True when the last failure was a command Kaisola *stopped* on its
+    /// deadline rather than one that failed. Git never reported anything about
+    /// the repository, so the banner offers Retry instead of only explaining.
+    @Published private(set) var errorIsRetryable = false
     @Published var commitMessage = ""
     @Published private(set) var isBusy = false
+
+    /// Re-runs exactly the operation the timeout interrupted. Nil unless the
+    /// last failure was retryable.
+    private var retryOperation: (() -> Void)?
 
     /// One-click PR state: the current branch's push/PR readiness, plus the
     /// result of the last Create-PR run (a PR or compare URL, and a status note).
@@ -37,6 +47,11 @@ final class GitPanelModel: ObservableObject {
     /// differs from what it was reviewed against). The card stays on screen so
     /// the user's edits aren't lost, but Confirm is disabled until review.
     @Published private(set) var prPlanStale = false
+    /// What the last confirm actually completed before it stopped. Empty on a
+    /// clean slate and after a successful run; populated when a confirm failed
+    /// part way, so the panel can name the branch it created, link the branch it
+    /// pushed, and let Retry resume instead of starting the sequence over.
+    @Published private(set) var prProgress = PRExecutionProgress()
     /// Review-stage edits. Seeded from the plan when it is assembled.
     @Published var prBranchDraft = "kaisola/pr-branch"
     @Published var prTitleDraft = ""
@@ -183,7 +198,12 @@ final class GitPanelModel: ObservableObject {
                     plan: plan,
                     currentHeadOID: snapshot.headOID,
                     currentBranch: snapshot.prep?.branch,
-                    currentDestination: snapshot.destination
+                    currentDestination: snapshot.destination,
+                    // A failed confirm that already forked the branch left it
+                    // checked out. That is the plan running, not the repository
+                    // drifting away from it — reading it as staleness would
+                    // disable the very Retry that finishes the job.
+                    completedBranchCreation: self.prProgress.createdBranch == plan.headBranch
                 )
             } else {
                 self.prPlanStale = false
@@ -268,7 +288,27 @@ final class GitPanelModel: ObservableObject {
         }
     }
 
+    /// The one gate on committing, shared by the Commit button, Return in the
+    /// message field, and `commit()` itself. Keyboard submit used to call
+    /// `commit()` straight through, so Return could fire a commit the disabled
+    /// button had already refused (blank message, nothing staged).
+    var canCommit: Bool {
+        !isBusy
+            && status?.staged.isEmpty == false
+            && !commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var commitHelp: String {
+        if isBusy { return "Wait for the current Git operation to finish" }
+        if status?.staged.isEmpty != false { return "Stage at least one file before committing" }
+        if commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Enter a commit message"
+        }
+        return "Commit the staged files"
+    }
+
     func commit() {
+        guard canCommit else { return }
         let message = commitMessage
         perform { (try $0.commit(message: message), try $0.status(), try? $0.prPrep()) } apply: {
             self.status = $0.1
@@ -338,6 +378,11 @@ final class GitPanelModel: ObservableObject {
         } apply: { plan in
             self.prPlan = plan
             self.prPlanStale = false
+            // Keep only the completed phases this freshly assembled plan is
+            // still standing on. A branch an earlier attempt pushed at this
+            // exact commit does not need pushing again; anything else about the
+            // old run no longer describes this plan and is dropped.
+            self.prProgress = self.prProgress.carriedForward(into: plan)
             self.prBranchDraft = plan.headBranch
             // "Review Again" re-runs this exact path once the reviewed plan
             // goes stale. Only reseed a field the user left exactly as this
@@ -375,8 +420,17 @@ final class GitPanelModel: ObservableObject {
     /// Refuses to run when the repository moved past the reviewed commit, so a
     /// commit or checkout landing between the two clicks (an agent, a terminal)
     /// can never silently turn into a pull request nobody looked at.
+    ///
+    /// It is also the retry. The fork and the push are real, non-idempotent side
+    /// effects, so each one is recorded in `prProgress` as it lands and a second
+    /// run resumes at the first phase that has not happened yet: a `gh` failure
+    /// costs one more `gh` call, not a duplicate branch or a redundant push.
     func confirmPR() {
         guard let reviewed = prPlan else { return }
+        // An attempt that already forked the branch is standing on it, so its
+        // name is settled — pin the draft to it rather than let a field the user
+        // was still editing rename the head `gh` is told about.
+        if let created = prProgress.createdBranch { prBranchDraft = created }
         let plan: PRPlan
         do {
             plan = try reviewed.applyingEdits(
@@ -386,56 +440,89 @@ final class GitPanelModel: ObservableObject {
             )
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            errorIsRetryable = false
+            retryOperation = nil
             return
         }
         prState = nil
         prURL = nil
+        let resumed = prProgress
         perform { service -> PROutcome in
+            var progress = resumed
             if let stale = GitPRPlanner.stalenessMessage(
                 plan: plan,
                 currentHeadOID: try service.headOID(),
                 currentBranch: try service.prPrep().branch,
-                currentDestination: service.prDestination()
+                currentDestination: service.prDestination(),
+                completedBranchCreation: progress.createdBranch == plan.headBranch
             ) {
-                throw GitService.GitError.commandFailed(stale)
+                throw PRExecutionFailure(
+                    progress: progress,
+                    underlying: GitService.GitError.commandFailed(stale)
+                )
             }
             guard plan.destination.isReadyForPullRequest,
                   let repositoryURL = plan.destination.webURL else {
-                throw GitService.GitError.commandFailed(
-                    "Add a web origin remote, then review the pull request again."
+                throw PRExecutionFailure(
+                    progress: progress,
+                    underlying: GitService.GitError.commandFailed(
+                        "Add a web origin remote, then review the pull request again."
+                    )
                 )
             }
-            if plan.createsBranch {
-                try service.createBranchFromHead(named: plan.headBranch)
-            }
-            try service.pushCurrentBranch(
-                setUpstream: plan.setsUpstream,
-                remoteName: plan.destination.remoteName
-            )
+            do {
+                if progress.needsBranchCreation(for: plan) {
+                    try service.createBranchFromHead(named: plan.headBranch)
+                    progress.createdBranch = plan.headBranch
+                }
+                if progress.needsPush(for: plan) {
+                    try service.pushCurrentBranch(
+                        setUpstream: plan.setsUpstream,
+                        remoteName: plan.destination.remoteName
+                    )
+                    progress.pushedBranch = plan.headBranch
+                    progress.pushedHeadOID = plan.headOID
+                    progress.remoteBranchURL = GitService.branchWebURL(
+                        destination: plan.destination,
+                        headBranch: plan.headBranch
+                    )
+                }
 
-            let result: PRResult
-            if GitService.ghAvailable() {
-                result = .created(url: try service.createPullRequest(
-                    title: plan.title,
-                    body: plan.body,
-                    baseBranch: plan.baseBranch,
-                    headBranch: plan.headBranch,
-                    repositoryURL: repositoryURL
-                ))
-            } else if let compare = service.compareURL(
-                destination: plan.destination,
-                headBranch: plan.headBranch
-            ) {
-                result = .compare(url: compare)
-            } else {
-                throw GitService.GitError.commandFailed("Install the GitHub CLI (gh) or add a GitHub origin remote to open a pull request.")
+                let result: PRResult
+                if GitService.ghAvailable() {
+                    switch try service.createPullRequest(
+                        title: plan.title,
+                        body: plan.body,
+                        baseBranch: plan.baseBranch,
+                        headBranch: plan.headBranch,
+                        repositoryURL: repositoryURL
+                    ) {
+                    case let .opened(url):
+                        result = .created(url: url)
+                    case let .openedWithoutURL(recoveryURL):
+                        result = .createdWithoutURL(url: recoveryURL)
+                    }
+                } else if let compare = service.compareURL(
+                    destination: plan.destination,
+                    headBranch: plan.headBranch
+                ) {
+                    result = .compare(url: compare)
+                } else {
+                    throw GitService.GitError.commandFailed("Install the GitHub CLI (gh) or add a GitHub origin remote to open a pull request.")
+                }
+                return PROutcome(result: result, status: try service.status(), prep: try? service.prPrep())
+            } catch {
+                // Whatever stopped the run, the phases above it already
+                // happened. Carry them out with the error so the panel reports
+                // them instead of only the failure.
+                throw PRExecutionFailure(progress: progress, underlying: error)
             }
-            return PROutcome(result: result, status: try service.status(), prep: try? service.prPrep())
         } apply: { outcome in
             self.status = outcome.status
             self.prPrepInfo = outcome.prep
             self.prPlan = nil
             self.prPlanStale = false
+            self.prProgress = PRExecutionProgress()
             self.diffs.removeAll()
             self.diffRequests.removeAll()
             self.log.removeAll()
@@ -444,12 +531,24 @@ final class GitPanelModel: ObservableObject {
                 self.prURL = url
                 self.prState = "Pull request opened."
                 ToastCenter.shared.show("Pull request opened", style: .success)
+            case let .createdWithoutURL(url):
+                self.prURL = url
+                self.prState = "Pull request opened, but gh printed no usable link — this opens the branch's pull requests instead."
+                ToastCenter.shared.show("Pull request opened — link unconfirmed", style: .info)
             case let .compare(url):
                 self.prURL = url
                 self.prState = "gh not installed — opened a compare page in your browser."
                 if let target = URL(string: url) { _ = NSWorkspace.shared.open(target) }
                 ToastCenter.shared.show("Opened compare page in browser", style: .info)
             }
+        } onError: { error in
+            // The error banner says what went wrong; this says what already
+            // happened anyway. Both outlive a cancelled review card, so a user
+            // who walks away still knows a branch of theirs is on the remote.
+            guard let failure = error as? PRExecutionFailure else { return }
+            self.prProgress = failure.progress
+            self.prURL = failure.progress.remoteBranchURL
+            self.prState = failure.progress.recoveryNote
         }
     }
 
@@ -464,6 +563,8 @@ final class GitPanelModel: ObservableObject {
         guard !isBusy else { return }
         isBusy = true
         errorMessage = nil
+        errorIsRetryable = false
+        retryOperation = nil
         // Every operation re-reads status, so any of them satisfies the refresh
         // policy's rate floor — a stage and an event-driven refresh must not run
         // git twice in the same window.
@@ -477,9 +578,29 @@ final class GitPanelModel: ObservableObject {
             } catch {
                 onError?(error)
                 errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                errorIsRetryable = Self.isRetryable(error)
+                // Hold the same closures, so Retry re-runs this operation
+                // rather than falling back to a generic refresh.
+                retryOperation = errorIsRetryable
+                    ? { [weak self] in self?.perform(work, apply: apply, onError: onError) }
+                    : nil
                 isBusy = false
             }
         }
+    }
+
+    /// Whether a failed operation is worth offering again. Pulled out as a pure
+    /// decision so the banner's Retry affordance is directly unit-testable.
+    nonisolated static func isRetryable(_ error: any Error) -> Bool {
+        (error as? GitService.GitError)?.isRetryable ?? false
+    }
+
+    /// Run the stopped operation again, from the banner's Retry button.
+    func retryLastOperation() {
+        guard !isBusy, let retry = retryOperation else { return }
+        retryOperation = nil
+        errorIsRetryable = false
+        retry()
     }
 
     private func closeDiff(_ path: String) {
@@ -512,8 +633,9 @@ private struct PROutcome: Sendable {
 }
 
 private enum PRResult: Sendable {
-    case created(url: String)   // gh opened a real pull request
-    case compare(url: String)   // gh missing — a browser compare page instead
+    case created(url: String)             // gh opened a real pull request
+    case createdWithoutURL(url: String)   // opened, but gh named no PR — a list to recover from
+    case compare(url: String)             // gh missing — a browser compare page instead
 }
 
 struct GitPanelView: View {
@@ -533,12 +655,30 @@ struct GitPanelView: View {
             // (a transient op failure would otherwise blank the whole panel
             // until a manual refresh).
             if let error = model.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle")
+                // A stopped command reads differently from a failed one: amber
+                // rather than red, a clock rather than a warning triangle, and a
+                // Retry button, because nothing is actually known to be wrong.
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Label(
+                        error,
+                        systemImage: model.errorIsRetryable ? "clock.badge.exclamationmark" : "exclamationmark.triangle"
+                    )
                     .font(.caption)
-                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
-                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .foregroundStyle(
+                        (model.errorIsRetryable ? KaisolaStatusTone.needsYou : .failed).foregroundColor
+                    )
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.red.opacity(0.08))
+                    if model.errorIsRetryable {
+                        Button("Retry", action: model.retryLastOperation)
+                            .buttonStyle(.borderless)
+                            .font(.caption)
+                            .disabled(model.isBusy)
+                            .accessibilityIdentifier("git.retry")
+                    }
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(model.errorIsRetryable ? Color.orange.opacity(0.10) : Color.red.opacity(0.08))
                 Divider()
             }
             if let status = model.status {
@@ -584,8 +724,8 @@ struct GitPanelView: View {
         HStack(spacing: 8) {
             Image(systemName: "arrow.triangle.branch")
             Text(model.status?.branch ?? "—").font(.subheadline.weight(.medium))
-            if let s = model.status, s.ahead > 0 { Text("↑\(s.ahead)").font(.caption).foregroundStyle(.secondary) }
-            if let s = model.status, s.behind > 0 { Text("↓\(s.behind)").font(.caption).foregroundStyle(.secondary) }
+            if let s = model.status, s.ahead > 0 { Text("↑\(s.ahead)").font(.caption).foregroundStyle(.kaisolaSecondary) }
+            if let s = model.status, s.behind > 0 { Text("↓\(s.behind)").font(.caption).foregroundStyle(.kaisolaSecondary) }
             Spacer()
             Button(action: model.pull) {
                 Label("Pull", systemImage: "arrow.down.circle")
@@ -617,9 +757,18 @@ struct GitPanelView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 4) {
                     bulkActions(status)
-                    fileSection("Staged", status.staged.map { ($0.path, $0.code) }, action: "Unstage", staged: true) { model.unstage($0) }
-                    fileSection("Changes", status.unstaged.map { ($0.path, $0.code) }, action: "Stage", staged: false, restorable: true) { model.stage($0) }
-                    fileSection("Untracked", status.untracked.map { ($0, "?") }, action: "Stage", staged: false) { model.stage($0) }
+                    fileSection(
+                        "Staged", status.staged.map { ($0.path, $0.code) }, stats: status.stagedStats,
+                        action: "Unstage", staged: true
+                    ) { model.unstage($0) }
+                    fileSection(
+                        "Changes", status.unstaged.map { ($0.path, $0.code) }, stats: status.unstagedStats,
+                        action: "Stage", staged: false, restorable: true
+                    ) { model.stage($0) }
+                    fileSection(
+                        "Untracked", status.untracked.map { ($0, "?") }, stats: nil,
+                        action: "Stage", staged: false
+                    ) { model.stage($0) }
                     logSection
                     prSection
                 }
@@ -631,7 +780,9 @@ struct GitPanelView: View {
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { model.commit() }
                 Button("Commit") { model.commit() }
-                    .disabled(model.commitMessage.trimmingCharacters(in: .whitespaces).isEmpty || status.staged.isEmpty || model.isBusy)
+                    .disabled(!model.canCommit)
+                    .help(model.commitHelp)
+                    .accessibilityIdentifier("git.commit")
             }
             .padding(12)
         }
@@ -657,6 +808,11 @@ struct GitPanelView: View {
                 .accessibilityIdentifier("git.stageAll")
             }
             Spacer()
+            if let summary = GitStatsRendering.summary(status.combinedStats) {
+                Text("Total \(summary)")
+                    .foregroundStyle(.kaisolaSecondary)
+                    .accessibilityIdentifier("git.stats.combined")
+            }
         }
         .font(.caption)
         .buttonStyle(.borderless)
@@ -670,7 +826,7 @@ struct GitPanelView: View {
             HStack {
                 Text("History")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Spacer()
                 Button(model.log.isEmpty ? "Show" : "Refresh") { model.loadLog() }
                     .buttonStyle(.borderless).font(.caption)
@@ -678,7 +834,7 @@ struct GitPanelView: View {
             .padding(.top, 8)
             ForEach(model.log) { commit in
                 HStack(spacing: 8) {
-                    Text(commit.shortHash).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    Text(commit.shortHash).font(.caption.monospaced()).foregroundStyle(.kaisolaSecondary)
                     Text(commit.subject).font(.caption).lineLimit(1)
                     Spacer()
                 }
@@ -691,13 +847,15 @@ struct GitPanelView: View {
     /// shows it — remote, destination, base and head branch, commits, exact
     /// changed files, and editable title/body — without running anything. "Push
     /// and Create PR" then executes exactly what is on screen (or opens a
-    /// browser compare page when gh is absent). The result URL is tappable.
+    /// browser compare page when gh is absent). The result URL is tappable, and
+    /// after a half-finished run that URL is the pushed branch: the note and the
+    /// link sit outside the card so they survive cancelling the review.
     @ViewBuilder
     private var prSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Pull Request")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 10)
 
@@ -716,11 +874,11 @@ struct GitPanelView: View {
                 }
             }
             if let note = model.prState {
-                Text(note).font(.caption2).foregroundStyle(.secondary)
+                Text(note).font(.caption2).foregroundStyle(.kaisolaSecondary)
             }
             if !model.ghAvailable {
                 Text("GitHub CLI (gh) not found — the confirm step opens a browser compare page instead.")
-                    .font(.caption2).foregroundStyle(.tertiary)
+                    .font(.caption2).foregroundStyle(.kaisolaTertiary)
             }
         }
         .padding(.horizontal, model.status?.isClean == true ? 12 : 0)
@@ -732,22 +890,22 @@ struct GitPanelView: View {
     private var prepareStage: some View {
         if let prep = model.prPrepInfo {
             HStack(spacing: 6) {
-                Image(systemName: "arrow.triangle.branch").font(.caption2).foregroundStyle(.secondary)
+                Image(systemName: "arrow.triangle.branch").font(.caption2).foregroundStyle(.kaisolaSecondary)
                 Text(prep.branch).font(.caption.monospaced())
                 if prep.aheadCount > 0 {
                     Text("· \(prep.aheadCount) PR \(prep.aheadCount == 1 ? "commit" : "commits")")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 } else {
                     Text("· no pull request commits")
                         .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.kaisolaTertiary)
                 }
                 Spacer()
             }
             if prep.isDefaultBranch, prep.aheadCount > 0 {
                 Text("On \(prep.branch) — the review proposes a new branch for the pull request.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.caption2).foregroundStyle(.kaisolaSecondary)
             }
         }
 
@@ -773,10 +931,28 @@ struct GitPanelView: View {
                     .accessibilityIdentifier("git.pr.stale")
             }
 
+            // A confirm that stopped part way: name every phase that did run so
+            // the branch and the push are never invisible completed work.
+            if model.prProgress.hasSideEffects {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Already done by the last attempt")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    ForEach(model.prProgress.completedPhases, id: \.self) { phase in
+                        Label(phase, systemImage: "checkmark.circle")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("git.pr.completedPhases")
+            }
+
             HStack(spacing: 6) {
-                Image(systemName: "arrow.triangle.pull").font(.caption2).foregroundStyle(.secondary)
+                Image(systemName: "arrow.triangle.pull").font(.caption2).foregroundStyle(.kaisolaSecondary)
                 Text(plan.baseBranch).font(.caption.monospaced())
-                Image(systemName: "arrow.left").font(.caption2).foregroundStyle(.tertiary)
+                Image(systemName: "arrow.left").font(.caption2).foregroundStyle(.kaisolaTertiary)
                 Text(plan.headBranch).font(.caption.monospaced())
                 if plan.createsBranch {
                     Text("new branch")
@@ -790,12 +966,12 @@ struct GitPanelView: View {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("Remote")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Text(plan.destination.remoteName)
                     .font(.caption2.monospaced())
                 Text("·")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                 Text(plan.destination.remoteDisplayURL)
                     .font(.caption2.monospaced())
                     .lineLimit(1)
@@ -811,7 +987,7 @@ struct GitPanelView: View {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("Destination")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Text("\(plan.destination.webURL ?? plan.destination.remoteDisplayURL) · \(plan.baseBranch)")
                     .font(.caption2.monospaced())
                     .lineLimit(1)
@@ -834,14 +1010,14 @@ struct GitPanelView: View {
             Text("\(plan.commitCount) \(plan.commitCount == 1 ? "commit" : "commits") · "
                  + "\(plan.changedFileCount) \(plan.changedFileCount == 1 ? "file" : "files") changed")
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
 
             ForEach(Array(plan.commitSubjects.prefix(6).enumerated()), id: \.offset) { _, subject in
-                Text("• \(subject)").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                Text("• \(subject)").font(.caption2).foregroundStyle(.kaisolaSecondary).lineLimit(1)
             }
             if plan.commitSubjects.count > 6 {
                 Text("+ \(plan.commitSubjects.count - 6) more")
-                    .font(.caption2).foregroundStyle(.tertiary)
+                    .font(.caption2).foregroundStyle(.kaisolaTertiary)
             }
 
             if !plan.changedFiles.isEmpty {
@@ -872,6 +1048,9 @@ struct GitPanelView: View {
                 TextField("Branch name", text: $model.prBranchDraft)
                     .textFieldStyle(.roundedBorder)
                     .font(.caption)
+                    // Once the branch exists renaming it here would only tell
+                    // `gh` about a head that was never pushed.
+                    .disabled(model.prProgress.createdBranch != nil)
                     .accessibilityIdentifier("git.pr.branch")
                     .accessibilityLabel("Pull request branch name")
             }
@@ -888,19 +1067,29 @@ struct GitPanelView: View {
                 .accessibilityLabel("Pull request description")
 
             if !model.prPlanStale {
+                // After a half-finished run "nothing has run yet" would be a
+                // lie, so the caption states the remaining work either way.
                 Text(
-                    "Nothing has run yet — confirm to push \(plan.headBranch) to "
-                        + "\(plan.destination.remoteName) and open the pull request against \(plan.baseBranch)."
+                    model.prProgress.hasSideEffects
+                        ? "Retry resumes where the last attempt stopped: "
+                            + "\(model.prProgress.remainingWork(for: plan))."
+                        : "Nothing has run yet — confirm to "
+                            + "\(model.prProgress.remainingWork(for: plan))."
                 )
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
 
             HStack(spacing: 8) {
                 Button {
                     model.confirmPR()
                 } label: {
-                    Label("Push and Create PR", systemImage: "arrow.up.forward.square")
+                    Label(
+                        model.prProgress.hasSideEffects ? "Retry Pull Request" : "Push and Create PR",
+                        systemImage: model.prProgress.hasSideEffects
+                            ? "arrow.clockwise.circle"
+                            : "arrow.up.forward.square"
+                    )
                         .font(.caption)
                 }
                 .disabled(
@@ -942,16 +1131,25 @@ struct GitPanelView: View {
     private func fileSection(
         _ title: String,
         _ files: [(String, String)],
+        stats: GitService.ChangeStats?,
         action: String,
         staged: Bool,
         restorable: Bool = false,
         perform: @escaping (String) -> Void
     ) -> some View {
         if !files.isEmpty {
-            Text("\(title) (\(files.count))")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.top, 4)
+            HStack(spacing: 6) {
+                Text("\(title) (\(files.count))")
+                    .fontWeight(.semibold)
+                if let stats, let summary = GitStatsRendering.summary(stats) {
+                    Text(summary)
+                        .foregroundStyle(.kaisolaTertiary)
+                        .accessibilityIdentifier("git.stats.\(staged ? "staged" : "unstaged")")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.kaisolaSecondary)
+            .padding(.top, 4)
             ForEach(files, id: \.0) { path, code in
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 8) {
@@ -962,7 +1160,7 @@ struct GitPanelView: View {
                             HStack(spacing: 4) {
                                 Text((path as NSString).lastPathComponent).lineLimit(1)
                                 Text((path as NSString).deletingLastPathComponent)
-                                    .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                                    .font(.caption2).foregroundStyle(.kaisolaTertiary).lineLimit(1)
                             }
                             .contentShape(Rectangle())
                         }
@@ -1003,6 +1201,21 @@ struct GitPanelView: View {
         case "?": .secondary
         default: .primary
         }
+    }
+}
+
+enum GitStatsRendering {
+    /// Text and binary truth occupy separate parts of the summary. In
+    /// particular an all-binary diff renders only "1 binary", never +0/-0.
+    static func summary(_ stats: GitService.ChangeStats) -> String? {
+        var parts: [String] = []
+        if stats.textFiles > 0 {
+            parts.append("+\(stats.additions) −\(stats.deletions)")
+        }
+        if stats.binaryFiles > 0 {
+            parts.append("\(stats.binaryFiles) binary")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 
@@ -1054,7 +1267,7 @@ private struct PatchText: View {
             if rendered.isTruncated {
                 Label("Large diff truncated in this view", systemImage: "ellipsis.rectangle")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.horizontal, 8)
                     .padding(.bottom, 5)
             }

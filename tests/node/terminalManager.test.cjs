@@ -7,6 +7,7 @@ const os = require('node:os')
 const path = require('node:path')
 const manager = require('../../runtime/node-broker/ipc/terminalManager.cjs')
 const { TerminalSpool } = require('../../runtime/node-broker/ipc/terminalSpool.cjs')
+const { DEFAULT_OBSERVER_QUEUE_BYTES } = require('../../runtime/node-broker/ipc/terminalObservers.cjs')
 const { TERMINAL_GEOMETRY_LIMITS } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
 const { __test } = manager
 
@@ -228,6 +229,95 @@ test('socket-loss prefix detach remains explicitly broad across projects', async
   assert.equal(manager.ownership(records[0][0]).owner, '')
   assert.equal(manager.ownership(records[1][0]).owner, '')
   assert.equal(manager.ownership(records[2][0]).owner, records[2][1])
+})
+
+test('primary output overflow stays bounded until an explicit snapshot reattach', async (t) => {
+  const id = 'primary-output-backpressure'
+  const owner = 'instance-primary|renderer-1|project-a'
+  const frames = []
+  let queuedBytes = DEFAULT_OBSERVER_QUEUE_BYTES - 32
+  manager.setEventSink((sender, channel, payload, options = {}) => {
+    // Other manager tests can still be receiving asynchronous native exit
+    // callbacks. They have no authenticated owner and would not share this
+    // client's broker socket in production.
+    if (sender !== owner) return true
+    const frameBytes = Buffer.byteLength(JSON.stringify({ channel, payload }))
+    const limit = options.maxQueueBytes
+    const accepted = options.force === true
+      || (Number.isFinite(limit) && queuedBytes + frameBytes <= limit)
+    frames.push({ sender, channel, payload, options, frameBytes, accepted })
+    if (accepted) queuedBytes += frameBytes
+    return accepted
+  })
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+    sender: owner,
+  })
+  const exited = new Promise((resolve) => record.pty.onExit(resolve))
+  t.after(async () => {
+    manager.release(id)
+    await exited
+    manager.setEventSink(null)
+  })
+
+  const overflow = 'overflow-primary-output'
+  record.spool.push(overflow)
+  record.cursor.append(overflow)
+  record.pending = overflow
+  record.flushPending()
+  assert.equal(frames.length, 2)
+  assert.equal(frames[0].channel, `terminal:data:${id}`)
+  assert.equal(frames[0].options.maxQueueBytes, DEFAULT_OBSERVER_QUEUE_BYTES)
+  assert.equal(frames[0].accepted, false)
+  assert.equal(frames[1].channel, 'terminal:snapshot-required')
+  assert.equal(frames[1].options.force, true)
+  assert.deepEqual(frames[1].payload, {
+    id,
+    reason: 'slow_consumer',
+    streamEpoch: record.cursor.streamEpoch,
+    endOffset: record.cursor.nextOffset,
+  })
+  assert.ok(
+    queuedBytes <= DEFAULT_OBSERVER_QUEUE_BYTES + frames[1].frameBytes,
+    `queued ${queuedBytes} bytes past the one permitted reset marker`,
+  )
+
+  const saturatedFrameCount = frames.length
+  const stressChunk = 'x'.repeat(64 * 1024)
+  for (let index = 0; index < 10_000; index += 1) {
+    record.pending = stressChunk
+    record.flushPending()
+  }
+  assert.equal(record.pending, '')
+  assert.equal(frames.length, saturatedFrameCount, 'paused output kept allocating socket frames')
+  assert.equal(manager.isLive(id), true)
+
+  assert.deepEqual(manager.write(id, 'still-running\n'), { ok: true })
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (manager.snapshot(id).output.includes('still-running')) break
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  assert.match(manager.snapshot(id).output, /still-running/)
+  record.flushPending()
+  assert.equal(frames.length, saturatedFrameCount, 'spooled PTY output escaped while reset was required')
+
+  // `terminal.attach` calls setSender and then returns a fresh snapshot. Only
+  // that explicit reset is allowed to resume incremental delivery.
+  queuedBytes = 0
+  manager.setSender(id, owner)
+  const recovery = manager.snapshot(id)
+  assert.equal(recovery.streamEpoch, frames[1].payload.streamEpoch)
+  assert.equal(recovery.endOffset >= frames[1].payload.endOffset, true)
+  assert.match(recovery.output, /still-running/)
+  record.pending = 'after-snapshot'
+  record.flushPending()
+  assert.equal(frames.length, saturatedFrameCount + 1)
+  assert.equal(frames.at(-1).channel, `terminal:data:${id}`)
+  assert.equal(frames.at(-1).payload, 'after-snapshot')
+  assert.equal(frames.at(-1).accepted, true)
 })
 
 test('coldTail reads the bounded retained tail across previous and current segments', (t) => {

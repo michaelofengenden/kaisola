@@ -10,7 +10,7 @@ const crypto = require('node:crypto')
 const { execFile, execFileSync } = require('node:child_process')
 const { agentEnv } = require('./shellEnv.cjs')
 const { TerminalSpool, DEFAULT_HOT_CAP, DEFAULT_SNAPSHOT_CAP } = require('./terminalSpool.cjs')
-const { TerminalObservers } = require('./terminalObservers.cjs')
+const { DEFAULT_OBSERVER_QUEUE_BYTES, TerminalObservers } = require('./terminalObservers.cjs')
 const { TerminalCursor, isUtf8Boundary } = require('../companion/terminalCursor.cjs')
 const { validatedTerminalGeometry } = require('./terminalCreateRoute.cjs')
 
@@ -205,6 +205,30 @@ function send(sender, channel, payload, options) {
     sender.send(channel, payload)
     return true
   }
+  return false
+}
+
+/** Keep the primary renderer socket bounded just like observer sockets. Once a
+ * delta cannot be queued, the spool remains authoritative and no more deltas
+ * are offered until terminal.attach rebinds the sender and returns a snapshot. */
+function deliverPrimaryOutput(record, id, payload) {
+  if (record.primaryOutputPaused) return false
+  const delivered = send(
+    record.sender,
+    `terminal:data:${id}`,
+    payload,
+    { maxQueueBytes: DEFAULT_OBSERVER_QUEUE_BYTES },
+  )
+  if (delivered) return true
+  record.primaryOutputPaused = true
+  // One forced, small reset marker is the only permitted overflow. Future
+  // deltas are discarded until an explicit attach obtains a fresh snapshot.
+  send(record.sender, 'terminal:snapshot-required', {
+    id,
+    reason: 'slow_consumer',
+    streamEpoch: record.cursor.streamEpoch,
+    endOffset: record.cursor.nextOffset,
+  }, { force: true, maxQueueBytes: DEFAULT_OBSERVER_QUEUE_BYTES })
   return false
 }
 
@@ -507,7 +531,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     if (!rec.pending) return
     const chunk = rec.pending
     rec.pending = ''
-    if (rec.rendererVisible) send(rec.sender, `terminal:data:${id}`, chunk)
+    if (rec.rendererVisible) deliverPrimaryOutput(rec, id, chunk)
   }
   rec.flushPending = flushPending
   p.onData((data) => {
@@ -625,6 +649,7 @@ function setSender(id, sender) {
   }
   r.pending = ''
   r.sender = sender
+  r.primaryOutputPaused = false
   r.lastSender = sender
   r.rendererVisible = true
   r.spool.setVisible(true)

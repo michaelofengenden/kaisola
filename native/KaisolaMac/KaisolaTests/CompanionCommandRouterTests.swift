@@ -131,6 +131,99 @@ final class CompanionCommandRouterTests: XCTestCase {
         XCTAssertEqual(unavailable.status, .unavailable)
     }
 
+    func testEffectiveGrantDeniesBeforeExternalRouteOrReceiptCache() async throws {
+        let router = CompanionCommandRouter()
+        let device = try pairedDevice(capabilities: [.observe, .terminalControl])
+        var externalCalls = 0
+        let result = try await router.route(
+            terminalCommandEnvelope(id: "command-downgraded", type: "terminal.write"),
+            device: device,
+            effectiveCapabilities: [.observe],
+            authorityGeneration: 2,
+            projection: nil,
+            acknowledgeAttention: { _ in false },
+            handleExternal: { _ in
+                externalCalls += 1
+                return nil
+            }
+        )
+        XCTAssertEqual(result.status, .rejected)
+        XCTAssertEqual(
+            result.message,
+            "This device's Companion access changed. Refresh and try again."
+        )
+        XCTAssertEqual(externalCalls, 0)
+    }
+
+    func testGenerationChangeCancelsLateResultAndSealsCommandIdentity() async throws {
+        let router = CompanionCommandRouter()
+        let device = try pairedDevice(capabilities: [.observe, .terminalControl])
+        let envelope = try terminalCommandEnvelope(
+            id: "command-generation-race",
+            type: "terminal.write"
+        )
+        let started = expectation(description: "external route started")
+        let gate = CommandGate()
+        var authorityIsCurrent = true
+        var externalCalls = 0
+        let firstTask = Task { @MainActor in
+            try await router.route(
+                envelope,
+                device: device,
+                effectiveCapabilities: [.observe, .terminalControl],
+                authorityGeneration: 7,
+                authorityIsCurrent: { authorityIsCurrent },
+                projection: nil,
+                acknowledgeAttention: { _ in false },
+                handleExternal: { command in
+                    externalCalls += 1
+                    started.fulfill()
+                    await gate.wait()
+                    return CompanionReceiptBody(
+                        type: "command.receipt",
+                        commandId: command.commandId,
+                        status: .applied,
+                        message: "applied",
+                        payload: nil
+                    )
+                }
+            )
+        }
+        await fulfillment(of: [started], timeout: 2)
+        authorityIsCurrent = false
+        router.invalidate(deviceID: device.deviceId)
+        await gate.release()
+        let first = try await firstTask.value
+        XCTAssertEqual(first.status, .rejected)
+
+        authorityIsCurrent = true
+        let second = try await router.route(
+            envelope,
+            device: device,
+            effectiveCapabilities: [.observe, .terminalControl],
+            authorityGeneration: 8,
+            authorityIsCurrent: { authorityIsCurrent },
+            projection: nil,
+            acknowledgeAttention: { _ in false },
+            handleExternal: { command in
+                externalCalls += 1
+                return CompanionReceiptBody(
+                    type: "command.receipt",
+                    commandId: command.commandId,
+                    status: .applied,
+                    message: "applied after regrant",
+                    payload: nil
+                )
+            }
+        )
+        XCTAssertEqual(second.status, .rejected)
+        XCTAssertEqual(
+            second.message,
+            "This device's Companion access changed. Refresh and try again."
+        )
+        XCTAssertEqual(externalCalls, 1)
+    }
+
     private func projection(revision: Int) -> CompanionProjection {
         CompanionProjection(
             projectionKind: "kaisola.companion.projection",
@@ -221,5 +314,18 @@ final class CompanionCommandRouterTests: XCTestCase {
                 payload: nil
             ))
         )
+    }
+}
+
+private actor CommandGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }

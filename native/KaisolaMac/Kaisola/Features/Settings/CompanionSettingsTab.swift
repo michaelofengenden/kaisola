@@ -5,9 +5,11 @@ import SwiftUI
 
 struct CompanionSettingsTab: View {
     @ObservedObject private var host = CompanionHost.shared
+    @State private var allowsAgentControl = false
     @State private var allowsTerminalControl = false
     @State private var operationError: String?
     @State private var pendingRevocation: CompanionPairedDeviceRecord?
+    @State private var capabilityUpdates: Set<String> = []
 
     var body: some View {
         ScrollView {
@@ -65,8 +67,19 @@ struct CompanionSettingsTab: View {
                 if case .ready = host.state {
                     SettingsCard(title: "Pair a Device", symbol: "qrcode") {
                         SettingsRow(
+                            title: "Allow agent control",
+                            detail: "Lets this phone message, stop, and approve agents",
+                            symbol: "bubble.left.and.bubble.right"
+                        ) {
+                            Toggle("", isOn: $allowsAgentControl)
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                                .accessibilityLabel("Allow agent control")
+                        }
+                        SettingsDivider()
+                        SettingsRow(
                             title: "Allow terminal control",
-                            detail: "Off gives this phone view-only access",
+                            detail: "Lets this phone type into shells running as you",
                             symbol: "keyboard"
                         ) {
                             Toggle("", isOn: $allowsTerminalControl)
@@ -157,11 +170,40 @@ struct CompanionSettingsTab: View {
                                 detail: capabilityDetail(device.capabilities),
                                 symbol: "laptopcomputer.and.iphone"
                             ) {
-                                Button("Revoke", role: .destructive) {
-                                    pendingRevocation = device
+                                HStack(spacing: 8) {
+                                    Menu("Access") {
+                                        Label("View status and output", systemImage: "checkmark")
+                                        Divider()
+                                        Button {
+                                            toggle(.agentControl, for: device)
+                                        } label: {
+                                            Label(
+                                                "Control agents",
+                                                systemImage: device.capabilities.contains(.agentControl)
+                                                    ? "checkmark" : "circle"
+                                            )
+                                        }
+                                        Button {
+                                            toggle(.terminalControl, for: device)
+                                        } label: {
+                                            Label(
+                                                "Control terminals",
+                                                systemImage: device.capabilities.contains(.terminalControl)
+                                                    ? "checkmark" : "circle"
+                                            )
+                                        }
+                                    }
+                                    .menuStyle(.borderlessButton)
+                                    .fixedSize()
+                                    .disabled(capabilityUpdates.contains(device.id))
+                                    .accessibilityLabel("Change access for \(device.displayName)")
+
+                                    Button("Revoke", role: .destructive) {
+                                        pendingRevocation = device
+                                    }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
                                 }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
                             }
                         }
                     }
@@ -234,7 +276,12 @@ struct CompanionSettingsTab: View {
     private func createOffer() {
         operationError = nil
         Task {
-            do { try await host.createPairingOffer(allowsTerminalControl: allowsTerminalControl) }
+            do {
+                try await host.createPairingOffer(
+                    allowsAgentControl: allowsAgentControl,
+                    allowsTerminalControl: allowsTerminalControl
+                )
+            }
             catch { operationError = error.localizedDescription }
         }
     }
@@ -255,8 +302,36 @@ struct CompanionSettingsTab: View {
         }
     }
 
+    private func toggle(
+        _ capability: CompanionCapability,
+        for device: CompanionPairedDeviceRecord
+    ) {
+        operationError = nil
+        capabilityUpdates.insert(device.id)
+        var capabilities = Set(device.capabilities)
+        if capabilities.contains(capability) { capabilities.remove(capability) }
+        else { capabilities.insert(capability) }
+        let ordered = CompanionCapability.allCases.filter(capabilities.contains)
+        Task {
+            defer { capabilityUpdates.remove(device.id) }
+            do {
+                try await host.updateCapabilities(
+                    deviceID: device.id,
+                    capabilities: ordered
+                )
+            } catch {
+                operationError = error.localizedDescription
+            }
+        }
+    }
+
     private func capabilityDetail(_ values: [CompanionCapability]) -> String {
-        values.contains(.terminalControl) ? "View and control terminals" : "View only"
+        switch (values.contains(.agentControl), values.contains(.terminalControl)) {
+        case (true, true): "View; control agents and terminals"
+        case (true, false): "View and control agents"
+        case (false, true): "View and control terminals"
+        case (false, false): "View only"
+        }
     }
 }
 

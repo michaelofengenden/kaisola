@@ -72,6 +72,22 @@ final class CompanionHostFoundationTests: XCTestCase {
         try await reopened.markSeen(device.id, now: 200)
         let lastSeenAt = await reopened.device(device.id)?.lastSeenAt
         XCTAssertEqual(lastSeenAt, 200)
+        let updated = try await reopened.updateCapabilities(
+            [.terminalControl, .observe, .agentControl],
+            for: device.id
+        )
+        XCTAssertEqual(updated.capabilities, [.observe, .agentControl, .terminalControl])
+        do {
+            _ = try await reopened.updateCapabilities([.terminalControl], for: device.id)
+            XCTFail("Expected a grant without observe to fail closed")
+        } catch {
+            XCTAssertEqual(error as? CompanionDeviceRosterError, .invalidStore)
+        }
+        let retainedCapabilities = await reopened.device(device.id)?.capabilities
+        XCTAssertEqual(retainedCapabilities, [.observe, .agentControl, .terminalControl])
+        let reopenedAfterUpdate = try CompanionDeviceRosterStore(fileURL: file)
+        let persistedCapabilities = await reopenedAfterUpdate.device(device.id)?.capabilities
+        XCTAssertEqual(persistedCapabilities, [.observe, .agentControl, .terminalControl])
         let revoked = try await reopened.revoke(device.id)
         XCTAssertTrue(revoked)
         let remainingDevices = await reopened.list()

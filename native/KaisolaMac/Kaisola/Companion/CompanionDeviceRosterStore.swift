@@ -118,6 +118,26 @@ actor CompanionDeviceRosterStore {
     }
 
     @discardableResult
+    func updateCapabilities(
+        _ capabilities: [CompanionCapability],
+        for id: String
+    ) throws -> CompanionPairedDeviceRecord {
+        guard var record = devicesByID[id] else {
+            throw CompanionDeviceRosterError.unknownDevice
+        }
+        let previous = record
+        record.capabilities = capabilities
+        record = try Self.normalizedRecord(record)
+        devicesByID[id] = record
+        do { try persist() }
+        catch {
+            devicesByID[id] = previous
+            throw error
+        }
+        return record
+    }
+
+    @discardableResult
     func revoke(_ id: String) throws -> Bool {
         guard let previous = devicesByID.removeValue(forKey: id) else { return false }
         do { try persist() }

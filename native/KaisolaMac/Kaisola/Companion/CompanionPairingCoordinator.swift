@@ -58,6 +58,10 @@ actor CompanionPairingCoordinator {
     static let handshakeTTL: Int64 = 30 * 1_000
     static let maximumActiveHandshakes = 8
 
+    func currentDevice(_ id: String) async -> CompanionPairedDeviceRecord? {
+        await roster.device(id)
+    }
+
     private struct Offer {
         let payload: CompanionPairingPayload
         let expiresAt: Int64

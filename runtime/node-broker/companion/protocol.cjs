@@ -39,6 +39,38 @@ const COMMAND_CAPABILITIES = Object.freeze({
   'terminal.interrupt': 'terminal-control',
   'terminal.release-control': 'terminal-control',
 })
+const SNAPSHOT_CAPABILITIES = Object.freeze({
+  'snapshot.projects': 'observe',
+  'terminal.snapshot': 'observe',
+})
+const EVENT_CAPABILITIES = Object.freeze({
+  'desktop.status': 'observe',
+  'project.updated': 'observe',
+  'session.updated': 'observe',
+  'attention.raised': 'observe',
+  'attention.cleared': 'observe',
+  'agent.turn.delta': 'observe',
+  'agent.turn.completed': 'observe',
+  'agent.permission.requested': 'observe',
+  'agent.permission.resolved': 'observe',
+  'terminal.snapshot': 'observe',
+  'terminal.output': 'observe',
+  'terminal.exit': 'observe',
+  'ledger.task.updated': 'observe',
+})
+const PROJECTION_FIELDS = Object.freeze({
+  projection: ['projectionKind', 'revision', 'generatedAt', 'freshness', 'projects', 'sessions', 'attention', 'permissions', 'board'],
+  project: ['id', 'name', 'connection', 'lastContactAt', 'counts'],
+  projectCounts: ['running', 'waiting', 'done', 'failed'],
+  session: ['id', 'projectId', 'kind', 'title', 'status', 'needsYou', 'unread', 'updatedAt', 'completedAt', 'provider', 'startedAt', 'terminalStreamEpoch', 'terminalEndOffset'],
+  attention: ['id', 'projectId', 'sessionId', 'kind', 'title', 'detail', 'createdAt', 'severity'],
+  permission: ['permId', 'projectId', 'sessionId', 'agent', 'title', 'kind', 'requestedAt', 'options', 'diffs', 'revision', 'completeness'],
+  permissionOption: ['id', 'label'],
+  permissionDiff: ['relativePath', 'oldText', 'newText'],
+  board: ['columns'],
+  boardColumn: ['id', 'title', 'sourceLabel', 'count', 'cards'],
+  boardCard: ['id', 'type', 'projectId', 'title', 'status', 'needsYou', 'updatedAt', 'provider'],
+})
 const RECEIPT_STATUSES = new Set(['accepted', 'applied', 'rejected', 'stale', 'unavailable', 'timed_out'])
 const TOP_LEVEL_FIELDS = new Set(['v', 'kind', 'desktopId', 'deviceId', 'connectionId', 'epoch', 'seq', 'id', 'sentAt', 'body'])
 const ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:@-]*$/
@@ -232,14 +264,17 @@ module.exports = {
   CAPABILITIES,
   COMMAND_CAPABILITIES,
   CompanionProtocolError,
+  EVENT_CAPABILITIES,
   EVENT_TYPES,
   IDENTIFIER_RE,
   KINDS,
   MAX_FRAME_BYTES,
   PROTOCOL_MINOR,
   PROTOCOL_VERSION,
+  PROJECTION_FIELDS,
   RECEIPT_STATUSES,
   SNAPSHOT_TYPES,
+  SNAPSHOT_CAPABILITIES,
   assertPlainObject,
   decodeEnvelope,
   encodedBytes,

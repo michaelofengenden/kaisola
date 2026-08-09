@@ -15,6 +15,7 @@ final class CompanionCommandRouter {
 
     private struct Pending {
         let fingerprint: Data
+        let denial: CompanionReceiptBody
         let task: Task<CompanionReceiptBody, Never>
     }
 
@@ -25,6 +26,9 @@ final class CompanionCommandRouter {
     func route(
         _ envelope: CompanionEnvelope,
         device: CompanionPairedDeviceRecord,
+        effectiveCapabilities: Set<CompanionCapability>? = nil,
+        authorityGeneration: UInt64 = 0,
+        authorityIsCurrent: @escaping @MainActor () -> Bool = { true },
         projection: CompanionProjection?,
         acknowledgeAttention: @escaping @MainActor (String) -> Bool,
         handleExternal: (@MainActor (CompanionCommandBody) async -> CompanionReceiptBody?)? = nil
@@ -33,7 +37,18 @@ final class CompanionCommandRouter {
             throw CompanionProtocolError.invalidBody("command router")
         }
         let command = try envelope.body.decode(CompanionCommandBody.self)
+        let granted = effectiveCapabilities ?? Set(device.capabilities)
+        guard authorityIsCurrent(), CompanionCapabilityPolicy.allowsCommand(
+            type: command.type,
+            claimedCapability: command.capability,
+            grantedCapabilities: granted
+        ) else {
+            return authorityDenied(command)
+        }
         let fingerprint = try CanonicalJSON.data(from: .object(envelope.body.fields))
+        // Capability generations fence whether work may execute, but command
+        // identity remains device-scoped. Reusing a command after a downgrade
+        // must not repeat a side effect that may already have reached an actor.
         let cacheKey = "\(device.deviceId)\u{0}\(command.commandId)"
         if let prior = cache[cacheKey] {
             guard prior.fingerprint == fingerprint else {
@@ -53,36 +68,82 @@ final class CompanionCommandRouter {
                     message: "This command identifier was reused with different content."
                 )
             }
-            return await inFlight.task.value
+            let result = await inFlight.task.value
+            guard authorityIsCurrent(), !Task.isCancelled else {
+                return authorityDenied(command)
+            }
+            return result
         }
 
         let task = Task { @MainActor [projection] in
+            guard authorityIsCurrent(), !Task.isCancelled else {
+                return self.authorityDenied(command)
+            }
+            let result: CompanionReceiptBody
             switch command.type {
             case "attention.ack":
-                return self.acknowledge(command, projection: projection, apply: acknowledgeAttention)
+                result = self.acknowledge(
+                    command,
+                    projection: projection,
+                    apply: acknowledgeAttention
+                )
             case "stream.subscribe", "stream.unsubscribe",
                  "terminal.acquire-control", "terminal.renew-control",
                  "terminal.write", "terminal.resize", "terminal.interrupt",
                  "terminal.release-control":
-                if let external = await handleExternal?(command) { return external }
-                return self.receipt(
-                    command,
-                    status: .unavailable,
-                    message: "That Companion operation is not enabled in this build."
-                )
+                if let external = await handleExternal?(command) {
+                    result = external
+                } else {
+                    result = self.receipt(
+                        command,
+                        status: .unavailable,
+                        message: "That Companion operation is not enabled in this build."
+                    )
+                }
             default:
-                return self.receipt(
+                result = self.receipt(
                     command,
                     status: .unavailable,
                     message: "\(command.type) is not available in this Companion build."
                 )
             }
+            guard authorityIsCurrent(), !Task.isCancelled else {
+                return self.authorityDenied(command)
+            }
+            return result
         }
-        pending[cacheKey] = Pending(fingerprint: fingerprint, task: task)
+        pending[cacheKey] = Pending(
+            fingerprint: fingerprint,
+            denial: authorityDenied(command),
+            task: task
+        )
         let result = await task.value
         pending.removeValue(forKey: cacheKey)
+        guard authorityIsCurrent(), !Task.isCancelled else {
+            return authorityDenied(command)
+        }
         remember(result, fingerprint: fingerprint, key: cacheKey)
         return result
+    }
+
+    func invalidate(deviceID: String) {
+        let prefix = "\(deviceID)\u{0}"
+        for key in Array(pending.keys) where key.hasPrefix(prefix) {
+            guard let retiring = pending.removeValue(forKey: key) else { continue }
+            // Seal the identifier before cancellation. The external actor may
+            // already have applied the operation even though its late receipt
+            // is suppressed, so a future grant cannot safely run it again.
+            remember(retiring.denial, fingerprint: retiring.fingerprint, key: key)
+            retiring.task.cancel()
+        }
+    }
+
+    private func authorityDenied(_ command: CompanionCommandBody) -> CompanionReceiptBody {
+        receipt(
+            command,
+            status: .rejected,
+            message: "This device's Companion access changed. Refresh and try again."
+        )
     }
 
     private func acknowledge(

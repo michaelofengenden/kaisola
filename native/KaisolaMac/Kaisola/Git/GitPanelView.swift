@@ -268,7 +268,27 @@ final class GitPanelModel: ObservableObject {
         }
     }
 
+    /// The one gate on committing, shared by the Commit button, Return in the
+    /// message field, and `commit()` itself. Keyboard submit used to call
+    /// `commit()` straight through, so Return could fire a commit the disabled
+    /// button had already refused (blank message, nothing staged).
+    var canCommit: Bool {
+        !isBusy
+            && status?.staged.isEmpty == false
+            && !commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var commitHelp: String {
+        if isBusy { return "Wait for the current Git operation to finish" }
+        if status?.staged.isEmpty != false { return "Stage at least one file before committing" }
+        if commitMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return "Enter a commit message"
+        }
+        return "Commit the staged files"
+    }
+
     func commit() {
+        guard canCommit else { return }
         let message = commitMessage
         perform { (try $0.commit(message: message), try $0.status(), try? $0.prPrep()) } apply: {
             self.status = $0.1
@@ -631,7 +651,9 @@ struct GitPanelView: View {
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { model.commit() }
                 Button("Commit") { model.commit() }
-                    .disabled(model.commitMessage.trimmingCharacters(in: .whitespaces).isEmpty || status.staged.isEmpty || model.isBusy)
+                    .disabled(!model.canCommit)
+                    .help(model.commitHelp)
+                    .accessibilityIdentifier("git.commit")
             }
             .padding(12)
         }

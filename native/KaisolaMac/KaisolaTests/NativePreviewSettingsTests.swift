@@ -4867,4 +4867,205 @@ final class NativePreviewSettingsTests: XCTestCase {
         })
         XCTAssertEqual(darkItem.state, .on)
     }
+
+    // MARK: - Settings window controls (#306)
+
+    /// A Settings window built the way the product builds it.
+    private func makeSettingsWindow(
+        styleMask: NSWindow.StyleMask = SettingsWindowChrome.styleMask,
+        size: NSSize = SettingsWindowChrome.minimumContentSize
+    ) -> NSWindow {
+        _ = NSApplication.shared
+        let window = NSWindow(
+            contentRect: NSRect(origin: .zero, size: size),
+            styleMask: styleMask,
+            backing: .buffered,
+            defer: false
+        )
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
+        return window
+    }
+
+    /// The reserved band is measured against AppKit's own title bar rather than
+    /// pinned to a literal, so a future macOS that grows that bar fails here
+    /// instead of quietly putting the mark back over the buttons.
+    func testSettingsReservesTheTitleBarBandAppKitOwns() {
+        let window = makeSettingsWindow()
+        let titleBarHeight = window.frame.height - window.contentLayoutRect.height
+        XCTAssertGreaterThan(titleBarHeight, 0)
+        XCTAssertGreaterThanOrEqual(SettingsWindowChrome.titleBarSafeArea, titleBarHeight)
+    }
+
+    /// The bug itself: the 30pt Settings mark sat 14pt below the top of a
+    /// full-size content view, which is on top of the minimize and zoom
+    /// controls. Both halves are asserted — the old geometry still collides, the
+    /// shipped one does not — so this cannot pass by measuring nothing.
+    func testSettingsMarkClearsEveryStandardWindowButton() throws {
+        let window = makeSettingsWindow()
+        let controls = NativeVisualWindowControlGate.controlRegions(in: window)
+        XCTAssertEqual(controls.count, 3)
+
+        let unreserved = SettingsWindowChrome.topLeadingContentFrames(titleBarSafeArea: 0)
+            .map { NativeVisualWindowControlGate.Region(name: $0.name, frame: $0.frame) }
+        let collision = try XCTUnwrap(NativeVisualWindowControlGate.collision(
+            controls: controls,
+            content: unreserved
+        ))
+        XCTAssertTrue(collision.hasPrefix("settings-identity-mark-over-"), collision)
+
+        let shipped = SettingsWindowChrome.topLeadingContentFrames()
+            .map { NativeVisualWindowControlGate.Region(name: $0.name, frame: $0.frame) }
+        XCTAssertNil(NativeVisualWindowControlGate.collision(
+            controls: controls,
+            content: shipped
+        ))
+
+        // Clearance, not a tie: the mark starts below the lowest button edge.
+        let lowestButtonEdge = controls.map(\.frame.maxY).max() ?? 0
+        XCTAssertGreaterThan(
+            SettingsWindowChrome.identityMarkFrame().minY,
+            lowestButtonEdge
+        )
+    }
+
+    /// The whole laid-out window rather than the one rect the layout declares:
+    /// this is the check each Settings fixture runs before writing its PNG.
+    func testSettingsWindowControlGatePassesTheShippedLayout() throws {
+        let suite = "kaisola.tests.settings-chrome.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let window = makeSettingsWindow(size: SettingsWindowChrome.idealContentSize)
+        window.contentView = NSHostingView(
+            rootView: SettingsView(settings: NativePreviewSettings(defaults: defaults))
+                .environmentObject(AuthModel.previewSignedIn())
+        )
+        window.contentView?.layoutSubtreeIfNeeded()
+        let report = NativeVisualWindowControlGate.inspect(window)
+        XCTAssertNil(report.failure)
+        XCTAssertEqual(report.controls, 3)
+    }
+
+    /// Every fixture surface that opens Settings is gated; workspace surfaces
+    /// keep their own chrome and are left alone.
+    func testWindowControlGateAppliesToSettingsSurfacesOnly() {
+        XCTAssertTrue(NativeVisualWindowControlGate.applies(to: "settings"))
+        XCTAssertTrue(NativeVisualWindowControlGate.applies(to: "settings-minimum"))
+        XCTAssertTrue(NativeVisualWindowControlGate.applies(to: "settings-ideal"))
+        XCTAssertTrue(NativeVisualWindowControlGate.applies(to: "usage"))
+        XCTAssertFalse(NativeVisualWindowControlGate.applies(to: "terminal"))
+        XCTAssertFalse(NativeVisualWindowControlGate.applies(to: "mesh"))
+    }
+
+    /// A control you can see but cannot use is the same failure as one you
+    /// cannot see. Settings shipped without `.miniaturizable` for its whole
+    /// life, so the gate is also held against a window that still does.
+    func testSettingsWindowKeepsAllThreeControlsOperable() throws {
+        let window = makeSettingsWindow()
+        XCTAssertNil(NativeVisualWindowControlGate.missingControl(in: window))
+        for kind in [NSWindow.ButtonType.closeButton, .miniaturizeButton, .zoomButton] {
+            let button = try XCTUnwrap(window.standardWindowButton(kind))
+            XCTAssertFalse(button.isHidden)
+            XCTAssertTrue(button.isEnabled)
+        }
+
+        let withoutMinimize = makeSettingsWindow(
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView]
+        )
+        XCTAssertEqual(
+            NativeVisualWindowControlGate.missingControl(in: withoutMinimize),
+            "disabled-miniaturize"
+        )
+    }
+
+    /// AppKit measures from the bottom-left corner and the layout from the
+    /// top-left one. Everything the gate compares goes through this flip.
+    func testWindowControlGateFlipsAppKitCoordinates() {
+        let window = makeSettingsWindow()
+        let height = window.contentView?.bounds.height ?? window.frame.height
+        XCTAssertEqual(
+            NativeVisualWindowControlGate.topLeftFrame(
+                CGRect(x: 7, y: height - 22, width: 14, height: 16),
+                in: window
+            ),
+            CGRect(x: 7, y: 6, width: 14, height: 16)
+        )
+    }
+
+    func testWindowControlGateOnlyReportsRegionsThatMeetAButton() {
+        let control = NativeVisualWindowControlGate.Region(
+            name: "zoom",
+            frame: CGRect(x: 47, y: 6, width: 14, height: 16)
+        )
+        let below = NativeVisualWindowControlGate.Region(
+            name: "sidebar-row",
+            frame: CGRect(x: 8, y: 42, width: 160, height: 34)
+        )
+        let over = NativeVisualWindowControlGate.Region(
+            name: "mark",
+            frame: CGRect(x: 22, y: 14, width: 30, height: 30)
+        )
+        XCTAssertNil(NativeVisualWindowControlGate.collision(
+            controls: [control],
+            content: [below]
+        ))
+        XCTAssertEqual(
+            NativeVisualWindowControlGate.collision(controls: [control], content: [below, over]),
+            "mark-over-zoom"
+        )
+    }
+
+    /// The two ends of the size contract the fixtures inspect. The old 810×540
+    /// fixture sat below the window's own minimum, so CI was reading a Settings
+    /// window the product cannot be resized to.
+    func testSettingsFixturesCaptureBothEndsOfTheSizeContract() {
+        XCTAssertEqual(
+            SettingsWindowChrome.visualContentSize(surface: "settings-minimum"),
+            SettingsWindowChrome.minimumContentSize
+        )
+        XCTAssertEqual(
+            SettingsWindowChrome.visualContentSize(surface: "settings-ideal"),
+            SettingsWindowChrome.idealContentSize
+        )
+        XCTAssertEqual(
+            SettingsWindowChrome.visualContentSize(surface: "settings"),
+            SettingsWindowChrome.minimumContentSize
+        )
+        XCTAssertGreaterThan(
+            SettingsWindowChrome.idealContentSize.height,
+            SettingsWindowChrome.minimumContentSize.height
+        )
+        XCTAssertTrue(SettingsWindowChrome.visualSurfaces.contains("settings-minimum"))
+        XCTAssertTrue(SettingsWindowChrome.visualSurfaces.contains("settings-ideal"))
+    }
+
+    /// The non-Retina fixture resamples the finished capture to one pixel per
+    /// point, and does nothing at all when it is not asked to.
+    func testNonRetinaCaptureRedrawsAtOnePixelPerPoint() throws {
+        let points = SettingsWindowChrome.minimumContentSize
+        let context = try XCTUnwrap(CGContext(
+            data: nil,
+            width: Int(points.width) * 2,
+            height: Int(points.height) * 2,
+            bitsPerComponent: 8,
+            bytesPerRow: 0,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.setFillColor(CGColor(red: 0.2, green: 0.4, blue: 0.9, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: points.width * 2, height: points.height * 2))
+        let retina = try XCTUnwrap(context.makeImage())
+
+        let onePoint = try XCTUnwrap(NativeVisualCapture.rescaled(
+            retina,
+            pointSize: points,
+            pointPixelScale: 1
+        ))
+        XCTAssertEqual(onePoint.width, Int(points.width))
+        XCTAssertEqual(onePoint.height, Int(points.height))
+
+        // An unset scale, and an image that is already 1×, are both no-ops.
+        XCTAssertNil(NativeVisualCapture.rescaled(retina, pointSize: points, pointPixelScale: 0))
+        XCTAssertNil(NativeVisualCapture.rescaled(onePoint, pointSize: points, pointPixelScale: 1))
+    }
 }

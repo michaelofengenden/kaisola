@@ -98,7 +98,14 @@ jobs:
             elif [[ "$surface" == onboarding ]]; then
               test "$width" -ge 700
               test "$height" -ge 500
-            elif [[ "$surface" == settings || "$surface" == settings-terminal || "$surface" == settings-terminal-history || "$surface" == settings-terminal-interaction || "$surface" == settings-companion || "$surface" == settings-mcp || "$surface" == settings-models || "$surface" == settings-shortcuts || "$surface" == settings-account-recovery || "$surface" == usage ]]; then
+            elif [[ "$surface" == settings-ideal ]]; then
+              # The ideal Settings window is 1100x800 of content. A headless
+              # WindowServer scales large windows down the same way it does the
+              # workspace ones, so this holds it clearly above the minimum
+              # fixture rather than pinning a scaled pixel size.
+              test "$width" -ge 800
+              test "$height" -ge 600
+            elif [[ "$surface" == settings || "$surface" == settings-minimum || "$surface" == settings-terminal || "$surface" == settings-terminal-history || "$surface" == settings-terminal-interaction || "$surface" == settings-companion || "$surface" == settings-mcp || "$surface" == settings-models || "$surface" == settings-shortcuts || "$surface" == settings-account-recovery || "$surface" == usage ]]; then
               test "$width" -ge 800
               test "$height" -ge 540
             else
@@ -134,17 +141,28 @@ jobs:
             fi
           }
 
-          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-transcript account-picker attention-completed companion-control mixed permission palette preview preview-narrow preview-code-editor preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file workspace-move topbar topbar-attention mesh onboarding settings settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-models settings-shortcuts settings-account-recovery usage; do
+          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-transcript account-picker attention-completed companion-control mixed permission palette preview preview-narrow preview-code-editor preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file workspace-move topbar topbar-attention mesh onboarding settings settings-minimum settings-ideal settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-models settings-shortcuts settings-account-recovery usage; do
             capture="$output/$surface.png"
             run_fixture "$surface" "$capture" \
               "$binary" -ApplePersistenceIgnoreState YES
             verify_capture "$capture" "$surface"
           done
 
-          for surface in terminal terminal-semantic mixed permission palette preview-code-editor workspace-move topbar-attention mesh onboarding settings-terminal settings-shortcuts; do
+          for surface in terminal terminal-semantic mixed permission palette preview-code-editor workspace-move topbar-attention mesh onboarding settings-minimum settings-ideal settings-terminal settings-shortcuts; do
             capture="$output/dark-$surface.png"
             run_fixture "$surface" "$capture" \
               /usr/bin/env KAISOLA_NATIVE_VISUAL_APPEARANCE=dark "$binary"
+            verify_capture "$capture" "$surface"
+          done
+
+          # The traffic-light clearance, the sidebar hairline and a 30pt mark
+          # are all decided at one pixel per point. This runner already renders
+          # near 1x, but the fixture states the scale instead of inheriting it,
+          # so the same inspection holds on a Retina host.
+          for surface in settings-minimum settings-ideal; do
+            capture="$output/nonretina-$surface.png"
+            run_fixture "$surface" "$capture" \
+              /usr/bin/env KAISOLA_NATIVE_VISUAL_SCALE=1 "$binary"
             verify_capture "$capture" "$surface"
           done
 

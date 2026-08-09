@@ -8,6 +8,109 @@ extension Notification.Name {
     static let kaisolaCheckForUpdates = Notification.Name("kaisolaCheckForUpdates")
 }
 
+/// What the Settings window owes AppKit: the style mask, the sizes it opens at,
+/// and the band of the content view the three standard window buttons live in.
+///
+/// Settings draws a full-size content view under a hidden, transparent title
+/// bar, so nothing but this type keeps custom content off the traffic lights.
+/// Nothing did: the 30pt Settings mark was drawn straight over the minimize and
+/// zoom controls, on every tab and in both appearances, and the window was not
+/// even `.miniaturizable`, so the control it buried would have done nothing if
+/// you had found it (#306).
+///
+/// The numbers the navigation column lays out with live here rather than inline
+/// in the view, so `NativeVisualWindowControlGate` and its tests measure the
+/// shipped layout instead of a copy of it.
+enum SettingsWindowChrome {
+    /// `.miniaturizable` is not decoration. AppKit draws the yellow control for
+    /// any titled window and simply refuses to run it when the mask omits it.
+    static let styleMask: NSWindow.StyleMask = [
+        .titled, .closable, .miniaturizable, .resizable, .fullSizeContentView,
+    ]
+
+    /// SettingsView's own frame contract, stated once so the ⌘, window, the
+    /// visual fixtures, and the tests cannot drift from it.
+    static let minimumContentSize = NSSize(width: 820, height: 560)
+    static let idealContentSize = NSSize(width: 1_100, height: 800)
+
+    /// The top band of the content view that belongs to AppKit.
+    ///
+    /// A standard title bar centres the three buttons in it, so reserving the
+    /// whole band clears every button *and* leaves the drag and
+    /// double-click-to-zoom region AppKit runs there empty. The bar is 28pt on
+    /// macOS 14–15 and 32 on macOS 26, which is why
+    /// `testSettingsReservesTheTitleBarBandAppKitOwns` measures a real window's
+    /// `contentLayoutRect` instead of trusting this literal: 28 passed every
+    /// review and failed that test on the first run.
+    ///
+    /// A sheet presentation reserves nothing. It has no window buttons and
+    /// carries its own Done action.
+    static let titleBarSafeArea: CGFloat = 32
+
+    static let navigationColumnWidth: CGFloat = 176
+    static let navigationOuterPadding: CGFloat = 8
+    static let navigationContentPadding: CGFloat = 14
+    static let navigationVerticalPadding: CGFloat = 14
+    static let identityMarkSize: CGFloat = 30
+
+    /// The Settings mark's frame in window points measured from the *top-left*
+    /// corner of the content view — the corner the traffic lights sit in.
+    ///
+    /// Parameterised on the reserved band so a test can ask what the pre-fix
+    /// layout did (pass 0) and what the shipped one does.
+    static func identityMarkFrame(titleBarSafeArea: CGFloat = titleBarSafeArea) -> CGRect {
+        CGRect(
+            x: navigationOuterPadding + navigationContentPadding,
+            y: titleBarSafeArea + navigationVerticalPadding,
+            width: identityMarkSize,
+            height: identityMarkSize
+        )
+    }
+
+    /// The visual-fixture surfaces that open Settings instead of the workspace
+    /// shell. Stated once because the app delegate asks twice: to build the
+    /// content and to size the window.
+    ///
+    /// `settings-minimum` and `settings-ideal` are the two ends of the size
+    /// contract above. Both open the General tab, which is where the mark that
+    /// used to cover the traffic lights lives.
+    static let visualSurfaces: Set<String> = [
+        "settings",
+        "settings-minimum",
+        "settings-ideal",
+        "settings-terminal",
+        "settings-terminal-history",
+        "settings-terminal-interaction",
+        "settings-companion",
+        "settings-mcp",
+        "settings-accounts",
+        "settings-models",
+        "settings-shortcuts",
+        "settings-account-recovery",
+        "usage",
+    ]
+
+    /// What a fixture surface opens at. Every surface except `settings-ideal`
+    /// captures the *minimum* window, which is the size the chrome is tightest
+    /// at — and which the old 810×540 fixture sat below, so CI was inspecting a
+    /// window the product cannot actually be resized to.
+    static func visualContentSize(surface: String) -> NSSize {
+        surface == "settings-ideal" ? idealContentSize : minimumContentSize
+    }
+
+    /// Custom content the layout can name outright in the traffic-light corner.
+    /// The gate walks the accessibility tree for everything it cannot know
+    /// about; these are the rects the view declares.
+    static func topLeadingContentFrames(
+        titleBarSafeArea: CGFloat = titleBarSafeArea
+    ) -> [(name: String, frame: CGRect)] {
+        [(
+            name: "settings-identity-mark",
+            frame: identityMarkFrame(titleBarSafeArea: titleBarSafeArea)
+        )]
+    }
+}
+
 /// The native Settings window (⌘,): workspace, terminal, Companion, and tools.
 struct SettingsView: View {
     @EnvironmentObject private var auth: AuthModel
@@ -92,6 +195,13 @@ struct SettingsView: View {
     /// switch rebuilds workspace-scoped Settings content.
     var sectionChanged: ((String) -> Void)? = nil
 
+    /// The window presentation hands its title-bar band back to AppKit. The
+    /// in-workspace sheet has no window buttons to clear and would only be
+    /// paying for an empty strip.
+    private var titleBarSafeArea: CGFloat {
+        dismiss == nil ? SettingsWindowChrome.titleBarSafeArea : 0
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             settingsNavigation
@@ -119,6 +229,10 @@ struct SettingsView: View {
                 settingsContent
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
+            // The detail column starts below the title bar for the same reason
+            // the navigation column does: everything above this line is the
+            // band AppKit drags and double-click-zooms the window by.
+            .padding(.top, titleBarSafeArea)
         }
         // Settings opens large.
         //
@@ -128,11 +242,11 @@ struct SettingsView: View {
         // display without pinning a larger one, and the account grid spends the
         // extra width on columns rather than margins.
         .frame(
-            minWidth: 820,
-            idealWidth: 1_100,
+            minWidth: SettingsWindowChrome.minimumContentSize.width,
+            idealWidth: SettingsWindowChrome.idealContentSize.width,
             maxWidth: .infinity,
-            minHeight: 560,
-            idealHeight: 800,
+            minHeight: SettingsWindowChrome.minimumContentSize.height,
+            idealHeight: SettingsWindowChrome.idealContentSize.height,
             maxHeight: .infinity
         )
         .background(Color(nsColor: .windowBackgroundColor).opacity(0.82))
@@ -181,35 +295,58 @@ struct SettingsView: View {
                         .foregroundStyle(.white)
                         .accessibilityHidden(true)
                 }
-                .frame(width: 30, height: 30)
+                .frame(
+                    width: SettingsWindowChrome.identityMarkSize,
+                    height: SettingsWindowChrome.identityMarkSize
+                )
                 Text("Settings").font(.headline)
             }
-            .padding(.horizontal, 14)
+            .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
             .padding(.bottom, 16)
+            // A mark and the window's own name: nothing here answers a click.
+            // Saying so keeps this row from claiming one near the controls even
+            // if it ever drifts back up the column.
+            .allowsHitTesting(false)
 
             // Grouped clusters (spec §3a): quiet headers, eleven sections in
             // four families instead of one flat run.
-            ForEach(SettingsGroup.allCases) { group in
-                Text(group.title.uppercased())
-                    .font(.system(size: 10.5, weight: .semibold))
-                    .foregroundStyle(.tertiary)
-                    .padding(.horizontal, 14)
-                    .padding(.top, group == SettingsGroup.allCases.first ? 0 : 10)
-                    .accessibilityAddTraits(.isHeader)
-                ForEach(group.sections) { section in
-                    sectionButton(section)
+            //
+            // Eleven 34pt rows and their headers want about 600pt; the window's
+            // own minimum is 560, and the reserved title-bar band takes 32 of
+            // those. The run scrolls rather than being clipped, so every section
+            // stays reachable at the minimum size — the column overflowed even
+            // before the band was reserved. It carries no indicator at rest and
+            // does not bounce when the list already fits.
+            ScrollView(.vertical, showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(SettingsGroup.allCases) { group in
+                        Text(group.title.uppercased())
+                            .font(.system(size: 10.5, weight: .semibold))
+                            .foregroundStyle(.tertiary)
+                            .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
+                            .padding(.top, group == SettingsGroup.allCases.first ? 0 : 10)
+                            .accessibilityAddTraits(.isHeader)
+                        ForEach(group.sections) { section in
+                            sectionButton(section)
+                        }
+                    }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .scrollBounceBehavior(.basedOnSize)
 
-            Spacer()
             Text("Changes apply instantly")
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
-                .padding(.horizontal, 14)
+                .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
         }
-        .padding(.vertical, 14)
-        .padding(.horizontal, 8)
-        .frame(width: 176)
+        // The sidebar material still runs to the window's top edge; only its
+        // content starts below the traffic lights. The mark used to sit 14pt
+        // down, which put it on top of the minimize and zoom buttons.
+        .padding(.top, titleBarSafeArea + SettingsWindowChrome.navigationVerticalPadding)
+        .padding(.bottom, SettingsWindowChrome.navigationVerticalPadding)
+        .padding(.horizontal, SettingsWindowChrome.navigationOuterPadding)
+        .frame(width: SettingsWindowChrome.navigationColumnWidth)
         .background {
             ZStack {
                 NativeVisualEffectView(material: .sidebar)

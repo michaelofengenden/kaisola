@@ -29,6 +29,10 @@ struct CustomAgentsSection: View {
     @State private var pendingEnableIndex: Int?
     /// The agent whose pinned install is currently running.
     @State private var installingAgentID: String?
+    /// A load or save failure stays visible in the section instead of making
+    /// the registry look empty or a mutation look committed.
+    @State private var registryError: String?
+    @State private var loadBlocked = false
     private let installs = AdapterInstallManager()
 
     var body: some View {
@@ -36,6 +40,12 @@ struct CustomAgentsSection: View {
             if specs.isEmpty {
                 Text("Add any terminal CLI — it appears in the New menu and launches into an owned terminal.")
                     .font(.caption).foregroundStyle(.secondary)
+            }
+            if let registryError {
+                Text(registryError)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             ForEach(Array(specs.enumerated()), id: \.offset) { index, spec in
                 VStack(alignment: .leading, spacing: 5) {
@@ -81,11 +91,12 @@ struct CustomAgentsSection: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
-        .onAppear { specs = store.all() }
+        .onAppear(perform: load)
     }
 
     private var canAdd: Bool {
-        specs.count < cap
+        !loadBlocked
+            && specs.count < cap
             && !newName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !newCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
@@ -96,46 +107,80 @@ struct CustomAgentsSection: View {
             get: { specs.indices.contains(index) ? specs[index].symbol : "terminal" },
             set: { newValue in
                 guard specs.indices.contains(index) else { return }
+                let previous = specs
                 specs[index].symbol = newValue
-                persist()
+                persist(affectedAgentID: specs[index].id, restoring: previous)
             }
         )
+    }
+
+    private func load() {
+        switch store.load() {
+        case let .success(loaded):
+            specs = loaded
+            registryError = nil
+            loadBlocked = false
+        case let .failure(error):
+            specs = []
+            registryError = error.localizedDescription
+            loadBlocked = true
+        }
     }
 
     private func add() {
         let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         let command = newCommand.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !name.isEmpty, !command.isEmpty, specs.count < cap else { return }
-        specs.append(CustomAgentSpec(
+        guard !loadBlocked, !name.isEmpty, !command.isEmpty, specs.count < cap else { return }
+        let previous = specs
+        let added = CustomAgentSpec(
             id: CustomAgentStore.slugify(name, existing: Set(specs.map(\.id))),
             name: name,
             launchCommand: command,
             symbol: symbolChoices.first ?? "terminal",
             acpPrivileges: []
-        ))
-        store.save(specs)
-        specs = store.all()   // reflect the store's cap
-        newName = ""
-        newCommand = ""
-        NotificationCenter.default.post(name: .kaisolaAgentsChanged, object: nil)
+        )
+        specs.append(added)
+        if persist(affectedAgentID: added.id, restoring: previous) {
+            newName = ""
+            newCommand = ""
+        }
     }
 
     private func delete(_ index: Int) {
         guard specs.indices.contains(index) else { return }
-        installs.uninstall(agentID: specs[index].id)
+        let previous = specs
+        let removedID = specs[index].id
         specs.remove(at: index)
-        if pendingEnableIndex == index {
-            pendingEnableIndex = nil
-        } else if let pendingEnableIndex, pendingEnableIndex > index {
-            self.pendingEnableIndex = pendingEnableIndex - 1
+        if persist(affectedAgentID: removedID, restoring: previous) {
+            installs.uninstall(agentID: removedID)
+            if pendingEnableIndex == index {
+                pendingEnableIndex = nil
+            } else if let pendingEnableIndex, pendingEnableIndex > index {
+                self.pendingEnableIndex = pendingEnableIndex - 1
+            }
         }
-        persist()
     }
 
-    /// Save the current list and announce the change so menus rebuild.
-    private func persist() {
-        store.save(specs)
-        NotificationCenter.default.post(name: .kaisolaAgentsChanged, object: nil)
+    /// Save the current list and announce only a committed change. On failure,
+    /// restore the exact UI state that still exists on disk and name the
+    /// affected entry in both the section and a toast.
+    @discardableResult
+    private func persist(
+        affectedAgentID: String?,
+        restoring previous: [CustomAgentSpec]
+    ) -> Bool {
+        switch store.save(specs, affectedAgentID: affectedAgentID) {
+        case let .success(saved):
+            specs = saved
+            registryError = nil
+            NotificationCenter.default.post(name: .kaisolaAgentsChanged, object: nil)
+            return true
+        case let .failure(error):
+            specs = previous
+            registryError = error.localizedDescription
+            ToastCenter.shared.show(error.localizedDescription, style: .error, duration: 6)
+            return false
+        }
     }
 
     // MARK: - Chat surface (ACP adapter)
@@ -245,9 +290,10 @@ struct CustomAgentsSection: View {
             get: { specs.indices.contains(index) ? (specs[index].acpPackage ?? "") : "" },
             set: { newValue in
                 guard specs.indices.contains(index) else { return }
+                let previous = specs
                 let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
                 specs[index].acpPackage = trimmed.isEmpty ? nil : trimmed
-                persist()
+                persist(affectedAgentID: specs[index].id, restoring: previous)
             }
         )
     }
@@ -261,8 +307,9 @@ struct CustomAgentsSection: View {
             },
             set: { newValue in
                 guard specs.indices.contains(index) else { return }
+                let previous = specs
                 specs[index].credentials = newValue
-                persist()
+                persist(affectedAgentID: specs[index].id, restoring: previous)
             }
         )
     }
@@ -278,6 +325,7 @@ struct CustomAgentsSection: View {
             },
             set: { enabled in
                 guard specs.indices.contains(index) else { return }
+                let previous = specs
                 var privileges = Set(specs[index].acpPrivileges ?? [])
                 if enabled {
                     privileges.insert(privilege.rawValue)
@@ -287,23 +335,28 @@ struct CustomAgentsSection: View {
                 specs[index].acpPrivileges = CustomAdapterPrivilege.allCases
                     .filter { privileges.contains($0.rawValue) }
                     .map(\.rawValue)
-                persist()
+                persist(affectedAgentID: specs[index].id, restoring: previous)
             }
         )
     }
 
     private func beginEnable(_ index: Int) {
         guard specs.indices.contains(index) else { return }
+        let previous = specs
+        let agentID = specs[index].id
         // A legacy pre-containment enablement is not an approval. Drop its old
         // install before opening the new review so no stale record can satisfy
         // the resolver while the user is choosing a grant.
-        if specs[index].chatEnabled == true, specs[index].containmentApproval == nil {
-            installs.uninstall(agentID: specs[index].id)
+        let removesLegacyInstall = specs[index].chatEnabled == true
+            && specs[index].containmentApproval == nil
+        if removesLegacyInstall {
             specs[index].chatEnabled = false
         }
         if specs[index].acpPrivileges == nil { specs[index].acpPrivileges = [] }
-        persist()
-        pendingEnableIndex = index
+        if persist(affectedAgentID: agentID, restoring: previous) {
+            if removesLegacyInstall { installs.uninstall(agentID: agentID) }
+            pendingEnableIndex = index
+        }
     }
 
     private func enableChat(_ index: Int) {
@@ -328,8 +381,12 @@ struct CustomAgentsSection: View {
                     approval: approval
                 )
                 if let liveIndex = specs.firstIndex(where: { $0.id == agentID }) {
+                    let previous = specs
                     specs[liveIndex].chatEnabled = true
-                    persist()
+                    guard persist(affectedAgentID: agentID, restoring: previous) else {
+                        installs.uninstall(agentID: agentID)
+                        return
+                    }
                 }
                 ToastCenter.shared.show(
                     "\(package) v\(record.resolvedVersion) installed, pinned, and contained. Chat is enabled.",
@@ -344,8 +401,10 @@ struct CustomAgentsSection: View {
     private func disableChat(_ index: Int) {
         guard specs.indices.contains(index) else { return }
         let agentID = specs[index].id
-        installs.uninstall(agentID: agentID)
+        let previous = specs
         specs[index].chatEnabled = false
-        persist()
+        if persist(affectedAgentID: agentID, restoring: previous) {
+            installs.uninstall(agentID: agentID)
+        }
     }
 }

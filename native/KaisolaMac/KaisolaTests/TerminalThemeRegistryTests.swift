@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import Kaisola
 
@@ -58,7 +59,7 @@ final class TerminalThemeRegistryTests: XCTestCase {
 
     func testAValidCustomThemeInstallsAndResolvesByID() throws {
         let store = try temporaryStore()
-        XCTAssertNil(store.upsert(validSpec()))
+        XCTAssertNil(try store.upsert(validSpec()))
         let resolved = TerminalThemeRegistry.definition(id: "midnight", store: store)
         XCTAssertEqual(resolved.id, "midnight")
         XCTAssertEqual(resolved.title, "Midnight")
@@ -100,7 +101,7 @@ final class TerminalThemeRegistryTests: XCTestCase {
         let store = try temporaryStore()
         var broken = validSpec(id: "broken")
         broken.dark.ansi.removeLast()
-        let reason = store.upsert(broken)
+        let reason = try store.upsert(broken)
         XCTAssertNotNil(reason)
         XCTAssertEqual(store.specs().count, 1)
         XCTAssertNil(store.specs().first?.asDefinition())
@@ -110,22 +111,182 @@ final class TerminalThemeRegistryTests: XCTestCase {
 
     func testRemovalIsReversibleAndExact() throws {
         let store = try temporaryStore()
-        store.upsert(validSpec(id: "one", title: "One"))
-        store.upsert(validSpec(id: "two", title: "Two"))
-        XCTAssertTrue(store.remove(id: "one"))
+        try store.upsert(validSpec(id: "one", title: "One"))
+        try store.upsert(validSpec(id: "two", title: "Two"))
+        XCTAssertTrue(try store.remove(id: "one"))
         XCTAssertEqual(store.specs().map(\.id), ["two"])
-        XCTAssertFalse(store.remove(id: "one"), "removing twice reports nothing happened")
-        store.upsert(validSpec(id: "one", title: "One"))
+        XCTAssertFalse(try store.remove(id: "one"), "removing twice reports nothing happened")
+        try store.upsert(validSpec(id: "one", title: "One"))
         XCTAssertEqual(Set(store.specs().map(\.id)), ["one", "two"])
     }
 
-    func testTheStoreIsCappedAndSurvivesCorruption() throws {
+    func testTheStoreRejectsAnOversizedBulkSaveWithoutReplacingTheRegistry() throws {
         let store = try temporaryStore()
-        store.save((0..<20).map { validSpec(id: "theme-\($0)", title: "Theme \($0)") })
-        XCTAssertEqual(store.specs().count, 12, "the cap holds even against a bulk save")
+        let baseline = validSpec(id: "baseline", title: "Baseline")
+        try store.save([baseline])
+        let before = try Data(contentsOf: store.fileURL)
 
-        try Data("not json".utf8).write(to: store.fileURL)
-        XCTAssertEqual(store.specs(), [], "a corrupt file reads as empty, never a crash")
+        XCTAssertThrowsError(
+            try store.save((0..<20).map { validSpec(id: "theme-\($0)", title: "Theme \($0)") })
+        )
+        XCTAssertEqual(store.specs(), [baseline])
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), before)
+    }
+
+    func testMissingVersionedAndLegacyStatesAreDistinctAndMigrateOnSave() throws {
+        let store = try temporaryStore()
+        XCTAssertEqual(store.load(), .init(specs: [], state: .missing))
+
+        let legacySpec = validSpec(id: "legacy", title: "Legacy")
+        let legacy = try JSONEncoder().encode(["themes": [legacySpec]])
+        try legacy.write(to: store.fileURL)
+        XCTAssertEqual(
+            store.load(),
+            .init(specs: [legacySpec], state: .ready(schemaVersion: 0))
+        )
+
+        try store.upsert(validSpec(id: "new", title: "New"))
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: store.fileURL)) as? [String: Any]
+        )
+        XCTAssertEqual(object["version"] as? Int, CustomThemeStore.schemaVersion)
+        XCTAssertEqual((object["themes"] as? [[String: Any]])?.count, 2)
+        XCTAssertEqual(store.load().state, .ready(schemaVersion: CustomThemeStore.schemaVersion))
+    }
+
+    func testMalformedRegistryIsPreservedAndLastKnownGoodThemeStaysLiveUntilReset() throws {
+        let store = try temporaryStore()
+        let baseline = validSpec(id: "baseline", title: "Baseline")
+        try store.upsert(baseline)
+        XCTAssertEqual(store.load().specs, [baseline], "prime the process-scoped last-known-good set")
+
+        let malformed = Data(#"{"version":1,"themes":[{"id":7}]}"#.utf8)
+        try malformed.write(to: store.fileURL)
+
+        let first = store.load()
+        guard case let .corrupt(.preserved(copyURL)) = first.state else {
+            return XCTFail("Expected corrupt preserved state, got \(first.state)")
+        }
+        XCTAssertEqual(first.specs, [baseline], "the running terminal must retain its last-known-good theme")
+        XCTAssertEqual(TerminalThemeRegistry.definition(id: baseline.id, store: store).id, baseline.id)
+        XCTAssertEqual(try Data(contentsOf: copyURL), malformed)
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), malformed)
+        let recoveryMode = try XCTUnwrap(
+            try FileManager.default.attributesOfItem(atPath: copyURL.path)[.posixPermissions] as? NSNumber
+        )
+        XCTAssertEqual(recoveryMode.intValue & 0o777, 0o600)
+        XCTAssertEqual(store.load(), first, "content-addressed preservation must be idempotent")
+
+        XCTAssertThrowsError(try store.upsert(validSpec(id: "replacement", title: "Replacement")))
+        XCTAssertThrowsError(try store.remove(id: baseline.id))
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), malformed)
+
+        let reset = try store.resetUnreadableRegistry()
+        XCTAssertEqual(reset, .init(specs: [], state: .ready(schemaVersion: CustomThemeStore.schemaVersion)))
+        XCTAssertEqual(try Data(contentsOf: copyURL), malformed, "explicit reset must retain the recovery copy")
+        XCTAssertNil(try store.upsert(validSpec(id: "replacement", title: "Replacement")))
+    }
+
+    func testDamagedRecoveryCopyFailsClosedAndCannotAuthorizeReset() throws {
+        let store = try temporaryStore()
+        let baseline = validSpec(id: "baseline", title: "Baseline")
+        try store.upsert(baseline)
+        _ = store.load()
+        let malformed = Data("not-json".utf8)
+        try malformed.write(to: store.fileURL)
+        let first = store.load()
+        let copyURL = try XCTUnwrap(first.state.preservedCopyURL)
+        try Data("different".utf8).write(to: copyURL)
+
+        let second = store.load()
+        guard case .corrupt(.failed) = second.state else {
+            return XCTFail("A mismatched recovery copy must fail closed, got \(second.state)")
+        }
+        XCTAssertEqual(second.specs, [baseline])
+        XCTAssertFalse(second.state.canReset)
+        XCTAssertThrowsError(try store.resetUnreadableRegistry())
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), malformed)
+    }
+
+    func testOneUndecodableRecordQuarantinesTheWholeRegistryWithoutDroppingRuntimeThemes() throws {
+        let store = try temporaryStore()
+        let baseline = validSpec(id: "baseline", title: "Baseline")
+        try store.upsert(baseline)
+        _ = store.load()
+
+        let encoded = try JSONEncoder().encode(validSpec(id: "decodable", title: "Decodable"))
+        let validObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let partial: [String: Any] = [
+            "version": CustomThemeStore.schemaVersion,
+            "themes": [validObject, ["id": "structurally-broken"]],
+        ]
+        let bytes = try JSONSerialization.data(withJSONObject: partial, options: [.sortedKeys])
+        try bytes.write(to: store.fileURL)
+
+        let snapshot = store.load()
+        guard case let .corrupt(.preserved(copyURL)) = snapshot.state else {
+            return XCTFail("One undecodable record must quarantine the complete registry")
+        }
+        XCTAssertEqual(snapshot.specs, [baseline])
+        XCTAssertEqual(try Data(contentsOf: copyURL), bytes)
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), bytes)
+    }
+
+    func testFutureSchemaIsPreservedAndCannotDowngradeTheRuntimeThemeSet() throws {
+        let store = try temporaryStore()
+        let baseline = validSpec(id: "baseline", title: "Baseline")
+        try store.upsert(baseline)
+        _ = store.load()
+
+        let future = Data(#"{"version":42,"themes":[],"futurePolicy":{"mode":"sealed"}}"#.utf8)
+        try future.write(to: store.fileURL)
+        let snapshot = store.load()
+        guard case let .newerVersion(version, .preserved(copyURL)) = snapshot.state else {
+            return XCTFail("Expected newer-version preserved state, got \(snapshot.state)")
+        }
+        XCTAssertEqual(version, 42)
+        XCTAssertEqual(snapshot.specs, [baseline])
+        XCTAssertEqual(try Data(contentsOf: copyURL), future)
+        XCTAssertThrowsError(try store.save([]))
+        XCTAssertThrowsError(try store.remove(id: baseline.id))
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), future)
+    }
+
+    func testIOReadFailureKeepsRuntimeThemeButCannotOfferDestructiveRecovery() throws {
+        let store = try temporaryStore()
+        let baseline = validSpec(id: "baseline", title: "Baseline")
+        try store.upsert(baseline)
+        _ = store.load()
+        try FileManager.default.removeItem(at: store.fileURL)
+        try FileManager.default.createDirectory(at: store.fileURL, withIntermediateDirectories: false)
+
+        let snapshot = store.load()
+        guard case .ioFailure = snapshot.state else {
+            return XCTFail("A directory at the registry path must be an I/O failure")
+        }
+        XCTAssertEqual(snapshot.specs, [baseline])
+        XCTAssertFalse(snapshot.state.canReset)
+        XCTAssertThrowsError(try store.resetUnreadableRegistry())
+        XCTAssertThrowsError(try store.upsert(validSpec(id: "blocked", title: "Blocked")))
+    }
+
+    func testWriteFailureIsVisibleAndLeavesRegistryAndLastKnownGoodUntouched() throws {
+        let store = try temporaryStore()
+        let baseline = validSpec(id: "baseline", title: "Baseline")
+        try store.upsert(baseline)
+        let before = try Data(contentsOf: store.fileURL)
+        let directory = store.fileURL.deletingLastPathComponent()
+
+        XCTAssertEqual(chmod(directory.path, 0o500), 0)
+        defer { _ = chmod(directory.path, 0o700) }
+        XCTAssertThrowsError(try store.upsert(validSpec(id: "lost", title: "Lost"))) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Kaisola could not save terminal themes. The existing registry was left unchanged."
+            )
+        }
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), before)
+        XCTAssertEqual(store.specs(), [baseline])
     }
 
     /// The hex parser is strict: a leading # is required, lengths are exact,

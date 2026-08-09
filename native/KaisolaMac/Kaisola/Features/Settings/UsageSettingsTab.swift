@@ -124,28 +124,32 @@ struct UsageSettingsTab: View {
                             // label, a plan pill, three meters — sits happily at
                             // 250, and the directory line truncates as it always
                             // did.
-                            LazyVGrid(
-                                columns: [GridItem(.adaptive(minimum: 250), spacing: 10, alignment: .top)],
-                                alignment: .leading,
-                                spacing: 10
-                            ) {
-                                ForEach(accountProfiles) { profile in
-                                    SubscriptionCardView(
-                                        profile: profile,
-                                        usage: reading(for: profile),
-                                        isRefreshing: usage.isRefreshingPlanUsage,
-                                        now: Date(),
-                                        isCurrentProject: currentProjectIDs.contains(profile.id),
-                                    onSignIn: { signingIn = profile },
-                                        onReveal: { reveal(profile) },
-                                        onRemove: { pendingAccountRemoval = profile }
-                                    )
-                                }
-                                // A reading with no matching configured profile
-                                // — the CLI's own default login, which has no
-                                // named account entry.
-                                ForEach(unmatchedReadings) { provider in
-                                    ProviderPlanUsageRow(provider: provider)
+                            // Reset countdowns and relative update ages remain
+                            // truthful while Settings stays open.
+                            TimelineView(.periodic(from: .now, by: 60)) { timeline in
+                                LazyVGrid(
+                                    columns: [GridItem(.adaptive(minimum: 250), spacing: 10, alignment: .top)],
+                                    alignment: .leading,
+                                    spacing: 10
+                                ) {
+                                    ForEach(accountProfiles) { profile in
+                                        SubscriptionCardView(
+                                            profile: profile,
+                                            usage: reading(for: profile),
+                                            isRefreshing: usage.isRefreshingPlanUsage,
+                                            now: timeline.date,
+                                            isCurrentProject: currentProjectIDs.contains(profile.id),
+                                            onSignIn: { signingIn = profile },
+                                            onReveal: { reveal(profile) },
+                                            onRemove: { pendingAccountRemoval = profile }
+                                        )
+                                    }
+                                    // A reading with no matching configured profile
+                                    // — the CLI's own default login, which has no
+                                    // named account entry.
+                                    ForEach(unmatchedReadings) { provider in
+                                        ProviderPlanUsageRow(provider: provider, now: timeline.date)
+                                    }
                                 }
                             }
                         }
@@ -356,9 +360,24 @@ private struct ProviderPlanUsageRow: View {
                 .foregroundStyle(.kaisolaSecondary)
                 .lineLimit(2)
             } else {
-                ForEach(provider.windows) { window in
-                    SubscriptionUsageMeter(window: window, now: now)
+                ForEach(provider.windowRows) { row in
+                    SubscriptionUsageMeter(window: row.window, now: now)
                 }
+            }
+
+            let provenance = SubscriptionCardView.provenanceCaption(
+                sourceLabel: provider.sourceLabel,
+                updatedAt: provider.updatedAt,
+                now: now
+            )
+            if !provenance.isEmpty {
+                Text(provenance)
+                    .font(.caption2)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(provenance)
+                    .accessibilityLabel("Usage source: \(provenance)")
             }
         }
         .padding(12)

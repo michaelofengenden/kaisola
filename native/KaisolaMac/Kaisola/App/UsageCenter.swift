@@ -187,9 +187,11 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
         /// constraint, which is what "spent" actually means. An account at 0%
         /// on five hours and 100% on its weekly bucket is spent.
         let usedPercent: Double
+        let bindingWindowLabel: String
         /// An account of the same provider with meaningfully more room.
         let alternativeLabel: String?
         let alternativeUsedPercent: Double?
+        let alternativeWindowLabel: String?
     }
 
     /// At or above this, an account counts as spent. Not 100: the last few
@@ -203,35 +205,58 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
 
     static func headroomAdvice(
         for binding: SessionAccountBinding,
-        readings: [UsageCenter.ProviderPlanUsage]
+        readings: [UsageCenter.ProviderPlanUsage],
+        now: Date = Date()
     ) -> HeadroomAdvice? {
-        func worst(_ reading: UsageCenter.ProviderPlanUsage) -> Double? {
-            reading.windows.compactMap(\.usedPercent).max()
+        func bindingWindow(
+            _ reading: UsageCenter.ProviderPlanUsage
+        ) -> UsageCenter.PlanWindow? {
+            guard reading.ok, reading.isFresh(at: now) else { return nil }
+            var result: UsageCenter.PlanWindow?
+            for candidate in reading.windows {
+                guard let used = candidate.reportedUsedPercent else { continue }
+                if result?.reportedUsedPercent.map({ used > $0 }) ?? true {
+                    result = candidate
+                }
+            }
+            return result
         }
         let current = readings.first {
-            $0.provider == binding.provider.rawValue
-                && $0.profileID != nil
-                && $0.profileLabel == binding.label
+            guard $0.provider == binding.provider.rawValue else { return false }
+            if let accountID = binding.accountID, !accountID.isEmpty {
+                return $0.profileID == accountID
+            }
+            return $0.profileLabel == binding.label
         }
-        guard let current, let used = worst(current), used >= exhaustedPercent else { return nil }
+        guard let current,
+              let currentWindow = bindingWindow(current),
+              let used = currentWindow.reportedUsedPercent,
+              used >= exhaustedPercent else { return nil }
 
         let ceiling = used - worthSwitchingMargin
         var bestLabel: String?
         var bestUsed: Double?
+        var bestWindowLabel: String?
         for reading in readings {
             guard reading.provider == binding.provider.rawValue else { continue }
+            if let accountID = binding.accountID, reading.profileID == accountID { continue }
             guard let label = reading.profileLabel, !label.isEmpty, label != binding.label else { continue }
-            guard let value = worst(reading), value <= ceiling else { continue }
+            guard let window = bindingWindow(reading),
+                  let value = window.reportedUsedPercent,
+                  value <= ceiling else { continue }
             if bestUsed == nil || value < bestUsed! {
                 bestUsed = value
                 bestLabel = label
+                bestWindowLabel = window.label
             }
         }
 
         return HeadroomAdvice(
             usedPercent: used,
+            bindingWindowLabel: currentWindow.label,
             alternativeLabel: bestLabel,
-            alternativeUsedPercent: bestUsed
+            alternativeUsedPercent: bestUsed,
+            alternativeWindowLabel: bestWindowLabel
         )
     }
 
@@ -288,15 +313,18 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
     /// One sentence a person can act on, or nothing.
     static func headroomWarning(
         for binding: SessionAccountBinding,
-        readings: [UsageCenter.ProviderPlanUsage]
+        readings: [UsageCenter.ProviderPlanUsage],
+        now: Date = Date()
     ) -> String? {
-        guard let advice = headroomAdvice(for: binding, readings: readings) else { return nil }
-        let used = Int(advice.usedPercent.rounded())
+        guard let advice = headroomAdvice(for: binding, readings: readings, now: now) else { return nil }
+        let used = UsageCenter.PlanWindow.percentCaption(advice.usedPercent)
+        let current = "\(binding.label) is \(used) used on its \(advice.bindingWindowLabel) limit."
         guard let label = advice.alternativeLabel,
-              let alternative = advice.alternativeUsedPercent else {
-            return "\(binding.label) is \(used)% used."
+              let alternative = advice.alternativeUsedPercent,
+              let alternativeWindow = advice.alternativeWindowLabel else {
+            return current
         }
-        return "\(binding.label) is \(used)% used. \(label) is at \(Int(alternative.rounded()))%."
+        return "\(current) \(label) is at \(UsageCenter.PlanWindow.percentCaption(alternative)) on its \(alternativeWindow) limit."
     }
 
     static func applying(
@@ -505,7 +533,7 @@ final class UsageCenter: ObservableObject {
             ? nil
             : .live
     )
-    static let automaticPlanUsageTTL: TimeInterval = 180
+    nonisolated static let automaticPlanUsageTTL: TimeInterval = 180
 
     /// One chat's usage rollup. `latest*` is the most recent context-window
     /// reading (what the gauge shows); `peakUsed` is the high-water mark of used
@@ -554,9 +582,38 @@ final class UsageCenter: ObservableObject {
         let resetsAt: Double?
 
         var id: String { label }
+
+        /// Provider percentages may legitimately carry a fractional component.
+        /// Missing, negative, and non-finite values are unknown rather than 0%.
+        nonisolated var reportedUsedPercent: Double? {
+            guard let usedPercent,
+                  usedPercent.isFinite,
+                  usedPercent >= 0,
+                  usedPercent <= 10_000 else { return nil }
+            return usedPercent
+        }
+
+        /// At most one decimal place keeps exact provider precision without
+        /// turning whole percentages into noisy `37.0%` labels.
+        nonisolated static func percentCaption(_ value: Double?) -> String {
+            guard let value,
+                  value.isFinite,
+                  value >= 0,
+                  value <= 10_000 else { return "—" }
+            let tenths = (value * 10).rounded() / 10
+            if tenths.rounded() == tenths {
+                return String(format: "%.0f%%", locale: Locale(identifier: "en_US_POSIX"), tenths)
+            }
+            return String(format: "%.1f%%", locale: Locale(identifier: "en_US_POSIX"), tenths)
+        }
     }
 
     struct ProviderPlanUsage: Codable, Equatable, Identifiable, Sendable {
+        struct WindowRow: Identifiable, Equatable, Sendable {
+            let id: Int
+            let window: PlanWindow
+        }
+
         let provider: String
         let displayName: String
         let profileID: String?
@@ -571,6 +628,36 @@ final class UsageCenter: ObservableObject {
         let updatedAt: Double?
 
         var id: String { "\(provider):\(profileID ?? "active")" }
+
+        /// Position is the identity because providers can report two distinct
+        /// buckets with the same display label. Keying SwiftUI by label silently
+        /// coalesces those rows and violates the provider's ordering.
+        nonisolated var windowRows: [WindowRow] {
+            windows.enumerated().map { WindowRow(id: $0.offset, window: $0.element) }
+        }
+
+        nonisolated var updatedDate: Date? {
+            guard let updatedAt, updatedAt.isFinite, updatedAt > 0 else { return nil }
+            let seconds = updatedAt > 10_000_000_000 ? updatedAt / 1_000 : updatedAt
+            guard seconds.isFinite, seconds > 0 else { return nil }
+            return Date(timeIntervalSince1970: seconds)
+        }
+
+        /// Launch advice is actionable only while its source reading is inside
+        /// the same freshness window used by automatic provider refresh. A
+        /// bounded future skew tolerates clock jitter without accepting corrupt
+        /// far-future timestamps indefinitely.
+        nonisolated func isFresh(
+            at now: Date,
+            maximumAge: TimeInterval = UsageCenter.automaticPlanUsageTTL,
+            maximumFutureSkew: TimeInterval = 60
+        ) -> Bool {
+            guard maximumAge > 0,
+                  maximumFutureSkew >= 0,
+                  let updatedDate else { return false }
+            let age = now.timeIntervalSince(updatedDate)
+            return age >= -maximumFutureSkew && age < maximumAge
+        }
 
         init(
             provider: String,

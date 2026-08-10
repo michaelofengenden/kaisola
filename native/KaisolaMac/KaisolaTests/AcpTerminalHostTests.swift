@@ -6,6 +6,122 @@ import XCTest
 /// semantics the ACP terminal bridge exposes to agents.
 final class AcpTerminalHostTests: XCTestCase {
 
+    func testSnapshotFixtureDefaultsToAnEmptyBacklogState() {
+        let snapshot = AcpTerminalHost.Snapshot(
+            output: "fixture",
+            truncated: false,
+            exitStatus: nil
+        )
+
+        XCTAssertEqual(snapshot.outputBufferStats, .empty)
+    }
+
+    func testSegmentedOutputTailSustainsMaximumCaptureWithoutMovingRetainedBytes() {
+        let chunkByteCount = AcpTerminalHost.outputStreamChunkByteLimit
+        let retainedChunkCount = AcpTerminalHost.maxOutputByteLimit / chunkByteCount
+        let totalChunkCount = retainedChunkCount * 16
+        var tail = AcpTerminalHost.SegmentedOutputTail(
+            byteLimit: AcpTerminalHost.maxOutputByteLimit
+        )
+
+        // Exercise 128 MiB of sustained output while the retained tail remains
+        // pinned at the maximum 8 MiB. The deterministic movement counters are
+        // the primary complexity contract; this generous wall limit catches a
+        // regression to repeated multi-megabyte front shifts without acting as
+        // a microbenchmark.
+        let clock = ContinuousClock()
+        let start = clock.now
+        for sequence in 0..<totalChunkCount {
+            let byte = UInt8(sequence % 95 + 32)
+            tail.append(Data(repeating: byte, count: chunkByteCount))
+        }
+        let elapsed = start.duration(to: clock.now)
+
+        let metrics = tail.metrics
+        XCTAssertEqual(metrics.appendedBytes, UInt64(totalChunkCount * chunkByteCount))
+        XCTAssertEqual(
+            metrics.discardedBytes,
+            UInt64((totalChunkCount - retainedChunkCount) * chunkByteCount)
+        )
+        XCTAssertEqual(metrics.retainedBytes, AcpTerminalHost.maxOutputByteLimit)
+        XCTAssertEqual(metrics.storedSegmentBytes, AcpTerminalHost.maxOutputByteLimit)
+        XCTAssertLessThanOrEqual(metrics.peakRetainedBytes, AcpTerminalHost.maxOutputByteLimit)
+        XCTAssertLessThanOrEqual(
+            metrics.peakStoredSegmentBytes,
+            AcpTerminalHost.maxOutputByteLimit + chunkByteCount
+        )
+        XCTAssertEqual(metrics.enqueuedSegments, UInt64(totalChunkCount))
+        XCTAssertEqual(metrics.dequeuedSegments, UInt64(totalChunkCount - retainedChunkCount))
+        XCTAssertEqual(metrics.partialHeadAdvances, 0)
+        XCTAssertEqual(metrics.bytesMovedWhileTrimming, 0)
+        XCTAssertLessThan(elapsed, .seconds(15), "sustained bounded capture took \(elapsed)")
+
+        var expected = Data()
+        expected.reserveCapacity(AcpTerminalHost.maxOutputByteLimit)
+        for sequence in (totalChunkCount - retainedChunkCount)..<totalChunkCount {
+            let byte = UInt8(sequence % 95 + 32)
+            expected.append(
+                Data(repeating: byte, count: chunkByteCount)
+            )
+        }
+        XCTAssertEqual(tail.materialized(), expected)
+        XCTAssertTrue(tail.truncated)
+    }
+
+    func testSegmentedOutputTailPreservesContiguousUTF8SuffixAcrossSegmentsAndGaps() {
+        var tail = AcpTerminalHost.SegmentedOutputTail(byteLimit: 5)
+        tail.append(Data([0x78, 0x78, 0xF0, 0x9F]))
+        tail.append(Data([0x8C, 0x8D, 0x21]))
+        XCTAssertEqual(String(decoding: tail.materialized(), as: UTF8.self), "🌍!")
+        XCTAssertEqual(tail.metrics.retainedBytes, 5)
+        XCTAssertTrue(tail.truncated)
+
+        tail.discardForDiscontinuity()
+        tail.append(Data([0x80, 0x81, 0x6E, 0x65, 0x77]))
+        XCTAssertEqual(String(decoding: tail.materialized(), as: UTF8.self), "new")
+        XCTAssertEqual(tail.metrics.retainedBytes, 3)
+    }
+
+    func testHighThroughputOutputBacklogStaysWithinDeclaredCeilingAndAccountsForDrops() async {
+        let (stream, buffer) = AcpTerminalHost.makeOutputStream()
+        let chunk = Data(repeating: 0x78, count: AcpTerminalHost.outputStreamChunkByteLimit)
+        let totalChunks = AcpTerminalHost.outputStreamBufferedChunkLimit * 256
+
+        // Deliberately hold the consumer while the producer offers 1 GiB of
+        // logical output. This deterministically saturates the bufferingNewest
+        // policy without relying on scheduler timing or noisy process RSS.
+        for _ in 0..<totalChunks {
+            buffer.yield(chunk)
+        }
+
+        let saturated = buffer.state().stats
+        let expectedDroppedChunks = totalChunks - AcpTerminalHost.outputStreamBufferedChunkLimit
+        XCTAssertEqual(saturated.bufferedByteCeiling, 4 * 1_048_576)
+        XCTAssertEqual(saturated.peakBufferedChunks, saturated.bufferedChunkLimit)
+        XCTAssertLessThanOrEqual(
+            saturated.peakBufferedChunks * saturated.chunkByteLimit,
+            saturated.bufferedByteCeiling
+        )
+        XCTAssertEqual(saturated.droppedChunks, UInt64(expectedDroppedChunks))
+        XCTAssertEqual(
+            saturated.droppedBytes,
+            UInt64(expectedDroppedChunks * AcpTerminalHost.outputStreamChunkByteLimit)
+        )
+
+        buffer.finish()
+        var retainedSequences: [UInt64] = []
+        for await retained in stream {
+            XCTAssertEqual(retained.data.count, AcpTerminalHost.outputStreamChunkByteLimit)
+            retainedSequences.append(retained.sequence)
+        }
+        XCTAssertEqual(retainedSequences.count, AcpTerminalHost.outputStreamBufferedChunkLimit)
+        XCTAssertEqual(
+            retainedSequences.first,
+            UInt64(totalChunks - AcpTerminalHost.outputStreamBufferedChunkLimit)
+        )
+        XCTAssertEqual(retainedSequences.last, UInt64(totalChunks - 1))
+    }
+
     func testCreateCapturesOutputAndExitCode() async throws {
         let host = AcpTerminalHost()
         let id = try await host.create(
@@ -26,6 +142,165 @@ final class AcpTerminalHostTests: XCTestCase {
                       "output must be fully drained before exit resolves")
         XCTAssertEqual(snapshot?.truncated, false)
         XCTAssertEqual(snapshot?.exitStatus?.exitCode, 3)
+        XCTAssertEqual(snapshot?.outputState, .complete)
+    }
+
+    func testGrandchildOutputAfterTheOldGracePeriodPrecedesWaitResolution() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-terminal-grandchild-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gateURL = directory.appendingPathComponent("write-now")
+        let host = AcpTerminalHost(descendantPipeDrainTimeoutNanoseconds: 5_000_000_000)
+        let id = try await host.create(
+            command: "/bin/sh",
+            args: [
+                "-c",
+                "(i=0; while [ ! -e \"$KAISOLA_WRITE_GATE\" ] && [ $i -lt 600 ]; do sleep 0.01; i=$((i + 1)); done; if [ -e \"$KAISOLA_WRITE_GATE\" ]; then printf grandchild-final; fi) & printf 'direct-child|'",
+            ],
+            env: ["KAISOLA_WRITE_GATE": gateURL.path],
+            cwd: directory.path,
+            outputByteLimit: nil
+        )
+        let receipt = TerminalExitReceipt()
+        let waiter = Task {
+            let status = await host.waitForExit(id)
+            await receipt.record(status)
+            return status
+        }
+
+        let drainDeadline = Date().addingTimeInterval(2)
+        while Date() < drainDeadline {
+            let snapshot = await host.output(id)
+            if snapshot?.outputState == .drainingDescendants,
+               snapshot?.output == "direct-child|" {
+                break
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let draining = await host.output(id)
+        XCTAssertEqual(draining?.outputState, .drainingDescendants)
+        XCTAssertNil(draining?.exitStatus, "direct-child exit alone must not resolve the terminal")
+        XCTAssertEqual(draining?.output, "direct-child|")
+
+        // Cross the old synthetic-EOF deadline while the real grandchild still
+        // owns the pipe. The waiter must remain unresolved until that child is
+        // explicitly allowed to publish its final bytes and close the pipe.
+        try await Task.sleep(nanoseconds: 2_200_000_000)
+        let prematurelyResolved = await receipt.value()
+        XCTAssertNil(prematurelyResolved)
+        try Data().write(to: gateURL)
+
+        let completionDeadline = Date().addingTimeInterval(3)
+        while await receipt.value() == nil, Date() < completionDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let status = await waiter.value
+        let completed = await host.output(id)
+        XCTAssertEqual(status?.exitCode, 0)
+        XCTAssertEqual(completed?.outputState, .complete)
+        XCTAssertEqual(completed?.output, "direct-child|grandchild-final")
+        XCTAssertFalse(completed?.truncated ?? true)
+
+        // Resolution is the append barrier: no later poll can observe growth.
+        try await Task.sleep(nanoseconds: 100_000_000)
+        let stableOutput = await host.output(id)?.output
+        XCTAssertEqual(stableOutput, completed?.output)
+        await host.release(id)
+    }
+
+    func testLingeringDescendantTimeoutClosesThePipeAndReportsBoundedLoss() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-terminal-timeout-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gateURL = directory.appendingPathComponent("write-after-timeout")
+        let descendantDoneURL = directory.appendingPathComponent("descendant-done")
+        let host = AcpTerminalHost(descendantPipeDrainTimeoutNanoseconds: 150_000_000)
+        let clock = ContinuousClock()
+        let started = clock.now
+        let id = try await host.create(
+            command: "/bin/sh",
+            args: [
+                "-c",
+                "(trap '' PIPE; i=0; while [ ! -e \"$KAISOLA_WRITE_GATE\" ] && [ $i -lt 600 ]; do sleep 0.01; i=$((i + 1)); done; if [ -e \"$KAISOLA_WRITE_GATE\" ]; then printf should-not-append 2>/dev/null || :; fi; : > \"$KAISOLA_DESCENDANT_DONE\") & printf bounded-prefix",
+            ],
+            env: [
+                "KAISOLA_WRITE_GATE": gateURL.path,
+                "KAISOLA_DESCENDANT_DONE": descendantDoneURL.path,
+            ],
+            cwd: directory.path,
+            outputByteLimit: nil
+        )
+        let status = await host.waitForExit(id)
+        let elapsed = started.duration(to: clock.now)
+        let timedOut = await host.output(id)
+
+        XCTAssertEqual(status?.exitCode, 0)
+        XCTAssertLessThan(elapsed, .seconds(2), "a descendant-held pipe must have a bounded wait")
+        XCTAssertEqual(timedOut?.outputState, .descendantTimeout)
+        XCTAssertEqual(timedOut?.output, "bounded-prefix")
+        XCTAssertTrue(timedOut?.truncated == true, "timeout must visibly disclose possible lost output")
+
+        try Data().write(to: gateURL)
+        let descendantDeadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: descendantDoneURL.path),
+              Date() < descendantDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: descendantDoneURL.path))
+        let afterLateWrite = await host.output(id)
+        XCTAssertEqual(afterLateWrite?.output, timedOut?.output)
+        XCTAssertEqual(afterLateWrite?.outputState, .descendantTimeout)
+        await host.release(id)
+        let released = await host.output(id)
+        XCTAssertNil(released)
+    }
+
+    func testReleaseClosesALingeringDescendantPipeImmediately() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-terminal-release-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let gateURL = directory.appendingPathComponent("finish-descendant")
+        let descendantDoneURL = directory.appendingPathComponent("descendant-done")
+        let host = AcpTerminalHost(descendantPipeDrainTimeoutNanoseconds: 30_000_000_000)
+        let id = try await host.create(
+            command: "/bin/sh",
+            args: [
+                "-c",
+                "(trap '' PIPE; i=0; while [ ! -e \"$KAISOLA_WRITE_GATE\" ] && [ $i -lt 600 ]; do sleep 0.01; i=$((i + 1)); done; printf released-late 2>/dev/null || :; : > \"$KAISOLA_DESCENDANT_DONE\") & printf released-prefix",
+            ],
+            env: [
+                "KAISOLA_WRITE_GATE": gateURL.path,
+                "KAISOLA_DESCENDANT_DONE": descendantDoneURL.path,
+            ],
+            cwd: directory.path,
+            outputByteLimit: nil
+        )
+
+        let drainDeadline = Date().addingTimeInterval(2)
+        while await host.output(id)?.outputState != .drainingDescendants,
+              Date() < drainDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let draining = await host.output(id)
+        XCTAssertEqual(draining?.outputState, .drainingDescendants)
+        await host.release(id)
+
+        let releaseDeadline = Date().addingTimeInterval(2)
+        while await host.output(id) != nil, Date() < releaseDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let released = await host.output(id)
+        XCTAssertNil(released)
+        try Data().write(to: gateURL)
+        let descendantDeadline = Date().addingTimeInterval(2)
+        while !FileManager.default.fileExists(atPath: descendantDoneURL.path),
+              Date() < descendantDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertTrue(FileManager.default.fileExists(atPath: descendantDoneURL.path))
     }
 
     func testAdapterProvidedLimitIsClampedToTheApplicationMaximum() async throws {
@@ -85,8 +360,8 @@ final class AcpTerminalHostTests: XCTestCase {
     func testKillTerminatesALongRunningProcess() async throws {
         let host = AcpTerminalHost()
         let id = try await host.create(
-            command: "/bin/sleep",
-            args: ["30"],
+            command: "exec",
+            args: ["/bin/sleep", "30"],
             env: [:],
             cwd: FileManager.default.temporaryDirectory.path,
             outputByteLimit: nil
@@ -97,6 +372,191 @@ final class AcpTerminalHostTests: XCTestCase {
         // (128+SIGTERM) or propagate the signal itself — either proves death.
         XCTAssertNotNil(status)
         XCTAssertTrue(status?.signal != nil || (status?.exitCode ?? 0) != 0)
+    }
+
+    func testSIGKILLEscalationSuccessIsRecordedUntilActualExit() async throws {
+        let sender = ScriptedSignalSender([
+            .deliverAndReport(.sent),
+        ])
+        let host = AcpTerminalHost(
+            sigkillEscalationDelayNanoseconds: 0,
+            signalSender: { sender.send(pid: $0, signal: $1) }
+        )
+        let id = try await host.create(
+            command: "exec",
+            args: ["/bin/sleep", "30"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        let createdPID = await host.processIdentifierForTesting(id)
+        let pid = try XCTUnwrap(createdPID)
+        defer { _ = Darwin.kill(pid, SIGKILL) }
+
+        await host.forceKillForTesting(id)
+        let statusAfterSend = await host.output(id)?.killStatus
+        XCTAssertEqual(statusAfterSend?.state, .sigkillSent)
+        XCTAssertEqual(statusAfterSend?.attempts, 1)
+        XCTAssertNil(statusAfterSend?.errorNumber)
+        XCTAssertEqual(sender.callCount, 1)
+
+        let exit = await host.waitForExit(id)
+        XCTAssertNotNil(exit)
+        let completed = await host.output(id)
+        XCTAssertEqual(completed?.killStatus, statusAfterSend)
+        await host.release(id)
+    }
+
+    func testSIGKILLESRCHReconcilesWithoutSynthesizingExitOrRemovingEntry() async throws {
+        let sender = ScriptedSignalSender([
+            .report(.failed(errorNumber: ESRCH)),
+        ])
+        let host = AcpTerminalHost(
+            sigkillEscalationDelayNanoseconds: 0,
+            sigkillRetryDelayNanoseconds: 0,
+            signalSender: { sender.send(pid: $0, signal: $1) }
+        )
+        let id = try await host.create(
+            command: "exec",
+            args: ["/bin/sleep", "30"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        let createdPID = await host.processIdentifierForTesting(id)
+        let pid = try XCTUnwrap(createdPID)
+        defer { _ = Darwin.kill(pid, SIGKILL) }
+
+        await host.forceKillForTesting(id)
+        let reconciling = await host.output(id)
+        XCTAssertNotNil(reconciling, "ESRCH is not proof of a delivered Process exit callback")
+        XCTAssertNil(reconciling?.exitStatus)
+        XCTAssertEqual(reconciling?.killStatus?.state, .reconcilingExit)
+        XCTAssertEqual(reconciling?.killStatus?.errorNumber, ESRCH)
+        XCTAssertFalse(reconciling?.killStatus?.processMayBeRunning ?? true)
+        XCTAssertEqual(sender.callCount, 1)
+
+        XCTAssertEqual(Darwin.kill(pid, SIGKILL), 0)
+        let exit = await host.waitForExit(id)
+        XCTAssertNotNil(exit)
+        let completed = await host.output(id)
+        XCTAssertEqual(completed?.killStatus?.state, .reconcilingExit)
+        await host.release(id)
+    }
+
+    func testSIGKILLEINTRRetriesOnceThenRecordsSuccessfulDelivery() async throws {
+        let sender = ScriptedSignalSender([
+            .report(.failed(errorNumber: EINTR)),
+            .deliverAndReport(.sent),
+        ])
+        let host = AcpTerminalHost(
+            sigkillEscalationDelayNanoseconds: 0,
+            sigkillRetryDelayNanoseconds: 0,
+            signalSender: { sender.send(pid: $0, signal: $1) }
+        )
+        let id = try await host.create(
+            command: "exec",
+            args: ["/bin/sleep", "30"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        let createdPID = await host.processIdentifierForTesting(id)
+        let pid = try XCTUnwrap(createdPID)
+        defer { _ = Darwin.kill(pid, SIGKILL) }
+
+        await host.forceKillForTesting(id)
+        let delivered = await host.output(id)?.killStatus
+        XCTAssertEqual(sender.callCount, 2)
+        XCTAssertEqual(delivered?.state, .sigkillSent)
+        XCTAssertEqual(delivered?.attempts, 2)
+        XCTAssertFalse(delivered?.retryable ?? true)
+        let exit = await host.waitForExit(id)
+        XCTAssertNotNil(exit)
+        await host.release(id)
+    }
+
+    func testSIGKILLPersistentEINTRStopsAtTheStrictAttemptBound() async throws {
+        let sender = ScriptedSignalSender(Array(
+            repeating: .report(.failed(errorNumber: EINTR)),
+            count: AcpTerminalHost.maximumSIGKILLAttempts
+        ))
+        let host = AcpTerminalHost(
+            sigkillEscalationDelayNanoseconds: 0,
+            signalSender: { sender.send(pid: $0, signal: $1) }
+        )
+        let id = try await host.create(
+            command: "exec",
+            args: ["/bin/sleep", "30"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        let createdPID = await host.processIdentifierForTesting(id)
+        let pid = try XCTUnwrap(createdPID)
+        defer { _ = Darwin.kill(pid, SIGKILL) }
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        await host.forceKillForTesting(id)
+        let elapsed = started.duration(to: clock.now)
+        let failure = await host.output(id)?.killStatus
+        XCTAssertEqual(sender.callCount, AcpTerminalHost.maximumSIGKILLAttempts)
+        XCTAssertLessThan(elapsed, .seconds(1), "EINTR retries must stay inside the strict retry window")
+        XCTAssertEqual(failure?.state, .failed)
+        XCTAssertEqual(failure?.attempts, AcpTerminalHost.maximumSIGKILLAttempts)
+        XCTAssertEqual(failure?.errorNumber, EINTR)
+        XCTAssertTrue(failure?.message.contains("Retry terminal/kill") == true)
+        let retained = await host.output(id)
+        XCTAssertNotNil(retained, "a failed escalation must retain the live entry")
+
+        XCTAssertEqual(Darwin.kill(pid, SIGKILL), 0)
+        let exit = await host.waitForExit(id)
+        XCTAssertNotNil(exit)
+        await host.release(id)
+    }
+
+    func testSIGKILLEPERMReturnsActionableWaitFailureButRetainsEntryUntilEventualExit() async throws {
+        let sender = ScriptedSignalSender([
+            .report(.failed(errorNumber: EPERM)),
+        ])
+        let host = AcpTerminalHost(
+            sigkillEscalationDelayNanoseconds: 0,
+            sigkillRetryDelayNanoseconds: 0,
+            signalSender: { sender.send(pid: $0, signal: $1) }
+        )
+        let id = try await host.create(
+            command: "exec",
+            args: ["/bin/sleep", "30"],
+            env: [:],
+            cwd: FileManager.default.temporaryDirectory.path,
+            outputByteLimit: nil
+        )
+        let createdPID = await host.processIdentifierForTesting(id)
+        let pid = try XCTUnwrap(createdPID)
+        defer { _ = Darwin.kill(pid, SIGKILL) }
+
+        await host.forceKillForTesting(id)
+        let failedSnapshot = await host.output(id)
+        let failure = try XCTUnwrap(failedSnapshot?.killStatus)
+        XCTAssertEqual(failure.state, .failed)
+        XCTAssertEqual(failure.errorNumber, EPERM)
+        XCTAssertFalse(failure.retryable)
+        XCTAssertTrue(failure.processMayBeRunning)
+        XCTAssertTrue(failure.message.contains("Check permissions"))
+        XCTAssertNil(failedSnapshot?.exitStatus)
+        XCTAssertNotNil(failedSnapshot, "permanent failure must not discard a live terminal")
+        let waitOutcome = await host.waitForExitOutcome(id)
+        XCTAssertEqual(waitOutcome, .terminationFailed(failure))
+
+        XCTAssertEqual(Darwin.kill(pid, SIGKILL), 0)
+        let exit = await host.waitForExit(id)
+        XCTAssertNotNil(exit)
+        let exitedSnapshot = await host.output(id)
+        XCTAssertNotNil(exitedSnapshot, "actual exit remains inspectable until release")
+        await host.release(id)
+        let released = await host.output(id)
+        XCTAssertNil(released)
     }
 
     func testReleaseInvalidatesTheTerminalID() async throws {
@@ -112,53 +572,6 @@ final class AcpTerminalHostTests: XCTestCase {
         await host.release(id)
         let snapshot = await host.output(id)
         XCTAssertNil(snapshot)
-    }
-
-    func testLingeringDescendantSealsOutputInsteadOfAppendingBehindTheExit() async throws {
-        let host = AcpTerminalHost()
-        // The child exits immediately but leaves a background subshell holding
-        // the write end of the pipe, so EOF never arrives. The subshell writes
-        // again well after the two-second grace period.
-        let id = try await host.create(
-            command: "/bin/sh",
-            args: ["-c", "printf before-exit; ( sleep 3; printf after-grace ) & exit 0"],
-            env: [:],
-            cwd: FileManager.default.temporaryDirectory.path,
-            outputByteLimit: nil
-        )
-        let status = await host.waitForExit(id)
-        let atExit = await host.output(id)
-        XCTAssertEqual(status?.exitCode, 0)
-        XCTAssertTrue(atExit?.output.contains("before-exit") == true)
-        XCTAssertFalse(atExit?.output.contains("after-grace") == true,
-                       "the descendant had not written yet when exit resolved")
-        // The lingering descendant is a fact of its own, not a fake EOF.
-        XCTAssertEqual(atExit?.outputDetached, true)
-
-        // Past the descendant's write: the snapshot behind the reported exit
-        // must be byte-for-byte the one wait_for_exit resolved against.
-        try await Task.sleep(nanoseconds: 2_500_000_000)
-        let later = await host.output(id)
-        XCTAssertEqual(later?.output, atExit?.output,
-                       "output was appended after wait_for_exit resolved")
-        XCTAssertFalse(later?.output.contains("after-grace") == true)
-        await host.release(id)
-    }
-
-    func testCleanExitReportsCompleteOutputRatherThanDetachedOutput() async throws {
-        let host = AcpTerminalHost()
-        let id = try await host.create(
-            command: "/bin/sh",
-            args: ["-c", "printf clean-eof"],
-            env: [:],
-            cwd: FileManager.default.temporaryDirectory.path,
-            outputByteLimit: nil
-        )
-        _ = await host.waitForExit(id)
-        let snapshot = await host.output(id)
-        XCTAssertTrue(snapshot?.output.contains("clean-eof") == true)
-        // Nothing held the pipe: the exit rode a real EOF.
-        XCTAssertEqual(snapshot?.outputDetached, false)
     }
 
     func testEnvOverlayReachesTheProcess() async throws {
@@ -197,8 +610,7 @@ final class AcpTerminalHostTests: XCTestCase {
             AcpTerminalHost.Snapshot(
                 output: "work in progress",
                 truncated: true,
-                exitStatus: nil,
-                outputDetached: false
+                exitStatus: nil
             ),
             nil,
         ])
@@ -220,8 +632,7 @@ final class AcpTerminalHostTests: XCTestCase {
         let staleSnapshot = AcpTerminalHost.Snapshot(
             output: "stale output",
             truncated: false,
-            exitStatus: .init(exitCode: 0, signal: nil),
-            outputDetached: false
+            exitStatus: .init(exitCode: 0, signal: nil)
         )
 
         let staleTask = Task { @MainActor in
@@ -268,5 +679,50 @@ private actor SuspendedTerminalSnapshot {
     func resolve(with snapshot: AcpTerminalHost.Snapshot?) {
         continuation?.resume(returning: snapshot)
         continuation = nil
+    }
+}
+
+private actor TerminalExitReceipt {
+    private var recorded: AcpTerminalHost.ExitStatus?
+
+    func record(_ status: AcpTerminalHost.ExitStatus?) {
+        recorded = status
+    }
+
+    func value() -> AcpTerminalHost.ExitStatus? {
+        recorded
+    }
+}
+
+private final class ScriptedSignalSender: @unchecked Sendable {
+    enum Step {
+        case report(AcpTerminalHost.SignalDeliveryResult)
+        case deliverAndReport(AcpTerminalHost.SignalDeliveryResult)
+    }
+
+    private let lock = NSLock()
+    private var steps: [Step]
+    private var calls = 0
+
+    init(_ steps: [Step]) {
+        self.steps = steps
+    }
+
+    var callCount: Int {
+        lock.withLock { calls }
+    }
+
+    func send(pid: Int32, signal: Int32) -> AcpTerminalHost.SignalDeliveryResult {
+        lock.withLock {
+            calls += 1
+            guard !steps.isEmpty else { return .failed(errorNumber: EIO) }
+            switch steps.removeFirst() {
+            case let .report(result):
+                return result
+            case let .deliverAndReport(result):
+                _ = Darwin.kill(pid, signal)
+                return result
+            }
+        }
     }
 }

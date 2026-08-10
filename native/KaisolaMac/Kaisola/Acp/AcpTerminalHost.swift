@@ -11,67 +11,427 @@ actor AcpTerminalHost {
         let signal: String?
     }
 
+    /// Direct-child lifetime and output-pipe lifetime are independent: a
+    /// background grandchild can inherit stdout/stderr after the shell exits.
+    /// Exposing that distinction prevents a terminal from looking silently
+    /// hung while its descendants are still able to append output.
+    enum OutputState: String, Equatable, Sendable {
+        case running
+        case pipeClosed = "pipe_closed"
+        case drainingDescendants = "draining_descendants"
+        case complete
+        case descendantTimeout = "descendant_timeout"
+    }
+
+    struct KillStatus: Equatable, Sendable {
+        enum State: String, Equatable, Sendable {
+            case sigtermRequested = "sigterm_requested"
+            case sigkillRetrying = "sigkill_retrying"
+            case sigkillSent = "sigkill_sent"
+            case reconcilingExit = "reconciling_exit"
+            case failed
+        }
+
+        let state: State
+        let attempts: Int
+        let errorNumber: Int32?
+        let message: String
+        let retryable: Bool
+        let processMayBeRunning: Bool
+    }
+
+    enum WaitOutcome: Equatable, Sendable {
+        case exited(ExitStatus)
+        case terminationFailed(KillStatus)
+    }
+
+    enum SignalDeliveryResult: Equatable, Sendable {
+        case sent
+        case failed(errorNumber: Int32)
+    }
+
+    typealias SignalSender = @Sendable (_ pid: Int32, _ signal: Int32) -> SignalDeliveryResult
+
     struct Snapshot: Equatable, Sendable {
         let output: String
         let truncated: Bool
         let exitStatus: ExitStatus?
-        /// The child exited while a descendant still held the write end of the
-        /// output pipe, so the exit was reported without an EOF. The buffer is
-        /// sealed at that moment: whatever the descendant writes afterwards is
-        /// read and dropped, never appended behind the reported exit.
-        let outputDetached: Bool
+        let outputState: OutputState
+        let killStatus: KillStatus?
+        let outputBufferStats: OutputBufferStats
+
+        init(
+            output: String,
+            truncated: Bool,
+            exitStatus: ExitStatus?,
+            outputState: OutputState? = nil,
+            killStatus: KillStatus? = nil,
+            outputBufferStats: OutputBufferStats = .empty
+        ) {
+            self.output = output
+            self.truncated = truncated
+            self.exitStatus = exitStatus
+            self.outputState = outputState ?? (exitStatus == nil ? .running : .complete)
+            self.killStatus = killStatus
+            self.outputBufferStats = outputBufferStats
+        }
+    }
+
+    /// Diagnostics for the pipe-to-actor backlog. Each queued element is no
+    /// larger than `chunkByteLimit`, so the product of the two declared limits
+    /// is a stable memory ceiling for the AsyncStream's retained payloads.
+    struct OutputBufferStats: Equatable, Sendable {
+        let chunkByteLimit: Int
+        let bufferedChunkLimit: Int
+        let bufferedByteCeiling: Int
+        let peakBufferedChunks: Int
+        let droppedChunks: UInt64
+        let droppedBytes: UInt64
+
+        static let empty = OutputBufferStats(
+            chunkByteLimit: AcpTerminalHost.outputStreamChunkByteLimit,
+            bufferedChunkLimit: AcpTerminalHost.outputStreamBufferedChunkLimit,
+            bufferedByteCeiling: AcpTerminalHost.outputStreamBufferedByteCeiling,
+            peakBufferedChunks: 0,
+            droppedChunks: 0,
+            droppedBytes: 0
+        )
     }
 
     static let defaultOutputByteLimit = 1_048_576
     /// Hard ceiling for adapter-requested output limits (mirrors Electron's
     /// 8 MiB clamp) — a hostile `outputByteLimit` cannot exhaust app memory.
     static let maxOutputByteLimit = 8 * 1_048_576
-    /// How long a lingering descendant may keep the pipe open after the child
-    /// exits before exit waiters are answered without an EOF.
-    private static let lingeringOutputGrace: TimeInterval = 2
+    /// FileHandle callbacks are split before they enter the stream. Together
+    /// these bounds cap retained AsyncStream payloads at 4 MiB per terminal.
+    static let outputStreamChunkByteLimit = 64 * 1024
+    static let outputStreamBufferedChunkLimit = 64
+    static let outputStreamBufferedByteCeiling =
+        outputStreamChunkByteLimit * outputStreamBufferedChunkLimit
+    /// A descendant holding inherited stdout/stderr must not retain an ACP
+    /// terminal forever. At the deadline the read end is closed for real;
+    /// waiters resolve only after the bounded stream drains and reaches EOF.
+    static let defaultDescendantPipeDrainTimeoutNanoseconds: UInt64 = 10_000_000_000
+    static let defaultSIGKILLEscalationDelayNanoseconds: UInt64 = 3_000_000_000
+    static let sigkillRetryDelayNanoseconds: UInt64 = 50_000_000
+    static let maximumSIGKILLAttempts = 3
+    static let maximumSIGKILLRetryWindowNanoseconds: UInt64 = 250_000_000
     private static let signalNames: [Int32: String] = [
         SIGHUP: "SIGHUP", SIGINT: "SIGINT", SIGQUIT: "SIGQUIT", SIGKILL: "SIGKILL",
         SIGTERM: "SIGTERM", SIGPIPE: "SIGPIPE", SIGSEGV: "SIGSEGV", SIGABRT: "SIGABRT",
     ]
 
-    /// Ordered traffic from the output pipe. The grace-period tick rides the
-    /// same stream as the bytes, so it can never overtake a chunk that was
-    /// already read.
-    private enum OutputEvent: Sendable {
-        case chunk(Data)
-        case exitGraceExpired
+    struct OutputChunk: Sendable {
+        let sequence: UInt64
+        let data: Data
+    }
+
+    struct OutputBufferState: Sendable {
+        let stats: OutputBufferStats
+        let latestDroppedSequence: UInt64?
+    }
+
+    struct OutputTailMetrics: Equatable, Sendable {
+        let appendedBytes: UInt64
+        let discardedBytes: UInt64
+        let retainedBytes: Int
+        let storedSegmentBytes: Int
+        let peakRetainedBytes: Int
+        let peakStoredSegmentBytes: Int
+        let enqueuedSegments: UInt64
+        let dequeuedSegments: UInt64
+        let partialHeadAdvances: UInt64
+        let bytesMovedWhileTrimming: UInt64
+    }
+
+    /// A byte-bounded deque whose front trim only releases whole segments or
+    /// advances an offset into the first segment. Appending sustained output
+    /// therefore never shifts the retained tail as `Data.removeFirst` does.
+    struct SegmentedOutputTail {
+        private let byteLimit: Int
+        private var segments: [Data?] = Array(repeating: nil, count: 16)
+        private var headIndex = 0
+        private var segmentCount = 0
+        private var headOffset = 0
+        private var retainedBytes = 0
+        private var storedSegmentBytes = 0
+        private var peakRetainedBytes = 0
+        private var peakStoredSegmentBytes = 0
+        private var appendedBytes: UInt64 = 0
+        private var discardedBytes: UInt64 = 0
+        private var enqueuedSegments: UInt64 = 0
+        private var dequeuedSegments: UInt64 = 0
+        private var partialHeadAdvances: UInt64 = 0
+        private(set) var truncated = false
+
+        init(byteLimit: Int) {
+            precondition(byteLimit > 0)
+            self.byteLimit = byteLimit
+        }
+
+        var isEmpty: Bool { retainedBytes == 0 }
+
+        var metrics: OutputTailMetrics {
+            OutputTailMetrics(
+                appendedBytes: appendedBytes,
+                discardedBytes: discardedBytes,
+                retainedBytes: retainedBytes,
+                storedSegmentBytes: storedSegmentBytes,
+                peakRetainedBytes: peakRetainedBytes,
+                peakStoredSegmentBytes: peakStoredSegmentBytes,
+                enqueuedSegments: enqueuedSegments,
+                dequeuedSegments: dequeuedSegments,
+                partialHeadAdvances: partialHeadAdvances,
+                bytesMovedWhileTrimming: 0
+            )
+        }
+
+        mutating func append(_ data: Data) {
+            guard !data.isEmpty else { return }
+            appendedBytes = Self.saturatingAdd(appendedBytes, UInt64(data.count))
+
+            var payload = data
+            if isEmpty, truncated {
+                // A stream overflow may split a scalar between fixed-size
+                // chunks. Start the new contiguous suffix at a UTF-8 boundary.
+                var start = data.startIndex
+                while start < data.endIndex, data[start] & 0xC0 == 0x80 {
+                    start += 1
+                }
+                let skipped = data.distance(from: data.startIndex, to: start)
+                if skipped > 0 {
+                    discardedBytes = Self.saturatingAdd(discardedBytes, UInt64(skipped))
+                    payload = Data(data[start..<data.endIndex])
+                }
+            }
+
+            if !payload.isEmpty {
+                enqueue(payload)
+                retainedBytes += payload.count
+            }
+
+            if retainedBytes > byteLimit {
+                discardFirst(retainedBytes - byteLimit)
+                // Keep the retained tail on a clean UTF-8 boundary.
+                while let byte = firstByte, byte & 0xC0 == 0x80 {
+                    discardFirst(1)
+                }
+                truncated = true
+            }
+
+            peakRetainedBytes = max(peakRetainedBytes, retainedBytes)
+            peakStoredSegmentBytes = max(peakStoredSegmentBytes, storedSegmentBytes)
+        }
+
+        /// Clears bytes before an AsyncStream overflow gap. The next append
+        /// will re-establish a clean UTF-8 start for the new contiguous suffix.
+        mutating func discardForDiscontinuity() {
+            discardedBytes = Self.saturatingAdd(discardedBytes, UInt64(retainedBytes))
+            while segmentCount > 0 { dequeueFirstSegment() }
+            retainedBytes = 0
+            headOffset = 0
+            truncated = true
+        }
+
+        func materialized() -> Data {
+            guard retainedBytes > 0 else { return Data() }
+            var result = Data()
+            result.reserveCapacity(retainedBytes)
+            for offset in 0..<segmentCount {
+                let index = (headIndex + offset) % segments.count
+                guard let segment = segments[index] else { continue }
+                let startOffset = offset == 0 ? headOffset : 0
+                let start = segment.index(segment.startIndex, offsetBy: startOffset)
+                result.append(contentsOf: segment[start..<segment.endIndex])
+            }
+            return result
+        }
+
+        private var firstByte: UInt8? {
+            guard segmentCount > 0, let segment = segments[headIndex] else { return nil }
+            return segment[segment.index(segment.startIndex, offsetBy: headOffset)]
+        }
+
+        private mutating func enqueue(_ data: Data) {
+            if segmentCount == segments.count { grow() }
+            let index = (headIndex + segmentCount) % segments.count
+            segments[index] = data
+            segmentCount += 1
+            storedSegmentBytes += data.count
+            enqueuedSegments = Self.saturatingAdd(enqueuedSegments, 1)
+        }
+
+        private mutating func discardFirst(_ requestedCount: Int) {
+            var remaining = requestedCount
+            while remaining > 0, segmentCount > 0 {
+                guard let segment = segments[headIndex] else { break }
+                let available = segment.count - headOffset
+                let discarded = min(remaining, available)
+                remaining -= discarded
+                retainedBytes -= discarded
+                discardedBytes = Self.saturatingAdd(discardedBytes, UInt64(discarded))
+
+                if discarded == available {
+                    dequeueFirstSegment()
+                } else {
+                    headOffset += discarded
+                    partialHeadAdvances = Self.saturatingAdd(partialHeadAdvances, 1)
+                }
+            }
+        }
+
+        private mutating func dequeueFirstSegment() {
+            guard segmentCount > 0, let segment = segments[headIndex] else { return }
+            storedSegmentBytes -= segment.count
+            segments[headIndex] = nil
+            headIndex = (headIndex + 1) % segments.count
+            segmentCount -= 1
+            headOffset = 0
+            dequeuedSegments = Self.saturatingAdd(dequeuedSegments, 1)
+            if segmentCount == 0 { headIndex = 0 }
+        }
+
+        private mutating func grow() {
+            var expanded: [Data?] = Array(repeating: nil, count: segments.count * 2)
+            for offset in 0..<segmentCount {
+                expanded[offset] = segments[(headIndex + offset) % segments.count]
+            }
+            segments = expanded
+            headIndex = 0
+        }
+
+        private static func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+            let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? .max : sum
+        }
+    }
+
+    /// Owns the continuation and synchronously accounts for every overflow.
+    /// Keeping this bookkeeping off the actor avoids replacing dropped stream
+    /// elements with an unbounded queue of per-drop Tasks.
+    final class OutputStreamBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private let continuation: AsyncStream<OutputChunk>.Continuation
+        private var nextSequence: UInt64 = 0
+        private var peakBufferedChunks = 0
+        private var droppedChunks: UInt64 = 0
+        private var droppedBytes: UInt64 = 0
+        private var latestDroppedSequence: UInt64?
+
+        init(continuation: AsyncStream<OutputChunk>.Continuation) {
+            self.continuation = continuation
+        }
+
+        func yield(_ data: Data) {
+            guard !data.isEmpty else { return }
+            var start = data.startIndex
+            while start < data.endIndex {
+                let end = min(start + AcpTerminalHost.outputStreamChunkByteLimit, data.endIndex)
+                let payload = start == data.startIndex && end == data.endIndex
+                    ? data
+                    : Data(data[start..<end])
+                lock.withLock {
+                    let chunk = OutputChunk(sequence: nextSequence, data: payload)
+                    nextSequence = nextSequence == .max ? .max : nextSequence + 1
+                    switch continuation.yield(chunk) {
+                    case .enqueued(let remainingCapacity):
+                        let buffered = AcpTerminalHost.outputStreamBufferedChunkLimit - remainingCapacity
+                        peakBufferedChunks = max(peakBufferedChunks, buffered)
+                    case .dropped(let dropped):
+                        peakBufferedChunks = AcpTerminalHost.outputStreamBufferedChunkLimit
+                        droppedChunks = Self.saturatingAdd(droppedChunks, 1)
+                        droppedBytes = Self.saturatingAdd(droppedBytes, UInt64(dropped.data.count))
+                        latestDroppedSequence = dropped.sequence
+                    case .terminated:
+                        break
+                    @unknown default:
+                        break
+                    }
+                }
+                start = end
+            }
+        }
+
+        func finish() {
+            lock.withLock { continuation.finish() }
+        }
+
+        func state() -> OutputBufferState {
+            lock.withLock {
+                OutputBufferState(
+                    stats: OutputBufferStats(
+                        chunkByteLimit: AcpTerminalHost.outputStreamChunkByteLimit,
+                        bufferedChunkLimit: AcpTerminalHost.outputStreamBufferedChunkLimit,
+                        bufferedByteCeiling: AcpTerminalHost.outputStreamBufferedByteCeiling,
+                        peakBufferedChunks: peakBufferedChunks,
+                        droppedChunks: droppedChunks,
+                        droppedBytes: droppedBytes
+                    ),
+                    latestDroppedSequence: latestDroppedSequence
+                )
+            }
+        }
+
+        private static func saturatingAdd(_ lhs: UInt64, _ rhs: UInt64) -> UInt64 {
+            let (sum, overflow) = lhs.addingReportingOverflow(rhs)
+            return overflow ? .max : sum
+        }
     }
 
     private final class Entry {
         let process: Process
-        var buffer = Data()
-        var truncated = false
-        var byteLimit: Int
+        let outputReadHandle: FileHandle
+        var buffer: SegmentedOutputTail
         var exitStatus: ExitStatus?
-        /// Exit reported by the termination handler, held until the pipe drains
-        /// so `wait_for_exit` can never resolve ahead of the final output.
-        var pendingExit: ExitStatus?
-        /// The pipe itself reported EOF: the child and every descendant that
-        /// inherited the write end are done writing.
-        var eofReached = false
-        /// A separate fact from EOF: the child exited and a descendant still
-        /// held the write end when the grace period ran out. Output ends here
-        /// because we stop trusting it, not because the writer finished.
-        var outputDetached = false
-        /// Closed at `finish`, so no byte can join the buffer behind an exit a
-        /// `wait_for_exit` caller has already seen.
-        var outputSealed = false
+        /// Direct-child exit is recorded separately from pipe EOF because a
+        /// descendant may keep the inherited write end alive.
+        var directChildExit: ExitStatus?
+        var outputState: OutputState = .running
+        var pipeEOFReached = false
+        var pipeDrainTimeoutTask: Task<Void, Never>?
+        var killEscalationTask: Task<Void, Never>?
+        var killStatus: KillStatus?
         var released = false
         var waiters: [CheckedContinuation<ExitStatus, Never>] = []
+        var outcomeWaiters: [CheckedContinuation<WaitOutcome, Never>] = []
+        let outputStreamBuffer: OutputStreamBuffer
+        /// Chunks at or below this sequence precede a stream overflow and can
+        /// no longer be part of the contiguous retained suffix.
+        var minimumRetainedSequence: UInt64 = 0
 
-        init(process: Process, byteLimit: Int) {
+        init(
+            process: Process,
+            outputReadHandle: FileHandle,
+            byteLimit: Int,
+            outputStreamBuffer: OutputStreamBuffer
+        ) {
             self.process = process
-            self.byteLimit = byteLimit
+            self.outputReadHandle = outputReadHandle
+            self.buffer = SegmentedOutputTail(byteLimit: byteLimit)
+            self.outputStreamBuffer = outputStreamBuffer
         }
     }
 
     private var entries: [String: Entry] = [:]
     private var counter = 0
+    private let descendantPipeDrainTimeoutNanoseconds: UInt64
+    private let sigkillEscalationDelayNanoseconds: UInt64
+    private let sigkillRetryDelayNanoseconds: UInt64
+    private let signalSender: SignalSender
+
+    init(
+        descendantPipeDrainTimeoutNanoseconds: UInt64 =
+            AcpTerminalHost.defaultDescendantPipeDrainTimeoutNanoseconds,
+        sigkillEscalationDelayNanoseconds: UInt64 =
+            AcpTerminalHost.defaultSIGKILLEscalationDelayNanoseconds,
+        sigkillRetryDelayNanoseconds: UInt64 = AcpTerminalHost.sigkillRetryDelayNanoseconds,
+        signalSender: @escaping SignalSender = AcpTerminalHost.systemSignalSender
+    ) {
+        self.descendantPipeDrainTimeoutNanoseconds = descendantPipeDrainTimeoutNanoseconds
+        self.sigkillEscalationDelayNanoseconds = sigkillEscalationDelayNanoseconds
+        self.sigkillRetryDelayNanoseconds = sigkillRetryDelayNanoseconds
+        self.signalSender = signalSender
+    }
 
     /// Spawn a command. `env` pairs overlay the app environment; a relative or
     /// missing cwd is the caller's responsibility (the client confines it to the
@@ -100,8 +460,14 @@ actor AcpTerminalHost {
         process.standardError = pipe
         process.standardInput = FileHandle.nullDevice
 
+        let (outputStream, outputStreamBuffer) = Self.makeOutputStream()
         let requestedLimit = outputByteLimit ?? Self.defaultOutputByteLimit
-        let entry = Entry(process: process, byteLimit: min(max(1, requestedLimit), Self.maxOutputByteLimit))
+        let entry = Entry(
+            process: process,
+            outputReadHandle: pipe.fileHandleForReading,
+            byteLimit: min(max(1, requestedLimit), Self.maxOutputByteLimit),
+            outputStreamBuffer: outputStreamBuffer
+        )
         entries[id] = entry
 
         // FileHandle may call the readability handler once with bytes and then
@@ -109,24 +475,19 @@ actor AcpTerminalHost {
         // lets the EOF task overtake the final append on a busy executor. Feed
         // one AsyncStream instead: its single consumer commits every chunk in
         // callback order, then marks EOF only after the buffer is fully drained.
-        let (outputStream, outputContinuation) = AsyncStream<OutputEvent>.makeStream()
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty {
                 handle.readabilityHandler = nil
-                outputContinuation.finish()
+                try? handle.close()
+                outputStreamBuffer.finish()
                 return
             }
-            outputContinuation.yield(.chunk(data))
+            outputStreamBuffer.yield(data)
         }
         Task { [weak self] in
-            for await event in outputStream {
-                switch event {
-                case .chunk(let data):
-                    await self?.append(id: id, data: data)
-                case .exitGraceExpired:
-                    await self?.markOutputDetached(id: id)
-                }
+            for await chunk in outputStream {
+                await self?.append(id: id, chunk: chunk)
             }
             await self?.markEOF(id: id)
         }
@@ -136,19 +497,14 @@ actor AcpTerminalHost {
                 ? ExitStatus(exitCode: nil, signal: Self.signalNames[finished.terminationStatus] ?? "SIG\(finished.terminationStatus)")
                 : ExitStatus(exitCode: finished.terminationStatus, signal: nil)
             Task { await self.recordExit(id: id, status: status) }
-            // A grandchild that inherited the pipe can hold it open long past
-            // the child's exit. Don't hold exit waiters hostage — after a grace
-            // period the output is declared detached instead of complete.
-            DispatchQueue.global().asyncAfter(deadline: .now() + Self.lingeringOutputGrace) {
-                outputContinuation.yield(.exitGraceExpired)
-            }
         }
 
         do {
             try process.run()
         } catch {
             pipe.fileHandleForReading.readabilityHandler = nil
-            outputContinuation.finish()
+            try? pipe.fileHandleForReading.close()
+            outputStreamBuffer.finish()
             entries[id] = nil
             throw error
         }
@@ -157,11 +513,14 @@ actor AcpTerminalHost {
 
     func output(_ id: String) -> Snapshot? {
         guard let entry = entries[id] else { return nil }
+        let bufferState = reconcileStreamOverflow(entry)
         return Snapshot(
-            output: String(decoding: entry.buffer, as: UTF8.self),
-            truncated: entry.truncated,
+            output: String(decoding: entry.buffer.materialized(), as: UTF8.self),
+            truncated: entry.buffer.truncated || entry.outputState == .descendantTimeout,
             exitStatus: entry.exitStatus,
-            outputDetached: entry.outputDetached
+            outputState: entry.outputState,
+            killStatus: entry.killStatus,
+            outputBufferStats: bufferState.stats
         )
     }
 
@@ -173,14 +532,48 @@ actor AcpTerminalHost {
         }
     }
 
+    /// ACP waiters need an actionable answer when a requested kill cannot be
+    /// delivered, but that failure is not an exit. The ordinary exit waiter
+    /// remains available for UI/tests that must await actual process death.
+    func waitForExitOutcome(_ id: String) async -> WaitOutcome? {
+        guard let entry = entries[id] else { return nil }
+        if let status = entry.exitStatus { return .exited(status) }
+        if let killStatus = entry.killStatus, killStatus.state == .failed {
+            return .terminationFailed(killStatus)
+        }
+        return await withCheckedContinuation { continuation in
+            entry.outcomeWaiters.append(continuation)
+        }
+    }
+
     /// SIGTERM now, SIGKILL if the process lingers.
-    func kill(_ id: String) {
-        guard let entry = entries[id], entry.exitStatus == nil, entry.process.isRunning else { return }
+    @discardableResult
+    func kill(_ id: String) -> KillStatus? {
+        guard let entry = entries[id] else { return nil }
+        guard entry.exitStatus == nil, entry.directChildExit == nil,
+              entry.process.isRunning else { return entry.killStatus }
         let pid = entry.process.processIdentifier
         entry.process.terminate()
-        DispatchQueue.global().asyncAfter(deadline: .now() + 3) { [weak self] in
-            Task { await self?.forceKillIfRunning(id: id, pid: pid) }
+        let requested = KillStatus(
+            state: .sigtermRequested,
+            attempts: 0,
+            errorNumber: nil,
+            message: "SIGTERM requested; SIGKILL will follow if the process is still running.",
+            retryable: true,
+            processMayBeRunning: true
+        )
+        entry.killStatus = requested
+        entry.killEscalationTask?.cancel()
+        let delay = sigkillEscalationDelayNanoseconds
+        entry.killEscalationTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
+                return
+            }
+            await self?.forceKillIfRunning(id: id, pid: pid)
         }
+        return requested
     }
 
     /// Invalidate the id; a still-running process is killed first.
@@ -189,7 +582,14 @@ actor AcpTerminalHost {
         entry.released = true
         if entry.exitStatus == nil, entry.process.isRunning {
             kill(id)
+        } else if entry.exitStatus == nil, entry.directChildExit != nil {
+            closeLingeringDescendantPipe(id: id, timedOut: false)
         } else {
+            entry.pipeDrainTimeoutTask?.cancel()
+            entry.killEscalationTask?.cancel()
+            entry.outputReadHandle.readabilityHandler = nil
+            try? entry.outputReadHandle.close()
+            entry.outputStreamBuffer.finish()
             entries[id] = nil
         }
     }
@@ -200,65 +600,240 @@ actor AcpTerminalHost {
 
     // MARK: - Internal
 
-    private func append(id: String, data: Data) {
-        // A sealed buffer belongs to an exit that callers have already been
-        // told about; a lingering descendant's late bytes are dropped here.
-        guard let entry = entries[id], !entry.outputSealed else { return }
-        entry.buffer.append(data)
-        if entry.buffer.count > entry.byteLimit {
-            // Keep the tail on a UTF-8 boundary so decoding stays clean.
-            var dropCount = entry.buffer.count - entry.byteLimit
-            while dropCount < entry.buffer.count,
-                  entry.buffer[entry.buffer.startIndex + dropCount] & 0xC0 == 0x80 {
-                dropCount += 1
-            }
-            entry.buffer.removeFirst(dropCount)
-            entry.truncated = true
-        }
+    private func append(id: String, chunk: OutputChunk) {
+        guard let entry = entries[id] else { return }
+        _ = reconcileStreamOverflow(entry)
+        guard chunk.sequence >= entry.minimumRetainedSequence else { return }
+
+        entry.buffer.append(chunk.data)
     }
 
-    /// Exit lands here first; it only becomes visible once the output ended —
-    /// by EOF, or by detaching from a descendant that outlived the child — so
-    /// `terminal/output` after `wait_for_exit` never grows afterwards.
+    /// Applies stream drops before exposing or appending output. Clearing the
+    /// already-consumed prefix keeps snapshots a contiguous suffix rather than
+    /// concatenating bytes from opposite sides of an overflow gap.
+    private func reconcileStreamOverflow(_ entry: Entry) -> OutputBufferState {
+        let state = entry.outputStreamBuffer.state()
+        guard let latestDropped = state.latestDroppedSequence,
+              latestDropped >= entry.minimumRetainedSequence else {
+            return state
+        }
+        entry.buffer.discardForDiscontinuity()
+        entry.minimumRetainedSequence = latestDropped == .max ? .max : latestDropped + 1
+        return state
+    }
+
+    /// Direct-child exit lands here first. It only becomes the terminal's final
+    /// status once the independently-owned output pipe reaches real EOF.
     private func recordExit(id: String, status: ExitStatus) {
         guard let entry = entries[id] else { return }
-        entry.pendingExit = status
-        if entry.eofReached || entry.outputDetached { finish(id: id, entry: entry) }
+        entry.killEscalationTask?.cancel()
+        entry.killEscalationTask = nil
+        entry.directChildExit = status
+        if entry.pipeEOFReached {
+            entry.outputState = .complete
+            finish(id: id, entry: entry)
+            return
+        }
+
+        entry.outputState = .drainingDescendants
+        if entry.released {
+            closeLingeringDescendantPipe(id: id, timedOut: false)
+            return
+        }
+        entry.pipeDrainTimeoutTask?.cancel()
+        let timeout = descendantPipeDrainTimeoutNanoseconds
+        entry.pipeDrainTimeoutTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: timeout)
+            } catch {
+                return
+            }
+            await self?.closeLingeringDescendantPipe(id: id, timedOut: true)
+        }
     }
 
     private func markEOF(id: String) {
         guard let entry = entries[id] else { return }
-        entry.eofReached = true
-        if entry.pendingExit != nil { finish(id: id, entry: entry) }
+        entry.pipeEOFReached = true
+        entry.pipeDrainTimeoutTask?.cancel()
+        entry.pipeDrainTimeoutTask = nil
+        if entry.outputState != .descendantTimeout {
+            entry.outputState = entry.directChildExit == nil ? .pipeClosed : .complete
+        }
+        if entry.directChildExit != nil { finish(id: id, entry: entry) }
     }
 
-    /// The grace period ran out with the pipe still open, so a descendant of
-    /// the exited child holds the write end. Its later bytes keep being read —
-    /// a writer blocked on a full pipe would wedge a background process the
-    /// agent meant to keep alive — but `append` drops them from here on.
-    private func markOutputDetached(id: String) {
-        guard let entry = entries[id], !entry.eofReached else { return }
-        entry.outputDetached = true
-        if entry.pendingExit != nil { finish(id: id, entry: entry) }
+    /// Bound a descendant-held pipe by actually closing the read end. Merely
+    /// pretending EOF would leave the readability callback able to append
+    /// after `wait_for_exit` resolves. Finishing the stream here makes its
+    /// single consumer the final ordering barrier.
+    private func closeLingeringDescendantPipe(id: String, timedOut: Bool) {
+        guard let entry = entries[id], entry.exitStatus == nil,
+              entry.directChildExit != nil, !entry.pipeEOFReached else { return }
+        entry.pipeDrainTimeoutTask?.cancel()
+        entry.pipeDrainTimeoutTask = nil
+        if timedOut { entry.outputState = .descendantTimeout }
+        entry.outputReadHandle.readabilityHandler = nil
+        try? entry.outputReadHandle.close()
+        entry.outputStreamBuffer.finish()
     }
 
     private func finish(id: String, entry: Entry) {
-        guard entry.exitStatus == nil, let status = entry.pendingExit else { return }
+        guard entry.exitStatus == nil, entry.pipeEOFReached,
+              let status = entry.directChildExit else { return }
         entry.exitStatus = status
-        // The snapshot a caller reads after `wait_for_exit` has to be the one
-        // the exit was reported against, so the buffer closes with it.
-        entry.outputSealed = true
         for waiter in entry.waiters { waiter.resume(returning: status) }
         entry.waiters.removeAll()
+        for waiter in entry.outcomeWaiters { waiter.resume(returning: .exited(status)) }
+        entry.outcomeWaiters.removeAll()
         if entry.released { entries[id] = nil }
     }
 
-    private func forceKillIfRunning(id: String, pid: Int32) {
-        guard let entry = entries[id], entry.exitStatus == nil else { return }
-        _ = Darwin.kill(pid, SIGKILL)
+    private func forceKillIfRunning(id: String, pid: Int32) async {
+        let startedAt = DispatchTime.now().uptimeNanoseconds
+        let (sum, overflow) = startedAt.addingReportingOverflow(
+            Self.maximumSIGKILLRetryWindowNanoseconds
+        )
+        let retryDeadline = overflow ? UInt64.max : sum
+        for attempt in 1...Self.maximumSIGKILLAttempts {
+            guard let entry = entries[id], entry.exitStatus == nil,
+                  entry.directChildExit == nil, entry.process.isRunning,
+                  entry.process.processIdentifier == pid else { return }
+            if attempt > 1, DispatchTime.now().uptimeNanoseconds >= retryDeadline {
+                recordKillFailure(
+                    entry,
+                    errorNumber: EINTR,
+                    attempts: attempt - 1,
+                    message: "SIGKILL retry window expired after \(attempt - 1) attempts (EINTR); the process may still be running. Retry terminal/kill."
+                )
+                return
+            }
+
+            switch signalSender(pid, SIGKILL) {
+            case .sent:
+                entry.killStatus = KillStatus(
+                    state: .sigkillSent,
+                    attempts: attempt,
+                    errorNumber: nil,
+                    message: "SIGKILL was delivered; waiting for the process exit notification.",
+                    retryable: false,
+                    processMayBeRunning: true
+                )
+                return
+            case .failed(errorNumber: ESRCH):
+                // ESRCH commonly means exit won the race. Never synthesize an
+                // exit: retain the entry until Process confirms termination.
+                entry.killStatus = KillStatus(
+                    state: .reconcilingExit,
+                    attempts: attempt,
+                    errorNumber: ESRCH,
+                    message: "SIGKILL found no process (ESRCH); waiting for the process exit notification.",
+                    retryable: false,
+                    processMayBeRunning: false
+                )
+                return
+            case .failed(errorNumber: EINTR) where attempt < Self.maximumSIGKILLAttempts:
+                entry.killStatus = KillStatus(
+                    state: .sigkillRetrying,
+                    attempts: attempt,
+                    errorNumber: EINTR,
+                    message: "SIGKILL was interrupted (EINTR); retrying within the bounded escalation window.",
+                    retryable: true,
+                    processMayBeRunning: true
+                )
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard now < retryDeadline else {
+                    recordKillFailure(
+                        entry,
+                        errorNumber: EINTR,
+                        attempts: attempt,
+                        message: "SIGKILL retry window expired after \(attempt) attempts (EINTR); the process may still be running. Retry terminal/kill."
+                    )
+                    return
+                }
+                let delay = min(sigkillRetryDelayNanoseconds, retryDeadline - now)
+                do {
+                    try await Task.sleep(nanoseconds: delay)
+                } catch {
+                    return
+                }
+            case let .failed(errorNumber):
+                let exhausted = errorNumber == EINTR
+                let message = exhausted
+                    ? "SIGKILL remained interrupted after \(attempt) attempts (EINTR); the process may still be running. Retry terminal/kill."
+                    : "SIGKILL failed with \(Self.errnoName(errorNumber)) (errno \(errorNumber)); the process may still be running. Check permissions, then retry terminal/kill."
+                recordKillFailure(
+                    entry,
+                    errorNumber: errorNumber,
+                    attempts: attempt,
+                    message: message
+                )
+                return
+            }
+        }
+    }
+
+    private func recordKillFailure(
+        _ entry: Entry,
+        errorNumber: Int32,
+        attempts: Int,
+        message: String
+    ) {
+        let failure = KillStatus(
+            state: .failed,
+            attempts: attempts,
+            errorNumber: errorNumber,
+            message: message,
+            retryable: false,
+            processMayBeRunning: true
+        )
+        entry.killStatus = failure
+        for waiter in entry.outcomeWaiters {
+            waiter.resume(returning: .terminationFailed(failure))
+        }
+        entry.outcomeWaiters.removeAll()
+    }
+
+    func processIdentifierForTesting(_ id: String) -> Int32? {
+        entries[id]?.process.processIdentifier
+    }
+
+    func forceKillForTesting(_ id: String) async {
+        guard let pid = entries[id]?.process.processIdentifier else { return }
+        await forceKillIfRunning(id: id, pid: pid)
+    }
+
+    nonisolated static func systemSignalSender(
+        pid: Int32,
+        signal: Int32
+    ) -> SignalDeliveryResult {
+        if Darwin.kill(pid, signal) == 0 { return .sent }
+        return .failed(errorNumber: errno)
+    }
+
+    nonisolated private static func errnoName(_ errorNumber: Int32) -> String {
+        switch errorNumber {
+        case EINTR: "EINTR"
+        case ESRCH: "ESRCH"
+        case EPERM: "EPERM"
+        case EINVAL: "EINVAL"
+        default: "POSIX error"
+        }
     }
 
     private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+
+    /// Internal seam used by the host and by deterministic backlog stress
+    /// tests. The newest elements survive overflow, matching tail semantics.
+    static func makeOutputStream() -> (
+        stream: AsyncStream<OutputChunk>,
+        buffer: OutputStreamBuffer
+    ) {
+        let pair = AsyncStream<OutputChunk>.makeStream(
+            bufferingPolicy: .bufferingNewest(outputStreamBufferedChunkLimit)
+        )
+        return (pair.stream, OutputStreamBuffer(continuation: pair.continuation))
     }
 }

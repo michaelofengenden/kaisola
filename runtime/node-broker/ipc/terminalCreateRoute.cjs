@@ -2,7 +2,24 @@
 
 const os = require('node:os')
 
-const MAX_TERMINAL_ID_LENGTH = 240
+// Terminal ids are caller-controlled authorization keys. Truncating an
+// overlong value aliases every id sharing that prefix onto the same terminal
+// and ownership record, so the cap is validation rather than formatting.
+const TERMINAL_ID_MAX_LENGTH = 240
+
+function terminalIdLengthRejection(id) {
+  if (id.length <= TERMINAL_ID_MAX_LENGTH) return null
+  return {
+    ok: false,
+    code: 'terminal_id_too_long',
+    message: `terminal id exceeds ${TERMINAL_ID_MAX_LENGTH} characters`,
+    // Keep the established #577 wire fields stable while sharing the verdict
+    // with every follow-on terminal route.
+    maxLength: TERMINAL_ID_MAX_LENGTH,
+    actualLength: id.length,
+  }
+}
+
 const TERMINAL_CREATE_LIMITS = Object.freeze({
   argumentCount: 200,
   argumentBytes: 16 * 1024,
@@ -295,15 +312,8 @@ function terminalCreateRoute({
 }) {
   const id = String(params.id || '')
   if (!id) return { ok: false, message: 'terminal id required' }
-  if (id.length > MAX_TERMINAL_ID_LENGTH) {
-    return {
-      ok: false,
-      code: 'terminal_id_too_long',
-      message: `terminal id exceeds ${MAX_TERMINAL_ID_LENGTH} characters`,
-      maxLength: MAX_TERMINAL_ID_LENGTH,
-      actualLength: id.length,
-    }
-  }
+  const idRejection = terminalIdLengthRejection(id)
+  if (idRejection) return idRejection
   const args = validatedArguments(params.args)
   if (!args.ok) return args
   const env = validatedEnvironment(params.env)
@@ -364,9 +374,11 @@ function terminalCreateRoute({
 module.exports = {
   terminalAttachRoute,
   terminalCreateRoute,
+  terminalIdLengthRejection,
   terminalKillRoute,
   terminalResizeRoute,
   validatedTerminalGeometry,
+  TERMINAL_ID_MAX_LENGTH,
   TERMINAL_CREATE_LIMITS,
   TERMINAL_GEOMETRY_LIMITS,
 }

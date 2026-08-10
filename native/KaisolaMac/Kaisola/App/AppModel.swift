@@ -3,6 +3,11 @@ import Combine
 import Foundation
 import KaisolaBrokerProtocol
 
+struct TerminalPasteProgress: Equatable, Sendable {
+    let sentBytes: Int
+    let totalBytes: Int
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     struct MissingSessionRecovery: Equatable, Sendable {
@@ -150,13 +155,16 @@ final class AppModel: ObservableObject {
         let kind: Kind
         let closedAt: Int64
     }
-    /// Project-scoped card geometry shared by terminals, ACP chats, and Mesh.
-    /// A column is horizontal; ids inside a column stack vertically.
-    @Published private(set) var paneLayouts: [String: SessionPaneLayout] = [:]
-    @Published private(set) var focusedPaneID: String?
-    @Published private(set) var keyboardFocusRequest: SurfaceKeyboardFocusRequest?
-    @Published private(set) var maximizedPaneID: String?
-    private var keyboardFocusGeneration: UInt64 = 0
+    /// Focused state machine for project-scoped terminal, chat, and Mesh cards.
+    /// AppModel coordinates async owners; synchronous card transitions live in
+    /// one explicit value API instead of being repeated across lifecycle code.
+    @Published private var unifiedSessionCards = UnifiedSessionCardState()
+    var paneLayouts: [String: SessionPaneLayout] { unifiedSessionCards.layouts }
+    var focusedPaneID: String? { unifiedSessionCards.focusedPaneID }
+    var keyboardFocusRequest: SurfaceKeyboardFocusRequest? {
+        unifiedSessionCards.keyboardFocusRequest
+    }
+    var maximizedPaneID: String? { unifiedSessionCards.maximizedPaneID }
     /// The project tab shown in the top-bar layout. Nil means the first project.
     @Published var selectedProjectName: String?
     /// Stable project identity used by interactive tabs/headers. Names are user
@@ -268,7 +276,11 @@ final class AppModel: ObservableObject {
     private let cursorStore: TerminalCursorStore
     private let workspaceStateStore: NativeWorkspaceStateStore
     private let transcriptStore: AcpTranscriptStore
+    /// Shared launch gate and recovery truth observed by the workspace and
+    /// Settings surfaces.
+    let projectAccountRecoveryCenter: ProjectAccountRecoveryCenter
     private let usageCenter: UsageCenter
+    private let usageAccountStore: UsageAccountStore
     private let attentionCenter: AttentionCenter
     private let chatDraftDefaults: UserDefaults
     private let migratedChatDraftDefaults: UserDefaults?
@@ -305,6 +317,8 @@ final class AppModel: ObservableObject {
         let data: String
         let opensAgentTurn: Bool
         let generation: UInt64
+        let pasteGeneration: UInt64?
+        let byteCount: Int
     }
     private var terminalInputQueues: [String: [PendingTerminalInput]] = [:]
     private var terminalInputDrainTasks: [String: Task<Void, Never>] = [:]
@@ -312,6 +326,13 @@ final class AppModel: ObservableObject {
     /// generation must never drain after that capability disappears and a
     /// later controller reattaches to the same PTY.
     private var terminalInputGenerations: [String: UInt64] = [:]
+    /// Keep individual broker writes below the documented node-pty boundary.
+    /// Ordinary keystrokes stay one packet; an intentional large paste is
+    /// streamed in UTF-8-safe chunks and exposes acknowledged progress.
+    nonisolated static let terminalWritePayloadByteLimit = BrokerWire.terminalWritePayloadBytes
+    private var nextTerminalPasteGeneration: UInt64 = 0
+    private var terminalPasteGenerationByTerminalID: [String: UInt64] = [:]
+    @Published private(set) var terminalPasteProgressByTerminalID: [String: TerminalPasteProgress] = [:]
     static let terminalInputDiscardNoticeSuffix =
         ": unsent input was discarded. Try again after input reconnects."
     static let terminalInputDiscardAggregateNotice =
@@ -393,9 +414,11 @@ final class AppModel: ObservableObject {
         cursorStore: TerminalCursorStore = TerminalCursorStore(fileURL: NativePreviewPaths.terminalCursorStore),
         workspaceStateStore: NativeWorkspaceStateStore = .live,
         transcriptStore: AcpTranscriptStore = .live,
+        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = .shared,
         adoptionStore: SessionAdoptionStore = SessionAdoptionStore(),
         pinStore: SessionPinStore = SessionPinStore(),
         usageCenter: UsageCenter = .shared,
+        usageAccountStore: UsageAccountStore = UsageAccountStore(),
         attentionCenter: AttentionCenter = .shared,
         chatDraftDefaults: UserDefaults = .standard,
         migratedChatDraftDefaults: UserDefaults? = UserDefaults(
@@ -418,9 +441,11 @@ final class AppModel: ObservableObject {
         self.cursorStore = cursorStore
         self.workspaceStateStore = workspaceStateStore
         self.transcriptStore = transcriptStore
+        self.projectAccountRecoveryCenter = projectAccountRecoveryCenter
         self.adoptionStore = adoptionStore
         self.pinStore = pinStore
         self.usageCenter = usageCenter
+        self.usageAccountStore = usageAccountStore
         self.attentionCenter = attentionCenter
         self.chatDraftDefaults = chatDraftDefaults
         self.migratedChatDraftDefaults = migratedChatDraftDefaults
@@ -447,6 +472,18 @@ final class AppModel: ObservableObject {
         persistedSessionAliases = navigation.sessionAliases
         reloadPersistedPins()
         sessionAdoptions = adoptionStore.adoptions()
+        observeChatAccountAvailability()
+        transcriptPersistenceHealthTask = Task { [weak self, transcriptStore] in
+            let updates = await transcriptStore.persistenceHealthUpdates()
+            for await update in updates {
+                guard !Task.isCancelled else { return }
+                self?.applyTranscriptPersistenceHealth(update)
+            }
+        }
+    }
+
+    deinit {
+        transcriptPersistenceHealthTask?.cancel()
     }
 
     /// Installed visual receipts assert this concrete no-launch route rather
@@ -458,10 +495,16 @@ final class AppModel: ObservableObject {
     /// Keeps each chat's usage observers alive only while that chat exists.
     /// Keying by id avoids retaining closed conversations and stale Usage rows.
     private var usageObservers: [String: Set<AnyCancellable>] = [:]
+    /// Account registry/auth changes can invalidate an adapter while its pane
+    /// remains open. Keep those non-destructive replacements alive through
+    /// window teardown, one ordered task per affected chat.
+    private var chatAccountInvalidationTasks: [String: Task<Void, Never>] = [:]
+    private var chatAccountObservers = Set<AnyCancellable>()
     private let usageSourceID = UUID().uuidString.lowercased()
     /// Serializes transcript actor enqueues so an immediate quit cannot overtake
     /// the final streaming row or an explicit chat removal.
     private var transcriptPersistenceTask: Task<Void, Never>?
+    private var transcriptPersistenceHealthTask: Task<Void, Never>?
     /// A closed chat is a tombstone for as long as buffered ACP events can
     /// still drain while the child process stops; those must not be allowed to
     /// enqueue a transcript write after the explicit deletion. Bounded by
@@ -492,7 +535,6 @@ final class AppModel: ObservableObject {
     /// they finish (or until window teardown awaits them) so application
     /// termination cannot strand child adapters.
     private let chatShutdownTasks = ShutdownTaskRegistry()
-    private var meshShutdownTasks: [String: Task<Void, Never>] = [:]
     /// A durable Mesh may be restored by only one window model at a time.
     /// Main-actor isolation makes this a process-wide claim without locks.
     private static var claimedRestoredMeshIDs: Set<String> = []
@@ -810,13 +852,12 @@ final class AppModel: ObservableObject {
     // MARK: - Unified session cards
 
     func paneLayout(for projectID: String?) -> SessionPaneLayout {
-        guard let projectID else { return SessionPaneLayout() }
-        return paneLayouts[projectID] ?? SessionPaneLayout()
+        unifiedSessionCards.layout(for: projectID)
     }
 
     func isSurfaceVisible(_ id: String) -> Bool {
         guard let projectID = projectID(forSurface: id) else { return false }
-        return paneLayouts[projectID]?.contains(id) == true
+        return unifiedSessionCards.contains(id, in: projectID)
     }
 
     /// Window-aware notification routing asks each model before mutating it.
@@ -833,11 +874,7 @@ final class AppModel: ObservableObject {
     /// Normal navigation focuses a card already in the dock; a hidden card
     /// replaces only the primary slot. Explicit "open beside" is separate.
     private func focusPane(_ id: String, projectID: String) {
-        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-        layout.focus(id)
-        paneLayouts[projectID] = layout
-        focusedPaneID = id
-        maximizedPaneID = nil
+        unifiedSessionCards.focus(id, in: projectID)
         scheduleWorkspaceStateSave(projectID: projectID)
     }
 
@@ -865,11 +902,7 @@ final class AppModel: ObservableObject {
         if isTerminal {
             splitIntentTokens[id] = UUID()
         }
-        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-        layout.add(id)
-        paneLayouts[projectID] = layout
-        focusedPaneID = id
-        maximizedPaneID = nil
+        unifiedSessionCards.revealBeside(id, in: projectID)
         focusSurfaceFields(id)
         requestSurfaceKeyboardFocus(id)
         // Opening a card beside the current one is a visit, exactly like
@@ -887,18 +920,17 @@ final class AppModel: ObservableObject {
     func placeSurface(_ id: String, relativeTo targetID: String, edge: SessionPaneLayout.Edge) {
         guard let projectID = projectID(forSurface: targetID),
               self.projectID(forSurface: id) == projectID else { return }
-        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-        layout.place(id, relativeTo: targetID, edge: edge)
-        paneLayouts[projectID] = layout
-        focusedPaneID = id
-        maximizedPaneID = nil
+        unifiedSessionCards.place(id, relativeTo: targetID, edge: edge, in: projectID)
         scheduleWorkspaceStateSave(projectID: projectID)
     }
 
     func resizePaneColumns(projectID: String, boundary: Int, delta: Double, minimumWeight: Double) {
-        guard var layout = paneLayouts[projectID] else { return }
-        layout.resizeColumns(boundary: boundary, delta: delta, minimumWeight: minimumWeight)
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.resizeColumns(
+            in: projectID,
+            boundary: boundary,
+            delta: delta,
+            minimumWeight: minimumWeight
+        )
     }
 
     func resizePaneRows(
@@ -908,14 +940,13 @@ final class AppModel: ObservableObject {
         delta: Double,
         minimumWeight: Double
     ) {
-        guard var layout = paneLayouts[projectID] else { return }
-        layout.resizeRows(
+        unifiedSessionCards.resizeRows(
+            in: projectID,
             columnID: columnID,
             boundary: boundary,
             delta: delta,
             minimumWeight: minimumWeight
         )
-        paneLayouts[projectID] = layout
     }
 
     func finishPaneResize(projectID: String) {
@@ -923,36 +954,29 @@ final class AppModel: ObservableObject {
     }
 
     func resetPaneColumns(projectID: String) {
-        guard var layout = paneLayouts[projectID] else { return }
-        layout.resetColumnWeights()
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.resetColumns(in: projectID)
         scheduleWorkspaceStateSave(projectID: projectID)
     }
 
     func resetPaneRows(projectID: String, columnID: String) {
-        guard var layout = paneLayouts[projectID] else { return }
-        layout.resetRowWeights(columnID: columnID)
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.resetRows(in: projectID, columnID: columnID)
         scheduleWorkspaceStateSave(projectID: projectID)
     }
 
     func toggleMaximizeSurface(_ id: String) {
-        maximizedPaneID = maximizedPaneID == id ? nil : id
-        focusedPaneID = id
+        unifiedSessionCards.toggleMaximize(id)
     }
 
     func minimizeSurface(_ id: String) async {
-        guard let projectID = projectID(forSurface: id), var layout = paneLayouts[projectID] else { return }
+        guard let projectID = projectID(forSurface: id),
+              paneLayouts[projectID] != nil else { return }
         if sessions.contains(where: { $0.id == id }) {
             splitIntentTokens[id] = UUID()
         }
-        layout.remove(id)
-        paneLayouts[projectID] = layout
+        guard let layout = unifiedSessionCards.remove(id, from: projectID) else { return }
         if sessions.contains(where: { $0.id == id }), id != selectedSessionID {
             await unsubscribeSplit(id)
         }
-        if focusedPaneID == id { focusedPaneID = layout.sessionIDs.first }
-        if maximizedPaneID == id { maximizedPaneID = nil }
         if selectedChatID == id { selectedChatID = nil }
         if selectedMeshID == id { selectedMeshID = nil }
         if selectedSessionID == id {
@@ -1005,12 +1029,7 @@ final class AppModel: ObservableObject {
             }
             sessionAdoptions[terminalID] = projectID
         }
-        var source = paneLayouts[previousDisplay] ?? SessionPaneLayout()
-        source.remove(terminalID)
-        paneLayouts[previousDisplay] = source
-        var target = paneLayouts[projectID] ?? SessionPaneLayout()
-        if !target.contains(terminalID) { target.add(terminalID) }
-        paneLayouts[projectID] = target
+        unifiedSessionCards.move(terminalID, from: previousDisplay, to: projectID)
         if let project = projects.first(where: { $0.id == projectID }) {
             selectedProjectID = project.id
             selectedProjectName = project.name
@@ -1056,11 +1075,7 @@ final class AppModel: ObservableObject {
     /// and Mesh consume the generation through SwiftUI `FocusState`; terminals
     /// keep their AppKit first-responder bridge.
     private func requestSurfaceKeyboardFocus(_ id: String) {
-        keyboardFocusGeneration &+= 1
-        keyboardFocusRequest = SurfaceKeyboardFocusRequest(
-            targetID: id,
-            generation: keyboardFocusGeneration
-        )
+        unifiedSessionCards.requestKeyboardFocus(for: id)
         if sessions.contains(where: { $0.id == id }) {
             TerminalKeyboardFocus.moveFirstResponder(toSessionID: id)
         }
@@ -1135,7 +1150,6 @@ final class AppModel: ObservableObject {
             await subscribeSplit(previousID)
         }
         focusPane(id, projectID: record.projectID)
-        focusedPaneID = id
     }
 
     /// Switch the top-level workspace context by stable id, then restore a real
@@ -1206,8 +1220,6 @@ final class AppModel: ObservableObject {
         for projectID: String,
         persist: Bool
     ) -> Bool {
-        guard var layout = paneLayouts[projectID] else { return false }
-        let previous = layout
         // Dormant terminals stay: their PTYs died with the broker, but the
         // panes are resurrection targets, not garbage.
         let available = Set(
@@ -1215,17 +1227,10 @@ final class AppModel: ObservableObject {
         ).union(chats(in: projectID).map(\.id))
             .union(meshes(in: projectID).map(\.id))
             .union(dormantTerminalIDs(in: projectID))
-        layout.normalize(availableSessionIDs: available)
-        guard layout != previous else { return false }
-
-        let removed = Set(previous.sessionIDs).subtracting(layout.sessionIDs)
-        paneLayouts[projectID] = layout
-        if let focusedPaneID, removed.contains(focusedPaneID) {
-            self.focusedPaneID = layout.sessionIDs.first
-        }
-        if let maximizedPaneID, removed.contains(maximizedPaneID) {
-            self.maximizedPaneID = nil
-        }
+        guard unifiedSessionCards.reconcile(
+            projectID,
+            availableSurfaceIDs: available
+        ) else { return false }
         if persist { scheduleWorkspaceStateSave(projectID: projectID) }
         return true
     }
@@ -2058,6 +2063,13 @@ final class AppModel: ObservableObject {
 
     var recentFolders: [String] { sessionStore.recentFolders() }
 
+    /// Remove a launch-history suggestion only. Open projects, files, and Git
+    /// worktrees remain untouched.
+    func removeRecentFolder(_ path: String) {
+        sessionStore.removeRecentFolder(path)
+        objectWillChange.send()
+    }
+
     func isOwned(_ terminalID: String) -> Bool {
         ownedTerminalIDs.contains(terminalID)
     }
@@ -2200,7 +2212,7 @@ final class AppModel: ObservableObject {
     /// overlay's persistence contract is provable without a relaunch.
     /// Test-only layout injection for close/quit races.
     func setPaneLayoutForTesting(_ layout: SessionPaneLayout, projectID: String) {
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.install(layout, for: projectID)
     }
 
     /// Test-only dormant marking (production sets this in restoreOwnedSessions).
@@ -2261,7 +2273,8 @@ final class AppModel: ObservableObject {
                 accountBinding: chat.accountBinding,
                 title: chat.conversation.title,
                 queuedPrompts: chat.conversation.queued.map(\.text),
-                modelOverride: chat.modelOverride
+                modelOverride: chat.modelOverride,
+                runProfile: chat.runProfile
             )
             panes.append(NativeRestorablePaneState(
                 id: chat.id,
@@ -2457,7 +2470,7 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func enqueueTranscriptSessionID(_ sessionID: String, chatID: String) {
+    private func enqueueTranscriptSessionID(_ sessionID: String?, chatID: String) {
         guard !explicitlyClosedChatIDs.contains(chatID) else { return }
         let previous = transcriptPersistenceTask
         let transcriptStore = transcriptStore
@@ -2511,6 +2524,39 @@ final class AppModel: ObservableObject {
     func flushTranscriptPersistence() async {
         await transcriptPersistenceTask?.value
         await transcriptStore.flush()
+    }
+
+    private func applyTranscriptPersistenceHealth(
+        _ update: AcpTranscriptStore.PersistenceHealthUpdate
+    ) {
+        chats.first(where: { $0.id == update.chatID })?
+            .conversation.applyTranscriptPersistenceHealth(update.health)
+    }
+
+    private func retryTranscriptPersistence(chatID: String) {
+        let transcriptStore = transcriptStore
+        Task { await transcriptStore.retryPersistence(chatID: chatID) }
+    }
+
+    /// Chats whose unreadable history has already been reported. One notice
+    /// per chat per launch: restoration, a Recently Closed reopen, and an
+    /// account or model switch can all read the same damaged transcript.
+    private var reportedUnreadableTranscriptIDs: Set<String> = []
+
+    /// Read a chat's stored tail. A chat with nothing saved and a chat whose
+    /// history is damaged or locked no longer look alike here: the second
+    /// surfaces the store's recovery guidance and still returns nil, because
+    /// the store refuses writes for it. The surface stays, and the history we
+    /// could not read is never replaced by the empty one this read produced.
+    private func restoredTranscript(
+        for chatID: String,
+        tailLimit: Int = AcpConversation.defaultVisibleLimit
+    ) async -> AcpTranscriptStore.Restoration? {
+        let outcome = await transcriptStore.restoration(for: chatID, tailLimit: tailLimit)
+        if let failure = outcome.failure, reportedUnreadableTranscriptIDs.insert(chatID).inserted {
+            ToastCenter.shared.show(failure.guidance, style: .error, duration: 8)
+        }
+        return outcome.restoration
     }
 
     private func wireMeshPersistence(_ mesh: MeshSession, recentlyClosed: Bool = false) {
@@ -2775,6 +2821,56 @@ final class AppModel: ObservableObject {
     /// restore actually succeeds, never merely because the banner was closed.
     @Published private(set) var workspaceRestorationNotice: WorkspaceRestorationNotice?
 
+    /// Resolve the environment overlay at the process-launch boundary. Missing
+    /// storage intentionally permits app defaults; every unsafe present-file
+    /// state raises the recovery surface and returns nil.
+    private func projectAccountOverlay(forProject projectID: String) -> [String: String]? {
+        let previousIssue = projectAccountRecoveryCenter.issue
+        switch projectAccountRecoveryCenter.launchOverlay(
+            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
+            forProject: projectID
+        ) {
+        case .success(let overlay):
+            return overlay
+        case .failure(let issue):
+            let isNew = previousIssue != issue
+            if isNew { ToastCenter.shared.show(issue.summary, style: .error, duration: 6) }
+            return nil
+        }
+    }
+
+    /// Re-read after the user repairs or replaces the account file. The launch
+    /// that was refused stays refused; success makes an explicit retry safe.
+    func retryProjectAccountRecovery() {
+        if projectAccountRecoveryCenter.retry() {
+            ToastCenter.shared.show("Project accounts are readable again", style: .success)
+        } else if let issue = projectAccountRecoveryCenter.issue {
+            ToastCenter.shared.show(issue.summary, style: .error, duration: 6)
+        }
+    }
+
+    func revealProjectAccountRecovery() {
+        guard let url = projectAccountRecoveryCenter.issue?.revealURL else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    /// Explicitly discard the active mapping only after the store has secured
+    /// the original bytes as a preserved copy (or can move the unreadable file
+    /// itself there atomically).
+    func resetProjectAccountsAfterFailure() {
+        do {
+            let preserved = try projectAccountRecoveryCenter.resetAfterFailure()
+            ToastCenter.shared.show(
+                "Reset project account overrides; kept \(preserved.lastPathComponent)",
+                style: .success,
+                duration: 6
+            )
+        } catch {
+            retryProjectAccountRecovery()
+            ToastCenter.shared.show(error.localizedDescription, style: .error, duration: 6)
+        }
+    }
+
     func restoreWorkspaceStateIfNeeded() async {
         guard !restoredWorkspaceState else { return }
         restoredWorkspaceState = true
@@ -2819,10 +2915,7 @@ final class AppModel: ObservableObject {
                 var isDirectory: ObjCBool = false
                 guard FileManager.default.fileExists(atPath: directory.path, isDirectory: &isDirectory),
                       isDirectory.boolValue else { continue }
-                let transcript = await transcriptStore.restoration(
-                    for: descriptor.id,
-                    tailLimit: AcpConversation.defaultVisibleLimit
-                )
+                let transcript = await restoredTranscript(for: descriptor.id)
                 let legacyDraft = try? await workspaceStateStore.draft(for: "chat|\(descriptor.id)")
                 let draft = transcript?.draft ?? legacyDraft
                 if transcript?.draft == nil, let legacyDraft, !legacyDraft.isEmpty {
@@ -2837,6 +2930,8 @@ final class AppModel: ObservableObject {
                     resumeSessionID: descriptor.acpSessionID ?? transcript?.sessionID,
                     accountBinding: descriptor.accountBinding,
                     modelOverride: descriptor.modelOverride,
+                    runProfile: descriptor.runProfile ?? .write,
+                    requiresAccountResolution: true,
                     initialTranscript: transcript,
                     initialDraft: draft,
                     initialQueuedPrompts: descriptor.queuedPrompts
@@ -2862,6 +2957,14 @@ final class AppModel: ObservableObject {
                     deferredMeshPanesByProject[descriptor.projectID, default: []].append(pane)
                     continue
                 }
+                guard let projectOverlay = projectAccountOverlay(
+                    forProject: descriptor.projectID
+                ) else {
+                    deferredMeshPanesByProject[descriptor.projectID, default: []].append(pane)
+                    continue
+                }
+                let environment = ProcessInfo.processInfo.environment
+                    .merging(projectOverlay) { _, custom in custom }
 
                 Self.claimedRestoredMeshIDs.insert(descriptor.id)
                 deferredMeshPanesByProject[descriptor.projectID]?.removeAll { $0.id == descriptor.id }
@@ -2885,10 +2988,7 @@ final class AppModel: ObservableObject {
 
                 var states: [MeshSession.RestoredColumnState] = []
                 for column in descriptor.columns {
-                    let transcript = await transcriptStore.restoration(
-                        for: column.id,
-                        tailLimit: AcpConversation.defaultVisibleLimit
-                    )
+                    let transcript = await restoredTranscript(for: column.id)
                     states.append(MeshSession.RestoredColumnState(
                         descriptor: column,
                         rows: transcript?.page.rows ?? [],
@@ -2901,13 +3001,19 @@ final class AppModel: ObservableObject {
                         usage: transcript?.usage
                     ))
                 }
-                let environment = ProcessInfo.processInfo.environment.merging(
-                    ProjectAccountStore.mergedOverlay(
-                        app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-                        project: ProjectAccountStore().override(forProject: descriptor.projectID)
-                    )
-                ) { _, custom in custom }
-                await mesh.restore(states: states, agents: AgentRegistry.all, environment: environment)
+                let restoreCompletion = await meshLifecycleCoordinator.restore(
+                    mesh,
+                    states: states,
+                    agents: AgentRegistry.all,
+                    environment: environment
+                )
+                guard restoreCompletion == .completed else {
+                    meshes.removeAll { $0.id == mesh.id }
+                    Self.claimedRestoredMeshIDs.remove(mesh.id)
+                    surfaceObservers.removeValue(forKey: mesh.id)?.cancel()
+                    meshLifecycleCoordinator.forget(meshID: mesh.id)
+                    continue
+                }
                 if mesh.lifecycle == .pendingDeletion,
                    mesh.restorationDescriptor.columns.isEmpty {
                     do {
@@ -2918,6 +3024,7 @@ final class AppModel: ObservableObject {
                         meshes.removeAll { $0.id == mesh.id }
                         Self.claimedRestoredMeshIDs.remove(mesh.id)
                         surfaceObservers.removeValue(forKey: mesh.id)?.cancel()
+                        meshLifecycleCoordinator.forget(meshID: mesh.id)
                         await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
                     } catch {
                         // Keep the empty pending-deletion recovery surface. A
@@ -2942,7 +3049,7 @@ final class AppModel: ObservableObject {
             } else {
                 layout.normalize()
             }
-            paneLayouts[projectState.projectID] = layout
+            unifiedSessionCards.install(layout, for: projectState.projectID)
             restoreFileTabs(from: projectState)
         }
 
@@ -2952,8 +3059,7 @@ final class AppModel: ObservableObject {
             selectedProjectName = project.name
             if let state = restoration.projects.first(where: { $0.projectID == projectID }),
                let focused = state.focusedPaneID,
-               paneLayouts[projectID]?.contains(focused) == true {
-                focusedPaneID = focused
+               unifiedSessionCards.restoreFocus(focused, in: projectID) {
                 if chats.contains(where: { $0.id == focused }) {
                     selectedChatID = focused
                     selectedMeshID = nil
@@ -3122,7 +3228,8 @@ final class AppModel: ObservableObject {
         _ agent: AgentProfile,
         inDirectory directory: URL,
         accountProfile: UsageAccountProfile? = nil,
-        initialDraft: String? = nil
+        initialDraft: String? = nil,
+        runProfile: AcpRunProfile? = nil
     ) {
         let project = sessionStore.openProject(directory: directory.path)
         refreshPersistedNavigationState(publish: false)
@@ -3136,10 +3243,7 @@ final class AppModel: ObservableObject {
             ToastCenter.shared.show(nudge, style: .info, duration: 6)
         }
         let chatID = "chat-\(UUID().uuidString.lowercased().prefix(8))"
-        let projectOverlay = ProjectAccountStore.mergedOverlay(
-            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-            project: ProjectAccountStore().override(forProject: project.id)
-        )
+        guard let projectOverlay = projectAccountOverlay(forProject: project.id) else { return }
         let effectiveAccountEnvironment = ProcessInfo.processInfo.environment
             .merging(projectOverlay) { _, configured in configured }
         // Custom agents bind by their *declared* credentials (review finding
@@ -3170,6 +3274,7 @@ final class AppModel: ObservableObject {
            ) {
             ToastCenter.shared.show(warning, style: .info, duration: 5)
         }
+        let runProfile = runProfile ?? AcpRunProfileStore().defaultProfile
         guard appendChat(
             id: chatID,
             agent: agent,
@@ -3177,6 +3282,8 @@ final class AppModel: ObservableObject {
             title: "\(agent.name) · \((directory.path as NSString).lastPathComponent)",
             resumeSessionID: nil,
             accountBinding: accountBinding,
+            modelOverride: runProfile.modelID,
+            runProfile: runProfile,
             initialTranscript: nil,
             initialDraft: initialDraft,
             initialQueuedPrompts: []
@@ -3195,6 +3302,9 @@ final class AppModel: ObservableObject {
         resumeSessionID: String?,
         accountBinding: SessionAccountBinding?,
         modelOverride: String? = nil,
+        runProfile: AcpRunProfile = .write,
+        accountAccess: ChatAccountAccess? = nil,
+        requiresAccountResolution: Bool = false,
         initialTranscript: AcpTranscriptStore.Restoration?,
         initialDraft: String?,
         initialQueuedPrompts: [String]
@@ -3216,15 +3326,14 @@ final class AppModel: ObservableObject {
             return normalized
         }()
         let projectID = NativeSessionStore.projectID(forDirectory: directory.path)
+        var runProfileSnapshot = runProfile
+        runProfileSnapshot.modelID = modelOverride ?? runProfile.modelID
         let mcp = McpConfigStore(workspace: directory).servers()
-        let baseEnvironment = ProcessInfo.processInfo.environment.merging(
-            ProjectAccountStore.mergedOverlay(
-                app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-                project: ProjectAccountStore().override(forProject: projectID)
-            )
-        ) { _, custom in custom }
+        guard let projectOverlay = projectAccountOverlay(forProject: projectID) else { return nil }
+        let baseEnvironment = ProcessInfo.processInfo.environment
+            .merging(projectOverlay) { _, custom in custom }
         var environment = SessionAccountBinding.applying(accountBinding, to: baseEnvironment)
-        environment = SessionModelOverride.applying(modelOverride, agentID: agent.id, to: environment)
+        environment = SessionModelOverride.applying(runProfileSnapshot.modelID, agentID: agent.id, to: environment)
         // The host marker — see the terminal spawn's twin assignment.
         environment["KAISOLA"] = "1"
         environment["KAISOLA_SESSION_ID"] = chatID
@@ -3233,6 +3342,11 @@ final class AppModel: ObservableObject {
         // provider thread preserves the visible transcript without risking a
         // resume under credentials that differ from the original continuation.
         let safeResumeSessionID = accountBinding?.normalized == nil ? nil : resumeSessionID
+        let providerContext = AcpProviderLaunchContext(
+            providerName: declaredProvider?.displayName ?? agent.name,
+            accountLabel: accountBinding?.label ?? "Default account",
+            defaultSettingsSectionID: declaredProvider == nil ? "agents" : "accounts"
+        )
         let conversation = AcpConversation(
             title: title,
             command: adapter.command,
@@ -3240,7 +3354,12 @@ final class AppModel: ObservableObject {
             containment: adapter.containment,
             environment: environment,
             cwd: directory.path,
+            transcriptAgentID: agent.id,
+            transcriptAgentName: agent.name,
+            transcriptModelID: modelOverride,
+            providerContext: providerContext,
             mcpServers: McpConfigStore.jsonValues(mcp),
+            runProfile: runProfileSnapshot,
             sensitiveGlobs: NativePreviewSettings.shared.sensitiveGlobs,
             draftKey: chatID,
             resumeSessionID: safeResumeSessionID,
@@ -3248,6 +3367,7 @@ final class AppModel: ObservableObject {
             initialRowStartOrdinal: initialTranscript?.page.startOrdinal ?? 0,
             initialEarlierRowCount: initialTranscript?.page.earlierRowCount ?? 0,
             initialTotalRowCount: initialTranscript?.page.totalRowCount ?? 0,
+            initialRetentionStatus: initialTranscript?.retentionStatus ?? .empty,
             initialDraft: initialDraft,
             initialAttachments: initialTranscript?.attachments ?? [],
             initialUsage: initialTranscript?.usage.map {
@@ -3309,6 +3429,22 @@ final class AppModel: ObservableObject {
                 chatID: chatID
             )
         }
+        conversation.onRetryTranscriptPersistence = { [weak self] in
+            self?.retryTranscriptPersistence(chatID: chatID)
+        }
+        let exportStore = transcriptStore
+        conversation.onExportTranscriptMarkdown = { request, destination in
+            try await exportStore.exportMarkdown(
+                for: chatID,
+                request: request,
+                to: destination
+            )
+        }
+        let healthStore = transcriptStore
+        Task { [weak conversation] in
+            let health = await healthStore.persistenceHealth(for: chatID)
+            conversation?.applyTranscriptPersistenceHealth(health)
+        }
         let pageStore = transcriptStore
         conversation.loadEarlierRows = { beforeOrdinal, limit in
             await pageStore.page(
@@ -3344,17 +3480,38 @@ final class AppModel: ObservableObject {
         conversation.onQueueChanged = { [weak self] _ in
             self?.scheduleWorkspaceStateSave(projectID: projectID)
         }
+        conversation.onConfirmedModelFallback = { [weak self, weak conversation] actualModelID in
+            guard let self, let conversation,
+                  let index = self.chats.firstIndex(where: { $0.id == chatID }),
+                  self.chats[index].conversation === conversation else { return }
+            let existing = self.chats[index]
+            self.chats[index] = existing.replacingModelOverride(with: actualModelID)
+            self.scheduleWorkspaceStateSave(projectID: projectID)
+        }
+        let accountAccess = accountAccess ?? ChatAccountAccess(
+            binding: accountBinding,
+            requiresResolution: requiresAccountResolution
+        )
         let handle = AcpChatHandle(
             id: chatID,
             agentID: agent.id,
             workspaceDirectory: directory,
             accountBinding: accountBinding,
-            modelOverride: modelOverride,
+            modelOverride: runProfileSnapshot.modelID,
+            runProfile: runProfileSnapshot,
+            accountAccess: accountAccess,
             conversation: conversation
         )
+        accountAccess.onResumeInvalidationRequired = { [weak self] in
+            self?.scheduleChatResumeInvalidation(chatID)
+        }
         chats.append(handle)
         surfaceObservers[chatID] = conversation.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
+        }
+        reconcileChatAccountAvailability(for: handle)
+        if requiresAccountResolution, accountAccess.phase == .resolving {
+            usageCenter.refreshPlanUsage(workspace: directory, force: false)
         }
         return handle
     }
@@ -3392,7 +3549,8 @@ final class AppModel: ObservableObject {
             accountBinding: closingChat.accountBinding,
             title: closingChat.conversation.title,
             queuedPrompts: closingChat.conversation.queued.map(\.text),
-            modelOverride: closingChat.modelOverride
+            modelOverride: closingChat.modelOverride,
+            runProfile: closingChat.runProfile
         )
         storeRecentlyClosedPane(NativeRestorablePaneState(
             id: chatID,
@@ -3425,9 +3583,7 @@ final class AppModel: ObservableObject {
         surfaceObservers.removeValue(forKey: chatID)?.cancel()
         attentionCenter.clear(targetID: chatID)
         if selectedChatID == chatID { selectedChatID = nil }
-        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-        layout.remove(chatID)
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.remove(chatID, from: projectID)
         scheduleWorkspaceStateSave(projectID: projectID)
         ToastCenter.shared.show("Moved chat to Recently Closed", style: .success)
         return true
@@ -3477,9 +3633,7 @@ final class AppModel: ObservableObject {
         attentionCenter.clear(targetID: chatID)
         if selectedChatID == chatID { selectedChatID = nil }
         if let projectID = closingChat?.projectID {
-            var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-            layout.remove(chatID)
-            paneLayouts[projectID] = layout
+            unifiedSessionCards.remove(chatID, from: projectID)
             scheduleWorkspaceStateSave(projectID: projectID)
         }
         // Unconditional (§4e): the user deleted the chat, so its transcript
@@ -3505,6 +3659,177 @@ final class AppModel: ObservableObject {
         return removalResult
     }
 
+    /// Keep restored chat startup and live-account invalidation on the same
+    /// local truth used by Usage settings. Published readings cover logout;
+    /// the account-list notification covers removal and successful sign-in.
+    private func observeChatAccountAvailability() {
+        usageCenter.$planUsage
+            .combineLatest(usageCenter.$isRefreshingPlanUsage)
+            .sink { [weak self] readings, isRefreshing in
+                guard let self else { return }
+                self.reconcileChatAccountAvailability(
+                    profiles: self.usageAccountStore.profiles(),
+                    readings: readings,
+                    isRefreshing: isRefreshing
+                )
+            }
+            .store(in: &chatAccountObservers)
+        NotificationCenter.default.publisher(for: .kaisolaUsageAccountsChanged)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                // An add/remove/sign-in changes the credential fingerprint.
+                // Do not let the preceding context's cached success unlock a
+                // continuation before the forced probe returns.
+                self.reconcileChatAccountAvailability(
+                    profiles: self.usageAccountStore.profiles(),
+                    readings: [],
+                    isRefreshing: true
+                )
+                self.usageCenter.refreshPlanUsage(
+                    workspace: self.currentProjectDirectory,
+                    force: true
+                )
+            }
+            .store(in: &chatAccountObservers)
+    }
+
+    private func reconcileChatAccountAvailability(
+        profiles: [UsageAccountProfile]? = nil,
+        readings: [UsageCenter.ProviderPlanUsage]? = nil,
+        isRefreshing: Bool? = nil,
+        now: Date = Date()
+    ) {
+        let profiles = profiles ?? usageAccountStore.profiles()
+        let readings = readings ?? usageCenter.planUsage
+        let isRefreshing = isRefreshing ?? usageCenter.isRefreshingPlanUsage
+        for chat in chats {
+            reconcileChatAccountAvailability(
+                for: chat,
+                profiles: profiles,
+                readings: readings,
+                isRefreshing: isRefreshing,
+                now: now
+            )
+        }
+    }
+
+    private func reconcileChatAccountAvailability(
+        for chat: AcpChatHandle,
+        profiles: [UsageAccountProfile]? = nil,
+        readings: [UsageCenter.ProviderPlanUsage]? = nil,
+        isRefreshing: Bool? = nil,
+        now: Date = Date()
+    ) {
+        let transition = chat.accountAccess.reconcile(.init(
+            profiles: profiles ?? usageAccountStore.profiles(),
+            readings: readings ?? usageCenter.planUsage,
+            isRefreshing: isRefreshing ?? usageCenter.isRefreshingPlanUsage,
+            now: now
+        ))
+        if transition == .requiresResumeInvalidation {
+            scheduleChatResumeInvalidation(chat.id)
+        }
+    }
+
+    private func scheduleChatResumeInvalidation(_ chatID: String) {
+        guard chats.contains(where: { $0.id == chatID }),
+              chatAccountInvalidationTasks[chatID] == nil else { return }
+        chatAccountInvalidationTasks[chatID] = Task { @MainActor [weak self] in
+            await self?.invalidateChatResumeIdentity(chatID)
+            self?.chatAccountInvalidationTasks[chatID] = nil
+        }
+    }
+
+    /// Replace only the adapter-bearing handle, with no provider resume id.
+    /// The stable chat id, pane, selection, transcript, draft, attachments and
+    /// queued follow-ups survive; the stopped process cannot become a zombie.
+    private func invalidateChatResumeIdentity(_ chatID: String) async {
+        guard let chat = chats.first(where: { $0.id == chatID }),
+              let agent = AgentRegistry.profile(id: chat.agentID) else { return }
+        let finalDraft = await chat.conversation.stop()
+        if let finalDraft {
+            enqueueDraftSave(
+                finalDraft,
+                chatID: chatID,
+                projectID: chat.projectID,
+                agentID: chat.agentID,
+                workspacePath: chat.workspaceDirectory.path
+            )
+        }
+        await flushTranscriptPersistence()
+        let transcript = await restoredTranscript(for: chatID)
+        guard let live = chats.first(where: { $0.id == chatID }),
+              live.conversation === chat.conversation else { return }
+
+        let queued = chat.conversation.queued.map(\.text)
+        chats.removeAll { $0.id == chatID }
+        usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
+        usageCenter.unregister(chatID: chatID, sourceID: usageSourceID, forgetWhenLast: false)
+        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        enqueueTranscriptSessionID(nil, chatID: chatID)
+        guard appendChat(
+            id: chatID,
+            agent: agent,
+            directory: chat.workspaceDirectory,
+            title: chat.conversation.title,
+            resumeSessionID: nil,
+            accountBinding: chat.accountBinding,
+            modelOverride: chat.modelOverride,
+            runProfile: chat.runProfile,
+            accountAccess: chat.accountAccess,
+            initialTranscript: transcript,
+            initialDraft: finalDraft ?? transcript?.draft,
+            initialQueuedPrompts: queued
+        ) != nil else { return }
+        scheduleWorkspaceStateSave(projectID: chat.projectID)
+    }
+
+    /// Profile used by the recovery card's direct Sign In sheet. If the user
+    /// had removed the registry entry, this explicit action re-registers the
+    /// exact immutable id/path before authentication begins.
+    func accountSignInProfile(for chatID: String) -> UsageAccountProfile? {
+        guard let chat = chats.first(where: { $0.id == chatID }),
+              let binding = chat.accountBinding,
+              let accountID = binding.accountID else { return nil }
+        let requested = UsageAccountProfile(
+            id: accountID,
+            provider: binding.provider,
+            label: binding.label,
+            directory: binding.configDirectory
+        )
+        let profile = usageAccountStore.profiles().first(where: {
+            guard $0.id == accountID, $0.provider == binding.provider else { return false }
+            return SessionAccountBinding.resolve(
+                provider: $0.provider,
+                profile: $0,
+                fallbackEnvironment: [:]
+            )?.continuationKey == binding.continuationKey
+        }) ?? usageAccountStore.restore(requested)
+        guard let profile else { return nil }
+        chat.accountAccess.beginRecovery()
+        NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+        return profile
+    }
+
+    /// Explicitly confirms the non-destructive path advertised by the blocked
+    /// state. This never removes the pane or transcript; it only makes sure the
+    /// adapter is stopped and the latest debounced draft is durable.
+    func preserveBlockedChat(_ chatID: String) async {
+        if let task = chatAccountInvalidationTasks[chatID] { await task.value }
+        guard let chat = chats.first(where: { $0.id == chatID }) else { return }
+        if let finalDraft = await chat.conversation.stop() {
+            enqueueDraftSave(
+                finalDraft,
+                chatID: chatID,
+                projectID: chat.projectID,
+                agentID: chat.agentID,
+                workspacePath: chat.workspaceDirectory.path
+            )
+            await draftPersistenceTask?.value
+        }
+        ToastCenter.shared.show("Transcript and draft kept. No agent is running.", style: .success)
+    }
+
     /// Stop the adapter without deleting the surface, transcript, or draft.
     /// The conversation can be restarted in place, so ordinary run control no
     /// longer has to go through the destructive close path.
@@ -3526,13 +3851,11 @@ final class AppModel: ObservableObject {
     /// is what asking to switch *now* means — and the queue then flushes into
     /// the new session.
     func switchChatAccount(_ chatID: String, to profile: UsageAccountProfile?) async {
+        if let task = chatAccountInvalidationTasks[chatID] { await task.value }
         guard let chat = chats.first(where: { $0.id == chatID }),
               let agent = AgentRegistry.profile(id: chat.agentID) else { return }
         let projectID = chat.projectID
-        let overlay = ProjectAccountStore.mergedOverlay(
-            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-            project: ProjectAccountStore().override(forProject: projectID)
-        )
+        guard let overlay = projectAccountOverlay(forProject: projectID) else { return }
         guard let binding = SessionAccountBinding.resolve(
             agentID: chat.agentID,
             profile: profile,
@@ -3556,14 +3879,12 @@ final class AppModel: ObservableObject {
         let directory = chat.workspaceDirectory
         let title = chat.conversation.title
         let queued = chat.conversation.queued.map(\.text)
+        let requiresAccountResolution = !chat.accountAccess.allowsAdapterStart
         // Stop the adapter and let every buffered row and the draft reach the
         // store before the transcript is read back for the new handle.
         let finalDraft = await chat.conversation.stop()
         await flushTranscriptPersistence()
-        let transcript = await transcriptStore.restoration(
-            for: chatID,
-            tailLimit: AcpConversation.defaultVisibleLimit
-        )
+        let transcript = await restoredTranscript(for: chatID)
         // Re-check after the awaits: a concurrent close, delete, or second
         // switch may have replaced or removed the handle this call captured.
         guard let live = chats.first(where: { $0.id == chatID }),
@@ -3583,6 +3904,8 @@ final class AppModel: ObservableObject {
             resumeSessionID: nil,
             accountBinding: binding,
             modelOverride: chat.modelOverride,
+            runProfile: chat.runProfile,
+            requiresAccountResolution: requiresAccountResolution,
             initialTranscript: transcript,
             initialDraft: finalDraft ?? transcript?.draft,
             initialQueuedPrompts: queued
@@ -3595,8 +3918,10 @@ final class AppModel: ObservableObject {
         }
         scheduleWorkspaceStateSave(projectID: projectID)
         ToastCenter.shared.show(
-            "Switched to \(binding.label). Fresh provider session; the transcript stays.",
-            style: .success
+            requiresAccountResolution
+                ? "Checking \(binding.label) before starting. The transcript stays."
+                : "Switched to \(binding.label). Fresh provider session; the transcript stays.",
+            style: requiresAccountResolution ? .info : .success
         )
     }
 
@@ -3624,10 +3949,7 @@ final class AppModel: ObservableObject {
         let resumeSessionID = chat.conversation.providerSessionID
         let finalDraft = await chat.conversation.stop()
         await flushTranscriptPersistence()
-        let transcript = await transcriptStore.restoration(
-            for: chatID,
-            tailLimit: AcpConversation.defaultVisibleLimit
-        )
+        let transcript = await restoredTranscript(for: chatID)
         guard let live = chats.first(where: { $0.id == chatID }),
               live.conversation === chat.conversation else { return }
         chats.removeAll { $0.id == chatID }
@@ -3642,6 +3964,7 @@ final class AppModel: ObservableObject {
             resumeSessionID: resumeSessionID ?? transcript?.sessionID,
             accountBinding: chat.accountBinding,
             modelOverride: target,
+            runProfile: chat.runProfile,
             initialTranscript: transcript,
             initialDraft: finalDraft ?? transcript?.draft,
             initialQueuedPrompts: queued
@@ -3659,6 +3982,52 @@ final class AppModel: ObservableObject {
         )
     }
 
+    /// Rebuild the adapter on a new immutable run-profile snapshot. ACP binds
+    /// client capabilities and MCP servers during initialize/session-new, so a
+    /// live process can never be safely widened or narrowed in place.
+    func switchChatRunProfile(_ chatID: String, to profileID: String) async {
+        guard let chat = chats.first(where: { $0.id == chatID }),
+              let agent = AgentRegistry.profile(id: chat.agentID),
+              let profile = AcpRunProfileStore().profile(id: profileID) else {
+            ToastCenter.shared.show("That run profile is no longer available.", style: .error)
+            return
+        }
+        guard profile != chat.runProfile else {
+            ToastCenter.shared.show("This chat already uses \(profile.name).", style: .info)
+            return
+        }
+        let projectID = chat.projectID
+        let queued = chat.conversation.queued.map(\.text)
+        let finalDraft = await chat.conversation.stop()
+        await flushTranscriptPersistence()
+        let transcript = await restoredTranscript(for: chatID)
+        guard let live = chats.first(where: { $0.id == chatID }),
+              live.conversation === chat.conversation else { return }
+        chats.removeAll { $0.id == chatID }
+        usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
+        usageCenter.unregister(chatID: chatID, sourceID: usageSourceID, forgetWhenLast: false)
+        surfaceObservers.removeValue(forKey: chatID)?.cancel()
+        guard appendChat(
+            id: chatID,
+            agent: agent,
+            directory: chat.workspaceDirectory,
+            title: chat.conversation.title,
+            resumeSessionID: nil,
+            accountBinding: chat.accountBinding,
+            modelOverride: profile.modelID,
+            runProfile: profile,
+            accountAccess: chat.accountAccess,
+            initialTranscript: transcript,
+            initialDraft: finalDraft ?? transcript?.draft,
+            initialQueuedPrompts: queued
+        ) != nil else {
+            ToastCenter.shared.show("The chat adapter is unavailable, so the profile was not switched.", style: .error)
+            return
+        }
+        scheduleWorkspaceStateSave(projectID: projectID)
+        ToastCenter.shared.show("Switched to \(profile.name). Fresh provider session; the transcript stays.", style: .success)
+    }
+
     func selectChat(_ chatID: String?) {
         selectedChatID = chatID
         if let chatID {
@@ -3670,7 +4039,6 @@ final class AppModel: ObservableObject {
                 focusPane(chatID, projectID: projectID)
             }
             selectedMeshID = nil
-            focusedPaneID = chatID
             attentionCenter.clear(targetID: chatID)
             requestSurfaceKeyboardFocus(chatID)
         }
@@ -3695,6 +4063,9 @@ final class AppModel: ObservableObject {
     /// Live Mesh sessions (app-scoped, like chats).
     @Published private(set) var meshes: [MeshSession] = []
     @Published var selectedMeshID: String?
+    /// AppModel owns presentation membership; this object owns lifecycle tasks,
+    /// cancellation, and transition state.
+    private let meshLifecycleCoordinator = MeshLifecycleCoordinator()
 
     /// Start a Mesh in a directory with every ACP-capable agent. `staged`
     /// runs the scout→execute pipeline; `idea` runs the read-only brainstorm.
@@ -3705,6 +4076,9 @@ final class AppModel: ObservableObject {
         refreshPersistedNavigationState(publish: false)
         selectedProjectID = project.id
         selectedProjectName = project.name
+        guard let projectOverlay = projectAccountOverlay(forProject: project.id) else { return }
+        let environment = ProcessInfo.processInfo.environment
+            .merging(projectOverlay) { _, custom in custom }
         let mesh = MeshSession(
             baseDirectory: directory,
             mode: staged ? .staged : .flat,
@@ -3720,15 +4094,7 @@ final class AppModel: ObservableObject {
         selectedChatID = nil
         focusPane(mesh.id, projectID: project.id)
         scheduleWorkspaceStateSave(projectID: project.id)
-        let environment = ProcessInfo.processInfo.environment.merging(
-            ProjectAccountStore.mergedOverlay(
-                app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-                project: ProjectAccountStore().override(
-                    forProject: NativeSessionStore.projectID(forDirectory: directory.path)
-                )
-            )
-        ) { _, custom in custom }
-        Task { await mesh.start(agents: agents, environment: environment) }
+        meshLifecycleCoordinator.start(mesh, agents: agents, environment: environment)
     }
 
     /// Close a Mesh without deleting any durable state. Running adapters stop,
@@ -3747,7 +4113,9 @@ final class AppModel: ObservableObject {
             .first(where: { $0.id == meshID })?.sizeWeight ?? 1
 
         mesh.onFileActivity = nil
-        await mesh.suspend()
+        guard await meshLifecycleCoordinator.suspend(mesh) == .completed else {
+            return .unavailable
+        }
         storeRecentlyClosedPane(NativeRestorablePaneState(
             id: mesh.id,
             surface: NativeRestorableSurfaceState(mesh: mesh.restorationDescriptor),
@@ -3760,9 +4128,8 @@ final class AppModel: ObservableObject {
         Self.claimedRestoredMeshIDs.remove(meshID)
         surfaceObservers.removeValue(forKey: meshID)?.cancel()
         if selectedMeshID == meshID { selectedMeshID = nil }
-        var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-        layout.remove(meshID)
-        paneLayouts[projectID] = layout
+        unifiedSessionCards.remove(meshID, from: projectID)
+        meshLifecycleCoordinator.forget(meshID: meshID)
         await persistWorkspaceStateImmediately(projectID: projectID)
         ToastCenter.shared.show("Moved Mesh to Recently Closed", style: .success)
         return .completed
@@ -3774,7 +4141,11 @@ final class AppModel: ObservableObject {
     func requestDeleteMesh(_ meshID: String, allowRecoverableWork: Bool) async -> MeshDeleteResult {
         guard let mesh = meshes.first(where: { $0.id == meshID }) else { return .unavailable }
         let columnIDs = mesh.durableColumnIDs
-        let result = await mesh.destroy(allowRecoverableWork: allowRecoverableWork)
+        let outcome = await meshLifecycleCoordinator.destroy(
+            mesh,
+            allowRecoverableWork: allowRecoverableWork
+        )
+        guard case let .completed(result) = outcome else { return .unavailable }
         switch result {
         case .safe:
             let projectID = mesh.projectID
@@ -3787,9 +4158,8 @@ final class AppModel: ObservableObject {
             Self.claimedRestoredMeshIDs.remove(meshID)
             surfaceObservers.removeValue(forKey: meshID)?.cancel()
             if selectedMeshID == meshID { selectedMeshID = nil }
-            var layout = paneLayouts[projectID] ?? SessionPaneLayout()
-            layout.remove(meshID)
-            paneLayouts[projectID] = layout
+            unifiedSessionCards.remove(meshID, from: projectID)
+            meshLifecycleCoordinator.forget(meshID: meshID)
             let removals = enqueueTranscriptRemovals(chatIDs: columnIDs)
             // Columns also have legacy composer-defaults copies. The Mesh's
             // workspace draft removal never reaches those per-column keys.
@@ -3826,7 +4196,6 @@ final class AppModel: ObservableObject {
                 focusPane(meshID, projectID: projectID)
             }
             selectedChatID = nil
-            focusedPaneID = meshID
             requestSurfaceKeyboardFocus(meshID)
         }
     }
@@ -3864,10 +4233,7 @@ final class AppModel: ObservableObject {
                   isDirectory.boolValue else {
                 return .blocked("The chat's project folder is unavailable. Nothing was removed.")
             }
-            let transcript = await transcriptStore.restoration(
-                for: descriptor.id,
-                tailLimit: AcpConversation.defaultVisibleLimit
-            )
+            let transcript = await restoredTranscript(for: descriptor.id)
             let legacyDraft = try? await workspaceStateStore.draft(for: "chat|\(descriptor.id)")
             let draft = transcript?.draft ?? legacyDraft
             if transcript?.draft == nil, let legacyDraft, !legacyDraft.isEmpty {
@@ -3881,6 +4247,8 @@ final class AppModel: ObservableObject {
                 resumeSessionID: descriptor.acpSessionID ?? transcript?.sessionID,
                 accountBinding: descriptor.accountBinding,
                 modelOverride: descriptor.modelOverride,
+                runProfile: descriptor.runProfile ?? .write,
+                requiresAccountResolution: true,
                 initialTranscript: transcript,
                 initialDraft: draft,
                 initialQueuedPrompts: descriptor.queuedPrompts
@@ -3987,7 +4355,12 @@ final class AppModel: ObservableObject {
             return .blocked("The Mesh project folder is unavailable. Its worktrees were preserved.")
         }
         let columnIDs = mesh.durableColumnIDs
-        switch await mesh.destroy(allowRecoverableWork: allowRecoverableWork) {
+        let outcome = await meshLifecycleCoordinator.destroy(
+            mesh,
+            allowRecoverableWork: allowRecoverableWork
+        )
+        guard case let .completed(result) = outcome else { return .unavailable }
+        switch result {
         case .safe:
             // The user crossed the permanent-delete boundary. Remove column
             // data even if writing the final archive tombstone needs a retry.
@@ -4011,6 +4384,7 @@ final class AppModel: ObservableObject {
                 return .blocked("Mesh work was cleaned up, but the delete tombstone could not be saved: \(error.localizedDescription)")
             }
             _ = removeRecentlyClosedPane(id: surfaceID)
+            meshLifecycleCoordinator.forget(meshID: surfaceID)
             await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
             if let failure = await firstTranscriptRemovalFailure(removals) {
                 return .blocked(
@@ -4054,10 +4428,7 @@ final class AppModel: ObservableObject {
         wireMeshPersistence(mesh, recentlyClosed: true)
         var states: [MeshSession.RestoredColumnState] = []
         for column in descriptor.columns {
-            let transcript = await transcriptStore.restoration(
-                for: column.id,
-                tailLimit: AcpConversation.defaultVisibleLimit
-            )
+            let transcript = await restoredTranscript(for: column.id)
             states.append(MeshSession.RestoredColumnState(
                 descriptor: column,
                 rows: transcript?.page.rows ?? [],
@@ -4070,13 +4441,21 @@ final class AppModel: ObservableObject {
                 usage: transcript?.usage
             ))
         }
-        let environment = ProcessInfo.processInfo.environment.merging(
-            ProjectAccountStore.mergedOverlay(
-                app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-                project: ProjectAccountStore().override(forProject: descriptor.projectID)
-            )
-        ) { _, custom in custom }
-        await mesh.restore(states: states, agents: AgentRegistry.all, environment: environment)
+        guard let projectOverlay = projectAccountOverlay(forProject: descriptor.projectID) else {
+            return nil
+        }
+        let environment = ProcessInfo.processInfo.environment
+            .merging(projectOverlay) { _, custom in custom }
+        let completion = await meshLifecycleCoordinator.restore(
+            mesh,
+            states: states,
+            agents: AgentRegistry.all,
+            environment: environment
+        )
+        guard completion == .completed else {
+            meshLifecycleCoordinator.forget(meshID: descriptor.id)
+            return nil
+        }
         return mesh
     }
 
@@ -4084,6 +4463,8 @@ final class AppModel: ObservableObject {
     /// and drop broker connections. Mesh Git worktrees deliberately remain
     /// registered; only an explicit, safety-checked permanent Delete may destroy them.
     func teardown() async {
+        for task in chatAccountInvalidationTasks.values { await task.value }
+        chatAccountInvalidationTasks.removeAll()
         // Save the user's restorable truth before asking any adapter or mesh to
         // stop. A provider shutdown can stall, but a bounded application quit
         // must still retain the latest file deck, cursor, drafts, transcripts,
@@ -4113,16 +4494,18 @@ final class AppModel: ObservableObject {
         await draftPersistenceTask?.value
         await persistWorkspaceStateNow()
         chats.removeAll()
+        meshLifecycleCoordinator.cancelAll()
         for mesh in meshes {
-            await mesh.suspend()
+            _ = await meshLifecycleCoordinator.suspend(mesh)
         }
-        for task in meshShutdownTasks.values { await task.value }
-        meshShutdownTasks.removeAll()
         // `suspend` updates lifecycle and can fence a worktree provision that
         // was already in flight. Flush that final safe manifest before the
         // window model releases its claim.
         await persistWorkspaceStateNow()
-        for mesh in meshes { Self.claimedRestoredMeshIDs.remove(mesh.id) }
+        for mesh in meshes {
+            Self.claimedRestoredMeshIDs.remove(mesh.id)
+            meshLifecycleCoordinator.forget(meshID: mesh.id)
+        }
         meshes.removeAll()
         surfaceObservers.removeAll()
         splitIntentTokens.removeAll()
@@ -4327,8 +4710,11 @@ final class AppModel: ObservableObject {
         publishTerminalSurfaceDocument(document)
         splitDocuments.removeAll()
         splitOrder.removeAll()
-        paneLayouts[project.id] = SessionPaneLayout(sessionID: sessions[0].id)
-        focusedPaneID = sessions[0].id
+        unifiedSessionCards.install(
+            SessionPaneLayout(sessionID: sessions[0].id),
+            for: project.id
+        )
+        unifiedSessionCards.focusPresentation(on: sessions[0].id)
 
         if includeSplit {
             let splitOutput = [
@@ -4356,7 +4742,7 @@ final class AppModel: ObservableObject {
             )
             publishTerminalSurfaceDocument(splitDocuments[sessions[1].id]!)
             splitOrder = [sessions[1].id]
-            paneLayouts[project.id]?.add(sessions[1].id)
+            unifiedSessionCards.add(sessions[1].id, to: project.id)
         }
     }
 
@@ -4456,7 +4842,10 @@ final class AppModel: ObservableObject {
         }
         meshes = [mesh]
         selectedSessionID = nil
-        paneLayouts[mesh.projectID] = SessionPaneLayout(sessionID: mesh.id)
+        unifiedSessionCards.install(
+            SessionPaneLayout(sessionID: mesh.id),
+            for: mesh.projectID
+        )
         selectMesh(mesh.id)
     }
 
@@ -4480,9 +4869,7 @@ final class AppModel: ObservableObject {
                 initialQueuedPrompts: []
               ) else { return }
         chat.conversation.loadVisualFixture(includePermission: includePermission)
-        var layout = paneLayouts[project.id] ?? SessionPaneLayout()
-        layout.add(chat.id)
-        paneLayouts[project.id] = layout
+        unifiedSessionCards.add(chat.id, to: project.id)
         selectChat(chat.id)
     }
 
@@ -5031,10 +5418,7 @@ final class AppModel: ObservableObject {
         // Account isolation (custom CLAUDE_CONFIG_DIR / CODEX_HOME) rides in
         // as exported variables ahead of the CLI. Per-project overrides win
         // over the app-wide setting, key by key.
-        var overlay = ProjectAccountStore.mergedOverlay(
-            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-            project: ProjectAccountStore().override(forProject: projectID)
-        )
+        guard var overlay = projectAccountOverlay(forProject: projectID) else { return nil }
         let accountBinding: SessionAccountBinding?
         if let agent, SessionAccountBinding.provider(forAgentID: agent.id) != nil {
             if let lockedAccountBinding {
@@ -5437,12 +5821,39 @@ final class AppModel: ObservableObject {
             return
         }
         let inputGeneration = terminalInputGenerations[terminalID, default: 0]
-        terminalInputQueues[terminalID, default: []].append(PendingTerminalInput(
-            projectID: projectID,
-            data: data,
-            opensAgentTurn: opensAgentTurn,
-            generation: inputGeneration
-        ))
+        let chunks = Self.terminalWriteChunks(data)
+        let pasteGeneration: UInt64?
+        if chunks.count > 1 {
+            let generation: UInt64
+            if let current = terminalPasteGenerationByTerminalID[terminalID] {
+                generation = current
+            } else {
+                nextTerminalPasteGeneration &+= 1
+                generation = nextTerminalPasteGeneration
+                terminalPasteGenerationByTerminalID[terminalID] = generation
+            }
+            pasteGeneration = generation
+            let current = terminalPasteProgressByTerminalID[terminalID]
+                ?? TerminalPasteProgress(sentBytes: 0, totalBytes: 0)
+            terminalPasteProgressByTerminalID[terminalID] = TerminalPasteProgress(
+                sentBytes: current.sentBytes,
+                totalBytes: current.totalBytes + chunks.reduce(0) { $0 + $1.utf8.count }
+            )
+        } else {
+            pasteGeneration = nil
+        }
+        terminalInputQueues[terminalID, default: []].append(contentsOf:
+            chunks.enumerated().map { index, chunk in
+                PendingTerminalInput(
+                    projectID: projectID,
+                    data: chunk,
+                    opensAgentTurn: opensAgentTurn && index == chunks.count - 1,
+                    generation: inputGeneration,
+                    pasteGeneration: pasteGeneration,
+                    byteCount: chunk.utf8.count
+                )
+            }
+        )
         guard terminalInputDrainTasks[terminalID] == nil else { return }
         terminalInputDrainTasks[terminalID] = Task { [weak self] in
             await self?.drainTerminalInputQueue(
@@ -5536,6 +5947,7 @@ final class AppModel: ObservableObject {
                       controlAvailable,
                       isOwned(terminalID) else { return }
                 trackTerminalDraftInput(packet.data, terminalID: terminalID)
+                acknowledgeTerminalPaste(packet, terminalID: terminalID)
                 if packet.opensAgentTurn {
                     // Deliberately not part of the write's error path: a
                     // refused turn signal is an activity-tracking failure, not
@@ -5579,6 +5991,98 @@ final class AppModel: ObservableObject {
         if terminalInputGenerations[terminalID, default: 0] == generation,
            terminalInputQueues[terminalID]?.isEmpty == true {
             terminalInputQueues.removeValue(forKey: terminalID)
+        }
+    }
+
+    /// The broker enforces this same cap immediately before node-pty. Split on
+    /// Unicode-scalar boundaries keep every chunk a valid String. A bracketed
+    /// paste closes and reopens around each body chunk so cancellation between
+    /// acknowledgements cannot strand the receiving TUI in paste mode; the
+    /// concatenated body remains byte-exact.
+    nonisolated static func terminalWriteChunks(_ data: String) -> [String] {
+        guard data.utf8.count > terminalWritePayloadByteLimit else { return [data] }
+        let bracketedPasteOpening = "\u{1B}[200~"
+        let bracketedPasteClosing = "\u{1B}[201~"
+        if data.hasPrefix(bracketedPasteOpening),
+           data.hasSuffix(bracketedPasteClosing) {
+            let body = String(
+                data.dropFirst(bracketedPasteOpening.count)
+                    .dropLast(bracketedPasteClosing.count)
+            )
+            let bodyLimit = terminalWritePayloadByteLimit
+                - bracketedPasteOpening.utf8.count
+                - bracketedPasteClosing.utf8.count
+            return terminalWriteScalarChunks(body, maximumBytes: bodyLimit).map {
+                bracketedPasteOpening + $0 + bracketedPasteClosing
+            }
+        }
+        return terminalWriteScalarChunks(
+            data,
+            maximumBytes: terminalWritePayloadByteLimit
+        )
+    }
+
+    nonisolated private static func terminalWriteScalarChunks(
+        _ data: String,
+        maximumBytes: Int
+    ) -> [String] {
+        var chunks: [String] = []
+        chunks.reserveCapacity((data.utf8.count / maximumBytes) + 1)
+        var current = ""
+        var currentBytes = 0
+        for scalar in data.unicodeScalars {
+            let scalarBytes = scalar.utf8.count
+            if currentBytes + scalarBytes > maximumBytes,
+               !current.isEmpty {
+                chunks.append(current)
+                current = ""
+                currentBytes = 0
+            }
+            current.unicodeScalars.append(scalar)
+            currentBytes += scalarBytes
+        }
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
+    }
+
+    func terminalPasteProgress(for terminalID: String) -> TerminalPasteProgress? {
+        terminalPasteProgressByTerminalID[terminalID]
+    }
+
+    /// Cancel only chunks the controller has not started. The current write has
+    /// an ambiguous outcome until its reply arrives and must never be aborted
+    /// or replayed; ordinary keyboard packets queued behind the paste survive.
+    func cancelTerminalPaste(for terminalID: String) {
+        guard let pasteGeneration = terminalPasteGenerationByTerminalID.removeValue(
+            forKey: terminalID
+        ) else { return }
+        terminalPasteProgressByTerminalID.removeValue(forKey: terminalID)
+        terminalInputQueues[terminalID]?.removeAll {
+            $0.pasteGeneration == pasteGeneration
+        }
+        ToastCenter.shared.show(
+            "Paste cancelled; a chunk already being sent may still finish.",
+            style: .info,
+            duration: 4
+        )
+    }
+
+    private func acknowledgeTerminalPaste(
+        _ packet: PendingTerminalInput,
+        terminalID: String
+    ) {
+        guard let pasteGeneration = packet.pasteGeneration,
+              terminalPasteGenerationByTerminalID[terminalID] == pasteGeneration,
+              let progress = terminalPasteProgressByTerminalID[terminalID] else { return }
+        let sentBytes = min(progress.totalBytes, progress.sentBytes + packet.byteCount)
+        if sentBytes == progress.totalBytes {
+            terminalPasteGenerationByTerminalID.removeValue(forKey: terminalID)
+            terminalPasteProgressByTerminalID.removeValue(forKey: terminalID)
+        } else {
+            terminalPasteProgressByTerminalID[terminalID] = TerminalPasteProgress(
+                sentBytes: sentBytes,
+                totalBytes: progress.totalBytes
+            )
         }
     }
 
@@ -5663,6 +6167,8 @@ final class AppModel: ObservableObject {
         terminalInputGenerations[terminalID, default: 0] &+= 1
         terminalInputDrainTasks.removeValue(forKey: terminalID)?.cancel()
         terminalInputQueues.removeValue(forKey: terminalID)
+        terminalPasteGenerationByTerminalID.removeValue(forKey: terminalID)
+        terminalPasteProgressByTerminalID.removeValue(forKey: terminalID)
         return discardedQueuedInput
     }
 
@@ -5744,6 +6250,7 @@ final class AppModel: ObservableObject {
         case .frameRejected,
              .malformedResponse,
              .requestTimedOut,
+             .terminalCapacityExceeded,
              .requestFailed:
             return false
         }
@@ -6018,9 +6525,7 @@ final class AppModel: ObservableObject {
             // it may follow the synchronous state commit.
             Task { [weak self] in await self?.select(nil) }
         }
-        if focusedPaneID == terminalID {
-            focusedPaneID = nil
-        }
+        unifiedSessionCards.clearFocus(ifMatching: terminalID)
     }
 
     /// Live work that would keep running out of sight if this project closed:
@@ -6122,7 +6627,6 @@ final class AppModel: ObservableObject {
             return
         }
         let originalLayout = paneLayouts[record.projectID]
-        let wasMaximized = maximizedPaneID == terminalID
         reopeningTerminalIDs.insert(terminalID)
         defer { reopeningTerminalIDs.remove(terminalID) }
 
@@ -6139,15 +6643,16 @@ final class AppModel: ObservableObject {
         // so swap against the CURRENT layout, never the pre-await snapshot —
         // overwriting with the stale copy was a lost-update.
         if sessionStore.isTerminalTombstoned(terminalID) {
-            focusedPaneID = createdID
+            unifiedSessionCards.focusPresentation(on: createdID)
             scheduleWorkspaceStateSave(projectID: record.projectID)
             return
         }
-        if var layout = paneLayouts[record.projectID] ?? originalLayout,
-           layout.replace(terminalID, with: createdID) {
-            paneLayouts[record.projectID] = layout
-            focusedPaneID = createdID
-            if wasMaximized { maximizedPaneID = createdID }
+        if unifiedSessionCards.replace(
+            terminalID,
+            with: createdID,
+            in: record.projectID,
+            fallback: originalLayout
+        ) {
             scheduleWorkspaceStateSave(projectID: record.projectID)
         }
         // The replacement owns the pane now; the old record must not linger
@@ -8133,6 +8638,238 @@ enum NativeSemanticShellIntegration {
 
     private static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+/// Owns the cancellable operations that move a Mesh between durable lifecycle
+/// states. `MeshSession` remains responsible for the worktree and adapter
+/// transaction itself; this coordinator prevents stale AppModel tasks from
+/// publishing a superseded transition.
+@MainActor
+final class MeshLifecycleCoordinator {
+    enum State: Equatable, Sendable {
+        case idle
+        case starting
+        case restoring
+        case active
+        case suspending
+        case suspended
+        case destroying
+        case destroyed
+        case recoveryRequired
+        case cancelled
+
+        init(_ persisted: NativeMeshLifecycle) {
+            switch persisted {
+            case .provisioning:
+                self = .starting
+            case .active:
+                self = .active
+            case .suspended:
+                self = .suspended
+            case .pendingDeletion:
+                self = .destroying
+            case .recoveryRequired:
+                self = .recoveryRequired
+            }
+        }
+    }
+
+    enum Completion: Equatable, Sendable {
+        case completed
+        case cancelled
+    }
+
+    enum Outcome<Value: Equatable & Sendable>: Equatable, Sendable {
+        case completed(Value)
+        case cancelled
+    }
+
+    private struct ActiveOperation {
+        let generation: UInt64
+        let cancel: @MainActor () -> Void
+        let wait: @MainActor () async -> Void
+    }
+
+    private var generationCounter: UInt64 = 0
+    private var operations: [String: ActiveOperation] = [:]
+    private var states: [String: State] = [:]
+
+    func state(for meshID: String) -> State {
+        states[meshID] ?? .idle
+    }
+
+    func start(
+        _ mesh: MeshSession,
+        agents: [AgentProfile],
+        environment: [String: String]
+    ) {
+        start(meshID: mesh.id) {
+            await mesh.start(agents: agents, environment: environment)
+            return State(mesh.lifecycle)
+        }
+    }
+
+    func restore(
+        _ mesh: MeshSession,
+        states: [MeshSession.RestoredColumnState],
+        agents: [AgentProfile],
+        environment: [String: String]
+    ) async -> Completion {
+        await restore(meshID: mesh.id) {
+            await mesh.restore(states: states, agents: agents, environment: environment)
+            return State(mesh.lifecycle)
+        }
+    }
+
+    func suspend(_ mesh: MeshSession) async -> Completion {
+        await suspend(meshID: mesh.id) {
+            await mesh.suspend()
+            return State(mesh.lifecycle)
+        }
+    }
+
+    func destroy(
+        _ mesh: MeshSession,
+        allowRecoverableWork: Bool
+    ) async -> Outcome<MeshSession.DiscardAssessment> {
+        await destroy(
+            meshID: mesh.id,
+            operation: {
+                await mesh.destroy(allowRecoverableWork: allowRecoverableWork)
+            },
+            resolvedState: { result in
+                result == .safe ? .destroyed : State(mesh.lifecycle)
+            }
+        )
+    }
+
+    /// Starts a retained operation without making AppModel own an unstructured
+    /// Task. A later suspend, destroy, or explicit cancellation invalidates its
+    /// generation before the underlying MeshSession is asked to stop.
+    func start(
+        meshID: String,
+        operation: @escaping @MainActor @Sendable () async -> State
+    ) {
+        let (generation, task) = beginOperation(
+            meshID: meshID,
+            transition: .starting,
+            operation: operation
+        )
+        Task { [weak self] in
+            let finalState = await task.value
+            self?.finish(meshID: meshID, generation: generation, state: finalState)
+        }
+    }
+
+    func restore(
+        meshID: String,
+        operation: @escaping @MainActor @Sendable () async -> State
+    ) async -> Completion {
+        await stateTransition(meshID: meshID, transition: .restoring, operation: operation)
+    }
+
+    func suspend(
+        meshID: String,
+        operation: @escaping @MainActor @Sendable () async -> State
+    ) async -> Completion {
+        await stateTransition(meshID: meshID, transition: .suspending, operation: operation)
+    }
+
+    func destroy<Value: Equatable & Sendable>(
+        meshID: String,
+        operation: @escaping @MainActor @Sendable () async -> Value,
+        resolvedState: @MainActor (Value) -> State
+    ) async -> Outcome<Value> {
+        let (generation, task) = beginOperation(
+            meshID: meshID,
+            transition: .destroying,
+            operation: operation
+        )
+        let value = await task.value
+        guard finish(
+            meshID: meshID,
+            generation: generation,
+            state: resolvedState(value)
+        ) else {
+            return .cancelled
+        }
+        return .completed(value)
+    }
+
+    /// Invalidates an operation synchronously. Its work receives cooperative
+    /// Task cancellation, while the generation fence prevents late completion
+    /// from changing the visible lifecycle even if that work ignores it.
+    func cancel(meshID: String) {
+        guard states[meshID] != nil || operations[meshID] != nil else { return }
+        let operation = operations.removeValue(forKey: meshID)
+        operation?.cancel()
+        states[meshID] = .cancelled
+    }
+
+    func cancelAll() {
+        for meshID in Array(operations.keys) {
+            cancel(meshID: meshID)
+        }
+    }
+
+    func waitForIdle(meshID: String) async {
+        while let operation = operations[meshID] {
+            await operation.wait()
+            if operations[meshID]?.generation == operation.generation {
+                await Task.yield()
+            }
+        }
+    }
+
+    /// Removes bounded coordinator metadata after AppModel drops the surface.
+    func forget(meshID: String) {
+        operations.removeValue(forKey: meshID)?.cancel()
+        states.removeValue(forKey: meshID)
+    }
+
+    private func stateTransition(
+        meshID: String,
+        transition: State,
+        operation: @escaping @MainActor @Sendable () async -> State
+    ) async -> Completion {
+        let (generation, task) = beginOperation(
+            meshID: meshID,
+            transition: transition,
+            operation: operation
+        )
+        let finalState = await task.value
+        return finish(meshID: meshID, generation: generation, state: finalState)
+            ? .completed
+            : .cancelled
+    }
+
+    private func beginOperation<Value: Sendable>(
+        meshID: String,
+        transition: State,
+        operation: @escaping @MainActor @Sendable () async -> Value
+    ) -> (UInt64, Task<Value, Never>) {
+        operations.removeValue(forKey: meshID)?.cancel()
+        generationCounter &+= 1
+        let generation = generationCounter
+        states[meshID] = transition
+        let task = Task { await operation() }
+        operations[meshID] = ActiveOperation(
+            generation: generation,
+            cancel: { task.cancel() },
+            wait: { _ = await task.value }
+        )
+        return (generation, task)
+    }
+
+    @discardableResult
+    private func finish(meshID: String, generation: UInt64, state: State) -> Bool {
+        guard operations[meshID]?.generation == generation else {
+            return false
+        }
+        operations.removeValue(forKey: meshID)
+        states[meshID] = state
+        return true
     }
 }
 

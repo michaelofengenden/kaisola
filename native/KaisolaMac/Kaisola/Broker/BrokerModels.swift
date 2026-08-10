@@ -42,15 +42,44 @@ struct BrokerHello: Equatable, Sendable {
     }
 }
 
+struct BrokerTerminalCapacity: Equatable, Sendable {
+    let liveTerminalCount: Int
+    let maximumLiveTerminals: Int
+    let availableTerminalSlots: Int
+
+    init?(value: JSONValue) {
+        guard let object = value.objectValue,
+              let live = object["liveTerminalCount"]?.intValue.flatMap(Int.init(exactly:)),
+              let maximum = object["maximumLiveTerminals"]?.intValue.flatMap(Int.init(exactly:)),
+              let available = object["availableTerminalSlots"]?.intValue.flatMap(Int.init(exactly:)),
+              live >= 0,
+              maximum > 0,
+              maximum <= BrokerWire.maximumConfigurableLiveTerminals,
+              live <= maximum,
+              available == maximum - live else { return nil }
+        liveTerminalCount = live
+        maximumLiveTerminals = maximum
+        availableTerminalSlots = available
+    }
+}
+
 struct BrokerStatus: Equatable, Sendable {
     let terminals: [BrokerTerminalRecord]
     /// Monotonic broker-wide mutation/activity fence sampled with this
     /// inventory. Nil is reserved for pre-generation legacy brokers.
     let activityEpoch: Int64?
+    /// Present on observer/administrator diagnostics from upgraded brokers.
+    /// Ordinary controller status intentionally omits this process-wide value.
+    let terminalCapacity: BrokerTerminalCapacity?
 
-    init(terminals: [BrokerTerminalRecord], activityEpoch: Int64? = nil) {
+    init(
+        terminals: [BrokerTerminalRecord],
+        activityEpoch: Int64? = nil,
+        terminalCapacity: BrokerTerminalCapacity? = nil
+    ) {
         self.terminals = terminals
         self.activityEpoch = activityEpoch
+        self.terminalCapacity = terminalCapacity
     }
 
     init(
@@ -104,6 +133,15 @@ struct BrokerStatus: Equatable, Sendable {
         } else {
             parsedActivityEpoch = nil
         }
+        let parsedTerminalCapacity: BrokerTerminalCapacity?
+        if let value = statusObject["terminalCapacity"] {
+            guard let terminalCapacity = BrokerTerminalCapacity(value: value) else {
+                throw BrokerClientError.malformedResponse
+            }
+            parsedTerminalCapacity = terminalCapacity
+        } else {
+            parsedTerminalCapacity = nil
+        }
         guard let diagnosticValues = diagnostics.arrayValue,
               let liveValues = live.arrayValue else {
             throw BrokerClientError.malformedResponse
@@ -126,6 +164,7 @@ struct BrokerStatus: Equatable, Sendable {
         }
         terminals = decodedTerminals
         activityEpoch = parsedActivityEpoch
+        terminalCapacity = parsedTerminalCapacity
     }
 
     static func validatedActivityEpoch(
@@ -362,6 +401,11 @@ struct TerminalSnapshot: Equatable, Sendable {
     let endOffset: Int64
     let truncated: Bool
     let exited: Bool
+    /// The broker's code for a spool segment it could not read, when the
+    /// snapshot it answered with is therefore not the whole retained tail.
+    /// `nil` means the output is authoritative — including when it is empty,
+    /// which a terminal that has produced nothing legitimately is.
+    let readError: String?
 
     init(
         streamEpoch: String,
@@ -369,7 +413,8 @@ struct TerminalSnapshot: Equatable, Sendable {
         startOffset: Int64,
         endOffset: Int64,
         truncated: Bool,
-        exited: Bool
+        exited: Bool,
+        readError: String? = nil
     ) {
         self.streamEpoch = streamEpoch
         self.output = output
@@ -377,6 +422,7 @@ struct TerminalSnapshot: Equatable, Sendable {
         self.endOffset = endOffset
         self.truncated = truncated
         self.exited = exited
+        self.readError = readError
     }
 
     init(value: JSONValue) throws {
@@ -396,6 +442,9 @@ struct TerminalSnapshot: Equatable, Sendable {
         self.endOffset = endOffset
         self.truncated = object["truncated"]?.boolValue ?? false
         self.exited = object["exited"]?.boolValue ?? false
+        // Older brokers never send the field; their snapshots stay
+        // authoritative, exactly as they are today.
+        self.readError = object["readError"]?.stringValue
     }
 }
 
@@ -409,6 +458,9 @@ struct TerminalHistoryPage: Equatable, Sendable, Identifiable {
     let endOffset: Int64
     let hasMore: Bool
     let truncated: Bool
+    /// Same contract as `TerminalSnapshot.readError`: set when the page is
+    /// short because a retained segment refused to be read.
+    let readError: String?
 
     var id: Int64 { startOffset }
 
@@ -418,7 +470,8 @@ struct TerminalHistoryPage: Equatable, Sendable, Identifiable {
         startOffset: Int64,
         endOffset: Int64,
         hasMore: Bool,
-        truncated: Bool
+        truncated: Bool,
+        readError: String? = nil
     ) {
         self.streamEpoch = streamEpoch
         self.output = output
@@ -426,6 +479,7 @@ struct TerminalHistoryPage: Equatable, Sendable, Identifiable {
         self.endOffset = endOffset
         self.hasMore = hasMore
         self.truncated = truncated
+        self.readError = readError
     }
 
     init(value: JSONValue, expectedEpoch: String, beforeOffset: Int64) throws {
@@ -448,6 +502,7 @@ struct TerminalHistoryPage: Equatable, Sendable, Identifiable {
         self.endOffset = endOffset
         self.hasMore = object["hasMore"]?.boolValue ?? false
         self.truncated = object["truncated"]?.boolValue ?? false
+        self.readError = object["readError"]?.stringValue
     }
 }
 
@@ -535,6 +590,7 @@ enum BrokerClientError: Error, Equatable, LocalizedError {
     case observeFeatureMissing
     case connectionTimedOut
     case requestTimedOut
+    case terminalCapacityExceeded(maximum: Int)
     case requestFailed(String)
     case socketFailure(Int32)
     case socketPathTooLong
@@ -553,6 +609,8 @@ enum BrokerClientError: Error, Equatable, LocalizedError {
         case .observeFeatureMissing: "The running session service cannot provide terminal observation."
         case .connectionTimedOut: "The private terminal connection did not become ready in time."
         case .requestTimedOut: "The session service did not answer a read-only request in time."
+        case let .terminalCapacityExceeded(maximum):
+            "The session service is already running its limit of \(maximum) terminals. Close one and try again."
         case .requestFailed: "The session service rejected a read-only request."
         case let .socketFailure(code): "The private terminal connection failed (\(code)); running sessions were not changed."
         case .socketPathTooLong: "The private terminal connection path is too long for macOS."

@@ -1,5 +1,7 @@
 import Darwin
+import Dispatch
 import Foundation
+import KaisolaBrokerProtocol
 import KaisolaCore
 import XCTest
 @testable import Kaisola
@@ -8,6 +10,157 @@ import XCTest
 /// protocol (initialize → session/new → session/prompt → session/update
 /// stream, plus a permission callback) is verified without spawning a process.
 final class AcpClientTests: XCTestCase {
+    func testRunProfileStoreSupportsCreateForkRenameDeleteAndRetainsUnknownAvailability() throws {
+        let suite = "AcpRunProfileStoreTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = AcpRunProfileStore(defaults: defaults, key: "profiles")
+
+        let created = store.create(
+            name: "Docs only",
+            modelID: "stable-model",
+            enabledClientToolIDs: [AcpRunProfile.ClientTool.readTextFile.rawValue, "future.tool"],
+            enabledMCPServerNames: ["docs", "removed-server"]
+        )
+        let fork = try XCTUnwrap(store.fork(created.id))
+        XCTAssertNotEqual(fork.id, created.id)
+        XCTAssertEqual(fork.modelID, "stable-model")
+        XCTAssertTrue(store.rename(fork.id, to: "Docs review"))
+        XCTAssertEqual(store.profile(id: fork.id)?.name, "Docs review")
+        XCTAssertTrue(store.delete(fork.id))
+        XCTAssertNil(store.profile(id: fork.id))
+
+        let restored = try XCTUnwrap(store.profile(id: created.id))
+        XCTAssertEqual(restored.enabledClientToolIDs, ["readTextFile", "future.tool"])
+        XCTAssertEqual(restored.enabledMCPServerNames, ["docs", "removed-server"])
+        XCTAssertEqual(
+            restored.availabilityWarnings(knownMCPServerNames: ["docs"]),
+            ["Tool “future.tool” is unavailable.", "MCP server “removed-server” is unavailable."]
+        )
+    }
+
+    func testRunProfileRestrictsAdvertisedAndEnforcedToolsAndMCPServers() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-acp-profile-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try Data("readable".utf8).write(to: directory.appending(path: "input.txt"))
+        let profile = AcpRunProfile(
+            id: "docs-only",
+            name: "Docs only",
+            modelID: "stable-model",
+            enabledClientToolIDs: [AcpRunProfile.ClientTool.readTextFile.rawValue],
+            enabledMCPServerNames: ["docs", "removed-server"]
+        )
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+
+        _ = try await client.start(
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: directory.path,
+            mcpServers: [
+                .object(["name": .string("docs"), "command": .string("docs-mcp")]),
+                .object(["name": .string("other"), "command": .string("other-mcp")]),
+            ],
+            access: .unrestricted,
+            runProfile: profile
+        )
+
+        let advertised = await transport.receivedClientCapabilities()?.objectValue
+        XCTAssertEqual(advertised?["fs"]?.objectValue?["readTextFile"], .bool(true))
+        XCTAssertEqual(advertised?["fs"]?.objectValue?["writeTextFile"], .bool(false))
+        XCTAssertEqual(advertised?["terminal"], .bool(false))
+        let servers = await transport.receivedSessionMcpServers()
+        XCTAssertEqual(servers.compactMap { $0.objectValue?["name"]?.stringValue }, ["docs"])
+
+        await transport.sendAgentRequest(
+            id: 25_401,
+            method: "fs/write_text_file",
+            params: .object(["path": .string("blocked.txt"), "content": .string("blocked")])
+        )
+        let response = try await transport.waitForClientResponse(id: 25_401)
+        XCTAssertTrue(
+            response.objectValue?["error"]?.objectValue?["message"]?.stringValue?
+                .contains("run profile") == true
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: directory.appending(path: "blocked.txt").path))
+        await client.stop()
+    }
+
+    func testRunProfileSnapshotPersistsWithRestorableChatWhileLegacyDefaultsToWrite() throws {
+        let profile = AcpRunProfile(
+            id: "review",
+            name: "Review",
+            modelID: "sonnet",
+            enabledClientToolIDs: [AcpRunProfile.ClientTool.readTextFile.rawValue],
+            enabledMCPServerNames: ["docs"]
+        )
+        let descriptor = NativeRestorableAgentChatDescriptor(
+            id: "chat-profile",
+            projectID: "project",
+            agentID: "claude-code",
+            workspacePath: "/tmp/project",
+            acpSessionID: nil,
+            title: "Review",
+            runProfile: profile
+        )
+        let surface = NativeRestorableSurfaceState(agentChat: descriptor)
+        XCTAssertEqual(surface.agentChatDescriptor?.runProfile, profile)
+        XCTAssertEqual(
+            try JSONDecoder().decode(
+                NativeRestorableAgentChatDescriptor.self,
+                from: JSONSerialization.data(withJSONObject: [
+                    "id": "legacy",
+                    "projectID": "project",
+                    "agentID": "codex",
+                    "workspacePath": "/tmp/project",
+                ])
+            ).runProfile,
+            nil
+        )
+    }
+
+    @MainActor
+    func testEveryDispatchedTurnRecordsTheImmutableRunProfileSnapshot() async throws {
+        let profile = AcpRunProfile(
+            id: "review",
+            name: "Review",
+            modelID: "sonnet",
+            enabledClientToolIDs: [AcpRunProfile.ClientTool.readTextFile.rawValue],
+            enabledMCPServerNames: ["docs"]
+        )
+        let transport = ScriptedAcpTransport()
+        let conversation = AcpConversation(
+            title: "Audit",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            runProfile: profile,
+            client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+
+        conversation.send("first")
+        try await Self.until("first turn settled") { !conversation.isRunning }
+        conversation.send("second")
+        try await Self.until("second turn settled") { !conversation.isRunning }
+
+        let audits = conversation.rows.compactMap { row -> AcpRunProfile? in
+            if case let .runProfileAudit(_, snapshot) = row { return snapshot }
+            return nil
+        }
+        XCTAssertEqual(audits, [profile, profile])
+        let roundTrip = try JSONDecoder().decode(
+            [AcpTranscriptRow].self,
+            from: JSONEncoder().encode(conversation.rows)
+        )
+        XCTAssertEqual(roundTrip, conversation.rows)
+    }
+
     func testCustomAdapterLaunchUsesSeatbeltAndAProviderScopedEnvironment() throws {
         let fixture = try CustomContainmentFixture()
         let containment = CustomAdapterContainment(
@@ -3225,6 +3378,196 @@ final class AcpClientTests: XCTestCase {
     }
 
     @MainActor
+    func testRestoredModelFallbackBlocksInferenceUntilExplicitAcceptance() async throws {
+        let transport = ScriptedAcpTransport(currentModelID: "sonnet")
+        let conversation = AcpConversation(
+            title: "Fallback",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            transcriptModelID: "retired-opus",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "Claude",
+                accountLabel: "Work",
+                defaultSettingsSectionID: "accounts"
+            ),
+            client: AcpClient(transport: transport)
+        )
+        var persistedModelID: String?
+        conversation.onConfirmedModelFallback = { persistedModelID = $0 }
+
+        await conversation.start()
+
+        let fallback = try XCTUnwrap(conversation.pendingModelFallback)
+        XCTAssertEqual(fallback.requestedID, "retired-opus")
+        XCTAssertEqual(fallback.requestedLabel, "retired-opus")
+        XCTAssertEqual(fallback.actualID, "sonnet")
+        XCTAssertEqual(fallback.actualLabel, "Sonnet")
+        XCTAssertEqual(fallback.providerName, "Claude")
+        XCTAssertEqual(fallback.accountLabel, "Work")
+        XCTAssertFalse(conversation.allowsInference)
+        XCTAssertFalse(conversation.send("must stay local"))
+        let promptsBeforeAcceptance = await transport.receivedPromptTexts()
+        XCTAssertEqual(promptsBeforeAcceptance, [])
+
+        conversation.acceptModelFallback()
+
+        XCTAssertNil(conversation.pendingModelFallback)
+        XCTAssertTrue(conversation.allowsInference)
+        XCTAssertEqual(persistedModelID, "sonnet")
+        XCTAssertTrue(conversation.send("accepted"))
+        try await Self.until("the accepted fallback prompt completed") {
+            await transport.receivedPromptTexts() == ["accepted"] && !conversation.isRunning
+        }
+    }
+
+    @MainActor
+    func testCancellingModelFallbackStopsBeforeAnyInference() async throws {
+        let transport = ScriptedAcpTransport(currentModelID: "sonnet")
+        let conversation = AcpConversation(
+            title: "Fallback",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            transcriptModelID: "retired-opus",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "Claude",
+                accountLabel: "Work",
+                defaultSettingsSectionID: "accounts"
+            ),
+            client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+
+        await conversation.cancelModelFallback()
+
+        XCTAssertNil(conversation.pendingModelFallback)
+        XCTAssertFalse(conversation.isConnected)
+        XCTAssertFalse(conversation.allowsInference)
+        XCTAssertTrue(conversation.statusMessage?.contains("cancelled before inference") == true)
+        let promptsAfterCancellation = await transport.receivedPromptTexts()
+        XCTAssertEqual(promptsAfterCancellation, [])
+    }
+
+    @MainActor
+    func testRestoredQueueCannotResumeAcrossModelFallbackWithoutAcceptance() async throws {
+        let transport = ScriptedAcpTransport(currentModelID: "sonnet")
+        let conversation = AcpConversation(
+            title: "Restored queue",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            transcriptModelID: "retired-opus",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "Claude",
+                accountLabel: "Work",
+                defaultSettingsSectionID: "accounts"
+            ),
+            client: AcpClient(transport: transport),
+            initialQueuedPrompts: ["preserved follow-up"]
+        )
+
+        await conversation.start(resumeQueuedPrompts: true)
+
+        XCTAssertEqual(conversation.queued.map(\.text), ["preserved follow-up"])
+        let blockedPrompts = await transport.receivedPromptTexts()
+        XCTAssertEqual(blockedPrompts, [])
+
+        conversation.acceptModelFallback()
+        try await Self.until("the accepted restored queue resumed") {
+            await transport.receivedPromptTexts() == ["preserved follow-up"]
+        }
+    }
+
+    @MainActor
+    func testProviderStartupFailureNamesProviderAccountAndRelevantSettings() async {
+        let conversation = AcpConversation(
+            title: "Provider failure",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "OpenAI",
+                accountLabel: "Project/default",
+                defaultSettingsSectionID: "accounts"
+            ),
+            client: AcpClient(transport: ProviderFailureAcpTransport(
+                message: "Missing OPENAI_API_KEY"
+            ))
+        )
+
+        await conversation.start()
+
+        let failure = try? XCTUnwrap(conversation.providerStartupFailure)
+        XCTAssertEqual(failure?.providerName, "OpenAI")
+        XCTAssertEqual(failure?.accountLabel, "Project/default")
+        XCTAssertEqual(failure?.settingsSectionID, "models")
+        XCTAssertEqual(failure?.settingsTitle, "Models & Keys")
+        XCTAssertTrue(failure?.detail.contains("Missing OPENAI_API_KEY") == true)
+        XCTAssertTrue(conversation.statusMessage?.contains("OpenAI") == true)
+    }
+
+    @MainActor
+    func testAdapterWithoutRequestedModelHidesFallbackControl() async {
+        let transport = ScriptedAcpTransport(currentModelID: "sonnet")
+        let conversation = AcpConversation(
+            title: "Default model",
+            command: "mock",
+            arguments: [],
+            environment: [:],
+            cwd: "/tmp",
+            providerContext: AcpProviderLaunchContext(
+                providerName: "Claude",
+                accountLabel: "Work",
+                defaultSettingsSectionID: "accounts"
+            ),
+            client: AcpClient(transport: transport)
+        )
+
+        await conversation.start()
+
+        XCTAssertNil(conversation.pendingModelFallback)
+        XCTAssertTrue(conversation.allowsInference)
+    }
+
+    @MainActor
+    func testPersistingAcceptedFallbackKeepsImmutableAccountBinding() {
+        let binding = SessionAccountBinding(
+            accountID: "work",
+            provider: .claude,
+            label: "Work",
+            configDirectory: "/tmp/claude-work"
+        )
+        let conversation = AcpConversation(
+            title: "Fallback",
+            command: "mock",
+            arguments: [],
+            cwd: "/tmp"
+        )
+        let access = ChatAccountAccess(binding: binding, requiresResolution: false)
+        let handle = AcpChatHandle(
+            id: "chat-fallback",
+            agentID: "claude-code",
+            workspaceDirectory: URL(fileURLWithPath: "/tmp"),
+            accountBinding: binding,
+            modelOverride: "retired-opus",
+            accountAccess: access,
+            conversation: conversation
+        )
+
+        let persisted = handle.replacingModelOverride(with: "sonnet")
+
+        XCTAssertEqual(persisted.modelOverride, "sonnet")
+        XCTAssertEqual(persisted.accountBinding, binding.normalized)
+        XCTAssertTrue(persisted.accountAccess === access)
+        XCTAssertTrue(persisted.conversation === conversation)
+    }
+
+    @MainActor
     func testFollowUpQueuedWhileRunningDispatchesAfterTurn() async throws {
         let transport = ScriptedAcpTransport()
         let client = AcpClient(transport: transport)
@@ -3628,7 +3971,9 @@ final class AcpClientTests: XCTestCase {
             try await client.requestForTesting("session/set_model", timeoutNanoseconds: 30_000_000_000)
         }
         try await Self.untilClient("the request to go in flight") {
-            await client.outstandingRequestTimeoutCountForTesting() == 1
+            let timeoutCount = await client.outstandingRequestTimeoutCountForTesting()
+            let requestIDs = await transport.unansweredRequestIDs()
+            return timeoutCount == 1 && !requestIDs.isEmpty
         }
         let inFlight = await transport.unansweredRequestIDs()
         await transport.answer(id: try XCTUnwrap(inFlight.first))
@@ -3653,6 +3998,304 @@ final class AcpClientTests: XCTestCase {
         let outstanding = await client.outstandingRequestTimeoutCountForTesting()
         XCTAssertEqual(outstanding, 0, "a failed send left its timeout task running")
         await client.stop()
+    }
+
+    // MARK: - Filesystem callback worker
+
+    func testDelayedFilesystemReadDoesNotBlockSessionUpdates() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-acp-read-worker-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try "worker result".write(
+            to: workspace.appending(path: "input.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let gate = FilesystemOperationGate()
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(
+            transport: transport,
+            filesystemWorker: AcpFilesystemWorker(operationHook: gate.hook)
+        )
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: workspace.path, mcpServers: []
+        )
+        defer {
+            gate.release()
+            Task { await client.stop() }
+        }
+
+        await transport.sendAgentRequest(
+            id: 36_701,
+            method: "fs/read_text_file",
+            params: .object(["path": .string("input.txt")])
+        )
+        try await Self.untilAsync("the read to reach the filesystem worker") { gate.didEnter }
+        try await Self.untilClient("the blocked read to remain in flight") {
+            await client.filesystemCallbacksInFlightForTesting() == 1
+        }
+
+        await transport.emitSessionUpdate(.object([
+            "sessionUpdate": .string("agent_message_chunk"),
+            "content": .object([
+                "type": .string("text"),
+                "text": .string("message while read is blocked"),
+            ]),
+        ]))
+        try await Self.untilAsync("the client actor to handle output during the read") {
+            collector.events.contains { event in
+                if case let .turnItem(.message(_, text)) = event {
+                    return text == "message while read is blocked"
+                }
+                return false
+            }
+        }
+        let prematureResponse = await transport.clientResponse(for: 36_701)
+        XCTAssertNil(prematureResponse)
+
+        gate.release()
+        let response = try await transport.waitForClientResponse(id: 36_701)
+        XCTAssertEqual(
+            response.objectValue?["result"]?.objectValue?["content"],
+            .string("worker result")
+        )
+    }
+
+    func testDelayedFilesystemWriteDoesNotBlockSessionUpdates() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-acp-write-worker-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let gate = FilesystemOperationGate()
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(
+            transport: transport,
+            filesystemWorker: AcpFilesystemWorker(operationHook: gate.hook)
+        )
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: workspace.path, mcpServers: []
+        )
+        defer {
+            gate.release()
+            Task { await client.stop() }
+        }
+
+        await transport.sendAgentRequest(
+            id: 36_702,
+            method: "fs/write_text_file",
+            params: .object([
+                "path": .string("nested/output.txt"),
+                "content": .string("written off actor"),
+            ])
+        )
+        try await Self.untilAsync("the write to reach the filesystem worker") { gate.didEnter }
+        try await Self.untilClient("the blocked write to remain in flight") {
+            await client.filesystemCallbacksInFlightForTesting() == 1
+        }
+
+        await transport.emitSessionUpdate(.object([
+            "sessionUpdate": .string("agent_message_chunk"),
+            "content": .object([
+                "type": .string("text"),
+                "text": .string("message while write is blocked"),
+            ]),
+        ]))
+        try await Self.untilAsync("the client actor to handle output during the write") {
+            collector.events.contains { event in
+                if case let .turnItem(.message(_, text)) = event {
+                    return text == "message while write is blocked"
+                }
+                return false
+            }
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: workspace.appending(path: "nested/output.txt").path)
+        )
+        let prematureResponse = await transport.clientResponse(for: 36_702)
+        XCTAssertNil(prematureResponse)
+
+        gate.release()
+        let response = try await transport.waitForClientResponse(id: 36_702)
+        XCTAssertEqual(response.objectValue?["result"], .object([:]))
+        XCTAssertEqual(
+            try String(contentsOf: workspace.appending(path: "nested/output.txt"), encoding: .utf8),
+            "written off actor"
+        )
+    }
+
+    func testFilesystemCompletionFromRetiredGenerationCannotAnswerReplacementConnection() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-acp-worker-generation-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try "stale result".write(
+            to: workspace.appending(path: "input.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let gate = FilesystemOperationGate()
+        let transport = ScriptedAcpTransport(newSessionIDs: ["old-session", "replacement-session"])
+        let client = AcpClient(
+            transport: transport,
+            filesystemWorker: AcpFilesystemWorker(operationHook: gate.hook)
+        )
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: workspace.path, mcpServers: []
+        )
+        defer {
+            gate.release()
+            Task { await client.stop() }
+        }
+
+        await transport.sendAgentRequest(
+            id: 36_703,
+            method: "fs/read_text_file",
+            params: .object(["path": .string("input.txt")])
+        )
+        try await Self.untilAsync("the stale read to reach the filesystem worker") { gate.didEnter }
+        try await Self.untilClient("the stale read to remain in flight") {
+            await client.filesystemCallbacksInFlightForTesting() == 1
+        }
+
+        await client.stop()
+        let replacement = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: workspace.path, mcpServers: []
+        )
+        XCTAssertEqual(replacement.sessionID, "replacement-session")
+
+        gate.release()
+        try await Self.untilClient("the stale callback task to retire") {
+            await client.filesystemCallbacksInFlightForTesting() == 0
+        }
+        let staleResponse = await transport.clientResponse(for: 36_703)
+        XCTAssertNil(staleResponse, "a retired filesystem completion answered on the replacement connection")
+
+        let options = try await client.setConfigOption(id: "reasoning_effort", value: "high")
+        XCTAssertEqual(options.first(where: { $0.id == "reasoning_effort" })?.currentValue, "high")
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(terminationCount, 1, "the stale completion terminated the healthy replacement")
+    }
+
+    // MARK: - Callback delivery health
+
+    func testFailedNotificationSendClosesTheConnectionWithAVisibleReason() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.failClientNotifications(true)
+        await client.cancel()
+
+        try await Self.untilAsync("the failed notification to retire the connection") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        let errors = collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message }
+            return nil
+        }
+        XCTAssertEqual(
+            errors,
+            ["Kaisola could not send an ACP notification. The agent connection was closed."]
+        )
+        XCTAssertEqual(
+            collector.events.filter { if case .exited = $0 { return true } else { return false } }.count,
+            1
+        )
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(terminationCount, 1)
+    }
+
+    func testFailedCallbackResponsesShareOneConnectionHealthTransition() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.failClientResponses(true)
+        await transport.sendAgentRequest(
+            id: 37_001,
+            method: "test/first_unhandled_callback",
+            params: .object([:])
+        )
+        await transport.sendAgentRequest(
+            id: 37_002,
+            method: "test/second_unhandled_callback",
+            params: .object([:])
+        )
+
+        try await Self.untilAsync("the failed responses to retire the connection once") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        let errors = collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message }
+            return nil
+        }
+        XCTAssertEqual(
+            errors,
+            ["Kaisola could not send an ACP callback response. The agent connection was closed."]
+        )
+        XCTAssertEqual(
+            collector.events.filter { if case .exited = $0 { return true } else { return false } }.count,
+            1
+        )
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(terminationCount, 1)
+    }
+
+    func testUnencodableRequiredCallbackResponseClosesTheConnection() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(
+            transport: transport,
+            outboundFrameLimits: AcpOutboundFrameLimits(
+                globalMaximumBytes: 4 * 1_024,
+                promptMaximumBytes: 4 * 1_024,
+                toolResponseMaximumBytes: 1
+            )
+        )
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.sendAgentRequest(
+            id: 37_003,
+            method: "fs/read_text_file",
+            params: .object(["path": .string("/var/empty/kaisola-callback-fixture")])
+        )
+
+        try await Self.untilAsync("the rejected callback encoding to retire the connection") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        XCTAssertTrue(collector.events.contains { event in
+            if case let .error(message) = event {
+                return message
+                    == "Kaisola could not send an ACP callback response. The agent connection was closed."
+            }
+            return false
+        })
+        let responseCount = await transport.receivedProtocolResponses().count
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(responseCount, 0)
+        XCTAssertEqual(terminationCount, 1)
     }
 
     func testAdapterExitCancelsEveryInFlightTimeout() async throws {
@@ -3875,6 +4518,13 @@ final class AcpClientTests: XCTestCase {
         _ = await prompt.value
     }
 
+    func testInvalidBrokerEnvelopeMapsToBoundedProtocolFailure() {
+        XCTAssertEqual(
+            AcpClient.protocolFailure(BrokerWireError.invalidEnvelope),
+            .malformedFrame("the message envelope is invalid")
+        )
+    }
+
     /// One newline-delimited `session/update` frame carrying an agent message.
     private static func agentMessageFrame(text: String) -> Data {
         var data = (try? JSONEncoder().encode(JSONValue.object([
@@ -3905,6 +4555,30 @@ private final class PromptOutcomeBox: @unchecked Sendable {
         if case let .failure(error) = storage { return error }
         return nil
     }
+}
+
+private struct ProviderFailureError: LocalizedError, Sendable {
+    let message: String
+    var errorDescription: String? { message }
+}
+
+/// Fails at the real transport-start boundary, before any ACP request can be
+/// emitted, so the conversation must add provider/account recovery context.
+private actor ProviderFailureAcpTransport: AcpByteTransport {
+    let message: String
+
+    init(message: String) {
+        self.message = message
+    }
+
+    func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
+        throw ProviderFailureError(message: message)
+    }
+
+    func send(_ data: Data) async throws {}
+    func receive(maximumBytes: Int) async throws -> Data? { nil }
+    func terminate() async {}
+    func exitCode() async -> Int32? { nil }
 }
 
 
@@ -3975,6 +4649,30 @@ private final class EventCollector: @unchecked Sendable {
             if case let .permission(request) = event { return request }
             return nil
         }
+    }
+}
+
+private final class FilesystemOperationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entered = false
+    private let released = DispatchSemaphore(value: 0)
+
+    lazy var hook: AcpFilesystemWorker.OperationHook = { [weak self] _ in
+        guard let self else { return }
+        lock.lock()
+        entered = true
+        lock.unlock()
+        released.wait()
+    }
+
+    var didEnter: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return entered
+    }
+
+    func release() {
+        released.signal()
     }
 }
 
@@ -4097,6 +4795,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private let steeringSupported: Bool
     private let steerOutcome: String?
     private let steerErrorMessage: String?
+    private let currentModelID: String?
     private let newSessionIDs: [String]
     private var newSessionIndex = 0
     private var currentSessionID = "sess-1"
@@ -4115,6 +4814,8 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
+    private var failingClientNotifications = false
+    private var failingClientResponses = false
     private var clientCapabilities: JSONValue?
     private var clientResponses: [Int64: JSONValue] = [:]
 
@@ -4133,6 +4834,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         steeringSupported: Bool = true,
         steerOutcome: String? = "injected",
         steerErrorMessage: String? = nil,
+        currentModelID: String? = nil,
         newSessionIDs: [String] = ["sess-1"],
         restartRaceStaleSessionID: String? = nil,
         loadRaceStaleSessionID: String? = nil,
@@ -4152,6 +4854,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         self.steeringSupported = steeringSupported
         self.steerOutcome = steerOutcome
         self.steerErrorMessage = steerErrorMessage
+        self.currentModelID = currentModelID
         self.newSessionIDs = newSessionIDs.isEmpty ? ["sess-1"] : newSessionIDs
         self.restartRaceStaleSessionID = restartRaceStaleSessionID
         self.loadRaceStaleSessionID = loadRaceStaleSessionID
@@ -4173,6 +4876,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func receivedProtocolResponses() -> [JSONValue] { protocolResponses }
     func terminationCount() -> Int { terminations }
     func receivedClientCapabilities() -> JSONValue? { clientCapabilities }
+    func clientResponse(for id: Int64) -> JSONValue? { clientResponses[id] }
+    func failClientNotifications(_ failing: Bool) { failingClientNotifications = failing }
+    func failClientResponses(_ failing: Bool) { failingClientResponses = failing }
 
     func sendAgentRequest(id: Int64, method: String, params: JSONValue) {
         enqueue(.object([
@@ -4301,6 +5007,12 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func send(_ data: Data) async throws {
         guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else { return }
         let id = object["id"]
+        if object["method"] == nil, failingClientResponses {
+            throw AcpClientError.notRunning
+        }
+        if id == nil, object["method"] != nil, failingClientNotifications {
+            throw AcpClientError.notRunning
+        }
         if object["method"] == nil {
             protocolResponses.append(.object(object))
             if let wireID = id?.intValue {
@@ -4358,7 +5070,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
             }
             newSessionIndex += 1
             currentSessionID = newSessionID
-            reply(id: id, result: .object([
+            var result: [String: JSONValue] = [
                 "sessionId": .string(newSessionID),
                 // Flat models shape (exercises the fallback parse path).
                 "models": .array([
@@ -4385,7 +5097,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                         ]),
                     ]),
                 ]),
-            ]))
+            ]
+            if let currentModelID { result["currentModelId"] = .string(currentModelID) }
+            reply(id: id, result: .object(result))
         case "session/load", "session/resume":
             let method = object["method"]?.stringValue ?? ""
             sessionMethods.append(method)

@@ -9,6 +9,11 @@ const {
   BROKER_PACKAGE_SCHEMA,
   BROKER_UPDATE_FEATURE,
   BROKER_ROLLING_UPDATE_FEATURE,
+  BROKER_MUTATION_IDEMPOTENCY_FEATURE,
+  BROKER_INVENTORY_FEATURE,
+  BROKER_ADMINISTRATION_FEATURE,
+  DEFAULT_MAX_LIVE_TERMINALS,
+  MAX_CONFIGURABLE_LIVE_TERMINALS,
   TERMINAL_HISTORY_CONTINUOUS_FEATURE,
   FEATURES,
   brokerVersionsCompatible,
@@ -19,8 +24,16 @@ test('independent broker implementation and helper package versions are pinned',
   assert.equal(BROKER_PACKAGE_SCHEMA, 1)
   assert.equal(BROKER_UPDATE_FEATURE, 'broker-update-v1')
   assert.equal(BROKER_ROLLING_UPDATE_FEATURE, 'broker-rolling-update-v1')
+  assert.equal(BROKER_MUTATION_IDEMPOTENCY_FEATURE, 'broker-mutation-idempotency-v1')
+  assert.equal(BROKER_INVENTORY_FEATURE, 'broker-inventory-v1')
+  assert.equal(BROKER_ADMINISTRATION_FEATURE, 'broker-administration-v1')
+  assert.equal(DEFAULT_MAX_LIVE_TERMINALS, 64)
+  assert.equal(MAX_CONFIGURABLE_LIVE_TERMINALS, 512)
   assert.equal(TERMINAL_HISTORY_CONTINUOUS_FEATURE, 'terminal-history-continuous-v1')
   assert.ok(FEATURES.includes(TERMINAL_HISTORY_CONTINUOUS_FEATURE))
+  assert.ok(FEATURES.includes(BROKER_MUTATION_IDEMPOTENCY_FEATURE))
+  assert.ok(FEATURES.includes(BROKER_INVENTORY_FEATURE))
+  assert.ok(FEATURES.includes(BROKER_ADMINISTRATION_FEATURE))
 })
 
 test('Node and Swift consume the same broker N/N+1 compatibility matrix', () => {

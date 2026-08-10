@@ -20,6 +20,138 @@ final class ProjectAccountSelectionTests: XCTestCase {
 
     private var profiles: [UsageAccountProfile] { [work, personal, codex] }
 
+    func testNewAccountProviderPickerNamesItsPurposeAndEverySegment() {
+        XCTAssertEqual(NewAccountProviderAccessibility.label, "New account provider")
+        XCTAssertEqual(
+            UsageAccountProfile.Provider.allCases.map(NewAccountProviderAccessibility.value),
+            ["Claude", "Codex"]
+        )
+        XCTAssertEqual(NewAccountProviderAccessibility.value(.claude), "Claude")
+        XCTAssertEqual(NewAccountProviderAccessibility.value(.codex), "Codex")
+    }
+
+    func testStoreRecoveryTakesPrecedenceOverProjectAssignmentRows() {
+        XCTAssertEqual(
+            ProjectAccountCardMode.resolve(hasRecoveryIssue: true, projectID: "project-1"),
+            .recovery
+        )
+        XCTAssertEqual(
+            ProjectAccountCardMode.resolve(hasRecoveryIssue: false, projectID: "project-1"),
+            .project
+        )
+        XCTAssertEqual(
+            ProjectAccountCardMode.resolve(hasRecoveryIssue: false, projectID: nil),
+            .noProject
+        )
+        XCTAssertEqual(
+            ProjectAccountCardMode.resolve(hasRecoveryIssue: true, projectID: nil),
+            .recovery
+        )
+    }
+
+    func testNamedAccountRemovalConfirmationListsProjectsAndOffersAppDefault() {
+        let impact = NamedAccountRemovalConfirmation(
+            accountLabel: "Work",
+            projectLabels: ["Kaisola", "Research"]
+        )
+
+        XCTAssertEqual(impact.actionTitle, "Use App Default and Remove Account")
+        XCTAssertEqual(
+            impact.message,
+            "Work is assigned to 2 projects: Kaisola and Research. Those projects will use App Default. The provider files and sign-in stay on disk."
+        )
+    }
+
+    func testUnassignedAccountRemovalKeepsTheSimpleConfirmation() {
+        let impact = NamedAccountRemovalConfirmation(
+            accountLabel: "Personal",
+            projectLabels: []
+        )
+
+        XCTAssertEqual(impact.actionTitle, "Remove Account")
+        XCTAssertEqual(
+            impact.message,
+            "Kaisola will forget Personal. Its provider files and sign-in stay on disk."
+        )
+    }
+
+    func testNamedAccountAuthenticationStatesChooseActionableControls() {
+        let checkedAt = Date(timeIntervalSince1970: 1_700_000_000)
+        let updatedAt = checkedAt.timeIntervalSince1970 * 1_000
+        func reading(
+            ok: Bool,
+            authRequired: Bool? = nil,
+            message: String? = nil
+        ) -> UsageCenter.ProviderPlanUsage {
+            UsageCenter.ProviderPlanUsage(
+                provider: "codex",
+                displayName: "Codex",
+                profileID: "acct_codex",
+                profileLabel: "Codex Work",
+                ok: ok,
+                authRequired: authRequired,
+                sourceLabel: "test",
+                windows: [],
+                message: message,
+                updatedAt: updatedAt
+            )
+        }
+
+        XCTAssertEqual(
+            NamedAccountAuthenticationPresentation.resolve(reading: nil, isRefreshing: true).status,
+            .checking
+        )
+        XCTAssertEqual(
+            NamedAccountAuthenticationPresentation.resolve(reading: nil, isRefreshing: false).action,
+            .check
+        )
+
+        let signedIn = NamedAccountAuthenticationPresentation.resolve(
+            reading: reading(ok: true),
+            isRefreshing: false
+        )
+        XCTAssertEqual(signedIn.status, .signedIn)
+        XCTAssertEqual(signedIn.actionTitle, "Check")
+        XCTAssertEqual(signedIn.lastVerification, checkedAt)
+
+        let signedOut = NamedAccountAuthenticationPresentation.resolve(
+            reading: reading(ok: false, authRequired: true, message: "Codex is not signed in."),
+            isRefreshing: false
+        )
+        XCTAssertEqual(signedOut.status, .signedOut)
+        XCTAssertEqual(signedOut.actionTitle, "Sign In")
+
+        let expired = NamedAccountAuthenticationPresentation.resolve(
+            reading: reading(ok: false, authRequired: true, message: "Your sign-in expired."),
+            isRefreshing: false
+        )
+        XCTAssertEqual(expired.status, .expired)
+        XCTAssertEqual(expired.actionTitle, "Reauthenticate")
+
+        let failed = NamedAccountAuthenticationPresentation.resolve(
+            reading: reading(ok: false, message: "Provider check timed out."),
+            isRefreshing: false
+        )
+        XCTAssertEqual(failed.status, .failed)
+        XCTAssertEqual(failed.actionTitle, "Check")
+        XCTAssertEqual(failed.diagnostic, "Provider check timed out.")
+    }
+
+    func testNamedAccountAuthenticationShowsLastVerificationAge() {
+        let now = Date(timeIntervalSince1970: 1_700_007_200)
+        XCTAssertEqual(
+            NamedAccountAuthenticationPresentation.lastCheckedCaption(
+                Date(timeIntervalSince1970: 1_700_000_000),
+                now: now
+            ),
+            "Last checked 2h ago"
+        )
+        XCTAssertEqual(
+            NamedAccountAuthenticationPresentation.lastCheckedCaption(nil, now: now),
+            "No verification time."
+        )
+    }
+
     // MARK: - Healthy assignments
 
     func testBlankOverrideIsAppDefault() {

@@ -1086,6 +1086,7 @@ actor BrokerStartupCoordinator:
             lockFile: metadataDirectory.appendingPathComponent("\(package.contentDigest).lock").path,
             storageDir: userData.appendingPathComponent("terminal-cache", isDirectory: true).path,
             logFile: metadataDirectory.appendingPathComponent("\(package.contentDigest).log").path,
+            maximumLiveTerminals: BrokerLaunchConfiguration.defaultMaximumLiveTerminals,
             startedAt: timestamp,
             version: appVersion,
             smoke: false

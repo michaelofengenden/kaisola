@@ -5,6 +5,8 @@ import KaisolaBrokerProtocol
 
 struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
     static let generationMetadataDirectoryName = "generations"
+    static let defaultMaximumLiveTerminals = BrokerWire.defaultMaximumLiveTerminals
+    static let maximumConfigurableLiveTerminals = BrokerWire.maximumConfigurableLiveTerminals
 
     let protocolVersion: Int
     let securityEpoch: Int
@@ -22,6 +24,10 @@ struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
     let lockFile: String
     let storageDir: String
     let logFile: String
+    /// Process-wide PTY ceiling for this detached broker generation. Optional
+    /// only so launch files written by the immediately previous app remain
+    /// decodable during a rolling upgrade; all new launch files seal a value.
+    let maximumLiveTerminals: Int?
     let startedAt: Int64
     let version: String
     let smoke: Bool
@@ -30,7 +36,7 @@ struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
         case protocolVersion = "protocol"
         case securityEpoch, implementationVersion, packageSchema, packageVersion, contentDigest
         case packageRoot
-        case token, socketPath, infoFile, lockFile, storageDir, logFile
+        case token, socketPath, infoFile, lockFile, storageDir, logFile, maximumLiveTerminals
         case startedAt, version, smoke
     }
 
@@ -47,6 +53,9 @@ struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
               BrokerHelperPackageVerification.isLowercaseSHA256(contentDigest),
               token.count == 64,
               token.allSatisfy(\.isHexDigit),
+              maximumLiveTerminals.map({
+                  (1...Self.maximumConfigurableLiveTerminals).contains($0)
+              }) ?? true,
               startedAt > 0,
               !version.isEmpty,
               version.count <= 120,

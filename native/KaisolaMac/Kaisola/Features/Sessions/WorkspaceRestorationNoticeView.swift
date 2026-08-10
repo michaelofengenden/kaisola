@@ -12,10 +12,19 @@ import SwiftUI
 /// removes it.
 struct WorkspaceRestorationNoticeView: View {
     @ObservedObject var model: AppModel
+    @ObservedObject private var projectAccountRecoveryCenter: ProjectAccountRecoveryCenter
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var confirmingProjectAccountReset = false
+
+    init(model: AppModel) {
+        self.model = model
+        _projectAccountRecoveryCenter = ObservedObject(
+            wrappedValue: model.projectAccountRecoveryCenter
+        )
+    }
 
     var body: some View {
-        Group {
+        VStack(spacing: 6) {
             if let notice = model.workspaceRestorationNotice {
                 Group {
                     if notice.isBannerDismissed {
@@ -29,6 +38,12 @@ struct WorkspaceRestorationNoticeView: View {
                 }
                 .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
             }
+            if let issue = projectAccountRecoveryCenter.issue {
+                projectAccountBanner(issue)
+                    .frame(maxWidth: 720, alignment: .leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
+            }
         }
         .animation(
             reduceMotion
@@ -36,6 +51,69 @@ struct WorkspaceRestorationNoticeView: View {
                 : .spring(response: 0.34, dampingFraction: 0.86),
             value: model.workspaceRestorationNotice
         )
+        .animation(
+            reduceMotion
+                ? .easeOut(duration: KaisolaVisualSystem.stateDuration)
+                : .spring(response: 0.34, dampingFraction: 0.86),
+            value: projectAccountRecoveryCenter.issue
+        )
+        .confirmationDialog(
+            "Reset all project account overrides?",
+            isPresented: $confirmingProjectAccountReset,
+            titleVisibility: .visible
+        ) {
+            Button("Reset Project Accounts", role: .destructive) {
+                model.resetProjectAccountsAfterFailure()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Kaisola will retain the preserved file, then clear every project's Claude and Codex selection. Agent launches can use app defaults again only after this explicit reset.")
+        }
+    }
+
+    private func projectAccountBanner(_ issue: ProjectAccountRecoveryIssue) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "person.crop.circle.badge.exclamationmark")
+                .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 6) {
+                Text(issue.title)
+                    .font(.callout.weight(.semibold))
+                Text(issue.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button("Retry") { model.retryProjectAccountRecovery() }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .accessibilityHint("Read the project-account file again")
+                    Button(issue.preservedCopyURL == nil
+                        ? "Reveal Original in Finder"
+                        : "Reveal Preserved Copy in Finder") {
+                        model.revealProjectAccountRecovery()
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Button("Reset…", role: .destructive) {
+                        confirmingProjectAccountReset = true
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                }
+            }
+            Spacer(minLength: 8)
+        }
+        .padding(12)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius))
+        .overlay(
+            RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius)
+                .strokeBorder(Color.red.opacity(0.45), lineWidth: KaisolaVisualSystem.focusStroke)
+        )
+        .shadow(color: .black.opacity(0.18), radius: 14, y: 5)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel(issue.title)
+        .accessibilityIdentifier("kaisola.project-account-recovery")
     }
 
     private func banner(_ notice: WorkspaceRestorationNotice) -> some View {

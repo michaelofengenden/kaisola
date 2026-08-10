@@ -106,6 +106,10 @@
 		4AEED15A504F6575273F165A /* AcpAdapterResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC20168C86DDDBA7D70222F3 /* AcpAdapterResolver.swift */; };
 		4B4670EA43E862CC87D986E2 /* AcpTranscriptPagingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B9366DA57DF29F48E569785 /* AcpTranscriptPagingTests.swift */; };
 		4BDC5B5AB5EC929E37C0181B /* NativePreviewSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */; };
+		A31700000000000000000001 /* NativeVisualTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = B31700000000000000000001 /* NativeVisualTokens.swift */; };
+		A31700000000000000000002 /* DesktopWallpaperResolution.swift in Sources */ = {isa = PBXBuildFile; fileRef = B31700000000000000000002 /* DesktopWallpaperResolution.swift */; };
+		A31700000000000000000003 /* DesktopBackdropRenderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = B31700000000000000000003 /* DesktopBackdropRenderer.swift */; };
+		A31700000000000000000004 /* NativeAppearanceViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = B31700000000000000000004 /* NativeAppearanceViews.swift */; };
 		4D4E12658C3765F9871895BF /* CompanionLinkClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24239D14B42DA0C8AFF7B561 /* CompanionLinkClient.swift */; };
 		4D51A3AC4497E78269BBCC81 /* CustomGrammarStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 443F6E111E133DACE49BA345 /* CustomGrammarStore.swift */; };
 		4E414C9D7F85C2BA40C92E76 /* SessionOrderStoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 732793D0CFBFD121B1D4146D /* SessionOrderStoreTests.swift */; };
@@ -368,6 +372,10 @@
 		07063F75FCF57994E572B99C /* AppModelProjectContextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelProjectContextTests.swift; sourceTree = "<group>"; };
 		07F25711B7E71707CD583039 /* AcpTerminalHostTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpTerminalHostTests.swift; sourceTree = "<group>"; };
 		081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewSettings.swift; sourceTree = "<group>"; };
+		B31700000000000000000001 /* NativeVisualTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeVisualTokens.swift; sourceTree = "<group>"; };
+		B31700000000000000000002 /* DesktopWallpaperResolution.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopWallpaperResolution.swift; sourceTree = "<group>"; };
+		B31700000000000000000003 /* DesktopBackdropRenderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesktopBackdropRenderer.swift; sourceTree = "<group>"; };
+		B31700000000000000000004 /* NativeAppearanceViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativeAppearanceViews.swift; sourceTree = "<group>"; };
 		0947C7DA82513DC2C0D20226 /* CustomThemeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomThemeStore.swift; sourceTree = "<group>"; };
 		09871A17CA3466F16953DC55 /* ExtensionsSettingsModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionsSettingsModel.swift; sourceTree = "<group>"; };
 		0A75F9D9A2E3D4F6821B1F0A /* AcpToolArtifactsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpToolArtifactsTests.swift; sourceTree = "<group>"; };
@@ -994,6 +1002,10 @@
 				C6AA966FC6B7942022613617 /* MemoryPressureResponder.swift */,
 				6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */,
 				081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */,
+				B31700000000000000000001 /* NativeVisualTokens.swift */,
+				B31700000000000000000002 /* DesktopWallpaperResolution.swift */,
+				B31700000000000000000003 /* DesktopBackdropRenderer.swift */,
+				B31700000000000000000004 /* NativeAppearanceViews.swift */,
 				AF04D4E52D6D1F5FAE4E6FA2 /* NativeVisualLayoutAudit.swift */,
 				99BEB5C842957215BC0F09A1 /* NativeVisualLayoutProbe.swift */,
 				6CDF76F788AF144D1713A04E /* NotificationBridge.swift */,
@@ -1493,6 +1505,10 @@
 				C03589E418393C7669764FA0 /* MeshView.swift in Sources */,
 				9D9F0944BD72F9C09E3A2B09 /* NativePreviewPaths.swift in Sources */,
 				4BDC5B5AB5EC929E37C0181B /* NativePreviewSettings.swift in Sources */,
+				A31700000000000000000001 /* NativeVisualTokens.swift in Sources */,
+				A31700000000000000000002 /* DesktopWallpaperResolution.swift in Sources */,
+				A31700000000000000000003 /* DesktopBackdropRenderer.swift in Sources */,
+				A31700000000000000000004 /* NativeAppearanceViews.swift in Sources */,
 				D8684CF2B2E76859A488B89C /* NativeSessionStore+AutoTitle.swift in Sources */,
 				A6466707F079FD97BD9432B1 /* NativeSessionStore.swift in Sources */,
 				2D4F3E75A2BD0372C6732DC0 /* NativeTerminalSurface.swift in Sources */,

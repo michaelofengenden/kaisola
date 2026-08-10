@@ -119,6 +119,64 @@ final class AcpPermissionRulesTests: XCTestCase {
         XCTAssertNil(AcpPermissionRules.requestMatchesRule(rules, workspace: nil, kind: "execute", resource: "anything"))
     }
 
+    func testStandingRuleRemovalConfirmationDisclosesTheExactScope() {
+        let rule = PermissionRule(
+            id: "release-rule",
+            workspace: "/work/研究 project",
+            action: "execute",
+            resource: "git push --force-with-lease origin release/*",
+            at: 17
+        )
+
+        let presentation = StandingRuleRemovalPresentation(rule: rule)
+
+        XCTAssertEqual(presentation.title, "Delete Standing Allow Rule?")
+        XCTAssertEqual(
+            presentation.message,
+            "Action: execute\nResource: git push --force-with-lease origin release/*\nWorkspace: /work/研究 project\n\nFuture matching requests will require approval again."
+        )
+        XCTAssertEqual(
+            presentation.announcement,
+            "Standing allow rule deleted. git push --force-with-lease origin release/* in /work/研究 project now requires approval."
+        )
+    }
+
+    func testStandingRuleRemovalReturnsFocusToTheNearestRemainingRule() {
+        let rules = [
+            PermissionRule(id: "first", workspace: "/w", action: "read", resource: "*", at: 1),
+            PermissionRule(id: "middle", workspace: "/w", action: "execute", resource: "git *", at: 2),
+            PermissionRule(id: "last", workspace: "/w", action: "edit", resource: "*", at: 3),
+        ]
+
+        XCTAssertEqual(
+            StandingRuleRemovalPresentation.focusTarget(afterRemoving: "middle", from: rules),
+            .rule("last")
+        )
+        XCTAssertEqual(
+            StandingRuleRemovalPresentation.focusTarget(afterRemoving: "last", from: rules),
+            .rule("middle")
+        )
+        XCTAssertEqual(
+            StandingRuleRemovalPresentation.focusTarget(afterRemoving: "first", from: [rules[0]]),
+            .emptyState
+        )
+    }
+
+    func testStandingRuleRemovalDoesNotClaimADeletionThatDidNotPersist() {
+        let rule = PermissionRule(id: "kept", workspace: "/w", action: "read", resource: "*", at: 1)
+        let replacement = PermissionRule(
+            id: "replacement",
+            workspace: rule.workspace,
+            action: rule.action,
+            resource: rule.resource,
+            at: 2
+        )
+
+        XCTAssertFalse(StandingRuleRemovalPresentation.didRemove(rule, persistedRules: [rule]))
+        XCTAssertFalse(StandingRuleRemovalPresentation.didRemove(rule, persistedRules: [replacement]))
+        XCTAssertTrue(StandingRuleRemovalPresentation.didRemove(rule, persistedRules: []))
+    }
+
     @MainActor
     func testCreateRulePersistsTheScopeShownInReview() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -237,6 +295,77 @@ final class AcpPermissionRulesTests: XCTestCase {
         XCTAssertEqual(
             SensitiveGlobPolicy.validationMessage("**/.ENV*", existing: ["**/.env*"]),
             "That sensitive-file pattern already exists."
+        )
+    }
+
+    func testSensitiveGlobFieldAssociatesInvalidStateAndCurrentError() {
+        let error = "Patterns cannot contain control characters."
+        let invalid = SensitiveGlobFieldAccessibility(issue: error)
+
+        XCTAssertEqual(invalid.value, "Invalid")
+        XCTAssertEqual(invalid.description, "Invalid. \(error)")
+
+        let valid = SensitiveGlobFieldAccessibility(issue: nil)
+        XCTAssertEqual(valid.value, "Valid")
+        XCTAssertEqual(valid.description, "No validation error.")
+    }
+
+    func testSensitiveGlobFieldAnnouncesEachValidationTransitionOnce() {
+        let broad = "Name at least part of a sensitive file; a wildcard-only pattern is too broad."
+        let unsupported = "Only * and ** wildcards are supported; ?, brackets, and braces are not."
+
+        XCTAssertNil(SensitiveGlobFieldAccessibility.announcement(previous: nil, current: nil))
+        XCTAssertEqual(
+            SensitiveGlobFieldAccessibility.announcement(previous: nil, current: broad),
+            "Sensitive file pattern invalid. \(broad)"
+        )
+        XCTAssertNil(SensitiveGlobFieldAccessibility.announcement(previous: broad, current: broad))
+        XCTAssertEqual(
+            SensitiveGlobFieldAccessibility.announcement(previous: broad, current: unsupported),
+            "Sensitive file pattern invalid. \(unsupported)"
+        )
+        XCTAssertEqual(
+            SensitiveGlobFieldAccessibility.announcement(previous: unsupported, current: nil),
+            "Sensitive file pattern is valid."
+        )
+    }
+
+    func testSensitiveGlobRemovalPlansExactMutationAndStableAdjacentFocus() {
+        XCTAssertEqual(
+            SensitiveGlobRemovalPolicy.plan(
+                removing: "**/.env*",
+                from: ["**/.env*", "**/*.pem", "**/*.key"]
+            ),
+            SensitiveGlobRemovalPlan(
+                remaining: ["**/*.pem", "**/*.key"],
+                nextFocus: .remove("**/*.pem")
+            )
+        )
+        XCTAssertEqual(
+            SensitiveGlobRemovalPolicy.plan(
+                removing: "**/*.key",
+                from: ["**/.env*", "**/*.pem", "**/*.key"]
+            )?.nextFocus,
+            .remove("**/*.pem")
+        )
+        XCTAssertEqual(
+            SensitiveGlobRemovalPolicy.plan(removing: "**/.env*", from: ["**/.env*"])?.nextFocus,
+            .newPattern
+        )
+        XCTAssertNil(
+            SensitiveGlobRemovalPolicy.plan(removing: "**/missing", from: ["**/.env*"])
+        )
+    }
+
+    func testSensitiveGlobRemovalNamesScopeAndProtectionChange() {
+        let glob = "**/*.p12"
+        XCTAssertEqual(
+            SensitiveGlobRemovalPolicy.confirmationMessage(for: glob),
+            "Remove **/*.p12? Paths matching this pattern will no longer always require approval."
+        )
+        XCTAssertEqual(
+            SensitiveGlobRemovalPolicy.announcement(for: glob),
+            "Sensitive file pattern **/*.p12 removed. Matching paths are no longer always-ask protected."
         )
     }
 

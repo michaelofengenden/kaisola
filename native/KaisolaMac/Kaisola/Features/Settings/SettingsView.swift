@@ -147,6 +147,7 @@ struct SettingsView: View {
     /// re-read the bridge (which owns the persisted rules).
     @State private var notificationRuleRevision = 0
     @State private var notificationAuthorization = NotificationAuthorizationState.unknown
+    @State private var externalEditorFeedback: String?
 
     /// Identifiable wrapper so the confirmation presents via `.alert(item:)`.
     private struct RestartRequest: Identifiable { let id = UUID() }
@@ -366,6 +367,10 @@ struct SettingsView: View {
     /// paying for an empty strip.
     private var titleBarSafeArea: CGFloat {
         dismiss == nil ? SettingsWindowChrome.titleBarSafeArea : 0
+    }
+
+    private var externalEditorDetail: String {
+        externalEditorFeedback ?? settings.externalEditorResolution.detail
     }
 
     var body: some View {
@@ -784,14 +789,34 @@ struct SettingsView: View {
                         .accessibilityLabel("Summon hotkey")
                     }
                     SettingsDivider()
-                    SettingsRow(title: "External editor", detail: "Used by Shift-Command-O", symbol: "arrow.up.forward.app") {
-                        TextField("System default", text: $settings.externalEditorApp)
-                            .textFieldStyle(.plain)
-                            .multilineTextAlignment(.trailing)
-                            .padding(.horizontal, 10)
-                            .frame(width: 190, height: 30)
-                            .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
-                            .accessibilityLabel("External editor")
+                    SettingsRow(
+                        title: "External editor",
+                        detail: externalEditorDetail,
+                        symbol: "arrow.up.forward.app"
+                    ) {
+                        VStack(alignment: .trailing, spacing: 6) {
+                            Menu {
+                                Button("System Default") {
+                                    settings.useSystemDefaultExternalEditor()
+                                    externalEditorFeedback = nil
+                                }
+                                Divider()
+                                Button("Choose Application…") { chooseExternalEditor() }
+                            } label: {
+                                ExternalEditorChoiceLabel(resolution: settings.externalEditorResolution)
+                            }
+                            .menuIndicator(.hidden)
+                            .accessibilityLabel("External editor application")
+
+                            Button("Test Open") {
+                                externalEditorFeedback = settings.testExternalEditor()
+                                    ? "Sent a safe test file to \(settings.externalEditorResolution.displayName)"
+                                    : "The external editor could not open the safe test file"
+                            }
+                            .controlSize(.small)
+                            .disabled(!settings.externalEditorResolution.isAvailable)
+                            .accessibilityHint("Opens a generated file containing no project or account data")
+                        }
                     }
                 }
             }
@@ -898,6 +923,21 @@ struct SettingsView: View {
         panel.directoryURL = URL(fileURLWithPath: "/System/Library/Desktop Pictures")
         guard panel.runModal() == .OK, let url = panel.url else { return }
         settings.glassWallpaper = url.path
+    }
+
+    private func chooseExternalEditor() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowedContentTypes = [.application]
+        panel.message = "Choose the application Shift-Command-O should use."
+        panel.prompt = "Use Application"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications", isDirectory: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        externalEditorFeedback = settings.selectExternalEditor(at: url)
+            ? nil
+            : "That item is not a resolvable macOS application"
     }
 
     private var terminal: some View {
@@ -1538,6 +1578,46 @@ private struct SettingsChoiceLabel: View {
     }
 }
 
+private struct ExternalEditorChoiceLabel: View {
+    let resolution: ExternalEditorResolution
+
+    var body: some View {
+        HStack(spacing: 7) {
+            icon
+                .frame(width: 18, height: 18)
+            Text(resolution.displayName)
+                .lineLimit(1)
+            Image(systemName: "chevron.up.chevron.down")
+                .font(.caption2.weight(.semibold))
+                .foregroundStyle(.kaisolaTertiary)
+        }
+        .font(.callout)
+        .padding(.horizontal, 10)
+        .frame(minWidth: 170, minHeight: 30)
+        .background(.quaternary.opacity(0.45), in: RoundedRectangle(cornerRadius: 8))
+    }
+
+    @ViewBuilder
+    private var icon: some View {
+        switch resolution {
+        case .systemDefault:
+            Image(systemName: "app.dashed")
+                .resizable()
+                .scaledToFit()
+                .foregroundStyle(.kaisolaSecondary)
+        case .application(let application):
+            Image(nsImage: NSWorkspace.shared.icon(forFile: application.url.path))
+                .resizable()
+                .scaledToFit()
+        case .unresolved:
+            Image(systemName: "exclamationmark.triangle.fill")
+                .resizable()
+                .scaledToFit()
+                .foregroundStyle(.orange)
+        }
+    }
+}
+
 /// The affected terminal surface keeps selection and a live preview here, then
 /// deep-links registry management to the consolidated Extensions destination.
 private struct TerminalColorCard: View {
@@ -1625,11 +1705,27 @@ private struct TerminalColorCard: View {
     }
 }
 
+struct TerminalPalettePreviewAccessibility: Equatable {
+    static let identifier = "settings.terminal.palette-preview"
+
+    let themeTitle: String
+
+    var label: String {
+        "Terminal palette preview, \(themeTitle) theme. "
+            + "Foreground text: home path. "
+            + "Background: terminal canvas. "
+            + "Cursor: block cursor. "
+            + "ANSI green: percent prompt. "
+            + "ANSI blue: codex command."
+    }
+}
+
 private struct TerminalPalettePreview: View {
     let definition: ThemeDefinition
     let light: Bool
     var body: some View {
         let palette = light ? definition.light : definition.dark
+        let accessibility = TerminalPalettePreviewAccessibility(themeTitle: definition.title)
         HStack(spacing: 10) {
             Text("~/Kaisola")
                 .foregroundStyle(Color(nsColor: palette.foreground).opacity(0.65))
@@ -1647,7 +1743,9 @@ private struct TerminalPalettePreview: View {
         .frame(height: 44)
         .background(Color(nsColor: palette.background), in: RoundedRectangle(cornerRadius: 9))
         .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.quaternary))
-        .accessibilityHidden(true)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibility.label)
+        .accessibilityIdentifier(TerminalPalettePreviewAccessibility.identifier)
     }
 
 }
@@ -1675,12 +1773,121 @@ enum SensitiveGlobPolicy {
     }
 }
 
+struct SensitiveGlobFieldAccessibility: Equatable {
+    static let identifier = "settings.guardrails.sensitive-glob"
+
+    let issue: String?
+
+    var value: String {
+        issue == nil ? "Valid" : "Invalid"
+    }
+
+    var description: String {
+        guard let issue else { return "No validation error." }
+        return "Invalid. \(issue)"
+    }
+
+    static func announcement(previous: String?, current: String?) -> String? {
+        guard previous != current else { return nil }
+        if let current {
+            return "Sensitive file pattern invalid. \(current)"
+        }
+        guard previous != nil else { return nil }
+        return "Sensitive file pattern is valid."
+    }
+}
+
+struct StandingRuleRemovalPresentation: Equatable {
+    enum FocusTarget: Equatable {
+        case rule(String)
+        case emptyState
+    }
+
+    let rule: PermissionRule
+
+    var title: String { "Delete Standing Allow Rule?" }
+
+    var message: String {
+        """
+        Action: \(rule.action)
+        Resource: \(rule.resource)
+        Workspace: \(rule.workspace)
+
+        Future matching requests will require approval again.
+        """
+    }
+
+    var announcement: String {
+        let label = AcpPermissionRules.ruleLabel(action: rule.action, resource: rule.resource)
+        return "Standing allow rule deleted. \(label) in \(rule.workspace) now requires approval."
+    }
+
+    static func focusTarget(afterRemoving id: String, from rules: [PermissionRule]) -> FocusTarget {
+        let originalIndex = rules.firstIndex { $0.id == id } ?? 0
+        let remaining = rules.filter { $0.id != id }
+        guard !remaining.isEmpty else { return .emptyState }
+        return .rule(remaining[min(originalIndex, remaining.count - 1)].id)
+    }
+
+    static func didRemove(_ rule: PermissionRule, persistedRules: [PermissionRule]) -> Bool {
+        !persistedRules.contains { candidate in
+            candidate.id == rule.id
+                || (candidate.workspace == rule.workspace
+                    && candidate.action == rule.action
+                    && candidate.resource == rule.resource)
+        }
+    }
+}
+
+enum SensitiveGlobControlFocus: Hashable {
+    case remove(String)
+    case newPattern
+}
+
+struct SensitiveGlobRemovalPlan: Equatable {
+    let remaining: [String]
+    let nextFocus: SensitiveGlobControlFocus
+}
+
+enum SensitiveGlobRemovalPolicy {
+    static func plan(removing glob: String, from existing: [String]) -> SensitiveGlobRemovalPlan? {
+        guard let removalIndex = existing.firstIndex(of: glob) else { return nil }
+        var remaining = existing
+        remaining.remove(at: removalIndex)
+        let nextFocus: SensitiveGlobControlFocus
+        if remaining.isEmpty {
+            nextFocus = .newPattern
+        } else {
+            nextFocus = .remove(remaining[min(removalIndex, remaining.count - 1)])
+        }
+        return SensitiveGlobRemovalPlan(remaining: remaining, nextFocus: nextFocus)
+    }
+
+    static func confirmationMessage(for glob: String) -> String {
+        "Remove \(glob)? Paths matching this pattern will no longer always require approval."
+    }
+
+    static func announcement(for glob: String) -> String {
+        "Sensitive file pattern \(glob) removed. Matching paths are no longer always-ask protected."
+    }
+}
+
 /// Guardrails tab: standing permission rules (delete) + sensitive globs (edit).
 private struct GuardrailsSettings: View {
     @ObservedObject var settings: NativePreviewSettings
     @State private var rules: [PermissionRule] = []
     @State private var newGlob = ""
+    @State private var globPendingRemoval: String?
     @State private var showsRestoreDefaultsConfirmation = false
+    @State private var pendingRuleRemoval: PermissionRule?
+    @State private var showsRuleRemovalConfirmation = false
+    @State private var pendingRuleFocus: StandingRuleRemovalPresentation.FocusTarget?
+    @State private var pendingRuleAnnouncement: String?
+    @State private var ruleRemovalFailure: String?
+    @FocusState private var focusedRuleID: String?
+    @FocusState private var emptyRuleStateFocused: Bool
+    @FocusState private var focusedControl: SensitiveGlobControlFocus?
+    @AccessibilityFocusState private var accessibilityFocusedControl: SensitiveGlobControlFocus?
     private let store = PermissionRuleStore()
 
     var body: some View {
@@ -1689,6 +1896,9 @@ private struct GuardrailsSettings: View {
                 if rules.isEmpty {
                     Text("No rules yet — \"Always Allow\" on a permission ask creates one.")
                         .font(.caption).foregroundStyle(.kaisolaSecondary)
+                        .focusable()
+                        .focused($emptyRuleStateFocused)
+                        .accessibilityIdentifier("settings.guardrails.allow-rules.empty")
                 }
                 ForEach(rules) { rule in
                     HStack {
@@ -1701,14 +1911,21 @@ private struct GuardrailsSettings: View {
                         }
                         Spacer()
                         Button(role: .destructive) {
-                            store.remove(id: rule.id)
-                            rules = store.rules()
+                            requestRuleRemoval(rule)
                         } label: {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
+                        .focused($focusedRuleID, equals: rule.id)
                         .accessibilityLabel("Delete allow-rule \(AcpPermissionRules.ruleLabel(action: rule.action, resource: rule.resource))")
+                        .accessibilityHint("Opens a confirmation showing the exact action, resource, and workspace.")
                     }
+                }
+                if let ruleRemovalFailure {
+                    Text(ruleRemovalFailure)
+                        .font(.caption)
+                        .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                        .accessibilityIdentifier("settings.guardrails.allow-rule-removal-error")
                 }
             }
             Section("Sensitive Files (Always Ask, Never Rule-Covered)") {
@@ -1717,17 +1934,29 @@ private struct GuardrailsSettings: View {
                         Text(glob).font(.callout.monospaced())
                         Spacer()
                         Button(role: .destructive) {
-                            settings.sensitiveGlobs.removeAll { $0 == glob }
+                            globPendingRemoval = glob
                         } label: {
                             Image(systemName: "trash")
                         }
                         .buttonStyle(.borderless)
                         .accessibilityLabel("Remove sensitive file pattern \(glob)")
+                        .accessibilityHint("Requires confirmation before changing always-ask protection")
+                        .focused($focusedControl, equals: .remove(glob))
+                        .accessibilityFocused($accessibilityFocusedControl, equals: .remove(glob))
                     }
                 }
                 HStack {
                     TextField("Add glob (e.g. **/*.p12)", text: $newGlob)
                         .onSubmit(addGlob)
+                        .focused($focusedControl, equals: .newPattern)
+                        .accessibilityFocused($accessibilityFocusedControl, equals: .newPattern)
+                        .accessibilityLabel("Sensitive file pattern")
+                        .accessibilityValue(newGlobAccessibility.value)
+                        .accessibilityHint(newGlobAccessibility.description)
+                        .accessibilityIdentifier(SensitiveGlobFieldAccessibility.identifier)
+                        .onChange(of: newGlobIssue) { previous, current in
+                            announceValidationChange(previous: previous, current: current)
+                        }
                     Button("Add", action: addGlob)
                         .disabled(!canAddGlob)
                 }
@@ -1735,6 +1964,7 @@ private struct GuardrailsSettings: View {
                     Text(issue)
                         .font(.caption)
                         .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                        .accessibilityHidden(true)
                 }
                 Button("Restore Defaults") { showsRestoreDefaultsConfirmation = true }
                 .font(.caption)
@@ -1743,6 +1973,42 @@ private struct GuardrailsSettings: View {
         .formStyle(.grouped)
         .padding(6)
         .onAppear { rules = store.rules() }
+        .confirmationDialog(
+            pendingRuleRemoval.map { StandingRuleRemovalPresentation(rule: $0).title }
+                ?? "Delete Standing Allow Rule?",
+            isPresented: $showsRuleRemovalConfirmation,
+            titleVisibility: .visible
+        ) {
+            if let rule = pendingRuleRemoval {
+                Button("Delete Allow Rule", role: .destructive) {
+                    confirmRuleRemoval(rule)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            if let rule = pendingRuleRemoval {
+                Text(StandingRuleRemovalPresentation(rule: rule).message)
+            }
+        }
+        .onChange(of: showsRuleRemovalConfirmation) { previous, current in
+            guard previous, !current else { return }
+            finishRuleRemovalDialog()
+        }
+        .confirmationDialog(
+            "Remove Sensitive-File Pattern?",
+            isPresented: showsGlobRemovalConfirmation,
+            titleVisibility: .visible,
+            presenting: globPendingRemoval
+        ) { glob in
+            Button("Remove \(glob)", role: .destructive) {
+                removeSensitiveGlob(glob)
+            }
+            Button("Cancel", role: .cancel) {
+                globPendingRemoval = nil
+            }
+        } message: { glob in
+            Text(SensitiveGlobRemovalPolicy.confirmationMessage(for: glob))
+        }
         .confirmationDialog(
             "Restore Default Sensitive-File Patterns?",
             isPresented: $showsRestoreDefaultsConfirmation,
@@ -1761,6 +2027,19 @@ private struct GuardrailsSettings: View {
         SensitiveGlobPolicy.validationMessage(newGlob, existing: settings.sensitiveGlobs)
     }
 
+    private var showsGlobRemovalConfirmation: Binding<Bool> {
+        Binding(
+            get: { globPendingRemoval != nil },
+            set: { isPresented in
+                if !isPresented { globPendingRemoval = nil }
+            }
+        )
+    }
+
+    private var newGlobAccessibility: SensitiveGlobFieldAccessibility {
+        SensitiveGlobFieldAccessibility(issue: newGlobIssue)
+    }
+
     private var canAddGlob: Bool {
         !newGlob.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && newGlobIssue == nil
     }
@@ -1773,5 +2052,99 @@ private struct GuardrailsSettings: View {
         }
         settings.sensitiveGlobs.append(trimmed)
         newGlob = ""
+    }
+
+    private func requestRuleRemoval(_ rule: PermissionRule) {
+        pendingRuleRemoval = rule
+        pendingRuleFocus = .rule(rule.id)
+        pendingRuleAnnouncement = nil
+        ruleRemovalFailure = nil
+        showsRuleRemovalConfirmation = true
+    }
+
+    private func confirmRuleRemoval(_ rule: PermissionRule) {
+        let presentation = StandingRuleRemovalPresentation(rule: rule)
+        let successFocus = StandingRuleRemovalPresentation.focusTarget(
+            afterRemoving: rule.id,
+            from: rules
+        )
+        store.remove(id: rule.id)
+        let persistedRules = store.rules()
+        rules = persistedRules
+        if StandingRuleRemovalPresentation.didRemove(rule, persistedRules: persistedRules) {
+            pendingRuleFocus = successFocus
+            pendingRuleAnnouncement = presentation.announcement
+            ruleRemovalFailure = nil
+        } else {
+            pendingRuleFocus = .rule(rule.id)
+            pendingRuleAnnouncement = nil
+            ruleRemovalFailure = "The allow rule could not be deleted. Nothing changed; try again."
+        }
+    }
+
+    private func finishRuleRemovalDialog() {
+        pendingRuleRemoval = nil
+        if let pendingRuleFocus {
+            focusedRuleID = nil
+            emptyRuleStateFocused = false
+            switch pendingRuleFocus {
+            case let .rule(id):
+                focusedRuleID = id
+            case .emptyState:
+                emptyRuleStateFocused = true
+            }
+        }
+        pendingRuleFocus = nil
+        if let pendingRuleAnnouncement {
+            NSAccessibility.post(
+                element: NSApplication.shared,
+                notification: .announcementRequested,
+                userInfo: [
+                    .announcement: pendingRuleAnnouncement,
+                    .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+                ]
+            )
+        }
+        pendingRuleAnnouncement = nil
+    }
+
+    private func removeSensitiveGlob(_ glob: String) {
+        guard let plan = SensitiveGlobRemovalPolicy.plan(
+            removing: glob,
+            from: settings.sensitiveGlobs
+        ) else {
+            globPendingRemoval = nil
+            return
+        }
+        settings.sensitiveGlobs = plan.remaining
+        globPendingRemoval = nil
+
+        DispatchQueue.main.async {
+            focusedControl = plan.nextFocus
+            accessibilityFocusedControl = plan.nextFocus
+        }
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: SensitiveGlobRemovalPolicy.announcement(for: glob),
+                .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+            ]
+        )
+    }
+
+    private func announceValidationChange(previous: String?, current: String?) {
+        guard let announcement = SensitiveGlobFieldAccessibility.announcement(
+            previous: previous,
+            current: current
+        ) else { return }
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: announcement,
+                .priority: NSAccessibilityPriorityLevel.low.rawValue,
+            ]
+        )
     }
 }

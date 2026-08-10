@@ -9,6 +9,148 @@ import XCTest
 /// checked.
 @MainActor
 final class NativePreviewSettingsTests: XCTestCase {
+    func testExternalEditorResolverDefaultsAndFailsClosed() {
+        let resolve: (String) -> ExternalEditorResolution = { selection in
+            ExternalEditorResolver.resolve(
+                selection,
+                applicationForBundleIdentifier: { _ in nil },
+                applicationForLegacyName: { _ in nil },
+                inspectApplication: { _ in nil }
+            )
+        }
+
+        XCTAssertEqual(resolve(""), .systemDefault)
+        XCTAssertEqual(resolve("  \n"), .systemDefault)
+        XCTAssertEqual(resolve("bundle:"), .unresolved)
+        XCTAssertEqual(resolve("path:relative.app"), .unresolved)
+        XCTAssertEqual(resolve("An App That Is Not Installed"), .unresolved)
+        XCTAssertFalse(resolve("bundle:missing.example").isAvailable)
+    }
+
+    func testExternalEditorResolverUsesStableBundleIdentityAndReadsLegacyChoices() throws {
+        let applicationURL = try makeApplicationBundle(
+            displayName: "Kaisola Test Editor",
+            bundleIdentifier: "test.kaisola.editor"
+        )
+        let application = try XCTUnwrap(ExternalEditorApplication(url: applicationURL))
+        XCTAssertEqual(application.displayName, "Kaisola Test Editor")
+        XCTAssertEqual(
+            ExternalEditorResolver.storedValue(for: application),
+            "bundle:test.kaisola.editor"
+        )
+
+        let resolve: (String) -> ExternalEditorResolution = { selection in
+            ExternalEditorResolver.resolve(
+                selection,
+                applicationForBundleIdentifier: { identifier in
+                    identifier == "test.kaisola.editor" ? applicationURL : nil
+                },
+                applicationForLegacyName: { name in
+                    name == "Kaisola Test Editor" ? applicationURL : nil
+                },
+                inspectApplication: { ExternalEditorApplication(url: $0) }
+            )
+        }
+        XCTAssertEqual(resolve("bundle:test.kaisola.editor"), .application(application))
+        XCTAssertEqual(resolve("test.kaisola.editor"), .application(application))
+        XCTAssertEqual(resolve("Kaisola Test Editor"), .application(application))
+        XCTAssertEqual(resolve(applicationURL.path), .application(application))
+    }
+
+    func testExternalEditorResolverFallsBackToValidatedApplicationPath() throws {
+        let applicationURL = try makeApplicationBundle(
+            displayName: "Unidentified Editor",
+            bundleIdentifier: nil
+        )
+        let application = try XCTUnwrap(ExternalEditorApplication(url: applicationURL))
+        XCTAssertNil(application.bundleIdentifier)
+        XCTAssertEqual(
+            ExternalEditorResolver.storedValue(for: application),
+            "path:\(applicationURL.standardizedFileURL.path)"
+        )
+    }
+
+    func testExternalEditorSelectionRejectsNonApplicationsWithoutChangingTheDraft() throws {
+        let defaults = makeDefaults()
+        let settings = NativePreviewSettings(defaults: defaults)
+        settings.externalEditorApp = "bundle:existing.example"
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-not-an-application-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+
+        XCTAssertFalse(settings.selectExternalEditor(at: directory))
+        XCTAssertEqual(settings.externalEditorApp, "bundle:existing.example")
+        XCTAssertFalse(settings.openInExternalEditor(directory))
+        XCTAssertEqual(
+            NativePreviewSettings(defaults: defaults).externalEditorApp,
+            "bundle:existing.example"
+        )
+
+        settings.useSystemDefaultExternalEditor()
+        XCTAssertEqual(settings.externalEditorResolution, .systemDefault)
+        XCTAssertEqual(NativePreviewSettings(defaults: defaults).externalEditorApp, "")
+    }
+
+    func testExternalEditorSelectionPersistsTheStableApplicationIdentity() throws {
+        let defaults = makeDefaults()
+        let settings = NativePreviewSettings(defaults: defaults)
+        let applicationURL = try makeApplicationBundle(
+            displayName: "Persistent Editor",
+            bundleIdentifier: "test.kaisola.persistent-editor"
+        )
+
+        XCTAssertTrue(settings.selectExternalEditor(at: applicationURL))
+        XCTAssertEqual(settings.externalEditorApp, "bundle:test.kaisola.persistent-editor")
+        XCTAssertEqual(
+            NativePreviewSettings(defaults: defaults).externalEditorApp,
+            "bundle:test.kaisola.persistent-editor"
+        )
+    }
+
+    func testExternalEditorTestDocumentContainsOnlyBenignFixedText() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-external-editor-test-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
+        let url = try NativePreviewSettings.writeExternalEditorTestDocument(in: directory)
+
+        XCTAssertEqual(url.lastPathComponent, NativePreviewSettings.externalEditorTestFileName)
+        XCTAssertEqual(
+            try String(contentsOf: url, encoding: .utf8),
+            "This safe test file contains no project or account data.\n"
+        )
+    }
+
+    func testTerminalPaletteAccessibilitySummaryNamesThemeAndEveryVisualRole() {
+        let summary = TerminalPalettePreviewAccessibility(themeTitle: "Kaisola")
+
+        XCTAssertEqual(
+            summary.label,
+            "Terminal palette preview, Kaisola theme. "
+                + "Foreground text: home path. "
+                + "Background: terminal canvas. "
+                + "Cursor: block cursor. "
+                + "ANSI green: percent prompt. "
+                + "ANSI blue: codex command."
+        )
+        XCTAssertEqual(
+            TerminalPalettePreviewAccessibility.identifier,
+            "settings.terminal.palette-preview"
+        )
+    }
+
+    func testTerminalPaletteAccessibilitySummaryUsesTheSelectedThemeTitle() {
+        XCTAssertTrue(
+            TerminalPalettePreviewAccessibility(themeTitle: "Solar Echo")
+                .label
+                .hasPrefix("Terminal palette preview, Solar Echo theme.")
+        )
+    }
+
     func testIsolatedFixtureUpdaterNeverStartsSparkle() {
         let controller = NativeUpdateController(isolatedFixture: true)
         XCTAssertFalse(controller.startedUpdater)
@@ -331,6 +473,41 @@ final class NativePreviewSettingsTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         defaults.removePersistentDomain(forName: suite)
         return defaults
+    }
+
+    private func makeApplicationBundle(
+        displayName: String,
+        bundleIdentifier: String?
+    ) throws -> URL {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-editor-app-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        let applicationURL = root.appendingPathComponent("Test Editor.app", isDirectory: true)
+        let contents = applicationURL.appendingPathComponent("Contents", isDirectory: true)
+        let executableDirectory = contents.appendingPathComponent("MacOS", isDirectory: true)
+        try FileManager.default.createDirectory(at: executableDirectory, withIntermediateDirectories: true)
+
+        var info: [String: Any] = [
+            "CFBundleDisplayName": displayName,
+            "CFBundleExecutable": "TestEditor",
+            "CFBundlePackageType": "APPL",
+        ]
+        if let bundleIdentifier { info["CFBundleIdentifier"] = bundleIdentifier }
+        let data = try PropertyListSerialization.data(
+            fromPropertyList: info,
+            format: .xml,
+            options: 0
+        )
+        try data.write(to: contents.appendingPathComponent("Info.plist"), options: .atomic)
+        let executable = executableDirectory.appendingPathComponent("TestEditor", isDirectory: false)
+        XCTAssertTrue(FileManager.default.createFile(atPath: executable.path, contents: Data()))
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: executable.path
+        )
+        addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+        return applicationURL
     }
 
     func testLayoutAndAppearancePersist() {

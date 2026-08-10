@@ -7,6 +7,7 @@ struct ElementRecord {
     let role: String?
     let labels: [String]
     let enabled: Bool?
+    let childCount: Int
 }
 
 struct Snapshot {
@@ -36,6 +37,10 @@ struct Receipt: Codable {
     let categoryNavigationRoles: [String]
     let commonMetadataFields: [String]
     let secretFree: Bool
+    let terminalPaletteIdentifierCount: Int
+    let terminalPaletteLabels: [String]
+    let terminalPaletteRole: String?
+    let terminalPaletteChildCount: Int?
 }
 
 private let categoryTitles = [
@@ -125,17 +130,18 @@ private func snapshot(processID: pid_t) -> Snapshot {
             of: element,
             errors: &result.errorCodes
         ) as? Bool
-        result.records.append(ElementRecord(
-            identifier: identifier,
-            role: role,
-            labels: labels,
-            enabled: enabled
-        ))
         let children = value(
             kAXChildrenAttribute,
             of: element,
             errors: &result.errorCodes
         ) as? [AXUIElement] ?? []
+        result.records.append(ElementRecord(
+            identifier: identifier,
+            role: role,
+            labels: labels,
+            enabled: enabled,
+            childCount: children.count
+        ))
         for child in children { walk(child, depth: depth + 1) }
     }
     walk(window, depth: 0)
@@ -160,6 +166,31 @@ private func matchingRecord(
 private func failure(surface: String, snapshot: Snapshot) -> String? {
     guard snapshot.windowCount == 1 else {
         return "wrong-window-count-\(snapshot.windowCount)"
+    }
+    if surface == "settings-terminal" {
+        let matches = snapshot.records.filter {
+            $0.identifier == "settings.terminal.palette-preview"
+        }
+        guard matches.count == 1 else {
+            return "wrong-terminal-palette-count-\(matches.count)"
+        }
+        let preview = matches[0]
+        guard preview.enabled != false else { return "disabled-terminal-palette" }
+        guard preview.childCount == 0 else {
+            return "terminal-palette-exposes-\(preview.childCount)-decorative-children"
+        }
+        let summary = preview.labels.joined(separator: " ")
+        for role in [
+            "macOS Terminal theme",
+            "Foreground text",
+            "Background",
+            "Cursor",
+            "ANSI green",
+            "ANSI blue",
+        ] where !summary.localizedCaseInsensitiveContains(role) {
+            return "terminal-palette-missing-\(role.replacingOccurrences(of: " ", with: "-"))"
+        }
+        return nil
     }
     let identifiers = snapshot.identifiers
     guard identifiers.contains("extensions.hub") else { return "missing-hub-identifier" }
@@ -220,11 +251,17 @@ private func receipt(
             guard let identifier = $0.identifier else { return false }
             return categoryIdentifiers.contains(identifier)
         }
-    } else {
+    } else if surface == "settings-extensions-narrow" {
         navigationRecords = snapshot.records.filter {
             $0.labels.contains { $0.localizedCaseInsensitiveContains("Extension category") }
         }
+    } else {
+        navigationRecords = []
     }
+    let terminalPaletteRecords = snapshot.records.filter {
+        $0.identifier == "settings.terminal.palette-preview"
+    }
+    let terminalPalette = terminalPaletteRecords.first
     return Receipt(
         processID: processID,
         surface: surface,
@@ -239,7 +276,11 @@ private func receipt(
         searchRole: matchingRecord(label: "Search extensions", in: snapshot)?.role,
         categoryNavigationRoles: navigationRecords.compactMap(\.role).sorted(),
         commonMetadataFields: commonFields,
-        secretFree: !containsLabel("fixture-secret", in: snapshot)
+        secretFree: !containsLabel("fixture-secret", in: snapshot),
+        terminalPaletteIdentifierCount: terminalPaletteRecords.count,
+        terminalPaletteLabels: terminalPalette?.labels ?? [],
+        terminalPaletteRole: terminalPalette?.role,
+        terminalPaletteChildCount: terminalPalette?.childCount
     )
 }
 
@@ -250,6 +291,9 @@ guard CommandLine.arguments.count == 3,
     exit(64)
 }
 let surface = CommandLine.arguments[2]
+let receiptPrefix = surface == "settings-terminal"
+    ? "KAISOLA_NATIVE_TERMINAL_PALETTE_AX"
+    : "KAISOLA_NATIVE_EXTENSIONS_AX"
 let deadline = Date().addingTimeInterval(6)
 var latest = Snapshot()
 var latestFailure = "window-not-ready"
@@ -262,8 +306,8 @@ repeat {
         let result = receipt(processID: processID, surface: surface, snapshot: latest)
         let data = try JSONEncoder().encode(result)
         let payload = String(decoding: data, as: UTF8.self)
-        print("KAISOLA_NATIVE_EXTENSIONS_AX=\(payload)")
-        print("KAISOLA_NATIVE_EXTENSIONS_AX=PASS surface=\(surface)")
+        print("\(receiptPrefix)=\(payload)")
+        print("\(receiptPrefix)=PASS surface=\(surface)")
         exit(0)
     }
     usleep(50_000)
@@ -271,10 +315,10 @@ repeat {
 
 let result = receipt(processID: processID, surface: surface, snapshot: latest)
 if let data = try? JSONEncoder().encode(result) {
-    print("KAISOLA_NATIVE_EXTENSIONS_AX=\(String(decoding: data, as: UTF8.self))")
+    print("\(receiptPrefix)=\(String(decoding: data, as: UTF8.self))")
 }
 fputs(
-    "KAISOLA_NATIVE_EXTENSIONS_AX=FAIL \(latestFailure) "
+    "\(receiptPrefix)=FAIL \(latestFailure) "
         + "errors=\(latest.errorCodes.sorted())\n",
     stderr
 )

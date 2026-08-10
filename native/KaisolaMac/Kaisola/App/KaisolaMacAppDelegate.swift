@@ -670,6 +670,21 @@ enum KaisolaMacMain {
             print("KAISOLA_NATIVE_LAUNCH_PROBE=PASS")
             return
         }
+        // The layout gate judges snapshots a capture run already wrote. It only
+        // reads JSON, so it runs on a headless runner with no window, no
+        // display and no user state, and reports through the exit status.
+        let commandArguments = Array(ProcessInfo.processInfo.arguments.dropFirst())
+        if NativeVisualLayoutCommand.requestsGate(arguments: commandArguments) {
+            guard let invocation = NativeVisualLayoutCommand.parse(arguments: commandArguments) else {
+                FileHandle.standardError.write(Data(
+                    ("KAISOLA_NATIVE_VISUAL_LAYOUT_GATE=FAIL usage: "
+                        + "--visual-layout-gate <directory> | --visual-layout-self-test <directory>"
+                        + " [--expectations <path>] [--review <path>]\n").utf8
+                ))
+                exit(2)
+            }
+            exit(NativeVisualLayoutCommand.run(invocation))
+        }
         KaisolaProductMigration.run()
         let application = NSApplication.shared
         application.setActivationPolicy(.regular)
@@ -2434,7 +2449,42 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             } catch {
                 print("KAISOLA_NATIVE_VISUAL_CAPTURE=FAIL \(error.localizedDescription)")
             }
+            // A PNG only proves something rendered. Record the geometry the
+            // screenshot cannot be checked for by eye — window-control zone,
+            // accessibility inventory, app-drawn ink — beside it, and let the
+            // post-capture gate judge every surface at once.
+            writeVisualLayoutSnapshot(of: captureWindow, capturePath: path)
             requestVisualFixtureTermination()
+        }
+    }
+
+    /// Structural evidence beside the capture. Never fails the fixture on its
+    /// own: the surface still gets its PNG, and `--visual-layout-gate` decides
+    /// after the whole inspection set exists, so one verdict covers every
+    /// screenshot instead of aborting at the first bad one.
+    private func writeVisualLayoutSnapshot(of window: NSWindow, capturePath: String) {
+        guard let snapshot = NativeVisualLayoutProbe.snapshot(
+            of: window,
+            surface: visualSurface,
+            appearance: visualAppearance
+        ) else {
+            print("KAISOLA_NATIVE_VISUAL_LAYOUT_SNAPSHOT=FAIL surface=\(visualSurface) reason=no-content-view")
+            return
+        }
+        let url = NativeVisualLayoutProbe.snapshotURL(forCapturePath: capturePath)
+        do {
+            try NativeVisualLayoutProbe.write(snapshot, to: url)
+            print(
+                "KAISOLA_NATIVE_VISUAL_LAYOUT_SNAPSHOT=PASS surface=\(visualSurface) "
+                    + "elements=\(snapshot.elements.count) source=\(snapshot.inventorySource) "
+                    + "controls=\(snapshot.windowControls.filter { !$0.isHidden }.count) "
+                    + "path=\(url.path)"
+            )
+        } catch {
+            print(
+                "KAISOLA_NATIVE_VISUAL_LAYOUT_SNAPSHOT=FAIL surface=\(visualSurface) "
+                    + "reason=\(error.localizedDescription)"
+            )
         }
     }
 

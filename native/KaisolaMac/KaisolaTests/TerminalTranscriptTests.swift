@@ -207,6 +207,167 @@ final class TerminalTranscriptTests: XCTestCase {
         XCTAssertEqual(appearancePreparationCount, 2)
     }
 
+    func testSearchPreparationFailureIsDistinctFromEmptyQueryAndNoMatches() throws {
+        var state = TerminalTranscriptSearchPreparationState()
+        let empty = TerminalTranscriptSearchWorker.Request(
+            query: "   ",
+            generation: 1,
+            dark: false
+        )
+        XCTAssertEqual(state.presentation(for: empty), .hidden)
+
+        let noMatches = TerminalTranscriptSearchWorker.Request(
+            query: "absent",
+            generation: 1,
+            dark: false
+        )
+        let noMatchAttempt = state.begin(request: noMatches)
+        XCTAssertEqual(state.presentation(for: noMatches), .searching)
+        XCTAssertNil(state.finishSuccess(matchCount: 0, attempt: noMatchAttempt))
+        XCTAssertEqual(state.presentation(for: noMatches), .matches(0))
+        XCTAssertEqual(state.presentation(for: noMatches).visibleText, "0 matches")
+        XCTAssertEqual(
+            state.presentation(for: noMatches).accessibilityLabel,
+            "No matches in loaded terminal transcript."
+        )
+        XCTAssertFalse(state.presentation(for: noMatches).canRetry)
+
+        let failing = TerminalTranscriptSearchWorker.Request(
+            query: "needle",
+            generation: 2,
+            dark: false
+        )
+        let failedAttempt = state.begin(request: failing)
+        XCTAssertEqual(
+            state.finishFailure("Search index unavailable.", attempt: failedAttempt),
+            .init(
+                message: "Terminal transcript search unavailable. Search index unavailable.",
+                priority: .high
+            )
+        )
+        XCTAssertEqual(
+            state.presentation(for: failing),
+            .unavailable(message: "Search index unavailable.")
+        )
+        XCTAssertEqual(state.presentation(for: failing).visibleText, "Search unavailable")
+        XCTAssertEqual(
+            state.presentation(for: failing).accessibilityLabel,
+            "Search unavailable. Search index unavailable."
+        )
+        XCTAssertTrue(state.presentation(for: failing).canRetry)
+    }
+
+    func testSearchPreparationRetryRecoversFromAWorkerError() async throws {
+        let worker = TerminalTranscriptSearchWorker { _, attempt in
+            if attempt == 1 { throw TerminalTranscriptSearchPreparationTestError.unavailable }
+        }
+        let request = TerminalTranscriptSearchWorker.Request(
+            query: "needle",
+            generation: 7,
+            dark: false
+        )
+        let pages = [TerminalTranscriptSearchWorker.Page(id: 1, text: "one needle")]
+        var state = TerminalTranscriptSearchPreparationState()
+
+        let firstAttempt = state.begin(request: request)
+        do {
+            _ = try await worker.prepare(pages, request: request)
+            XCTFail("The controlled first preparation must fail")
+        } catch {
+            XCTAssertEqual(
+                state.finishFailure(error.localizedDescription, attempt: firstAttempt),
+                .init(
+                    message: "Terminal transcript search unavailable. Search index unavailable.",
+                    priority: .high
+                )
+            )
+        }
+        XCTAssertTrue(state.presentation(for: request).canRetry)
+
+        let retry = state.begin(request: request)
+        XCTAssertEqual(state.presentation(for: request), .searching)
+        XCTAssertFalse(state.presentation(for: request).canRetry)
+        let prepared = try await worker.prepare(pages, request: request)
+        XCTAssertEqual(prepared.matchCount, 1)
+        XCTAssertEqual(
+            state.finishSuccess(matchCount: prepared.matchCount, attempt: retry),
+            .init(
+                message: "Terminal transcript search available. 1 match.",
+                priority: .medium
+            )
+        )
+        XCTAssertEqual(state.presentation(for: request), .matches(1))
+        XCTAssertNil(
+            state.finishSuccess(matchCount: prepared.matchCount, attempt: retry),
+            "A retry may announce recovery only once"
+        )
+    }
+
+    func testSearchPreparationCancellationRestoresTheRetryableFailure() async throws {
+        let worker = TerminalTranscriptSearchWorker { _, _ in
+            try Task.checkCancellation()
+        }
+        let request = TerminalTranscriptSearchWorker.Request(
+            query: "needle",
+            generation: 4,
+            dark: false
+        )
+        let pages = [TerminalTranscriptSearchWorker.Page(id: 1, text: "needle")]
+        var state = TerminalTranscriptSearchPreparationState()
+        let firstAttempt = state.begin(request: request)
+        _ = state.finishFailure("Search index unavailable.", attempt: firstAttempt)
+        let retry = state.begin(request: request)
+
+        let task = Task { try await worker.prepare(pages, request: request) }
+        task.cancel()
+        do {
+            _ = try await task.value
+            XCTFail("The controlled preparation must observe cancellation")
+        } catch is CancellationError {
+            state.cancel(attempt: retry)
+        } catch {
+            XCTFail("Cancellation must not become a search failure: \(error)")
+        }
+
+        XCTAssertEqual(
+            state.presentation(for: request),
+            .unavailable(message: "Search index unavailable.")
+        )
+        XCTAssertTrue(state.presentation(for: request).canRetry)
+    }
+
+    func testSearchPreparationClearsFailureForQueryOrGenerationChangeAndIgnoresLateResults() {
+        var state = TerminalTranscriptSearchPreparationState()
+        let original = TerminalTranscriptSearchWorker.Request(
+            query: "needle",
+            generation: 1,
+            dark: false
+        )
+        let staleAttempt = state.begin(request: original)
+        _ = state.finishFailure("Search index unavailable.", attempt: staleAttempt)
+
+        let changedQuery = TerminalTranscriptSearchWorker.Request(
+            query: "different",
+            generation: 1,
+            dark: false
+        )
+        XCTAssertEqual(state.presentation(for: changedQuery), .searching)
+        XCTAssertFalse(state.presentation(for: changedQuery).canRetry)
+        let currentAttempt = state.begin(request: changedQuery)
+        XCTAssertNil(state.finishFailure("Late original failure.", attempt: staleAttempt))
+        XCTAssertEqual(state.presentation(for: changedQuery), .searching)
+        XCTAssertNil(state.finishSuccess(matchCount: 2, attempt: currentAttempt))
+        XCTAssertEqual(state.presentation(for: changedQuery), .matches(2))
+
+        let changedGeneration = TerminalTranscriptSearchWorker.Request(
+            query: "different",
+            generation: 2,
+            dark: false
+        )
+        XCTAssertEqual(state.presentation(for: changedGeneration), .searching)
+        XCTAssertFalse(state.presentation(for: changedGeneration).canRetry)
+    }
+
     func testTranscriptUsesTheConfiguredTerminalTypefaceAndWeight() {
         let menlo = TerminalTranscriptTypography.font(
             family: "Menlo",
@@ -400,4 +561,10 @@ final class TerminalTranscriptTests: XCTestCase {
             TerminalTranscriptSanitizer.incrementalPageText(output: "newest page", isLastLoadedPage: true)
         )
     }
+}
+
+private enum TerminalTranscriptSearchPreparationTestError: LocalizedError {
+    case unavailable
+
+    var errorDescription: String? { "Search index unavailable." }
 }

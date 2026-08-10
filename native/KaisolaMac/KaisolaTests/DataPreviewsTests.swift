@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -9,77 +10,318 @@ final class DataPreviewsTests: XCTestCase {
 
     // MARK: - CSV parsing
 
+    func testCsvHeaderModesResolveHeaderSemanticsAndDataRowNumbers() {
+        let labeled = [["name", "age"], ["Ada", "36"], ["Grace", "37"]]
+        let headerless = [["Ada", "36"], ["Grace", "37"]]
+
+        let automatic = CsvHeaderResolution(mode: .automatic, rows: labeled)
+        XCTAssertTrue(automatic.hasHeader)
+        XCTAssertTrue(automatic.isHeader(rowIndex: 0))
+        XCTAssertNil(automatic.dataRowNumber(rowIndex: 0))
+        XCTAssertEqual(automatic.dataRowNumber(rowIndex: 1), 1)
+        XCTAssertEqual(automatic.accessibilityLabel(rowIndex: 0, columnIndex: 1), "Header, column 2")
+        XCTAssertEqual(automatic.accessibilityLabel(rowIndex: 1, columnIndex: 1), "Row 1, column 2")
+
+        let conservativeAuto = CsvHeaderResolution(mode: .automatic, rows: headerless)
+        XCTAssertFalse(conservativeAuto.hasHeader)
+        XCTAssertEqual(conservativeAuto.dataRowNumber(rowIndex: 0), 1)
+
+        let forcedHeader = CsvHeaderResolution(mode: .firstRowIsHeader, rows: headerless)
+        XCTAssertTrue(forcedHeader.hasHeader)
+        XCTAssertEqual(forcedHeader.dataRowNumber(rowIndex: 1), 1)
+        XCTAssertEqual(
+            CsvCellInspection(
+                rowIndex: 0,
+                columnIndex: 1,
+                value: "36",
+                rowAccessibilityLabel: "Header"
+            ).accessibilityLabel,
+            "Header, column 2"
+        )
+
+        let forcedData = CsvHeaderResolution(mode: .noHeader, rows: labeled)
+        XCTAssertFalse(forcedData.hasHeader)
+        XCTAssertEqual(forcedData.dataRowNumber(rowIndex: 0), 1)
+        XCTAssertEqual(forcedData.accessibilityLabel(rowIndex: 0, columnIndex: 0), "Row 1, column 1")
+    }
+
+    func testCsvHeaderModeChoicesUseExactUserFacingNames() {
+        XCTAssertEqual(CsvHeaderMode.allCases.map(\.title), [
+            "Auto",
+            "First Row Is Header",
+            "No Header",
+        ])
+    }
+
+    func testCsvHeaderPreferencePersistsPerPreviewWithoutStoringThePath() {
+        let suite = "CsvHeaderPreferenceTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let firstPath = "/private/tmp/Customer exports/people.csv"
+        let secondPath = "/private/tmp/Customer exports/events.csv"
+
+        var store = CsvHeaderPreferenceStore(defaults: defaults)
+        XCTAssertEqual(store.mode(forPath: firstPath), .automatic)
+        store.set(.noHeader, forPath: firstPath)
+        store.set(.firstRowIsHeader, forPath: secondPath)
+
+        store = CsvHeaderPreferenceStore(defaults: defaults)
+        XCTAssertEqual(store.mode(forPath: firstPath), .noHeader)
+        XCTAssertEqual(
+            store.mode(forPath: "/private/tmp/Customer exports/archive/../people.csv"),
+            .noHeader,
+            "standardized aliases of the same preview must share one preference"
+        )
+        XCTAssertEqual(store.mode(forPath: secondPath), .firstRowIsHeader)
+        XCTAssertFalse(
+            defaults.dictionaryRepresentation().keys.contains { $0.contains(firstPath) },
+            "the persisted key must not expose an absolute preview path"
+        )
+
+        store.set(.automatic, forPath: firstPath)
+        XCTAssertEqual(CsvHeaderPreferenceStore(defaults: defaults).mode(forPath: firstPath), .automatic)
+    }
+
     func testParsesSimpleRows() {
-        let (rows, truncated) = CsvTable.parse("a,b,c\n1,2,3")
-        XCTAssertEqual(rows, [["a", "b", "c"], ["1", "2", "3"]])
-        XCTAssertFalse(truncated)
+        let result = CsvTable.parse("a,b,c\n1,2,3")
+        XCTAssertEqual(result.rows, [["a", "b", "c"], ["1", "2", "3"]])
+        XCTAssertFalse(result.truncated)
     }
 
     func testQuotedFieldWithEmbeddedCommaAndNewline() {
-        let (rows, _) = CsvTable.parse("name,note\n\"Doe, Jane\",\"line1\nline2\"")
-        XCTAssertEqual(rows, [["name", "note"], ["Doe, Jane", "line1\nline2"]])
+        let result = CsvTable.parse("name,note\n\"Doe, Jane\",\"line1\nline2\"")
+        XCTAssertEqual(result.rows, [["name", "note"], ["Doe, Jane", "line1\nline2"]])
     }
 
     func testEscapedQuotesInsideQuotedField() {
         // Source field: "He said ""hi"""  ->  He said "hi"
-        let (rows, _) = CsvTable.parse("q\n\"He said \"\"hi\"\"\"")
-        XCTAssertEqual(rows, [["q"], ["He said \"hi\""]])
+        let result = CsvTable.parse("q\n\"He said \"\"hi\"\"\"")
+        XCTAssertEqual(result.rows, [["q"], ["He said \"hi\""]])
     }
 
     func testMidFieldQuoteIsLiteralAndDoesNotSwallowRest() {
         // A stray quote NOT at field start (3"5) is a literal character; it must
         // not open a quoted field that eats every later delimiter/newline.
-        let (rows, _) = CsvTable.parse("a,b\n3\"5,tail\nx,y")
-        XCTAssertEqual(rows, [["a", "b"], ["3\"5", "tail"], ["x", "y"]])
+        let result = CsvTable.parse("a,b\n3\"5,tail\nx,y")
+        XCTAssertEqual(result.rows, [["a", "b"], ["3\"5", "tail"], ["x", "y"]])
     }
 
     func testCRLFLineEndings() {
-        let (rows, _) = CsvTable.parse("a,b\r\n1,2\r\n")
-        XCTAssertEqual(rows, [["a", "b"], ["1", "2"]])
+        let result = CsvTable.parse("a,b\r\n1,2\r\n")
+        XCTAssertEqual(result.rows, [["a", "b"], ["1", "2"]])
     }
 
     func testTrailingNewlineDoesNotAddEmptyRow() {
-        let (rows, _) = CsvTable.parse("a\nb\n")
-        XCTAssertEqual(rows, [["a"], ["b"]])
+        let result = CsvTable.parse("a\nb\n")
+        XCTAssertEqual(result.rows, [["a"], ["b"]])
     }
 
     func testTrailingEmptyFieldIsPreserved() {
-        let (rows, _) = CsvTable.parse("a,")
-        XCTAssertEqual(rows, [["a", ""]])
+        let result = CsvTable.parse("a,")
+        XCTAssertEqual(result.rows, [["a", ""]])
     }
 
     func testEmptyInputYieldsNoRows() {
-        let (rows, truncated) = CsvTable.parse("")
-        XCTAssertTrue(rows.isEmpty)
-        XCTAssertFalse(truncated)
+        let result = CsvTable.parse("")
+        XCTAssertTrue(result.rows.isEmpty)
+        XCTAssertFalse(result.truncated)
+        XCTAssertEqual(result.truncation, .empty)
     }
 
     func testSemicolonDelimiterParsing() {
-        let (rows, _) = CsvTable.parse("a;b;c", delimiter: ";")
-        XCTAssertEqual(rows, [["a", "b", "c"]])
+        let result = CsvTable.parse("a;b;c", delimiter: ";")
+        XCTAssertEqual(result.rows, [["a", "b", "c"]])
+    }
+
+    func testCsvUTF8CursorTraversesComposedUnicodeAndCRLFInSourceOrder() {
+        let source = "café 🍣 e\u{301}\r\n\"\"終"
+        var cursor = CsvTable.UTF8Cursor(source.utf8)
+        var traversed: [UInt8] = []
+
+        while let byte = cursor.take() {
+            traversed.append(byte)
+        }
+
+        XCTAssertEqual(String(decoding: traversed, as: UTF8.self), source)
+        XCTAssertNil(cursor.peek())
+        XCTAssertNil(cursor.take())
+    }
+
+    func testStreamingCsvParserPreservesQuotedUnicodeCorpus() {
+        let fixtures: [(text: String, delimiter: Character, rows: [[String]])] = [
+            (
+                "name,note\r\n藤井,\"café 🍣\"\r\nZoë,\"line one\r\nline two\"",
+                ",",
+                [["name", "note"], ["藤井", "café 🍣"], ["Zoë", "line one\r\nline two"]]
+            ),
+            (
+                "\"He said \"\"終\"\"\";\"данные;δοκιμή\";tail",
+                ";",
+                [["He said \"終\"", "данные;δοκιμή", "tail"]]
+            ),
+            (
+                "decomposed,emoji,empty\ne\u{301},🏳️‍🌈,",
+                ",",
+                [["decomposed", "emoji", "empty"], ["e\u{301}", "🏳️‍🌈", ""]]
+            ),
+            (
+                "literal\"quote\t\"embedded\tseparator\"\t終",
+                "\t",
+                [["literal\"quote", "embedded\tseparator", "終"]]
+            ),
+            (
+                "café💠\"данные💠δοκιμή\"💠終",
+                "💠",
+                [["café", "данные💠δοκιμή", "終"]]
+            ),
+        ]
+
+        for fixture in fixtures {
+            XCTAssertEqual(
+                CsvTable.parse(fixture.text, delimiter: fixture.delimiter).rows,
+                fixture.rows,
+                "fixture: \(fixture.text.debugDescription)"
+            )
+        }
     }
 
     // MARK: - CSV caps
 
     func testRowCapAndTruncatedFlag() {
         let text = (0..<(CsvTable.maxRows + 500)).map(String.init).joined(separator: "\n")
-        let (rows, truncated) = CsvTable.parse(text)
-        XCTAssertEqual(rows.count, CsvTable.maxRows)
-        XCTAssertTrue(truncated)
+        let result = CsvTable.parse(text)
+        XCTAssertEqual(result.rows.count, CsvTable.maxRows)
+        XCTAssertTrue(result.truncated)
     }
 
     func testColumnCapAndTruncatedFlag() {
         let wideRow = (0..<(CsvTable.maxCols + 30)).map { "c\($0)" }.joined(separator: ",")
-        let (rows, truncated) = CsvTable.parse(wideRow)
-        XCTAssertEqual(rows.first?.count, CsvTable.maxCols)
-        XCTAssertTrue(truncated)
+        let result = CsvTable.parse(wideRow)
+        XCTAssertEqual(result.rows.first?.count, CsvTable.maxCols)
+        XCTAssertTrue(result.truncated)
     }
 
     func testWithinCapsIsNotTruncated() {
         let text = (0..<10).map { "\($0),x,y" }.joined(separator: "\n")
-        let (rows, truncated) = CsvTable.parse(text)
-        XCTAssertEqual(rows.count, 10)
-        XCTAssertFalse(truncated)
+        let result = CsvTable.parse(text)
+        XCTAssertEqual(result.rows.count, 10)
+        XCTAssertFalse(result.truncated)
+    }
+
+    func testRowOnlyTruncationReportsActualAndDisplayedCounts() {
+        let text = (0...CsvTable.maxRows).map(String.init).joined(separator: "\n")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows + 1)
+        XCTAssertEqual(result.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.actualColumnCount, 1)
+        XCTAssertEqual(result.truncation.displayedColumnCount, 1)
+        XCTAssertTrue(result.truncation.rowsWereTruncated)
+        XCTAssertFalse(result.truncation.columnsWereTruncated)
+        XCTAssertEqual(result.truncation.notice, "Showing 2000 of 2001 rows.")
+    }
+
+    func testColumnOnlyTruncationReportsActualAndDisplayedCounts() {
+        let text = (0...CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, 1)
+        XCTAssertEqual(result.truncation.displayedRowCount, 1)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols + 1)
+        XCTAssertEqual(result.truncation.displayedColumnCount, CsvTable.maxCols)
+        XCTAssertFalse(result.truncation.rowsWereTruncated)
+        XCTAssertTrue(result.truncation.columnsWereTruncated)
+        XCTAssertEqual(result.truncation.notice, "Showing 64 of 65 columns.")
+    }
+
+    func testRowAndColumnTruncationReportsBothDimensions() {
+        let row = (0...CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let text = Array(repeating: row, count: CsvTable.maxRows + 1).joined(separator: "\n")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows + 1)
+        XCTAssertEqual(result.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols + 1)
+        XCTAssertEqual(result.truncation.displayedColumnCount, CsvTable.maxCols)
+        XCTAssertTrue(result.truncation.rowsWereTruncated)
+        XCTAssertTrue(result.truncation.columnsWereTruncated)
+        XCTAssertEqual(
+            result.truncation.notice,
+            "Showing 2000 of 2001 rows and 64 of 65 columns."
+        )
+    }
+
+    func testExactRowAndColumnBoundariesDoNotReportTruncation() {
+        let row = (0..<CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let text = Array(repeating: row, count: CsvTable.maxRows).joined(separator: "\n")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols)
+        XCTAssertEqual(result.truncation.displayedColumnCount, CsvTable.maxCols)
+        XCTAssertFalse(result.truncation.rowsWereTruncated)
+        XCTAssertFalse(result.truncation.columnsWereTruncated)
+        XCTAssertNil(result.truncation.notice)
+    }
+
+    func testDiscardedColumnBytesCannotChangeQuoteOrRecordBoundaries() {
+        let visible = (0..<CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let result = CsvTable.parse("\(visible),discarded\"literal,tail\nnext")
+
+        XCTAssertEqual(result.truncation.actualRowCount, 2)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols + 2)
+        XCTAssertEqual(result.rows.count, 2)
+        XCTAssertEqual(result.rows[0].count, CsvTable.maxCols)
+        XCTAssertEqual(result.rows[1], ["next"])
+    }
+
+    func testDiscardedRowBytesCannotChangeQuoteOrRecordBoundaries() {
+        let visibleRows = Array(repeating: "visible", count: CsvTable.maxRows)
+            .joined(separator: "\n")
+        let result = CsvTable.parse("\(visibleRows)\ndiscarded\"literal,tail\nlast")
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows + 2)
+        XCTAssertEqual(result.truncation.actualColumnCount, 2)
+        XCTAssertEqual(result.rows.count, CsvTable.maxRows)
+        XCTAssertEqual(result.rows.last, ["visible"])
+    }
+
+    // MARK: - CSV cell inspection
+
+    func testCsvCellInspectionPreservesTheCompleteAccessibleValue() {
+        let value = String(repeating: "long-value-", count: 100) + "終"
+        let inspection = CsvCellInspection(rowIndex: 7, columnIndex: 3, value: value)
+
+        XCTAssertEqual(inspection.value, value)
+        XCTAssertEqual(inspection.accessibilityLabel, "Row 8, column 4")
+        XCTAssertEqual(inspection.accessibilityValue, value)
+        XCTAssertEqual(
+            inspection.accessibilityHint,
+            "Press Return to inspect the complete value and copy it."
+        )
+        XCTAssertEqual(
+            CsvCellInspection(rowIndex: 8, columnIndex: 4, value: "").accessibilityValue,
+            "Empty cell"
+        )
+    }
+
+    func testCsvCellInspectionIdentityUsesCoordinatesRatherThanTruncatedText() {
+        let original = CsvCellInspection(rowIndex: 2, columnIndex: 5, value: "before")
+        let updated = CsvCellInspection(rowIndex: 2, columnIndex: 5, value: "after")
+        let neighbor = CsvCellInspection(rowIndex: 2, columnIndex: 6, value: "before")
+
+        XCTAssertEqual(original.id, updated.id)
+        XCTAssertNotEqual(original.id, neighbor.id)
+    }
+
+    func testCsvCellClipboardCopiesTheCompleteValueToAnIsolatedPasteboard() {
+        let pasteboard = NSPasteboard(name: .init("kaisola-csv-cell-inspection-tests"))
+        defer { pasteboard.clearContents() }
+        let value = "first line\nsecond\tcolumn\nUnicode: café 終"
+
+        XCTAssertTrue(CsvCellClipboard.copy(value, to: pasteboard))
+        XCTAssertEqual(pasteboard.string(forType: .string), value)
     }
 
     // MARK: - Delimiter detection
@@ -183,12 +425,73 @@ final class DataPreviewsTests: XCTestCase {
 
     func testNodeIdentityIsTheDeterministicPathToTheValue() throws {
         let root = JsonTree.build(try object(from: #"{"tags":["a","b"],"meta":{"n":1}}"#))
-        XCTAssertEqual(root.id, "$")
+        // Identities are RFC 6901 JSON Pointers; the whole document is "".
+        XCTAssertEqual(root.id, "")
 
         let byKey = Dictionary(uniqueKeysWithValues: root.children.map { ($0.key ?? "", $0) })
-        XCTAssertEqual(byKey["tags"]?.id, "$.tags")
-        XCTAssertEqual(byKey["tags"]?.children.map(\.id), ["$.tags[0]", "$.tags[1]"])
-        XCTAssertEqual(byKey["meta"]?.children.map(\.id), ["$.meta.n"])
+        XCTAssertEqual(byKey["tags"]?.id, "/tags")
+        XCTAssertEqual(byKey["tags"]?.children.map(\.id), ["/tags/0", "/tags/1"])
+        XCTAssertEqual(byKey["meta"]?.children.map(\.id), ["/meta/n"])
+    }
+
+    func testKeysAreEscapedIntoPointerTokens() throws {
+        // RFC 6901 §3: `~` becomes `~0` and `/` becomes `~1`, in that order, so
+        // a key can never introduce a level separator of its own.
+        let root = JsonTree.build(try object(from: #"{"a/b":1,"a~b":2,"a~1b":3}"#))
+        let byKey = Dictionary(uniqueKeysWithValues: root.children.map { ($0.key ?? "", $0) })
+        XCTAssertEqual(byKey["a/b"]?.id, "/a~1b")
+        XCTAssertEqual(byKey["a~b"]?.id, "/a~0b")
+        XCTAssertEqual(byKey["a~1b"]?.id, "/a~01b")
+    }
+
+    func testDottedKeysDoNotCollideWithNestedObjects() throws {
+        // The reported collision: `{"a.b":…}` and `{"a":{"b":…}}` are different
+        // values that used to share the identity `$.a.b`.
+        let root = JsonTree.build(try object(from: #"{"a.b":1,"a":{"b":2}}"#))
+        let ids = identifiers(of: root)
+        XCTAssertEqual(Set(ids).count, ids.count)
+
+        let byKey = Dictionary(uniqueKeysWithValues: root.children.map { ($0.key ?? "", $0) })
+        XCTAssertEqual(byKey["a.b"]?.id, "/a.b")
+        XCTAssertEqual(byKey["a"]?.children.map(\.id), ["/a/b"])
+    }
+
+    func testBracketKeysDoNotCollideWithArrayIndices() throws {
+        let root = JsonTree.build(try object(from: #"{"a[0]":1,"a":[2]}"#))
+        let ids = identifiers(of: root)
+        XCTAssertEqual(Set(ids).count, ids.count)
+
+        let byKey = Dictionary(uniqueKeysWithValues: root.children.map { ($0.key ?? "", $0) })
+        XCTAssertEqual(byKey["a[0]"]?.id, "/a[0]")
+        XCTAssertEqual(byKey["a"]?.children.map(\.id), ["/a/0"])
+    }
+
+    func testEmptyKeysDoNotCollideWithDottedSiblings() throws {
+        // `{"":{"x":…}}` and `{".x":…}` both used to produce `$..x`.
+        let ids = identifiers(of: JsonTree.build(try object(from: #"{"":{"x":1},".x":2,".":3}"#)))
+        XCTAssertEqual(Set(ids).count, ids.count)
+        XCTAssertTrue(ids.contains("//x"))   // the "x" member of the ""-keyed object
+    }
+
+    func testPipedKeysDoNotCollideWithNestedPaths() throws {
+        // Pipes are the truncation marker's old separator, and they travel with
+        // dots in real documents (log fields, composite keys).
+        let ids = identifiers(of: JsonTree.build(try object(from: """
+        {"a|b.c":1,"a|b":{"c":2},"a|truncated":3,"a":{"|truncated":4}}
+        """)))
+        XCTAssertEqual(Set(ids).count, ids.count)
+    }
+
+    func testDuplicateLookingNestedPathsStayDistinct() throws {
+        // Every spelling of a.b.c at once: three different values, three ids.
+        let root = JsonTree.build(try object(from: #"{"a":{"b":{"c":1}},"a.b":{"c":2},"a.b.c":3}"#))
+        let ids = identifiers(of: root)
+        XCTAssertEqual(Set(ids).count, ids.count)
+
+        let byKey = Dictionary(uniqueKeysWithValues: root.children.map { ($0.key ?? "", $0) })
+        XCTAssertEqual(byKey["a"]?.children.first?.children.map(\.id), ["/a/b/c"])
+        XCTAssertEqual(byKey["a.b"]?.children.map(\.id), ["/a.b/c"])
+        XCTAssertEqual(byKey["a.b.c"]?.id, "/a.b.c")
     }
 
     func testNodeIdentityIsStableAcrossRebuilds() throws {
@@ -212,7 +515,9 @@ final class DataPreviewsTests: XCTestCase {
         let bigArray = "[" + (0..<(JsonTree.maxNodes + 50)).map(String.init).joined(separator: ",") + "]"
         let ids = identifiers(of: JsonTree.build(try object(from: bigArray)))
         XCTAssertEqual(Set(ids).count, ids.count)
-        XCTAssertTrue(ids.contains { $0.hasSuffix("|truncated") })
+        // `~t` is not a legal escape, so the marker token is one no member can
+        // spell — not even a key literally named `truncated`.
+        XCTAssertTrue(ids.contains { $0.hasSuffix("/~truncated") })
     }
 
     // MARK: - Content-identity parse caches
@@ -269,9 +574,14 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertEqual(model.columnWidths[1], CsvPreviewModel.maximumColumnWidth)
     }
 
-    func testCsvPreviewModelCarriesTheTruncationFlag() {
+    func testCsvPreviewModelCarriesTheTruncationSummary() {
         let text = (0..<(CsvTable.maxRows + 10)).map(String.init).joined(separator: "\n")
-        XCTAssertTrue(CsvPreviewModel.make(text).truncated)
+        let model = CsvPreviewModel.make(text)
+
+        XCTAssertTrue(model.truncated)
+        XCTAssertEqual(model.truncation.actualRowCount, CsvTable.maxRows + 10)
+        XCTAssertEqual(model.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(model.truncation.notice, "Showing 2000 of 2010 rows.")
     }
 
     func testJsonPreviewOutcomeIsBuiltOncePerContentIdentity() async {
@@ -361,5 +671,246 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertTrue(truncated)
         XCTAssertEqual(jsonParseCount, 1)
         XCTAssertLessThan(jsonElapsed, .seconds(3.5))
+    }
+
+    // MARK: - HTML JavaScript approval
+
+    private static let benignHTML = "<html><body><p>Weekly report</p></body></html>"
+    private static let scriptedHTML =
+        "<html><body><div id=\"root\"></div><script>exfiltrate()</script></body></html>"
+    private static let staticShellHTML = """
+        <html><body>
+          <p>Loading weekly report…</p>
+          <div id="root"></div>
+          <SCRIPT src="report.js"></SCRIPT>
+        </body></html>
+        """
+
+    private func htmlIdentity(
+        path: String = "/project/report.html",
+        modifiedAt seconds: TimeInterval = 10,
+        revision: Int = 1
+    ) -> PreviewParseIdentity {
+        PreviewParseIdentity(
+            path: path,
+            modificationDate: Date(timeIntervalSince1970: seconds),
+            revision: revision
+        )
+    }
+
+    /// Mounts a document the way the preview does — prepare, then approve.
+    private func approvedApproval(
+        for identity: PreviewParseIdentity,
+        source: String
+    ) -> HTMLScriptApproval {
+        var approval = HTMLScriptApproval()
+        approval.adopt(identity: identity, fingerprint: HTMLScriptApproval.fingerprint(source))
+        approval.allow(for: identity)
+        XCTAssertTrue(approval.allowsJavaScript(for: identity))
+        return approval
+    }
+
+    func testJavaScriptApprovalDoesNotSurviveExternalReplacementOfTheSameFile() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 1)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // An agent rewrites the file on disk: same path, later snapshot, and a
+        // revision bump from the reload the workspace watcher triggers.
+        let replaced = htmlIdentity(modifiedAt: 20, revision: 2)
+        XCTAssertFalse(approval.allowsJavaScript(for: replaced))
+
+        approval.adopt(
+            identity: replaced,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.scriptedHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: replaced))
+        XCTAssertFalse(approval.allowsJavaScript(for: approvedIdentity))
+    }
+
+    func testJavaScriptApprovalDoesNotSurviveAnInEditorSave() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 3)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // Saving from the built-in editor rewrites the file and bumps the
+        // preview revision, leaving the pane pointed at the same path.
+        let saved = htmlIdentity(modifiedAt: 40, revision: 4)
+        XCTAssertFalse(approval.allowsJavaScript(for: saved))
+
+        approval.adopt(
+            identity: saved,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.scriptedHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: saved))
+    }
+
+    func testJavaScriptApprovalDropsWhenContentChangesUnderOneModificationTimestamp() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 1)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // Filesystem timestamps are coarse enough that a fast rewrite can land
+        // on the same mtime. The revision still moves, and so do the bytes.
+        let rewritten = htmlIdentity(modifiedAt: 10, revision: 2)
+        XCTAssertFalse(approval.allowsJavaScript(for: rewritten))
+
+        approval.adopt(
+            identity: rewritten,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.scriptedHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: rewritten))
+    }
+
+    func testJavaScriptApprovalReturnsOnlyWhenAReloadProducedIdenticalBytes() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 1)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // A reload of unchanged content should not ask again, but the grant
+        // stays off until those bytes have actually proved identical.
+        let reloaded = htmlIdentity(modifiedAt: 20, revision: 2)
+        XCTAssertFalse(approval.allowsJavaScript(for: reloaded))
+
+        approval.adopt(
+            identity: reloaded,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertTrue(approval.allowsJavaScript(for: reloaded))
+    }
+
+    func testJavaScriptApprovalDoesNotFollowIdenticalContentToAnotherFile() {
+        let approvedIdentity = htmlIdentity(path: "/project/trusted.html")
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        let otherFile = htmlIdentity(path: "/project/copy.html", modifiedAt: 20, revision: 2)
+        approval.adopt(
+            identity: otherFile,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: otherFile))
+    }
+
+    func testRevokingJavaScriptClearsTheGrantForIdenticalContentToo() {
+        let approvedIdentity = htmlIdentity()
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        approval.revoke()
+        XCTAssertFalse(approval.allowsJavaScript(for: approvedIdentity))
+
+        let reloaded = htmlIdentity(modifiedAt: 20, revision: 2)
+        approval.adopt(
+            identity: reloaded,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: reloaded))
+    }
+
+    func testJavaScriptApprovalTakenBeforeFingerprintingCoversOnlyThatIdentity() {
+        // The preparing overlay normally blocks this, but a grant made without
+        // a known fingerprint must not outlive the document it was made for.
+        let approvedIdentity = htmlIdentity()
+        var approval = HTMLScriptApproval()
+        approval.allow(for: approvedIdentity)
+        XCTAssertTrue(approval.allowsJavaScript(for: approvedIdentity))
+
+        let reloaded = htmlIdentity(modifiedAt: 20, revision: 2)
+        approval.adopt(
+            identity: reloaded,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: reloaded))
+    }
+
+    func testHtmlPreviewPreparationCarriesScriptPresenceReadinessAndFingerprintFromOneCachedPreparation() async {
+        let cache = PreviewParseCache<HTMLPreviewPreparation>()
+        _ = await cache.value(for: Self.scriptedHTML, parse: HTMLPreviewPreparation.make)
+        let preparation = await cache.value(for: Self.scriptedHTML, parse: HTMLPreviewPreparation.make)
+        let parseCount = await cache.parseCount
+
+        XCTAssertEqual(parseCount, 1)
+        XCTAssertTrue(preparation.containsJavaScript)
+        XCTAssertTrue(preparation.requiresJavaScriptPrompt)
+        XCTAssertEqual(preparation.fingerprint, HTMLScriptApproval.fingerprint(Self.scriptedHTML))
+        XCTAssertNotEqual(preparation.fingerprint, HTMLScriptApproval.fingerprint(Self.benignHTML))
+        let benign = HTMLPreviewPreparation.make(Self.benignHTML)
+        XCTAssertFalse(benign.containsJavaScript)
+        XCTAssertFalse(benign.requiresJavaScriptPrompt)
+    }
+
+    func testStaticShellWithScriptsKeepsJavaScriptDisabledActionDiscoverable() {
+        let preparation = HTMLPreviewPreparation.make(Self.staticShellHTML)
+        let presentation = HTMLJavaScriptDisabledPresentation(preparation: preparation)
+
+        XCTAssertTrue(preparation.containsJavaScript)
+        XCTAssertFalse(preparation.requiresJavaScriptPrompt)
+        XCTAssertFalse(presentation.showsAutomaticReview)
+        XCTAssertTrue(presentation.showsCompactIndicator)
+        XCTAssertEqual(presentation.indicatorTitle, "JavaScript is off")
+        XCTAssertEqual(presentation.reviewActionTitle, "Review and Allow…")
+    }
+
+    func testEveryScriptBearingDocumentGetsAnAutomaticReviewOrCompactIndicator() {
+        let fixtures = [
+            Self.scriptedHTML,
+            Self.staticShellHTML,
+            "<html><body><svg></svg><script type=\"module\">boot()</script></body></html>",
+        ]
+
+        for source in fixtures {
+            let presentation = HTMLJavaScriptDisabledPresentation(
+                preparation: HTMLPreviewPreparation.make(source)
+            )
+            XCTAssertNotEqual(
+                presentation.showsAutomaticReview,
+                presentation.showsCompactIndicator,
+                "every script-bearing fixture must have exactly one discoverable route"
+            )
+        }
+
+        let benign = HTMLJavaScriptDisabledPresentation(
+            preparation: HTMLPreviewPreparation.make(Self.benignHTML)
+        )
+        XCTAssertFalse(benign.showsAutomaticReview)
+        XCTAssertFalse(benign.showsCompactIndicator)
+    }
+
+    func testHtmlJavaScriptSecurityScopeExplainsEveryCapabilityBeforeApproval() {
+        let project = URL(fileURLWithPath: "/tmp/kaisola-html-security/project", isDirectory: true)
+        let file = project.appendingPathComponent("reports/status.html")
+        let scope = HTMLJavaScriptSecurityScope(fileURL: file, readAccessRoot: project)
+        let disclosures = Dictionary(uniqueKeysWithValues: scope.disclosures.map { ($0.id, $0.detail) })
+
+        XCTAssertEqual(scope.effectiveReadAccessRoot, project.standardizedFileURL)
+        XCTAssertEqual(
+            disclosures[.localFiles],
+            "Scripts can read this file and other files inside \(project.path)."
+        )
+        XCTAssertEqual(
+            disclosures[.network],
+            "Scripts can contact network hosts permitted by the page and WebKit."
+        )
+        XCTAssertEqual(
+            disclosures[.storage],
+            "Website data is temporary and is not persisted by this preview."
+        )
+        XCTAssertEqual(
+            disclosures[.navigation],
+            "Only clicked HTTP or HTTPS links open in your browser; off-project redirects and custom schemes stay blocked."
+        )
+        XCTAssertEqual(
+            scope.approvalSummary,
+            "Approval applies only to status.html at its current contents."
+        )
+        XCTAssertEqual(scope.enabledNotice, "JavaScript is enabled for status.html only.")
+        XCTAssertEqual(HTMLJavaScriptSecurityScope.revokeActionTitle, "Revoke JavaScript")
+    }
+
+    func testHtmlJavaScriptSecurityScopeNeverOverclaimsAnUnrelatedReadRoot() {
+        let requestedRoot = URL(fileURLWithPath: "/tmp/kaisola-html-security/project")
+        let file = URL(fileURLWithPath: "/tmp/kaisola-html-security/project-copy/status.html")
+        let scope = HTMLJavaScriptSecurityScope(fileURL: file, readAccessRoot: requestedRoot)
+
+        XCTAssertEqual(scope.effectiveReadAccessRoot, file.deletingLastPathComponent())
+        XCTAssertEqual(
+            scope.disclosures.first(where: { $0.id == .localFiles })?.detail,
+            "Scripts can read this file and other files inside /tmp/kaisola-html-security/project-copy."
+        )
     }
 }

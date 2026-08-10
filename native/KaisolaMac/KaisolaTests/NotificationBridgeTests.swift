@@ -263,6 +263,212 @@ final class NotificationBridgeTests: XCTestCase {
         XCTAssertFalse(center.hasAcknowledgedSessionResponse(targetID: "terminal", completedAt: 1))
         XCTAssertNil(defaults.data(forKey: key))
     }
+
+    // MARK: - damaged attention storage
+
+    private static let attentionEntriesKey = "attention.entries.v1"
+    private static let attentionAcknowledgementsKey = "attention.acknowledged-session-completions.v1"
+    private static let attentionPreservedEntriesKey = "attention.entries.unreadable.v1"
+
+    private func makeCenter(defaults: UserDefaults) -> AttentionCenter {
+        AttentionCenter(defaults: defaults, postsNotifications: false, updatesDockBadge: false)
+    }
+
+    func testOneMalformedEntryDoesNotTakeItsNeighboursWithIt() {
+        let defaults = makeDefaults()
+        let payload = """
+        {"schemaVersion":2,"entries":[
+        {"id":"a","kind":"permission","targetID":"chat-a","title":"Approve","detail":"edit","at":100},
+        {"id":"b","kind":"permission","targetID":"chat-b","title":"Approve","detail":"edit","at":"soon"},
+        {"id":"c","kind":"bell","targetID":"term-c","title":"Bell","detail":"ping","at":300}
+        ]}
+        """
+        defaults.set(Data(payload.utf8), forKey: Self.attentionEntriesKey)
+
+        let center = makeCenter(defaults: defaults)
+        XCTAssertEqual(
+            center.entries.map(\.targetID),
+            ["chat-a", "term-c"],
+            "one unreadable record must not discard the pending asks around it"
+        )
+        XCTAssertEqual(center.storageNotices.map(\.kind), [.recordsDropped(count: 1)])
+        XCTAssertEqual(center.storageNotices.map(\.payload), [.entries])
+    }
+
+    func testAttentionRestoreDropsSessionTimestampThatCannotBeAcknowledged() throws {
+        let defaults = makeDefaults()
+        let valid = AttentionCenter.Entry(
+            id: "terminal-valid-permission-1000",
+            kind: .permission,
+            targetID: "terminal-valid",
+            title: "Approval needed",
+            detail: "Review the command",
+            at: Date(timeIntervalSince1970: 1)
+        )
+        let outOfRange = AttentionCenter.Entry(
+            id: "terminal-extreme-session-responded",
+            kind: .sessionResponded,
+            targetID: "terminal-extreme",
+            title: "Agent responded",
+            detail: "Corrupt timestamp",
+            at: Date(timeIntervalSince1970: 1e20)
+        )
+        let raw = try JSONEncoder().encode([valid, outOfRange])
+        defaults.set(raw, forKey: Self.attentionEntriesKey)
+
+        let center = makeCenter(defaults: defaults)
+
+        XCTAssertEqual(center.entries, [valid])
+        XCTAssertEqual(
+            defaults.data(forKey: Self.attentionEntriesKey),
+            raw,
+            "dropping one unsafe record must not discard the recoverable source"
+        )
+        XCTAssertEqual(center.storageNotices.map(\.kind), [.recordsDropped(count: 1)])
+        XCTAssertEqual(center.storageNotices.map(\.payload), [.entries])
+        XCTAssertFalse(center.notifySessionResponded(
+            targetID: "terminal-negative",
+            title: "Agent responded",
+            detail: "Invalid timestamp",
+            completedAt: -1
+        ))
+        XCTAssertFalse(center.notifySessionResponded(
+            targetID: "terminal-overflow",
+            title: "Agent responded",
+            detail: "Invalid timestamp",
+            completedAt: .max
+        ))
+    }
+
+    func testAnUnreadableAcknowledgementKeepsTheRest() {
+        let completedAt: Int64 = 1_785_000_000_123
+        let defaults = makeDefaults()
+        let payload = """
+        {"schemaVersion":2,"acknowledgements":{"terminal-a":\(completedAt),"terminal-b":"never"}}
+        """
+        defaults.set(Data(payload.utf8), forKey: Self.attentionAcknowledgementsKey)
+
+        let center = makeCenter(defaults: defaults)
+        XCTAssertTrue(center.hasAcknowledgedSessionResponse(
+            targetID: "terminal-a",
+            completedAt: completedAt
+        ))
+        XCTAssertFalse(
+            center.notifySessionResponded(
+                targetID: "terminal-a",
+                title: "Codex · Kaisola",
+                detail: "replayed inventory",
+                completedAt: completedAt
+            ),
+            "a damaged neighbour must not re-notify a response the user already visited"
+        )
+        XCTAssertEqual(center.storageNotices.map(\.kind), [.recordsDropped(count: 1)])
+        XCTAssertEqual(center.storageNotices.map(\.payload), [.acknowledgements])
+    }
+
+    func testUnreadableAttentionBytesAreKeptForRecoveryRatherThanDeleted() throws {
+        let defaults = makeDefaults()
+        let damaged = Data(#"{"schemaVersion":2,"entries":[{"id""#.utf8)
+        defaults.set(damaged, forKey: Self.attentionEntriesKey)
+
+        let center = makeCenter(defaults: defaults)
+        XCTAssertTrue(center.entries.isEmpty)
+        XCTAssertNil(
+            defaults.data(forKey: Self.attentionEntriesKey),
+            "the live key is cleared so the next save can land"
+        )
+        XCTAssertEqual(defaults.data(forKey: Self.attentionPreservedEntriesKey), damaged)
+        let notice = try XCTUnwrap(center.storageNotices.first)
+        XCTAssertEqual(notice.kind, .unreadable)
+        XCTAssertEqual(notice.preservedCopyKey, Self.attentionPreservedEntriesKey)
+        XCTAssertFalse(notice.blocksSaving)
+    }
+
+    func testAbsentAttentionStorageIsNotReportedAsCorrupt() {
+        let center = makeCenter(defaults: makeDefaults())
+        XCTAssertTrue(center.entries.isEmpty)
+        XCTAssertTrue(center.storageNotices.isEmpty, "a first launch has nothing to explain")
+    }
+
+    func testAClearThatCannotBeSavedKeepsTheRowOnScreen() throws {
+        let suite = "kaisola-attention-write-drop-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(WriteDroppingDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        addTeardownBlock { defaults.removePersistentDomain(forName: suite) }
+
+        let center = makeCenter(defaults: defaults)
+        center.notify(kind: .permission, targetID: "chat-a", title: "Approve", detail: "edit")
+        XCTAssertEqual(
+            center.entries.count,
+            1,
+            "arriving work shows up whether or not it can be saved"
+        )
+
+        center.clearAll()
+        XCTAssertEqual(
+            center.entries.count,
+            1,
+            "an unsaved clear would come back on the next launch, so the badge stays honest"
+        )
+        XCTAssertTrue(center.storageNotices.contains { $0.kind == .saveNotConfirmed })
+    }
+
+    func testNewerVersionAttentionDataIsLeftAloneUntilTheUserResets() throws {
+        let defaults = makeDefaults()
+        let future = Data(#"{"schemaVersion":99,"entries":[],"visitedAt":1}"#.utf8)
+        defaults.set(future, forKey: Self.attentionEntriesKey)
+
+        let center = makeCenter(defaults: defaults)
+        let notice = try XCTUnwrap(center.storageNotices.first)
+        XCTAssertEqual(notice.kind, .newerVersion(schemaVersion: 99))
+        XCTAssertTrue(notice.blocksSaving)
+        XCTAssertEqual(
+            defaults.data(forKey: Self.attentionEntriesKey),
+            future,
+            "data this build cannot interpret stays exactly where its owner expects it"
+        )
+
+        center.notify(kind: .permission, targetID: "chat-a", title: "Approve", detail: "edit")
+        center.clearAll()
+        XCTAssertEqual(center.entries.count, 1, "saving is blocked, so clearing cannot commit")
+        XCTAssertEqual(defaults.data(forKey: Self.attentionEntriesKey), future)
+        center.dismissStorageNotices()
+        XCTAssertEqual(
+            center.storageNotices.map(\.kind),
+            [.newerVersion(schemaVersion: 99)],
+            "the reason saving is blocked cannot be dismissed away"
+        )
+
+        center.resetStorage()
+        XCTAssertTrue(center.storageNotices.isEmpty)
+        XCTAssertEqual(makeCenter(defaults: defaults).entries.map(\.targetID), ["chat-a"])
+    }
+
+    func testTheUnversionedLegacyAttentionPayloadStillLoadsAndIsRewrittenVersioned() throws {
+        let defaults = makeDefaults()
+        let legacyEntries = """
+        [{"id":"a","kind":"turnCompleted","targetID":"chat-a","title":"Done","detail":"x","at":100}]
+        """
+        defaults.set(Data(legacyEntries.utf8), forKey: Self.attentionEntriesKey)
+        defaults.set(Data(#"{"terminal-a":5}"#.utf8), forKey: Self.attentionAcknowledgementsKey)
+
+        let center = makeCenter(defaults: defaults)
+        XCTAssertEqual(center.entries.map(\.targetID), ["chat-a"])
+        XCTAssertTrue(center.hasAcknowledgedSessionResponse(targetID: "terminal-a", completedAt: 5))
+        XCTAssertTrue(center.storageNotices.isEmpty, "readable schema 1 data is not a problem")
+
+        center.notify(kind: .bell, targetID: "term-b", title: "Bell", detail: "ping")
+        let stored = try XCTUnwrap(defaults.data(forKey: Self.attentionEntriesKey))
+        let object = try JSONSerialization.jsonObject(with: stored) as? [String: Any]
+        XCTAssertEqual(object?["schemaVersion"] as? Int, 2)
+    }
+}
+
+/// A defaults store whose writes silently do not land: the shape of a full
+/// container or a revoked sandbox extension, and the case that used to let the
+/// badge clear work the next launch brought straight back.
+private final class WriteDroppingDefaults: UserDefaults {
+    override func set(_ value: Any?, forKey defaultName: String) {}
 }
 
 /// Per-event delivery rules: each needs-you group carries its own

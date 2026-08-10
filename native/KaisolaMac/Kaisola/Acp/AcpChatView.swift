@@ -2,6 +2,59 @@ import AppKit
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// One spoken contract for the symbol-only checkpoint menu and its destructive
+/// choices. Keep the consequence in the choice hint even though a confirmation
+/// follows: VoiceOver users need to understand the action before selecting it.
+enum CheckpointMenuAccessibility {
+    static let label = "Restore checkpoint"
+    static let hint = "Choose a snapshot taken before a turn. "
+        + "Restoring replaces current working tree files after confirmation."
+    static let choiceHint = "Replaces current working tree files with this snapshot after confirmation."
+    static let identifier = "acp.checkpoints.restore"
+
+    static func value(checkpointCount: Int) -> String {
+        "\(checkpointCount) checkpoint\(checkpointCount == 1 ? "" : "s") available"
+    }
+
+    static func choiceLabel(turn: Int, time: String) -> String {
+        "Restore checkpoint before turn \(turn) at \(time)"
+    }
+}
+
+/// One deterministic spoken contract for staged attachments. The chip owns
+/// the filename and size while its destructive child names the exact file it
+/// removes; focus routing never depends on a row index after the mutation.
+enum AcpAttachmentAccessibility {
+    enum FocusDestination: Equatable {
+        case removalButton(id: String)
+        case attachmentControl
+    }
+
+    static func chipLabel(name: String) -> String {
+        "Attachment \(name)"
+    }
+
+    static func chipValue(byteSize: Int) -> String {
+        "Size \(ByteCountFormatter.string(fromByteCount: Int64(byteSize), countStyle: .file))"
+    }
+
+    static func removalLabel(name: String) -> String {
+        "Remove attachment \(name)"
+    }
+
+    static func removalAnnouncement(name: String) -> String {
+        "Removed attachment \(name)"
+    }
+
+    static func focusDestination(removing id: String, orderedIDs: [String]) -> FocusDestination {
+        guard let index = orderedIDs.firstIndex(of: id),
+              orderedIDs.indices.contains(index + 1) else {
+            return .attachmentControl
+        }
+        return .removalButton(id: orderedIDs[index + 1])
+    }
+}
+
 /// The ACP conversation surface: streaming messages, thinking blocks,
 /// tool-call cards, a plan, a live permission prompt, model picker, usage, and
 /// a composer. Mirrors the Electron Assistant transcript.
@@ -16,6 +69,7 @@ struct AcpChatView: View {
 
     @State private var restoreTarget: AcpConversation.TurnCheckpoint?
     @ObservedObject var conversation: AcpConversation
+    @ObservedObject private var accountAccess: ChatAccountAccess
     private let presentation: Presentation
     @State private var draft = ""
     /// Highlights the composer while an OS file drag hovers it.
@@ -25,20 +79,44 @@ struct AcpChatView: View {
     @State private var transcriptIsAtBottom = true
     @State private var hasUnseenTranscriptUpdates = false
     @State private var transcriptConversationID: ObjectIdentifier?
+    @State private var isExportingTranscript = false
+    @StateObject private var transcriptViewportAnchor = AcpTranscriptViewportAnchor()
+    @ObservedObject private var previewSettings = NativePreviewSettings.shared
+    @State private var densityAnchorGeneration: UInt64 = 0
     @FocusState private var composerFocused: Bool
+    @FocusState private var focusedAttachmentRemovalID: String?
+    @AccessibilityFocusState private var accessibilityFocusedAttachmentRemovalID: String?
+    @FocusState private var attachmentControlFocused: Bool
+    @AccessibilityFocusState private var attachmentControlAccessibilityFocused: Bool
     private let focusRequestGeneration: UInt64?
     private let onKeyboardFocus: (() -> Void)?
+    private let onSignIn: () -> Void
+    private let onChooseAccount: () -> Void
+    private let onPreserveTranscript: () -> Void
+
+    private struct StartupTaskID: Hashable {
+        let conversation: ObjectIdentifier
+        let accountAllowsStart: Bool
+    }
 
     init(
         conversation: AcpConversation,
+        accountAccess: ChatAccountAccess,
         presentation: Presentation = .standard,
         focusRequestGeneration: UInt64? = nil,
-        onKeyboardFocus: (() -> Void)? = nil
+        onKeyboardFocus: (() -> Void)? = nil,
+        onSignIn: @escaping () -> Void = {},
+        onChooseAccount: @escaping () -> Void = {},
+        onPreserveTranscript: @escaping () -> Void = {}
     ) {
         _conversation = ObservedObject(wrappedValue: conversation)
+        _accountAccess = ObservedObject(wrappedValue: accountAccess)
         self.presentation = presentation
         self.focusRequestGeneration = focusRequestGeneration
         self.onKeyboardFocus = onKeyboardFocus
+        self.onSignIn = onSignIn
+        self.onChooseAccount = onChooseAccount
+        self.onPreserveTranscript = onPreserveTranscript
     }
 
     /// The chat has produced nothing yet, so the transcript's space belongs to
@@ -58,6 +136,14 @@ struct AcpChatView: View {
                 embeddedControls
             }
             Divider()
+            if conversation.transcriptRetentionStatus.isTruncated {
+                transcriptRetentionNotice
+                Divider()
+            }
+            if conversation.transcriptPersistenceHealth.needsAttention {
+                transcriptPersistenceNotice
+                Divider()
+            }
             if showsEmptyState {
                 emptyState
             } else {
@@ -98,7 +184,14 @@ struct AcpChatView: View {
         // Key the startup work to the object so a new session never flashes or
         // saves the preceding session's draft.
         .task(id: ObjectIdentifier(conversation)) {
+            transcriptSearch = AcpTranscriptSearchState()
             draft = conversation.loadDraft()
+        }
+        .task(id: StartupTaskID(
+            conversation: ObjectIdentifier(conversation),
+            accountAllowsStart: accountAccess.allowsAdapterStart
+        )) {
+            guard accountAccess.allowsAdapterStart else { return }
             await conversation.start()
         }
         .onChange(of: draft) { _, newValue in
@@ -107,6 +200,100 @@ struct AcpChatView: View {
         .onAppear { applyFocusRequest(focusRequestGeneration) }
         .onChange(of: focusRequestGeneration) { _, request in
             applyFocusRequest(request)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .kaisolaTranscriptFindCommand)) { notification in
+            handleTranscriptFindCommand(notification)
+        }
+    }
+
+    private var transcriptRetentionNotice: some View {
+        let status = conversation.transcriptRetentionStatus
+        let bytes = ByteCountFormatter.string(
+            fromByteCount: status.truncatedByteCount,
+            countStyle: .file
+        )
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "archivebox")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            Text("Earlier saved history was truncated at this chat's disk quota (\(status.truncatedRowCount.formatted()) rows, \(bytes)). User prompts, tool evidence, and the newest transcript were kept first.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.secondary.opacity(0.06))
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Saved chat history truncated")
+        .accessibilityValue("\(status.truncatedRowCount) rows and \(bytes) removed after this chat reached its disk quota")
+    }
+
+    private var transcriptPersistenceNotice: some View {
+        let health = conversation.transcriptPersistenceHealth
+        let detail: String
+        let canRetry: Bool
+        switch health {
+        case .healthy:
+            detail = ""
+            canRetry = false
+        case let .retrying(attempt, maximumAttempts):
+            detail = "Saving the latest transcript failed. Retry \(attempt) of \(maximumAttempts) is pending; keep this chat open."
+            canRetry = false
+        case let .failed(failure):
+            detail = "\(failure.detail) \(failure.guidance)"
+            canRetry = true
+        }
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "externaldrive.badge.exclamationmark")
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+            Text(detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+            if canRetry {
+                Button("Retry") { conversation.retryTranscriptPersistence() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+            }
+            Button("Export Recovery Copy") { exportTranscriptRecoveryCopy() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+        .background(Color.orange.opacity(0.08))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("acp.transcriptPersistenceWarning")
+        .accessibilityLabel("Transcript is not saved")
+        .accessibilityValue(detail)
+    }
+
+    @MainActor
+    private func exportTranscriptRecoveryCopy() {
+        let panel = NSSavePanel()
+        panel.title = "Export Chat Transcript Recovery Copy"
+        panel.prompt = "Export"
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = AcpTranscriptRecoveryExport.suggestedFileName(
+            for: conversation.title
+        )
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let data = try AcpTranscriptRecoveryExport.data(
+                title: conversation.title,
+                startOrdinal: conversation.loadedRowStartOrdinal,
+                rows: conversation.rows
+            )
+            try data.write(to: url, options: .atomic)
+        } catch {
+            ToastCenter.shared.show(
+                "Could not export the transcript recovery copy: \(error.localizedDescription)",
+                style: .error
+            )
         }
     }
 
@@ -129,7 +316,7 @@ struct AcpChatView: View {
             Text(conversation.title).font(.subheadline.weight(.medium))
             if conversation.isRunning {
                 ProgressView().controlSize(.small)
-                Text("Working…").font(.caption).foregroundStyle(.secondary)
+                Text("Working…").font(.caption).foregroundStyle(.kaisolaSecondary)
             }
             Spacer()
             sessionControls
@@ -164,22 +351,34 @@ struct AcpChatView: View {
             Menu {
                 Text("Restore the working tree to before a turn:")
                 ForEach(conversation.checkpoints.reversed()) { checkpoint in
-                    Button("Turn \(checkpoint.turn) — \(checkpoint.at.formatted(date: .omitted, time: .shortened))") {
+                    let time = checkpoint.at.formatted(date: .omitted, time: .shortened)
+                    Button("Turn \(checkpoint.turn) — \(time)") {
                         restoreTarget = checkpoint
                     }
+                    .accessibilityLabel(CheckpointMenuAccessibility.choiceLabel(
+                        turn: checkpoint.turn,
+                        time: time
+                    ))
+                    .accessibilityHint(CheckpointMenuAccessibility.choiceHint)
                 }
             } label: {
                 Image(systemName: "clock.arrow.circlepath")
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
+            .accessibilityLabel(CheckpointMenuAccessibility.label)
+            .accessibilityValue(CheckpointMenuAccessibility.value(
+                checkpointCount: conversation.checkpoints.count
+            ))
+            .accessibilityHint(CheckpointMenuAccessibility.hint)
+            .accessibilityIdentifier(CheckpointMenuAccessibility.identifier)
             .help("Pre-turn checkpoints (git snapshots)")
             .confirmationDialog(
                 "Restore checkpoint?",
                 isPresented: Binding(get: { restoreTarget != nil }, set: { if !$0 { restoreTarget = nil } })
             ) {
                 Button("Restore Files", role: .destructive) {
-                    if let restoreTarget { conversation.restoreCheckpoint(restoreTarget.id) }
+                    if let restoreTarget { conversation.restoreCheckpoint(restoreTarget) }
                     restoreTarget = nil
                 }
                 Button("Cancel", role: .cancel) { restoreTarget = nil }
@@ -190,19 +389,88 @@ struct AcpChatView: View {
         if let usage = conversation.usage {
             Text("\(usage.used / 1000)k / \(usage.max / 1000)k")
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             if let amount = usage.costAmount,
                let cost = UsageCenter.costLabel(amount: amount, currency: usage.costCurrency) {
                 Text(cost)
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .help("Cumulative cost reported by this agent session")
                     .accessibilityLabel("Session cost \(cost)")
+            }
+        }
+        Menu {
+            Button("Copy Last Response") { copyLastResponse() }
+                .disabled(conversation.lastAssistantResponse == nil)
+            Button("Export/Open as Markdown…") { exportAndOpenMarkdown() }
+                .disabled(
+                    isExportingTranscript
+                        || (conversation.rows.isEmpty && conversation.hiddenEarlierCount == 0)
+                )
+        } label: {
+            if isExportingTranscript {
+                ProgressView().controlSize(.mini)
+            } else {
+                Image(systemName: "square.and.arrow.up")
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("Copy or export this conversation")
+        .accessibilityLabel("Conversation export actions")
+        .accessibilityIdentifier("acp.transcriptExportMenu")
+    }
+
+    @MainActor
+    private func copyLastResponse() {
+        guard let response = conversation.lastAssistantResponse else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(response, forType: .string) else {
+            ToastCenter.shared.show("Could not copy the last response.", style: .error)
+            return
+        }
+        ToastCenter.shared.show("Last response copied.", style: .success)
+    }
+
+    @MainActor
+    private func exportAndOpenMarkdown() {
+        let panel = NSSavePanel()
+        panel.title = "Export and Open Chat as Markdown"
+        panel.prompt = "Export & Open"
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = AcpTranscriptMarkdownExport.suggestedFileName(
+            for: conversation.title
+        )
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        isExportingTranscript = true
+        Task { @MainActor in
+            defer { isExportingTranscript = false }
+            do {
+                _ = try await conversation.exportTranscriptMarkdown(to: destination)
+                guard NSWorkspace.shared.open(destination) else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
+            } catch {
+                ToastCenter.shared.show(
+                    "Could not export the chat as Markdown: \(error.localizedDescription)",
+                    style: .error
+                )
             }
         }
     }
 
     private var transcript: some View {
+        VStack(spacing: 0) {
+            if transcriptSearch.isPresented {
+                transcriptSearchBar
+                Divider()
+            }
+            transcriptScrollView
+        }
+    }
+
+    private var transcriptScrollView: some View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
@@ -212,36 +480,17 @@ struct AcpChatView: View {
                                 ProgressView().controlSize(.small)
                                 Text(loadingEarlierRows ? "Loading earlier messages…" : "Earlier messages")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                             }
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 6)
                             .onAppear {
-                                guard transcriptIsReady,
-                                      transcriptConversationID == ObjectIdentifier(conversation),
-                                      !loadingEarlierRows,
-                                      let anchor = conversation.visibleRows.first?.id else { return }
-                                loadingEarlierRows = true
-                                Task { @MainActor in
-                                    await conversation.expandEarlier()
-                                    guard transcriptConversationID == ObjectIdentifier(conversation) else {
-                                        loadingEarlierRows = false
-                                        return
-                                    }
-                                    // Expanding prepends rows. Restore the formerly
-                                    // first visible row so the viewport does not jump,
-                                    // while retaining active trackpad velocity on
-                                    // macOS 15 and newer.
-                                    TerminalTranscriptScrollPolicy.preserveUserVelocity {
-                                        proxy.scrollTo(anchor, anchor: .top)
-                                    }
-                                    loadingEarlierRows = false
-                                }
+                                loadEarlierRows(using: proxy)
                             }
                         } else if transcriptIsReady, !conversation.rows.isEmpty {
                             Label("Beginning of session", systemImage: "checkmark.circle")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 6)
                                 .accessibilityLabel("Beginning of session history")
@@ -249,7 +498,7 @@ struct AcpChatView: View {
                         if let status = conversation.statusMessage {
                             Label(status, systemImage: "exclamationmark.triangle")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                         }
                         ForEach(conversation.visibleRows) { row in
                             TranscriptRowView(
@@ -259,6 +508,20 @@ struct AcpChatView: View {
                                 terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) }
                             )
                             .id(row.id)
+                            .background {
+                                AcpTranscriptViewportMarker(
+                                    rowID: row.id,
+                                    anchor: transcriptViewportAnchor
+                                )
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            }
+                            .background {
+                                if transcriptSearch.currentRowID == row.id {
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .fill(Color.accentColor.opacity(0.12))
+                                        .accessibilityHidden(true)
+                                }
+                            }
                         }
                         Color.clear
                             .frame(height: 1)
@@ -295,6 +558,7 @@ struct AcpChatView: View {
             }
             .onAppear {
                 transcriptConversationID = ObjectIdentifier(conversation)
+                transcriptSearch.refresh(rows: conversation.visibleRows)
                 transcriptIsReady = false
                 transcriptIsAtBottom = true
                 hasUnseenTranscriptUpdates = false
@@ -304,6 +568,7 @@ struct AcpChatView: View {
                 }
             }
             .onChange(of: conversation.contentVersion) { _, newVersion in
+                transcriptSearch.refresh(rows: conversation.visibleRows)
                 guard transcriptIsReady,
                       conversation.lastHistoryInsertionContentVersion != newVersion else { return }
                 if transcriptIsAtBottom {
@@ -322,8 +587,301 @@ struct AcpChatView: View {
                     hasUnseenTranscriptUpdates = true
                 }
             }
+            .onChange(of: searchNavigationRequest) { _, request in
+                guard let request,
+                      let rowID = transcriptSearch.move(request.direction) else { return }
+                TerminalTranscriptScrollPolicy.preserveUserVelocity {
+                    proxy.scrollTo(rowID, anchor: .center)
+                }
+            }
+            .onChange(of: searchPageRequestGeneration) { _, _ in
+                loadEarlierRows(using: proxy)
+            }
+            .onChange(of: previewSettings.toolCallDensity) { _, density in
+                preserveReadingAnchorForToolCallDensity(density, using: proxy)
+            }
         }
         .id(ObjectIdentifier(conversation))
+    }
+
+    @State private var transcriptSearch = AcpTranscriptSearchState()
+    @State private var searchNavigationGeneration: UInt64 = 0
+    @State private var searchNavigationRequest: AcpTranscriptSearchNavigationRequest?
+    @State private var searchPageRequestGeneration: UInt64 = 0
+    @FocusState private var transcriptSearchFocused: Bool
+
+    private var transcriptSearchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .accessibilityHidden(true)
+            TextField(
+                "Find in conversation",
+                text: Binding(
+                    get: { transcriptSearch.query },
+                    set: { transcriptSearch.updateQuery($0, rows: conversation.visibleRows) }
+                )
+            )
+            .textFieldStyle(.roundedBorder)
+            .focused($transcriptSearchFocused)
+            .onSubmit { requestTranscriptSearchNavigation(.next) }
+            .accessibilityIdentifier("acp.transcript.search.field")
+            .accessibilityHint("Searches the loaded transcript without moving your reading position")
+
+            Text(transcriptSearch.statusText(hasHiddenEarlierRows: conversation.hiddenEarlierCount > 0))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.kaisolaSecondary)
+                .fixedSize()
+                .accessibilityIdentifier("acp.transcript.search.status")
+
+            if conversation.hiddenEarlierCount > 0, !transcriptSearch.query.isEmpty {
+                Button {
+                    searchPageRequestGeneration &+= 1
+                } label: {
+                    Label("Search earlier", systemImage: "arrow.up.to.line")
+                        .labelStyle(.iconOnly)
+                }
+                .disabled(loadingEarlierRows)
+                .help("Load an earlier transcript page and include it in search")
+                .accessibilityLabel("Search earlier messages")
+                .accessibilityHint("Loads older messages without moving the current reading position")
+                .accessibilityIdentifier("acp.transcript.search.earlier")
+            }
+
+            Button { requestTranscriptSearchNavigation(.previous) } label: {
+                Image(systemName: "chevron.up")
+            }
+            .disabled(transcriptSearch.matches.isEmpty)
+            .help("Previous match")
+            .accessibilityLabel("Previous transcript match")
+            .accessibilityIdentifier("acp.transcript.search.previous")
+
+            Button { requestTranscriptSearchNavigation(.next) } label: {
+                Image(systemName: "chevron.down")
+            }
+            .disabled(transcriptSearch.matches.isEmpty)
+            .help("Next match")
+            .accessibilityLabel("Next transcript match")
+            .accessibilityIdentifier("acp.transcript.search.next")
+
+            Button { dismissTranscriptSearch() } label: {
+                Image(systemName: "xmark")
+            }
+            .help("Close Find")
+            .accessibilityLabel("Close transcript search")
+            .accessibilityIdentifier("acp.transcript.search.close")
+        }
+        .buttonStyle(.borderless)
+        .controlSize(.small)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+        .onExitCommand { dismissTranscriptSearch() }
+        .onChange(of: transcriptSearchFocused) { _, isFocused in
+            if isFocused { onKeyboardFocus?() }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Find in ACP transcript")
+        .accessibilityIdentifier("acp.transcript.search")
+    }
+
+    private func handleTranscriptFindCommand(_ notification: Notification) {
+        guard let source = notification.object as? AcpConversation,
+              source === conversation,
+              let rawValue = notification.userInfo?[AcpTranscriptFindCommand.notificationActionKey] as? Int,
+              let command = AcpTranscriptFindCommand(rawValue: rawValue) else { return }
+        switch command {
+        case .show, .useSelection:
+            presentTranscriptSearch()
+        case .next:
+            requestTranscriptSearchNavigation(.next)
+        case .previous:
+            requestTranscriptSearchNavigation(.previous)
+        }
+    }
+
+    private func presentTranscriptSearch() {
+        transcriptSearch.present()
+        transcriptSearch.refresh(rows: conversation.visibleRows)
+        composerFocused = false
+        DispatchQueue.main.async { transcriptSearchFocused = true }
+    }
+
+    private func dismissTranscriptSearch() {
+        transcriptSearch.dismiss()
+        transcriptSearchFocused = false
+    }
+
+    private func requestTranscriptSearchNavigation(_ direction: AcpTranscriptSearchDirection) {
+        if !transcriptSearch.isPresented { presentTranscriptSearch() }
+        searchNavigationGeneration &+= 1
+        searchNavigationRequest = AcpTranscriptSearchNavigationRequest(
+            generation: searchNavigationGeneration,
+            direction: direction
+        )
+    }
+
+    private func loadEarlierRows(using proxy: ScrollViewProxy) {
+        guard transcriptIsReady,
+              transcriptConversationID == ObjectIdentifier(conversation),
+              !loadingEarlierRows,
+              conversation.hiddenEarlierCount > 0 else { return }
+        loadingEarlierRows = true
+        Task { @MainActor in
+            // `searchPageRequestGeneration` changes during a SwiftUI update
+            // transaction. Measuring AppKit from that transaction can see the
+            // old LazyVStack mount set even though the corresponding rows are
+            // already visible through accessibility. Cross a main-run-loop
+            // boundary before capture, and retry once because SwiftUI may use
+            // the first pass to mount a newly exposed lazy row.
+            await nextTranscriptLayoutPass()
+            var mountedAnchor = transcriptViewportAnchor.capture()
+            if mountedAnchor == nil {
+                await nextTranscriptLayoutPass()
+                mountedAnchor = transcriptViewportAnchor.capture()
+            }
+            let fallbackAnchor = conversation.visibleRows.first?.id
+            guard mountedAnchor != nil || fallbackAnchor != nil else {
+                loadingEarlierRows = false
+                return
+            }
+            await conversation.expandEarlier()
+            guard transcriptConversationID == ObjectIdentifier(conversation) else {
+                loadingEarlierRows = false
+                return
+            }
+            transcriptSearch.refresh(rows: conversation.visibleRows)
+            // Let SwiftUI lay out the prepended page before measuring its real
+            // AppKit document geometry. The mounted marker preserves the
+            // reader's exact intra-row offset; the data-window first row is
+            // retained only as a safe pre-mount fallback.
+            await nextTranscriptLayoutPass()
+            if let mountedAnchor {
+                let restoration = await restoreMountedTranscriptAnchor(
+                    mountedAnchor,
+                    using: proxy
+                )
+                emitVisualTranscriptAnchorReceipt(
+                    restoration,
+                    failureReason: "restore-no-mounted-anchor"
+                )
+            } else if let fallbackAnchor {
+                TerminalTranscriptScrollPolicy.preserveUserVelocity {
+                    proxy.scrollTo(fallbackAnchor, anchor: .top)
+                }
+                emitVisualTranscriptAnchorReceipt(
+                    nil,
+                    failureReason: "capture-no-mounted-anchor"
+                )
+            }
+            loadingEarlierRows = false
+        }
+    }
+
+    @MainActor
+    private func nextTranscriptLayoutPass() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    /// LazyVStack is allowed to unmount the captured row while it inserts a
+    /// large earlier page. Bring that exact identity back into the mounted
+    /// window if necessary, then require two consecutive run-loop passes with
+    /// a real AppKit restoration. The second pass catches a delayed SwiftUI
+    /// content-size correction instead of issuing a premature success receipt.
+    private func restoreMountedTranscriptAnchor(
+        _ snapshot: AcpTranscriptViewportAnchor.Snapshot,
+        using proxy: ScrollViewProxy
+    ) async -> AcpTranscriptViewportAnchor.Restoration? {
+        var didRequestMount = false
+        var consecutiveRestorations = 0
+
+        for _ in 0..<6 {
+            if let restoration = transcriptViewportAnchor.restore(snapshot) {
+                consecutiveRestorations += 1
+                if consecutiveRestorations == 2 { return restoration }
+            } else {
+                consecutiveRestorations = 0
+                if !didRequestMount {
+                    didRequestMount = true
+                    TerminalTranscriptScrollPolicy.preserveUserVelocity {
+                        proxy.scrollTo(snapshot.rowID, anchor: .top)
+                    }
+                }
+            }
+            await nextTranscriptLayoutPass()
+        }
+        return nil
+    }
+
+    /// Compact/Balanced/Detailed can reflow every mounted tool card at once.
+    /// Capture the actual top reading row before SwiftUI commits that height
+    /// change, then restore its exact intra-row offset after the new density is
+    /// laid out. A generation guard makes rapid menu changes last-write-wins.
+    private func preserveReadingAnchorForToolCallDensity(
+        _ density: ToolCallDensity,
+        using proxy: ScrollViewProxy
+    ) {
+        guard transcriptIsReady,
+              transcriptConversationID == ObjectIdentifier(conversation),
+              let snapshot = transcriptViewportAnchor.capture() else { return }
+        densityAnchorGeneration &+= 1
+        let generation = densityAnchorGeneration
+        Task { @MainActor in
+            await nextTranscriptLayoutPass()
+            guard generation == densityAnchorGeneration,
+                  transcriptConversationID == ObjectIdentifier(conversation) else { return }
+            let restoration = await restoreMountedTranscriptAnchor(snapshot, using: proxy)
+            emitVisualTranscriptDensityAnchorReceipt(restoration, density: density)
+        }
+    }
+
+    private func emitVisualTranscriptDensityAnchorReceipt(
+        _ restoration: AcpTranscriptViewportAnchor.Restoration?,
+        density: ToolCallDensity
+    ) {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+              environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "mixed-density" else { return }
+        let line: String
+        if let restoration {
+            line = "KAISOLA_NATIVE_TRANSCRIPT_DENSITY_ANCHOR=PASS "
+                + "density=\(density.rawValue) "
+                + "row=\(restoration.rowID) "
+                + "requested=\(String(format: "%.3f", restoration.requestedOffset)) "
+                + "restored=\(String(format: "%.3f", restoration.restoredOffset)) "
+                + "error=\(String(format: "%.3f", restoration.error))"
+        } else {
+            line = "KAISOLA_NATIVE_TRANSCRIPT_DENSITY_ANCHOR=FAIL "
+                + "density=\(density.rawValue) no-mounted-anchor"
+        }
+        FileHandle.standardOutput.write(Data("\(line)\n".utf8))
+        try? FileHandle.standardOutput.synchronize()
+    }
+
+    private func emitVisualTranscriptAnchorReceipt(
+        _ restoration: AcpTranscriptViewportAnchor.Restoration?,
+        failureReason: String
+    ) {
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+              environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "mixed-search" else { return }
+        let line: String
+        guard let restoration else {
+            line = "KAISOLA_NATIVE_TRANSCRIPT_VIEWPORT_ANCHOR=FAIL \(failureReason)"
+            FileHandle.standardOutput.write(Data("\(line)\n".utf8))
+            try? FileHandle.standardOutput.synchronize()
+            return
+        }
+        line = "KAISOLA_NATIVE_TRANSCRIPT_VIEWPORT_ANCHOR=PASS "
+            + "row=\(restoration.rowID) "
+            + "requested=\(String(format: "%.3f", restoration.requestedOffset)) "
+            + "restored=\(String(format: "%.3f", restoration.restoredOffset)) "
+            + "error=\(String(format: "%.3f", restoration.error)) "
+            + "hiddenEarlier=\(conversation.hiddenEarlierCount)"
+        FileHandle.standardOutput.write(Data("\(line)\n".utf8))
+        try? FileHandle.standardOutput.synchronize()
     }
 
     /// Slash commands matching the draft's leading "/query", ranked by FuzzyMatch.
@@ -341,11 +899,13 @@ struct AcpChatView: View {
 
     private var composer: some View {
         VStack(spacing: 6) {
-            if !conversation.isConnected, conversation.statusMessage != nil {
+            if let account = accountAccess.presentation {
+                accountRecoveryCard(account)
+            } else if !conversation.isConnected, conversation.statusMessage != nil {
                 HStack(spacing: 8) {
                     Label("Agent disconnected — your draft and queued follow-ups are preserved.", systemImage: "bolt.slash")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     Spacer()
                     if conversation.canRestart {
                         Button(conversation.queued.isEmpty ? "Restart" : "Restart & Resume") {
@@ -373,7 +933,7 @@ struct AcpChatView: View {
                         } label: {
                             HStack(spacing: 8) {
                                 Text("/\(command.name)").font(.caption.monospaced().weight(.semibold))
-                                Text(command.description).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                Text(command.description).font(.caption).foregroundStyle(.kaisolaSecondary).lineLimit(1)
                                 Spacer()
                             }
                             .contentShape(Rectangle())
@@ -394,6 +954,8 @@ struct AcpChatView: View {
                 conversation: conversation,
                 draft: $draft,
                 focused: $composerFocused,
+                attachmentFocused: $attachmentControlFocused,
+                attachmentAccessibilityFocused: $attachmentControlAccessibilityFocused,
                 isNewConversation: showsEmptyState,
                 send: sendDraft,
                 onKeyboardFocus: onKeyboardFocus
@@ -446,27 +1008,102 @@ struct AcpChatView: View {
         }
     }
 
+    private func accountRecoveryCard(
+        _ account: ChatAccountAccess.Presentation
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 8) {
+                if account.showsActivityIndicator {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityLabel(account.headline)
+                } else {
+                    Image(systemName: "person.crop.circle.badge.exclamationmark")
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(account.headline)
+                        .font(.caption.weight(.semibold))
+                    Text("\(account.provider) · \(account.account)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(.secondary)
+                    Text(account.detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 0)
+            }
+            if !account.actions.isEmpty {
+                HStack(spacing: 8) {
+                    Button(ChatAccountAccess.RecoveryAction.signIn.rawValue, action: onSignIn)
+                        .buttonStyle(.borderedProminent)
+                    Button(
+                        ChatAccountAccess.RecoveryAction.chooseAccount.rawValue,
+                        action: onChooseAccount
+                    )
+                        .buttonStyle(.bordered)
+                    Button(
+                        ChatAccountAccess.RecoveryAction.preserveTranscript.rawValue,
+                        action: onPreserveTranscript
+                    )
+                        .buttonStyle(.bordered)
+                    Spacer(minLength: 0)
+                }
+                .controlSize(.small)
+            }
+        }
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(.orange.opacity(0.3), lineWidth: 1)
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(account.headline). \(account.provider) account \(account.account). \(account.detail)")
+    }
+
     private var attachmentStrip: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 6) {
                 ForEach(conversation.pendingAttachments) { attachment in
                     HStack(spacing: 6) {
                         Image(systemName: attachment.iconName)
-                            .font(.caption2).foregroundStyle(.secondary)
+                            .font(.caption2).foregroundStyle(.kaisolaSecondary)
                         Text(attachment.name).font(.caption).lineLimit(1)
                         Text(byteLabel(attachment.byteSize))
-                            .font(.caption2).foregroundStyle(.secondary)
+                            .font(.caption2).foregroundStyle(.kaisolaSecondary)
                         Button {
-                            conversation.removeAttachment(attachment.id)
+                            removeAttachment(attachment)
                         } label: {
                             Image(systemName: "xmark.circle.fill").font(.caption2)
                         }
                         .buttonStyle(.borderless)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .help("Remove this attachment")
+                        .accessibilityLabel(
+                            AcpAttachmentAccessibility.removalLabel(name: attachment.name)
+                        )
+                        .accessibilityIdentifier("acp.attachment.remove.\(attachment.id)")
+                        .accessibilityFocused(
+                            $accessibilityFocusedAttachmentRemovalID,
+                            equals: attachment.id
+                        )
+                        .focusable()
+                        .focused($focusedAttachmentRemovalID, equals: attachment.id)
                     }
                     .padding(.horizontal, 8).padding(.vertical, 4)
                     .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 6))
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel(
+                        AcpAttachmentAccessibility.chipLabel(name: attachment.name)
+                    )
+                    .accessibilityValue(
+                        AcpAttachmentAccessibility.chipValue(byteSize: attachment.byteSize)
+                    )
+                    .accessibilityIdentifier("acp.attachment.\(attachment.id)")
                 }
             }
             .padding(.horizontal, 2)
@@ -478,6 +1115,46 @@ struct AcpChatView: View {
 
     private func byteLabel(_ bytes: Int) -> String {
         ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+
+    private func removeAttachment(_ attachment: AcpConversation.PendingAttachment) {
+        let focusDestination = AcpAttachmentAccessibility.focusDestination(
+            removing: attachment.id,
+            orderedIDs: conversation.pendingAttachments.map(\.id)
+        )
+        conversation.removeAttachment(attachment.id)
+        let announcement = AcpAttachmentAccessibility.removalAnnouncement(name: attachment.name)
+
+        // Wait until SwiftUI has removed the chip before assigning accessibility
+        // focus, otherwise the disappearing button can consume the request.
+        DispatchQueue.main.async {
+            switch focusDestination {
+            case .removalButton(let id):
+                attachmentControlFocused = false
+                attachmentControlAccessibilityFocused = false
+                focusedAttachmentRemovalID = id
+                accessibilityFocusedAttachmentRemovalID = id
+            case .attachmentControl:
+                focusedAttachmentRemovalID = nil
+                accessibilityFocusedAttachmentRemovalID = nil
+                // Removing the last chip also removes the strip that precedes
+                // the composer, which rebuilds the native menu control. Assign
+                // its focus on the following turn so the new control, rather
+                // than the disappearing hierarchy, consumes the request.
+                DispatchQueue.main.async {
+                    attachmentControlFocused = true
+                    attachmentControlAccessibilityFocused = true
+                }
+            }
+            NSAccessibility.post(
+                element: NSApplication.shared,
+                notification: .announcementRequested,
+                userInfo: [
+                    .announcement: announcement,
+                    .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+                ]
+            )
+        }
     }
 
     /// Stage files dropped onto the composer.
@@ -507,7 +1184,7 @@ struct AcpChatView: View {
                 HStack(spacing: 8) {
                     Text("\(conversation.queued.count) preserved follow-up\(conversation.queued.count == 1 ? "" : "s")")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     Spacer()
                     Button("Resume All") {
                         conversation.resumeQueuedFollowUps()
@@ -521,7 +1198,7 @@ struct AcpChatView: View {
             }
             ForEach(conversation.queued) { message in
                 HStack(spacing: 6) {
-                    Image(systemName: "clock").font(.caption2).foregroundStyle(.secondary)
+                    Image(systemName: "clock").font(.caption2).foregroundStyle(.kaisolaSecondary)
                     Text(message.text).font(.caption).lineLimit(1)
                     Spacer()
                     // Identified so the row's own contents, and whether it is
@@ -549,7 +1226,7 @@ struct AcpChatView: View {
                         Image(systemName: "xmark.circle.fill").font(.caption2)
                     }
                     .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .disabled(conversation.injectingQueuedIDs.contains(message.id))
                     .help("Remove this queued follow-up")
                     .accessibilityIdentifier("acp.queued.\(message.id).remove")
@@ -622,6 +1299,66 @@ enum AcpChatRendering {
     }
 }
 
+struct ToolCallDensityPresentation: Equatable, Sendable {
+    let call: AcpToolCall
+    let density: ToolCallDensity
+
+    var statusLabel: String {
+        switch call.status {
+        case .pending: "Pending"
+        case .inProgress: "In progress"
+        case .completed: "Completed"
+        case .failed: "Failed"
+        }
+    }
+
+    var affectedFiles: [String] { call.declaredFilePaths }
+    var artifactCount: Int { call.content.count }
+    var hasExpandableContent: Bool { artifactCount > 0 }
+
+    var visibleDetailLevel: Int {
+        switch density {
+        case .compact: 1
+        case .balanced: 2
+        case .detailed: 3
+        }
+    }
+
+    var showsArtifactSummary: Bool { density != .compact }
+    var wrapsAffectedFiles: Bool { density == .detailed }
+    var expandsArtifactsByDefault: Bool { false }
+
+    var accessibilityOrder: [String] {
+        [
+            statusLabel,
+            call.title,
+            call.kind,
+            affectedFiles.isEmpty
+                ? "No affected files"
+                : "Affected files: \(affectedFiles.joined(separator: ", "))",
+            artifactCount == 1
+                ? "1 expandable artifact"
+                : "\(artifactCount) expandable artifacts",
+        ]
+    }
+
+    var cardSpacing: CGFloat {
+        switch density {
+        case .compact: 4
+        case .balanced: 8
+        case .detailed: 10
+        }
+    }
+
+    var cardPadding: CGFloat {
+        switch density {
+        case .compact: 6
+        case .balanced: 9
+        case .detailed: 12
+        }
+    }
+}
+
 struct TranscriptRowView: View {
     let row: AcpTranscriptRow
     var workspaceURL: URL?
@@ -630,6 +1367,17 @@ struct TranscriptRowView: View {
 
     var body: some View {
         switch row {
+        case let .runProfileAudit(_, profile):
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.shield")
+                    .accessibilityHidden(true)
+                Text("Run profile: \(profile.name)")
+                if let model = profile.modelID { Text("· \(model)") }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Run profile audit: \(profile.name)")
         case let .user(_, text, failed):
             HStack(spacing: 8) {
                 Spacer(minLength: 40)
@@ -674,17 +1422,17 @@ struct TranscriptRowView: View {
                 )
                 Text(bounded.text)
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .textSelection(.enabled)
                 if bounded.isTruncated {
                     Text("Thinking output truncated in this view")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
             } label: {
                 Label("Thinking", systemImage: "brain")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
         case let .tool(call):
             ToolCallCard(
@@ -694,7 +1442,57 @@ struct TranscriptRowView: View {
             )
         case let .plan(_, entries):
             PlanCard(entries: entries)
+        case let .permissionDecision(_, text):
+            Label {
+                Text(text)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            } icon: {
+                Image(systemName: "shield.slash")
+                    .foregroundStyle(.orange)
+            }
+            .padding(.vertical, 4)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("acp.transcript.\(row.id)")
         }
+    }
+}
+
+/// One spoken contract for the tool header. The visible row contains a status
+/// symbol, title, disclosure chevron, and kind; exposing those children
+/// separately made the symbol-derived button name opaque and left status
+/// changes silent. Keep the description bounded to metadata already visible in
+/// the row — artifact contents may contain sensitive output and are available
+/// only after the user opens the disclosure.
+struct ToolCallAccessibility: Equatable {
+    let label: String
+    let value: String
+    let actionName: String?
+    let identifier: String
+
+    init(call: AcpToolCall, expanded: Bool) {
+        let artifactCount = call.content.count
+        let artifactLabel = "\(artifactCount) artifact\(artifactCount == 1 ? "" : "s")"
+        let statusLabel: String
+        switch call.status {
+        case .pending: statusLabel = "Pending"
+        case .inProgress: statusLabel = "In progress"
+        case .completed: statusLabel = "Completed"
+        case .failed: statusLabel = "Failed"
+        }
+
+        if artifactCount > 0 {
+            let disclosureLabel = expanded ? "Hide details" : "Show details"
+            label = "\(disclosureLabel) for \(call.title)"
+            value = "\(call.kind) tool, \(statusLabel), \(artifactLabel), \(expanded ? "Expanded" : "Collapsed")"
+            actionName = disclosureLabel
+        } else {
+            label = call.title
+            value = "\(call.kind) tool, \(statusLabel), \(artifactLabel)"
+            actionName = nil
+        }
+        identifier = "acp.tool.\(call.id)"
     }
 }
 
@@ -702,37 +1500,61 @@ struct ToolCallCard: View {
     let call: AcpToolCall
     var workspaceURL: URL?
     var terminalSnapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
+    @ObservedObject private var settings = NativePreviewSettings.shared
     @State private var expanded = false
 
-    private var hasArtifacts: Bool { !call.content.isEmpty }
+    private var density: ToolCallDensity { settings.toolCallDensity }
+    private var presentation: ToolCallDensityPresentation {
+        ToolCallDensityPresentation(call: call, density: density)
+    }
+    private var hasArtifacts: Bool { presentation.hasExpandableContent }
+    private var accessibility: ToolCallAccessibility {
+        ToolCallAccessibility(call: call, expanded: expanded)
+    }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Button {
-                if hasArtifacts { expanded.toggle() }
-            } label: {
-                HStack(spacing: 9) {
-                    Image(systemName: statusSymbol)
-                        .foregroundStyle(statusColor)
-                    Text(call.title).lineLimit(1)
-                    Spacer()
-                    if hasArtifacts {
-                        Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                            .font(.caption2).foregroundStyle(.secondary)
-                    }
-                    Text(call.kind).font(.caption).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: presentation.cardSpacing) {
+            if hasArtifacts {
+                Button {
+                    expanded.toggle()
+                } label: {
+                    header
                 }
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel(accessibility.label)
+                .accessibilityValue(accessibility.value)
+                .accessibilityIdentifier(accessibility.identifier)
+                .accessibilityAddTraits([.isButton, .updatesFrequently])
+            } else {
+                header
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel(accessibility.label)
+                    .accessibilityValue(accessibility.value)
+                    .accessibilityIdentifier(accessibility.identifier)
+                    .accessibilityAddTraits(.updatesFrequently)
             }
-            .buttonStyle(.plain)
-            .disabled(!hasArtifacts)
 
-            if !call.locations.isEmpty {
+            if !presentation.affectedFiles.isEmpty {
                 Text(AcpTranscriptInlineRendering.attributed(
-                    call.locations.joined(separator: ", "),
+                    presentation.affectedFiles.joined(separator: ", "),
                     workspaceURL: workspaceURL
                 ))
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .lineLimit(presentation.wrapsAffectedFiles ? nil : 1)
+                    .accessibilityLabel(presentation.accessibilityOrder[3])
+            }
+
+            if presentation.showsArtifactSummary, presentation.hasExpandableContent {
+                Text(
+                    presentation.artifactCount == 1
+                        ? "1 artifact"
+                        : "\(presentation.artifactCount) artifacts"
+                )
+                .font(.caption2)
+                .foregroundStyle(.kaisolaSecondary)
+                .accessibilityLabel(presentation.accessibilityOrder[4])
             }
 
             if expanded {
@@ -748,11 +1570,31 @@ struct ToolCallCard: View {
                 }
             }
         }
-        .padding(9)
+        .padding(presentation.cardPadding)
         .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
         .environment(\.openURL, OpenURLAction { link in
             AcpTranscriptLinkRouting.open(link, workspaceURL: workspaceURL)
         })
+    }
+
+    private var header: some View {
+        HStack(spacing: density == .compact ? 6 : 9) {
+            Image(systemName: statusSymbol)
+                .foregroundStyle(statusColor)
+                .accessibilityHidden(true)
+            Text(presentation.statusLabel)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(statusColor)
+            Text(call.title)
+                .lineLimit(density == .detailed ? 2 : 1)
+            Spacer()
+            if hasArtifacts {
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2).foregroundStyle(.kaisolaSecondary)
+            }
+            Text(call.kind).font(.caption).foregroundStyle(.kaisolaSecondary)
+        }
+        .contentShape(Rectangle())
     }
 
     private var statusSymbol: String {
@@ -765,7 +1607,7 @@ struct ToolCallCard: View {
 
     private var statusColor: Color {
         switch call.status {
-        case .pending, .inProgress: .secondary
+        case .pending, .inProgress: .kaisolaSecondary
         case .completed: .green
         case .failed: .red
         }
@@ -827,7 +1669,7 @@ private struct ToolTextArtifact: View {
             if rendered.isTruncated {
                 Text("A bounded prefix is shown; the complete tool output remains available.")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.horizontal, 8)
                     .padding(.bottom, 6)
             }
@@ -838,29 +1680,117 @@ private struct ToolTextArtifact: View {
 
 /// Live output of an agent-spawned terminal inside a tool card: polls the
 /// AcpTerminalHost snapshot until the process exits.
+@MainActor
+final class AcpTerminalContentModel: ObservableObject {
+    enum Status: Equatable {
+        case running
+        case exited(String)
+        case unavailable
+
+        var label: String {
+            switch self {
+            case .running: "Running…"
+            case let .exited(label): label
+            case .unavailable: "Terminal output unavailable"
+            }
+        }
+    }
+
+    @Published private(set) var output = ""
+    @Published private(set) var outputIsTruncated = false
+    @Published private(set) var status: Status = .running
+
+    private let pollIntervalNanoseconds: UInt64
+    private var activeTerminalID: String?
+    private var pollGeneration: UInt64 = 0
+
+    init(pollIntervalNanoseconds: UInt64 = 700_000_000) {
+        self.pollIntervalNanoseconds = pollIntervalNanoseconds
+    }
+
+    func poll(
+        terminalID: String,
+        snapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
+    ) async {
+        pollGeneration &+= 1
+        let generation = pollGeneration
+        if activeTerminalID != terminalID {
+            activeTerminalID = terminalID
+            output = ""
+            outputIsTruncated = false
+        }
+        status = .running
+
+        while !Task.isCancelled {
+            let next = await snapshot?(terminalID)
+            guard !Task.isCancelled, pollGeneration == generation else { return }
+            guard let next else {
+                status = .unavailable
+                return
+            }
+
+            let bounded = AcpChatRendering.bounded(
+                next.output,
+                characterLimit: AcpChatRendering.toolCharacterLimit,
+                lineLimit: AcpChatRendering.toolLineLimit
+            )
+            output = bounded.text
+            outputIsTruncated = next.truncated || bounded.isTruncated
+            if let exitStatus = next.exitStatus {
+                status = .exited(
+                    exitStatus.exitCode.map { "Exited (\($0))" }
+                        ?? exitStatus.signal.map { "Killed (\($0))" }
+                        ?? "Exited"
+                )
+                return
+            }
+
+            if pollIntervalNanoseconds == 0 {
+                await Task.yield()
+            } else {
+                do {
+                    try await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    /// Invalidates an in-flight provider call that may ignore task cancellation.
+    func invalidate() {
+        pollGeneration &+= 1
+    }
+}
+
 struct TerminalContentView: View {
     let terminalID: String
     var snapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
-    @State private var output = ""
-    @State private var outputIsTruncated = false
-    @State private var exitText: String?
+    @StateObject private var model = AcpTerminalContentModel()
+    @State private var retryGeneration: UInt64 = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Image(systemName: "terminal").font(.caption2)
-                Text(exitText ?? "Running…").font(.caption2)
+                Text(model.status.label).font(.caption2)
                 Spacer()
+                if model.status == .unavailable {
+                    Button {
+                        retryGeneration &+= 1
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2.weight(.semibold))
+                    .help("Try to load this terminal's output again")
+                }
             }
-            .foregroundStyle(
-                exitText == nil
-                    ? KaisolaStatusTone.working.foregroundColor
-                    : Color.secondary
-            )
+            .foregroundStyle(statusColor)
             .padding(.horizontal, 8).padding(.vertical, 5)
             .background(.quaternary.opacity(0.6))
             ScrollView {
-                Text(output.isEmpty ? " " : output)
+                Text(model.output.isEmpty ? " " : model.output)
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -868,35 +1798,43 @@ struct TerminalContentView: View {
             }
             .frame(maxHeight: 180)
             .background(.black.opacity(0.18))
-            if outputIsTruncated {
+            if model.status == .unavailable {
+                Text("No snapshot was returned for \(terminalID). The terminal may have been released or its output evicted.")
+                    .font(.caption2)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+            }
+            if model.outputIsTruncated {
                 Text("Earlier terminal output truncated in this view")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
-        .task(id: terminalID) {
-            while !Task.isCancelled {
-                guard let snap = await snapshot?(terminalID) else { break }
-                let bounded = AcpChatRendering.bounded(
-                    snap.output,
-                    characterLimit: AcpChatRendering.toolCharacterLimit,
-                    lineLimit: AcpChatRendering.toolLineLimit
-                )
-                output = bounded.text
-                outputIsTruncated = bounded.isTruncated
-                if let status = snap.exitStatus {
-                    exitText = status.exitCode.map { "Exited (\($0))" }
-                        ?? status.signal.map { "Killed (\($0))" }
-                        ?? "Exited"
-                    break
-                }
-                try? await Task.sleep(nanoseconds: 700_000_000)
-            }
+        .task(id: PollIdentity(terminalID: terminalID, retryGeneration: retryGeneration)) {
+            await model.poll(terminalID: terminalID, snapshot: snapshot)
         }
+        .onDisappear {
+            model.invalidate()
+        }
+    }
+
+    private var statusColor: Color {
+        switch model.status {
+        case .running: KaisolaStatusTone.working.foregroundColor
+        case .unavailable: KaisolaStatusTone.needsYou.foregroundColor
+        case .exited: .kaisolaSecondary
+        }
+    }
+
+    private struct PollIdentity: Hashable {
+        let terminalID: String
+        let retryGeneration: UInt64
     }
 }
 
@@ -945,7 +1883,7 @@ struct DiffView: View {
                 }
                 .buttonStyle(.plain)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .help(sideBySide ? "Unified view" : "Side-by-side view")
             }
             .padding(.horizontal, 8).padding(.vertical, 5)
@@ -964,7 +1902,7 @@ struct DiffView: View {
                             systemImage: "ellipsis.rectangle"
                         )
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     }
                     HStack(spacing: 10) {
                         if boundedOld.isTruncated || boundedNew.isTruncated {
@@ -1096,7 +2034,7 @@ struct PlanCard: View {
                         .foregroundStyle(
                             entry.status == "completed"
                                 ? KaisolaStatusTone.done.foregroundColor
-                                : Color.secondary
+                                : Color.kaisolaSecondary
                         )
                     Text(entry.content).strikethrough(entry.status == "completed")
                     Spacer()
@@ -1117,6 +2055,13 @@ struct AcpPermissionBar: View {
     let allowOnce: () -> Void
     let createRule: () -> Void
     var enablesKeyboardShortcuts = true
+
+    /// The exact payload stays one click away rather than in front of the
+    /// decision. Collapsed by default; the summary above already carries the
+    /// fields a reviewer needs.
+    @State private var showsRawPayload = false
+
+    private var summary: AcpPermissionSummary { review.summary }
 
     private var ruleUnavailableReason: String {
         review.allowOnceOptionID == nil
@@ -1145,72 +2090,56 @@ struct AcpPermissionBar: View {
                 if pendingCount > 1 {
                     Text("\(pendingCount - 1) more permission request\(pendingCount == 2 ? "" : "s") queued")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .multilineTextAlignment(.trailing)
                 }
             }
 
-            inspectorSection(review.rawInputIsTitleFallback ? "Agent-provided request" : "Raw input") {
-                ScrollView([.horizontal, .vertical]) {
-                    Text(review.rawInput)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: true, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(minHeight: 34, maxHeight: 96, alignment: .topLeading)
-                .inspectorSurface()
-                if review.rawInputIsTitleFallback {
-                    Text("This adapter did not provide ACP rawInput; the exact title above is the only request payload available.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                }
-            }
+            // One vertical scroll for the whole reading, capped so a long ask
+            // can never push the decision buttons or the composer off-screen.
+            // `fixedSize` keeps a short card short instead of padding it to the
+            // cap; nothing inside scrolls, so there is no nested-scroll trap.
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 10) {
+                    summarySection
 
-            inspectorSection("Affected paths (\(review.paths.count))") {
-                if review.paths.isEmpty {
-                    Text("None declared by the adapter.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                } else {
-                    ScrollView([.horizontal, .vertical]) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            ForEach(Array(review.paths.enumerated()), id: \.offset) { _, path in
-                                Text(path)
-                                    .font(.caption.monospaced())
-                                    .textSelection(.enabled)
-                                    .fixedSize(horizontal: true, vertical: true)
-                            }
+                    pathsSection
+
+                    inspectorSection(allowsRule ? "Proposed standing rule" : "Standing rule unavailable") {
+                        if allowsRule {
+                            ruleScopeRow("Workspace", review.ruleScope.workspace)
+                            ruleScopeRow("Action", review.ruleScope.action)
+                            ruleScopeRow("Resource", review.ruleScope.resource)
+                            Text("Future requests must match all three fields.")
+                                .font(.caption2)
+                                .foregroundStyle(.kaisolaSecondary)
+                        } else {
+                            Text(ruleUnavailableReason)
+                                .font(.caption)
+                                .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(minHeight: 24, maxHeight: 88, alignment: .topLeading)
-                    .inspectorSurface()
-                }
-            }
 
-            inspectorSection(allowsRule ? "Proposed standing rule" : "Standing rule unavailable") {
-                if allowsRule {
-                    ruleScopeRow("Workspace", review.ruleScope.workspace)
-                    ruleScopeRow("Action", review.ruleScope.action)
-                    ruleScopeRow("Resource", review.ruleScope.resource)
-                    Text("Future requests must match all three fields.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                } else {
-                    Text(ruleUnavailableReason)
-                        .font(.caption)
-                        .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
-                }
-            }
+                    if !review.omittedOptions.isEmpty {
+                        let labels = review.omittedOptions.map { "\($0.name) [\($0.kind)]" }.joined(separator: ", ")
+                        Text("Additional adapter choices not exposed: \(labels). Kaisola offers only scoped local persistence and one-time wire decisions.")
+                            .font(.caption2)
+                            .foregroundStyle(.kaisolaSecondary)
+                            .textSelection(.enabled)
+                            // Same wrapping rule as the summary: this sentence
+                            // names options the user is not being offered, so
+                            // it cannot end in an ellipsis.
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
 
-            if !review.omittedOptions.isEmpty {
-                let labels = review.omittedOptions.map { "\($0.name) [\($0.kind)]" }.joined(separator: ", ")
-                Text("Additional adapter choices not exposed: \(labels). Kaisola offers only scoped local persistence and one-time wire decisions.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
+                    rawPayloadInspector
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(maxHeight: 380)
+            .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 8) {
                 Spacer(minLength: 0)
@@ -1237,6 +2166,148 @@ struct AcpPermissionBar: View {
         .accessibilityHint(review.allowOnceOptionID == nil
             ? "Use Escape to deny this request"
             : "Use Return to allow once or Escape to deny")
+    }
+
+    /// The decision, in words, at the top of the card. Every row wraps, so a
+    /// narrow chat pane shows the whole command instead of a sideways fragment.
+    private var summarySection: some View {
+        inspectorSection("What this request does") {
+            Text(summary.headline)
+                .font(.callout.weight(.semibold))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if !summary.concerns.isEmpty || !summary.escapingPaths.isEmpty {
+                alertRow(concernHeadline)
+            }
+
+            ForEach(summary.fields) { field in
+                summaryRow(field)
+            }
+
+            Text(summary.undeclaredLabels.isEmpty
+                ? AcpPermissionSummary.unflaggedIsNotSafeNote
+                : "The adapter did not declare: \(summary.undeclaredLabels.joined(separator: ", ")). \(AcpPermissionSummary.unflaggedIsNotSafeNote)")
+                .font(.caption2)
+                .foregroundStyle(.kaisolaSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var concernHeadline: String {
+        let escaping = summary.escapingPaths.count
+        var parts = summary.concerns
+        if escaping > 0 {
+            parts.append("\(escaping) path\(escaping == 1 ? "" : "s") outside the workspace.")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private func summaryRow(_ field: AcpPermissionSummary.Field) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(field.label)
+                .font(.caption2)
+                .foregroundStyle(.kaisolaSecondary)
+            Text(field.text)
+                .font(field.isDeclared ? .caption.monospaced() : .caption)
+                .foregroundStyle(field.isDeclared ? Color.primary : Color.kaisolaSecondary)
+                .textSelection(.enabled)
+                // Wrapping, never sideways scrolling: a multiline command and a
+                // long Unicode path both stay readable at any pane width.
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let concern = field.concern {
+                alertRow(concern)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // One element per field keeps VoiceOver reading label, value, then
+        // warning, in the order the card lays them out.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            field.concern.map { "\(field.label): \(field.text). Warning: \($0)" }
+                ?? "\(field.label): \(field.text)"
+        )
+    }
+
+    private func alertRow(_ text: String) -> some View {
+        Label(text, systemImage: "exclamationmark.triangle.fill")
+            .font(.caption2)
+            .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityLabel("Warning: \(text)")
+    }
+
+    private var pathsSection: some View {
+        inspectorSection("Affected paths (\(summary.paths.count))") {
+            if summary.paths.isEmpty {
+                Text("None declared by the adapter. That is not a promise the request touches no files.")
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                // Every path in full. A clipped or half-cut path is exactly the
+                // misreading this card exists to prevent, so the list has no
+                // height of its own; the card's single scroll bounds it.
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(summary.paths.enumerated()), id: \.offset) { _, entry in
+                        pathRow(entry)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .inspectorSurface()
+            }
+        }
+    }
+
+    private func pathRow(_ entry: AcpPermissionSummary.PathEntry) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            if entry.leavesWorkspace {
+                Image(systemName: "arrow.up.forward.square.fill")
+                    .font(.caption2)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                    .accessibilityHidden(true)
+            }
+            Text(entry.path)
+                .font(.caption.monospaced())
+                .foregroundStyle(entry.leavesWorkspace ? KaisolaStatusTone.failed.foregroundColor : Color.primary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(entry.leavesWorkspace ? "\(entry.path), outside the workspace" : entry.path)
+    }
+
+    /// The payload, byte for byte, still selectable — just no longer the first
+    /// thing a time-pressed reviewer has to decode.
+    private var rawPayloadInspector: some View {
+        DisclosureGroup(isExpanded: $showsRawPayload) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(review.rawInput)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .inspectorSurface()
+                if review.rawInputIsTitleFallback {
+                    Text("This adapter did not provide ACP rawInput; the exact title above is the only request payload available.")
+                        .font(.caption2)
+                        .foregroundStyle(.kaisolaSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.top, 5)
+        } label: {
+            Text(review.rawInputIsTitleFallback
+                ? "Exact agent-provided request"
+                : "Exact raw input (unmodified JSON)")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.kaisolaSecondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder
@@ -1284,7 +2355,7 @@ struct AcpPermissionBar: View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title)
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1294,12 +2365,52 @@ struct AcpPermissionBar: View {
         VStack(alignment: .leading, spacing: 1) {
             Text(label)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             Text(value)
                 .font(.caption.monospaced())
                 .textSelection(.enabled)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+enum AcpTranscriptRecoveryExport {
+    struct Document: Codable, Equatable, Sendable {
+        var formatVersion: Int
+        var title: String
+        var startOrdinal: Int64
+        var isCompleteTranscript: Bool
+        var rows: [AcpTranscriptRow]
+
+        init(title: String, startOrdinal: Int64, rows: [AcpTranscriptRow]) {
+            let boundedStartOrdinal = max(0, startOrdinal)
+            self.formatVersion = 1
+            self.title = title
+            self.startOrdinal = boundedStartOrdinal
+            self.isCompleteTranscript = boundedStartOrdinal == 0
+            self.rows = rows
+        }
+    }
+
+    static func data(title: String, startOrdinal: Int64, rows: [AcpTranscriptRow]) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        return try encoder.encode(Document(
+            title: title,
+            startOrdinal: startOrdinal,
+            rows: rows
+        ))
+    }
+
+    static func suggestedFileName(for title: String) -> String {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_"))
+        let stem = title.lowercased().unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(String(scalar)) : "-"
+        }
+        let compact = String(stem)
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .joined(separator: "-")
+        return "\(compact.isEmpty ? "chat" : compact)-transcript-recovery.json"
     }
 }
 

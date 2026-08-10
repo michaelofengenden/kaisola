@@ -5,11 +5,169 @@ import Security
 import XCTest
 @testable import Kaisola
 
+private struct LegacyCompanionRosterArchive: Codable {
+    let version: Int
+    let devices: [LegacyCompanionPairedDeviceRecord]
+}
+
+private struct LegacyCompanionPairedDeviceRecord: Codable {
+    let deviceId: String
+    let displayName: String
+    let identityPublic: String
+    let x25519StaticPublic: String
+    let capabilities: [CompanionCapability]
+    let pairedAt: Int64
+    let lastSeenAt: Int64
+}
+
 final class CompanionHostFoundationTests: XCTestCase {
     private let desktopSigningSeed = Data((0..<32).map { UInt8($0) })
     private let desktopAgreementSeed = Data((32..<64).map { UInt8($0) })
     private let phoneSigningSeed = Data((64..<96).map { UInt8($0) })
     private let phoneAgreementSeed = Data((96..<128).map { UInt8($0) })
+
+    func testAccountScopedRosterPathsAndRecordsCannotCrossAccounts() async throws {
+        let accountA = try CompanionAccountScope(accountID: "firebase-account-a")
+        let accountB = try CompanionAccountScope(accountID: "firebase-account-b")
+        XCTAssertEqual(accountA, try CompanionAccountScope(accountID: "firebase-account-a"))
+        XCTAssertNotEqual(accountA, accountB)
+        XCTAssertFalse(accountA.rawValue.contains("firebase-account-a"))
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-companion-account-rosters-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let accountAFile = NativePreviewPaths.companionDevices(
+            accountScope: accountA,
+            directory: directory
+        )
+        let accountBFile = NativePreviewPaths.companionDevices(
+            accountScope: accountB,
+            directory: directory
+        )
+        XCTAssertNotEqual(accountAFile, accountBFile)
+        XCTAssertFalse(accountAFile.lastPathComponent.contains("firebase-account-a"))
+
+        let accountAStore = try CompanionDeviceRosterStore(
+            fileURL: accountAFile,
+            accountScope: accountA
+        )
+        let device = try CompanionIdentity(
+            id: "device-account-scope",
+            role: .device,
+            displayName: "Scoped iPhone"
+        )
+        let record = try await accountAStore.pair(
+            peer: CompanionIdentityPin(
+                id: device.id,
+                identityPublic: device.identityPublic,
+                x25519StaticPublic: device.x25519StaticPublic
+            ),
+            displayName: device.displayName,
+            capabilities: [.observe],
+            now: 100
+        )
+        XCTAssertEqual(record.accountScope, accountA)
+
+        XCTAssertThrowsError(try CompanionDeviceRosterStore(
+            fileURL: accountAFile,
+            accountScope: accountB
+        )) { error in
+            XCTAssertEqual(error as? CompanionDeviceRosterError, .accountMismatch)
+        }
+        let accountBStore = try CompanionDeviceRosterStore(
+            fileURL: accountBFile,
+            accountScope: accountB
+        )
+        let accountBDevices = await accountBStore.list()
+        XCTAssertTrue(accountBDevices.isEmpty)
+        let restoredA = try CompanionDeviceRosterStore(
+            fileURL: accountAFile,
+            accountScope: accountA
+        )
+        let restoredADevices = await restoredA.list()
+        XCTAssertEqual(restoredADevices, [record])
+    }
+
+    @MainActor
+    func testRevocationFenceInvalidatesEveryTransportAndRejectsRacedResume() {
+        let fence = CompanionDeviceRevocationFence()
+        let nearby = fence.authorize(
+            deviceID: "device-revocation-test",
+            connectionID: "nearby-connection",
+            resumed: true
+        )
+        let link = fence.authorize(
+            deviceID: "device-revocation-test",
+            connectionID: "link-connection",
+            resumed: true
+        )
+
+        XCTAssertNotNil(nearby)
+        XCTAssertNotNil(link)
+        XCTAssertTrue(nearby.map(fence.isAuthorized) == true)
+        XCTAssertTrue(link.map(fence.isAuthorized) == true)
+        XCTAssertEqual(fence.token(connectionID: "nearby-connection"), nearby)
+        XCTAssertEqual(fence.token(connectionID: "link-connection"), link)
+        XCTAssertEqual(
+            fence.revoke(deviceID: "device-revocation-test"),
+            ["link-connection", "nearby-connection"]
+        )
+        XCTAssertFalse(nearby.map(fence.isAuthorized) == true)
+        XCTAssertFalse(link.map(fence.isAuthorized) == true)
+        XCTAssertNil(fence.token(connectionID: "nearby-connection"))
+        XCTAssertNil(fence.token(connectionID: "link-connection"))
+        XCTAssertNil(fence.authorize(
+            deviceID: "device-revocation-test",
+            connectionID: "raced-resume",
+            resumed: true
+        ))
+
+        let repaired = fence.authorize(
+            deviceID: "device-revocation-test",
+            connectionID: "explicit-new-pairing",
+            resumed: false
+        )
+        XCTAssertNotNil(repaired)
+        XCTAssertTrue(repaired.map(fence.isAuthorized) == true)
+    }
+
+    @MainActor
+    func testAccountTransitionClearsOnlyInMemoryRevocationIdentity() {
+        let fence = CompanionDeviceRevocationFence()
+        let accountAToken = fence.authorize(
+            deviceID: "shared-device-id",
+            connectionID: "account-a-link",
+            resumed: true
+        )
+        XCTAssertNotNil(accountAToken)
+        XCTAssertEqual(
+            fence.revoke(deviceID: "shared-device-id"),
+            ["account-a-link"]
+        )
+        XCTAssertNil(fence.authorize(
+            deviceID: "shared-device-id",
+            connectionID: "account-b-link-before-reset",
+            resumed: true
+        ))
+
+        fence.resetForAccountChange()
+
+        XCTAssertFalse(accountAToken.map(fence.isAuthorized) == true)
+        let accountBToken = fence.authorize(
+            deviceID: "shared-device-id",
+            connectionID: "account-b-link",
+            resumed: true
+        )
+        XCTAssertNotNil(accountBToken)
+        XCTAssertTrue(accountBToken.map(fence.isAuthorized) == true)
+    }
 
     func testDesktopIdentityIsStableAndPrivateKeysNeverSynchronize() throws {
         let service = "com.kaisola.mac.companion-identity.test-\(UUID().uuidString)"
@@ -45,7 +203,11 @@ final class CompanionHostFoundationTests: XCTestCase {
         )
         defer { try? FileManager.default.removeItem(at: directory) }
         let file = directory.appendingPathComponent("devices-v1.json")
-        let store = try CompanionDeviceRosterStore(fileURL: file)
+        let accountScope = try CompanionAccountScope(accountID: "roster-round-trip-account")
+        let store = try CompanionDeviceRosterStore(
+            fileURL: file,
+            accountScope: accountScope
+        )
         let device = try CompanionIdentity(
             id: "device-test",
             role: .device,
@@ -66,16 +228,48 @@ final class CompanionHostFoundationTests: XCTestCase {
         var attributes = try FileManager.default.attributesOfItem(atPath: file.path)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
 
-        let reopened = try CompanionDeviceRosterStore(fileURL: file)
+        let reopened = try CompanionDeviceRosterStore(
+            fileURL: file,
+            accountScope: accountScope
+        )
         let reopenedDevices = await reopened.list()
         XCTAssertEqual(reopenedDevices, [paired])
         try await reopened.markSeen(device.id, now: 200)
         let lastSeenAt = await reopened.device(device.id)?.lastSeenAt
         XCTAssertEqual(lastSeenAt, 200)
-        let revoked = try await reopened.revoke(device.id)
+        let updated = try await reopened.updateCapabilities(
+            [.terminalControl, .observe, .agentControl],
+            for: device.id
+        )
+        XCTAssertEqual(updated.capabilities, [.observe, .agentControl, .terminalControl])
+        do {
+            _ = try await reopened.updateCapabilities([.terminalControl], for: device.id)
+            XCTFail("Expected a grant without observe to fail closed")
+        } catch {
+            XCTAssertEqual(error as? CompanionDeviceRosterError, .invalidStore)
+        }
+        let retainedCapabilities = await reopened.device(device.id)?.capabilities
+        XCTAssertEqual(retainedCapabilities, [.observe, .agentControl, .terminalControl])
+        let reopenedAfterUpdate = try CompanionDeviceRosterStore(
+            fileURL: file,
+            accountScope: accountScope
+        )
+        let persistedCapabilities = await reopenedAfterUpdate.device(device.id)?.capabilities
+        XCTAssertEqual(persistedCapabilities, [.observe, .agentControl, .terminalControl])
+        let revoked = try await reopened.revoke(device.id, now: 300)
         XCTAssertTrue(revoked)
         let remainingDevices = await reopened.list()
         XCTAssertTrue(remainingDevices.isEmpty)
+        let tombstone = await reopened.revokedDevice(device.id)
+        XCTAssertEqual(tombstone?.pin, paired.pin)
+        XCTAssertEqual(tombstone?.revokedAt, 300)
+
+        let reopenedAfterRevocation = try CompanionDeviceRosterStore(
+            fileURL: file,
+            accountScope: accountScope
+        )
+        let reopenedTombstone = await reopenedAfterRevocation.revokedDevice(device.id)
+        XCTAssertEqual(reopenedTombstone, tombstone)
 
         attributes = try FileManager.default.attributesOfItem(atPath: file.path)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
@@ -90,9 +284,58 @@ final class CompanionHostFoundationTests: XCTestCase {
         let file = directory.appendingPathComponent("devices-v1.json")
         try Data(#"{"version":1,"devices":[]}"#.utf8).write(to: file)
         try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: file.path)
-        XCTAssertThrowsError(try CompanionDeviceRosterStore(fileURL: file)) { error in
+        XCTAssertThrowsError(try CompanionDeviceRosterStore(
+            fileURL: file,
+            accountScope: try CompanionAccountScope(accountID: "unsafe-roster-account")
+        )) { error in
             XCTAssertEqual(error as? CompanionDeviceRosterError, .unsafePath)
         }
+    }
+
+    func testUnscopedVersionOneRosterCannotBeAdoptedByTheFirstSignedInAccount() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-companion-roster-v1-\(UUID().uuidString)", isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let file = directory.appendingPathComponent("devices-v1.json")
+        let identity = try CompanionIdentity(
+            id: "device-legacy-roster",
+            role: .device,
+            displayName: "Legacy iPhone"
+        )
+        let record = LegacyCompanionPairedDeviceRecord(
+            deviceId: identity.id,
+            displayName: identity.displayName,
+            identityPublic: identity.identityPublic,
+            x25519StaticPublic: identity.x25519StaticPublic,
+            capabilities: [.observe],
+            pairedAt: 100,
+            lastSeenAt: 100
+        )
+        try JSONEncoder().encode(LegacyCompanionRosterArchive(
+            version: 1,
+            devices: [record]
+        )).write(to: file, options: [.atomic])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: file.path
+        )
+
+        XCTAssertThrowsError(try CompanionDeviceRosterStore(
+            fileURL: file,
+            accountScope: try CompanionAccountScope(accountID: "first-account-after-upgrade")
+        )) { error in
+            XCTAssertEqual(error as? CompanionDeviceRosterError, .accountMismatch)
+        }
+        let untouched = try JSONSerialization.jsonObject(with: Data(contentsOf: file))
+            as? [String: Any]
+        XCTAssertEqual(untouched?["version"] as? Int, 1)
+        XCTAssertEqual((untouched?["devices"] as? [Any])?.count, 1)
     }
 
     func testBonjourAdvertisementMatchesShippingPhoneContract() throws {
@@ -123,6 +366,376 @@ final class CompanionHostFoundationTests: XCTestCase {
         XCTAssertGreaterThan(image.size.width, 100)
         XCTAssertEqual(image.size.width, image.size.height)
         XCTAssertNil(CompanionQRCode.image(for: ""))
+    }
+
+    func testCompanionSettingsFailuresRemainIsolatedUntilTheirOwnAction() {
+        var failures = CompanionSettingsFailureStore()
+        let offer = CompanionSettingsFailure(
+            message: "Could not create a code.",
+            retryTitle: "Try Again",
+            retry: .createOffer
+        )
+        let confirmation = CompanionSettingsFailure(
+            message: "The phrases could not be confirmed.",
+            retryTitle: "Create New Code",
+            retry: .createReplacementOffer
+        )
+        let phoneA = CompanionSettingsFailure(
+            message: "Phone A still has access.",
+            retryTitle: "Retry Revoke",
+            retry: .revoke(deviceID: "phone-a")
+        )
+        let phoneB = CompanionSettingsFailure(
+            message: "Phone B access did not change.",
+            retryTitle: "Retry Access Change",
+            retry: .updateCapabilities(
+                deviceID: "phone-b",
+                capabilities: [.observe, .agentControl]
+            )
+        )
+
+        failures.record(offer, for: .offer)
+        failures.record(confirmation, for: .confirmation)
+        failures.record(phoneA, for: .device("phone-a"))
+        failures.record(phoneB, for: .device("phone-b"))
+
+        failures.clear(.confirmation)
+        XCTAssertEqual(failures.failure(for: .offer), offer)
+        XCTAssertNil(failures.failure(for: .confirmation))
+        XCTAssertEqual(failures.failure(for: .device("phone-a")), phoneA)
+        XCTAssertEqual(failures.failure(for: .device("phone-b")), phoneB)
+
+        failures.clear(.device("phone-a"))
+        XCTAssertNil(failures.failure(for: .device("phone-a")))
+        XCTAssertEqual(failures.failure(for: .device("phone-b")), phoneB)
+
+        failures.record(phoneA, for: .device("phone-a"))
+        failures.retainDeviceFailures(for: ["phone-b"])
+        XCTAssertNil(failures.failure(for: .device("phone-a")))
+        XCTAssertEqual(failures.failure(for: .device("phone-b")), phoneB)
+    }
+
+    func testCompanionSettingsFailureMessagesAreBounded() {
+        let failure = CompanionSettingsFailure(
+            message: String(repeating: "x", count: 5_000),
+            retryTitle: "Try Again",
+            retry: .createOffer
+        )
+        XCTAssertEqual(
+            failure.message.count,
+            CompanionSettingsFailure.maximumMessageCharacters
+        )
+    }
+
+    func testCompanionSettingsFailureTargetsExposeStableLocalAnchors() {
+        XCTAssertEqual(
+            CompanionSettingsFailureTarget.offer.accessibilityIdentifier,
+            "companion.error.offer"
+        )
+        XCTAssertEqual(
+            CompanionSettingsFailureTarget.confirmation.accessibilityIdentifier,
+            "companion.error.confirmation"
+        )
+        XCTAssertEqual(
+            CompanionSettingsFailureTarget.device("phone-a").accessibilityIdentifier,
+            "companion.error.device.phone-a"
+        )
+        XCTAssertNotEqual(
+            CompanionSettingsFailureTarget.device("phone-a").accessibilityIdentifier,
+            CompanionSettingsFailureTarget.device("phone-b").accessibilityIdentifier
+        )
+        XCTAssertNotEqual(
+            CompanionSettingsFailureTarget.device("phone-a").anchorID,
+            CompanionSettingsFailureTarget.device("phone-b").anchorID
+        )
+    }
+
+    func testCompanionSettingsRendersAndFocusesEveryFailureAtItsAction() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Kaisola/Features/Settings/CompanionSettingsTab.swift"),
+            encoding: .utf8
+        )
+
+        XCTAssertFalse(source.contains("@State private var operationError"))
+        XCTAssertTrue(source.contains("ScrollViewReader { proxy in"))
+        XCTAssertTrue(source.contains("@FocusState private var focusedFailure"))
+        XCTAssertTrue(source.contains("proxy.scrollTo(target.anchorID, anchor: .center)"))
+        XCTAssertTrue(source.contains("inlineFailure(for: .offer)"))
+        XCTAssertTrue(source.contains("inlineFailure(for: .confirmation)"))
+        XCTAssertTrue(source.contains("inlineFailure(for: .device(device.id))"))
+        XCTAssertTrue(source.contains("Button(failure.retryTitle)"))
+    }
+
+    @MainActor
+    func testPairNewDeviceIgnoresRepeatActivationWhileAnOfferIsInFlight() throws {
+        let activation = CompanionPairingOfferActivation()
+        let first = try XCTUnwrap(activation.begin())
+        XCTAssertTrue(activation.isCreating)
+        XCTAssertNil(activation.begin())
+        XCTAssertNil(activation.begin())
+        XCTAssertTrue(activation.finish(first))
+        XCTAssertFalse(activation.isCreating)
+        let second = try XCTUnwrap(activation.begin())
+        XCTAssertNotEqual(second, first)
+    }
+
+    @MainActor
+    func testOnlyTheNewestOfferActivationMayApplyItsResult() throws {
+        let activation = CompanionPairingOfferActivation()
+        let abandoned = try XCTUnwrap(activation.begin())
+        activation.discard()
+        XCTAssertFalse(activation.isCreating)
+        let newest = try XCTUnwrap(activation.begin())
+        XCTAssertFalse(activation.finish(abandoned))
+        XCTAssertTrue(activation.isCreating)
+        XCTAssertTrue(activation.finish(newest))
+        XCTAssertFalse(activation.isCreating)
+        XCTAssertFalse(activation.finish(newest))
+    }
+
+    func testPairNewDeviceButtonRendersTheGatedProgressState() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Kaisola/Features/Settings/CompanionSettingsTab.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains(".disabled(offerActivation.isCreating)"))
+        XCTAssertTrue(source.contains("ProgressView().controlSize(.mini)"))
+        XCTAssertTrue(source.contains("CompanionPairingOfferActivation.progressLabel"))
+    }
+
+    func testPairingGrantDraftIsResetAtEveryOfferBoundary() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Kaisola/Features/Settings/CompanionSettingsTab.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains(
+            "@State private var pairingGrantDraft = CompanionPairingGrantDraft()"
+        ))
+        XCTAssertTrue(source.contains("let selection = pairingGrantDraft.selection"))
+        XCTAssertTrue(source.contains(
+            "allowsTerminalControl: selection.allowsTerminalControl"
+        ))
+        XCTAssertEqual(
+            source.components(separatedBy: ".disabled(pairingGrantControlsDisabled)").count - 1,
+            2,
+            "an active or in-flight offer must freeze both exact grant choices"
+        )
+        XCTAssertTrue(source.contains("pairingGrantDraft.reset(after: .offerCreationFailed)"))
+        XCTAssertGreaterThanOrEqual(
+            source.components(separatedBy: "pairingGrantDraft.reset(after: .cancelled)").count - 1,
+            3,
+            "cancel, host loss, and owned confirmation failure must all clear grants"
+        )
+        XCTAssertTrue(source.contains("pairingGrantDraft.reset(after: .confirmed)"))
+        XCTAssertTrue(source.contains("pairingGrantDraft.reset(after: .expired)"))
+        XCTAssertTrue(source.contains(".onChange(of: host.pairingPayload?.pairingNonce)"))
+        XCTAssertTrue(source.contains(".task(id: host.pairingPayload)"))
+        XCTAssertTrue(source.contains("CompanionPairingOfferExpiryFence(payload: payload)"))
+    }
+
+    func testPairingGrantDraftDefaultsToViewOnlyAndSnapshotsExactOptIn() {
+        var draft = CompanionPairingGrantDraft()
+        XCTAssertEqual(
+            draft.selection,
+            CompanionPairingGrantSelection(
+                allowsAgentControl: false,
+                allowsTerminalControl: false
+            )
+        )
+
+        draft.allowsAgentControl = true
+        draft.allowsTerminalControl = true
+        let optedIn = draft.selection
+        draft.allowsAgentControl = false
+        draft.allowsTerminalControl = false
+
+        XCTAssertEqual(
+            optedIn,
+            CompanionPairingGrantSelection(
+                allowsAgentControl: true,
+                allowsTerminalControl: true
+            ),
+            "offer creation must use the synchronous selection, not later toggle mutations"
+        )
+    }
+
+    func testPairingGrantDraftResetsAfterEveryTerminalTransition() {
+        XCTAssertEqual(
+            Set(CompanionPairingGrantDraft.ResetReason.allCases),
+            [.offerCreationFailed, .cancelled, .confirmed, .expired]
+        )
+        for reason in CompanionPairingGrantDraft.ResetReason.allCases {
+            var draft = CompanionPairingGrantDraft(
+                allowsAgentControl: true,
+                allowsTerminalControl: true
+            )
+            draft.reset(after: reason)
+            XCTAssertEqual(
+                draft.selection,
+                CompanionPairingGrantSelection(
+                    allowsAgentControl: false,
+                    allowsTerminalControl: false
+                ),
+                "\(reason) must return the next offer to view-only"
+            )
+        }
+    }
+
+    func testPairingGrantExpiryIsExactOfferAndGenerationFenced() {
+        let expiry = CompanionPairingOfferExpiryFence(
+            pairingNonce: "pairing-old",
+            expiresAt: 12_000
+        )
+        XCTAssertTrue(expiry.matches(pairingNonce: "pairing-old", expiresAt: 12_000))
+        XCTAssertFalse(expiry.matches(pairingNonce: nil, expiresAt: nil))
+        XCTAssertFalse(expiry.matches(pairingNonce: "pairing-new", expiresAt: 12_000))
+        XCTAssertFalse(expiry.matches(pairingNonce: "pairing-old", expiresAt: 13_000))
+    }
+
+    func testPairingConfirmationRendersOneGatedProgressAndFailureRestartState() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Kaisola/Features/Settings/CompanionSettingsTab.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains(
+            "@StateObject private var confirmationActivation = CompanionPairingConfirmationActivation()"
+        ))
+        XCTAssertEqual(
+            source.components(separatedBy: ".disabled(confirmationActivation.isConfirming)").count - 1,
+            2,
+            "both phrase decisions must become inert while one confirmation owns the slot"
+        )
+        XCTAssertTrue(source.contains(
+            "Text(CompanionPairingConfirmationActivation.progressLabel)"
+        ))
+        XCTAssertTrue(source.contains(
+            "let attempt = confirmationActivation.begin(pairingID: phrase.pairingID)"
+        ))
+        XCTAssertTrue(source.contains(
+            "message: CompanionPairingConfirmationActivation.failureMessage(error)"
+        ))
+        XCTAssertTrue(source.contains(
+            "guard confirmationActivation.fail(attempt) else { return }\n"
+                + "                host.cancelPairing()\n"
+                + "                recordFailure("
+        ))
+        XCTAssertTrue(source.contains("retry: .createReplacementOffer"))
+        XCTAssertTrue(source.contains("at: .confirmation"))
+    }
+
+    @MainActor
+    func testPairingConfirmationStaysGatedUntilTheExactPairingSettles() throws {
+        let activation = CompanionPairingConfirmationActivation()
+        let attempt = try XCTUnwrap(activation.begin(pairingID: "pairing-1"))
+
+        XCTAssertTrue(activation.isConfirming)
+        XCTAssertNil(activation.begin(pairingID: "pairing-1"))
+        XCTAssertTrue(activation.submitted(
+            attempt,
+            currentPairingID: "pairing-1"
+        ))
+        XCTAssertTrue(
+            activation.isConfirming,
+            "sending the local SAS decision is not success until the phone settles the same pairing"
+        )
+        XCTAssertNil(activation.begin(pairingID: "pairing-1"))
+
+        activation.reconcile(pairingID: "pairing-1")
+        XCTAssertTrue(activation.isConfirming)
+        activation.reconcile(pairingID: nil)
+        XCTAssertFalse(activation.isConfirming)
+    }
+
+    @MainActor
+    func testPairingConfirmationFailureCannotCancelANewerPairing() throws {
+        let activation = CompanionPairingConfirmationActivation()
+        XCTAssertNil(activation.begin(pairingID: ""))
+        let stale = try XCTUnwrap(activation.begin(pairingID: "pairing-old"))
+
+        activation.reconcile(pairingID: "pairing-new")
+        XCTAssertFalse(activation.isConfirming)
+        let current = try XCTUnwrap(activation.begin(pairingID: "pairing-new"))
+        XCTAssertFalse(activation.fail(stale))
+        XCTAssertTrue(activation.isConfirming)
+
+        // A disconnect can clear the phrase before confirmPairing() reports
+        // failure. Keep ownership during submission so that failure still
+        // restores a clear new-offer state instead of disappearing silently.
+        activation.reconcile(pairingID: nil)
+        XCTAssertTrue(activation.isConfirming)
+        XCTAssertTrue(activation.fail(current))
+        XCTAssertFalse(activation.isConfirming)
+        XCTAssertFalse(activation.fail(current))
+    }
+
+    @MainActor
+    func testPairingConfirmationFailureMessageExplainsTheRestart() {
+        let error = NSError(
+            domain: "pairing-fixture",
+            code: 7,
+            userInfo: [NSLocalizedDescriptionKey: "Handshake timed out."]
+        )
+        XCTAssertEqual(
+            CompanionPairingConfirmationActivation.failureMessage(error),
+            "Pairing confirmation failed: Handshake timed out. Create a new pairing code to try again."
+        )
+        XCTAssertEqual(
+            CompanionPairingConfirmationActivation.progressLabel,
+            "Confirming pairing"
+        )
+    }
+
+    func testPairingCodePresentationPreservesTheExactDisplayedAndCopiedValue() {
+        let code = #"{"accountScope":"acct-1","pairingNonce":"aB-_09","type":"kaisola-companion-pairing"}"#
+        let presentation = CompanionPairingCodePresentation(code: code)
+
+        XCTAssertEqual(presentation.displayValue, code)
+        XCTAssertEqual(presentation.copyValue, code)
+        XCTAssertEqual(presentation.accessibilityValue, code)
+        XCTAssertEqual(presentation.title, "Single-use pairing code")
+    }
+
+    func testPairingCodePresentationExplainsQRCodeFailureWithoutHidingManualFallback() {
+        let code = #"{"pairingNonce":"manual-fallback"}"#
+        let presentation = CompanionPairingCodePresentation(code: code)
+
+        XCTAssertNil(presentation.qrFallbackMessage(qrCodeAvailable: true))
+        XCTAssertEqual(
+            presentation.qrFallbackMessage(qrCodeAvailable: false),
+            "QR code unavailable. Copy or select the pairing code instead."
+        )
+        XCTAssertEqual(presentation.displayValue, code)
+        XCTAssertEqual(presentation.copyValue, code)
+        XCTAssertTrue(
+            CompanionPairingOfferAccessibility.qrFallback.hasPrefix(
+                CompanionPairingOfferAccessibility.group + "."
+            )
+        )
+    }
+
+    func testPairingOfferControlsUseOneStableAccessibilityGroup() {
+        let identifiers = CompanionPairingOfferAccessibility.allControlIdentifiers
+
+        XCTAssertEqual(Set(identifiers).count, identifiers.count)
+        XCTAssertTrue(identifiers.allSatisfy {
+            $0.hasPrefix(CompanionPairingOfferAccessibility.group + ".")
+        })
+        XCTAssertTrue(identifiers.contains(CompanionPairingOfferAccessibility.code))
+        XCTAssertTrue(identifiers.contains(CompanionPairingOfferAccessibility.qrCode))
+        XCTAssertTrue(identifiers.contains(CompanionPairingOfferAccessibility.copy))
+        XCTAssertTrue(identifiers.contains(CompanionPairingOfferAccessibility.cancel))
     }
 
     func testPairingCoordinatorCompletesMutualProofSASAndSecureResume() async throws {
@@ -255,6 +868,7 @@ final class CompanionHostFoundationTests: XCTestCase {
             "desktopId": .string(fixture.desktop.id),
             "deviceId": .string(fixture.phone.id),
             "connectionId": .string(resumeConnectionID),
+            "accountScope": .string(fixture.roster.accountScope.rawValue),
         ])
         let resumeInitiator = try NoiseXXInitiator(
             identity: fixture.phone,
@@ -272,6 +886,7 @@ final class CompanionHostFoundationTests: XCTestCase {
                 "type": .string("resume.start"),
                 "deviceId": .string(fixture.phone.id),
                 "connectionId": .string(resumeConnectionID),
+                "accountScope": .string(fixture.roster.accountScope.rawValue),
                 "message1": .string(try resumeInitiator.writeMessage1().base64URLEncodedString()),
             ]),
             nowMilliseconds: now + 10
@@ -328,6 +943,114 @@ final class CompanionHostFoundationTests: XCTestCase {
         XCTAssertTrue(resumed)
         let resumedConnection = await fixture.coordinator.authenticatedConnection(socketID: "socket-resume")
         XCTAssertEqual(resumedConnection?.resumed, true)
+    }
+
+    func testRevokedDeviceGetsAuthenticatedTerminalFrameAndCannotResume() async throws {
+        let fixture = try makePairingFixture()
+        defer { try? FileManager.default.removeItem(at: fixture.directory) }
+        _ = try await fixture.roster.pair(
+            peer: CompanionIdentityPin(
+                id: fixture.phone.id,
+                identityPublic: fixture.phone.identityPublic,
+                x25519StaticPublic: fixture.phone.x25519StaticPublic
+            ),
+            displayName: fixture.phone.displayName,
+            capabilities: [.observe, .terminalControl],
+            now: 1_000
+        )
+        let didRevoke = try await fixture.roster.revoke(fixture.phone.id, now: 1_100)
+        XCTAssertTrue(didRevoke)
+
+        let connectionID = "connection-revoked-resume"
+        let contextValue: JSONValue = .object([
+            "v": .integer(1),
+            "mode": .string("resume"),
+            "protocol": .string(CompanionCrypto.noiseProtocol),
+            "desktopId": .string(fixture.desktop.id),
+            "deviceId": .string(fixture.phone.id),
+            "connectionId": .string(connectionID),
+            "accountScope": .string(fixture.roster.accountScope.rawValue),
+        ])
+        let initiator = try NoiseXXInitiator(
+            identity: fixture.phone,
+            prologue: createNoisePrologue(contextValue),
+            peerPin: CompanionIdentityPin(
+                id: fixture.desktop.id,
+                identityPublic: fixture.desktop.identityPublic,
+                x25519StaticPublic: fixture.desktop.x25519StaticPublic
+            )
+        )
+        let started = try await fixture.coordinator.receive(
+            socketID: "socket-revoked-resume",
+            payload: try wire([
+                "v": .integer(1),
+                "type": .string("resume.start"),
+                "deviceId": .string(fixture.phone.id),
+                "connectionId": .string(connectionID),
+                "accountScope": .string(fixture.roster.accountScope.rawValue),
+                "message1": .string(try initiator.writeMessage1().base64URLEncodedString()),
+            ]),
+            nowMilliseconds: 1_200
+        )
+        let message2Object = try object(try XCTUnwrap(started.frames.first))
+        let sessionID = try XCTUnwrap(message2Object["sessionId"]?.stringValue)
+        let message2 = try XCTUnwrap(
+            message2Object["message2"]?.stringValue.flatMap(Data.init(base64URLString:))
+        )
+        try initiator.readMessage2(message2)
+        let message3 = try initiator.writeMessage3()
+        let result = try initiator.result()
+        let phoneChannel = try SecureFrameChannel(
+            result: result,
+            context: CompanionConnectionContext(
+                desktopId: fixture.desktop.id,
+                deviceId: fixture.phone.id,
+                connectionId: connectionID
+            ),
+            role: .device
+        )
+        let completed = try await fixture.coordinator.receive(
+            socketID: "socket-revoked-resume",
+            payload: try wire([
+                "v": .integer(1),
+                "type": .string("resume.message3"),
+                "sessionId": .string(sessionID),
+                "message3": .string(message3.base64URLEncodedString()),
+            ]),
+            nowMilliseconds: 1_201
+        )
+        let confirmationObject = try object(try XCTUnwrap(completed.frames.first))
+        try CompanionKeyConfirmation.verify(
+            channel: phoneChannel,
+            frame: try decodeSecureFrame(try XCTUnwrap(confirmationObject["confirmationFrame"])),
+            expectedRole: .desktop,
+            handshakeHash: result.handshakeHash
+        )
+        let terminal = try await fixture.coordinator.receive(
+            socketID: "socket-revoked-resume",
+            payload: try CanonicalJSON.data(from: CompanionKeyConfirmation.make(
+                channel: phoneChannel,
+                role: .device,
+                handshakeHash: result.handshakeHash
+            )),
+            nowMilliseconds: 1_202
+        )
+        guard case let .revoked(deviceID) = terminal.event else {
+            return XCTFail("Expected revoked terminal event")
+        }
+        XCTAssertEqual(deviceID, fixture.phone.id)
+        let terminalPayload = try phoneChannel.decryptJSON(
+            try decodeSecureFrameData(try XCTUnwrap(terminal.frames.first))
+        )
+        XCTAssertEqual(terminalPayload.objectValue?["type"]?.stringValue, "device-revoked")
+        XCTAssertEqual(
+            terminalPayload.objectValue?["message"]?.stringValue,
+            "This iPhone was revoked on the Mac. Pair it again to reconnect."
+        )
+        let authenticated = await fixture.coordinator.authenticatedConnection(
+            socketID: "socket-revoked-resume"
+        )
+        XCTAssertNil(authenticated)
     }
 
     func testPairingOfferIsSingleUseEvenWhenClaimingHandshakeIsMalformed() async throws {
@@ -400,7 +1123,8 @@ final class CompanionHostFoundationTests: XCTestCase {
             agreementSeed: phoneAgreementSeed
         )
         let roster = try CompanionDeviceRosterStore(
-            fileURL: directory.appendingPathComponent("devices-v1.json")
+            fileURL: directory.appendingPathComponent("devices-v3.json"),
+            accountScope: try CompanionAccountScope(accountID: "host-foundation-pairing")
         )
         return PairingFixture(
             directory: directory,

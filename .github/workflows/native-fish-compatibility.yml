@@ -1,0 +1,109 @@
+name: native-fish-compatibility
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  required-fish-compatibility:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      KAISOLA_REQUIRE_FISH_COMPATIBILITY: '1'
+      KAISOLA_EXPECTED_FISH_VERSION: '4.8.1'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22.23.1'
+
+      - name: Install checksum-pinned Fish runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/kaisola-fish-compatibility"
+          runtime="$RUNNER_TEMP/kaisola-fish-4.8.1"
+          archive="$runtime/fish-4.8.1.app.zip"
+          mkdir -p "$evidence" "$runtime/extracted"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$archive" \
+            https://github.com/fish-shell/fish-shell/releases/download/4.8.1/fish-4.8.1.app.zip
+          printf '%s  %s\n' \
+            aec7606269bbd0af8ac29f66d7f50f32f72b1d68d3b278227ae3e94cf501bb7f \
+            "$archive" | shasum -a 256 -c - | tee "$evidence/checksum.txt"
+          ditto -x -k "$archive" "$runtime/extracted"
+          fish="$runtime/extracted/fish-4.8.1.app/Contents/Resources/base/usr/local/bin/fish"
+          test -x "$fish"
+          test -x /usr/bin/expect
+          test "$("$fish" --version)" = 'fish, version 4.8.1'
+          "$fish" --version | tee "$evidence/fish-version.txt"
+          printf 'KAISOLA_TEST_FISH=%s\n' "$fish" >> "$GITHUB_ENV"
+
+          # App-hosted XCTest does not inherit arbitrary xcodebuild variables.
+          # Supply the exact same explicit test variable through one ignored,
+          # owner-only, fail-closed test contract.
+          config="native/KaisolaMac/.artifacts/required-fish-compatibility.json"
+          mkdir -p "$(dirname "$config")"
+          node - "$config" "$fish" <<'NODE'
+          const fs = require('node:fs')
+          const [configPath, fishPath] = process.argv.slice(2)
+          fs.writeFileSync(configPath, `${JSON.stringify({
+            schemaVersion: 1,
+            fishPath,
+            fishVersion: '4.8.1',
+          })}\n`, { mode: 0o600 })
+          fs.chmodSync(configPath, 0o600)
+          NODE
+          cp native/KaisolaMac/ResourceGates/fish-compatibility-v1.md "$evidence/"
+
+      - name: Verify Fish compatibility contract
+        run: node --test tests/node/nativeFishCompatibility.test.cjs
+
+      - name: Run required generated Fish integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/kaisola-fish-compatibility"
+          xcodebuild \
+            -project native/KaisolaMac/KaisolaMac.xcodeproj \
+            -scheme Kaisola \
+            -configuration Debug \
+            -destination "platform=macOS,arch=$(uname -m)" \
+            -derivedDataPath "$RUNNER_TEMP/kaisola-fish-derived" \
+            -resultBundlePath "$evidence/FishCompatibility.xcresult" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackageUpdates \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=YES \
+            ARCHS="$(uname -m)" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            KAISOLA_PACKAGE_BROKER_HELPER=0 \
+            -only-testing:KaisolaTests/NativeTerminalInteractionTests/testGeneratedFishIntegrationExecutesWhenFishRuntimeIsAvailable \
+            test 2>&1 | tee "$evidence/xcodebuild.log"
+
+      - name: Reject skipped or ambiguous Fish results
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/kaisola-fish-compatibility"
+          results="$evidence/test-results.json"
+          xcrun xcresulttool get test-results tests \
+            --path "$evidence/FishCompatibility.xcresult" \
+            --format json > "$results"
+          node scripts/native-fish-compatibility-result.cjs --results "$results" \
+            | tee "$evidence/validated-summary.json"
+
+      - name: Publish Fish compatibility evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-fish-compatibility-${{ github.sha }}
+          path: ${{ runner.temp }}/kaisola-fish-compatibility
+          if-no-files-found: error
+          retention-days: 14

@@ -6,6 +6,287 @@ enum AcpWire {
     static let protocolVersion = 1
 }
 
+/// A reusable, immutable-at-launch declaration of the model and host services
+/// an ACP chat may use. String identifiers are retained deliberately: a tool
+/// or MCP server removed after the profile was saved must remain visible as an
+/// actionable warning, never disappear and silently broaden the profile.
+struct AcpRunProfile: Codable, Equatable, Hashable, Identifiable, Sendable {
+    enum ClientTool: String, CaseIterable, Codable, Sendable {
+        case readTextFile
+        case writeTextFile
+        case terminal
+
+        var title: String {
+            switch self {
+            case .readTextFile: "Read workspace files"
+            case .writeTextFile: "Write workspace files"
+            case .terminal: "Run host terminals"
+            }
+        }
+    }
+
+    static let allMCPServersID = "*"
+    // Xcode 16.4 / Swift 6.1 can crash while lowering these value-only lazy
+    // globals under whole-module compilation. Computed values are equivalent
+    // here: profiles are immutable value snapshots with stable explicit IDs.
+    static var write: AcpRunProfile {
+        AcpRunProfile(
+            id: "write",
+            name: "Write",
+            modelID: nil,
+            enabledClientToolIDs: ClientTool.allCases.map(\.rawValue),
+            enabledMCPServerNames: [allMCPServersID]
+        )
+    }
+
+    static var ask: AcpRunProfile {
+        AcpRunProfile(
+            id: "ask",
+            name: "Ask",
+            modelID: nil,
+            enabledClientToolIDs: [ClientTool.readTextFile.rawValue],
+            enabledMCPServerNames: [allMCPServersID]
+        )
+    }
+
+    static var minimal: AcpRunProfile {
+        AcpRunProfile(
+            id: "minimal",
+            name: "Minimal",
+            modelID: nil,
+            enabledClientToolIDs: [],
+            enabledMCPServerNames: []
+        )
+    }
+
+    static var builtIns: [AcpRunProfile] { [write, ask, minimal] }
+
+    let id: String
+    var name: String
+    var modelID: String?
+    var enabledClientToolIDs: [String]
+    var enabledMCPServerNames: [String]
+
+    init(
+        id: String,
+        name: String,
+        modelID: String?,
+        enabledClientToolIDs: [String],
+        enabledMCPServerNames: [String]
+    ) {
+        self.id = id
+        self.name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let model = modelID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.modelID = model?.isEmpty == false ? model : nil
+        self.enabledClientToolIDs = Self.unique(enabledClientToolIDs)
+        self.enabledMCPServerNames = Self.unique(enabledMCPServerNames)
+    }
+
+    var isBuiltIn: Bool { Self.builtIns.contains { $0.id == id } }
+
+    func allows(_ tool: ClientTool) -> Bool {
+        enabledClientToolIDs.contains(tool.rawValue)
+    }
+
+    func restricting(_ access: AcpAdapterAccess) -> AcpAdapterAccess {
+        AcpAdapterAccess(
+            workspaceRead: access.workspaceRead && allows(.readTextFile),
+            workspaceWrite: access.workspaceWrite && allows(.writeTextFile),
+            network: access.network,
+            childProcess: access.childProcess,
+            hostTerminal: access.hostTerminal && allows(.terminal)
+        )
+    }
+
+    func filterMCPServers(_ servers: [JSONValue]) -> [JSONValue] {
+        guard !enabledMCPServerNames.contains(Self.allMCPServersID) else { return servers }
+        let allowed = Set(enabledMCPServerNames)
+        return servers.filter { value in
+            guard let name = value.objectValue?["name"]?.stringValue else { return false }
+            return allowed.contains(name)
+        }
+    }
+
+    func availabilityWarnings(knownMCPServerNames: [String]) -> [String] {
+        let tools = Set(ClientTool.allCases.map(\.rawValue))
+        let knownServers = Set(knownMCPServerNames)
+        let toolWarnings = enabledClientToolIDs
+            .filter { !tools.contains($0) }
+            .map { "Tool “\($0)” is unavailable." }
+        let serverWarnings = enabledMCPServerNames
+            .filter { $0 != Self.allMCPServersID && !knownServers.contains($0) }
+            .map { "MCP server “\($0)” is unavailable." }
+        return toolWarnings + serverWarnings
+    }
+
+    private static func unique(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        return values.compactMap { raw in
+            let value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty, seen.insert(value).inserted else { return nil }
+            return value
+        }
+    }
+}
+
+/// UserDefaults-backed custom run profiles. Built-ins are immutable and kept
+/// out of the payload so upgrades can safely improve their definitions.
+final class AcpRunProfileStore {
+    private let defaults: UserDefaults
+    private let key: String
+
+    init(defaults: UserDefaults = .standard, key: String = "acpRunProfiles.v1") {
+        self.defaults = defaults
+        self.key = key
+    }
+
+    func all() -> [AcpRunProfile] { AcpRunProfile.builtIns + custom() }
+
+    func profile(id: String) -> AcpRunProfile? {
+        all().first { $0.id == id }
+    }
+
+    var defaultProfileID: String {
+        get {
+            let stored = defaults.string(forKey: "\(key).default") ?? AcpRunProfile.write.id
+            return profile(id: stored) == nil ? AcpRunProfile.write.id : stored
+        }
+        set {
+            guard profile(id: newValue) != nil else { return }
+            defaults.set(newValue, forKey: "\(key).default")
+        }
+    }
+
+    var defaultProfile: AcpRunProfile {
+        profile(id: defaultProfileID) ?? .write
+    }
+
+    @discardableResult
+    func create(
+        name: String,
+        modelID: String? = nil,
+        enabledClientToolIDs: [String] = AcpRunProfile.write.enabledClientToolIDs,
+        enabledMCPServerNames: [String] = AcpRunProfile.write.enabledMCPServerNames
+    ) -> AcpRunProfile {
+        var profiles = custom()
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let base = Self.slug(trimmed.isEmpty ? "Profile" : trimmed)
+        let existing = Set(all().map(\.id))
+        var candidate = base
+        var suffix = 2
+        while existing.contains(candidate) {
+            candidate = "\(base)-\(suffix)"
+            suffix += 1
+        }
+        let profile = AcpRunProfile(
+            id: candidate,
+            name: trimmed.isEmpty ? "Profile" : trimmed,
+            modelID: modelID,
+            enabledClientToolIDs: enabledClientToolIDs,
+            enabledMCPServerNames: enabledMCPServerNames
+        )
+        profiles.append(profile)
+        save(profiles)
+        return profile
+    }
+
+    @discardableResult
+    func fork(_ id: String) -> AcpRunProfile? {
+        guard let source = profile(id: id) else { return nil }
+        return create(
+            name: "\(source.name) Copy",
+            modelID: source.modelID,
+            enabledClientToolIDs: source.enabledClientToolIDs,
+            enabledMCPServerNames: source.enabledMCPServerNames
+        )
+    }
+
+    @discardableResult
+    func rename(_ id: String, to name: String) -> Bool {
+        guard !AcpRunProfile.builtIns.contains(where: { $0.id == id }) else { return false }
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+        var profiles = custom()
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return false }
+        profiles[index].name = trimmed
+        save(profiles)
+        return true
+    }
+
+    @discardableResult
+    func update(_ profile: AcpRunProfile) -> Bool {
+        guard !profile.isBuiltIn else { return false }
+        var profiles = custom()
+        guard let index = profiles.firstIndex(where: { $0.id == profile.id }) else { return false }
+        profiles[index] = profile
+        save(profiles)
+        return true
+    }
+
+    /// Apply the warning's explicit repair action without broadening the
+    /// profile: valid selections remain enabled, while identifiers the current
+    /// client or workspace cannot provide are removed from this custom profile.
+    @discardableResult
+    func removeUnavailableReferences(
+        from id: String,
+        knownMCPServerNames: [String]?
+    ) -> Bool {
+        guard !AcpRunProfile.builtIns.contains(where: { $0.id == id }) else { return false }
+        var profiles = custom()
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return false }
+
+        let knownToolIDs = Set(AcpRunProfile.ClientTool.allCases.map(\.rawValue))
+        var repaired = profiles[index]
+        repaired.enabledClientToolIDs.removeAll { !knownToolIDs.contains($0) }
+        if let knownMCPServerNames {
+            let knownServerNames = Set(knownMCPServerNames)
+            repaired.enabledMCPServerNames.removeAll {
+                $0 != AcpRunProfile.allMCPServersID && !knownServerNames.contains($0)
+            }
+        }
+        guard repaired != profiles[index] else { return false }
+
+        profiles[index] = repaired
+        save(profiles)
+        return true
+    }
+
+    @discardableResult
+    func delete(_ id: String) -> Bool {
+        guard !AcpRunProfile.builtIns.contains(where: { $0.id == id }) else { return false }
+        var profiles = custom()
+        let oldCount = profiles.count
+        profiles.removeAll { $0.id == id }
+        guard profiles.count != oldCount else { return false }
+        save(profiles)
+        if defaults.string(forKey: "\(key).default") == id {
+            defaults.set(AcpRunProfile.write.id, forKey: "\(key).default")
+        }
+        return true
+    }
+
+    private func custom() -> [AcpRunProfile] {
+        guard let data = defaults.data(forKey: key),
+              let profiles = try? JSONDecoder().decode([AcpRunProfile].self, from: data) else {
+            return []
+        }
+        return profiles.filter { !$0.isBuiltIn }.prefix(32).map { $0 }
+    }
+
+    private func save(_ profiles: [AcpRunProfile]) {
+        guard let data = try? JSONEncoder().encode(Array(profiles.prefix(32))) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    private static func slug(_ value: String) -> String {
+        let scalars = value.lowercased().unicodeScalars.map { scalar -> Character in
+            CharacterSet.alphanumerics.contains(scalar) ? Character(String(scalar)) : "-"
+        }
+        let collapsed = String(scalars).split(separator: "-").joined(separator: "-")
+        return collapsed.isEmpty ? "profile" : collapsed
+    }
+}
+
 /// A streamed conversation turn item, mirroring the ACP `session/update`
 /// variants the Electron renderer consumes (agent_message_chunk,
 /// agent_thought_chunk, tool_call, plan, …).
@@ -184,6 +465,92 @@ struct AcpSessionInfo: Equatable, Sendable {
     }
 }
 
+/// Immutable provider/account identity captured before an adapter starts.
+/// Failure and fallback UI must describe this launch context rather than
+/// inferring credentials from whatever error text an adapter happens to emit.
+struct AcpProviderLaunchContext: Equatable, Sendable {
+    let providerName: String
+    let accountLabel: String
+    let defaultSettingsSectionID: String
+
+    init(
+        providerName: String,
+        accountLabel: String,
+        defaultSettingsSectionID: String
+    ) {
+        self.providerName = providerName.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.accountLabel = accountLabel.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.defaultSettingsSectionID = defaultSettingsSectionID
+    }
+}
+
+/// A provider launch error with a deterministic recovery destination. The raw
+/// detail remains visible, but it never supplies provider/account identity.
+struct AcpProviderStartupFailure: Equatable, Sendable {
+    let providerName: String
+    let accountLabel: String
+    let detail: String
+    let settingsSectionID: String
+    let settingsTitle: String
+
+    init(context: AcpProviderLaunchContext, detail: String) {
+        let normalizedDetail = detail.trimmingCharacters(in: .whitespacesAndNewlines)
+        let searchable = normalizedDetail.lowercased()
+        let modelOrKeyFailure = [
+            "api key", "api_key", "apikey", "base url", "base_url", "model",
+        ].contains { searchable.contains($0) }
+        let accountFailure = [
+            "account", "authentication", "authenticate", "credentials", "login",
+            "sign in", "signed out", "401", "403",
+        ].contains { searchable.contains($0) }
+
+        providerName = context.providerName.isEmpty ? "Configured provider" : context.providerName
+        accountLabel = context.accountLabel.isEmpty ? "Default account" : context.accountLabel
+        self.detail = normalizedDetail.isEmpty ? "The adapter did not provide an error detail." : normalizedDetail
+        if modelOrKeyFailure {
+            settingsSectionID = "models"
+            settingsTitle = "Models & Keys"
+        } else if accountFailure {
+            settingsSectionID = "accounts"
+            settingsTitle = "Accounts"
+        } else {
+            settingsSectionID = context.defaultSettingsSectionID
+            switch context.defaultSettingsSectionID {
+            case "agents": settingsTitle = "Agents"
+            case "models": settingsTitle = "Models & Keys"
+            default: settingsTitle = "Accounts"
+            }
+        }
+    }
+
+    var summary: String {
+        "\(providerName) account “\(accountLabel)” could not start. \(detail)"
+    }
+}
+
+/// A requested model was not honored by the adapter. This is a pre-inference
+/// gate: callers must explicitly accept the adapter's actual model or cancel.
+struct AcpModelFallback: Equatable, Sendable {
+    let requestedID: String
+    let requestedLabel: String
+    let actualID: String
+    let actualLabel: String
+    let providerName: String
+    let accountLabel: String
+}
+
+extension Notification.Name {
+    /// Window-scoped through `object: AppModel`; another window must not open
+    /// Settings when this conversation requests provider recovery.
+    static var kaisolaOpenProviderSettings: Notification.Name {
+        Notification.Name("kaisola.openProviderSettings")
+    }
+}
+
+enum AcpProviderSettingsNotificationKey {
+    static let sectionID = "sectionID"
+}
+
 /// A slash command the agent advertises via `available_commands_update`.
 struct AcpCommand: Equatable, Sendable, Identifiable {
     let name: String
@@ -194,8 +561,16 @@ struct AcpCommand: Equatable, Sendable, Identifiable {
 /// An adapter configuration option (reasoning effort, approval preset, …) from
 /// `session/new`'s `configOptions` and `session/set_config_option` responses.
 struct AcpConfigOption: Equatable, Sendable, Identifiable {
+    enum Value: Equatable, Sendable {
+        case select(String)
+        case boolean(Bool)
+    }
+
     let id: String
     let name: String
+    /// Adapter-provided explanatory copy. Boolean rows use it as both help and
+    /// an accessibility hint; it is never inferred from the identifier.
+    let description: String?
     /// ACP's own classification of what this option *is* (`mode`, `model`,
     /// `thought_level`, …). Adapters name the same setting differently — Codex
     /// says "Reasoning effort", our mock says the same, a third could say
@@ -203,13 +578,117 @@ struct AcpConfigOption: Equatable, Sendable, Identifiable {
     /// two surfaces are describing one setting. `nil` when the adapter omits it,
     /// which is why the name heuristics survive alongside it.
     var category: String?
-    var currentValue: String?
+    let value: Value?
     let choices: [Choice]
+
+    /// Compatibility accessor for select options. A boolean never degrades to
+    /// the strings "true"/"false", which keeps wire typing fail closed.
+    var currentValue: String? {
+        guard case let .select(current)? = value else { return nil }
+        return current
+    }
+
+    var booleanValue: Bool? {
+        guard case let .boolean(current)? = value else { return nil }
+        return current
+    }
+
+    init(
+        id: String,
+        name: String,
+        description: String? = nil,
+        category: String? = nil,
+        currentValue: String?,
+        choices: [Choice]
+    ) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.category = category
+        self.value = currentValue.map(Value.select)
+        self.choices = choices
+    }
+
+    init(
+        id: String,
+        name: String,
+        description: String? = nil,
+        category: String? = nil,
+        currentBooleanValue: Bool
+    ) {
+        self.id = id
+        self.name = name
+        self.description = description
+        self.category = category
+        self.value = .boolean(currentBooleanValue)
+        self.choices = []
+    }
 
     struct Choice: Equatable, Sendable, Identifiable {
         let value: String
         let name: String
         var id: String { value }
+    }
+}
+
+/// ACP v1 boolean session configuration is optional and separately negotiated.
+/// Keeping its additive wire contract here leaves the established select-option
+/// parser and mutation path unchanged for adapters that do not support it.
+enum AcpBooleanConfigWire {
+    static func advertise(in parameters: JSONValue) -> JSONValue {
+        guard var root = parameters.objectValue,
+              var capabilities = root["clientCapabilities"]?.objectValue else {
+            return parameters
+        }
+        capabilities["session"] = .object([
+            "configOptions": .object([
+                "boolean": .object([:]),
+            ]),
+        ])
+        root["clientCapabilities"] = .object(capabilities)
+        return .object(root)
+    }
+
+    /// Unknown option types and type/value mismatches are ignored rather than
+    /// coerced into a control that could send a differently typed mutation.
+    static func parseOptions(_ value: JSONValue?) -> [AcpConfigOption] {
+        (value?.arrayValue ?? []).compactMap { item -> AcpConfigOption? in
+            guard let object = item.objectValue,
+                  let id = object["id"]?.stringValue else { return nil }
+            let name = object["name"]?.stringValue ?? id
+            let description = object["description"]?.stringValue
+            let category = object["category"]?.stringValue
+            switch object["type"]?.stringValue {
+            case "boolean":
+                guard let currentValue = object["currentValue"]?.boolValue else { return nil }
+                return AcpConfigOption(
+                    id: id,
+                    name: name,
+                    description: description,
+                    category: category,
+                    currentBooleanValue: currentValue
+                )
+            case "select", nil:
+                let choices = (object["options"]?.arrayValue ?? []).compactMap { choice -> AcpConfigOption.Choice? in
+                    guard let fields = choice.objectValue,
+                          let value = fields["value"]?.stringValue else { return nil }
+                    return AcpConfigOption.Choice(
+                        value: value,
+                        name: fields["name"]?.stringValue ?? value
+                    )
+                }
+                return AcpConfigOption(
+                    id: id,
+                    name: name,
+                    description: description,
+                    category: category,
+                    currentValue: object["currentValue"]?.stringValue,
+                    choices: choices
+                )
+            default:
+                return nil
+            }
+        }
     }
 }
 
@@ -234,6 +713,10 @@ enum AcpClientError: Error, Equatable, LocalizedError {
     case adapterExited(code: Int32)
     case spawnFailed(String)
     case malformedResponse
+    /// A frame that never reached the JSON-RPC layer: unparsable JSON, invalid
+    /// UTF-8, a stream that ended mid-message. The payload is a short excerpt of
+    /// the offending bytes (see `AcpClient.framePreview`), never the whole frame.
+    case malformedFrame(String)
     case requestFailed(String)
     case frameTooLarge
     case unsupportedProtocol(Int)
@@ -244,6 +727,7 @@ enum AcpClientError: Error, Equatable, LocalizedError {
         case let .adapterExited(code): "The agent process exited (code \(code))."
         case let .spawnFailed(message): "Could not start the agent: \(message)"
         case .malformedResponse: "The agent sent a malformed message."
+        case let .malformedFrame(detail): "The agent sent a malformed message: \(detail)"
         case let .requestFailed(message): message
         case .frameTooLarge: "The agent sent an oversized message."
         case let .unsupportedProtocol(version):

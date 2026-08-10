@@ -55,6 +55,20 @@ final class OnboardingStateTests: XCTestCase {
                       "A different suite has its own, still-unseen record.")
     }
 
+    func testManualReopenInstructionNamesPaletteRouteWithoutResettingSeenState() {
+        let defaults = makeDefaults()
+        OnboardingState.markSeen(defaults: defaults)
+
+        XCTAssertEqual(
+            OnboardingState.reopenInstruction,
+            "Reopen anytime: press Command-K and choose Readiness Checklist…"
+        )
+        XCTAssertFalse(
+            OnboardingState.shouldShow(defaults: defaults),
+            "explaining or using the manual route must not re-arm first-run onboarding"
+        )
+    }
+
     func testHostedFixturesNeverCoverTheirDeclaredSurfaceWithOnboarding() {
         let defaults = makeDefaults()
         XCTAssertTrue(OnboardingState.shouldShow(defaults: defaults))
@@ -70,6 +84,20 @@ final class OnboardingStateTests: XCTestCase {
             environment: [:],
             defaults: defaults
         ))
+    }
+
+    func testReadinessReopenFixtureUsesOnlyItsBrokerFreeSurface() {
+        XCTAssertTrue(RootShellView.shouldPresentReadinessReopenFixture(environment: [
+            "KAISOLA_NATIVE_VISUAL_FIXTURE": "1",
+            "KAISOLA_NATIVE_VISUAL_SURFACE": "onboarding-reopen",
+        ]))
+        XCTAssertFalse(RootShellView.shouldPresentReadinessReopenFixture(environment: [
+            "KAISOLA_NATIVE_VISUAL_FIXTURE": "1",
+            "KAISOLA_NATIVE_VISUAL_SURFACE": "onboarding",
+        ]))
+        XCTAssertFalse(RootShellView.shouldPresentReadinessReopenFixture(environment: [
+            "KAISOLA_NATIVE_VISUAL_SURFACE": "onboarding-reopen",
+        ]))
     }
 
     func testTerminalReadinessRequiresWriteControlNotOnlyObservation() {
@@ -141,6 +169,87 @@ final class OnboardingStateTests: XCTestCase {
                 isRefreshing: false
             ),
             .init(kind: .ready, detail: "A plain terminal does not require an agent account.")
+        )
+    }
+
+    /// An unsigned build has no updater, so Settings can only explain the
+    /// limitation. The row must keep that explanation and offer nothing.
+    func testUnsignedBuildKeepsTheUpdateExplanationWithoutAnInertAction() {
+        let status = OnboardingReadiness.updates(
+            canConfigure: false,
+            checksAutomatically: false,
+            pendingVersion: nil
+        )
+        XCTAssertEqual(status.kind, .information)
+        XCTAssertEqual(status.detail, "Update controls become available in a signed Kaisola build.")
+        XCTAssertNil(
+            OnboardingReadiness.updateAction(for: status),
+            "Update Settings cannot change an unsigned build's update state, so the row must not offer it."
+        )
+
+        let unsignedWithStalePendingUpdate = OnboardingReadiness.updates(
+            canConfigure: false,
+            checksAutomatically: true,
+            pendingVersion: "2.0"
+        )
+        XCTAssertEqual(unsignedWithStalePendingUpdate, status)
+        XCTAssertNil(OnboardingReadiness.updateAction(for: unsignedWithStalePendingUpdate))
+    }
+
+    /// A signed build's action tracks whether a control there can act: the
+    /// automatic-check toggle for an off state, Restart and Update for a
+    /// pending version, and nothing at all once updates are already handled.
+    func testSignedBuildOffersUpdateSettingsOnlyForStatesSettingsCanChange() {
+        let checksOff = OnboardingReadiness.updates(
+            canConfigure: true,
+            checksAutomatically: false,
+            pendingVersion: nil
+        )
+        XCTAssertEqual(checksOff.kind, .needsAction)
+        XCTAssertEqual(OnboardingReadiness.updateAction(for: checksOff), "Update Settings")
+
+        let checksOn = OnboardingReadiness.updates(
+            canConfigure: true,
+            checksAutomatically: true,
+            pendingVersion: nil
+        )
+        XCTAssertEqual(checksOn.kind, .ready)
+        XCTAssertNil(OnboardingReadiness.updateAction(for: checksOn))
+
+        // Restart and Update is live in Settings whenever a version is waiting,
+        // so that state stays actionable even with nothing left to configure.
+        let pending = OnboardingReadiness.updates(
+            canConfigure: true,
+            checksAutomatically: true,
+            pendingVersion: "9.9.9"
+        )
+        XCTAssertEqual(pending.kind, .needsAction)
+        XCTAssertEqual(OnboardingReadiness.updateAction(for: pending), "Update Settings")
+    }
+
+    /// The decision is only worth having while the checklist actually asks it.
+    /// The row used to offer the button for every non-ready status, which is
+    /// how the unsigned build got a dead end in the first place.
+    func testChecklistRoutesTheUpdatesActionThroughTheSharedDecision() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Kaisola/Features/Onboarding/OnboardingView.swift"),
+            encoding: .utf8
+        )
+        let code = source
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .filter { !$0.trimmingCharacters(in: .whitespaces).hasPrefix("//") }
+            .joined(separator: "\n")
+
+        XCTAssertTrue(
+            code.contains("actionTitle: OnboardingReadiness.updateAction(for: updateStatus)"),
+            "The Updates row must take its action from OnboardingReadiness.updateAction."
+        )
+        XCTAssertFalse(
+            code.contains("updateStatus.kind == .ready ? nil : \"Update Settings\""),
+            "Offering Update Settings for every non-ready status puts a dead button on unsigned builds."
         )
     }
 

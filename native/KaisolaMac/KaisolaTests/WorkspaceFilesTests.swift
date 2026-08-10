@@ -1,11 +1,164 @@
 import AppKit
+import Darwin
 import Foundation
+import ImageIO
+import UniformTypeIdentifiers
 import XCTest
 @testable import Kaisola
 
 /// ProjectFiles (tree listing + bounded enumeration) and FilePreviewContent
 /// (what a file renders as) — the workspace rail's foundations.
 final class WorkspaceFilesTests: XCTestCase {
+    func testAllDocumentsPresentationKeepsEveryTabReachableInSourceOrder() {
+        let project = URL(fileURLWithPath: "/tmp/Overflow project", isDirectory: true)
+        let first = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("README.md"),
+            isPinned: true,
+            line: nil
+        )
+        let selected = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("Sources/main.swift"),
+            isPinned: false,
+            line: nil
+        )
+        let last = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("Tests/main.swift"),
+            isPinned: true,
+            line: nil
+        )
+
+        let presentation = FilePreviewTabOverflowPresentation(
+            tabs: [first, selected, last],
+            selectedURL: selected.url,
+            workspaceRoot: project,
+            loadedURL: selected.url,
+            isDirty: true
+        )
+
+        XCTAssertEqual(presentation.label, "All Documents")
+        XCTAssertEqual(presentation.value, "3 open, main.swift — Sources selected")
+        XCTAssertEqual(presentation.selectedScrollTarget, selected.url.standardizedFileURL)
+        XCTAssertEqual(
+            presentation.entries.map(\.url),
+            [first.url, selected.url, last.url].map(\.standardizedFileURL)
+        )
+        XCTAssertEqual(
+            presentation.entries.map(\.accessibilityLabel),
+            [
+                "README.md, kept open",
+                "main.swift — Sources, selected, preview, modified",
+                "main.swift — Tests, kept open",
+            ]
+        )
+    }
+
+    func testAllDocumentsPresentationHasAStableKeyboardAndVoiceOverTarget() {
+        XCTAssertEqual(
+            FilePreviewTabOverflowPresentation.accessibilityIdentifier,
+            "preview.allDocuments"
+        )
+        XCTAssertEqual(
+            FilePreviewTabOverflowPresentation.visibleTitle(openDocumentCount: 12),
+            "All 12"
+        )
+    }
+
+    func testEditorModeControlsSpeakTheirActionAndCurrentToggleValue() {
+        let cases: [(FilePreviewEditorControlAccessibility.Kind, Bool, String, String)] = [
+            (.markdown, false, "Edit Markdown source", "Markdown preview shown"),
+            (.markdown, true, "Show Markdown preview", "Markdown source editor shown"),
+            (.text, false, "Edit text", "Text preview shown"),
+            (.text, true, "Show text preview", "Text editor shown"),
+            (.html, false, "Edit HTML source", "HTML preview shown"),
+            (.html, true, "Show HTML preview", "HTML source editor shown"),
+        ]
+
+        for (kind, editorVisible, label, value) in cases {
+            let accessibility = FilePreviewEditorControlAccessibility(
+                kind: kind,
+                editorVisible: editorVisible
+            )
+            XCTAssertEqual(accessibility.label, label)
+            XCTAssertEqual(accessibility.value, value)
+        }
+    }
+
+    func testSaveControlSpeaksCleanDirtySavingAndConflictStates() {
+        let file = URL(fileURLWithPath: "/tmp/main.swift")
+
+        let clean = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: false,
+            isLoading: false,
+            isSaving: false,
+            hasConflict: false
+        )
+        XCTAssertEqual(clean.label, "Save main.swift")
+        XCTAssertEqual(clean.value, "Saved")
+        XCTAssertFalse(clean.isEnabled)
+
+        let dirty = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: true,
+            isLoading: false,
+            isSaving: false,
+            hasConflict: true
+        )
+        XCTAssertEqual(dirty.value, "Changes pending, file changed on disk")
+        XCTAssertTrue(dirty.isEnabled)
+
+        let saving = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: true,
+            isLoading: false,
+            isSaving: true,
+            hasConflict: false
+        )
+        XCTAssertEqual(saving.value, "Saving")
+        XCTAssertFalse(saving.isEnabled)
+    }
+
+    func testDocumentHeaderFocusOrderIsStable() {
+        XCTAssertEqual(
+            FilePreviewControlAccessibility.headerFocusOrder,
+            ["preview.editorMode", "preview.save", "preview.options", "preview.hide"]
+        )
+    }
+
+    func testRevertConfirmationNamesTheExactDocumentAndRecoveredDraft() {
+        let confirmation = FilePreviewRevertConfirmation(
+            fileURL: URL(fileURLWithPath: "/tmp/Incident notes.md"),
+            includesRecoveredDraft: true
+        )
+
+        XCTAssertEqual(confirmation.title, "Revert changes in Incident notes.md?")
+        XCTAssertEqual(confirmation.confirmLabel, "Revert Incident notes.md")
+        XCTAssertEqual(
+            confirmation.message,
+            "This permanently discards current edits and the recovered draft for Incident notes.md. Recovery data is kept until you confirm."
+        )
+        XCTAssertTrue(confirmation.matchesCurrentDocument(
+            URL(fileURLWithPath: "/tmp/Incident notes.md")
+        ))
+        XCTAssertFalse(confirmation.matchesCurrentDocument(
+            URL(fileURLWithPath: "/tmp/another.md")
+        ))
+    }
+
+    func testOrdinaryRevertConfirmationDoesNotClaimARecoveredDraft() {
+        let confirmation = FilePreviewRevertConfirmation(
+            fileURL: URL(fileURLWithPath: "/tmp/main.swift"),
+            includesRecoveredDraft: false
+        )
+
+        XCTAssertEqual(confirmation.title, "Revert changes in main.swift?")
+        XCTAssertEqual(
+            confirmation.message,
+            "This permanently discards current edits in main.swift. Recovery data is kept until you confirm."
+        )
+        XCTAssertFalse(confirmation.message.contains("recovered draft"))
+    }
+
     func testMarkdownListContinuationHandlesBulletsTasksAndOrderedLists() {
         XCTAssertEqual(MarkdownListContinuation.action(for: "- first"), .continueWith("- "))
         XCTAssertEqual(MarkdownListContinuation.action(for: "  * nested"), .continueWith("  * "))
@@ -320,7 +473,273 @@ final class WorkspaceFilesTests: XCTestCase {
         let warning = FilePreviewNotice.warning("The file changed on disk.")
         XCTAssertEqual(warning.severity, .warning)
         XCTAssertEqual(warning.message, "The file changed on disk.")
+
+        // Save and recovery notices are dismiss-only; only a refused external
+        // open earns buttons in the banner.
+        XCTAssertTrue(failure.recovery.isEmpty)
+        XCTAssertFalse(failure.isExternalOpenRefusal)
+        XCTAssertTrue(recovered.recovery.isEmpty)
+        XCTAssertFalse(conflicted.isExternalOpenRefusal)
     }
+
+    func testRefusedExternalOpenRaisesAPersistentErrorWithBothRecoveryDoors() throws {
+        let outcome = FilePreviewExternalOpen.defaultApplicationOutcome(
+            accepted: false,
+            fileName: "quarterly.numbers"
+        )
+        guard case let .refused(notice) = outcome else {
+            return XCTFail("A refused open must surface a notice, not silence")
+        }
+        XCTAssertEqual(notice.severity, .error)
+        XCTAssertTrue(
+            notice.message.contains("quarterly.numbers"),
+            "The banner has to name the file: \(notice.message)"
+        )
+        XCTAssertEqual(notice.recovery, [.revealInFinder, .chooseApplication])
+        XCTAssertEqual(notice.recovery.map(\.title), ["Reveal in Finder", "Choose Application…"])
+        XCTAssertTrue(notice.isExternalOpenRefusal)
+        XCTAssertEqual(notice.accessibilityLabel, "Error: \(notice.message)")
+    }
+
+    func testExternalOpenConfirmsOnlyWhenMacOSAcceptsTheRequest() {
+        guard case let .opened(message) = FilePreviewExternalOpen.defaultApplicationOutcome(
+            accepted: true,
+            fileName: "README.md"
+        ) else {
+            return XCTFail("An accepted open must confirm")
+        }
+        XCTAssertEqual(message, "Opened README.md")
+
+        // The refusal is never reported as a success, however it is phrased.
+        if case .opened = FilePreviewExternalOpen.defaultApplicationOutcome(
+            accepted: false,
+            fileName: "README.md"
+        ) {
+            XCTFail("A refused open must not be confirmed as opened")
+        }
+    }
+
+    func testChosenApplicationFailureKeepsTheRecoveryBannerAndNamesTheApp() throws {
+        let application = URL(fileURLWithPath: "/Applications/Numbers.app")
+        XCTAssertEqual(FilePreviewExternalOpen.applicationName(for: application), "Numbers")
+
+        let refused = FilePreviewExternalOpen.chosenApplicationOutcome(
+            failure: "The application is damaged.",
+            fileName: "quarterly.numbers",
+            applicationName: FilePreviewExternalOpen.applicationName(for: application)
+        )
+        guard case let .refused(notice) = refused else {
+            return XCTFail("A failed launch must keep the banner up")
+        }
+        XCTAssertEqual(notice.severity, .error)
+        XCTAssertTrue(notice.message.contains("Numbers"))
+        XCTAssertTrue(notice.message.contains("The application is damaged."))
+        XCTAssertEqual(notice.recovery, [.revealInFinder, .chooseApplication])
+
+        guard case let .opened(message) = FilePreviewExternalOpen.chosenApplicationOutcome(
+            failure: nil,
+            fileName: "quarterly.numbers",
+            applicationName: "Numbers"
+        ) else {
+            return XCTFail("A launch that threw nothing is a success")
+        }
+        XCTAssertEqual(message, "Opened quarterly.numbers in Numbers")
+    }
+
+    /// The policy above only helps if the preview's buttons actually consult it.
+    /// A discarded `NSWorkspace.shared.open(…)` statement is exactly the bug
+    /// this file regressed on, and nothing else in a unit test can see a
+    /// SwiftUI button's action, so the source is the assertion.
+    func testFilePreviewNeverDiscardsTheExternalOpenResult() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Kaisola/Features/Workspace/FilePreviewView.swift"),
+            encoding: .utf8
+        )
+        for (index, line) in source.components(separatedBy: .newlines).enumerated() {
+            XCTAssertFalse(
+                line.trimmingCharacters(in: .whitespaces).hasPrefix("NSWorkspace.shared.open("),
+                """
+                FilePreviewView.swift:\(index + 1) drops the result of NSWorkspace.open, \
+                so a refused launch would look like a dead button. Route it through \
+                FilePreviewExternalOpen instead.
+                """
+            )
+        }
+    }
+
+    func testImagePreviewAccessibilityUsesDecodedFormatPixelsAndExplicitMissingDescription() throws {
+        let file = root.appendingPathComponent("release-map.jpg")
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 37,
+            pixelsHigh: 23,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ))
+        let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+        try png.write(to: file, options: .atomic)
+
+        let metadata = try XCTUnwrap(ImagePreviewAccessibilityMetadata.load(from: file))
+        XCTAssertEqual(metadata.filename, "release-map.jpg")
+        XCTAssertEqual(metadata.pixelWidth, 37)
+        XCTAssertEqual(metadata.pixelHeight, 23)
+        XCTAssertEqual(metadata.format, "PNG")
+        XCTAssertNil(metadata.authoredDescription)
+        XCTAssertEqual(
+            metadata.accessibilityDescription,
+            "Image preview: release-map.jpg. PNG format, 37 by 23 pixels. "
+                + "No authored description is available."
+        )
+    }
+
+    func testImagePreviewAccessibilityPreservesAuthoredDescriptionVerbatimAfterTrimming() {
+        let metadata = ImagePreviewAccessibilityMetadata(
+            filename: "architecture.tiff",
+            pixelWidth: 640,
+            pixelHeight: 480,
+            format: "TIFF",
+            authoredDescription: "  Service ownership diagram.  "
+        )
+
+        XCTAssertEqual(metadata.authoredDescription, "Service ownership diagram.")
+        XCTAssertEqual(
+            metadata.accessibilityDescription,
+            "Image preview: architecture.tiff. TIFF format, 640 by 480 pixels. "
+                + "Authored description: Service ownership diagram."
+        )
+    }
+
+    func testImagePreviewAccessibilityReadsAnAuthoredDescriptionFromTheFile() throws {
+        let file = root.appendingPathComponent("diagram.asset")
+        let bitmap = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: 19,
+            pixelsHigh: 11,
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ))
+        let image = try XCTUnwrap(bitmap.cgImage)
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
+            file as CFURL,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ))
+        CGImageDestinationAddImage(destination, image, [
+            kCGImagePropertyPNGDictionary: [
+                kCGImagePropertyPNGDescription: "Deployment dependency graph.",
+            ],
+        ] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+
+        let metadata = try XCTUnwrap(ImagePreviewAccessibilityMetadata.load(from: file))
+        XCTAssertEqual(metadata.format, "PNG")
+        XCTAssertEqual(metadata.pixelWidth, 19)
+        XCTAssertEqual(metadata.pixelHeight, 11)
+        XCTAssertEqual(metadata.authoredDescription, "Deployment dependency graph.")
+        XCTAssertTrue(metadata.accessibilityDescription.hasSuffix(
+            "Authored description: Deployment dependency graph."
+        ))
+    }
+
+    func testCollapsingTheChangedOnDiskBannerKeepsACompactConflictIndicator() {
+        var state = FilePreviewConflictState()
+        XCTAssertFalse(state.showsBanner)
+        XCTAssertFalse(state.showsCompactIndicator)
+
+        state.apply(.detectedExternalChange(isDirty: true))
+        XCTAssertTrue(state.isActive)
+        XCTAssertTrue(state.showsBanner)
+        XCTAssertFalse(state.showsCompactIndicator)
+
+        // The close control collapses the banner. The conflict itself survives,
+        // so a compact indicator has to stay on screen.
+        state.apply(.collapseRequested)
+        XCTAssertTrue(state.isActive)
+        XCTAssertFalse(state.showsBanner)
+        XCTAssertTrue(state.showsCompactIndicator)
+
+        // Another agent write must not reopen a banner the user folded away.
+        state.apply(.detectedExternalChange(isDirty: true))
+        XCTAssertTrue(state.showsCompactIndicator)
+        XCTAssertFalse(state.showsBanner)
+
+        state.apply(.expandRequested)
+        XCTAssertTrue(state.showsBanner)
+        XCTAssertFalse(state.showsCompactIndicator)
+    }
+
+    func testOnlyReloadSaveOrDiscardClearsAnExternalFileConflict() {
+        for resolution in [
+            FilePreviewConflictState.Event.reloaded,
+            .savedThroughConflictDecision,
+            .draftDiscarded,
+            .documentLoaded
+        ] {
+            var state = FilePreviewConflictState()
+            state.apply(.detectedExternalChange(isDirty: true))
+            state.apply(.collapseRequested)
+            state.apply(resolution)
+            XCTAssertFalse(state.isActive, "\(resolution) should end the conflict")
+            XCTAssertFalse(state.showsBanner)
+            XCTAssertFalse(state.showsCompactIndicator)
+        }
+
+        // A clean preview follows the newer file on its own, so nothing is left
+        // to warn about.
+        var clean = FilePreviewConflictState()
+        clean.apply(.detectedExternalChange(isDirty: true))
+        clean.apply(.detectedExternalChange(isDirty: false))
+        XCTAssertFalse(clean.isActive)
+
+        // Collapse and expand are display-only: neither may resolve anything.
+        var collapsed = FilePreviewConflictState()
+        collapsed.apply(.detectedExternalChange(isDirty: true))
+        collapsed.apply(.collapseRequested)
+        collapsed.apply(.expandRequested)
+        collapsed.apply(.collapseRequested)
+        XCTAssertTrue(collapsed.isActive)
+        XCTAssertTrue(collapsed.showsCompactIndicator)
+
+        // Collapse cannot manufacture an indicator without a conflict.
+        var idle = FilePreviewConflictState()
+        idle.apply(.collapseRequested)
+        XCTAssertFalse(idle.showsCompactIndicator)
+        idle.apply(.expandRequested)
+        XCTAssertFalse(idle.showsBanner)
+    }
+
+    func testSaveControlAnnouncesAnUnresolvedDiskConflict() {
+        var state = FilePreviewConflictState()
+        XCTAssertEqual(state.saveHelpText, "Save")
+        XCTAssertEqual(state.saveAccessibilityLabel, "Save")
+
+        state.apply(.detectedExternalChange(isDirty: true))
+        XCTAssertEqual(state.saveHelpText, "Save — file changed on disk")
+        XCTAssertEqual(state.saveAccessibilityLabel, "Save, file changed on disk")
+
+        // Collapsing hides the banner, not the conflict-aware Save state.
+        state.apply(.collapseRequested)
+        XCTAssertEqual(state.saveAccessibilityLabel, "Save, file changed on disk")
+
+        state.apply(.reloaded)
+        XCTAssertEqual(state.saveHelpText, "Save")
+        XCTAssertEqual(state.saveAccessibilityLabel, "Save")
+    }
+
     private var root: URL!
 
     override func setUpWithError() throws {
@@ -514,6 +933,118 @@ final class WorkspaceFilesTests: XCTestCase {
         }
     }
 
+    /// `root/<name>/notes.md` plus a same-shaped decoy outside the project, so
+    /// a redirected operation lands somewhere the assertions can see it.
+    private func swapFixture(named name: String) throws -> (live: URL, decoy: URL) {
+        let live = root.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: live, withIntermediateDirectories: true)
+        try "real".write(to: live.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+
+        let decoy = root.deletingLastPathComponent()
+            .appendingPathComponent("kaisola-decoy-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        addTeardownBlock { try? FileManager.default.removeItem(at: decoy) }
+        try FileManager.default.createDirectory(at: decoy, withIntermediateDirectories: true)
+        try "decoy".write(to: decoy.appendingPathComponent("notes.md"), atomically: true, encoding: .utf8)
+        return (live, decoy)
+    }
+
+    /// The race itself: a validated directory moves aside and a symbolic link
+    /// out of the project takes its place. Returns the directory's new home.
+    private func swapForLink(_ directory: URL, to decoy: URL) throws -> URL {
+        let relocated = directory.deletingLastPathComponent()
+            .appendingPathComponent(directory.lastPathComponent + "-moved", isDirectory: true)
+        try FileManager.default.moveItem(at: directory, to: relocated)
+        try FileManager.default.createSymbolicLink(at: directory, withDestinationURL: decoy)
+        return relocated
+    }
+
+    func testWorkspaceRenameFollowsTheVerifiedParentWhenItIsSwappedForALink() throws {
+        let fixture = try swapFixture(named: "live")
+        let move = try WorkspaceFileOperations.renameMove(
+            item: fixture.live.appendingPathComponent("notes.md"),
+            to: "renamed.md",
+            workspaceRoot: root
+        )
+        let parent = try WorkspaceFileOperations.openDirectory(fixture.live, workspaceRoot: root)
+        defer { parent.close() }
+
+        let relocated = try swapForLink(fixture.live, to: fixture.decoy)
+        try WorkspaceFileOperations.commitMove(move, from: parent, to: parent)
+
+        XCTAssertEqual(
+            try String(contentsOf: relocated.appendingPathComponent("renamed.md"), encoding: .utf8),
+            "real"
+        )
+        XCTAssertEqual(
+            try String(contentsOf: fixture.decoy.appendingPathComponent("notes.md"), encoding: .utf8),
+            "decoy"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: fixture.decoy.appendingPathComponent("renamed.md").path
+            )
+        )
+    }
+
+    func testWorkspaceMoveFollowsTheVerifiedDestinationWhenItIsSwappedForALink() throws {
+        let fixture = try swapFixture(named: "inbox")
+        let source = root.appendingPathComponent("README.md")
+        let move = try WorkspaceFileOperations.movePlan(
+            item: source,
+            to: fixture.live.appendingPathComponent("README.md"),
+            workspaceRoot: root
+        )
+        let sourceParent = try WorkspaceFileOperations.openDirectory(root, workspaceRoot: root)
+        defer { sourceParent.close() }
+        let destinationParent = try WorkspaceFileOperations.openDirectory(
+            fixture.live,
+            workspaceRoot: root
+        )
+        defer { destinationParent.close() }
+
+        let relocated = try swapForLink(fixture.live, to: fixture.decoy)
+        try WorkspaceFileOperations.commitMove(move, from: sourceParent, to: destinationParent)
+
+        XCTAssertEqual(
+            try String(contentsOf: relocated.appendingPathComponent("README.md"), encoding: .utf8),
+            "hello"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: fixture.decoy.appendingPathComponent("README.md").path
+            )
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: source.path))
+    }
+
+    func testWorkspaceTrashTargetsTheVerifiedItemWhenItsParentIsSwappedForALink() throws {
+        let fixture = try swapFixture(named: "outbox")
+        let candidate = try WorkspaceFileOperations.trashCandidate(
+            item: fixture.live.appendingPathComponent("notes.md"),
+            workspaceRoot: root
+        )
+        let parent = try WorkspaceFileOperations.openDirectory(
+            candidate.deletingLastPathComponent(),
+            workspaceRoot: root
+        )
+        defer { parent.close() }
+
+        let relocated = try swapForLink(fixture.live, to: fixture.decoy)
+        let target = try WorkspaceFileOperations.trashTarget(for: candidate, in: parent)
+
+        // The validated path itself now resolves into the decoy: that redirect
+        // is exactly what a path-based trashItem would have followed.
+        XCTAssertEqual(
+            candidate.resolvingSymlinksInPath().path,
+            fixture.decoy.appendingPathComponent("notes.md").resolvingSymlinksInPath().path
+        )
+        XCTAssertEqual(
+            target.resolvingSymlinksInPath().path,
+            relocated.appendingPathComponent("notes.md").resolvingSymlinksInPath().path
+        )
+        XCTAssertEqual(try String(contentsOf: target, encoding: .utf8), "real")
+    }
+
     func testMoveDestinationListIsBoundedAndOmitsCurrentParentAndSourceSubtree() throws {
         let docs = root.appendingPathComponent("docs", isDirectory: true)
         let nested = docs.appendingPathComponent("nested", isDirectory: true)
@@ -546,6 +1077,166 @@ final class WorkspaceFilesTests: XCTestCase {
             movingItem: root.appendingPathComponent("README.md"),
             visitLimit: 1
         ).isEmpty)
+    }
+
+    /// The Move sheet used to dismiss the instant `performMove` accepted the
+    /// request, which was before the move had run at all. A failure then landed
+    /// as a toast with the destination list already gone, so the only way back
+    /// was to rebuild the whole operation.
+    @MainActor
+    func testMoveSheetKeepsTheItemAndDestinationSelectedWhenTheMoveFails() async throws {
+        let item = FileNode(
+            url: root.appendingPathComponent("README.md").standardizedFileURL,
+            isDirectory: false
+        )
+        let controller = WorkspaceMoveController(root: root, item: item)
+        await controller.loadDestinations()
+        let destination = try XCTUnwrap(
+            controller.visibleDirectories.first { $0.lastPathComponent == "src" }
+        )
+        controller.select(destination)
+
+        let refusal = "Could not move README.md: an item with that name is already there."
+        await controller.submit { _ in .failed(refusal) }
+
+        XCTAssertEqual(controller.phase, .failed(refusal))
+        XCTAssertEqual(controller.failureMessage, refusal)
+        XCTAssertFalse(
+            controller.isFinished,
+            "the sheet was allowed to close on a move that never succeeded"
+        )
+        XCTAssertEqual(controller.item.url, item.url)
+        XCTAssertEqual(
+            controller.selectedDirectory,
+            destination,
+            "the picked destination has to survive the failure for Retry to mean anything"
+        )
+
+        // Retry is the same operation again, not a rebuilt one.
+        await controller.submit { attempted in
+            XCTAssertEqual(attempted, destination)
+            return .succeeded
+        }
+        XCTAssertTrue(controller.isFinished)
+        XCTAssertNil(controller.failureMessage)
+    }
+
+    @MainActor
+    func testMoveSheetReportsTheMoveInFlightAndFinishesOnlyOnConfirmedSuccess() async throws {
+        let item = FileNode(
+            url: root.appendingPathComponent("README.md").standardizedFileURL,
+            isDirectory: false
+        )
+        let controller = WorkspaceMoveController(root: root, item: item)
+        await controller.loadDestinations()
+        XCTAssertEqual(controller.phase, .choosing)
+        XCTAssertFalse(controller.isMoving)
+        XCTAssertNil(controller.selectedDirectory)
+        XCTAssertFalse(controller.canSubmit)
+
+        let destination = try XCTUnwrap(
+            controller.visibleDirectories.first { $0.lastPathComponent == "src" }
+        )
+        controller.select(destination)
+        XCTAssertTrue(controller.canSubmit)
+
+        await controller.submit { _ in
+            // While the filesystem work runs the sheet is still up, and says so.
+            XCTAssertTrue(controller.isMoving, "the sheet showed no progress while moving")
+            XCTAssertFalse(controller.isFinished, "the sheet closed before the move finished")
+            await Task.yield()
+            XCTAssertFalse(controller.isFinished)
+            return .succeeded
+        }
+
+        XCTAssertEqual(controller.phase, .succeeded)
+        XCTAssertTrue(controller.isFinished)
+        XCTAssertNil(controller.failureMessage)
+    }
+
+    @MainActor
+    func testMoveSheetRequiresAnExplicitDestinationAndAnnouncesItsRelativePath() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("src/generated", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let item = FileNode(
+            url: root.appendingPathComponent("README.md").standardizedFileURL,
+            isDirectory: false
+        )
+        let controller = WorkspaceMoveController(root: root, item: item)
+        await controller.loadDestinations()
+
+        XCTAssertNil(controller.selectedDirectory)
+        XCTAssertNil(controller.selectionAnnouncement)
+        XCTAssertFalse(controller.canSubmit)
+
+        var submitted = false
+        await controller.submit { _ in
+            submitted = true
+            return .succeeded
+        }
+        XCTAssertFalse(submitted, "Return must not move to a folder the user never chose")
+        XCTAssertFalse(controller.isFinished)
+
+        let generated = try XCTUnwrap(
+            controller.visibleDirectories.first { $0.lastPathComponent == "generated" }
+        )
+        controller.select(generated)
+        XCTAssertEqual(controller.selectedDirectory, generated)
+        XCTAssertTrue(controller.canSubmit)
+        XCTAssertEqual(
+            controller.selectionAnnouncement,
+            "Selected move destination: src/generated"
+        )
+    }
+
+    @MainActor
+    func testMoveSheetSearchNeverChangesTheExplicitDestination() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("docs", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let item = FileNode(
+            url: root.appendingPathComponent("README.md").standardizedFileURL,
+            isDirectory: false
+        )
+        let controller = WorkspaceMoveController(root: root, item: item)
+        await controller.loadDestinations()
+
+        controller.searchText = "src"
+        XCTAssertNil(controller.selectedDirectory)
+        XCTAssertNil(controller.selectedPath)
+
+        let src = try XCTUnwrap(controller.visibleDirectories.first)
+        controller.select(src)
+        XCTAssertEqual(controller.selectedDirectory?.lastPathComponent, "src")
+        XCTAssertEqual(controller.selectedPath, src.path)
+
+        controller.searchText = "docs"
+        XCTAssertEqual(
+            controller.selectedPath,
+            src.path,
+            "filtering must not silently retarget the user's explicit destination"
+        )
+        XCTAssertNil(controller.selectedDirectory)
+        XCTAssertFalse(controller.canSubmit)
+
+        controller.searchText = ""
+        XCTAssertEqual(controller.selectedDirectory, src)
+        XCTAssertTrue(controller.canSubmit)
+
+        await controller.submit { _ in .failed("Could not move README.md.") }
+        XCTAssertNotNil(controller.failureMessage)
+
+        // Choosing somewhere else retires the diagnostic it was about.
+        let docs = try XCTUnwrap(
+            controller.visibleDirectories.first { $0.lastPathComponent == "docs" }
+        )
+        controller.select(docs)
+        XCTAssertNil(controller.failureMessage)
+        XCTAssertEqual(controller.phase, .choosing)
+        XCTAssertEqual(controller.selectedDirectory, docs)
     }
 
     func testWorkspaceCreateFileAndFolderAreExclusiveAndWorkspaceBounded() throws {
@@ -611,6 +1302,129 @@ final class WorkspaceFilesTests: XCTestCase {
             )
         ) { error in
             XCTAssertEqual(error as? WorkspaceFileOperations.OperationError, .symbolicLink)
+        }
+    }
+
+    func testNewInstructionFileWritesTheTemplateThenReportsTheExistingFile() throws {
+        let target = root.appendingPathComponent(WorkspaceInstructionFile.fileName).standardizedFileURL
+
+        let created = try WorkspaceInstructionFile.create(in: root).get()
+        XCTAssertEqual(created, .created(target))
+        XCTAssertTrue(created.didWrite)
+        XCTAssertEqual(created.url, target)
+        XCTAssertEqual(
+            try String(contentsOf: target, encoding: .utf8),
+            WorkspaceInstructionFile.template
+        )
+
+        let second = try WorkspaceInstructionFile.create(in: root).get()
+        XCTAssertEqual(second, .alreadyExisted(target))
+        XCTAssertFalse(second.didWrite)
+        XCTAssertEqual(
+            try String(contentsOf: target, encoding: .utf8),
+            WorkspaceInstructionFile.template,
+            "a second action must never overwrite the project's instructions"
+        )
+    }
+
+    func testFailedInstructionFileWriteOpensNothingAndSucceedsOnRetry() throws {
+        try XCTSkipIf(getuid() == 0, "a root test process can write into a read-only folder")
+        let project = root.appendingPathComponent("read-only-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500],
+            ofItemAtPath: project.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: project.path
+            )
+        }
+        let target = project.appendingPathComponent(WorkspaceInstructionFile.fileName)
+
+        let result = WorkspaceInstructionFile.create(in: project)
+        guard case let .failure(failure) = result else {
+            return XCTFail("a folder that refuses the write must not report a created file")
+        }
+        XCTAssertEqual(failure.reason, .permission)
+        XCTAssertTrue(failure.message.contains(WorkspaceInstructionFile.fileName))
+        XCTAssertNil(
+            try? result.get(),
+            "a failed write must not hand the rail a file to open"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+
+        // The retry offered beside the failure is the point of surfacing it:
+        // once the cause clears, the same action writes the file.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: project.path
+        )
+        let retried = try WorkspaceInstructionFile.create(in: project).get()
+        XCTAssertEqual(retried, .created(target.standardizedFileURL))
+        XCTAssertEqual(
+            try String(contentsOf: target, encoding: .utf8),
+            WorkspaceInstructionFile.template
+        )
+    }
+
+    func testInstructionFileRefusesAFolderOrLinkOccupyingItsName() throws {
+        let occupied = root.appendingPathComponent(WorkspaceInstructionFile.fileName)
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent(WorkspaceInstructionFile.fileName, isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        guard case let .failure(folderFailure) = WorkspaceInstructionFile.create(in: root) else {
+            return XCTFail("a folder under that name is a collision, not an instruction file")
+        }
+        XCTAssertEqual(folderFailure.reason, .collision)
+
+        try FileManager.default.removeItem(at: occupied)
+        try FileManager.default.createSymbolicLink(
+            at: occupied,
+            withDestinationURL: root.appendingPathComponent("README.md")
+        )
+        guard case let .failure(linkFailure) = WorkspaceInstructionFile.create(in: root) else {
+            return XCTFail("a symbolic link under that name is a collision")
+        }
+        XCTAssertEqual(linkFailure.reason, .collision)
+
+        let missingProject = root.appendingPathComponent("gone", isDirectory: true)
+        guard case let .failure(missingFailure) = WorkspaceInstructionFile.create(in: missingProject) else {
+            return XCTFail("a project folder that is not there cannot hold an instruction file")
+        }
+        XCTAssertEqual(missingFailure.reason, .workspaceUnavailable)
+    }
+
+    func testInstructionFileFailuresSeparateCollisionPermissionAndDiskFull() {
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EEXIST).reason, .collision)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EACCES).reason, .permission)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EPERM).reason, .permission)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EROFS).reason, .permission)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: ENOSPC).reason, .diskFull)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EDQUOT).reason, .diskFull)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: ENOENT).reason, .workspaceUnavailable)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EIO).reason, .unknown)
+
+        XCTAssertTrue(
+            WorkspaceInstructionFile.Failure(reason: .diskFull).message.contains("disk is full")
+        )
+        XCTAssertTrue(
+            WorkspaceInstructionFile.Failure(reason: .permission).message.contains("permission")
+        )
+        for reason in [
+            WorkspaceInstructionFile.Failure.Reason.collision,
+            .permission,
+            .diskFull,
+            .workspaceUnavailable,
+            .unknown,
+        ] {
+            XCTAssertTrue(
+                WorkspaceInstructionFile.Failure(reason: reason).message
+                    .contains(WorkspaceInstructionFile.fileName),
+                "every failure should name the file it did not write"
+            )
         }
     }
 
@@ -724,13 +1538,127 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(ProjectFiles.enumerate(root: root, limit: 5).count, 5)
     }
 
+    func testEnumerateReportsFileLimitWithoutFalsePositiveAtExactBoundary() throws {
+        let zero = ProjectFiles.enumerate(root: root, limit: 0)
+        XCTAssertEqual(zero.paths, [])
+        XCTAssertEqual(zero.completion.limits, [.init(kind: .files, maximum: 0)])
+
+        let exact = ProjectFiles.enumerate(root: root, limit: 2)
+        XCTAssertEqual(Set(exact.paths), ["README.md", "src/main.swift"])
+        XCTAssertTrue(exact.completion.isComplete)
+        XCTAssertEqual(exact.completion.limits, [])
+
+        try "third".write(
+            to: root.appendingPathComponent("third.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let limited = ProjectFiles.enumerate(root: root, limit: 2)
+        XCTAssertEqual(limited.paths.count, 2)
+        XCTAssertFalse(limited.completion.isComplete)
+        XCTAssertEqual(
+            limited.completion.limits,
+            [.init(kind: .files, maximum: 2)]
+        )
+    }
+
+    func testEnumerateReportsDirectoryVisitAndCancellationStops() {
+        let exactDirectoryBoundary = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 2,
+            visitLimit: 100
+        )
+        XCTAssertTrue(exactDirectoryBoundary.completion.isComplete)
+
+        let directoryLimited = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 1,
+            visitLimit: 100
+        )
+        XCTAssertEqual(
+            directoryLimited.completion.limits,
+            [.init(kind: .directories, maximum: 1)]
+        )
+        XCTAssertFalse(directoryLimited.completion.wasCancelled)
+
+        let visitLimited = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 100,
+            visitLimit: 1
+        )
+        XCTAssertEqual(
+            visitLimited.completion.limits,
+            [.init(kind: .visitedEntries, maximum: 1)]
+        )
+
+        let exactVisitBoundary = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 100,
+            visitLimit: 4
+        )
+        XCTAssertTrue(exactVisitBoundary.completion.isComplete)
+
+        var checks = 0
+        let cancelled = ProjectFiles.enumerate(root: root, isCancelled: {
+            checks += 1
+            return checks >= 2
+        })
+        XCTAssertTrue(cancelled.completion.wasCancelled)
+        XCTAssertFalse(cancelled.completion.isComplete)
+    }
+
+    @MainActor
+    func testProjectFileIndexPreservesTraversalMetadataAndPartialPresentationIsActionable() async {
+        let enumeration = ProjectFiles.Enumeration(
+            paths: ["README.md"],
+            completion: .init(
+                limits: [
+                    .init(kind: .directories, maximum: 2_000),
+                    .init(kind: .visitedEntries, maximum: 20_000),
+                ],
+                wasCancelled: false
+            )
+        )
+        let index = ProjectFileIndex(enumerateResult: { _ in enumeration })
+
+        let snapshot = await index.snapshot(for: root)
+        let files = await index.files(for: root)
+        XCTAssertEqual(snapshot, enumeration)
+        XCTAssertEqual(files, enumeration.paths)
+
+        let notice = try? XCTUnwrap(
+            ProjectFileSearchPresentation.notice(for: enumeration.completion)
+        )
+        XCTAssertEqual(notice?.title, "Partial results")
+        XCTAssertEqual(notice?.actionTitle, "Browse folders")
+        XCTAssertTrue(notice?.detail.contains("2,000 folders") == true)
+        XCTAssertTrue(notice?.detail.contains("20,000 items") == true)
+    }
+
+    func testDetailedIndexUpdatePreservesPriorPartialReceipt() throws {
+        let partial = ProjectFiles.Enumeration(
+            paths: ProjectFiles.enumerate(root: root).paths,
+            completion: .init(limits: [.init(kind: .directories, maximum: 2_000)])
+        )
+        let added = root.appendingPathComponent("src/added.swift")
+        try "added".write(to: added, atomically: true, encoding: .utf8)
+
+        let updated = try XCTUnwrap(ProjectFiles.updatingEnumeration(
+            partial,
+            root: root,
+            changedPaths: [added]
+        ))
+        XCTAssertTrue(updated.paths.contains("src/added.swift"))
+        XCTAssertEqual(updated.completion, partial.completion)
+    }
+
     func testEnumerateHonorsDirectoryAndVisitBounds() {
         let rootOnly = ProjectFiles.enumerate(
             root: root,
             directoryLimit: 1,
             visitLimit: 100
         )
-        XCTAssertEqual(rootOnly, ["README.md"])
+        XCTAssertEqual(rootOnly.paths, ["README.md"])
 
         let oneVisit = ProjectFiles.enumerate(
             root: root,
@@ -789,7 +1717,7 @@ final class WorkspaceFilesTests: XCTestCase {
 
     @MainActor
     func testDetailedIndexInvalidationAvoidsASecondRepositoryWalk() async throws {
-        let probe = ProjectFileIndexStaticProbe(files: ProjectFiles.enumerate(root: root))
+        let probe = ProjectFileIndexStaticProbe(files: ProjectFiles.enumerate(root: root).paths)
         let index = ProjectFileIndex(enumerateFiles: probe.enumerate)
         _ = await index.files(for: root)
         XCTAssertEqual(probe.startedCount, 1)
@@ -1502,6 +2430,180 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertNil(try currentStore.loadNewest(for: file, workspaceRoot: root))
     }
 
+    func testFailedRecoveryClaimStaysTypedInsteadOfLookingLikeNoDraft() throws {
+        let recoveryDirectory = root.appendingPathComponent(".preview-recovery", isDirectory: true)
+        let store = FilePreviewRecoveryStore(directoryURL: recoveryDirectory)
+        let file = root.appendingPathComponent("README.md")
+        let orphan = try store.saveText(
+            "prior-process draft",
+            for: file,
+            workspaceRoot: root,
+            expectedModificationDate: nil,
+            ownerID: "prior-process",
+            revision: 1
+        )
+        // The claimant slot already holds a newer revision, so copying the
+        // orphan into it is rejected by the store itself.
+        let stale = try store.saveText(
+            "claimant journal",
+            for: file,
+            workspaceRoot: root,
+            expectedModificationDate: nil,
+            ownerID: "claimant",
+            revision: 5
+        )
+        let registry = FilePreviewRecoveryOwnerRegistry()
+        registry.register("claimant")
+        defer { registry.unregister("claimant") }
+
+        let failed = store.claimOutcome(
+            for: file,
+            workspaceRoot: root,
+            claimantID: "claimant",
+            ownerRegistry: registry
+        )
+        XCTAssertEqual(failed.failure?.reason, .staleRevision)
+        XCTAssertEqual(
+            failed.failure?.message,
+            "A newer recovery revision is already stored for this editor."
+        )
+        XCTAssertNil(failed.claim)
+        XCTAssertNotEqual(failed, .noDraft)
+
+        // A file with nothing journaled is the genuinely empty answer, and it
+        // has to stay distinguishable from the failure above.
+        XCTAssertEqual(
+            store.claimOutcome(
+                for: root.appendingPathComponent("src/main.swift"),
+                workspaceRoot: root,
+                claimantID: "claimant",
+                ownerRegistry: registry
+            ),
+            .noDraft
+        )
+
+        // The refused claim wrote nothing, so the draft is still recoverable.
+        XCTAssertTrue(store.remove(stale, for: file, workspaceRoot: root))
+        let retried = store.claimOutcome(
+            for: file,
+            workspaceRoot: root,
+            claimantID: "claimant",
+            ownerRegistry: registry
+        )
+        XCTAssertEqual(retried.claim?.record.text, "prior-process draft")
+        XCTAssertEqual(retried.claim?.sourceTokens, [orphan])
+        store.releaseClaims(
+            retried.claim?.sourceTokens ?? [],
+            for: file,
+            workspaceRoot: root,
+            claimantID: "claimant"
+        )
+    }
+
+    func testRecoveryFailureActionsLeaveTheRestOfTheJournalAlone() throws {
+        let recoveryDirectory = root.appendingPathComponent(".preview-recovery", isDirectory: true)
+        let store = FilePreviewRecoveryStore(directoryURL: recoveryDirectory)
+        let file = root.appendingPathComponent("README.md")
+        let otherFile = root.appendingPathComponent("src/main.swift")
+        _ = try store.saveText(
+            "orphan draft",
+            for: file,
+            workspaceRoot: root,
+            expectedModificationDate: nil,
+            ownerID: "prior-process",
+            revision: 1
+        )
+        let live = try store.saveText(
+            "live window draft",
+            for: file,
+            workspaceRoot: root,
+            expectedModificationDate: nil,
+            ownerID: "live-window",
+            revision: 1
+        )
+        let otherOrphan = try store.saveText(
+            "another file's draft",
+            for: otherFile,
+            workspaceRoot: root,
+            expectedModificationDate: nil,
+            ownerID: "prior-process",
+            revision: 1
+        )
+        let registry = FilePreviewRecoveryOwnerRegistry()
+        registry.register("live-window")
+        defer { registry.unregister("live-window") }
+
+        let recordCount: () -> Int = {
+            ((try? FileManager.default.contentsOfDirectory(
+                at: recoveryDirectory,
+                includingPropertiesForKeys: nil
+            )) ?? []).filter { $0.pathExtension == "json" }.count
+        }
+
+        // Inspect resolves the exact record and is read-only.
+        let inspected = try XCTUnwrap(store.newestOrphanRecordURL(
+            for: file,
+            workspaceRoot: root,
+            ownerRegistry: registry
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: inspected.path))
+        XCTAssertEqual(recordCount(), 3)
+
+        XCTAssertEqual(
+            try store.discardOrphans(for: file, workspaceRoot: root, ownerRegistry: registry),
+            1
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: inspected.path))
+        XCTAssertNil(store.newestOrphanRecordURL(
+            for: file,
+            workspaceRoot: root,
+            ownerRegistry: registry
+        ))
+        // The live window's own journal and every other file's draft survive.
+        XCTAssertEqual(try store.loadNewest(for: file, workspaceRoot: root)?.token, live)
+        XCTAssertEqual(try store.loadNewest(for: otherFile, workspaceRoot: root)?.token, otherOrphan)
+        XCTAssertEqual(recordCount(), 2)
+    }
+
+    func testRecoveryFailurePolicySurfacesOnlyActionableFailures() {
+        let stale = FilePreviewRecoveryClaimFailure(
+            FilePreviewRecoveryStore.RecoveryError.staleRevision
+        )
+        let unavailable = FilePreviewRecoveryClaimFailure(
+            FilePreviewRecoveryStore.RecoveryError.storageUnavailable
+        )
+        let outside = FilePreviewRecoveryClaimFailure(
+            FilePreviewRecoveryStore.RecoveryError.outsideWorkspace
+        )
+        XCTAssertTrue(FilePreviewRecoveryFailurePolicy.shouldSurface(stale))
+        XCTAssertTrue(FilePreviewRecoveryFailurePolicy.shouldSurface(unavailable))
+        // Every file opened without a project root reports this; it hides no draft.
+        XCTAssertFalse(FilePreviewRecoveryFailurePolicy.shouldSurface(outside))
+
+        XCTAssertTrue(FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: false,
+            isLoading: false,
+            isSaving: false
+        ))
+        // Retry re-runs the load, so it must not run over an unsaved draft or
+        // across an in-flight load or save.
+        XCTAssertFalse(FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: true,
+            isLoading: false,
+            isSaving: false
+        ))
+        XCTAssertFalse(FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: false,
+            isLoading: true,
+            isSaving: false
+        ))
+        XCTAssertFalse(FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: false,
+            isLoading: false,
+            isSaving: true
+        ))
+    }
+
     func testClaimReadsOwnerLivenessAtSelectionTime() throws {
         let store = FilePreviewRecoveryStore(
             directoryURL: root.appendingPathComponent(".preview-recovery", isDirectory: true)
@@ -2005,6 +3107,74 @@ final class WorkspaceFilesTests: XCTestCase {
     }
 
     // MARK: - Continuous Markdown editing
+
+    func testMarkdownHybridDiffMarksSeparatedChangesWithoutRewritingTheDraft() {
+        let baseline = """
+        # Title
+        keep
+        old value
+        same
+        remove [unsafe](javascript:alert(1))
+        tail
+        """
+        let edited = """
+        # Title
+        keep
+        new value
+        same
+        tail
+        | added | table |
+        """
+
+        let plan = MarkdownHybridDiffPlan.build(baseline: baseline, edited: edited)
+
+        XCTAssertEqual(plan.editedSource, edited)
+        XCTAssertEqual(plan.markers.map(\.kind), [.changed, .deletion, .addition])
+        XCTAssertEqual(plan.markers[0].oldText, "old value")
+        XCTAssertEqual(plan.markers[0].newText, "new value")
+        XCTAssertEqual(
+            (edited as NSString).substring(with: plan.markers[0].editedRange),
+            "new value"
+        )
+        XCTAssertEqual(plan.markers[1].editedRange.length, 0)
+        XCTAssertTrue(plan.markers[1].inspectionText.contains("[unsafe](javascript:alert(1))"))
+        XCTAssertEqual(
+            (edited as NSString).substring(with: plan.markers[2].editedRange),
+            "| added | table |"
+        )
+    }
+
+    func testMarkdownHybridDiffKeepsCodeTablesLinksAndLineEndingsAsPlainExactText() {
+        let baseline = "| name | value |\r\n| --- | --- |\r\n| old | [site](https://example.com) |\r\n"
+        let edited = "| name | value |\r\n| --- | --- |\r\n| new | `code <tag>` |\r\n"
+
+        let plan = MarkdownHybridDiffPlan.build(baseline: baseline, edited: edited)
+        let marker = try? XCTUnwrap(plan.markers.first)
+
+        XCTAssertEqual(plan.editedSource.utf8.count, edited.utf8.count)
+        XCTAssertEqual(marker?.kind, .changed)
+        XCTAssertEqual(marker?.newText, "| new | `code <tag>` |")
+        XCTAssertEqual(marker?.inspectionPresentation, .plainText)
+        XCTAssertFalse(marker?.inspectionAllowsLinkActivation ?? true)
+    }
+
+    func testMarkdownHybridDiffIsEmptyForIdenticalBytesAndBoundedForHugeFiles() {
+        XCTAssertTrue(
+            MarkdownHybridDiffPlan.build(baseline: "same\n", edited: "same\n").markers.isEmpty
+        )
+
+        let baseline = (0...MarkdownHybridDiffPlan.maximumComparedLines)
+            .map { "old-\($0)" }
+            .joined(separator: "\n")
+        let edited = (0...MarkdownHybridDiffPlan.maximumComparedLines)
+            .map { "new-\($0)" }
+            .joined(separator: "\n")
+        let plan = MarkdownHybridDiffPlan.build(baseline: baseline, edited: edited)
+
+        XCTAssertTrue(plan.isTruncated)
+        XCTAssertLessThanOrEqual(plan.markers.count, MarkdownHybridDiffPlan.maximumMarkers)
+        XCTAssertEqual(plan.editedSource, edited)
+    }
 
     /// The jump this surface exists to remove. Save, autosave, the recovery
     /// journal, and external reconciliation of identical bytes all re-run the
@@ -3284,6 +4454,280 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(Set(ProjectFiles.enumerate(root: root)), ["README.md", "src/main.swift"])
     }
 
+    /// Make a folder Kaisola can't read, and put it back afterwards even if
+    /// the test bails out early.
+    private func makeUnreadableFolder(named name: String) throws -> URL {
+        let locked = root.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try "secret".write(
+            to: locked.appendingPathComponent("notes.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+        addTeardownBlock {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: locked.path
+            )
+        }
+        try XCTSkipUnless(
+            access(locked.path, R_OK) != 0,
+            "This test user can read a 000 folder, so permission denied is unreachable."
+        )
+        return locked
+    }
+
+    func testDirectoryListingDistinguishesAnUnreadableFolderFromAnEmptyOne() throws {
+        let empty = root.appendingPathComponent("empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        let locked = try makeUnreadableFolder(named: "locked")
+
+        // Both folders list exactly nothing. Only the typed result tells the
+        // rail which of them is a real, quiet, empty folder.
+        let emptyListing = ProjectFiles.listing(of: empty)
+        XCTAssertEqual(emptyListing.nodes, [])
+        XCTAssertNil(emptyListing.failure)
+        XCTAssertTrue(emptyListing.isEmptyAndReadable)
+
+        let lockedListing = ProjectFiles.listing(of: locked)
+        XCTAssertEqual(lockedListing.nodes, [])
+        XCTAssertEqual(lockedListing.failure, .permissionDenied)
+        XCTAssertFalse(lockedListing.isEmptyAndReadable)
+        XCTAssertNil(lockedListing.emptyState)
+
+        // The legacy accessor keeps its old shape for the fuzzy index.
+        XCTAssertEqual(ProjectFiles.children(of: locked), [])
+    }
+
+    func testDirectoryListingDistinguishesEmptyFromOnlyHiddenOrIgnoredContent() throws {
+        let empty = root.appendingPathComponent("empty-project", isDirectory: true)
+        let ignored = root.appendingPathComponent("ignored-project", isDirectory: true)
+        let visible = root.appendingPathComponent("visible-project", isDirectory: true)
+        for directory in [empty, ignored, visible] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        try FileManager.default.createDirectory(
+            at: ignored.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: ignored.appendingPathComponent("node_modules", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try "secret".write(
+            to: ignored.appendingPathComponent(".env"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "visible".write(
+            to: visible.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertEqual(ProjectFiles.listing(of: empty).emptyState, .emptyProject)
+        let ignoredListing = ProjectFiles.listing(of: ignored)
+        XCTAssertEqual(ignoredListing.nodes, [])
+        XCTAssertNil(ignoredListing.failure)
+        XCTAssertEqual(ignoredListing.emptyState, .hiddenOrIgnoredContent)
+        XCTAssertNil(ProjectFiles.listing(of: visible).emptyState)
+        XCTAssertNil(ProjectFiles.listing(of: root, limit: 0).emptyState)
+    }
+
+    func testWorkspaceFilesEmptyStatesNameCauseAndCreationActions() {
+        XCTAssertEqual(WorkspaceFilesEmptyState.emptyProject.title, "Empty project")
+        XCTAssertEqual(
+            WorkspaceFilesEmptyState.emptyProject.message,
+            "Create a new file or folder to get started."
+        )
+        XCTAssertEqual(
+            WorkspaceFilesEmptyState.hiddenOrIgnoredContent.title,
+            "No visible files"
+        )
+        XCTAssertEqual(
+            WorkspaceFilesEmptyState.hiddenOrIgnoredContent.message,
+            "This project contains only hidden or ignored items."
+        )
+        XCTAssertEqual(WorkspaceFilesEmptyState.newFileLabel, "New File…")
+        XCTAssertEqual(WorkspaceFilesEmptyState.newFolderLabel, "New Folder…")
+        XCTAssertNotEqual(
+            WorkspaceFilesEmptyState.emptyProject.accessibilityIdentifier,
+            WorkspaceFilesEmptyState.hiddenOrIgnoredContent.accessibilityIdentifier
+        )
+    }
+
+    func testFileTreeAccessibilityNamesRoleDepthExpansionAndSelection() {
+        let collapsedFolder = WorkspaceFileTreeRowAccessibility(
+            name: "Sources",
+            isDirectory: true,
+            depth: 0,
+            isExpanded: false,
+            isSelected: false
+        )
+        XCTAssertEqual(collapsedFolder.label, "Sources")
+        XCTAssertEqual(collapsedFolder.value, "Folder, level 1, collapsed, not selected")
+        XCTAssertEqual(collapsedFolder.hint, "Activate to expand this folder")
+        XCTAssertEqual(collapsedFolder.activation, .expandFolder)
+        XCTAssertEqual(collapsedFolder.disclosureActionLabel, "Expand")
+
+        let expandedFolder = WorkspaceFileTreeRowAccessibility(
+            name: "Features",
+            isDirectory: true,
+            depth: 1,
+            isExpanded: true,
+            isSelected: false
+        )
+        XCTAssertEqual(expandedFolder.value, "Folder, level 2, expanded, not selected")
+        XCTAssertEqual(expandedFolder.hint, "Activate to collapse this folder")
+        XCTAssertEqual(expandedFolder.activation, .collapseFolder)
+        XCTAssertEqual(expandedFolder.disclosureActionLabel, "Collapse")
+
+        let selectedFile = WorkspaceFileTreeRowAccessibility(
+            name: "Editor.swift",
+            isDirectory: false,
+            depth: 2,
+            isExpanded: false,
+            isSelected: true
+        )
+        XCTAssertEqual(selectedFile.value, "File, level 3, selected")
+        XCTAssertEqual(selectedFile.hint, "Activate to open this file")
+        XCTAssertEqual(selectedFile.activation, .openFile)
+        XCTAssertNil(selectedFile.disclosureActionLabel)
+    }
+
+    func testFileTreeKeyboardAndVoiceOverActionsFollowTheSameNestedDisclosureState() {
+        let collapsed = WorkspaceFileTreeRowAccessibility(
+            name: "Sources",
+            isDirectory: true,
+            depth: 0,
+            isExpanded: false,
+            isSelected: false
+        )
+        XCTAssertEqual(collapsed.keyboardActivation, .expandFolder)
+        XCTAssertEqual(collapsed.voiceOverDisclosureAction, .expandFolder)
+
+        let expanded = WorkspaceFileTreeRowAccessibility(
+            name: "Sources",
+            isDirectory: true,
+            depth: 0,
+            isExpanded: true,
+            isSelected: false
+        )
+        XCTAssertEqual(expanded.keyboardActivation, .collapseFolder)
+        XCTAssertEqual(expanded.voiceOverDisclosureAction, .collapseFolder)
+
+        let nestedFile = WorkspaceFileTreeRowAccessibility(
+            name: "Editor.swift",
+            isDirectory: false,
+            depth: 2,
+            isExpanded: false,
+            isSelected: false
+        )
+        XCTAssertEqual(nestedFile.keyboardActivation, .openFile)
+        XCTAssertNil(nestedFile.voiceOverDisclosureAction)
+    }
+
+    func testDirectoryListingNamesMissingReplacedCancelledAndBoundedFolders() throws {
+        XCTAssertEqual(
+            ProjectFiles.listing(of: root.appendingPathComponent("gone", isDirectory: true)).failure,
+            .missing
+        )
+        XCTAssertEqual(
+            ProjectFiles.listing(of: root.appendingPathComponent("README.md")).failure,
+            .notDirectory
+        )
+
+        // Cancelled before the first entry, and cancelled part-way through:
+        // neither may look like a folder that simply had nothing in it.
+        XCTAssertEqual(ProjectFiles.listing(of: root, isCancelled: { true }).failure, .cancelled)
+        var checks = 0
+        let interrupted = ProjectFiles.listing(of: root, isCancelled: {
+            checks += 1
+            return checks > 1
+        })
+        XCTAssertEqual(interrupted.failure, .cancelled)
+
+        // A caller's own limit is deliberate bounding, not a failure.
+        let bulk = root.appendingPathComponent("bulk", isDirectory: true)
+        try FileManager.default.createDirectory(at: bulk, withIntermediateDirectories: true)
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            try "x".write(to: bulk.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let bounded = ProjectFiles.listing(of: bulk, limit: 2)
+        XCTAssertEqual(bounded.nodes.count, 2)
+        XCTAssertNil(bounded.failure)
+    }
+
+    func testDirectoryLoadFailuresCarryTheirOwnDiagnostic() throws {
+        let failures: [ProjectFiles.DirectoryLoadFailure] = [
+            .permissionDenied, .missing, .notDirectory, .cancelled, .ioFailure(code: EIO),
+        ]
+        for failure in failures {
+            XCTAssertFalse(failure.summary.isEmpty)
+            XCTAssertFalse(failure.diagnostic.isEmpty)
+        }
+        XCTAssertEqual(Set(failures.map(\.summary)).count, failures.count)
+
+        let reason = String(cString: try XCTUnwrap(strerror(EIO)))
+        XCTAssertTrue(
+            ProjectFiles.DirectoryLoadFailure.ioFailure(code: EIO).diagnostic.contains(reason)
+        )
+        XCTAssertFalse(
+            ProjectFiles.DirectoryLoadFailure.ioFailure(code: 0).diagnostic.contains(reason)
+        )
+    }
+
+    @MainActor
+    func testWorkspaceTreeModelPublishesUnreadableFoldersAndRetryClearsThem() async throws {
+        let locked = try makeUnreadableFolder(named: "locked")
+        let tree = WorkspaceTreeModel(root: root)
+
+        tree.load(locked)
+        let published = await settledListing(from: tree, of: locked)
+        let failed = try XCTUnwrap(published)
+        XCTAssertEqual(failed.failure, .permissionDenied)
+        XCTAssertEqual(tree.children(of: locked), [])
+        XCTAssertEqual(tree.loadFailure(for: locked), .permissionDenied)
+
+        // Retry is the inline affordance the row offers: fix the folder, load
+        // it again, and the rail goes back to an ordinary quiet listing.
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path)
+        tree.load(locked, force: true)
+        let retried = await settledListing(from: tree, of: locked, matching: { $0.failure == nil })
+        let recovered = try XCTUnwrap(retried)
+        XCTAssertEqual(recovered.nodes.map(\.name), ["notes.md"])
+        XCTAssertNil(tree.loadFailure(for: locked))
+
+        // A genuinely empty folder still publishes nothing to complain about.
+        let empty = root.appendingPathComponent("empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        tree.load(empty)
+        let publishedEmpty = await settledListing(from: tree, of: empty)
+        let emptyListing = try XCTUnwrap(publishedEmpty)
+        XCTAssertTrue(emptyListing.isEmptyAndReadable)
+        XCTAssertNil(tree.loadFailure(for: empty))
+    }
+
+    /// Poll the model's published snapshot until its background load lands.
+    @MainActor
+    private func settledListing(
+        from tree: WorkspaceTreeModel,
+        of directory: URL,
+        timeout: TimeInterval = 5,
+        matching isSettled: (ProjectFiles.DirectoryListing) -> Bool = { _ in true }
+    ) async -> ProjectFiles.DirectoryListing? {
+        let key = directory.standardizedFileURL.path
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let listing = tree.listingsByDirectory[key], isSettled(listing) {
+                return listing
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return nil
+    }
+
     func testSyntaxHighlighterAppKitPathClampsOutOfRangeSpanInsteadOfThrowing() {
         // `spans(in:language:)` can never itself produce a range past the text
         // it scanned, but the AppKit adapter must still defend against one —
@@ -3314,6 +4758,120 @@ final class WorkspaceFilesTests: XCTestCase {
         )
         XCTAssertEqual(effective, NSRange(location: 4, length: storage.length - 4))
     }
+
+    // MARK: - File rail click arbitration
+
+    @MainActor
+    func testFileRailSingleClickOpensExactlyOnePreviewWhenTheDoubleClickWindowCloses() {
+        let window = ManualDoubleClickWindow()
+        let clicks = WorkspaceRowClickArbiter(interval: { 0.5 }, schedule: window.schedule)
+        var opens: [RailOpen] = []
+
+        clicks.click(rowID: "/w/README.md") { opens.append(RailOpen(row: "/w/README.md", pinned: $0)) }
+        XCTAssertEqual(opens, [], "the preview must wait: a second click may still be coming")
+        XCTAssertEqual(
+            clicks.armedRowID,
+            "/w/README.md",
+            "the row highlights immediately so the wait is invisible"
+        )
+
+        window.elapse()
+        XCTAssertEqual(opens, [RailOpen(row: "/w/README.md", pinned: false)])
+        XCTAssertNil(clicks.armedRowID)
+
+        window.elapse()
+        XCTAssertEqual(opens.count, 1, "no timer may open the same document a second time")
+    }
+
+    @MainActor
+    func testFileRailDoubleClickOpensExactlyOnePinnedDocumentAndNoPreview() {
+        let window = ManualDoubleClickWindow()
+        let clicks = WorkspaceRowClickArbiter(interval: { 0.5 }, schedule: window.schedule)
+        var opens: [RailOpen] = []
+        let row = "/w/src/main.swift"
+        let open: (Bool) -> Void = { opens.append(RailOpen(row: row, pinned: $0)) }
+
+        // A double click reaches the rail as two button fires plus the two-tap
+        // gesture. All three used to open the file; exactly one may now.
+        clicks.click(rowID: row, open: open)
+        clicks.click(rowID: row, open: open)
+        clicks.doubleClick(rowID: row, open: open)
+        XCTAssertEqual(opens, [RailOpen(row: row, pinned: true)])
+        XCTAssertNil(clicks.armedRowID, "the pinned open cancels the armed preview")
+
+        window.elapse()
+        XCTAssertEqual(
+            opens,
+            [RailOpen(row: row, pinned: true)],
+            "the cancelled preview must never fire"
+        )
+    }
+
+    @MainActor
+    func testFileRailPinsOnceWhicheverOrderTheGestureAndTheSecondButtonFireArriveIn() {
+        let window = ManualDoubleClickWindow()
+        let clicks = WorkspaceRowClickArbiter(interval: { 0.5 }, schedule: window.schedule)
+        var opens: [RailOpen] = []
+        let row = "/w/src/main.swift"
+        let open: (Bool) -> Void = { opens.append(RailOpen(row: row, pinned: $0)) }
+
+        // SwiftUI does not order a simultaneous gesture against the button it
+        // rides on, and a third click is still the same gesture, not a new one.
+        clicks.click(rowID: row, open: open)
+        clicks.doubleClick(rowID: row, open: open)
+        clicks.click(rowID: row, open: open)
+        clicks.click(rowID: row, open: open)
+        XCTAssertEqual(opens, [RailOpen(row: row, pinned: true)])
+
+        window.elapse()
+        XCTAssertEqual(opens, [RailOpen(row: row, pinned: true)])
+
+        // Once the window has closed the row answers a fresh single click again.
+        clicks.click(rowID: row, open: open)
+        window.elapse()
+        XCTAssertEqual(
+            opens,
+            [RailOpen(row: row, pinned: true), RailOpen(row: row, pinned: false)]
+        )
+    }
+
+    @MainActor
+    func testFileRailFollowsTheLastRowClickedInsteadOfLoadingTwoPreviews() {
+        let window = ManualDoubleClickWindow()
+        let clicks = WorkspaceRowClickArbiter(interval: { 0.5 }, schedule: window.schedule)
+        var opens: [RailOpen] = []
+
+        clicks.click(rowID: "/w/README.md") { opens.append(RailOpen(row: "/w/README.md", pinned: $0)) }
+        clicks.click(rowID: "/w/CHANGELOG.md") { opens.append(RailOpen(row: "/w/CHANGELOG.md", pinned: $0)) }
+        XCTAssertEqual(clicks.armedRowID, "/w/CHANGELOG.md")
+
+        window.elapse()
+        XCTAssertEqual(opens, [RailOpen(row: "/w/CHANGELOG.md", pinned: false)])
+    }
+}
+
+/// The double-click window, opened and closed by hand in place of the
+/// arbiter's `Task.sleep`.
+@MainActor
+private final class ManualDoubleClickWindow {
+    private var waiting: [@MainActor () -> Void] = []
+
+    func schedule(_ delay: TimeInterval, _ work: @escaping @MainActor () -> Void) {
+        waiting.append(work)
+    }
+
+    /// Runs everything waiting on the window. Work scheduled while it drains
+    /// belongs to the next window, exactly as a later timer would.
+    func elapse() {
+        let due = waiting
+        waiting.removeAll()
+        for work in due { work() }
+    }
+}
+
+private struct RailOpen: Equatable {
+    let row: String
+    let pinned: Bool
 }
 
 private final class ProjectFileIndexProbe: @unchecked Sendable {

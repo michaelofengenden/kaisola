@@ -40,3 +40,21 @@ test('protocol.cjs command→capability map matches the canonical table', () => 
     assert.ok(tables.capabilities.includes(capability), `${capability} is not a declared capability`)
   }
 })
+
+test('canonical capability policy covers every outbound state type and projection field', () => {
+  assert.deepEqual(protocol.EVENT_CAPABILITIES, tables.eventCapabilities)
+  assert.deepEqual(protocol.SNAPSHOT_CAPABILITIES, tables.snapshotCapabilities)
+  assert.deepEqual(protocol.PROJECTION_FIELDS, tables.projectionFields)
+  assert.deepEqual(sorted(Object.keys(tables.eventCapabilities)), sorted(tables.eventTypes))
+  assert.deepEqual(sorted(Object.keys(tables.snapshotCapabilities)), sorted(tables.snapshotTypes))
+  for (const capability of [
+    ...Object.values(tables.eventCapabilities),
+    ...Object.values(tables.snapshotCapabilities),
+  ]) {
+    assert.ok(tables.capabilities.includes(capability), `${capability} is not a declared capability`)
+  }
+  for (const fields of Object.values(tables.projectionFields)) {
+    assert.ok(Array.isArray(fields) && fields.length > 0)
+    assert.equal(new Set(fields).size, fields.length)
+  }
+})

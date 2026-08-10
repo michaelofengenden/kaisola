@@ -128,14 +128,14 @@ struct QuietIdentityMarkView: View {
     private func symbol(_ name: String) -> some View {
         Image(systemName: name)
             .font(.system(size: QuietIdentityMarkView.symbolSize * (size / QuietIdentityMarkView.slot), weight: .regular))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
     }
 
     /// A naked text glyph, for the marks SF has no monoline drawing of.
     private func glyph(_ text: String, size glyphSize: CGFloat) -> some View {
         Text(text)
             .font(.system(size: glyphSize * (size / QuietIdentityMarkView.slot), weight: .regular))
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
     }
 }
 
@@ -384,6 +384,204 @@ enum QuietRailTitle {
         guard !project.isEmpty, title.caseInsensitiveCompare(project) == .orderedSame else { return rawTitle }
         guard let processName, !processName.isEmpty else { return "Terminal \(ordinal)" }
         return "\(processName) · \(ordinal)"
+    }
+}
+
+/// What one rail row actually draws, decided with its siblings in view.
+///
+/// `QuietRailTitle` already handles the row whose title says *nothing*. This
+/// handles the row whose title says something the row next to it also says: a
+/// project full of agent sessions tends to name them all the same way —
+/// "Codex · MATLAB kernel bridge", "Codex · MATLAB plotting spike",
+/// "Codex · MATLAB solver notes". The rail budgets about fifteen characters
+/// (`QuietRowBudget`) and truncates from the tail, so all three render
+/// "Codex · MAT…". The column that exists to tell rows apart then tells you
+/// only which agent they belong to, which the identity mark said already, and
+/// reading the rail means hovering rows one at a time.
+struct QuietRailLabel: Equatable {
+    enum Truncation: Equatable {
+        /// The default. A title that already reads apart from its siblings
+        /// keeps it.
+        case tail
+        /// Keeps the head *and* the tail, losing the middle — for rows whose
+        /// text still collides once the shared lead is gone.
+        case middle
+
+        /// SwiftUI's spelling of the same choice.
+        var textMode: Text.TruncationMode {
+            switch self {
+            case .tail: return .tail
+            case .middle: return .middle
+            }
+        }
+    }
+
+    /// What the row draws.
+    let text: String
+    let truncation: Truncation
+    /// The shared lead the row stopped drawing, or empty. Kept so the row can
+    /// still say the whole title on hover and to VoiceOver: the elision is a
+    /// scanning economy, never a loss of the value.
+    let droppedLead: String
+
+    init(text: String, truncation: Truncation = .tail, droppedLead: String = "") {
+        self.text = text
+        self.truncation = truncation
+        self.droppedLead = droppedLead
+    }
+
+    /// A title nothing had to be done to.
+    static func verbatim(_ title: String) -> QuietRailLabel { QuietRailLabel(text: title) }
+
+    /// Whether the row is drawing less than the whole title, so hover has to
+    /// carry the rest.
+    var elidesTitle: Bool { !droppedLead.isEmpty || truncation == .middle }
+}
+
+/// Decides what a project's rows draw, given every title drawn beside them.
+///
+/// Two steps, in this order.
+///
+/// 1. **Drop the shared lead.** When two or more rows in the same project open
+///    with the same whole segment — one ending on a separator the user typed,
+///    `Codex · `, `kaisola: `, `src/` — the rail stops drawing it and the part
+///    of the title that differs moves to the front, where a scan finds it. This
+///    is the adaptive provider chip the issue asks for, except the chip already
+///    exists: it is the row's identity mark, which has been saying "Codex" in
+///    its 16pt slot the whole time.
+/// 2. **Truncate from the middle.** For what step 1 cannot fix — titles that
+///    differ only past the visible window with no segment boundary to cut on —
+///    the row keeps its head *and* its tail and gives up the middle instead.
+///
+/// Both steps are conditional. A project whose titles already read apart, and
+/// whose rows share no repeated lead, gets every title back verbatim: no chip,
+/// no second line, no taller row, nothing added to the resting rail.
+///
+/// Pure, and counted in characters rather than measured in points, because this
+/// runs on every body pass; see `QuietRowBudget.ambiguousTitleCharacters` for
+/// where the count comes from and how it is held to the real lane.
+enum QuietRailLabels {
+    /// Separators a lead may end on: the marks people actually type between a
+    /// title's segments. A run of plain words is NOT a boundary — dropping
+    /// "MATLAB kernel " off the front of a title because two rows happen to
+    /// start with it would delete the subject rather than the preamble.
+    static let leadSeparators = [" · ", " — ", " – ", " - ", " | ", " / ", ": ", "/"]
+
+    /// Shortest lead worth dropping. Two characters off the front is not what
+    /// made the rows hard to tell apart, and losing them only makes the column
+    /// ragged.
+    static let minimumLead = 3
+
+    /// Shortest thing a row may be left holding. This is the guard that keeps
+    /// `QuietRailTitle`'s ordinals intact: "zsh · 1", "zsh · 2", "zsh · 3" do
+    /// share a lead, and without it they would draw as "1", "2", "3".
+    static let minimumRemainder = 3
+
+    /// - Parameters:
+    ///   - titles: every surface title the project draws, in draw order.
+    ///   - window: how many leading characters count as the same at a glance.
+    /// - Returns: one label per title, in the same order.
+    static func labels(
+        for titles: [String],
+        window: Int = QuietRowBudget.ambiguousTitleCharacters
+    ) -> [QuietRailLabel] {
+        var labels = zip(titles, leads(for: titles, window: window)).map { title, lead -> QuietRailLabel in
+            guard let lead else { return .verbatim(title) }
+            return QuietRailLabel(text: remainder(of: title, after: lead), droppedLead: lead)
+        }
+        // Whatever a lead could not separate — and the rows that never had one
+        // to drop — truncate from the middle instead, which is what keeps the
+        // end of the title on screen.
+        for group in collisions(in: labels.map(\.text), window: window) {
+            for index in group {
+                labels[index] = QuietRailLabel(
+                    text: labels[index].text,
+                    truncation: .middle,
+                    droppedLead: labels[index].droppedLead
+                )
+            }
+        }
+        return labels
+    }
+
+    /// The lead each row gives up, or `nil` for a row that keeps its title
+    /// whole: the longest leading segment it shares with at least one other row
+    /// and that the whole sharing group can afford to lose.
+    ///
+    /// Longest wins so nested segments collapse as far as they can: given
+    /// "Codex · MATLAB: kernel", "Codex · MATLAB: plots" and "Codex · sidebar",
+    /// the first two drop "Codex · MATLAB: " while the third drops "Codex · ".
+    ///
+    /// One pass over the group builds the sharing table, so a project's rows
+    /// cost this once between them rather than once each.
+    static func leads(for titles: [String], window: Int) -> [String?] {
+        let segments = titles.map { leadingSegments(of: $0) }
+        var sharers: [String: [Int]] = [:]
+        for (index, candidates) in segments.enumerated() {
+            for segment in candidates { sharers[segment, default: []].append(index) }
+        }
+        return segments.map { candidates in
+            candidates.first { segment in
+                guard let group = sharers[segment], group.count > 1 else { return false }
+                return isWorthDropping(segment, from: group.map { titles[$0] }, window: window)
+            }
+        }
+    }
+
+    /// Every leading segment a title has, longest first:
+    /// "Codex · MATLAB: kernel" yields ["Codex · MATLAB: ", "Codex · "].
+    static func leadingSegments(of title: String) -> [String] {
+        var segments: [String] = []
+        var index = title.startIndex
+        while index < title.endIndex {
+            for separator in leadSeparators where title[index...].hasPrefix(separator) {
+                let segment = String(title[title.startIndex ..< title.index(index, offsetBy: separator.count)])
+                if segment.count >= minimumLead { segments.append(segment) }
+                break
+            }
+            index = title.index(after: index)
+        }
+        return segments.sorted { $0.count > $1.count }
+    }
+
+    /// Whether a group of rows is better off without the lead they share.
+    ///
+    /// All-or-nothing per group on purpose: dropping the lead from the long
+    /// titles and leaving it on the short ones gives the column two different
+    /// leading columns of text, which reads worse than the repetition did.
+    static func isWorthDropping(_ lead: String, from titles: [String], window: Int) -> Bool {
+        // Somebody has to actually be paying for it. Rows that fit the lane
+        // whole lose nothing to a repeated prefix, so the prefix stays.
+        guard titles.contains(where: { $0.count > window }) else { return false }
+        // …and every row has to still say something without it.
+        return titles.allSatisfy { remainder(of: $0, after: lead).count >= minimumRemainder }
+    }
+
+    /// What a title reads as once its lead is gone. The leading space a
+    /// separator like "/" leaves behind goes with it.
+    static func remainder(of title: String, after lead: String) -> String {
+        String(title.dropFirst(lead.count)).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Index groups whose visible prefixes are equal while their full texts are
+    /// not — precisely the rows a sighted scan cannot tell apart.
+    ///
+    /// Rows saying *exactly* the same thing are a different problem, the one
+    /// `QuietRailTitle`'s ordinals exist for, and no truncation strategy
+    /// separates them; a group of those is left alone.
+    static func collisions(in texts: [String], window: Int) -> [[Int]] {
+        var buckets: [String: [Int]] = [:]
+        var order: [String] = []
+        for (index, text) in texts.enumerated() {
+            let key = String(text.prefix(window))
+            if buckets[key] == nil { order.append(key) }
+            buckets[key, default: []].append(index)
+        }
+        return order.compactMap { key in
+            guard let group = buckets[key], group.count > 1 else { return nil }
+            guard Set(group.map { texts[$0] }).count > 1 else { return nil }
+            return group
+        }
     }
 }
 

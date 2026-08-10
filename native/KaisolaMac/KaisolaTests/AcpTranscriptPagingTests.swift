@@ -1,4 +1,7 @@
+import AppKit
 import Foundation
+import KaisolaCore
+import SwiftUI
 import XCTest
 @testable import Kaisola
 
@@ -24,6 +27,43 @@ private actor TranscriptPageFixture {
     func requestCount() -> Int { requests.count }
 }
 
+@MainActor
+private final class TranscriptViewportFixtureModel: ObservableObject {
+    @Published var rowIDs: [String]
+    @Published var rowHeight: CGFloat = 72
+
+    init(rowIDs: [String]) {
+        self.rowIDs = rowIDs
+    }
+}
+
+@MainActor
+private struct TranscriptViewportFixtureView: View {
+    @ObservedObject var model: TranscriptViewportFixtureModel
+    let anchor: AcpTranscriptViewportAnchor
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(spacing: 8) {
+                ForEach(model.rowIDs, id: \.self) { rowID in
+                    Text(rowID)
+                        .frame(
+                            maxWidth: .infinity,
+                            minHeight: model.rowHeight,
+                            maxHeight: model.rowHeight
+                        )
+                        .background {
+                            AcpTranscriptViewportMarker(rowID: rowID, anchor: anchor)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                        .accessibilityIdentifier("fixture.\(rowID)")
+                }
+            }
+            .padding(12)
+        }
+    }
+}
+
 /// Unit tests for two Electron-parity behaviors on `AcpConversation` that need
 /// no live agent: transcript render-window paging (`visibleRows`/`expandEarlier`)
 /// and per-chat persistent composer drafts (`loadDraft`/`saveDraft` round-trip).
@@ -39,6 +79,18 @@ final class AcpTranscriptPagingTests: XCTestCase {
             arguments: [],
             cwd: "/tmp",
             draftKey: draftKey
+        )
+    }
+
+    private func makePermissionConversation() -> AcpConversation {
+        AcpConversation(
+            title: "Permission test",
+            command: "mock",
+            arguments: [],
+            cwd: "/tmp",
+            ruleStore: PermissionRuleStore(fileURL: FileManager.default.temporaryDirectory
+                .appendingPathComponent("kaisola-permission-\(UUID().uuidString).json")),
+            sensitiveGlobs: []
         )
     }
 
@@ -78,6 +130,83 @@ final class AcpTranscriptPagingTests: XCTestCase {
 
         XCTAssertEqual(conversation.visibleRows.count, 40)
         XCTAssertEqual(conversation.hiddenEarlierCount, 0)
+    }
+
+    func testRestoredQuotaStatusRemainsAvailableForPersistentDisclosure() {
+        let status = AcpTranscriptStore.RetentionStatus(
+            truncatedRowCount: 42,
+            truncatedByteCount: 4_096
+        )
+        let conversation = AcpConversation(
+            title: "Test",
+            command: "mock",
+            arguments: [],
+            cwd: "/tmp",
+            initialRetentionStatus: status
+        )
+
+        XCTAssertEqual(conversation.transcriptRetentionStatus, status)
+        XCTAssertTrue(conversation.transcriptRetentionStatus.isTruncated)
+    }
+
+    func testPersistenceHealthAndRetryActionRemainAttachedToConversation() {
+        let conversation = makeConversation()
+        var retryCount = 0
+        conversation.onRetryTranscriptPersistence = { retryCount += 1 }
+        let failure = AcpTranscriptStore.PersistenceFailure(
+            attemptCount: 3,
+            maximumAttempts: 3
+        )
+
+        conversation.applyTranscriptPersistenceHealth(.failed(failure))
+        XCTAssertEqual(conversation.transcriptPersistenceHealth, .failed(failure))
+        conversation.retryTranscriptPersistence()
+        XCTAssertEqual(retryCount, 1)
+    }
+
+    func testConversationExportsProvenanceAndCopiesOnlyTheLastAssistantResponse() async throws {
+        let conversation = AcpConversation(
+            title: "Review thread",
+            command: "mock",
+            arguments: [],
+            cwd: "/tmp",
+            transcriptAgentID: "codex",
+            transcriptAgentName: "Codex",
+            transcriptModelID: "gpt-test"
+        )
+        conversation.seedRowsForTesting([
+            .message(id: "1", text: "first response"),
+            .message(id: "2", text: "last response\n```swift\nprint(1)\n```"),
+            .thought(id: "3", text: "private reasoning after response"),
+            .tool(.init(id: "tool", title: "Check", kind: "read", status: .completed)),
+        ])
+        var capturedRequest: AcpTranscriptMarkdownExport.Request?
+        let destination = URL(fileURLWithPath: "/tmp/thread.md")
+        conversation.onExportTranscriptMarkdown = { request, url in
+            capturedRequest = request
+            XCTAssertEqual(url, destination)
+            return .init(
+                rowCount: 4,
+                startOrdinal: 0,
+                byteCount: 200,
+                includedPendingChanges: false
+            )
+        }
+
+        XCTAssertEqual(
+            conversation.lastAssistantResponse,
+            "last response\n```swift\nprint(1)\n```"
+        )
+        let receipt = try await conversation.exportTranscriptMarkdown(
+            to: destination,
+            exportedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        XCTAssertEqual(receipt.rowCount, 4)
+        XCTAssertEqual(capturedRequest?.title, "Review thread")
+        XCTAssertEqual(capturedRequest?.agentID, "codex")
+        XCTAssertEqual(capturedRequest?.agentName, "Codex")
+        XCTAssertEqual(capturedRequest?.modelID, "gpt-test")
+        XCTAssertEqual(capturedRequest?.exportedAt, Date(timeIntervalSince1970: 1_700_000_000))
     }
 
     func testVisibleLimitIsSettableToDriveTheView() {
@@ -146,6 +275,242 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertEqual(persistenceEvents, 0, "Reading durable pages must not schedule redundant writes")
         let requestCount = await fixture.requestCount()
         XCTAssertEqual(requestCount, 5)
+    }
+
+    func testTranscriptSearchCountsVisibleOccurrencesAndNavigatesInOrder() {
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "u", text: "Needle once", failed: false),
+            .message(id: "m", text: "needle twice NEEDLE"),
+            .plan(id: "p", entries: [
+                AcpPlanEntry(id: "e", content: "No match", priority: "medium", status: "pending"),
+            ]),
+        ]
+        var state = AcpTranscriptSearchState()
+
+        state.updateQuery("needle", rows: rows)
+
+        XCTAssertEqual(state.matchCount, 3)
+        XCTAssertNil(state.currentRowID, "typing must not jump the reading anchor")
+        XCTAssertEqual(state.statusText(hasHiddenEarlierRows: false), "3 matches")
+        XCTAssertEqual(state.move(.next), "user-u")
+        XCTAssertEqual(state.statusText(hasHiddenEarlierRows: false), "1 of 3")
+        XCTAssertEqual(state.move(.next), "msg-m")
+        XCTAssertEqual(state.move(.next), "msg-m")
+        XCTAssertEqual(state.move(.next), "user-u", "next wraps")
+        XCTAssertEqual(state.move(.previous), "msg-m", "previous wraps")
+    }
+
+    func testTranscriptSearchIndexesTheVisibleRunProfileAuditFields() {
+        let profile = AcpRunProfile(
+            id: "review",
+            name: "Review safely",
+            modelID: "model-search-token",
+            enabledClientToolIDs: [AcpRunProfile.ClientTool.readTextFile.rawValue],
+            enabledMCPServerNames: []
+        )
+        var state = AcpTranscriptSearchState()
+
+        state.updateQuery("model-search-token", rows: [
+            .runProfileAudit(id: "audit", snapshot: profile),
+        ])
+
+        XCTAssertEqual(state.matchCount, 1)
+        XCTAssertEqual(state.move(.next), "run-profile-audit")
+    }
+
+    func testTranscriptSearchRefreshPreservesSelectionDuringStreaming() {
+        var state = AcpTranscriptSearchState()
+        state.updateQuery("ship", rows: [
+            .message(id: "one", text: "ship it"),
+            .message(id: "two", text: "waiting"),
+        ])
+        XCTAssertEqual(state.move(.next), "msg-one")
+
+        state.refresh(rows: [
+            .message(id: "one", text: "ship it"),
+            .message(id: "two", text: "waiting, then ship"),
+        ])
+
+        XCTAssertEqual(state.matchCount, 2)
+        XCTAssertEqual(state.currentRowID, "msg-one")
+        XCTAssertEqual(state.statusText(hasHiddenEarlierRows: false), "1 of 2")
+    }
+
+    func testPagedTranscriptSearchFindsOlderRowsWithoutDiscardingReadingAnchor() async throws {
+        var rows = Self.messageRows(count: 500)
+        rows[0] = .message(id: "oldest", text: "the buried needle")
+        let conversation = makeConversation()
+        conversation.seedRowsForTesting(rows)
+        let readingAnchor = try XCTUnwrap(conversation.visibleRows.first?.id)
+        var search = AcpTranscriptSearchState()
+        search.updateQuery("needle", rows: conversation.visibleRows)
+        XCTAssertEqual(search.matchCount, 0)
+        XCTAssertEqual(search.statusText(hasHiddenEarlierRows: true), "No matches loaded")
+
+        while search.matchCount == 0, conversation.hiddenEarlierCount > 0 {
+            await conversation.expandEarlier()
+            search.refresh(rows: conversation.visibleRows)
+            XCTAssertTrue(
+                conversation.visibleRows.contains(where: { $0.id == readingAnchor }),
+                "prepending a search page must keep the prior reading anchor addressable"
+            )
+        }
+
+        XCTAssertEqual(search.matchCount, 1)
+        XCTAssertEqual(search.statusText(hasHiddenEarlierRows: false), "1 match")
+        XCTAssertNil(search.currentRowID, "fetching older matches does not move the viewport")
+        XCTAssertEqual(search.move(.next), "msg-oldest")
+    }
+
+    func testMountedViewportAnchorPreservesExactReadingOffsetAcrossPrepend() throws {
+        let originalRows = (0..<18).map { "row-\($0)" }
+        let model = TranscriptViewportFixtureModel(rowIDs: originalRows)
+        let anchor = AcpTranscriptViewportAnchor()
+        let host = NSHostingView(
+            rootView: TranscriptViewportFixtureView(model: model, anchor: anchor)
+                .frame(width: 360, height: 240)
+        )
+        host.frame = NSRect(x: 0, y: 0, width: 360, height: 240)
+        let window = NSWindow(
+            contentRect: host.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        host.layoutSubtreeIfNeeded()
+
+        let positioned = try XCTUnwrap(anchor.restore(.init(
+            rowID: "row-2",
+            offsetFromViewportTop: -17.25
+        )))
+        XCTAssertEqual(positioned.restoredOffset, -17.25, accuracy: 0.75)
+        let captured = try XCTUnwrap(anchor.capture())
+        XCTAssertEqual(captured.rowID, "row-2")
+        XCTAssertEqual(captured.offsetFromViewportTop, -17.25, accuracy: 0.75)
+
+        let scrollView = try XCTUnwrap(Self.firstScrollView(in: host))
+        model.rowIDs = (0..<200).map { "earlier-\($0)" } + originalRows
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        host.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
+
+        let originBeforeFallback = scrollView.contentView.bounds.origin.y
+        var restored = anchor.restore(captured)
+        let originAfterFallback = scrollView.contentView.bounds.origin.y
+        if restored == nil {
+            // The first call applies the captured clip-geometry fallback when
+            // LazyVStack evicts the row; the next mounted pass must validate
+            // the same row's real intra-row offset.
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            host.layoutSubtreeIfNeeded()
+            window.layoutIfNeeded()
+            restored = anchor.restore(captured)
+        }
+        guard let finalRestoration = restored else {
+            XCTFail(
+                "clip origin \(originBeforeFallback) -> \(originAfterFallback); "
+                    + "document=\(String(describing: scrollView.documentView?.bounds)) "
+                    + "viewport=\(scrollView.documentVisibleRect)"
+            )
+            return
+        }
+        XCTAssertEqual(finalRestoration.rowID, "row-2")
+        XCTAssertEqual(
+            finalRestoration.restoredOffset,
+            captured.offsetFromViewportTop,
+            accuracy: 0.75
+        )
+        XCTAssertLessThanOrEqual(finalRestoration.error, 0.75)
+    }
+
+    func testMountedViewportAnchorPreservesExactReadingOffsetAcrossRowHeightChange() throws {
+        let model = TranscriptViewportFixtureModel(
+            rowIDs: (0..<18).map { "density-row-\($0)" }
+        )
+        let anchor = AcpTranscriptViewportAnchor()
+        let host = NSHostingView(
+            rootView: TranscriptViewportFixtureView(model: model, anchor: anchor)
+                .frame(width: 360, height: 240)
+        )
+        host.frame = NSRect(x: 0, y: 0, width: 360, height: 240)
+        let window = NSWindow(
+            contentRect: host.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let positioned = try XCTUnwrap(anchor.restore(.init(
+            rowID: "density-row-2",
+            offsetFromViewportTop: -13.5
+        )))
+        XCTAssertEqual(positioned.restoredOffset, -13.5, accuracy: 0.75)
+        let captured = try XCTUnwrap(anchor.capture())
+        XCTAssertEqual(captured.rowID, "density-row-2")
+
+        let scrollView = try XCTUnwrap(Self.firstScrollView(in: host))
+        let documentHeightBefore = try XCTUnwrap(scrollView.documentView).bounds.height
+        model.rowHeight = 118
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        host.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
+        XCTAssertGreaterThan(
+            try XCTUnwrap(scrollView.documentView).bounds.height,
+            documentHeightBefore,
+            "the mounted contract must exercise a real document-height change"
+        )
+
+        var restoration = anchor.restore(captured)
+        if restoration == nil {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            host.layoutSubtreeIfNeeded()
+            restoration = anchor.restore(captured)
+        }
+        let finalRestoration = try XCTUnwrap(restoration)
+        XCTAssertEqual(finalRestoration.rowID, "density-row-2")
+        XCTAssertEqual(
+            finalRestoration.restoredOffset,
+            captured.offsetFromViewportTop,
+            accuracy: 0.75
+        )
+        XCTAssertLessThanOrEqual(finalRestoration.error, 0.75)
+    }
+
+    func testTranscriptSearchIsBoundedAndDismissalRetainsNoActiveMatch() {
+        let text = Array(repeating: "needle", count: AcpTranscriptSearchIndex.maximumMatches + 10)
+            .joined(separator: " ")
+        var state = AcpTranscriptSearchState()
+        state.present()
+        state.updateQuery("needle", rows: [.message(id: "many", text: text)])
+
+        XCTAssertEqual(state.matchCount, AcpTranscriptSearchIndex.maximumMatches)
+        XCTAssertTrue(state.hasAdditionalMatches)
+        XCTAssertEqual(
+            state.statusText(hasHiddenEarlierRows: false),
+            "\(AcpTranscriptSearchIndex.maximumMatches)+ matches"
+        )
+        XCTAssertEqual(state.move(.next), "msg-many")
+
+        state.dismiss()
+        XCTAssertFalse(state.isPresented)
+        XCTAssertNil(state.currentRowID)
+        XCTAssertEqual(state.query, "needle", "reopening Find should retain the last query")
+    }
+
+    private static func firstScrollView(in view: NSView) -> NSScrollView? {
+        if let scrollView = view as? NSScrollView { return scrollView }
+        for subview in view.subviews {
+            if let scrollView = firstScrollView(in: subview) { return scrollView }
+        }
+        return nil
     }
 
     /// Chunks after the first are held for `chunkFlushInterval` and published
@@ -272,6 +637,158 @@ final class AcpTranscriptPagingTests: XCTestCase {
         conversation.answerPermission("reject")
         XCTAssertNil(conversation.pendingPermission)
         XCTAssertEqual(conversation.pendingPermissionCount, 0)
+    }
+
+    func testPermissionQueueAcceptsDeclaredCountLimitAndDeniesNextAsk() {
+        let conversation = makePermissionConversation()
+        for id in 1...AcpConversation.maximumOutstandingPermissionCount {
+            conversation.receivePermissionForTesting(Self.permission(id: id))
+        }
+
+        XCTAssertEqual(
+            conversation.pendingPermissionCount,
+            AcpConversation.maximumOutstandingPermissionCount
+        )
+        XCTAssertLessThanOrEqual(
+            conversation.pendingPermissionRetainedBytes,
+            AcpConversation.maximumRetainedPermissionBytes
+        )
+
+        conversation.receivePermissionForTesting(Self.permission(id: 10_000, title: "Overflow"))
+
+        XCTAssertEqual(
+            conversation.pendingPermissionCount,
+            AcpConversation.maximumOutstandingPermissionCount,
+            "the overflowing ask must never enter the retained FIFO"
+        )
+        XCTAssertTrue(conversation.rows.contains { row in
+            guard case let .permissionDecision(_, text) = row else { return false }
+            return text.contains("Overflow") && text.contains("32-prompt limit")
+        })
+    }
+
+    func testPermissionQueueBoundsAggregateEncodedPayloadBytes() {
+        let conversation = makePermissionConversation()
+        let first = Self.permission(
+            id: 1,
+            title: "First payload",
+            rawInput: .string(String(repeating: "a", count: 500_000))
+        )
+        let second = Self.permission(
+            id: 2,
+            title: "Second payload",
+            rawInput: .string(String(repeating: "b", count: 500_000))
+        )
+        let overflow = Self.permission(
+            id: 3,
+            title: "Byte overflow",
+            rawInput: .string(String(repeating: "c", count: 100_000))
+        )
+        let acceptedBytes = AcpConversation.retainedPermissionPayloadBytes(first)
+            + AcpConversation.retainedPermissionPayloadBytes(second)
+        XCTAssertLessThan(acceptedBytes, AcpConversation.maximumRetainedPermissionBytes)
+        XCTAssertGreaterThan(
+            acceptedBytes + AcpConversation.retainedPermissionPayloadBytes(overflow),
+            AcpConversation.maximumRetainedPermissionBytes
+        )
+
+        conversation.receivePermissionForTesting(first)
+        conversation.receivePermissionForTesting(second)
+        conversation.receivePermissionForTesting(overflow)
+
+        XCTAssertEqual(conversation.pendingPermissionCount, 2)
+        XCTAssertEqual(conversation.pendingPermissionRetainedBytes, acceptedBytes)
+        XCTAssertTrue(conversation.rows.contains { row in
+            guard case let .permissionDecision(_, text) = row else { return false }
+            return text.contains("Byte overflow") && text.contains("retained-payload limit")
+        })
+    }
+
+    func testStalePresentedAndQueuedPermissionsExpireInArrivalOrder() {
+        let conversation = makePermissionConversation()
+        let receivedAt = Date()
+        conversation.receivePermissionForTesting(
+            Self.permission(id: 1, title: "Oldest"),
+            receivedAt: receivedAt
+        )
+        conversation.receivePermissionForTesting(
+            Self.permission(id: 2, title: "Next"),
+            receivedAt: receivedAt.addingTimeInterval(1)
+        )
+
+        conversation.expirePermissionsForTesting(
+            at: receivedAt.addingTimeInterval(AcpConversation.permissionPromptLifetime + 2)
+        )
+
+        XCTAssertNil(conversation.pendingPermission)
+        XCTAssertEqual(conversation.pendingPermissionCount, 0)
+        XCTAssertEqual(conversation.pendingPermissionRetainedBytes, 0)
+        let events = conversation.rows.compactMap { row -> String? in
+            guard case let .permissionDecision(_, text) = row else { return nil }
+            return text
+        }
+        XCTAssertEqual(events.count, 2)
+        XCTAssertTrue(events[0].contains("Oldest"))
+        XCTAssertTrue(events[1].contains("Next"))
+        XCTAssertTrue(events.allSatisfy { $0.contains("expired after 5 minutes") })
+    }
+
+    func testAutomaticPermissionEvidencePublishesEveryEventButRetainsABoundedTail() {
+        let conversation = makePermissionConversation()
+        var persistenceSnapshotCount = 0
+        var persistenceReceivedDecision = false
+        conversation.onTranscriptChanged = { rows, _ in
+            persistenceSnapshotCount += 1
+            persistenceReceivedDecision = rows.contains {
+                if case .permissionDecision = $0 { return true }
+                return false
+            }
+        }
+        var observedEventIDs: Set<String> = []
+        var maximumResolutionBacklog = 0
+        let eventCount = AcpConversation.maximumRetainedPermissionDecisionRows + 5
+        let oversizedPayload = String(
+            repeating: "x",
+            count: AcpConversation.maximumRetainedPermissionBytes
+        )
+        for id in 1...eventCount {
+            conversation.receivePermissionForTesting(Self.permission(
+                id: id,
+                title: "Oversized \(id)",
+                rawInput: .string(oversizedPayload)
+            ))
+            if let last = conversation.rows.last, case .permissionDecision = last {
+                observedEventIDs.insert(last.id)
+            }
+            maximumResolutionBacklog = max(
+                maximumResolutionBacklog,
+                conversation.pendingAutomaticPermissionResolutionCount
+            )
+        }
+
+        let retainedEvents = conversation.rows.filter {
+            if case .permissionDecision = $0 { return true }
+            return false
+        }
+        XCTAssertEqual(observedEventIDs.count, eventCount)
+        XCTAssertEqual(
+            retainedEvents.count,
+            AcpConversation.maximumRetainedPermissionDecisionRows
+        )
+        XCTAssertLessThanOrEqual(
+            maximumResolutionBacklog,
+            AcpConversation.maximumPendingAutomaticPermissionResolutions
+        )
+        XCTAssertFalse(
+            persistenceReceivedDecision,
+            "live automatic-denial evidence must not accumulate in durable transcript pages"
+        )
+        XCTAssertEqual(
+            persistenceSnapshotCount,
+            0,
+            "ephemeral evidence must not enqueue redundant durable snapshots"
+        )
+        XCTAssertTrue(retainedEvents.last?.id.contains("\(eventCount)") == true)
     }
 
     func testPermissionVisualFixtureIsOptInAndDecisionGrade() throws {
@@ -468,6 +985,30 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertNil(UserDefaults.standard.string(forKey: defaultsKey), "clearing the draft deletes the key")
     }
 
+    func testForgettingTheDraftErasesItAndDisarmsLaterSaves() {
+        let key = "unit-\(UUID().uuidString)"
+        let defaultsKey = "chatDraft.\(key)"
+        defer { UserDefaults.standard.removeObject(forKey: defaultsKey) }
+
+        let conversation = makeConversation(draftKey: key)
+        conversation.saveDraft("unsent secret")
+        XCTAssertEqual(UserDefaults.standard.string(forKey: defaultsKey), "unsent secret")
+
+        conversation.forgetPersistentDraft()
+        XCTAssertNil(
+            UserDefaults.standard.string(forKey: defaultsKey),
+            "a permanent delete must erase the legacy defaults draft"
+        )
+
+        // The composer can still emit one last change as it tears down.
+        conversation.saveDraft("late write after delete")
+        XCTAssertNil(
+            UserDefaults.standard.string(forKey: defaultsKey),
+            "a save after the delete boundary must not resurrect the draft"
+        )
+        XCTAssertEqual(makeConversation(draftKey: key).loadDraft(), "")
+    }
+
     func testDraftIsNoOpWithoutAKey() {
         let conversation = makeConversation(draftKey: nil)
         conversation.saveDraft("orphan")   // no key ⇒ nothing persisted
@@ -478,5 +1019,22 @@ final class AcpTranscriptPagingTests: XCTestCase {
 
     private static func messageRows(count: Int) -> [AcpTranscriptRow] {
         (0..<count).map { .message(id: "m\($0)", text: "row \($0)") }
+    }
+
+    private static func permission(
+        id: Int,
+        title: String? = nil,
+        rawInput: JSONValue? = nil
+    ) -> AcpPermissionRequest {
+        AcpPermissionRequest(
+            id: id,
+            sessionID: "session",
+            title: title ?? "Permission \(id)",
+            options: [
+                .init(id: "allow", name: "Allow", kind: "allow_once"),
+                .init(id: "reject", name: "Reject", kind: "reject_once"),
+            ],
+            rawInput: rawInput
+        )
     }
 }

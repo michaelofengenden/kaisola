@@ -107,12 +107,27 @@ enum AcpDiff {
     /// the whole line changed — keeps pathological lines O(1) to render.
     static let wordTokenCap = 200
 
+    /// Diff identity is separate from rendered text so canonically equivalent
+    /// Unicode stays context without rewriting either side. Markdown syntax is
+    /// tokenized independently from prose words: changing a citation year or a
+    /// sentence word must not paint its brackets, link target, or punctuation.
+    private struct WordToken: Equatable {
+        let text: String
+        let identity: String
+    }
+
+    private enum WordTokenKind {
+        case whitespace
+        case prose
+        case syntax
+    }
+
     /// Word-level segments for a removed/added line pair: LCS over word tokens
     /// (whitespace runs are tokens too, so the segments reconstruct each line
     /// exactly). Tokens outside the LCS are `changed`.
     static func wordSegments(removed: String, added: String) -> (removed: [Segment], added: [Segment]) {
-        let oldTokens = wordTokens(removed)
-        let newTokens = wordTokens(added)
+        let oldTokens = semanticWordTokens(removed)
+        let newTokens = semanticWordTokens(added)
         guard oldTokens.count <= wordTokenCap, newTokens.count <= wordTokenCap else {
             return (
                 removed.isEmpty ? [] : [Segment(text: removed, changed: true)],
@@ -123,7 +138,7 @@ enum AcpDiff {
         var lcs = Array(repeating: Array(repeating: 0, count: n + 1), count: m + 1)
         for i in stride(from: m - 1, through: 0, by: -1) {
             for j in stride(from: n - 1, through: 0, by: -1) {
-                lcs[i][j] = oldTokens[i] == newTokens[j]
+                lcs[i][j] = oldTokens[i].identity == newTokens[j].identity
                     ? lcs[i + 1][j + 1] + 1
                     : max(lcs[i + 1][j], lcs[i][j + 1])
             }
@@ -131,20 +146,26 @@ enum AcpDiff {
         var oldSegments: [Segment] = [], newSegments: [Segment] = []
         var i = 0, j = 0
         while i < m, j < n {
-            if oldTokens[i] == newTokens[j] {
-                oldSegments.append(Segment(text: oldTokens[i], changed: false))
-                newSegments.append(Segment(text: newTokens[j], changed: false))
+            if oldTokens[i].identity == newTokens[j].identity {
+                oldSegments.append(Segment(text: oldTokens[i].text, changed: false))
+                newSegments.append(Segment(text: newTokens[j].text, changed: false))
                 i += 1; j += 1
             } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-                oldSegments.append(Segment(text: oldTokens[i], changed: true))
+                oldSegments.append(Segment(text: oldTokens[i].text, changed: true))
                 i += 1
             } else {
-                newSegments.append(Segment(text: newTokens[j], changed: true))
+                newSegments.append(Segment(text: newTokens[j].text, changed: true))
                 j += 1
             }
         }
-        while i < m { oldSegments.append(Segment(text: oldTokens[i], changed: true)); i += 1 }
-        while j < n { newSegments.append(Segment(text: newTokens[j], changed: true)); j += 1 }
+        while i < m {
+            oldSegments.append(Segment(text: oldTokens[i].text, changed: true))
+            i += 1
+        }
+        while j < n {
+            newSegments.append(Segment(text: newTokens[j].text, changed: true))
+            j += 1
+        }
         return (coalesce(oldSegments), coalesce(newSegments))
     }
 
@@ -193,25 +214,71 @@ enum AcpDiff {
         return rows
     }
 
-    /// Runs of non-whitespace and runs of whitespace, in order — concatenating
-    /// the tokens reproduces the input exactly.
+    /// Semantic prose, syntax, and whitespace runs in source order — joining
+    /// them always reproduces the input exactly.
     static func wordTokens(_ text: String) -> [String] {
+        semanticWordTokens(text).map(\.text)
+    }
+
+    private static func semanticWordTokens(_ text: String) -> [WordToken] {
         guard !text.isEmpty else { return [] }
-        var tokens: [String] = []
+        let characters = Array(text)
+        var tokens: [WordToken] = []
         var current = ""
-        var currentIsSpace: Bool?
-        for character in text {
-            let isSpace = character.isWhitespace
-            if currentIsSpace == nil || currentIsSpace == isSpace {
-                current.append(character)
-            } else {
-                tokens.append(current)
-                current = String(character)
-            }
-            currentIsSpace = isSpace
+        var currentKind: WordTokenKind?
+
+        func appendCurrent() {
+            guard !current.isEmpty else { return }
+            tokens.append(WordToken(
+                text: current,
+                identity: current.precomposedStringWithCanonicalMapping
+            ))
+            current = ""
         }
-        if !current.isEmpty { tokens.append(current) }
+
+        for index in characters.indices {
+            let kind = wordTokenKind(
+                characters[index],
+                previous: index > characters.startIndex ? characters[index - 1] : nil,
+                next: index + 1 < characters.endIndex ? characters[index + 1] : nil
+            )
+            // Keep each syntax character independently matchable. Grouping `[@`
+            // into one token would paint the preserved `[` when only `@` became
+            // `#`; coalescing joins unchanged syntax back for rendering later.
+            if currentKind != kind || kind == .syntax {
+                appendCurrent()
+                currentKind = kind
+            }
+            current.append(characters[index])
+        }
+        appendCurrent()
         return tokens
+    }
+
+    private static func wordTokenKind(
+        _ character: Character,
+        previous: Character?,
+        next: Character?
+    ) -> WordTokenKind {
+        if character.isWhitespace { return .whitespace }
+        if isProseCharacter(character) { return .prose }
+        if isInternalWordJoiner(character),
+           previous.map(isProseCharacter) == true,
+           next.map(isProseCharacter) == true {
+            return .prose
+        }
+        return .syntax
+    }
+
+    private static func isProseCharacter(_ character: Character) -> Bool {
+        character.unicodeScalars.allSatisfy { scalar in
+            CharacterSet.alphanumerics.contains(scalar)
+                || CharacterSet.nonBaseCharacters.contains(scalar)
+        }
+    }
+
+    private static func isInternalWordJoiner(_ character: Character) -> Bool {
+        character == "'" || character == "’" || character == "-"
     }
 
     private static func coalesce(_ segments: [Segment]) -> [Segment] {

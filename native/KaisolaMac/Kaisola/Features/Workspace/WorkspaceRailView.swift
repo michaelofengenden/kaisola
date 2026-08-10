@@ -1,5 +1,84 @@
 import AppKit
+import Darwin
 import SwiftUI
+
+/// One source of truth for what a file-tree row says and does through either
+/// Full Keyboard Access or VoiceOver. The visible indentation and glyphs are
+/// presentation only; role, hierarchy, disclosure, and selection live here.
+struct WorkspaceFileTreeRowAccessibility: Equatable, Sendable {
+    enum Activation: Equatable, Sendable {
+        case openFile
+        case expandFolder
+        case collapseFolder
+    }
+
+    let label: String
+    let value: String
+    let hint: String
+    let activation: Activation
+    let disclosureActionLabel: String?
+    let isSelected: Bool
+
+    init(
+        name: String,
+        isDirectory: Bool,
+        depth: Int,
+        isExpanded: Bool,
+        isSelected: Bool
+    ) {
+        let level = max(0, depth) + 1
+        self.label = name
+        self.isSelected = isSelected
+        if isDirectory {
+            let expansion = isExpanded ? "expanded" : "collapsed"
+            self.value = "Folder, level \(level), \(expansion), \(isSelected ? "selected" : "not selected")"
+            self.hint = isExpanded
+                ? "Activate to collapse this folder"
+                : "Activate to expand this folder"
+            self.activation = isExpanded ? .collapseFolder : .expandFolder
+            self.disclosureActionLabel = isExpanded ? "Collapse" : "Expand"
+        } else {
+            self.value = "File, level \(level), \(isSelected ? "selected" : "not selected")"
+            self.hint = "Activate to open this file"
+            self.activation = .openFile
+            self.disclosureActionLabel = nil
+        }
+    }
+
+    /// A focused Button and VoiceOver's default Activate gesture take the same
+    /// route; this name makes the keyboard contract explicit in tests.
+    var keyboardActivation: Activation { activation }
+
+    /// Folders additionally advertise a named Expand/Collapse action. Files
+    /// use the Button's ordinary Activate action and expose no fake disclosure.
+    var voiceOverDisclosureAction: Activation? {
+        disclosureActionLabel == nil ? nil : activation
+    }
+}
+
+private struct WorkspaceFileTreeAccessibilityModifier: ViewModifier {
+    let descriptor: WorkspaceFileTreeRowAccessibility
+    let performDisclosure: () -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        let described = content
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(descriptor.label)
+            .accessibilityValue(descriptor.value)
+            .accessibilityHint(descriptor.hint)
+            .accessibilityAddTraits(
+                descriptor.isSelected ? [.isButton, .isSelected] : .isButton
+            )
+        if let actionLabel = descriptor.disclosureActionLabel {
+            described.accessibilityAction(named: Text(actionLabel)) {
+                performDisclosure()
+            }
+        } else {
+            described
+        }
+    }
+}
 
 /// The workspace rail: a lazy file tree for the active project (⌘B). Clicking a
 /// file opens it in the preview pane.
@@ -27,17 +106,32 @@ struct WorkspaceRailView: View {
     let close: () -> Void
 
     @State private var expanded: Set<String> = []
-    @State private var searchText = ""
+    @State private var searchText = {
+        let environment = ProcessInfo.processInfo.environment
+        return environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+            && environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "workspace-search-partial"
+            ? "indexed-fixture"
+            : ""
+    }()
     @State private var renameTarget: FileNode?
     @State private var renameDraft = ""
     @State private var moveTarget: FileNode?
     @State private var creationRequest: CreationRequest?
     @State private var creationDraft = ""
     @State private var trashTarget: FileNode?
+    @State private var instructionFileFailure: WorkspaceInstructionFile.Failure?
     @State private var isMutating = false
+    /// Which row the pointer is over, and which row the keyboard is on. Either
+    /// one earns that row its "⋯" button; every other row keeps it transparent.
+    @State private var hoveredRow: String?
+    @FocusState private var focusedRow: String?
+    /// Sticky fallback for inputs that cannot hover — see `WorkspaceRowActions`.
+    @State private var rowActionsAlwaysVisible = false
     /// Live FSEvents watcher — agent writes refresh the tree automatically.
     @StateObject private var watcher: WorkspaceWatcher
     @StateObject private var tree: WorkspaceTreeModel
+    /// Keeps one click and two clicks from both opening the same file.
+    @StateObject private var clicks = WorkspaceRowClickArbiter()
 
     init(
         root: URL,
@@ -68,7 +162,7 @@ struct WorkspaceRailView: View {
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 TextField("Search files", text: $searchText)
                     .textFieldStyle(.plain)
                 Menu {
@@ -87,7 +181,7 @@ struct WorkspaceRailView: View {
                 } label: {
                     Image(systemName: "scope")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(followsAgentFiles ? Color.accentColor : Color.secondary)
+                        .foregroundStyle(followsAgentFiles ? Color.accentColor : Color.kaisolaSecondary)
                 }
                 .buttonStyle(.borderless)
                 .disabled(!canFollowAgentFiles)
@@ -109,7 +203,7 @@ struct WorkspaceRailView: View {
                 Button(action: close) {
                     Image(systemName: "minus")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .frame(width: 20, height: 20)
                 }
                 .buttonStyle(.borderless)
@@ -123,18 +217,27 @@ struct WorkspaceRailView: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 6)
 
+            if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !tree.isSearching {
+                partialSearchNotice
+            }
+
             if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        nodeRows(for: root, depth: 0)
+                if let emptyState = tree.emptyState(for: root) {
+                    projectEmptyState(emptyState)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            nodeRows(for: root, depth: 0)
+                        }
+                        .padding(.vertical, 6)
                     }
-                    .padding(.vertical, 6)
+                    .scrollBounceBehavior(.basedOnSize)
                 }
-                .scrollBounceBehavior(.basedOnSize)
             } else if tree.isSearching {
                 VStack(spacing: 10) {
                     ProgressView().controlSize(.small)
-                    Text("Indexing files…").font(.caption).foregroundStyle(.secondary)
+                    Text("Indexing files…").font(.caption).foregroundStyle(.kaisolaSecondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if tree.searchResults.isEmpty {
@@ -143,13 +246,17 @@ struct WorkspaceRailView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 1) {
                         ForEach(tree.searchResults, id: \.self) { path in
+                            let node = FileNode(
+                                url: root.appendingPathComponent(path).standardizedFileURL,
+                                isDirectory: false
+                            )
                             Button {
-                                openFile(root.appendingPathComponent(path), false)
+                                openFile(node.url, false)
                             } label: {
                                 HStack(spacing: 7) {
                                     Image(systemName: "doc.text")
                                         .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(.kaisolaSecondary)
                                     FadingFileName(text: path)
                                     Spacer(minLength: 0)
                                 }
@@ -157,8 +264,7 @@ struct WorkspaceRailView: View {
                                 .padding(.vertical, 4)
                                 .padding(.trailing, Self.optionsClearance - 10)
                                 .background(
-                                    selectedFile?.standardizedFileURL.path
-                                        == root.appendingPathComponent(path).standardizedFileURL.path
+                                    isSelected(node)
                                         ? Color.accentColor.opacity(0.15)
                                         : .clear,
                                     in: RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -167,19 +273,15 @@ struct WorkspaceRailView: View {
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel(path)
-                            .overlay(alignment: .trailing) {
-                                itemMenu(FileNode(
-                                    url: root.appendingPathComponent(path).standardizedFileURL,
-                                    isDirectory: false
-                                ))
-                                .padding(.trailing, 6)
-                            }
+                            .focused($focusedRow, equals: node.id)
                             .contextMenu {
-                                itemActions(FileNode(
-                                    url: root.appendingPathComponent(path).standardizedFileURL,
-                                    isDirectory: false
-                                ))
+                                itemActions(node)
                             }
+                            .overlay(alignment: .trailing) {
+                                itemMenu(node, revealed: revealsRowActions(node))
+                                    .padding(.trailing, 6)
+                            }
+                            .onHover { inside in setRowHover(node, inside) }
                         }
                     }
                     .padding(.vertical, 5)
@@ -201,7 +303,9 @@ struct WorkspaceRailView: View {
         .padding(4)
         .task {
             tree.load(root)
+            tree.search(searchText)
             revealSelection()
+            rowActionsAlwaysVisible = WorkspaceRowActions.systemAlwaysVisible()
             // Deterministic broker-free visual QA: present a real file-action
             // sheet over the real lazy tree without mutating any fixture file.
             if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
@@ -227,6 +331,11 @@ struct WorkspaceRailView: View {
             revealSelection()
         }
         .onChange(of: searchText) { _, query in tree.search(query) }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification
+        )) { _ in
+            rowActionsAlwaysVisible = WorkspaceRowActions.systemAlwaysVisible()
+        }
         .onChange(of: watcher.changeBatch) { _, batch in
             tree.refresh(
                 changeBatch: batch,
@@ -241,15 +350,8 @@ struct WorkspaceRailView: View {
                 .disabled(isMutating)
             Divider()
             Button("Refresh") { refresh() }
-            Button("New AGENTS.md") {
-                let target = root.appendingPathComponent("AGENTS.md")
-                if !FileManager.default.fileExists(atPath: target.path) {
-                    try? Self.agentsTemplate.write(to: target, atomically: true, encoding: .utf8)
-                    ProjectFileIndex.shared.invalidate(root: root)
-                    tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
-                }
-                openFile(target, true)
-            }
+            Button("New AGENTS.md") { createInstructionFile() }
+                .disabled(isMutating)
         }
         .alert(
             "Rename \(renameTarget?.isDirectory == true ? "Folder" : "File")",
@@ -264,7 +366,7 @@ struct WorkspaceRailView: View {
         })
         .sheet(item: $moveTarget) { target in
             WorkspaceMoveSheet(root: root, item: target) { destinationDirectory in
-                performMove(target, to: destinationDirectory)
+                await performMove(target, to: destinationDirectory)
             }
         }
         .alert(
@@ -289,7 +391,49 @@ struct WorkspaceRailView: View {
         } message: {
             Text("This is recoverable from the macOS Trash.")
         }
+        .alert(
+            "Couldn't Create \(WorkspaceInstructionFile.fileName)",
+            isPresented: instructionFileFailurePresented,
+            presenting: instructionFileFailure
+        ) { _ in
+            // The alert writes `isPresented` back *after* this action returns,
+            // so a synchronous retry's new failure would be cleared before it
+            // could be shown. Retry on the next turn instead.
+            Button("Try Again") { Task { @MainActor in createInstructionFile() } }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("workspace-agents-create-retry")
+            Button("Cancel", role: .cancel) { instructionFileFailure = nil }
+        } message: { failure in
+            Text(failure.message)
+        }
         .accessibilityLabel("Project files")
+    }
+
+    /// The index is deliberately bounded; when one of those bounds wins, do
+    /// not let a partial match list masquerade as proof that another file does
+    /// not exist. Folder browsing is the uncached scope escape hatch.
+    @ViewBuilder
+    private var partialSearchNotice: some View {
+        if let notice = ProjectFileSearchPresentation.notice(for: tree.searchCompletion) {
+            VStack(alignment: .leading, spacing: 5) {
+                Label(notice.title, systemImage: "exclamationmark.magnifyingglass")
+                    .font(.caption.weight(.semibold))
+                Text(notice.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(notice.actionTitle) { searchText = "" }
+                    .buttonStyle(.link)
+                    .font(.caption)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(Color.orange.opacity(0.09))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("\(notice.title). \(notice.detail)")
+            .accessibilityIdentifier("files.search-partial")
+        }
     }
 
     private var renamePresented: Binding<Bool> {
@@ -310,6 +454,13 @@ struct WorkspaceRailView: View {
         Binding(
             get: { creationRequest != nil },
             set: { if !$0 { creationRequest = nil } }
+        )
+    }
+
+    private var instructionFileFailurePresented: Binding<Bool> {
+        Binding(
+            get: { instructionFileFailure != nil },
+            set: { if !$0 { instructionFileFailure = nil } }
         )
     }
 
@@ -377,18 +528,24 @@ struct WorkspaceRailView: View {
         trashTarget = node
     }
 
+    /// Asks the open editors whether this item may be changed. Returns the
+    /// reason it may not, so a caller with a surface of its own — the Move
+    /// sheet — can say it in place instead of behind a toast.
     @MainActor
-    private func prepareMutation(_ node: FileNode) -> Bool {
+    private func mutationBarrierRefusal(_ node: FileNode) -> String? {
         let request = WorkspaceFileMutationBarrierRequest(item: node.url)
         NotificationCenter.default.post(name: .kaisolaPrepareWorkspaceFileMutation, object: request)
         guard request.mayProceed else {
-            ToastCenter.shared.show(
-                "Resolve the unsaved changes in \(node.name) before changing it.",
-                style: .error
-            )
-            return false
+            return "Resolve the unsaved changes in \(node.name) before changing it."
         }
-        return true
+        return nil
+    }
+
+    @MainActor
+    private func prepareMutation(_ node: FileNode) -> Bool {
+        guard let refusal = mutationBarrierRefusal(node) else { return true }
+        ToastCenter.shared.show(refusal, style: .error)
+        return false
     }
 
     private func performRename() {
@@ -427,47 +584,51 @@ struct WorkspaceRailView: View {
         }
     }
 
-    @discardableResult
-    private func performMove(_ target: FileNode, to destinationDirectory: URL) -> Bool {
-        guard prepareMutation(target) else { return false }
+    /// Runs the move and reports what actually happened. This used to return
+    /// `true` the moment it spawned its detached task, and the sheet read that
+    /// as "done" and dismissed — so a failure arrived as a toast long after the
+    /// destination the user picked had disappeared. The sheet now awaits this,
+    /// which means a failure message stays the sheet's to show.
+    @MainActor
+    private func performMove(
+        _ target: FileNode,
+        to destinationDirectory: URL
+    ) async -> WorkspaceMoveOutcome {
+        if let refusal = mutationBarrierRefusal(target) { return .failed(refusal) }
         let destination = destinationDirectory.appendingPathComponent(
             target.name,
             isDirectory: target.isDirectory
         )
         let root = self.root
         isMutating = true
-        Task {
-            do {
-                let move = try await Task.detached(priority: .userInitiated) {
-                    try WorkspaceFileOperations.move(
-                        item: target.url,
-                        to: destination,
-                        workspaceRoot: root
-                    )
-                }.value
-                didMoveItem(move.source, move.destination)
-                expanded = Set(expanded.map { path in
-                    WorkspaceFileOperations.replacingPrefix(
-                        of: URL(fileURLWithPath: path),
-                        from: move.source,
-                        to: move.destination
-                    )?.path ?? path
-                })
-                refresh(changedPaths: [move.source, move.destination])
-                ToastCenter.shared.show(
-                    "Moved \(target.name) to \(destinationDirectory.lastPathComponent)",
-                    style: .success
+        defer { isMutating = false }
+        do {
+            let move = try await Task.detached(priority: .userInitiated) {
+                try WorkspaceFileOperations.move(
+                    item: target.url,
+                    to: destination,
+                    workspaceRoot: root
                 )
-            } catch {
-                ToastCenter.shared.show(
-                    WorkspaceFileOperations.userFacingDescription(for: error, action: "move"),
-                    style: .error,
-                    duration: 5
-                )
-            }
-            isMutating = false
+            }.value
+            didMoveItem(move.source, move.destination)
+            expanded = Set(expanded.map { path in
+                WorkspaceFileOperations.replacingPrefix(
+                    of: URL(fileURLWithPath: path),
+                    from: move.source,
+                    to: move.destination
+                )?.path ?? path
+            })
+            refresh(changedPaths: [move.source, move.destination])
+            ToastCenter.shared.show(
+                "Moved \(target.name) to \(destinationDirectory.lastPathComponent)",
+                style: .success
+            )
+            return .succeeded
+        } catch {
+            return .failed(
+                WorkspaceFileOperations.userFacingDescription(for: error, action: "move")
+            )
         }
-        return true
     }
 
     private func performCreate() {
@@ -515,6 +676,24 @@ struct WorkspaceRailView: View {
         }
     }
 
+    /// Writes the starter AGENTS.md and opens it *only* once the write is
+    /// confirmed. A suppressed error used to open a tab regardless, so a
+    /// permission or disk failure left a phantom document that implied the
+    /// instruction file was there. Failures now surface with a retry instead.
+    private func createInstructionFile() {
+        switch WorkspaceInstructionFile.create(in: root) {
+        case let .success(outcome):
+            if outcome.didWrite {
+                ProjectFileIndex.shared.invalidate(root: root)
+                tree.refresh(expandedDirectories: expanded.map { URL(fileURLWithPath: $0, isDirectory: true) })
+            }
+            instructionFileFailure = nil
+            openFile(outcome.url, true)
+        case let .failure(failure):
+            instructionFileFailure = failure
+        }
+    }
+
     private func performTrash() {
         guard let target = trashTarget, prepareMutation(target) else { return }
         let root = self.root
@@ -542,29 +721,10 @@ struct WorkspaceRailView: View {
         }
     }
 
-    /// Starter AGENTS.md dropped at the project root — the emerging convention
-    /// agent CLIs read for repo-specific guidance. Opens the existing file
-    /// instead when one is already there.
-    static let agentsTemplate = """
-    # AGENTS.md
-
-    Guidance for AI agents working in this repository.
-
-    ## Project overview
-
-    Describe what this project is and how it fits together.
-
-    ## Commands
-
-    - Build:
-    - Test:
-    - Lint:
-
-    ## Conventions
-
-    Code style, structure, and review expectations agents should follow.
-    """
-
+    /// Compatibility surface retained for the original exclusive-create
+    /// regression suite. The live action uses `WorkspaceInstructionFile`, whose
+    /// low-level writer also rejects racing files and incomplete writes.
+    static let agentsTemplate = WorkspaceInstructionFile.template
 
     @ViewBuilder
     private func nodeRows(for directory: URL, depth: Int) -> some View {
@@ -575,15 +735,89 @@ struct WorkspaceRailView: View {
                     AnyView(nodeRows(for: node.url, depth: depth + 1))
                 }
             }
+            // A folder that is simply empty stays quiet. A folder Kaisola could
+            // not read looks identical from here unless it says so, which is
+            // how permission and I/O problems used to pass for empty ones.
+            if let failure = tree.loadFailure(for: directory) {
+                failureRow(failure, directory: directory, depth: depth)
+            }
         } else {
             HStack(spacing: 7) {
                 ProgressView().controlSize(.mini)
-                Text("Loading…").font(.caption).foregroundStyle(.tertiary)
+                Text("Loading…").font(.caption).foregroundStyle(.kaisolaTertiary)
             }
             .padding(.leading, CGFloat(depth) * 14 + 12)
             .padding(.vertical, 6)
             .task { tree.load(directory) }
         }
+    }
+
+    private func projectEmptyState(_ state: WorkspaceFilesEmptyState) -> some View {
+        VStack(spacing: 12) {
+            Spacer(minLength: 12)
+            VStack(spacing: 8) {
+                Image(systemName: state.systemImageName)
+                    .font(.system(size: 34, weight: .light))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Text(state.title)
+                    .font(.title3.weight(.semibold))
+                    .multilineTextAlignment(.center)
+                Text(state.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(state.title)
+            .accessibilityValue(state.message)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier(state.accessibilityIdentifier)
+            VStack(spacing: 8) {
+                Button(WorkspaceFilesEmptyState.newFileLabel) {
+                    beginCreate(.file, in: root)
+                }
+                .accessibilityLabel("New File in project")
+                .accessibilityIdentifier("files.empty.new-file")
+                Button(WorkspaceFilesEmptyState.newFolderLabel) {
+                    beginCreate(.folder, in: root)
+                }
+                .accessibilityLabel("New Folder in project")
+                .accessibilityIdentifier("files.empty.new-folder")
+            }
+            Spacer(minLength: 12)
+        }
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// The one row a failed directory gets: what went wrong, and a way back.
+    private func failureRow(
+        _ failure: ProjectFiles.DirectoryLoadFailure,
+        directory: URL,
+        depth: Int
+    ) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+            Text(failure.summary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+            Button("Retry") { tree.load(directory, force: true) }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .accessibilityIdentifier("files.retry")
+        }
+        .padding(.leading, CGFloat(depth) * 14 + 12)
+        .padding(.trailing, Self.optionsClearance - 10)
+        .padding(.vertical, 4)
+        .help(failure.diagnostic)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(failure.summary). \(failure.diagnostic)")
     }
 
     private func nodeRow(_ node: FileNode, depth: Int) -> some View {
@@ -596,7 +830,7 @@ struct WorkspaceRailView: View {
                     tree.load(node.url)
                 }
             } else {
-                openFile(node.url, false)
+                clicks.click(rowID: node.id) { pinned in openFile(node.url, pinned) }
             }
         } label: {
             HStack(spacing: 5) {
@@ -609,7 +843,7 @@ struct WorkspaceRailView: View {
                 }
                 Image(systemName: node.isDirectory ? "folder" : "doc.text")
                     .font(.caption)
-                    .foregroundStyle(node.isDirectory ? Color.accentColor : .secondary)
+                    .foregroundStyle(node.isDirectory ? Color.accentColor : .kaisolaSecondary)
                 fileName(node.name)
                 Spacer(minLength: 0)
             }
@@ -622,7 +856,7 @@ struct WorkspaceRailView: View {
             // its 6pt inset, plus a little air.
             .padding(.trailing, Self.optionsClearance)
             .background(
-                !node.isDirectory && selectedFile?.standardizedFileURL.path == node.url.standardizedFileURL.path
+                rowIsHighlighted(node)
                     ? Color.accentColor.opacity(0.15)
                     : .clear,
                 in: RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -630,31 +864,90 @@ struct WorkspaceRailView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .modifier(WorkspaceFileTreeAccessibilityModifier(
+            descriptor: WorkspaceFileTreeRowAccessibility(
+                name: node.name,
+                isDirectory: node.isDirectory,
+                depth: depth,
+                isExpanded: expanded.contains(node.id),
+                isSelected: !node.isDirectory
+                    && selectedFile?.standardizedFileURL.path == node.url.standardizedFileURL.path
+            ),
+            performDisclosure: {
+                guard node.isDirectory else { return }
+                if expanded.contains(node.id) {
+                    expanded.remove(node.id)
+                } else {
+                    expanded.insert(node.id)
+                    tree.load(node.url)
+                }
+            }
+        ))
         .accessibilityLabel(node.name)
         .id(node.id)
+        .focused($focusedRow, equals: node.id)
         .simultaneousGesture(
             TapGesture(count: 2).onEnded {
                 guard !node.isDirectory else { return }
-                openFile(node.url, true)
+                clicks.doubleClick(rowID: node.id) { pinned in openFile(node.url, pinned) }
             }
         )
         .contextMenu {
             itemActions(node)
         }
         .overlay(alignment: .trailing) {
-            itemMenu(node)
+            itemMenu(node, revealed: revealsRowActions(node))
                 .padding(.trailing, 6)
         }
+        .onHover { inside in setRowHover(node, inside) }
+    }
+
+    private func isSelected(_ node: FileNode) -> Bool {
+        !node.isDirectory
+            && selectedFile?.standardizedFileURL.path == node.url.standardizedFileURL.path
+    }
+
+    /// The pointer can only be over one row, but SwiftUI delivers the leave of
+    /// the row it left after the enter of the row it reached, so a blind clear
+    /// would erase the new row's hover.
+    private func setRowHover(_ node: FileNode, _ inside: Bool) {
+        if inside {
+            hoveredRow = node.id
+        } else if hoveredRow == node.id {
+            hoveredRow = nil
+        }
+    }
+
+    private func revealsRowActions(_ node: FileNode) -> Bool {
+        WorkspaceRowActions.isRevealed(
+            isHovering: hoveredRow == node.id,
+            isFocused: focusedRow == node.id,
+            isSelected: isSelected(node),
+            alwaysVisible: rowActionsAlwaysVisible
+        )
     }
 
     /// Room kept clear at the trailing edge for the floating options button.
     private static let optionsClearance: CGFloat = 30
 
+    /// The selected file, or — while a click waits out the double-click window
+    /// — the row that click will open. Without the second case a single click
+    /// would leave the rail looking untouched until the document arrived.
+    private func rowIsHighlighted(_ node: FileNode) -> Bool {
+        guard !node.isDirectory else { return false }
+        if let armedRowID = clicks.armedRowID { return armedRowID == node.id }
+        return selectedFile?.standardizedFileURL.path == node.url.standardizedFileURL.path
+    }
+
     private func fileName(_ name: String) -> some View {
         FadingFileName(text: name)
     }
 
-    private func itemMenu(_ node: FileNode) -> some View {
+    /// `revealed` drives opacity only. Dropping the menu from the hierarchy
+    /// would take its accessibility label with it and leave VoiceOver nothing
+    /// to land on, so a resting row keeps a fully described, fully hit-testable
+    /// control that simply is not drawn.
+    private func itemMenu(_ node: FileNode, revealed: Bool) -> some View {
         Menu {
             itemActions(node)
         } label: {
@@ -668,6 +961,8 @@ struct WorkspaceRailView: View {
         .fixedSize()
         .help("File options")
         .accessibilityLabel("Options for \(node.name)")
+        .opacity(revealed ? 1 : 0)
+        .animation(.easeInOut(duration: KaisolaVisualSystem.stateDuration), value: revealed)
     }
 
     @ViewBuilder
@@ -718,19 +1013,138 @@ struct WorkspaceRailView: View {
     }
 }
 
-private struct WorkspaceMoveSheet: View {
-    @Environment(\.dismiss) private var dismiss
+/// Decides what a click on a file row means, so a single click and a double
+/// click stay mutually exclusive.
+///
+/// SwiftUI fires a row `Button` on every mouse-up and the two-tap gesture fires
+/// on top of it, so one double click used to run the transient open twice and
+/// then the pinned open: three navigations, a tab flickering between preview
+/// and kept-open, and two preview loads for a document the user asked to keep.
+/// Clicks land here instead. The transient open waits out one double-click
+/// interval, and a second click inside that window cancels it and opens the
+/// file pinned, so exactly one open leaves the rail per gesture.
+///
+/// The wait is only observable if the row looks dead while it runs, hence
+/// `armedRowID`: the rail highlights the armed row immediately and the document
+/// arrives a beat later.
+@MainActor
+final class WorkspaceRowClickArbiter: ObservableObject {
+    /// The row whose transient open is waiting for a possible second click.
+    @Published private(set) var armedRowID: String?
+
+    /// The user's own double-click speed — never a longer wait than the window
+    /// AppKit itself uses to call two clicks a double click.
+    private let interval: @MainActor () -> TimeInterval
+    private let schedule: @MainActor (TimeInterval, @escaping @MainActor () -> Void) -> Void
+    /// Monotonic ticket. Every armed open and every settled burst carries one so
+    /// a timer that fires late can tell it was superseded.
+    private var sequence = 0
+    private var armedTicket = 0
+    /// The row a double click already answered. Trailing clicks of the same
+    /// burst — the button's second fire, a third click — are swallowed until
+    /// the window closes.
+    private var settledRowID: String?
+    private var settledTicket = 0
+
+    init(
+        interval: @escaping @MainActor () -> TimeInterval = { NSEvent.doubleClickInterval },
+        schedule: @escaping @MainActor (TimeInterval, @escaping @MainActor () -> Void) -> Void = { delay, work in
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(delay))
+                work()
+            }
+        }
+    ) {
+        self.interval = interval
+        self.schedule = schedule
+    }
+
+    /// One mouse-up on a file row. `open(true)` keeps the document open,
+    /// `open(false)` opens it as the replaceable preview.
+    func click(rowID: String, open: @escaping (Bool) -> Void) {
+        if settledRowID == rowID { return }
+        if armedRowID == rowID {
+            settle(rowID: rowID, open: open)
+        } else {
+            arm(rowID: rowID, open: open)
+        }
+    }
+
+    /// The two-tap gesture. Whether it arrives before or after the button's
+    /// second fire is not guaranteed, so either one may settle the burst and
+    /// the other is swallowed.
+    func doubleClick(rowID: String, open: @escaping (Bool) -> Void) {
+        guard settledRowID != rowID else { return }
+        settle(rowID: rowID, open: open)
+    }
+
+    /// Clicking a second row before the window closes replaces the pending open
+    /// rather than stacking two preview loads: the rail follows the last click.
+    private func arm(rowID: String, open: @escaping (Bool) -> Void) {
+        sequence += 1
+        let ticket = sequence
+        armedTicket = ticket
+        armedRowID = rowID
+        schedule(interval()) { [weak self] in
+            guard let self, self.armedTicket == ticket else { return }
+            self.armedRowID = nil
+            open(false)
+        }
+    }
+
+    private func settle(rowID: String, open: (Bool) -> Void) {
+        sequence += 1
+        let ticket = sequence
+        if armedRowID == rowID {
+            // Bumping the ticket is what cancels the armed transient open.
+            armedTicket = ticket
+            armedRowID = nil
+        }
+        settledTicket = ticket
+        settledRowID = rowID
+        schedule(interval()) { [weak self] in
+            guard let self, self.settledTicket == ticket else { return }
+            self.settledRowID = nil
+        }
+        open(true)
+    }
+}
+
+/// What the Move sheet learns about an attempted move — the real result, not
+/// the fact that the work started.
+enum WorkspaceMoveOutcome: Equatable, Sendable {
+    case succeeded
+    case failed(String)
+}
+
+/// The Move sheet's own state: the destinations it found, the one the user
+/// picked, and how far the attempt has gotten. It lives outside the view so the
+/// rule that matters here — the sheet leaves only on a confirmed move — is a
+/// thing that can be exercised without presenting a sheet.
+@MainActor
+final class WorkspaceMoveController: ObservableObject {
+    enum Phase: Equatable {
+        case choosing
+        case moving
+        case failed(String)
+        case succeeded
+    }
 
     let root: URL
     let item: FileNode
-    let commit: (URL) -> Bool
 
-    @State private var directories: [URL] = []
-    @State private var selectedPath: String?
-    @State private var searchText = ""
-    @State private var isLoading = true
+    @Published private(set) var directories: [URL] = []
+    @Published private(set) var isLoading = true
+    @Published private(set) var phase: Phase = .choosing
+    @Published private(set) var selectedPath: String?
+    @Published var searchText = ""
 
-    private var visibleDirectories: [URL] {
+    init(root: URL, item: FileNode) {
+        self.root = root
+        self.item = item
+    }
+
+    var visibleDirectories: [URL] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return directories }
         return directories.filter {
@@ -738,10 +1152,187 @@ private struct WorkspaceMoveSheet: View {
         }
     }
 
-    private var selectedDirectory: URL? {
+    var selectedDirectory: URL? {
         guard let selectedPath else { return nil }
         return visibleDirectories.first { $0.path == selectedPath }
     }
+
+    var isMoving: Bool { phase == .moving }
+
+    /// Return and the Move button are inert until a row activation records an
+    /// explicit choice. Loading and filtering never manufacture that choice.
+    var canSubmit: Bool {
+        !isLoading && !isMoving && !isFinished && selectedDirectory != nil
+    }
+
+    /// The full project-relative choice spoken after pointer or keyboard row
+    /// activation. Read from the unfiltered directory set so changing search
+    /// text cannot silently change (or rename) the user's choice.
+    var selectionAnnouncement: String? {
+        guard let selectedPath,
+              let selected = directories.first(where: { $0.path == selectedPath }) else {
+            return nil
+        }
+        return "Selected move destination: \(destinationLabel(selected))"
+    }
+
+    /// The one failure the user needs in front of them, shown in the sheet
+    /// rather than in a toast behind it.
+    var failureMessage: String? {
+        guard case let .failed(message) = phase else { return nil }
+        return message
+    }
+
+    /// The sheet's only permission to close itself.
+    var isFinished: Bool { phase == .succeeded }
+
+    func select(_ directory: URL) {
+        let path = directory.standardizedFileURL.path
+        guard !isMoving, visibleDirectories.contains(where: { $0.path == path }) else { return }
+        selectedPath = path
+        // The diagnostic described the previous destination.
+        if case .failed = phase { phase = .choosing }
+    }
+
+    func loadDestinations() async {
+        isLoading = true
+        let root = root
+        let movingItem = item.url
+        let loaded = await Task.detached(priority: .utility) {
+            ProjectFiles.moveDestinationDirectories(root: root, movingItem: movingItem)
+        }.value
+        guard !Task.isCancelled else { return }
+        directories = loaded
+        if let selectedPath, !loaded.contains(where: { $0.path == selectedPath }) {
+            self.selectedPath = nil
+        }
+        isLoading = false
+    }
+
+    /// Awaits the move and records the result. The item and the destination are
+    /// left exactly as they were on failure, so Retry is one more click rather
+    /// than a rebuilt operation.
+    func submit(_ move: @MainActor (URL) async -> WorkspaceMoveOutcome) async {
+        guard !isMoving, !isFinished, let destination = selectedDirectory else { return }
+        phase = .moving
+        switch await move(destination) {
+        case .succeeded:
+            phase = .succeeded
+        case let .failed(message):
+            phase = .failed(message)
+        }
+    }
+
+    func destinationLabel(_ directory: URL) -> String {
+        let root = root.standardizedFileURL
+        let directory = directory.standardizedFileURL
+        guard directory.path != root.path else {
+            return "\(root.lastPathComponent) — Project Root"
+        }
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard directory.path.hasPrefix(prefix) else { return directory.lastPathComponent }
+        return String(directory.path.dropFirst(prefix.count))
+    }
+}
+
+enum WorkspaceAgentsFileCreation {
+    typealias Writer = (_ data: Data, _ target: URL) throws -> Void
+
+    enum Failure: Error, Equatable, Sendable {
+        case destinationExists
+        case permissionDenied
+        case diskFull
+        case other
+
+        var message: String {
+            switch self {
+            case .destinationExists:
+                "AGENTS.md already exists. Rename or remove it, then try again."
+            case .permissionDenied:
+                "Kaisola doesn't have permission to create AGENTS.md in this project."
+            case .diskFull:
+                "There isn't enough disk space to create AGENTS.md."
+            case .other:
+                "Kaisola couldn't create AGENTS.md. Check the project and try again."
+            }
+        }
+    }
+
+    static func attempt(in root: URL, template: String) -> Result<URL, Failure> {
+        attempt(in: root, template: template) { data, target in
+            // Foundation rejects combining `.atomic` with
+            // `.withoutOverwriting`. Exclusive creation is the required
+            // boundary here: a racing AGENTS.md must never be replaced.
+            try data.write(to: target, options: .withoutOverwriting)
+        }
+    }
+
+    static func attempt(
+        in root: URL,
+        template: String,
+        writer: Writer
+    ) -> Result<URL, Failure> {
+        let target = root.standardizedFileURL.appendingPathComponent("AGENTS.md")
+        do {
+            try writer(Data(template.utf8), target)
+            return .success(target)
+        } catch {
+            return .failure(classify(error))
+        }
+    }
+
+    private static func classify(_ error: any Error) -> Failure {
+        if let cocoaError = error as? CocoaError {
+            switch cocoaError.code {
+            case .fileWriteFileExists:
+                return .destinationExists
+            case .fileReadNoPermission, .fileWriteNoPermission, .fileWriteVolumeReadOnly:
+                return .permissionDenied
+            case .fileWriteOutOfSpace:
+                return .diskFull
+            default:
+                break
+            }
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain {
+            switch nsError.code {
+            case Int(EEXIST):
+                return .destinationExists
+            case Int(EACCES), Int(EPERM), Int(EROFS):
+                return .permissionDenied
+            case Int(ENOSPC):
+                return .diskFull
+            default:
+                break
+            }
+        }
+        return .other
+    }
+}
+
+private struct WorkspaceMoveSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let root: URL
+    let item: FileNode
+    let move: @MainActor (URL) async -> WorkspaceMoveOutcome
+
+    @StateObject private var controller: WorkspaceMoveController
+
+    init(
+        root: URL,
+        item: FileNode,
+        move: @escaping @MainActor (URL) async -> WorkspaceMoveOutcome
+    ) {
+        self.root = root
+        self.item = item
+        self.move = move
+        _controller = StateObject(wrappedValue: WorkspaceMoveController(root: root, item: item))
+    }
+
+    private var visibleDirectories: [URL] { controller.visibleDirectories }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -750,27 +1341,28 @@ private struct WorkspaceMoveSheet: View {
                     .font(.title3.weight(.semibold))
                 Text("Choose a folder inside \(root.lastPathComponent). The item will keep its name.")
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
 
-            TextField("Search folders", text: $searchText)
+            TextField("Search folders", text: $controller.searchText)
                 .textFieldStyle(.roundedBorder)
+                .disabled(controller.isMoving)
 
             Group {
-                if isLoading {
+                if controller.isLoading {
                     VStack(spacing: 10) {
                         ProgressView().controlSize(.small)
                         Text("Finding project folders…")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if visibleDirectories.isEmpty {
                     ContentUnavailableView(
-                        searchText.isEmpty ? "No Other Folders" : "No Matching Folders",
+                        controller.searchText.isEmpty ? "No Other Folders" : "No Matching Folders",
                         systemImage: "folder.badge.minus",
                         description: Text(
-                            searchText.isEmpty
+                            controller.searchText.isEmpty
                                 ? "This item has no safe cross-directory destination."
                                 : "Try a different folder search."
                         )
@@ -779,15 +1371,15 @@ private struct WorkspaceMoveSheet: View {
                     ScrollView {
                         LazyVStack(spacing: 2) {
                             ForEach(visibleDirectories, id: \.path) { directory in
-                                let isSelected = selectedPath == directory.path
+                                let isSelected = controller.selectedPath == directory.path
                                 Button {
-                                    selectedPath = directory.path
+                                    controller.select(directory)
                                 } label: {
                                     HStack(spacing: 9) {
                                         Image(systemName: directory.path == root.standardizedFileURL.path
                                             ? "shippingbox"
                                             : "folder")
-                                            .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                                            .foregroundStyle(isSelected ? Color.accentColor : .kaisolaSecondary)
                                             .frame(width: 18)
                                         Text(destinationLabel(directory))
                                             .font(.callout)
@@ -809,8 +1401,14 @@ private struct WorkspaceMoveSheet: View {
                                     .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
+                                .disabled(controller.isMoving)
                                 .accessibilityLabel("Move destination \(destinationLabel(directory))")
-                                .accessibilityValue(isSelected ? "Selected" : "Not selected")
+                                .accessibilityValue(
+                                    isSelected
+                                        ? "Selected. \(destinationLabel(directory))"
+                                        : "Not selected"
+                                )
+                                .accessibilityHint("Choose this folder as the move destination")
                             }
                         }
                         .padding(4)
@@ -828,52 +1426,82 @@ private struct WorkspaceMoveSheet: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             Divider()
-            HStack {
-                Spacer()
+            if let failure = controller.failureMessage {
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                    Text(failure)
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(
+                    Color.orange.opacity(0.13),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Move failed. \(failure)")
+                .accessibilityIdentifier("workspace.move.failure")
+            }
+            HStack(spacing: 9) {
+                if controller.isMoving {
+                    ProgressView().controlSize(.small)
+                    Text("Moving \(item.name)…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .accessibilityIdentifier("workspace.move.progress")
+                }
+                Spacer(minLength: 0)
                 Button("Cancel", role: .cancel) { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Move") {
-                    guard let selectedDirectory, commit(selectedDirectory) else { return }
-                    dismiss()
+                    // The move is already in flight; leaving now would put its
+                    // result back where this sheet cannot show it.
+                    .disabled(controller.isMoving)
+                Button(controller.failureMessage == nil ? "Move" : "Retry") {
+                    Task { await submit() }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(selectedDirectory == nil || isLoading)
+                .disabled(!controller.canSubmit)
+                .accessibilityIdentifier("workspace.move.commit")
             }
         }
         .padding(20)
         .frame(width: 460, height: 440)
+        .interactiveDismissDisabled(controller.isMoving)
         .task(id: item.id) {
-            isLoading = true
-            let root = root
-            let movingItem = item.url
-            let scan = Task.detached(priority: .utility) {
-                ProjectFiles.moveDestinationDirectories(
-                    root: root,
-                    movingItem: movingItem
-                )
-            }
-            let loaded = await scan.value
-            guard !Task.isCancelled else { return }
-            directories = loaded
-            selectedPath = loaded.first?.path
-            isLoading = false
+            await controller.loadDestinations()
         }
-        .onChange(of: searchText) { _, _ in
-            if selectedDirectory == nil {
-                selectedPath = visibleDirectories.first?.path
-            }
+        .onChange(of: controller.selectedPath) { _, _ in
+            announceSelection()
         }
     }
 
+    /// The sheet leaves only once the move is confirmed. Anything else keeps
+    /// the item, the destination and the diagnostic on screen together.
+    private func submit() async {
+        await controller.submit(move)
+        if controller.isFinished { dismiss() }
+    }
+
     private func destinationLabel(_ directory: URL) -> String {
-        let root = root.standardizedFileURL
-        let directory = directory.standardizedFileURL
-        guard directory.path != root.path else {
-            return "\(root.lastPathComponent) — Project Root"
-        }
-        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
-        guard directory.path.hasPrefix(prefix) else { return directory.lastPathComponent }
-        return String(directory.path.dropFirst(prefix.count))
+        controller.destinationLabel(directory)
+    }
+
+    private func announceSelection() {
+        guard let announcement = controller.selectionAnnouncement else { return }
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: announcement,
+                .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+            ]
+        )
     }
 }
 
@@ -933,6 +1561,180 @@ struct FadingFileName: View {
                     .frame(width: fadeWidth)
                 }
             }
+    }
+}
+
+/// The project's starter AGENTS.md — the emerging convention agent CLIs read
+/// for repo-specific guidance.
+///
+/// Creation is its own type because the rail may only open a document it can
+/// prove is on disk. The write is exclusive (an existing file is never
+/// overwritten), a partial write is discarded rather than left looking like a
+/// real instruction file, and every failure comes back with advice a person can
+/// act on before retrying the same action.
+enum WorkspaceInstructionFile {
+    static let fileName = "AGENTS.md"
+
+    enum Outcome: Equatable, Sendable {
+        /// This action wrote the starter file.
+        case created(URL)
+        /// A regular file was already there; nothing was written.
+        case alreadyExisted(URL)
+
+        /// The file the rail may open. It exists in both cases — that is the
+        /// point of returning an outcome rather than a bare path.
+        var url: URL {
+            switch self {
+            case let .created(url), let .alreadyExisted(url): url
+            }
+        }
+
+        var didWrite: Bool {
+            if case .created = self { true } else { false }
+        }
+    }
+
+    struct Failure: Error, Equatable, Sendable {
+        enum Reason: Equatable, Sendable {
+            case collision
+            case permission
+            case diskFull
+            case workspaceUnavailable
+            case unknown
+        }
+
+        let reason: Reason
+
+        /// Each message names the cause the person can clear, because the alert
+        /// that carries it offers the action again straight away.
+        var message: String {
+            switch reason {
+            case .collision:
+                "A folder or link named \(fileName) is already in this project. Rename or remove it, then try again."
+            case .permission:
+                "Kaisola doesn't have permission to write \(fileName) in this project folder."
+            case .diskFull:
+                "The disk is full, so \(fileName) wasn't written. Free some space, then try again."
+            case .workspaceUnavailable:
+                "The project folder is unavailable, so \(fileName) wasn't written."
+            case .unknown:
+                "Kaisola couldn't write \(fileName). Check the project folder, then try again."
+            }
+        }
+    }
+
+    /// Creates the starter file when it is missing. Success means a real file
+    /// is on disk right now; a failure never yields a path to open.
+    static func create(in workspaceRoot: URL) -> Result<Outcome, Failure> {
+        let root = workspaceRoot.standardizedFileURL
+        var rootIsDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: root.path, isDirectory: &rootIsDirectory),
+              rootIsDirectory.boolValue else {
+            return .failure(Failure(reason: .workspaceUnavailable))
+        }
+
+        let target = root.appendingPathComponent(fileName).standardizedFileURL
+        var targetIsDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: target.path, isDirectory: &targetIsDirectory) {
+            // A folder or a link under that name is a collision, not an
+            // instruction file: opening it would preview something that is not
+            // the guidance the action promised.
+            guard !targetIsDirectory.boolValue else {
+                return .failure(Failure(reason: .collision))
+            }
+            let values = try? target.resourceValues(forKeys: [.isSymbolicLinkKey])
+            guard values?.isSymbolicLink != true else {
+                return .failure(Failure(reason: .collision))
+            }
+            return .success(.alreadyExisted(target))
+        }
+
+        if let failure = write(template, to: target) {
+            return .failure(failure)
+        }
+        guard FileManager.default.fileExists(atPath: target.path) else {
+            return .failure(Failure(reason: .unknown))
+        }
+        return .success(.created(target))
+    }
+
+    /// errno is the only signal that separates a full disk from a folder the
+    /// app may not write to, and the two need different advice.
+    static func failure(forErrno code: Int32) -> Failure {
+        switch code {
+        case EEXIST:
+            Failure(reason: .collision)
+        case EACCES, EPERM, EROFS:
+            Failure(reason: .permission)
+        case ENOSPC, EDQUOT, EFBIG:
+            Failure(reason: .diskFull)
+        case ENOENT, ENOTDIR:
+            Failure(reason: .workspaceUnavailable)
+        default:
+            Failure(reason: .unknown)
+        }
+    }
+
+    static let template = """
+    # AGENTS.md
+
+    Guidance for AI agents working in this repository.
+
+    ## Project overview
+
+    Describe what this project is and how it fits together.
+
+    ## Commands
+
+    - Build:
+    - Test:
+    - Lint:
+
+    ## Conventions
+
+    Code style, structure, and review expectations agents should follow.
+    """
+
+    /// Exclusive create plus a complete write, or nothing at all. `O_EXCL`
+    /// keeps the filesystem the collision authority even if a file appears
+    /// between the check above and this call.
+    private static func write(_ contents: String, to destination: URL) -> Failure? {
+        let descriptor = destination.path.withCString { path in
+            Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
+        }
+        guard descriptor >= 0 else { return failure(forErrno: errno) }
+
+        let bytes = Array(contents.utf8)
+        var offset = 0
+        while offset < bytes.count {
+            let written = bytes.withUnsafeBytes { buffer in
+                Darwin.write(descriptor, buffer.baseAddress! + offset, bytes.count - offset)
+            }
+            if written < 0 {
+                let code = errno
+                if code == EINTR { continue }
+                return discard(descriptor, at: destination, reporting: failure(forErrno: code))
+            }
+            offset += written
+        }
+        // A truncated instruction file is worse than none: it would read as
+        // real guidance, and the retry would then collide with itself.
+        guard Darwin.close(descriptor) == 0 else {
+            let code = errno
+            try? FileManager.default.removeItem(at: destination)
+            return failure(forErrno: code)
+        }
+        return nil
+    }
+
+    private static func discard(
+        _ descriptor: Int32,
+        at destination: URL,
+        reporting failure: Failure
+    ) -> Failure {
+        Darwin.close(descriptor)
+        try? FileManager.default.removeItem(at: destination)
+        return failure
     }
 }
 

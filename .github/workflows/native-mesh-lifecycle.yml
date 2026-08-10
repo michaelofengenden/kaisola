@@ -1,0 +1,92 @@
+name: native-mesh-lifecycle
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  required-mesh-lifecycle:
+    runs-on: macos-15
+    timeout-minutes: 25
+    env:
+      KAISOLA_REQUIRE_MESH_INTEGRATION: '1'
+      KAISOLA_EXPECTED_NODE_VERSION: '22.23.1'
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22.23.1'
+
+      - name: Prepare pinned runtime and evidence directory
+        shell: bash
+        env:
+          KAISOLA_MESH_LIFECYCLE_RECEIPT: ${{ runner.temp }}/kaisola-mesh-lifecycle/receipt.json
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/kaisola-mesh-lifecycle"
+          mkdir -p "$evidence"
+          printf 'KAISOLA_NODE=%s\n' "$(command -v node)" >> "$GITHUB_ENV"
+          node --version > "$evidence/node-version.txt"
+          git rev-parse HEAD > "$evidence/commit.txt"
+          # App-hosted XCTest does not inherit arbitrary xcodebuild environment
+          # variables. Hand it one ignored, owner-only, fail-closed contract.
+          config="native/KaisolaMac/.artifacts/required-mesh-lifecycle.json"
+          mkdir -p "$(dirname "$config")"
+          node - "$config" "$(command -v node)" "$KAISOLA_MESH_LIFECYCLE_RECEIPT" <<'NODE'
+          const fs = require('node:fs')
+          const [configPath, nodePath, receiptPath] = process.argv.slice(2)
+          fs.writeFileSync(configPath, `${JSON.stringify({
+            schemaVersion: 1,
+            nodePath,
+            nodeVersion: '22.23.1',
+            receiptPath,
+          })}\n`, { mode: 0o600 })
+          fs.chmodSync(configPath, 0o600)
+          NODE
+
+      - name: Run required Mesh suspend and destroy lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/kaisola-mesh-lifecycle"
+          xcodebuild \
+            -project native/KaisolaMac/KaisolaMac.xcodeproj \
+            -scheme Kaisola \
+            -configuration Debug \
+            -destination "platform=macOS,arch=$(uname -m)" \
+            -derivedDataPath "$RUNNER_TEMP/kaisola-mesh-lifecycle-derived" \
+            -resultBundlePath "$evidence/MeshLifecycle.xcresult" \
+            -disableAutomaticPackageResolution \
+            -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackageUpdates \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=YES \
+            ARCHS="$(uname -m)" \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            KAISOLA_PACKAGE_BROKER_HELPER=0 \
+            -only-testing:KaisolaTests/MeshSessionTests/testMeshSuspendPreservesRecoverableWorkAndConfirmedDestroyCleansIt \
+            test 2>&1 | tee "$evidence/xcodebuild.log"
+
+      - name: Validate redacted Mesh lifecycle receipt
+        shell: bash
+        env:
+          KAISOLA_MESH_LIFECYCLE_RECEIPT: ${{ runner.temp }}/kaisola-mesh-lifecycle/receipt.json
+        run: |
+          set -euo pipefail
+          node scripts/native-mesh-lifecycle-receipt.cjs \
+            --receipt "$KAISOLA_MESH_LIFECYCLE_RECEIPT" \
+            | tee "$RUNNER_TEMP/kaisola-mesh-lifecycle/validated-summary.json"
+
+      - name: Publish Mesh lifecycle evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-mesh-lifecycle-${{ github.sha }}
+          path: ${{ runner.temp }}/kaisola-mesh-lifecycle
+          if-no-files-found: error
+          retention-days: 14

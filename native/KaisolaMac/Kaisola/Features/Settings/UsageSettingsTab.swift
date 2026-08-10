@@ -49,12 +49,12 @@ struct UsageSettingsTab: View {
                 ProgressView().controlSize(.small)
                 Text("Reading provider account limits…")
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
         } else if let error = usage.planUsageError {
             Label(error, systemImage: "exclamationmark.triangle")
                 .font(.callout)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .fixedSize(horizontal: false, vertical: true)
         } else {
             Label(
@@ -62,7 +62,7 @@ struct UsageSettingsTab: View {
                 systemImage: "person.2"
             )
             .font(.callout)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -85,7 +85,7 @@ struct UsageSettingsTab: View {
                         HStack {
                             Text("Each account is read separately, with no model prompt and no copied credentials.")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .fixedSize(horizontal: false, vertical: true)
                             Spacer(minLength: 12)
                             Button {
@@ -100,6 +100,22 @@ struct UsageSettingsTab: View {
                             .controlSize(.small)
                             .disabled(usage.isRefreshingPlanUsage)
                             .accessibilityLabel("Refresh account limits")
+                        }
+
+                        if let staleness = usage.planUsageStaleness {
+                            let timestamp = staleness.lastSuccessfulRefresh.formatted(
+                                date: .abbreviated,
+                                time: .shortened
+                            )
+                            Label(
+                                staleness.notice(lastUpdatedDescription: timestamp),
+                                systemImage: "exclamationmark.triangle"
+                            )
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityIdentifier("usage.plan.stale-snapshot")
                         }
 
                         // A configured account gets a card even before its
@@ -124,28 +140,32 @@ struct UsageSettingsTab: View {
                             // label, a plan pill, three meters — sits happily at
                             // 250, and the directory line truncates as it always
                             // did.
-                            LazyVGrid(
-                                columns: [GridItem(.adaptive(minimum: 250), spacing: 10, alignment: .top)],
-                                alignment: .leading,
-                                spacing: 10
-                            ) {
-                                ForEach(accountProfiles) { profile in
-                                    SubscriptionCardView(
-                                        profile: profile,
-                                        usage: reading(for: profile),
-                                        isRefreshing: usage.isRefreshingPlanUsage,
-                                        now: Date(),
-                                        isCurrentProject: currentProjectIDs.contains(profile.id),
-                                    onSignIn: { signingIn = profile },
-                                        onReveal: { reveal(profile) },
-                                        onRemove: { pendingAccountRemoval = profile }
-                                    )
-                                }
-                                // A reading with no matching configured profile
-                                // — the CLI's own default login, which has no
-                                // named account entry.
-                                ForEach(unmatchedReadings) { provider in
-                                    ProviderPlanUsageRow(provider: provider)
+                            // Reset countdowns and relative update ages remain
+                            // truthful while Settings stays open.
+                            TimelineView(.periodic(from: .now, by: 60)) { timeline in
+                                LazyVGrid(
+                                    columns: [GridItem(.adaptive(minimum: 250), spacing: 10, alignment: .top)],
+                                    alignment: .leading,
+                                    spacing: 10
+                                ) {
+                                    ForEach(accountProfiles) { profile in
+                                        SubscriptionCardView(
+                                            profile: profile,
+                                            usage: reading(for: profile),
+                                            isRefreshing: usage.isRefreshingPlanUsage,
+                                            now: timeline.date,
+                                            isCurrentProject: currentProjectIDs.contains(profile.id),
+                                            onSignIn: { signingIn = profile },
+                                            onReveal: { reveal(profile) },
+                                            onRemove: { pendingAccountRemoval = profile }
+                                        )
+                                    }
+                                    // A reading with no matching configured profile
+                                    // — the CLI's own default login, which has no
+                                    // named account entry.
+                                    ForEach(unmatchedReadings) { provider in
+                                        ProviderPlanUsageRow(provider: provider, now: timeline.date)
+                                    }
                                 }
                             }
                         }
@@ -158,7 +178,7 @@ struct UsageSettingsTab: View {
                     if usage.byChat.isEmpty {
                         Text("Context usage appears once an agent chat reports a window.")
                             .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .fixedSize(horizontal: false, vertical: true)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 16)
@@ -327,7 +347,7 @@ private struct ProviderPlanUsageRow: View {
                         .lineLimit(1)
                     Text("Signed in to the CLI directly")
                         .font(.caption2)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.kaisolaTertiary)
                 }
                 Spacer(minLength: 6)
                 if let plan = provider.plan, !plan.isEmpty {
@@ -342,7 +362,7 @@ private struct ProviderPlanUsageRow: View {
             if let account = provider.account, !account.isEmpty {
                 Text(account)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
@@ -353,12 +373,27 @@ private struct ProviderPlanUsageRow: View {
                     systemImage: provider.ok ? "info.circle" : "exclamationmark.circle"
                 )
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .lineLimit(2)
             } else {
-                ForEach(provider.windows) { window in
-                    SubscriptionUsageMeter(window: window, now: now)
+                ForEach(provider.windowRows) { row in
+                    SubscriptionUsageMeter(window: row.window, now: now)
                 }
+            }
+
+            let provenance = SubscriptionCardView.provenanceCaption(
+                sourceLabel: provider.sourceLabel,
+                updatedAt: provider.updatedAt,
+                now: now
+            )
+            if !provenance.isEmpty {
+                Text(provenance)
+                    .font(.caption2)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(provenance)
+                    .accessibilityLabel("Usage source: \(provenance)")
             }
         }
         .padding(12)
@@ -396,7 +431,7 @@ private struct ChatUsageRow: View {
                 Spacer()
                 Text(agentName)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             ProgressView(value: fraction)
                 .tint(fraction >= 0.85 ? .orange : .accentColor)
@@ -405,16 +440,16 @@ private struct ChatUsageRow: View {
             HStack {
                 Text("\(UsageSettingsTab.tokens(chat.latestUsed)) / \(UsageSettingsTab.tokens(chat.latestMax))")
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Spacer()
                 Text("peak \(UsageSettingsTab.tokens(chat.peakUsed)) · \(chat.turns) turn\(chat.turns == 1 ? "" : "s")")
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
             }
             if let amount = chat.costAmount {
                 Text(amount, format: .currency(code: chat.costCurrency ?? "USD"))
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             if !chat.recentTurns.isEmpty {
                 // The per-turn ledger, newest first: which turns spent the
@@ -423,7 +458,7 @@ private struct ChatUsageRow: View {
                     .map { Self.turnLabel($0) }
                     .joined(separator: " · "))
                     .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .lineLimit(1)
                     .help("Context change per completed turn, newest first. Negative is compaction. This session only.")
                     .accessibilityLabel("Recent turns, newest first")

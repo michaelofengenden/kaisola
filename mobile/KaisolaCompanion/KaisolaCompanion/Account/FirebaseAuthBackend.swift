@@ -151,28 +151,74 @@ enum KeychainAuthInteractionPolicy: Equatable, Sendable {
     }
 }
 
+enum KeychainAuthQueryMode: Equatable, Sendable {
+    case dataProtection
+    case legacy
+}
+
+/// Process-wide mode for one secure-store instance. A missing entitlement may
+/// move an operation from the data-protection keychain to the legacy keychain,
+/// but a legacy attempt is terminal. Keeping the attempted mode explicit also
+/// lets a stale concurrent data-protection query join an already activated
+/// fallback without ever retrying the legacy query.
+final class KeychainAuthFallbackState: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedMode = KeychainAuthQueryMode.dataProtection
+
+    var queryMode: KeychainAuthQueryMode {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedMode
+    }
+
+    func retryMode(
+        afterMissingEntitlementIn attemptedMode: KeychainAuthQueryMode
+    ) -> KeychainAuthQueryMode? {
+        guard attemptedMode == .dataProtection else { return nil }
+        lock.lock()
+        defer { lock.unlock() }
+        storedMode = .legacy
+        return .legacy
+    }
+}
+
+struct KeychainAuthSecurityOperations: @unchecked Sendable {
+    let copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    let update: (CFDictionary, CFDictionary) -> OSStatus
+    let add: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    let delete: (CFDictionary) -> OSStatus
+
+    static let live = KeychainAuthSecurityOperations(
+        copyMatching: { SecItemCopyMatching($0, $1) },
+        update: { SecItemUpdate($0, $1) },
+        add: { SecItemAdd($0, $1) },
+        delete: { SecItemDelete($0) }
+    )
+}
+
 final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
     private let service: String
     private let interactionPolicy: KeychainAuthInteractionPolicy
+    private let securityOperations: KeychainAuthSecurityOperations
     /// The data-protection keychain needs an application-identifier
     /// entitlement on macOS; a build signed without one gets
     /// errSecMissingEntitlement on EVERY operation — which shipped as
     /// "sign-in doesn't work" in 0.1.109. Once the modern keychain refuses,
     /// this store falls back to the legacy keychain for the process; builds
     /// that do carry the entitlement keep the modern, never-prompting path.
-    private let fallbackLock = NSLock()
-    private var useLegacyKeychain = false
+    private let fallbackState = KeychainAuthFallbackState()
     /// One authentication context per store, allocated lazily — building one
     /// per QUERY exhausted iOS's per-process LAContext allocation cap under
     /// the companion test suite (the fallback/migration paths issue several
     /// queries per operation), crashing with "exceeded number of allocated
     /// contexts". The context carries no per-operation state, so sharing is
     /// semantically identical.
+    private let authenticationContextLock = NSLock()
     private var cachedAuthenticationContext: LAContext?
 
     private func authenticationContext() -> LAContext {
-        fallbackLock.lock()
-        defer { fallbackLock.unlock() }
+        authenticationContextLock.lock()
+        defer { authenticationContextLock.unlock() }
         if let cachedAuthenticationContext { return cachedAuthenticationContext }
         let context = interactionPolicy.makeAuthenticationContext()
         cachedAuthenticationContext = context
@@ -189,42 +235,41 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
 
     init(
         service: String = KeychainAuthSecureStore.defaultService(),
-        interactionPolicy: KeychainAuthInteractionPolicy = .allowUserInteraction
+        interactionPolicy: KeychainAuthInteractionPolicy = .allowUserInteraction,
+        securityOperations: KeychainAuthSecurityOperations = .live
     ) {
         self.service = service
         self.interactionPolicy = interactionPolicy
+        self.securityOperations = securityOperations
     }
 
     func data(for key: String) throws -> Data? {
-        var query = baseQuery(for: key)
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var mode = fallbackState.queryMode
+        while true {
+            var query = baseQuery(for: key, mode: mode)
+            query[kSecReturnData as String] = true
+            query[kSecMatchLimit as String] = kSecMatchLimitOne
 
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        if status == errSecMissingEntitlement {
-            recordMissingEntitlement()
-            return try data(for: key)
+            var result: CFTypeRef?
+            let status = securityOperations.copyMatching(query as CFDictionary, &result)
+            if status == errSecMissingEntitlement {
+                guard let retryMode = fallbackState.retryMode(
+                    afterMissingEntitlementIn: mode
+                ) else {
+                    throw KeychainStoreError(status: status)
+                }
+                mode = retryMode
+                continue
+            }
+            if status == errSecItemNotFound {
+                guard mode == .dataProtection else { return nil }
+                return try migrateLegacyItemIfPresent(for: key)
+            }
+            guard status == errSecSuccess, let data = result as? Data else {
+                throw KeychainStoreError(status: status)
+            }
+            return data
         }
-        if status == errSecItemNotFound {
-            return try migrateLegacyItemIfPresent(for: key)
-        }
-        guard status == errSecSuccess, let data = result as? Data else {
-            throw KeychainStoreError(status: status)
-        }
-        return data
-    }
-
-    private var legacyFallbackActive: Bool {
-        fallbackLock.lock()
-        defer { fallbackLock.unlock() }
-        return useLegacyKeychain
-    }
-
-    private func recordMissingEntitlement() {
-        fallbackLock.lock()
-        defer { fallbackLock.unlock() }
-        useLegacyKeychain = true
     }
 
     /// One-time rescue of an item written by an older build into the legacy
@@ -239,55 +284,86 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
         legacy[kSecReturnData as String] = true
         legacy[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: CFTypeRef?
-        let status = SecItemCopyMatching(legacy as CFDictionary, &result)
+        let status = securityOperations.copyMatching(legacy as CFDictionary, &result)
         guard status == errSecSuccess, let data = result as? Data else { return nil }
         try set(data, for: key)
-        SecItemDelete(legacyQuery(for: key) as CFDictionary)
+        _ = securityOperations.delete(legacyQuery(for: key) as CFDictionary)
         return data
     }
 
     func set(_ data: Data, for key: String) throws {
-        let query = baseQuery(for: key)
         let attributes: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
         ]
-        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
-        if updateStatus == errSecSuccess { return }
-        if updateStatus == errSecMissingEntitlement {
-            recordMissingEntitlement()
-            return try set(data, for: key)
-        }
-        guard updateStatus == errSecItemNotFound else {
-            throw KeychainStoreError(status: updateStatus)
-        }
+        var mode = fallbackState.queryMode
+        while true {
+            let query = baseQuery(for: key, mode: mode)
+            let updateStatus = securityOperations.update(
+                query as CFDictionary,
+                attributes as CFDictionary
+            )
+            if updateStatus == errSecSuccess { return }
+            if updateStatus == errSecMissingEntitlement {
+                guard let retryMode = fallbackState.retryMode(
+                    afterMissingEntitlementIn: mode
+                ) else {
+                    throw KeychainStoreError(status: updateStatus)
+                }
+                mode = retryMode
+                continue
+            }
+            guard updateStatus == errSecItemNotFound else {
+                throw KeychainStoreError(status: updateStatus)
+            }
 
-        var addQuery = query
-        attributes.forEach { addQuery[$0.key] = $0.value }
-        let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
-        if addStatus == errSecMissingEntitlement {
-            recordMissingEntitlement()
-            return try set(data, for: key)
-        }
-        guard addStatus == errSecSuccess else {
-            throw KeychainStoreError(status: addStatus)
+            var addQuery = query
+            attributes.forEach { addQuery[$0.key] = $0.value }
+            let addStatus = securityOperations.add(addQuery as CFDictionary, nil)
+            if addStatus == errSecMissingEntitlement {
+                guard let retryMode = fallbackState.retryMode(
+                    afterMissingEntitlementIn: mode
+                ) else {
+                    throw KeychainStoreError(status: addStatus)
+                }
+                mode = retryMode
+                continue
+            }
+            guard addStatus == errSecSuccess else {
+                throw KeychainStoreError(status: addStatus)
+            }
+            return
         }
     }
 
     func removeData(for key: String) throws {
-        let status = SecItemDelete(baseQuery(for: key) as CFDictionary)
-        if status == errSecMissingEntitlement {
-            recordMissingEntitlement()
-            return try removeData(for: key)
-        }
-        // Sweep any stale legacy copy too, so sign-out removes both worlds.
-        SecItemDelete(legacyQuery(for: key) as CFDictionary)
-        guard status == errSecSuccess || status == errSecItemNotFound else {
-            throw KeychainStoreError(status: status)
+        var mode = fallbackState.queryMode
+        while true {
+            let status = securityOperations.delete(
+                baseQuery(for: key, mode: mode) as CFDictionary
+            )
+            if status == errSecMissingEntitlement {
+                guard let retryMode = fallbackState.retryMode(
+                    afterMissingEntitlementIn: mode
+                ) else {
+                    throw KeychainStoreError(status: status)
+                }
+                mode = retryMode
+                continue
+            }
+            // Sweep any stale legacy copy too, so sign-out removes both worlds.
+            _ = securityOperations.delete(legacyQuery(for: key) as CFDictionary)
+            guard status == errSecSuccess || status == errSecItemNotFound else {
+                throw KeychainStoreError(status: status)
+            }
+            return
         }
     }
 
-    private func baseQuery(for key: String) -> [String: Any] {
+    private func baseQuery(
+        for key: String,
+        mode: KeychainAuthQueryMode
+    ) -> [String: Any] {
         var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -298,7 +374,7 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
         // by a per-binary ACL — the fix for the per-update re-prompt. It
         // requires the application-identifier entitlement; a build without it
         // trips the errSecMissingEntitlement fallback above and stays legacy.
-        if !legacyFallbackActive {
+        if mode == .dataProtection {
             query[kSecUseDataProtectionKeychain as String] = true
         }
         return query

@@ -39,9 +39,72 @@ enum QuietIdentityMarkInk {
     }
 }
 
+/// What a rail row's title lane actually shows, at a real width in the real
+/// font.
+///
+/// The truncation is modelled rather than driven through CoreText: what these
+/// fixtures have to settle is whether two rows end up drawing the *same
+/// string*, and for that "the longest prefix that fits, plus an ellipsis" — and
+/// its middle-truncating twin — is the answer AppKit arrives at too. The
+/// measurement, the lane width and the font, is real.
+enum QuietRailLaneFixture {
+    /// Computed rather than stored: `NSFont` is not `Sendable`, and a stored
+    /// static is a shared mutable global under Swift 6 checking.
+    static var titleFont: NSFont { .systemFont(ofSize: QuietRailMetrics.titleText) }
+    static var timeFont: NSFont {
+        .monospacedDigitSystemFont(ofSize: QuietRailMetrics.secondaryText, weight: .regular)
+    }
+
+    /// The lane a session title gets at the rail's resting width, with a "now"
+    /// time label and no hover control — the geometry the issue reported in.
+    static var restingLane: CGFloat {
+        QuietRowBudget.titleWidth(
+            sidebarWidth: NativeWorkspaceChrome.projectSidebarIdealWidth,
+            timeLabelWidth: width(of: "now", in: timeFont),
+            showsReveal: false
+        )
+    }
+
+    static func width(of text: String, in font: NSFont) -> CGFloat {
+        (text as NSString).size(withAttributes: [.font: font]).width
+    }
+
+    /// How many leading characters of a title survive tail truncation.
+    static func tailCharacters(of title: String, in lane: CGFloat) -> Int {
+        guard !title.isEmpty else { return 0 }
+        var visible = 0
+        for count in 1 ... title.count {
+            guard width(of: String(title.prefix(count)) + "…", in: titleFont) <= lane else { break }
+            visible = count
+        }
+        return visible
+    }
+
+    /// What the row draws: the whole text when it fits, otherwise the text cut
+    /// the way this label says to cut it.
+    static func drawn(_ label: QuietRailLabel, in lane: CGFloat) -> String {
+        let text = label.text
+        guard !text.isEmpty, width(of: text, in: titleFont) > lane else { return text }
+        var drawn = "…"
+        for count in 1 ... text.count {
+            let candidate: String
+            switch label.truncation {
+            case .tail:
+                candidate = String(text.prefix(count)) + "…"
+            case .middle:
+                candidate = String(text.prefix((count + 1) / 2)) + "…" + String(text.suffix(count / 2))
+            }
+            guard width(of: candidate, in: titleFont) <= lane else { break }
+            drawn = candidate
+        }
+        return drawn
+    }
+}
+
 /// The rail's three pure derivations: who a row belongs to (`QuietIdentity`),
 /// what a row is called when its title carries no information
-/// (`QuietRailTitle`), and where a compact-list drag lands in the persisted
+/// (`QuietRailTitle`) or carries the same thing the row beside it does
+/// (`QuietRailLabels`), and where a compact-list drag lands in the persisted
 /// project order once the active project is pinned out of that list
 /// (`QuietRailOrder`).
 final class QuietIdentityMarkTests: XCTestCase {
@@ -585,6 +648,216 @@ final class QuietIdentityMarkTests: XCTestCase {
             QuietRailTitle.displayTitle(rawTitle: "  kaisola \n", projectName: "Kaisola", processName: "fish", ordinal: 4),
             "fish · 4"
         )
+    }
+
+    // MARK: - Repeated-prefix labels
+
+    /// The complaint: a project full of agent sessions names them all the same
+    /// way, the rail truncates from the tail, and the column that exists to
+    /// tell rows apart renders three different sessions as "Codex · MAT…".
+    func testRepeatedProviderPrefixesGiveWayToWhatTheRowsActuallySay() {
+        let titles = [
+            "Codex · MATLAB kernel bridge",
+            "Codex · MATLAB plotting spike",
+            "Codex · MATLAB solver notes",
+        ]
+        let labels = QuietRailLabels.labels(for: titles)
+
+        XCTAssertEqual(
+            labels.map(\.text),
+            ["MATLAB kernel bridge", "MATLAB plotting spike", "MATLAB solver notes"]
+        )
+        XCTAssertEqual(labels.map(\.droppedLead), Array(repeating: "Codex · ", count: 3))
+        // The lead was enough on its own — nothing here needs the middle.
+        XCTAssertEqual(labels.map(\.truncation), Array(repeating: .tail, count: 3))
+        // …and what the rows draw now differs inside the window the rail can
+        // actually show, which is the whole point.
+        XCTAssertEqual(Set(labels.map { visiblePrefix($0.text) }).count, 3)
+    }
+
+    /// "Handle many same-provider sessions in one project." Eight Codex rows
+    /// whose subjects diverge early: none of them *collide* at the window, so a
+    /// collision-only rule would leave all eight spending eight characters on
+    /// the word their identity mark already draws.
+    func testManySameProviderSessionsAllStopRepeatingTheProvider() {
+        let subjects = [
+            "sidebar width budget",
+            "changelog generator",
+            "release on push",
+            "glass energy modes",
+            "terminal image attach",
+            "worktree session tooling",
+            "markdown fidelity fix",
+            "native paired capture",
+        ]
+        let labels = QuietRailLabels.labels(for: subjects.map { "Codex · " + $0 })
+
+        XCTAssertEqual(labels.map(\.text), subjects)
+        XCTAssertTrue(labels.allSatisfy { $0.droppedLead == "Codex · " })
+        XCTAssertEqual(Set(labels.map { visiblePrefix($0.text) }).count, subjects.count)
+    }
+
+    /// The other half of the rule: a project whose rows share nothing gets its
+    /// titles back untouched. No chip, no elision, no middle truncation — the
+    /// resting rail is exactly what it was.
+    func testTitlesThatShareNothingAreDrawnVerbatim() {
+        let titles = ["build the rail", "Audit Kaisola Sidebar parity", "Ship the changelog generator"]
+        let labels = QuietRailLabels.labels(for: titles)
+
+        XCTAssertEqual(labels.map(\.text), titles)
+        XCTAssertTrue(labels.allSatisfy { $0.droppedLead.isEmpty })
+        XCTAssertTrue(labels.allSatisfy { $0.truncation == .tail })
+        XCTAssertTrue(labels.allSatisfy { !$0.elidesTitle })
+    }
+
+    /// `QuietRailTitle`'s ordinals share a lead and must keep it: without the
+    /// remainder floor these three rows would draw as "1", "2", "3".
+    func testProcessOrdinalRowsKeepTheirProcessName() {
+        let titles = (1...3).map { ordinal in
+            QuietRailTitle.displayTitle(rawTitle: "Kaisola", projectName: "Kaisola", processName: "zsh", ordinal: ordinal)
+        }
+        let labels = QuietRailLabels.labels(for: titles)
+
+        XCTAssertEqual(labels.map(\.text), ["zsh · 1", "zsh · 2", "zsh · 3"])
+        XCTAssertTrue(labels.allSatisfy { $0.droppedLead.isEmpty })
+    }
+
+    /// A lead is a whole segment or it is nothing. Two titles opening with the
+    /// same two words share no separator, so the rail keeps both words and
+    /// truncates from the middle instead — dropping "MATLAB kernel " would
+    /// delete the subject rather than a preamble.
+    func testASharedRunOfPlainWordsIsNeverCutOffTheFront() {
+        let titles = ["MATLAB kernel bridge alpha", "MATLAB kernel bridge beta"]
+        let labels = QuietRailLabels.labels(for: titles)
+
+        XCTAssertEqual(labels.map(\.text), titles)
+        XCTAssertTrue(labels.allSatisfy { $0.droppedLead.isEmpty })
+        XCTAssertEqual(labels.map(\.truncation), [.middle, .middle])
+        XCTAssertTrue(labels.allSatisfy { $0.elidesTitle })
+    }
+
+    /// Both steps on one row: the lead goes, and what is left still reads the
+    /// same for the first dozen characters, so the row keeps its tail too.
+    func testWhatTheLeadCannotSeparateTruncatesFromTheMiddle() {
+        let labels = QuietRailLabels.labels(for: [
+            "Codex · MATLAB kernel bridge alpha",
+            "Codex · MATLAB kernel bridge beta",
+        ])
+
+        XCTAssertEqual(labels.map(\.droppedLead), ["Codex · ", "Codex · "])
+        XCTAssertEqual(labels.map(\.text), ["MATLAB kernel bridge alpha", "MATLAB kernel bridge beta"])
+        XCTAssertEqual(labels.map(\.truncation), [.middle, .middle])
+    }
+
+    /// Nested segments collapse as far as they can, per sharing group rather
+    /// than per project: the two MATLAB rows lose more than the row that only
+    /// shares the provider.
+    func testNestedSegmentsCollapseAsFarAsTheirOwnGroupAllows() {
+        let labels = QuietRailLabels.labels(for: [
+            "Codex · MATLAB: kernel bridge",
+            "Codex · MATLAB: plotting spike",
+            "Codex · sidebar width budget",
+        ])
+
+        XCTAssertEqual(labels.map(\.droppedLead), ["Codex · MATLAB: ", "Codex · MATLAB: ", "Codex · "])
+        XCTAssertEqual(labels.map(\.text), ["kernel bridge", "plotting spike", "sidebar width budget"])
+    }
+
+    /// Rows that fit the lane whole are not paying for their repeated lead, so
+    /// they keep it — the elision is a width economy, not a style rule.
+    func testAShortRepeatedLeadIsLeftAloneWhenNobodyIsPayingForIt() {
+        let labels = QuietRailLabels.labels(for: ["ops: up", "ops: down"])
+        XCTAssertTrue(labels.allSatisfy { $0.droppedLead.isEmpty })
+    }
+
+    /// All-or-nothing per sharing group: one row that would be left holding
+    /// almost nothing keeps the lead on the whole group, rather than the column
+    /// acquiring two different leading edges.
+    func testALeadStaysWhenAnyRowInItsGroupWouldBeLeftWithNothing() {
+        let labels = QuietRailLabels.labels(for: [
+            "Kaisola · a",
+            "Kaisola · sidebar width budget rework",
+        ])
+        XCTAssertTrue(labels.allSatisfy { $0.droppedLead.isEmpty })
+    }
+
+    /// Two rows that genuinely say the same thing are `QuietRailTitle`'s
+    /// problem, not this one, and no truncation strategy separates them — so
+    /// they are left alone rather than both being middle-truncated for nothing.
+    func testIdenticalTitlesAreLeftToTheOrdinalFallback() {
+        let labels = QuietRailLabels.labels(for: ["Audit Kaisola Sidebar parity", "Audit Kaisola Sidebar parity"])
+        XCTAssertTrue(labels.allSatisfy { $0.truncation == .tail })
+        XCTAssertTrue(labels.allSatisfy { !$0.elidesTitle })
+    }
+
+    // MARK: - Repeated-prefix width fixtures
+
+    /// The width-budget fixture the acceptance criteria ask for, with the
+    /// issue's own titles: render each label into the *measured* title lane the
+    /// way the row draws it, and compare the results the way the eye does.
+    ///
+    /// The first assertion is the bug, stated as a fixture rather than as prose:
+    /// drawn verbatim with tail truncation — what the rail did — three distinct
+    /// sessions collapse to one string.
+    func testRepeatedPrefixTitlesStayApartInTheMeasuredTitleLane() {
+        let titles = [
+            "Codex · MATLAB kernel bridge",
+            "Codex · MATLAB plotting spike",
+            "Codex · MATLAB solver notes",
+        ]
+
+        let before = titles.map { QuietRailLaneFixture.drawn(.verbatim($0), in: QuietRailLaneFixture.restingLane) }
+        XCTAssertEqual(
+            Set(before).count,
+            1,
+            "the fixture stopped reproducing the bug it was written for: \(before)"
+        )
+
+        let after = QuietRailLabels.labels(for: titles)
+            .map { QuietRailLaneFixture.drawn($0, in: QuietRailLaneFixture.restingLane) }
+        XCTAssertEqual(
+            Set(after).count,
+            titles.count,
+            "two rows still draw the same string: \(after)"
+        )
+    }
+
+    /// …and the same fixture for the case a shared lead cannot fix, where the
+    /// distinguishing word is at the *end* of the title.
+    func testTitlesThatDifferOnlyAtTheirTailStayApartInTheMeasuredLane() {
+        let titles = ["MATLAB kernel bridge alpha", "MATLAB kernel bridge beta"]
+
+        let before = titles.map { QuietRailLaneFixture.drawn(.verbatim($0), in: QuietRailLaneFixture.restingLane) }
+        XCTAssertEqual(Set(before).count, 1, "the fixture no longer reproduces: \(before)")
+
+        let after = QuietRailLabels.labels(for: titles)
+            .map { QuietRailLaneFixture.drawn($0, in: QuietRailLaneFixture.restingLane) }
+        XCTAssertEqual(Set(after).count, titles.count, "middle truncation lost the tail: \(after)")
+        XCTAssertTrue(after.allSatisfy { $0.hasSuffix("alpha") || $0.hasSuffix("beta") })
+    }
+
+    /// The approximation this whole strategy rests on: the character window
+    /// `QuietRailLabels` calls "the same at a glance" must not be wider than
+    /// what the lane really draws, or a pair the rail renders identically slips
+    /// past it. Held against the real font at the rail's resting width, and
+    /// again at its narrowest, using the issue's own title.
+    func testTheAmbiguityWindowIsNoWiderThanWhatTheLaneDraws() {
+        let sample = "Codex · MATLAB kernel bridge"
+        let resting = QuietRailLaneFixture.tailCharacters(of: sample, in: QuietRailLaneFixture.restingLane)
+        XCTAssertLessThanOrEqual(
+            QuietRowBudget.ambiguousTitleCharacters,
+            resting,
+            "the window is wider than the \(resting) characters the 210pt lane draws"
+        )
+        // Not so narrow that it flags titles the rail tells apart perfectly
+        // well: half the lane would call every shared word a collision.
+        XCTAssertGreaterThan(QuietRowBudget.ambiguousTitleCharacters, resting / 2)
+    }
+
+    /// What the eye gets off a row before it has to hover: the leading run the
+    /// rail counts as "the same at a glance".
+    private func visiblePrefix(_ text: String) -> String {
+        String(text.prefix(QuietRowBudget.ambiguousTitleCharacters))
     }
 
     // MARK: - Row width budget

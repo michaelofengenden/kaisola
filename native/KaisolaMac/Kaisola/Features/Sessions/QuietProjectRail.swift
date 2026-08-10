@@ -1,3 +1,4 @@
+import AppKit
 import Combine
 import SwiftUI
 
@@ -61,10 +62,11 @@ struct QuietProjectRail: View {
     private let meshMenu: (MeshSession) -> AnyView
     private let deleteRecentlyClosed: (AppModel.RecentlyClosedSurface) -> Void
 
-    /// Time-in-state, not time-since-creation: rows report how long the surface
-    /// has been in the state it is showing.
+    /// Time-in-state, not time-since-creation. Only transitions observed by
+    /// this live window have a known age; restored first observations stay
+    /// explicitly unknown rather than being stamped as newly transitioned.
     @State private var clock = QuietStatusClock()
-    @State private var now = Date()
+    @State private var now = QuietStatusClock.Reading.now
     /// Held in `@State` so a parent re-render (which happens on every streamed
     /// terminal byte) cannot restart the timer before it ever fires.
     @State private var tick = Timer.publish(every: 30, on: .main, in: .common).autoconnect()
@@ -120,7 +122,13 @@ struct QuietProjectRail: View {
                 model.moveProject(id: move.id, toIndex: move.toIndex)
             }
         }
-        .onReceive(tick) { now = $0 }
+        .onReceive(tick) { _ in now = .now }
+        .onReceive(NotificationCenter.default.publisher(for: .NSSystemClockDidChange)) { _ in
+            now = .now
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)) { _ in
+            now = .now
+        }
     }
 
     private func group(_ project: AppModel.ProjectGroup, placement: QuietProjectPlacement) -> some View {
@@ -132,8 +140,15 @@ struct QuietProjectRail: View {
             placement: placement,
             now: now,
             orderStore: orderStore,
-            since: { clock.since(id: $0) },
-            note: { id, status in clock.note(id: id, status: status, at: Date()) },
+            clockEntry: { clock.entry(id: $0) },
+            note: { id, status in
+                let observedAt = QuietStatusClock.Reading.now
+                // `now` otherwise trails by up to one 30-second tick. Keep it
+                // aligned with a fresh observation so an ordinary transition
+                // begins at zero rather than briefly looking unavailable.
+                now = observedAt
+                clock.note(id: id, status: status, at: observedAt)
+            },
             selectSession: selectSession,
             launchMenu: launchMenu,
             projectMenu: projectMenu,
@@ -179,6 +194,82 @@ enum QuietRailOrder {
         let landed = destination > from ? destination - 1 : destination
         guard landed != from else { return nil }
         return Move(id: orderedIDs[from], toIndex: landed)
+    }
+}
+
+// MARK: - Session drag persistence
+
+/// What a session drag is allowed to leave on screen, once the store has said
+/// whether the new order actually reached disk.
+///
+/// Pure, because the paths that matter here are the ones nobody sees. A drag
+/// whose write failed must not go on sitting there looking saved until a
+/// relaunch quietly undoes it, and a drag that would replace an order file
+/// Kaisola cannot read has to stop and ask rather than take the file with it.
+/// Both are decisions, not rendering, so they are tested as decisions.
+enum QuietSessionOrderCommit {
+    /// What the user is told, if anything.
+    enum Notice: Equatable {
+        /// The order was not saved. Carries the store's short reason.
+        case failed(String)
+        /// Saved, after setting a damaged order file aside at this URL.
+        case preserved(URL)
+        /// Nothing was written: the user decides whether the damaged catalog
+        /// may be replaced.
+        case confirmReplace(SessionOrderStore.Damage)
+    }
+
+    struct Resolution: Equatable {
+        /// The order the rail draws from here: the dragged one when it is
+        /// durable, the pre-drag one when it is not.
+        let order: [String]
+        let notice: Notice?
+    }
+
+    static func resolve(
+        previous: [String],
+        attempted: [String],
+        outcome: SessionOrderStore.SaveOutcome
+    ) -> Resolution {
+        switch outcome {
+        case let .saved(preservedCopy):
+            guard let preservedCopy else { return Resolution(order: attempted, notice: nil) }
+            return Resolution(order: attempted, notice: .preserved(preservedCopy))
+        case let .writeFailed(reason):
+            return Resolution(order: previous, notice: .failed(reason))
+        case let .needsConfirmation(damage):
+            return Resolution(order: previous, notice: .confirmReplace(damage))
+        }
+    }
+
+    /// Names the consequence as well as the cause. The rows sliding back to
+    /// where they were is otherwise the only signal the user gets, and on its
+    /// own that reads as the drag having been rejected at random.
+    static func failureMessage(_ reason: String) -> String {
+        "Session order not saved: \(reason). The list is back in its last saved order."
+    }
+
+    static func preservedMessage(_ url: URL) -> String {
+        "Session order saved. The unreadable order file was kept as \(url.lastPathComponent)."
+    }
+
+    static let confirmationTitle = "Replace the saved session order?"
+
+    /// Every branch says the same two things: what Kaisola cannot do with the
+    /// file, and that replacing it keeps a copy. The forward-version case adds
+    /// the one cost a copy does not cover — the newer install loses its order.
+    static func confirmationMessage(for damage: SessionOrderStore.Damage) -> String {
+        switch damage {
+        case .malformed:
+            return "Kaisola cannot read session-order.json, so it cannot save this drag "
+                + "without replacing it. Replacing keeps a copy of the unreadable file beside it."
+        case let .forwardVersion(version):
+            return "session-order.json was written by a newer version of Kaisola (format \(version)). "
+                + "Replacing it keeps a copy beside it, but that version will lose the ordering it stored."
+        case .unreadableFile:
+            return "Kaisola cannot open session-order.json. Replacing it keeps a copy of the "
+                + "existing file beside it."
+        }
     }
 }
 
@@ -340,6 +431,25 @@ enum QuietRowBudget {
     static let headerPlusTrailingInset: CGFloat = QuietRailMetrics.plusTrailingInset
     static var headerPlusReserved: CGFloat { headerPlusSlot + headerPlusTrailingInset }
 
+    /// How many leading characters two titles have to share before the rail
+    /// treats them as the same row at a glance.
+    ///
+    /// Measured rather than assumed. At the resting 210pt width with a "now"
+    /// time label the title lane is 103.5pt, and 103.5pt of the system font at
+    /// 13pt renders **13** characters of "Codex · MATLAB kernel bridge" — the
+    /// issue's own example, which is why three of those read as one row. The
+    /// 15-character floor `titleWidth`'s test holds is a floor for a *narrow*
+    /// sample; wide glyphs cost more. 12 sits under the measurement so a pair
+    /// the rail really does draw identically is always caught, and titles that
+    /// diverge inside the first dozen characters are left alone.
+    ///
+    /// Deliberately a count and not a `titleWidth` call: `QuietRailLabels` runs
+    /// on every body pass, including the ones a streaming agent triggers, and
+    /// it would otherwise re-measure every title against a font each time.
+    /// `QuietIdentityMarkTests` measures the real font against this constant so
+    /// the approximation cannot quietly drift past what the lane draws.
+    static let ambiguousTitleCharacters = 12
+
     /// - Parameters:
     ///   - sidebarWidth: the navigation column's width. Rows span it entirely;
     ///     see `QuietRailMetrics.listRowBleed`.
@@ -415,7 +525,7 @@ private struct QuietProjectMarkView: View {
     var body: some View {
         Image(systemName: "folder")
             .font(.system(size: QuietRailMetrics.projectMarkText, weight: .regular))
-            .foregroundStyle(tint ?? Color.secondary)
+            .foregroundStyle(tint ?? Color.kaisolaSecondary)
             .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
             .accessibilityHidden(true)
     }
@@ -435,9 +545,9 @@ private struct QuietProjectGroup: View {
     let project: AppModel.ProjectGroup
     @Binding var isExpanded: Bool
     let placement: QuietProjectPlacement
-    let now: Date
+    let now: QuietStatusClock.Reading
     let orderStore: SessionOrderStore
-    let since: (String) -> Date?
+    let clockEntry: (String) -> QuietStatusClock.Entry?
     let note: (String, QuietSessionStatus) -> Void
     let selectSession: (BrokerTerminalRecord) -> Void
     let launchMenu: (AppModel.ProjectGroup) -> AnyView
@@ -456,6 +566,18 @@ private struct QuietProjectGroup: View {
     /// never turns a re-render into file I/O.
     @State private var manualOrder: [String] = []
     @State private var loadedOrder = false
+    /// A drag waiting on the user's answer about replacing an order file
+    /// Kaisola cannot read. Nothing is written until they answer.
+    @State private var pendingReplacement: PendingOrderReplacement?
+
+    /// The drag held back by the replace-confirmation, with the order to put
+    /// back if the user declines.
+    private struct PendingOrderReplacement: Identifiable, Equatable {
+        let id = UUID()
+        let ids: [String]
+        let previous: [String]
+        let damage: SessionOrderStore.Damage
+    }
 
     private var isActive: Bool { placement == .active }
 
@@ -499,15 +621,31 @@ private struct QuietProjectGroup: View {
             visibleIDs: onScreen,
             focusedPaneID: model.focusedPaneID
         )
+        // What each row actually draws. A title is only ambiguous relative to
+        // the titles beside it, so this is decided once for the whole group
+        // rather than per row — and only while the group is showing its rows.
+        let labels = isExpanded ? labelMap(sessions: sessions, chats: chats, meshes: meshes) : [:]
 
         Group {
             header(statuses: statuses)
             if isExpanded {
                 ForEach(chats) { chat in
-                    chatRow(chat, status: statuses[chat.id] ?? .idle, selected: selected, onScreen: onScreen)
+                    chatRow(
+                        chat,
+                        status: statuses[chat.id] ?? .idle,
+                        selected: selected,
+                        onScreen: onScreen,
+                        labels: labels
+                    )
                 }
                 ForEach(meshes) { mesh in
-                    meshRow(mesh, status: statuses[mesh.id] ?? .idle, selected: selected, onScreen: onScreen)
+                    meshRow(
+                        mesh,
+                        status: statuses[mesh.id] ?? .idle,
+                        selected: selected,
+                        onScreen: onScreen,
+                        labels: labels
+                    )
                 }
                 ForEach(Array(sessions.enumerated()), id: \.element.id) { index, session in
                     sessionRow(
@@ -515,14 +653,15 @@ private struct QuietProjectGroup: View {
                         ordinal: index + 1,
                         status: statuses[session.id] ?? .idle,
                         selected: selected,
-                        onScreen: onScreen
+                        onScreen: onScreen,
+                        labels: labels
                     )
                 }
                 .onMove { indices, target in
-                    var ids = sessions.map(\.id)
+                    let previous = sessions.map(\.id)
+                    var ids = previous
                     ids.move(fromOffsets: indices, toOffset: target)
-                    manualOrder = ids
-                    orderStore.setOrder(projectID: project.id, ids: ids)
+                    commitOrder(ids, previous: previous)
                 }
                 if !recentlyClosed.isEmpty {
                     recentlyClosedRow(recentlyClosed)
@@ -547,6 +686,69 @@ private struct QuietProjectGroup: View {
         // whose surfaces are collapsed keeps accumulating time-in-state.
         .onAppear { noteAll(statuses) }
         .onChange(of: statuses) { _, updated in noteAll(updated) }
+        // Hung off the header because it is the one row of the group that is
+        // always drawn: attaching it to the session rows instead would give the
+        // group one alert per session.
+        .alert(
+            QuietSessionOrderCommit.confirmationTitle,
+            isPresented: Binding(
+                get: { pendingReplacement != nil },
+                set: { presented in if !presented { pendingReplacement = nil } }
+            ),
+            presenting: pendingReplacement
+        ) { pending in
+            Button("Replace", role: .destructive) {
+                pendingReplacement = nil
+                commitOrder(pending.ids, previous: pending.previous, replacingUnreadableCatalog: true)
+            }
+            Button("Cancel", role: .cancel) { pendingReplacement = nil }
+        } message: { pending in
+            Text(QuietSessionOrderCommit.confirmationMessage(for: pending.damage))
+        }
+    }
+
+    /// Applies a drag only as far as the store actually got.
+    ///
+    /// The rail used to set `manualOrder` first and write second with the
+    /// write's result discarded, so a save that never landed left the new order
+    /// sitting on screen until the next launch quietly restored the old one.
+    /// What the rail draws is now whatever is durable: the dragged list when
+    /// the file landed, the pre-drag list when it did not, and a toast saying
+    /// which happened.
+    private func commitOrder(
+        _ ids: [String],
+        previous: [String],
+        replacingUnreadableCatalog: Bool = false
+    ) {
+        let outcome = orderStore.setOrder(
+            projectID: project.id,
+            ids: ids,
+            replacingUnreadableCatalog: replacingUnreadableCatalog
+        )
+        let resolution = QuietSessionOrderCommit.resolve(
+            previous: previous,
+            attempted: ids,
+            outcome: outcome
+        )
+        manualOrder = resolution.order
+        switch resolution.notice {
+        case .none:
+            break
+        case let .failed(reason):
+            ToastCenter.shared.show(
+                QuietSessionOrderCommit.failureMessage(reason),
+                style: .error,
+                duration: 5
+            )
+        case let .preserved(url):
+            ToastCenter.shared.show(
+                QuietSessionOrderCommit.preservedMessage(url),
+                style: .info,
+                duration: 5
+            )
+        case let .confirmReplace(damage):
+            pendingReplacement = PendingOrderReplacement(ids: ids, previous: previous, damage: damage)
+        }
     }
 
     private func noteAll(_ statuses: [String: QuietSessionStatus]) {
@@ -593,7 +795,7 @@ private struct QuietProjectGroup: View {
                         if QuietProjectHeaderControls.showsDisclosureChevron(hovering: hovering) {
                             Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                                 .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(.kaisolaTertiary)
                                 .accessibilityHidden(true)
                         }
                     }
@@ -639,7 +841,7 @@ private struct QuietProjectGroup: View {
                             // `.secondary` at rest, not `.primary`: present
                             // enough to find without competing with the project
                             // name beside it, which is the row's actual subject.
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                     }
                     .menuStyle(.borderlessButton)
                     .menuIndicator(.hidden)
@@ -702,7 +904,7 @@ private struct QuietProjectGroup: View {
             } label: {
                 Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                     .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .frame(width: 14, height: QuietRailMetrics.rowHeight)
                     .contentShape(Rectangle())
             }
@@ -754,7 +956,7 @@ private struct QuietProjectGroup: View {
     private var emptyRow: some View {
         Text("No activity yet")
             .font(.system(size: QuietRailMetrics.secondaryText))
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.kaisolaTertiary)
             .padding(.leading, QuietRailMetrics.sessionIndent)
             .frame(height: QuietRailMetrics.rowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -783,14 +985,14 @@ private struct QuietProjectGroup: View {
             HStack(spacing: QuietRailMetrics.markGap) {
                 Image(systemName: "clock.arrow.circlepath")
                     .font(.system(size: QuietRailMetrics.projectMarkText))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .frame(width: QuietRailMetrics.mark)
                 Text("Recently Closed")
                     .lineLimit(1)
                 Spacer(minLength: QuietRailMetrics.laneGap)
                 Text("\(surfaces.count)")
                     .font(.system(size: QuietRailMetrics.secondaryText).monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             .font(.system(size: QuietRailMetrics.secondaryText, weight: .medium))
             .padding(.leading, QuietRailMetrics.sessionIndent)
@@ -853,28 +1055,71 @@ private struct QuietProjectGroup: View {
         return ids.filter { model.isSurfaceVisible($0) }
     }
 
+    /// The title a session row carries on its own, before the group's other
+    /// titles get a say. Shared with `labelMap` so the string the labeller
+    /// reasoned about is exactly the string the row would have drawn.
+    private func sessionTitle(_ record: BrokerTerminalRecord, ordinal: Int) -> String {
+        QuietRailTitle.displayTitle(
+            rawTitle: model.sessionTitle(for: record),
+            projectName: project.name,
+            processName: model.meta(for: record.id)?.processName,
+            ordinal: ordinal
+        )
+    }
+
+    /// Every drawn title in the group, run through `QuietRailLabels` once and
+    /// handed back keyed by surface id.
+    ///
+    /// Chats, meshes and sessions are pooled on purpose: they share the one
+    /// 36pt column and the eye reads straight down it, so two rows of different
+    /// kinds that both render "Codex · MAT…" are the same complaint.
+    private func labelMap(
+        sessions: [BrokerTerminalRecord],
+        chats: [AcpChatHandle],
+        meshes: [MeshSession]
+    ) -> [String: QuietRailLabel] {
+        var ids: [String] = []
+        var titles: [String] = []
+        for chat in chats {
+            ids.append(chat.id)
+            titles.append(chat.conversation.title)
+        }
+        for mesh in meshes {
+            ids.append(mesh.id)
+            titles.append(mesh.title)
+        }
+        for (index, record) in sessions.enumerated() {
+            ids.append(record.id)
+            titles.append(sessionTitle(record, ordinal: index + 1))
+        }
+        var map: [String: QuietRailLabel] = [:]
+        for (id, label) in zip(ids, QuietRailLabels.labels(for: titles)) where map[id] == nil {
+            map[id] = label
+        }
+        return map
+    }
+
     private func sessionRow(
         _ record: BrokerTerminalRecord,
         ordinal: Int,
         status: QuietSessionStatus,
         selected: String?,
-        onScreen: [String]
+        onScreen: [String],
+        labels: [String: QuietRailLabel]
     ) -> some View {
         let processName = model.meta(for: record.id)?.processName
+        let title = sessionTitle(record, ordinal: ordinal)
+        let time = timeInState(record.id, status: status)
         return QuietSurfaceRowView(
             id: record.id,
             identity: QuietIdentity.identity(
                 agentName: model.agentProfile(for: record.id)?.name,
                 processName: processName
             ),
-            title: QuietRailTitle.displayTitle(
-                rawTitle: model.sessionTitle(for: record),
-                projectName: project.name,
-                processName: processName,
-                ordinal: ordinal
-            ),
+            title: title,
+            label: labels[record.id] ?? .verbatim(title),
             status: status,
-            timeLabel: timeLabel(record.id),
+            timeInState: time,
             isSelected: selected == record.id,
             isOnScreen: onScreen.contains(record.id),
             tooltip: tooltip(for: record),
@@ -885,13 +1130,21 @@ private struct QuietProjectGroup: View {
         )
     }
 
-    private func chatRow(_ chat: AcpChatHandle, status: QuietSessionStatus, selected: String?, onScreen: [String]) -> some View {
-        QuietSurfaceRowView(
+    private func chatRow(
+        _ chat: AcpChatHandle,
+        status: QuietSessionStatus,
+        selected: String?,
+        onScreen: [String],
+        labels: [String: QuietRailLabel]
+    ) -> some View {
+        let time = timeInState(chat.id, status: status)
+        return QuietSurfaceRowView(
             id: chat.id,
             identity: QuietIdentity.identity(agentName: chat.agentID, processName: nil),
             title: chat.conversation.title,
+            label: labels[chat.id] ?? .verbatim(chat.conversation.title),
             status: status,
-            timeLabel: timeLabel(chat.id),
+            timeInState: time,
             isSelected: selected == chat.id,
             isOnScreen: onScreen.contains(chat.id),
             tooltip: chatTooltip(chat),
@@ -902,13 +1155,21 @@ private struct QuietProjectGroup: View {
         )
     }
 
-    private func meshRow(_ mesh: MeshSession, status: QuietSessionStatus, selected: String?, onScreen: [String]) -> some View {
-        QuietSurfaceRowView(
+    private func meshRow(
+        _ mesh: MeshSession,
+        status: QuietSessionStatus,
+        selected: String?,
+        onScreen: [String],
+        labels: [String: QuietRailLabel]
+    ) -> some View {
+        let time = timeInState(mesh.id, status: status)
+        return QuietSurfaceRowView(
             id: mesh.id,
             identity: .mesh,
             title: mesh.title,
+            label: labels[mesh.id] ?? .verbatim(mesh.title),
             status: status,
-            timeLabel: timeLabel(mesh.id),
+            timeInState: time,
             isSelected: selected == mesh.id,
             isOnScreen: onScreen.contains(mesh.id),
             tooltip: mesh.stage == "Idle" ? "Mesh · Ready" : "Mesh · \(mesh.stage)",
@@ -921,9 +1182,12 @@ private struct QuietProjectGroup: View {
 
     // MARK: Derivations
 
-    private func timeLabel(_ id: String) -> String {
-        guard let start = since(id) else { return "" }
-        return QuietTimeLabel.label(since: start, now: now)
+    private func timeInState(_ id: String, status: QuietSessionStatus) -> QuietTimeInStatePresentation {
+        QuietTimeInStatePresentation.make(
+            status: status,
+            entry: clockEntry(id),
+            now: now
+        )
     }
 
     /// Everything the rollup and the expanded rows both need, derived once per
@@ -1067,7 +1331,7 @@ private struct QuietRollupView: View {
             if rollup.total > 0 {
                 Text("\(rollup.total)")
                     .font(.system(size: QuietRailMetrics.secondaryText).monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             ForEach(Array(rollup.dots.enumerated()), id: \.offset) { _, state in
                 QuietStatusMark(status: state, size: QuietRailMetrics.dot)
@@ -1195,7 +1459,10 @@ private struct QuietSelectionPillView: View {
 /// whole rail.
 private struct QuietRowBody: View {
     let identity: QuietIdentity
-    let title: String
+    /// What this row draws, decided against every other title in the project
+    /// (`QuietRailLabels`) rather than in isolation. The whole title still
+    /// reaches hover and VoiceOver from `QuietSurfaceRowView`.
+    let label: QuietRailLabel
     let timeLabel: String
     let status: QuietSessionStatus
     let isSelected: Bool
@@ -1211,14 +1478,16 @@ private struct QuietRowBody: View {
         HStack(spacing: 0) {
             QuietIdentityMarkView(identity: identity)
                 .padding(.trailing, QuietRailMetrics.markGap)
-            Text(title)
+            Text(label.text)
                 .font(.system(size: QuietRailMetrics.titleText, weight: QuietRowEmphasis.weight(isSelected: isSelected)))
                 // Three steps: the row you are looking at is the user's accent
                 // colour, an ended row is tertiary, everything else is
                 // secondary regular.
                 .foregroundStyle(titleStyle)
                 .lineLimit(1)
-                .truncationMode(.tail)
+                // Tail everywhere except the rows a tail would render
+                // identically; see `QuietRailLabels`.
+                .truncationMode(label.truncation.textMode)
                 // The only compressible token in the row; without this it loses
                 // to its fixed-size siblings and truncates first.
                 .layoutPriority(1)
@@ -1262,7 +1531,7 @@ private struct QuietRowBody: View {
         // the primary ink rather than the accent, which stays the mark of the
         // one row you are typing in.
         if isOnScreen { return AnyShapeStyle(HierarchicalShapeStyle.primary) }
-        if status.isDimmed { return AnyShapeStyle(HierarchicalShapeStyle.tertiary) }
+        if status.isDimmed { return AnyShapeStyle(Color.kaisolaTertiary) }
         return AnyShapeStyle(HierarchicalShapeStyle.secondary)
     }
 
@@ -1286,7 +1555,7 @@ private struct QuietRowBody: View {
                 // pointer-only affordance cannot serve.
                 Image(systemName: "square.split.2x1")
                     .font(.system(size: QuietRailMetrics.revealText, weight: .medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .frame(width: QuietRailMetrics.revealSlot, height: QuietRailMetrics.revealSlot)
                     .contentShape(Rectangle())
                     .highPriorityGesture(TapGesture().onEnded { reveal() })
@@ -1298,7 +1567,7 @@ private struct QuietRowBody: View {
             if !timeLabel.isEmpty {
                 Text(timeLabel)
                     .font(.system(size: QuietRailMetrics.secondaryText).monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .lineLimit(1)
             }
             QuietStatusDot(status: status)
@@ -1347,9 +1616,14 @@ private struct QuietSurfaceRowView: View {
     /// can address a specific row without depending on its visible title.
     let id: String
     let identity: QuietIdentity
+    /// The whole title. Hover and VoiceOver read this one, whatever the row
+    /// ends up drawing.
     let title: String
+    /// What the row draws, once the project's other titles have been taken
+    /// into account.
+    let label: QuietRailLabel
     let status: QuietSessionStatus
-    let timeLabel: String
+    let timeInState: QuietTimeInStatePresentation
     let isSelected: Bool
     /// On screen, but not the pane holding focus.
     var isOnScreen = false
@@ -1373,8 +1647,8 @@ private struct QuietSurfaceRowView: View {
         Button(action: press) {
             QuietRowBody(
                 identity: identity,
-                title: title,
-                timeLabel: timeLabel,
+                label: label,
+                timeLabel: timeInState.compactLabel,
                 status: status,
                 isSelected: isSelected,
                 showsReveal: hovering,
@@ -1388,6 +1662,7 @@ private struct QuietSurfaceRowView: View {
         // System Events seeing a row with AXPress but no readable title.
         .accessibilityElement(children: .combine)
         .accessibilityLabel(accessibilityLabel)
+        .accessibilityValue(QuietSurfaceRowSemantics.accessibilityValue(time: timeInState))
         .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
         .accessibilityIdentifier(id)
         .accessibilityAction { select() }
@@ -1396,19 +1671,29 @@ private struct QuietSurfaceRowView: View {
             groupHover(inside)
             withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
         }
-        .help(tooltip)
+        .help(helpText)
         .contextMenu { menu() }
         .listRowInsets(QuietRailMetrics.listRowBleed)
         .listRowSeparator(.hidden)
         .listRowBackground(Color.clear)
     }
 
-    /// A row with no time-in-state yet must not read as "…, idle, " — the
-    /// components are joined only when they carry something.
+    /// Always the *whole* title, never the drawn label: eliding a shared lead
+    /// is a scanning economy for the eye, and VoiceOver reads one row at a time
+    /// with no siblings in view to supply the missing words.
     private var accessibilityLabel: String {
-        [title, status.accessibilityWord ?? "idle", timeLabel]
-            .filter { !$0.isEmpty }
-            .joined(separator: ", ")
+        QuietSurfaceRowSemantics.accessibilityLabel(title: title, status: status)
+    }
+
+    /// A row drawing less than its whole title has to be able to say the rest
+    /// somewhere the pointer can reach it, so the title joins the tooltip —
+    /// but only for those rows. The expanded time meaning then follows the
+    /// same base details for every row.
+    private var helpText: String {
+        let base = label.elidesTitle
+            ? (tooltip.isEmpty ? title : "\(title) · \(tooltip)")
+            : tooltip
+        return QuietSurfaceRowSemantics.tooltip(base: base, time: timeInState)
     }
 
     /// ⌘-click opens the surface beside the current one instead of replacing

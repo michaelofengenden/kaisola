@@ -116,6 +116,71 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         )
     }
 
+    func testReleaseClassifiesAbsentTerminalAndRetiredGenerationWithoutGuessingARoute() async throws {
+        let topology = makeTopology()
+        let connectionID = "22222222-2222-4222-8222-222222222222"
+        let current = RoutingControlClient(connectionInstanceID: connectionID)
+        let draining = RoutingControlClient(connectionInstanceID: connectionID)
+        let queue = ControlClientQueue([current, draining])
+        let routes = BrokerGenerationRouteTable()
+        let control = BrokerGenerationControlRouter(
+            routes: routes,
+            connectionInstanceID: connectionID,
+            factory: { _ in queue.next() }
+        )
+        try await control.connect(to: topology, ownerID: "owner")
+
+        do {
+            _ = try await control.release(
+                projectID: "project",
+                terminalID: "not-yet-classified",
+                brokerGenerationID: nil
+            )
+            XCTFail("An empty route map is not absence until inventory validates it")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerClientError,
+                .requestFailed("terminal generation unavailable")
+            )
+        }
+        try await routes.replaceTerminalOwners(["moved-terminal": topology.current.id])
+        do {
+            _ = try await control.release(
+                projectID: "project",
+                terminalID: "moved-terminal",
+                brokerGenerationID: topology.draining[0].id
+            )
+            XCTFail("Persisted generation evidence must not override current inventory")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
+        try await routes.replaceTerminalOwners([:])
+
+        let legacyAbsent = try await control.release(
+            projectID: "project",
+            terminalID: "legacy-absent",
+            brokerGenerationID: nil
+        )
+        let retiredGeneration = try await control.release(
+            projectID: "project",
+            terminalID: "retired-terminal",
+            brokerGenerationID: String(repeating: "f", count: 64)
+        )
+        let activeButAbsent = try await control.release(
+            projectID: "project",
+            terminalID: "active-absent",
+            brokerGenerationID: topology.current.id
+        )
+
+        XCTAssertEqual(legacyAbsent, .terminalAbsent)
+        XCTAssertEqual(retiredGeneration, .generationAbsent)
+        XCTAssertEqual(activeButAbsent, .released)
+        let currentCalls = await current.calls()
+        let drainingCalls = await draining.calls()
+        XCTAssertEqual(currentCalls, ["release:active-absent"])
+        XCTAssertEqual(drainingCalls, [])
+    }
+
     func testDuplicateTerminalIdentityAcrossGenerationsFailsClosed() async throws {
         let topology = makeTopology()
         let duplicate = terminal("duplicate")
@@ -135,6 +200,147 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? BrokerClientError, .identityChanged)
         }
+    }
+
+    func testInvalidInventoryRowPreservesTheLastPublishedRouteSnapshot() async throws {
+        let topology = makeTopology()
+        let current = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("current-terminal")])
+        )
+        let draining = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("draining-terminal")])
+        )
+        let queue = ObserverClientQueue([current, draining])
+        let routes = BrokerGenerationRouteTable()
+        let observer = BrokerGenerationObserverRouter(routes: routes, factory: { queue.next() })
+
+        _ = try await observer.connect(to: topology)
+        _ = try await observer.inventory()
+        await current.failInventory(with: .invalidDiagnosticRow(index: 2))
+
+        do {
+            _ = try await observer.inventory()
+            XCTFail("an invalid child row must reject the complete merged inventory")
+        } catch {
+            XCTAssertEqual(error as? BrokerInventoryError, .invalidDiagnosticRow(index: 2))
+        }
+
+        let retainedCurrentRoute = try await routes.generationID(for: "current-terminal")
+        let retainedDrainingRoute = try await routes.generationID(for: "draining-terminal")
+        XCTAssertEqual(retainedCurrentRoute, topology.current.id)
+        XCTAssertEqual(retainedDrainingRoute, topology.draining[0].id)
+    }
+
+    func testInventoryRetriesWholeMergeWhenOneBrokerActivityEpochChanges() async throws {
+        let topology = makeTopology()
+        let current = RoutingObserverClient(statuses: [
+            BrokerStatus(terminals: [terminal("stale-current")], activityEpoch: 10),
+            BrokerStatus(terminals: [terminal("fresh-current")], activityEpoch: 11),
+        ])
+        let draining = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("stable-drain")], activityEpoch: 20)
+        )
+        let queue = ObserverClientQueue([current, draining])
+        let routes = BrokerGenerationRouteTable()
+        let observer = BrokerGenerationObserverRouter(routes: routes, factory: { queue.next() })
+
+        _ = try await observer.connect(to: topology)
+        let status = try await observer.inventory()
+        let currentRoute = try await routes.generationID(for: "fresh-current")
+        let drainRoute = try await routes.generationID(for: "stable-drain")
+        let currentInventoryCount = await current.inventoryCount()
+        let drainingInventoryCount = await draining.inventoryCount()
+
+        XCTAssertEqual(status.terminals.map(\.id), ["fresh-current", "stable-drain"])
+        XCTAssertEqual(currentRoute, topology.current.id)
+        XCTAssertEqual(drainRoute, topology.draining[0].id)
+        do {
+            _ = try await routes.generationID(for: "stale-current")
+            XCTFail("the discarded mixed snapshot must never replace live routes")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerClientError,
+                .requestFailed("terminal generation unavailable")
+            )
+        }
+        XCTAssertEqual(currentInventoryCount, 4)
+        XCTAssertEqual(drainingInventoryCount, 3)
+    }
+
+    func testMultiGenerationInventoryRejectsAMissingActivityEpoch() async throws {
+        let topology = makeTopology()
+        let unfenced = RoutingObserverClient(
+            unfencedStatus: BrokerStatus(terminals: [terminal("unfenced")])
+        )
+        let draining = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("draining")], activityEpoch: 1)
+        )
+        let queue = ObserverClientQueue([unfenced, draining])
+        let routes = BrokerGenerationRouteTable()
+        let observer = BrokerGenerationObserverRouter(routes: routes, factory: { queue.next() })
+
+        _ = try await observer.connect(to: topology)
+        do {
+            _ = try await observer.inventory()
+            XCTFail("every generation in a merged inventory must provide an activity epoch")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+        }
+        do {
+            _ = try await routes.generationID(for: "unfenced")
+            XCTFail("an unfenced inventory must not replace routes")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerClientError,
+                .requestFailed("terminal generation unavailable")
+            )
+        }
+    }
+
+    func testInventoryRetriesWhenRegistryRevisionChangesWithTheSameGenerationIDs() async throws {
+        let original = makeTopology(registryTopologyVersion: 41)
+        let revised = makeTopology(registryTopologyVersion: 42)
+        let pause = RoutingInventoryPause()
+        let staleCurrent = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("stale-current")], activityEpoch: 1),
+            pause: pause
+        )
+        let staleDrain = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("stale-drain")], activityEpoch: 1)
+        )
+        let current = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("revised-current")], activityEpoch: 2)
+        )
+        let drain = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("revised-drain")], activityEpoch: 2)
+        )
+        let queue = ObserverClientQueue([staleCurrent, staleDrain, current, drain])
+        let routes = BrokerGenerationRouteTable()
+        let observer = BrokerGenerationObserverRouter(routes: routes, factory: { queue.next() })
+
+        _ = try await observer.connect(to: original)
+        let pending = Task { try await observer.inventory() }
+        await pause.waitUntilPaused()
+        _ = try await observer.connect(to: revised)
+        await pause.resume()
+        let status = try await pending.value
+        let currentRoute = try await routes.generationID(for: "revised-current")
+        let staleInventoryCount = await staleCurrent.inventoryCount()
+        let currentInventoryCount = await current.inventoryCount()
+
+        XCTAssertEqual(status.terminals.map(\.id), ["revised-current", "revised-drain"])
+        XCTAssertEqual(currentRoute, revised.current.id)
+        do {
+            _ = try await routes.generationID(for: "stale-current")
+            XCTFail("the old registry revision must not publish routes")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerClientError,
+                .requestFailed("terminal generation unavailable")
+            )
+        }
+        XCTAssertEqual(staleInventoryCount, 1)
+        XCTAssertEqual(currentInventoryCount, 2)
     }
 
     func testAcknowledgedCreateSurvivesAnOlderInventorySnapshot() async throws {
@@ -244,11 +450,67 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         XCTAssertEqual(repeated, [])
     }
 
+    func testControllerReconnectReplacesAChildThatReportedDisconnect() async throws {
+        let topology = BrokerGenerationTopology(
+            current: makeTopology().current,
+            draining: []
+        )
+        let routes = BrokerGenerationRouteTable()
+        let connectionID = "33333333-3333-4333-8333-333333333333"
+        let failed = RoutingControlClient(connectionInstanceID: connectionID)
+        let replacement = RoutingControlClient(connectionInstanceID: connectionID)
+        let queue = ControlClientQueue([failed, replacement])
+        let control = BrokerGenerationControlRouter(
+            routes: routes,
+            connectionInstanceID: connectionID,
+            factory: { _ in queue.next() }
+        )
+        let signal = RoutingDisconnectSignal()
+        await control.setDisconnectHandler { error in
+            Task { await signal.record(error) }
+        }
+
+        try await control.connect(to: topology, ownerID: "owner")
+        await failed.simulateDisconnect()
+        for _ in 0..<100 {
+            if await signal.count > 0 { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let disconnectCount = await signal.count
+        XCTAssertEqual(disconnectCount, 1)
+
+        try await control.connect(to: topology, ownerID: "owner")
+        _ = try await control.createTerminal(
+            projectID: "project",
+            terminalID: "replacement-terminal",
+            command: "/bin/sh",
+            arguments: [],
+            cwd: "/tmp",
+            columns: 80,
+            rows: 24
+        )
+
+        let failedConnectCount = await failed.connectCount()
+        let replacementConnectCount = await replacement.connectCount()
+        let replacementCalls = await replacement.calls()
+        XCTAssertEqual(failedConnectCount, 1)
+        XCTAssertEqual(replacementConnectCount, 1)
+        XCTAssertEqual(replacementCalls, ["create:replacement-terminal"])
+    }
+
     func testDiagnosticsNameAppCurrentAndEveryDrainingBrokerVersion() {
         let topology = makeTopology()
+        let retirement = BrokerRetirementDiagnostic(
+            generationID: topology.draining[0].id,
+            pid: topology.draining[0].info.pid,
+            failureCount: 2,
+            reason: .shutdownTimedOut,
+            nextAttemptInSweeps: 4
+        )
         let detail = BrokerGenerationDiagnostics.detail(
             appVersion: "1.1.8",
-            topology: topology
+            topology: topology,
+            retirementDiagnostics: [retirement]
         )
 
         XCTAssertTrue(detail.contains("App 1.1.8"))
@@ -256,14 +518,26 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         XCTAssertTrue(detail.contains("Draining brokers: routing-test"))
         XCTAssertEqual(detail.components(separatedBy: "package routing-test").count - 1, 2)
         XCTAssertEqual(detail.components(separatedBy: "implementation 2").count - 1, 2)
+        XCTAssertTrue(detail.contains("Retirement skipped"))
+        XCTAssertTrue(detail.contains("safe handoff timed out"))
+        XCTAssertTrue(detail.contains("failure count 2"))
+        XCTAssertTrue(detail.contains("retry in 4 heartbeats"))
+
+        let staleDetail = BrokerGenerationDiagnostics.detail(
+            appVersion: "1.1.8",
+            topology: .single(topology.current.info),
+            retirementDiagnostics: [retirement]
+        )
+        XCTAssertFalse(staleDetail.contains("Retirement skipped"))
     }
 
-    private func makeTopology() -> BrokerGenerationTopology {
+    private func makeTopology(registryTopologyVersion: Int64 = 1) -> BrokerGenerationTopology {
         let currentDigest = String(repeating: "a", count: 64)
         let drainingDigest = String(repeating: "b", count: 64)
         return BrokerGenerationTopology(
             current: generation(currentDigest, role: .current, startedAt: 2),
-            draining: [generation(drainingDigest, role: .draining, startedAt: 1)]
+            draining: [generation(drainingDigest, role: .draining, startedAt: 1)],
+            registryTopologyVersion: registryTopologyVersion
         )
     }
 
@@ -338,14 +612,34 @@ private final class ControlClientQueue: @unchecked Sendable {
 }
 
 private actor RoutingObserverClient: ObserveOnlyBrokerServing {
-    private let status: BrokerStatus
+    private var statuses: [BrokerStatus]
+    private var inventoryError: BrokerInventoryError?
+    private let pause: RoutingInventoryPause?
+    private var recordedInventoryCount = 0
     private var recordedCalls: [String] = []
     private var recordedDisconnectCount = 0
     private var eventHandler: (@Sendable (BrokerEvent) -> Void)?
     private var disconnectHandler: (@Sendable (any Error) -> Void)?
 
     init(status: BrokerStatus) {
-        self.status = status
+        self.statuses = [Self.withDefaultActivityEpoch(status)]
+        pause = nil
+    }
+
+    init(unfencedStatus status: BrokerStatus) {
+        self.statuses = [status]
+        pause = nil
+    }
+
+    init(status: BrokerStatus, pause: RoutingInventoryPause) {
+        self.statuses = [Self.withDefaultActivityEpoch(status)]
+        self.pause = pause
+    }
+
+    init(statuses: [BrokerStatus]) {
+        precondition(!statuses.isEmpty)
+        self.statuses = statuses.map(Self.withDefaultActivityEpoch)
+        pause = nil
     }
 
     func setEventHandler(_ handler: (@Sendable (BrokerEvent) -> Void)?) async {
@@ -372,7 +666,13 @@ private actor RoutingObserverClient: ObserveOnlyBrokerServing {
         )
     }
 
-    func inventory() async throws -> BrokerStatus { status }
+    func inventory() async throws -> BrokerStatus {
+        recordedInventoryCount += 1
+        if let inventoryError { throw inventoryError }
+        if recordedInventoryCount == 1, let pause { await pause.pause() }
+        if statuses.count > 1 { return statuses.removeFirst() }
+        return statuses[0]
+    }
 
     func subscribe(
         to terminal: BrokerTerminalRecord,
@@ -420,13 +720,54 @@ private actor RoutingObserverClient: ObserveOnlyBrokerServing {
     }
 
     func calls() -> [String] { recordedCalls }
+    func failInventory(with error: BrokerInventoryError) { inventoryError = error }
+    func inventoryCount() -> Int { recordedInventoryCount }
     func disconnectCount() -> Int { recordedDisconnectCount }
+
+    private static func withDefaultActivityEpoch(_ status: BrokerStatus) -> BrokerStatus {
+        BrokerStatus(
+            terminals: status.terminals,
+            activityEpoch: status.activityEpoch ?? 1
+        )
+    }
+}
+
+/// Deterministic suspension seam: the test waits until a child inventory is
+/// in flight, publishes a new registry revision, then lets the stale call
+/// return. No wall-clock sleeps or scheduler assumptions are involved.
+private actor RoutingInventoryPause {
+    private var didPause = false
+    private var didResume = false
+    private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+    private var resumeWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func pause() async {
+        didPause = true
+        let waiters = pauseWaiters
+        pauseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        guard !didResume else { return }
+        await withCheckedContinuation { resumeWaiters.append($0) }
+    }
+
+    func waitUntilPaused() async {
+        if didPause { return }
+        await withCheckedContinuation { pauseWaiters.append($0) }
+    }
+
+    func resume() {
+        didResume = true
+        let waiters = resumeWaiters
+        resumeWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
 }
 
 private actor RoutingControlClient: BrokerControlServing {
     nonisolated let connectionInstanceID: String
     private var recordedCalls: [String] = []
     private var recordedDisconnectCount = 0
+    private var recordedConnectCount = 0
     private var disconnectHandler: (@Sendable (any Error) -> Void)?
 
     init(connectionInstanceID: String) {
@@ -437,7 +778,9 @@ private actor RoutingControlClient: BrokerControlServing {
         disconnectHandler = handler
     }
 
-    func connect(to info: BrokerInfo, ownerID: String) async throws {}
+    func connect(to info: BrokerInfo, ownerID: String) async throws {
+        recordedConnectCount += 1
+    }
 
     func createTerminal(
         projectID: String,
@@ -495,5 +838,17 @@ private actor RoutingControlClient: BrokerControlServing {
     }
 
     func calls() -> [String] { recordedCalls }
+    func connectCount() -> Int { recordedConnectCount }
     func disconnectCount() -> Int { recordedDisconnectCount }
+    func simulateDisconnect() {
+        disconnectHandler?(BrokerClientError.connectionClosed)
+    }
+}
+
+private actor RoutingDisconnectSignal {
+    private(set) var count = 0
+
+    func record(_ error: any Error) {
+        count += 1
+    }
 }

@@ -5,8 +5,10 @@ struct AgentSessionView: View {
     @EnvironmentObject private var store: CompanionStore
     @EnvironmentObject private var coordinator: CompanionConnectionCoordinator
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.dismiss) private var dismiss
     @State private var draft = ""
     @State private var sending = false
+    @State private var accountIntent: CompanionConnectionCoordinator.AccountIntent?
     let sessionId: String
 
     private var session: CompanionSession? { store.session(for: sessionId) }
@@ -55,6 +57,11 @@ struct AgentSessionView: View {
                 ContentUnavailableView("Session ended", systemImage: "sparkle.slash")
             }
         }
+        .onAppear { accountIntent = coordinator.captureAccountIntent() }
+        .onChange(of: coordinator.accountGeneration) { _, generation in
+            guard accountIntent?.generation != generation else { return }
+            dismiss()
+        }
         .navigationTitle(session?.title ?? "Agent")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
@@ -64,7 +71,8 @@ struct AgentSessionView: View {
                         StatusBadge(status: session.status)
                         if session.status == .running && (store.canControlAgents || store.isPreview) {
                             Button {
-                                Task { _ = await coordinator.cancelAgent(session) }
+                                let intent = accountIntent
+                                Task { _ = await coordinator.cancelAgent(session, intent: intent) }
                             } label: {
                                 Image(systemName: "stop.fill")
                                     .font(.caption2)
@@ -98,9 +106,13 @@ struct AgentSessionView: View {
                 .lineLimit(1...5)
                 .disabled(!canCompose || sending)
                 .submitLabel(.send)
-                .onSubmit { Task { await send(session) } }
+                .onSubmit {
+                    let intent = accountIntent
+                    Task { await send(session, intent: intent) }
+                }
             Button {
-                Task { await send(session) }
+                let intent = accountIntent
+                Task { await send(session, intent: intent) }
             } label: {
                 if sending {
                     ProgressView().controlSize(.small)
@@ -137,11 +149,14 @@ struct AgentSessionView: View {
         (store.canControlAgents || store.isPreview) && store.connection != .offline
     }
 
-    private func send(_ session: CompanionSession) async {
+    private func send(
+        _ session: CompanionSession,
+        intent: CompanionConnectionCoordinator.AccountIntent?
+    ) async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
         guard canCompose, !text.isEmpty, !sending else { return }
         sending = true
-        if await coordinator.sendAgentMessage(to: session, text: text) { draft = "" }
+        if await coordinator.sendAgentMessage(to: session, text: text, intent: intent) { draft = "" }
         sending = false
     }
 }

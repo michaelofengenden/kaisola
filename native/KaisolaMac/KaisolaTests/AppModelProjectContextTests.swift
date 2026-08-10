@@ -686,6 +686,12 @@ final class AppModelProjectContextTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         model.openChat(agent, inDirectory: directory)
         let chat = try XCTUnwrap(model.chats.first)
+        let defaultsKeys = AcpConversation.persistedDraftDefaultsKeys(for: chat.id)
+        defer {
+            for key in defaultsKeys {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
         let rows: [AcpTranscriptRow] = [
             .user(id: "user-1", text: "keep this question", failed: false),
             .message(id: "agent-1", text: "keep this answer"),
@@ -728,11 +734,17 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertTrue(model.recentlyClosedSurfaces(in: chat.projectID).isEmpty)
 
         XCTAssertTrue(model.closeChat(chat.id))
+        for key in defaultsKeys {
+            XCTAssertNotNil(UserDefaults.standard.string(forKey: key))
+        }
         let deleteResult = await model.deleteRecentlyClosedSurface(
             chat.id,
             allowRecoverableWork: true
         )
         XCTAssertEqual(deleteResult, .completed)
+        for key in defaultsKeys {
+            XCTAssertNil(UserDefaults.standard.object(forKey: key))
+        }
         XCTAssertTrue(model.recentlyClosedSurfaces(in: chat.projectID).isEmpty)
         let missingResult = await model.restoreRecentlyClosedSurface(chat.id)
         XCTAssertEqual(missingResult, .unavailable)
@@ -742,6 +754,98 @@ final class AppModelProjectContextTests: XCTestCase {
         )
         let persisted = try await workspaceStore.projectState(for: chat.projectID)
         XCTAssertFalse(persisted?.panes.contains(where: { $0.id == chat.id }) == true)
+    }
+
+    /// A permanent delete may not announce itself while the transcript is
+    /// still on disk: an unwritable store has to come back as blocked.
+    @MainActor
+    func testPermanentChatDeleteReportsATranscriptItCouldNotErase() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let transcriptStore = AcpTranscriptStore(
+            databaseURL: root.appendingPathComponent("transcripts.sqlite3"),
+            writerID: "project-context-removal-failure",
+            schedulesAutomaticFlush: false,
+            injectedRemovalFailure: .open
+        )
+        let model = AppModel(
+            sessionStore: NativeSessionStore(fileURL: storeFile),
+            workspaceStateStore: NativeWorkspaceStateStore(
+                fileURL: root.appendingPathComponent("workspace-state-v1.json")
+            ),
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore)
+        )
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        let directory = root.appendingPathComponent("unerasable-chat-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        model.openChat(agent, inDirectory: directory)
+        let chat = try XCTUnwrap(model.chats.first)
+        XCTAssertTrue(model.closeChat(chat.id))
+
+        let deleteResult = await model.deleteRecentlyClosedSurface(
+            chat.id,
+            allowRecoverableWork: true
+        )
+        guard case let .blocked(message) = deleteResult else {
+            return XCTFail("expected a blocked delete, got \(deleteResult)")
+        }
+        XCTAssertTrue(message.contains("could not be erased"), message)
+    }
+
+    /// A composer draft lives in two places: the workspace draft store, and the
+    /// legacy `chatDraft.<id>` defaults key that `loadDraft` still reads. A
+    /// permanent delete that clears only the first leaves the unsent text
+    /// readable in preferences for the life of the install.
+    @MainActor
+    func testPermanentDeleteErasesTheLegacyAndCurrentDraftStores() async throws {
+        let (model, _) = makeModel()
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        let directory = storeFile.deletingLastPathComponent()
+            .appendingPathComponent("deleted-draft-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        model.openChat(agent, inDirectory: directory)
+        let chat = try XCTUnwrap(model.chats.first)
+        let legacyKey = "chatDraft.\(chat.id)"
+        let stableKey = "chat|\(chat.id)"
+        defer { UserDefaults.standard.removeObject(forKey: legacyKey) }
+
+        // Seed both stores: `saveDraft` writes the defaults mirror inline, and
+        // the draft hook is what the composer's debounce eventually calls.
+        let secret = "unsent recovery phrase 8f21-tttp"
+        chat.conversation.saveDraft(secret)
+        chat.conversation.onDraftChanged?(secret)
+        await model.flushDraftPersistence()
+
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: storeFile.deletingLastPathComponent()
+                .appendingPathComponent("workspace-state-v1.json")
+        )
+        let seededDraft = try await workspaceStore.draft(for: stableKey)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: legacyKey), secret)
+        XCTAssertEqual(seededDraft, secret)
+
+        await model.deleteChat(chat.id)
+        await model.flushDraftPersistence()
+        await model.teardown()
+
+        XCTAssertNil(
+            UserDefaults.standard.string(forKey: legacyKey),
+            "the legacy defaults draft survived a permanent delete"
+        )
+        await workspaceStore.invalidateCache()
+        let survivingDraft = try await workspaceStore.draft(for: stableKey)
+        XCTAssertNil(survivingDraft, "the workspace draft survived a permanent delete")
+
+        // Relaunch: a fresh conversation on the same key finds no plaintext.
+        let relaunched = AcpConversation(
+            title: "Relaunched",
+            command: "mock",
+            arguments: [],
+            cwd: directory.path,
+            draftKey: chat.id
+        )
+        XCTAssertEqual(relaunched.loadDraft(), "")
     }
 
     @MainActor
@@ -1089,6 +1193,188 @@ final class AppModelProjectContextTests: XCTestCase {
     }
 
     @MainActor
+    func testColdRestoreWithRemovedNamedAccountStopsAtActionableState() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let now = Date(timeIntervalSince1970: 10)
+        let access = ChatAccountAccess(
+            binding: binding,
+            requiresResolution: true,
+            now: now
+        )
+
+        let transition = access.reconcile(.init(
+            profiles: [],
+            readings: [],
+            isRefreshing: false,
+            now: now
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.accountRemoved))
+        XCTAssertFalse(access.allowsAdapterStart)
+        let presentation = try XCTUnwrap(access.presentation)
+        XCTAssertEqual(presentation.provider, profile.provider.displayName)
+        XCTAssertEqual(presentation.account, profile.label)
+        XCTAssertFalse(presentation.showsActivityIndicator)
+        XCTAssertEqual(presentation.actions, [.signIn, .chooseAccount, .preserveTranscript])
+        XCTAssertTrue(presentation.detail.contains("Claude account “Work”"))
+        XCTAssertTrue(presentation.detail.contains("transcript and draft are still here"))
+    }
+
+    @MainActor
+    func testDelayedAccountResolutionUnlocksBeforeBoundedDeadline() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let now = Date(timeIntervalSince1970: 20)
+        let access = ChatAccountAccess(
+            binding: binding,
+            requiresResolution: true,
+            now: now
+        )
+
+        _ = access.reconcile(.init(
+            profiles: [profile],
+            readings: [],
+            isRefreshing: true,
+            now: now
+        ))
+        XCTAssertEqual(access.phase, .resolving)
+        XCTAssertEqual(access.presentation?.showsActivityIndicator, true)
+        XCTAssertTrue(access.presentation?.actions.isEmpty == true)
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [signedInReading(profile)],
+            isRefreshing: false,
+            now: now.addingTimeInterval(1)
+        ))
+        XCTAssertEqual(transition, .changed)
+        XCTAssertEqual(access.phase, .ready)
+        XCTAssertTrue(access.allowsAdapterStart)
+        XCTAssertNil(access.presentation)
+    }
+
+    @MainActor
+    func testLogoutInvalidatesResumeAndExposesAllRecoveryActions() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let access = ChatAccountAccess(binding: binding, requiresResolution: false)
+        let signedOut = UsageCenter.ProviderPlanUsage(
+            provider: profile.provider.rawValue,
+            displayName: profile.provider.displayName,
+            profileID: profile.id,
+            profileLabel: profile.label,
+            ok: false,
+            sourceLabel: "fixture",
+            windows: [],
+            message: "Sign in required"
+        )
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [signedOut],
+            isRefreshing: false,
+            now: Date()
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.signedOut))
+        XCTAssertEqual(access.presentation?.actions, [.signIn, .chooseAccount, .preserveTranscript])
+        XCTAssertEqual(access.presentation?.showsActivityIndicator, false)
+    }
+
+    @MainActor
+    func testAccountRemovalInvalidatesPreviouslyReadyChatWithoutDeletingItsContract() throws {
+        let (_, binding) = try restoredChatAccountFixture()
+        let access = ChatAccountAccess(binding: binding, requiresResolution: false)
+
+        let transition = access.reconcile(.init(
+            profiles: [],
+            readings: [],
+            isRefreshing: false,
+            now: Date()
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.accountRemoved))
+        XCTAssertEqual(access.binding, binding)
+        XCTAssertTrue(access.presentation?.detail.contains("transcript and draft are still here") == true)
+    }
+
+    @MainActor
+    func testOrdinarySignedInRestorationStartsWithoutRecoveryUI() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let access = ChatAccountAccess(binding: binding, requiresResolution: true)
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [signedInReading(profile)],
+            isRefreshing: false,
+            now: Date()
+        ))
+
+        XCTAssertEqual(transition, .changed)
+        XCTAssertEqual(access.phase, .ready)
+        XCTAssertTrue(access.allowsAdapterStart)
+        XCTAssertNil(access.presentation)
+    }
+
+    @MainActor
+    func testUnresolvedAccountStopsSpinnerAtDeadline() throws {
+        let (profile, binding) = try restoredChatAccountFixture()
+        let now = Date(timeIntervalSince1970: 30)
+        let access = ChatAccountAccess(
+            binding: binding,
+            requiresResolution: true,
+            now: now,
+            timeout: 5
+        )
+
+        let transition = access.reconcile(.init(
+            profiles: [profile],
+            readings: [],
+            isRefreshing: false,
+            now: now.addingTimeInterval(5)
+        ))
+
+        XCTAssertEqual(transition, .requiresResumeInvalidation)
+        XCTAssertEqual(access.phase, .actionRequired(.resolutionTimedOut))
+        XCTAssertFalse(try XCTUnwrap(access.presentation).showsActivityIndicator)
+    }
+
+    private func restoredChatAccountFixture() throws -> (
+        UsageAccountProfile,
+        SessionAccountBinding
+    ) {
+        let profile = UsageAccountProfile(
+            id: "restored-work",
+            provider: .claude,
+            label: "Work",
+            directory: storeFile.deletingLastPathComponent()
+                .appendingPathComponent("claude-work", isDirectory: true).path
+        )
+        let binding = try XCTUnwrap(SessionAccountBinding.resolve(
+            provider: profile.provider,
+            profile: profile,
+            fallbackEnvironment: [:]
+        ))
+        return (profile, binding)
+    }
+
+    private func signedInReading(
+        _ profile: UsageAccountProfile
+    ) -> UsageCenter.ProviderPlanUsage {
+        UsageCenter.ProviderPlanUsage(
+            provider: profile.provider.rawValue,
+            displayName: profile.provider.displayName,
+            profileID: profile.id,
+            profileLabel: profile.label,
+            ok: true,
+            sourceLabel: "fixture",
+            account: "ready@example.test",
+            windows: []
+        )
+    }
+
+    @MainActor
     func testChatRestorationLoadsOnlyTailThenFetchesEarlierSQLitePage() async throws {
         let root = storeFile.deletingLastPathComponent()
         let projectDirectory = root.appendingPathComponent("paged-chat-project", isDirectory: true)
@@ -1156,12 +1442,211 @@ final class AppModelProjectContextTests: XCTestCase {
         await model.teardown()
     }
 
+    /// A chat whose stored rows cannot be decoded keeps its surface, says so,
+    /// and does not have its damaged history overwritten by the empty
+    /// transcript restoration produced.
+    @MainActor
+    func testDamagedTranscriptRestoresWithGuidanceAndKeepsTheStoredRows() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        let projectDirectory = root.appendingPathComponent("damaged-chat-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
+        let projectID = NativeSessionStore.projectID(forDirectory: projectDirectory.path)
+        let chatID = "damaged-chat"
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-damaged-restore.json")
+        )
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: projectID,
+            layout: SessionPaneLayout(sessionID: chatID),
+            panes: [NativeRestorablePaneState(
+                id: chatID,
+                surface: NativeRestorableSurfaceState(agentChat: NativeRestorableAgentChatDescriptor(
+                    id: chatID,
+                    projectID: projectID,
+                    agentID: agent.id,
+                    workspacePath: projectDirectory.path,
+                    acpSessionID: nil,
+                    accountBinding: nil,
+                    title: "Damaged chat"
+                ))
+            )],
+            focusedPaneID: chatID
+        ))
+
+        let transcriptURL = root.appendingPathComponent("transcripts-damaged-restore.json")
+        let seed = AcpTranscriptStore(fileURL: transcriptURL)
+        let rows = (0..<3).map { AcpTranscriptRow.message(id: "\($0)", text: "row \($0)") }
+        await seed.scheduleSave(rows, for: chatID, now: 1)
+        await seed.flush()
+        let databaseURL = seed.databaseURL
+        try TranscriptDatabaseProbe.execute(
+            "UPDATE transcript_rows SET row_json = X'6E6F70' WHERE chat_id = '\(chatID)'",
+            at: databaseURL
+        )
+
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        let model = makeRestoringModel(
+            workspaceStore: workspaceStore,
+            root: root,
+            identity: "damaged-restore",
+            projectDirectory: projectDirectory
+        )
+        await model.restoreWorkspaceStateIfNeeded()
+
+        let conversation = try XCTUnwrap(model.chats.first { $0.id == chatID }?.conversation)
+        XCTAssertTrue(conversation.rows.isEmpty)
+        XCTAssertTrue(ToastCenter.shared.toasts.contains {
+            $0.message.contains("saved history is damaged")
+                && $0.message.contains(databaseURL.path)
+        })
+
+        // The chat keeps streaming into a surface whose history we could not
+        // read; none of that may reach the rows still on disk.
+        model.enqueueTranscriptSave([.message(id: "new", text: "post-damage turn")], chatID: chatID)
+        await model.flushTranscriptPersistence()
+        XCTAssertEqual(try TranscriptDatabaseProbe.rowCount(chatID: chatID, at: databaseURL), 3)
+        await model.teardown()
+    }
+
+    @MainActor
+    func testAppModelUsesUsageCentersExactRecoveryAuthorityAndState() async throws {
+        let root = storeFile.deletingLastPathComponent()
+            .appendingPathComponent("shared-project-account-recovery", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let accountURL = root.appendingPathComponent("project-accounts.json")
+        let recoveryCenter = ProjectAccountRecoveryCenter(
+            store: ProjectAccountStore(fileURL: accountURL)
+        )
+        let transcriptStore = AcpTranscriptStore(fileURL: root.appendingPathComponent("transcripts.json"))
+        let usageCenter = UsageCenter(
+            persistenceStore: transcriptStore,
+            projectAccountRecoveryCenter: recoveryCenter
+        )
+        let model = AppModel(
+            brokerPreparer: ProjectContextBrokerPreparer(),
+            fallbackPreparer: nil,
+            client: ProjectContextBrokerClient(),
+            sessionStore: NativeSessionStore(fileURL: root.appendingPathComponent("sessions.json")),
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            workspaceStateStore: NativeWorkspaceStateStore(fileURL: root.appendingPathComponent("workspace.json")),
+            transcriptStore: transcriptStore,
+            usageCenter: usageCenter
+        )
+
+        XCTAssertTrue(model.projectAccountRecoveryCenter === recoveryCenter)
+        XCTAssertTrue(usageCenter.projectAccountRecoveryCenter === recoveryCenter)
+
+        try Data("corrupt account mapping".utf8).write(to: accountURL)
+        _ = model.projectAccountRecoveryCenter.loadStatus()
+
+        XCTAssertEqual(recoveryCenter.issue?.kind, .corrupt)
+        XCTAssertEqual(usageCenter.projectAccountRecoveryCenter.issue?.kind, .corrupt)
+        await model.teardown()
+    }
+
+    @MainActor
+    func testCorruptProjectAccountsBlockChatMeshAndTerminalCreationFunnels() async throws {
+        let root = storeFile.deletingLastPathComponent()
+            .appendingPathComponent("corrupt-project-account-launches", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let accountURL = root.appendingPathComponent("project-accounts.json")
+        let corruptBytes = Data("corrupt account mapping".utf8)
+        try corruptBytes.write(to: accountURL)
+        let recoveryCenter = ProjectAccountRecoveryCenter(
+            store: ProjectAccountStore(fileURL: accountURL)
+        )
+        let control = ProjectAccountNoLaunchBrokerControlClient()
+        let transcriptStore = AcpTranscriptStore(fileURL: root.appendingPathComponent("transcripts.json"))
+        let model = AppModel(
+            controlClient: control,
+            sessionStore: NativeSessionStore(fileURL: root.appendingPathComponent("sessions.json")),
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            workspaceStateStore: NativeWorkspaceStateStore(fileURL: root.appendingPathComponent("workspace.json")),
+            transcriptStore: transcriptStore,
+            projectAccountRecoveryCenter: recoveryCenter,
+            usageCenter: UsageCenter(
+                persistenceStore: transcriptStore,
+                projectAccountRecoveryCenter: recoveryCenter
+            )
+        )
+        model.loadVisualFixture(workspace: root)
+        let agent = try XCTUnwrap(AgentRegistry.profile(id: "codex"))
+
+        model.openChat(agent, inDirectory: root)
+        model.openMesh(inDirectory: root)
+        await model.createAgentSession(agent, inDirectory: root)
+        let terminalCreationCount = await control.createCount()
+
+        XCTAssertTrue(model.chats.isEmpty, "the ACP child-process funnel must not materialize a chat")
+        XCTAssertTrue(model.meshes.isEmpty, "the Mesh funnel must not schedule any columns")
+        XCTAssertEqual(terminalCreationCount, 0, "terminal.create must never reach the broker")
+        XCTAssertEqual(recoveryCenter.issue?.kind, .corrupt)
+        XCTAssertEqual(try Data(contentsOf: accountURL), corruptBytes)
+    }
+
+    @MainActor
+    func testCorruptProjectAccountsBlockWorkspaceChatAndMeshRestorationFunnels() async throws {
+        let root = storeFile.deletingLastPathComponent()
+            .appendingPathComponent("corrupt-project-account-restore", isDirectory: true)
+        let projectDirectory = root.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
+        let projectID = NativeSessionStore.projectID(forDirectory: projectDirectory.path)
+        let agent = try XCTUnwrap(AgentRegistry.profile(id: "codex"))
+        let chatID = "blocked-restored-chat"
+        let chatDescriptor = NativeRestorableAgentChatDescriptor(
+            id: chatID,
+            projectID: projectID,
+            agentID: agent.id,
+            workspacePath: projectDirectory.path,
+            acpSessionID: "must-not-resume",
+            accountBinding: nil,
+            title: "Blocked restored chat"
+        )
+        let chatPane = NativeRestorablePaneState(
+            id: chatID,
+            surface: NativeRestorableSurfaceState(agentChat: chatDescriptor)
+        )
+        let meshPane = Self.meshPane(id: "blocked-restored-mesh", basePath: projectDirectory.path)
+        let workspaceStore = NativeWorkspaceStateStore(fileURL: root.appendingPathComponent("workspace.json"))
+        try await workspaceStore.saveRestorationState(NativeWorkspaceRestorationState(
+            selectedProjectID: projectID,
+            projects: [NativeProjectWorkspaceState(
+                projectID: projectID,
+                layout: SessionPaneLayout(columns: [
+                    .init(sessionIDs: [chatPane.id, meshPane.id]),
+                ]),
+                panes: [chatPane, meshPane],
+                focusedPaneID: chatPane.id
+            )]
+        ))
+        let accountURL = root.appendingPathComponent("project-accounts.json")
+        try Data("corrupt restored mapping".utf8).write(to: accountURL)
+        let recoveryCenter = ProjectAccountRecoveryCenter(
+            store: ProjectAccountStore(fileURL: accountURL)
+        )
+        let model = makeRestoringModel(
+            workspaceStore: workspaceStore,
+            root: root,
+            identity: "blocked-restore",
+            projectDirectory: projectDirectory,
+            projectAccountRecoveryCenter: recoveryCenter
+        )
+
+        await model.restoreWorkspaceStateIfNeeded()
+
+        XCTAssertTrue(model.chats.isEmpty)
+        XCTAssertTrue(model.meshes.isEmpty)
+        XCTAssertEqual(recoveryCenter.issue?.kind, .corrupt)
+    }
+
     @MainActor
     private func makeRestoringModel(
         workspaceStore: NativeWorkspaceStateStore,
         root: URL,
         identity: String,
-        projectDirectory: URL
+        projectDirectory: URL,
+        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = ProjectAccountRecoveryCenter()
     ) -> AppModel {
         let sessionStore = NativeSessionStore(
             fileURL: root.appendingPathComponent("native-sessions-\(identity).json")
@@ -1180,7 +1665,11 @@ final class AppModelProjectContextTests: XCTestCase {
             ),
             workspaceStateStore: workspaceStore,
             transcriptStore: transcriptStore,
-            usageCenter: UsageCenter(persistenceStore: transcriptStore),
+            projectAccountRecoveryCenter: projectAccountRecoveryCenter,
+            usageCenter: UsageCenter(
+                persistenceStore: transcriptStore,
+                projectAccountRecoveryCenter: projectAccountRecoveryCenter
+            ),
             reconnectBackoff: BrokerReconnectBackoff(
                 baseNanoseconds: 1,
                 maximumNanoseconds: 2,
@@ -1214,6 +1703,44 @@ final class AppModelProjectContextTests: XCTestCase {
             surface: NativeRestorableSurfaceState(mesh: descriptor)
         )
     }
+}
+
+private actor ProjectAccountNoLaunchBrokerControlClient: BrokerControlServing {
+    private var creations = 0
+
+    func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {}
+    func connect(to info: BrokerInfo, ownerID: String) async throws {}
+
+    func createTerminal(
+        projectID: String,
+        terminalID: String,
+        command: String,
+        arguments: [String],
+        cwd: String,
+        columns: Int,
+        rows: Int,
+        restore: Bool
+    ) async throws -> TerminalCreation {
+        creations += 1
+        return TerminalCreation(
+            terminalID: terminalID,
+            projectID: projectID,
+            pid: 1,
+            streamEpoch: "unexpected"
+        )
+    }
+
+    func attach(projectID: String, terminalID: String) async throws {}
+    func write(projectID: String, terminalID: String, data: String) async throws {}
+    func resize(projectID: String, terminalID: String, columns: Int, rows: Int) async throws {}
+    func kill(projectID: String, terminalID: String) async throws {}
+    func release(projectID: String, terminalID: String) async throws {}
+    func detachOwner(projectID: String, terminalID: String) async throws {}
+    func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws {}
+    func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {}
+    func disconnect() async {}
+
+    func createCount() -> Int { creations }
 }
 
 private struct ProjectContextBrokerPreparer: BrokerInfoPreparing {

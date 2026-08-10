@@ -3,6 +3,26 @@ import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// Window-local presentation effects carried by registered commands. Keeping
+/// this mapping value-based lets tests prove that a global command targets the
+/// intended window without mounting the full workspace or touching a broker.
+enum RootShellLocalCommand: Equatable, Sendable {
+    case toggleCommandPalette
+    case toggleOmniBar
+    case toggleDocumentPreview
+    case presentReadinessChecklist
+
+    init?(commandID: AppCommandID) {
+        switch commandID {
+        case .commandPalette: self = .toggleCommandPalette
+        case .messageCurrentAgent: self = .toggleOmniBar
+        case .toggleDocumentPreview: self = .toggleDocumentPreview
+        case .readinessChecklist: self = .presentReadinessChecklist
+        default: return nil
+        }
+    }
+}
+
 struct RootShellView: View {
     nonisolated static func shouldAutomaticallyRefreshPlanUsage(
         environment: [String: String]
@@ -16,6 +36,16 @@ struct RootShellView: View {
     ) -> Bool {
         !NativePreviewSettings.isIsolatedFixture(environment: environment)
             && OnboardingState.shouldShow(defaults: defaults)
+    }
+
+    /// Drives the isolated optimized interaction gate through the same sheet,
+    /// dismissal, command palette, and local-command route as production. The
+    /// app delegate still supplies a broker-free fixture model.
+    nonisolated static func shouldPresentReadinessReopenFixture(
+        environment: [String: String]
+    ) -> Bool {
+        environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+            && environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "onboarding-reopen"
     }
 
     @EnvironmentObject private var model: AppModel
@@ -33,6 +63,7 @@ struct RootShellView: View {
     /// Chat id awaiting a typed model id (the menu's "Custom Model…").
     @State private var customModelTarget: String?
     @State private var customModelText: String = ""
+    @State private var signingInChatAccount: UsageAccountProfile?
     @State private var renameProjectTarget: String?
     @State private var renameText: String = ""
     @State private var gitRepo: URL?
@@ -234,6 +265,15 @@ struct RootShellView: View {
                 }
                 performLocalCommand(AppCommandID(rawValue: rawID))
             }
+            .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenProviderSettings)) { note in
+                guard let target = note.object as? AppModel,
+                      target === model,
+                      let sectionID = note.userInfo?[AcpProviderSettingsNotificationKey.sectionID] as? String else {
+                    return
+                }
+                settingsSectionID = sectionID
+                showSettings = true
+            }
             .onChange(of: model.latestAgentFileActivity) { _, activity in
                 guard let activity,
                       WorkspaceAgentFileFollowPolicy.shouldOpen(
@@ -247,7 +287,9 @@ struct RootShellView: View {
             }
             .onAppear {
                 let environment = ProcessInfo.processInfo.environment
-                if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+                if Self.shouldPresentReadinessReopenFixture(environment: environment) {
+                    showOnboarding = true
+                } else if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
                    environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "palette" {
                     showPalette = true
                 } else if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
@@ -328,6 +370,11 @@ struct RootShellView: View {
                 customModelTarget = nil
             }
         }
+        .sheet(item: $signingInChatAccount) { profile in
+            AccountSignInSheet(profile: profile) {
+                signingInChatAccount = nil
+            }
+        }
         .sheet(item: Binding(get: { gitRepo.map(GitRepoID.init) }, set: { gitRepo = $0?.url })) { repo in
             VStack(spacing: 0) {
                 HStack {
@@ -337,7 +384,10 @@ struct RootShellView: View {
                 }
                 .padding(12)
                 Divider()
-                GitPanelView(repoRoot: repo.url)
+                GitPanelView(repoRoot: repo.url) { agent, draft in
+                    model.openChat(agent, inDirectory: repo.url, initialDraft: draft)
+                    gitRepo = nil
+                }
                     .frame(width: 520, height: 460)
             }
         }
@@ -466,11 +516,18 @@ struct RootShellView: View {
     }
 
     private func performLocalCommand(_ id: AppCommandID) {
-        switch id {
-        case .commandPalette: toggleCommandPalette()
-        case .messageCurrentAgent: toggleOmniBar()
-        case .toggleDocumentPreview: toggleFilePreviewColumn()
-        default: break
+        guard let command = RootShellLocalCommand(commandID: id) else { return }
+        switch command {
+        case .toggleCommandPalette:
+            toggleCommandPalette()
+        case .toggleOmniBar:
+            toggleOmniBar()
+        case .toggleDocumentPreview:
+            toggleFilePreviewColumn()
+        case .presentReadinessChecklist:
+            showPalette = false
+            showOmniBar = false
+            showOnboarding = true
         }
     }
 
@@ -505,9 +562,52 @@ struct RootShellView: View {
 
     // MARK: - Layouts
 
+    /// The one action surface injected into either navigation shell. Layout
+    /// switching changes presentation only; it cannot select a different
+    /// implementation of project, session, or destructive actions.
+    private var shellActions: RootShellActionModel {
+        RootShellActionModel(
+            openDroppedProjects: { urls in
+                let folders = urls.filter(\.hasDirectoryPath)
+                guard !folders.isEmpty else { return false }
+                for folder in folders { model.openProject(directory: folder) }
+                return true
+            },
+            openProject: { runCommand(.openProject) },
+            useLeftTreeNavigation: { runCommand(.navigationLayout(.leftTree)) },
+            moveProject: { model.moveProject(id: $0, toIndex: $1) },
+            runQuickAction: { action, directory in
+                Task { await model.runQuickAction(action, inProject: directory) }
+            },
+            selectSession: { session in
+                if KaisolaMacAppDelegate.focusWindow(displayingSurface: session.id) { return }
+                guard SurfaceSelectionPolicy.shouldRequestFocus(
+                    focusedPaneID: model.focusedPaneID,
+                    targetID: session.id,
+                    browserOpen: model.browserCardURL != nil,
+                    activeProjectID: model.selectedProjectID,
+                    targetProjectID: session.projectID
+                ) else { return }
+                Task { await model.focusSurface(session.id) }
+            },
+            projectLaunchMenu: { AnyView(projectLaunchMenu($0)) },
+            projectContextMenu: { AnyView(projectContextMenu($0)) },
+            sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
+            chatContextMenu: { AnyView(chatContextMenuContent($0)) },
+            meshContextMenu: { AnyView(meshContextMenuContent($0)) },
+            renameSurface: { renameTarget = $0 },
+            closeChat: { model.closeChat($0.id) },
+            deleteChat: requestDeleteChat,
+            closeMesh: requestMoveMeshToRecentlyClosed,
+            deleteMesh: requestDeleteMesh,
+            deleteRecentlyClosed: requestDeleteRecentlyClosed
+        )
+    }
+
     /// Nested project→session tree in a left sidebar (the default).
     private var leftTreeLayout: some View {
-        NavigationSplitView {
+        let actions = shellActions
+        return RootLeftTreeShell(actions: actions) { actions in
             VStack(spacing: 0) {
                 // No "Projects" title row: the chrome panel already starts below
                 // the traffic lights, the rail's own pinned project names the
@@ -528,23 +628,13 @@ struct RootShellView: View {
                         // uses, so the rail always pins exactly the project
                         // whose sessions are expanded.
                         isActiveProject: { activeProjectID == $0 },
-                        selectSession: { session in
-                            if KaisolaMacAppDelegate.focusWindow(displayingSurface: session.id) { return }
-                            guard SurfaceSelectionPolicy.shouldRequestFocus(
-                                focusedPaneID: model.focusedPaneID,
-                                targetID: session.id,
-                                browserOpen: model.browserCardURL != nil,
-                                activeProjectID: model.selectedProjectID,
-                                targetProjectID: session.projectID
-                            ) else { return }
-                            Task { await model.focusSurface(session.id) }
-                        },
-                        launchMenu: { AnyView(projectLaunchMenu($0)) },
-                        contextMenu: { AnyView(projectContextMenu($0)) },
-                        sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
-                        chatContextMenu: { AnyView(chatContextMenuContent($0)) },
-                        meshContextMenu: { AnyView(meshContextMenuContent($0)) },
-                        deleteRecentlyClosed: requestDeleteRecentlyClosed
+                        selectSession: actions.selectSession,
+                        launchMenu: actions.projectLaunchMenu,
+                        contextMenu: actions.projectContextMenu,
+                        sessionContextMenu: actions.sessionContextMenu,
+                        chatContextMenu: actions.chatContextMenu,
+                        meshContextMenu: actions.meshContextMenu,
+                        deleteRecentlyClosed: actions.deleteRecentlyClosed
                     )
                     addProjectRow
                         .listRowInsets(QuietRailMetrics.listRowBleed)
@@ -558,12 +648,7 @@ struct RootShellView: View {
                 // Typed to URLs, so the rail's own internal text drags (project
                 // reorder) never collide with it.
                 .dropDestination(for: URL.self) { urls, _ in
-                    let folders = urls.filter(\.hasDirectoryPath)
-                    guard !folders.isEmpty else { return false }
-                    for folder in folders {
-                        model.openProject(directory: folder)
-                    }
-                    return true
+                    actions.openDroppedProjects(urls)
                 } isTargeted: { sidebarDropTargeted = $0 }
                 .overlay {
                     if sidebarDropTargeted {
@@ -671,10 +756,9 @@ struct RootShellView: View {
                 ideal: NativeWorkspaceChrome.projectSidebarIdealWidth,
                 max: NativeWorkspaceChrome.projectSidebarMaximumWidth
             )
-        } detail: {
+        } detail: { _ in
             detailArea
         }
-        .navigationSplitViewStyle(.balanced)
     }
 
     /// The detail column: the content on its own inset floating card, gutters
@@ -790,7 +874,7 @@ struct RootShellView: View {
         Button(action: action) {
             Image(systemName: symbol)
                 .font(.system(size: NativeWorkspaceChrome.detailChromeGlyphSize, weight: .regular))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: 24, height: 20)
                 .contentShape(Rectangle())
         }
@@ -825,6 +909,11 @@ struct RootShellView: View {
         } label: {
             Label(model.isPinned(session.id) ? "Unpin" : "Pin",
                   systemImage: model.isPinned(session.id) ? "pin.slash" : "pin")
+        }
+        if model.pinsUnreadable != nil {
+            // Pinning stays stuck until the unreadable file moves aside, and
+            // this is the only action allowed to give up on that file.
+            Button("Reset Pinned Sessions") { model.resetUnreadablePins() }
         }
         if !visible {
             Button("Open in Split") {
@@ -953,7 +1042,7 @@ struct RootShellView: View {
                     .font(.callout)
                 Spacer(minLength: 0)
             }
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .padding(.leading, 12)
             .frame(height: QuietRailMetrics.rowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -988,7 +1077,7 @@ struct RootShellView: View {
                 } label: {
                     HStack(spacing: 7) {
                         Circle()
-                            .fill(device.presence == .online ? Color.green : Color.secondary.opacity(0.45))
+                            .fill(device.presence == .online ? Color.green : Color.kaisolaTertiary)
                             .frame(width: 6, height: 6)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(device.deviceName)
@@ -996,7 +1085,7 @@ struct RootShellView: View {
                                 .lineLimit(1)
                             Text("\(device.sessions.count) remembered \(device.sessions.count == 1 ? "session" : "sessions")")
                                 .font(.system(size: 10))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                         }
                     }
                 }
@@ -1013,7 +1102,7 @@ struct RootShellView: View {
                     ? "clock.arrow.circlepath"
                     : "checkmark.icloud")
                     .font(.system(size: 9.5))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .lineLimit(1)
                     .help("Remembered-session catalog freshness")
                     .accessibilityLabel("Remembered sessions, \(freshness)")
@@ -1048,7 +1137,7 @@ struct RootShellView: View {
                     .lineLimit(1)
                 Text("\(session.projectName) · \(rememberedSessionActivityTitle(session.activity))")
                     .font(.system(size: 9.5))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(1)
             }
         }
@@ -1085,39 +1174,39 @@ struct RootShellView: View {
     /// A project tab strip over a session row, then the detail pane (Electron's
     /// "Top bar" mode).
     private var topBarLayout: some View {
-        VStack(spacing: 0) {
+        let actions = shellActions
+        return RootTopBarShell(actions: actions) { actions in
             ProjectTabStripView(
                 projects: model.projects,
                 selected: activeProjectBinding,
-                menu: { project in AnyView(self.projectContextMenu(project)) },
-                openFolder: { runCommand(.openProject) },
-                useSidebar: { runCommand(.navigationLayout(.leftTree)) },
-                reorder: { model.moveProject(id: $0, toIndex: $1) }
+                menu: actions.projectContextMenu,
+                openFolder: actions.openProject,
+                useSidebar: actions.useLeftTreeNavigation,
+                reorder: actions.moveProject
             )
             .padding(.leading, NativeWorkspaceChrome.topBarTrafficLightClearance)
-            Divider()
+        } quickActions: { actions in
             if let active = model.projects.first(where: { $0.id == activeProjectID }),
                let activeDir = active.directory {
                 QuickActionsBar(projectID: active.id, projectName: active.name) { action in
-                    Task { await model.runQuickAction(action, inProject: activeDir) }
+                    actions.runQuickAction(action, activeDir)
                 }
             }
+        } sessions: { actions in
             SessionStrip(
                 model: model,
                 projectID: activeProjectID,
-                rename: { renameTarget = $0 },
-                closeChat: { model.closeChat($0.id) },
-                deleteChat: requestDeleteChat,
-                closeMesh: requestMoveMeshToRecentlyClosed,
-                deleteMesh: requestDeleteMesh,
-                deleteRecentlyClosed: requestDeleteRecentlyClosed
+                rename: actions.renameSurface,
+                closeChat: actions.closeChat,
+                deleteChat: actions.deleteChat,
+                closeMesh: actions.closeMesh,
+                deleteMesh: actions.deleteMesh,
+                deleteRecentlyClosed: actions.deleteRecentlyClosed
             )
-            Divider()
+        } detail: { _ in
             detailArea
-            HStack(spacing: 0) {
-                footer.frame(width: 235)
-                Spacer(minLength: 0)
-            }
+        } footer: { _ in
+            footer
         }
     }
 
@@ -1482,6 +1571,7 @@ struct RootShellView: View {
             state: model.connectionState,
             brokerUpgradeState: model.brokerUpgradeState,
             brokerGenerationDetail: model.brokerGenerationDetail,
+            brokerUpdateGateBlockedDetail: model.brokerUpdateGateBlockedDetail,
             brokerRollbackCandidates: model.brokerRollbackCandidates,
             rollbackBrokerGeneration: { generationID in
                 Task { await model.rollbackBrokerGeneration(generationID) }
@@ -1525,16 +1615,17 @@ struct RootShellView: View {
         }
     }
 
-    /// New agent session running the agent's CLI in the active project (or a
-    /// picked folder).
+    /// New agent session with an explicit execution boundary. Even when a
+    /// project is active, the user sees where the process, branch, account, and
+    /// host will be before anything launches.
     @MainActor
     static func promptForNewAgent(_ agent: AgentProfile, model: AppModel) {
-        if let directory = model.currentProjectDirectory {
-            startAgentSession(agent, in: directory, model: model)
-            return
-        }
-        chooseDirectory(prompt: "Start \(agent.name) Here") { directory in
-            startAgentSession(agent, in: directory, model: model)
+        promptForRunOn(agent, model: model) { directory, profile in
+            Task { await model.createAgentSession(
+                agent,
+                inDirectory: directory,
+                accountProfile: profile
+            ) }
         }
     }
 
@@ -1560,49 +1651,187 @@ struct RootShellView: View {
         }
     }
 
-    /// New ACP chat with the agent in the active project (or a picked folder).
+    /// ACP chat launch shares the same location/account authority as a terminal
+    /// agent launch; the transport kind must not change where it runs.
     @MainActor
     static func promptForNewChat(_ agent: AgentProfile, model: AppModel) {
         guard AcpAdapter.forAgent(agent.id) != nil else { return }
-        if let directory = model.currentProjectDirectory {
-            startChat(agent, in: directory, model: model)
-            return
-        }
-        chooseDirectory(prompt: "Chat with \(agent.name) Here") { directory in
-            startChat(agent, in: directory, model: model)
-        }
-    }
-
-    @MainActor
-    private static func startAgentSession(
-        _ agent: AgentProfile,
-        in directory: URL,
-        model: AppModel
-    ) {
-        chooseSessionAccount(for: agent) { profile in
-            Task { await model.createAgentSession(
-                agent,
-                inDirectory: directory,
-                accountProfile: profile
-            ) }
-        }
-    }
-
-    @MainActor
-    private static func startChat(
-        _ agent: AgentProfile,
-        in directory: URL,
-        model: AppModel
-    ) {
-        chooseSessionAccount(for: agent) { profile in
+        promptForRunOn(agent, model: model) { directory, profile in
             model.openChat(agent, inDirectory: directory, accountProfile: profile)
         }
     }
 
-    /// Pick a local provider-owned config directory without ever reading or
-    /// copying its credentials. No named profiles means zero extra ceremony.
-    /// Once selected, AppModel snapshots the resolved path into the session so
-    /// later settings changes cannot redirect an existing continuation.
+    private typealias RunOnLaunch = @MainActor (URL, UsageAccountProfile?) -> Void
+
+    @MainActor
+    private static func promptForRunOn(
+        _ agent: AgentProfile,
+        model: AppModel,
+        additionalDirectory: URL? = nil,
+        then launch: @escaping RunOnLaunch
+    ) {
+        let preferredPath = additionalDirectory?.standardizedFileURL.path
+            ?? model.currentProjectDirectory?.standardizedFileURL.path
+        var projects = model.projects.compactMap { project -> RunOnTargetBuilder.Project? in
+            guard let directory = project.directory?.standardizedFileURL else { return nil }
+            return .init(name: project.name, path: directory.path)
+        }
+        if let additionalDirectory {
+            let path = additionalDirectory.standardizedFileURL.path
+            projects.removeAll { URL(fileURLWithPath: $0.path).standardizedFileURL.path == path }
+            projects.insert(.init(name: additionalDirectory.lastPathComponent, path: path), at: 0)
+        } else if let preferredPath,
+                  let preferredIndex = projects.firstIndex(where: { $0.path == preferredPath }),
+                  preferredIndex != 0 {
+            projects.insert(projects.remove(at: preferredIndex), at: 0)
+        }
+        let worktrees = model.meshes.flatMap { mesh in
+            mesh.columns.compactMap { column -> RunOnTargetBuilder.Worktree? in
+                guard let path = column.worktreePath, let branch = column.branch else { return nil }
+                return .init(
+                    name: "\(mesh.title) — \(column.agent.name)",
+                    path: path,
+                    branch: branch
+                )
+            }
+        }
+        let recentPaths = model.recentFolders
+        let host = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        let visualFixture = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+            && ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "account-picker"
+        if visualFixture, projects.isEmpty {
+            projects = [.init(name: "Kaisola", path: "/Users/example/Developer/Kaisola")]
+        }
+        let projectSnapshot = projects
+        let worktreeSnapshot = worktrees
+        let recentSnapshot = recentPaths
+        let fixturePaths = visualFixture ? Set(projectSnapshot.map(\.path)) : []
+
+        Task {
+            let targets = await Task.detached(priority: .userInitiated) {
+                [projectSnapshot, worktreeSnapshot, recentSnapshot, host, fixturePaths] in
+                RunOnTargetBuilder.build(
+                    projects: projectSnapshot,
+                    recentPaths: recentSnapshot,
+                    worktrees: worktreeSnapshot,
+                    host: host,
+                    isDirectory: { path in
+                        if fixturePaths.contains(path) { return true }
+                        var isDirectory: ObjCBool = false
+                        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                            && isDirectory.boolValue
+                    },
+                    branch: { path in
+                        if fixturePaths.contains(path) { return "main" }
+                        guard let status = try? GitService(
+                            repoRoot: URL(fileURLWithPath: path, isDirectory: true)
+                        ).status() else { return nil }
+                        return status.branch
+                    }
+                )
+            }.value
+            presentRunOnPicker(
+                agent,
+                model: model,
+                targets: targets,
+                preferredPath: preferredPath,
+                launch: launch
+            )
+        }
+    }
+
+    @MainActor
+    private static func presentRunOnPicker(
+        _ agent: AgentProfile,
+        model: AppModel,
+        targets: [RunOnTarget],
+        preferredPath: String?,
+        launch: @escaping RunOnLaunch
+    ) {
+        let selectedTarget = targets.first { $0.path == preferredPath }
+        let provider = SessionAccountBinding.provider(forAgentID: agent.id)
+        var profiles = provider.map { provider in
+            UsageAccountStore().profiles().filter { $0.provider == provider }
+        } ?? []
+        let visualFixture = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+            && ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "account-picker"
+        if visualFixture, let provider {
+            profiles = [
+                UsageAccountProfile(
+                    id: "visual-work",
+                    provider: provider,
+                    label: "Work",
+                    directory: "/Users/example/.\(provider.rawValue)-work"
+                ),
+                UsageAccountProfile(
+                    id: "visual-research",
+                    provider: provider,
+                    label: "Research",
+                    directory: "/Users/example/.\(provider.rawValue)-research"
+                ),
+            ]
+        }
+        profiles.sort {
+            $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending
+        }
+
+        let controller = RunOnPickerController(
+            model: RunOnPickerModel(
+                targets: targets,
+                selectedScope: selectedTarget?.scope,
+                selectedTargetID: selectedTarget?.id
+            ),
+            profiles: profiles,
+            provider: provider,
+            preferNamedAccount: visualFixture,
+            removeRecent: { path in model.removeRecentFolder(path) }
+        )
+        let alert = NSAlert()
+        alert.messageText = "Run \(agent.name) on…"
+        alert.informativeText = "Choose the execution location first, then a project, root, or branch. Search stays inside that location."
+        alert.alertStyle = .informational
+        alert.accessoryView = controller.accessoryView
+        alert.addButton(withTitle: "Start")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Choose Folder…")
+        controller.startButton = alert.buttons.first
+        controller.refresh()
+
+        let finish: @MainActor (NSApplication.ModalResponse) -> Void = { response in
+            if response == .alertThirdButtonReturn {
+                chooseDirectory(prompt: "Run \(agent.name) Here") { directory in
+                    promptForRunOn(
+                        agent,
+                        model: model,
+                        additionalDirectory: directory,
+                        then: launch
+                    )
+                }
+                return
+            }
+            guard response == .alertFirstButtonReturn,
+                  let target = controller.selectedTarget,
+                  target.canStart else { return }
+            launch(
+                URL(fileURLWithPath: target.path, isDirectory: true),
+                controller.selectedProfile
+            )
+        }
+        if let window = NSApp.keyWindow
+            ?? NSApp.mainWindow
+            ?? NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) }) {
+            alert.beginSheetModal(for: window) { response in
+                Task { @MainActor in finish(response) }
+            }
+        } else {
+            finish(alert.runModal())
+        }
+    }
+
+    /// Choose only the provider account for an already-restored chat. Its
+    /// execution location is fixed by the existing session, so presenting the
+    /// Run on picker here would incorrectly imply that switching credentials
+    /// can also move the continuation to another project or worktree.
     @MainActor
     private static func chooseSessionAccount(
         for agent: AgentProfile,
@@ -1631,8 +1860,8 @@ struct RootShellView: View {
                 ),
             ]
         }
-        profiles.sort { lhs, rhs in
-                lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
+        profiles.sort {
+            $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending
         }
         guard !profiles.isEmpty else {
             handle(nil)
@@ -1647,17 +1876,13 @@ struct RootShellView: View {
             picker.item(at: picker.numberOfItems - 1)?.toolTip = profile.expandedDirectory
         }
         picker.setAccessibilityLabel("Account")
-        if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
-           ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "account-picker" {
-            picker.selectItem(at: min(1, picker.numberOfItems - 1))
-        }
 
         let alert = NSAlert()
         alert.messageText = "Choose \(agent.name) account"
-        alert.informativeText = "This account stays locked to the new session and all of its continuations. Credentials remain in the provider's own config directory."
+        alert.informativeText = "This account stays locked to the restored session and its continuations. Credentials remain in the provider's own config directory."
         alert.alertStyle = .informational
         alert.accessoryView = picker
-        alert.addButton(withTitle: "Start")
+        alert.addButton(withTitle: "Switch")
         alert.addButton(withTitle: "Cancel")
 
         let finish: @MainActor (NSApplication.ModalResponse) -> Void = { response in
@@ -1916,7 +2141,7 @@ struct RootShellView: View {
             let cardRadius = KaisolaVisualSystem.paneRadius
             let terminalChrome = terminalPaneChrome(for: id)
             VStack(spacing: 0) {
-                unifiedSessionHeader(id)
+                unifiedSessionHeader(id, paneWidth: geometry.size.width)
                 unifiedSessionContent(id)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1952,7 +2177,7 @@ struct RootShellView: View {
         .frame(minWidth: 220, minHeight: 150)
     }
 
-    private func unifiedSessionHeader(_ id: String) -> some View {
+    private func unifiedSessionHeader(_ id: String, paneWidth: CGFloat) -> some View {
         let terminalChrome = terminalPaneChrome(for: id)
         return HStack(spacing: 7) {
             Button {
@@ -1984,21 +2209,10 @@ struct RootShellView: View {
                             .foregroundStyle(
                                 surfaceLive(id)
                                     ? KaisolaStatusTone.done.foregroundColor
-                                    : Color.secondary
+                                    : Color.kaisolaSecondary
                             )
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel(surfaceStatusLabel(id))
-                    }
-                    if let deviceName = companionControllerName(for: id) {
-                        Label(deviceName, systemImage: "iphone")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(Color.accentColor)
-                            .lineLimit(1)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.accentColor.opacity(0.1), in: Capsule())
-                            .help("Controlled from \(deviceName)")
-                            .accessibilityLabel("Controlled from \(deviceName)")
                     }
                     Spacer(minLength: 4)
                 }
@@ -2006,6 +2220,14 @@ struct RootShellView: View {
             }
             .buttonStyle(.plain)
             .help("Focus \(surfaceTitle(id))")
+            // Outside the focus button on purpose: the chip is its own control,
+            // and the higher priority means it takes its width before the
+            // button's label does. A pane title that is usually the project
+            // name again truncates first; who holds control does not.
+            if let source = companionControllerChipSource(for: id) {
+                CompanionControllerChipView(source: source, paneWidth: paneWidth)
+                    .layoutPriority(1)
+            }
             if let mesh = model.meshes.first(where: { $0.id == id }) {
                 MeshStagedPromptQueueButton(mesh: mesh)
                 MeshConfigurationMenu(mesh: mesh)
@@ -2021,7 +2243,7 @@ struct RootShellView: View {
                     .frame(width: 24, height: 22)
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .help(model.maximizedPaneID == id ? "Restore pane" : "Maximize pane")
             if model.sessions.contains(where: { $0.id == id }) {
                 Button {
@@ -2031,7 +2253,7 @@ struct RootShellView: View {
                         .frame(width: 24, height: 22)
                 }
                 .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .disabled(model.terminalTranscriptContext(for: id) == nil)
                 .help("Open the full retained terminal transcript")
                 popOutTerminalButton(id)
@@ -2041,7 +2263,7 @@ struct RootShellView: View {
                     .frame(width: 24, height: 22)
             }
             .buttonStyle(.plain)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .help("Hide this session; keep it running")
         }
         .padding(.leading, 10)
@@ -2159,9 +2381,29 @@ struct RootShellView: View {
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)
         .fixedSize()
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.kaisolaSecondary)
         .help("Account: \(currentLabel) · Model: \(chat.modelOverride ?? "default") — switch either, even mid-conversation")
         .accessibilityLabel("Account and model: \(currentLabel), \(chat.modelOverride ?? "default model")")
+    }
+
+    private func signInToRestoredChatAccount(_ chat: AcpChatHandle) {
+        guard let profile = model.accountSignInProfile(for: chat.id) else {
+            settingsSectionID = "accounts"
+            showSettings = true
+            ToastCenter.shared.show(
+                "Open Accounts to add or repair this provider account.",
+                style: .info
+            )
+            return
+        }
+        signingInChatAccount = profile
+    }
+
+    private func chooseRestoredChatAccount(_ chat: AcpChatHandle) {
+        guard let agent = AgentRegistry.profile(id: chat.agentID) else { return }
+        Self.chooseSessionAccount(for: agent) { profile in
+            Task { await model.switchChatAccount(chat.id, to: profile) }
+        }
     }
 
     @ViewBuilder
@@ -2179,20 +2421,28 @@ struct RootShellView: View {
         }
     }
 
-    private func companionControllerName(for terminalID: String) -> String? {
+    private func companionControllerChipSource(
+        for terminalID: String
+    ) -> CompanionControllerChipSource? {
         guard let terminal = model.sessions.first(where: { $0.id == terminalID }) else { return nil }
-        if let deviceName = companionHost.controllingDeviceName(
+        if let source = companionHost.controllerChipSource(
             projectID: terminal.projectID,
             terminalID: terminal.id
         ) {
-            return deviceName
+            return source
         }
         // Deterministic visual fixtures exercise the chip without manufacturing
-        // a paired-device roster or network lease. Production sets both states
-        // together through CompanionHost's lease callback.
-        return model.companionControlledTerminalIDs.contains(terminalID)
-            ? "iPhone"
-            : nil
+        // a paired-device roster or network lease. Gated on the fixture flag:
+        // a production pane must never invent a controller name during the few
+        // milliseconds between a lease being fenced and its status publishing.
+        guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+              model.companionControlledTerminalIDs.contains(terminalID) else { return nil }
+        return CompanionControllerChipSource(
+            deviceName: "Michael's iPhone",
+            // Far enough out that a slow capture still photographs a live
+            // lease rather than the chip decaying to amber mid-run.
+            expiresAt: CompanionControllerChipSource.milliseconds(Date()) + 3_600_000
+        )
     }
 
     private func openTerminalTranscript(_ terminalID: String, fromLiveBoundary: Bool = false) {
@@ -2212,9 +2462,15 @@ struct RootShellView: View {
         } else if let chat = model.chats.first(where: { $0.id == id }) {
             AcpChatView(
                 conversation: chat.conversation,
+                accountAccess: chat.accountAccess,
                 presentation: .embedded,
                 focusRequestGeneration: keyboardFocusGeneration(for: id),
-                onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) }
+                onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) },
+                onSignIn: { signInToRestoredChatAccount(chat) },
+                onChooseAccount: { chooseRestoredChatAccount(chat) },
+                onPreserveTranscript: {
+                    Task { await model.preserveBlockedChat(chat.id) }
+                }
             )
                 .id(chat.id)
         } else if let mesh = model.meshes.first(where: { $0.id == id }) {
@@ -2252,7 +2508,7 @@ struct RootShellView: View {
                 .fontWeight(.semibold)
             Text(command)
                 .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             Button {
                 Task { await model.runPendingAgentResume(for: id) }
             } label: {
@@ -2285,6 +2541,10 @@ struct RootShellView: View {
         if unifiedTerminalDocument(id) != nil,
            let feed = model.terminalSurfaceFeed(for: id) {
             let owned = model.isOwned(id)
+            let authority = TerminalSurfaceAuthority(
+                isOwned: owned,
+                hasDurableOwnership: model.canClose(id)
+            )
             ZStack(alignment: .top) {
                 TerminalSurfaceFeedView(feed: feed) { liveDocument in
                     NativeTerminalSurface(
@@ -2294,7 +2554,7 @@ struct RootShellView: View {
                         scrollback: liveDocument.scrollback,
                         surfaceDelta: liveDocument.surfaceDelta,
                         workingDirectory: model.directory(for: id),
-                        isOwned: owned,
+                        authority: authority,
                         fontSize: settings.terminalFontSize,
                         fontFamily: settings.terminalFontFamily,
                         fontWeight: settings.terminalFontWeight,
@@ -2313,11 +2573,11 @@ struct RootShellView: View {
                         onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) }
                     )
                 }
-                // A reconnect can promote an observed surface to an owned one
-                // after inventory is already visible. The concrete AppKit class is
-                // part of the input-safety boundary: remount so a formerly
-                // ReadOnlyTerminalView can never keep swallowing owned keystrokes.
-                .id("unified-\(id)-\(owned)")
+                // Live controller ownership may flap while the control socket
+                // reconnects. Keep the exact parsed view for durable local
+                // sessions and revoke its input capability in place; only a
+                // genuine observer/controller class change may remount.
+                .id("unified-\(id)-\(authority.controllerCapable)")
                 .onAppear { fulfillTerminalKeyboardFocusRequest(for: id) }
                 .onChange(of: model.keyboardFocusRequest) { _, _ in
                     fulfillTerminalKeyboardFocusRequest(for: id)
@@ -2368,7 +2628,7 @@ struct RootShellView: View {
                         .disabled(model.terminalTranscriptContext(for: id) == nil)
                 }
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .background(.regularMaterial, in: Capsule())
@@ -2379,10 +2639,57 @@ struct RootShellView: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Session ended")
                 .accessibilityHint("Open the retained terminal transcript to review its output")
+            } else if model.isTerminalInputDegraded(id) {
+                let recovering = model.isTerminalInputRecovering(id)
+                HStack(spacing: 8) {
+                    Label("Input paused", systemImage: "exclamationmark.triangle.fill")
+                    Button(recovering ? "Checking…" : "Resume input") {
+                        Task { await model.recoverTerminalInput(id) }
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(recovering)
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.kaisolaSecondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.regularMaterial, in: Capsule())
+                .overlay {
+                    Capsule().stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+                }
+                .padding(10)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Input paused for \(surfaceTitle(id))")
+                .accessibilityHint("The last write could not be confirmed. Other terminals remain connected. Resume input revalidates only this terminal.")
+            } else if let progress = model.terminalPasteProgress(for: id) {
+                HStack(spacing: 8) {
+                    ProgressView(
+                        value: Double(progress.sentBytes),
+                        total: Double(progress.totalBytes)
+                    )
+                    .controlSize(.small)
+                    .frame(width: 72)
+                    Text("Pasting \(progress.sentBytes) of \(progress.totalBytes) bytes")
+                    Button("Cancel") { model.cancelTerminalPaste(for: id) }
+                        .buttonStyle(.borderless)
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.regularMaterial, in: Capsule())
+                .overlay {
+                    Capsule().stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+                }
+                .padding(10)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Pasting into \(surfaceTitle(id))")
+                .accessibilityValue("\(progress.sentBytes) of \(progress.totalBytes) bytes sent")
+                .accessibilityHint("Cancel stops chunks that have not started sending")
             } else if case let .reconnecting(attempt) = model.connectionState {
                 Label("Reconnecting…", systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.horizontal, 10)
                     .padding(.vertical, 6)
                     .background(.regularMaterial, in: Capsule())
@@ -2505,7 +2812,7 @@ struct RootShellView: View {
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.kaisolaSecondary)
         .help("Open this session in a new window")
     }
 }
@@ -4236,7 +4543,7 @@ private struct SessionStrip: View {
                 if sessions.isEmpty, chats.isEmpty, meshes.isEmpty, recentlyClosed.isEmpty {
                     Text("No activity in this project")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .padding(.horizontal, 8)
                 }
                 ForEach(chats) { chat in
@@ -4255,7 +4562,7 @@ private struct SessionStrip: View {
                                ) {
                                 Text(cost)
                                     .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                             }
                         }
                         .font(.callout)
@@ -4287,7 +4594,7 @@ private struct SessionStrip: View {
                             if mesh.stage != "Idle" {
                                 Text(mesh.stage)
                                     .font(.caption2)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                             }
                         }
                         .font(.callout)
@@ -4355,7 +4662,7 @@ private struct SessionStrip: View {
                             Circle()
                                 .fill(visible || working
                                       ? WorkspacePalette.terminal
-                                      : Color.secondary.opacity(0.45))
+                                      : Color.kaisolaTertiary)
                                 .frame(width: 6, height: 6)
                             Text(model.sessionTitle(for: session)).lineLimit(1)
                         }
@@ -4629,11 +4936,399 @@ enum AddableRecentFolders {
     }
 }
 
+/// The first decision in the Run on picker. Unavailable paths are deliberately
+/// their own scope so a search can never make an offline recent look runnable.
+enum RunOnScope: String, CaseIterable, Equatable, Sendable {
+    case local
+    case worktree
+    case unavailable
+
+    var sectionTitle: String {
+        switch self {
+        case .local: "This Computer"
+        case .worktree: "Mesh Worktrees"
+        case .unavailable: "Unavailable"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .local: "desktopcomputer"
+        case .worktree: "arrow.triangle.branch"
+        case .unavailable: "externaldrive.badge.exclamationmark"
+        }
+    }
+}
+
+/// One exact execution boundary. The confirmation string is intentionally a
+/// complete four-line contract: a friendly project name alone is never enough
+/// authority to start a process.
+struct RunOnTarget: Identifiable, Equatable, Sendable {
+    let name: String
+    let path: String
+    let branch: String?
+    let host: String
+    let scope: RunOnScope
+    let isRecent: Bool
+
+    var id: String { "\(scope.rawValue):\(path):\(branch ?? "")" }
+    var canStart: Bool { scope != .unavailable }
+
+    func confirmation(accountName: String) -> String {
+        [
+            "Filesystem: \(path)",
+            "Git branch: \(branch ?? "Not a Git repository")",
+            "Account: \(accountName)",
+            "Execution host: \(host)",
+        ].joined(separator: "\n")
+    }
+}
+
+/// Pure picker state shared by AppKit and contract tests. Filtering starts
+/// with the selected scope and only then applies the query.
+struct RunOnPickerModel: Equatable, Sendable {
+    private(set) var targets: [RunOnTarget]
+    private(set) var selectedScope: RunOnScope
+    private(set) var query = ""
+    private(set) var selectedTargetID: String?
+
+    init(targets: [RunOnTarget], selectedScope: RunOnScope? = nil, selectedTargetID: String? = nil) {
+        self.targets = targets
+        self.selectedScope = selectedScope
+            ?? RunOnScope.allCases.first(where: { scope in targets.contains { $0.scope == scope } })
+            ?? .local
+        self.selectedTargetID = selectedTargetID
+        normalizeSelection()
+    }
+
+    var filteredTargets: [RunOnTarget] {
+        let scoped = targets.filter { $0.scope == selectedScope }
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return scoped }
+        return scoped.filter { target in
+            target.name.localizedCaseInsensitiveContains(needle)
+                || target.path.localizedCaseInsensitiveContains(needle)
+                || (target.branch?.localizedCaseInsensitiveContains(needle) ?? false)
+        }
+    }
+
+    var selectedTarget: RunOnTarget? {
+        filteredTargets.first { $0.id == selectedTargetID } ?? filteredTargets.first
+    }
+
+    mutating func selectScope(_ scope: RunOnScope) {
+        selectedScope = scope
+        query = ""
+        selectedTargetID = nil
+        normalizeSelection()
+    }
+
+    mutating func updateQuery(_ query: String) {
+        self.query = query
+        normalizeSelection()
+    }
+
+    mutating func selectTarget(_ id: String?) {
+        selectedTargetID = id
+        normalizeSelection()
+    }
+
+    @discardableResult
+    mutating func removeRecent(targetID: String) -> String? {
+        guard let target = targets.first(where: { $0.id == targetID }), target.isRecent else {
+            return nil
+        }
+        targets.removeAll { $0.id == targetID }
+        if selectedTargetID == targetID { selectedTargetID = nil }
+        normalizeSelection()
+        return target.path
+    }
+
+    private mutating func normalizeSelection() {
+        let visible = filteredTargets
+        if !visible.contains(where: { $0.id == selectedTargetID }) {
+            selectedTargetID = visible.first?.id
+        }
+    }
+}
+
+/// Snapshot inputs used off the main actor so file-system and Git probes never
+/// block terminal rendering while the picker is prepared.
+enum RunOnTargetBuilder {
+    struct Project: Equatable, Sendable {
+        let name: String
+        let path: String
+    }
+
+    struct Worktree: Equatable, Sendable {
+        let name: String
+        let path: String
+        let branch: String
+    }
+
+    static func build(
+        projects: [Project],
+        recentPaths: [String],
+        worktrees: [Worktree],
+        host: String,
+        isDirectory: (String) -> Bool,
+        branch: (String) -> String?
+    ) -> [RunOnTarget] {
+        var seen = Set<String>()
+        var availableLocal: [RunOnTarget] = []
+        var availableWorktrees: [RunOnTarget] = []
+        var unavailable: [RunOnTarget] = []
+
+        func normalized(_ path: String) -> String {
+            URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+        }
+
+        func appendLocal(name: String, path rawPath: String, recent: Bool) {
+            let path = normalized(rawPath)
+            guard seen.insert(path).inserted else { return }
+            let exists = isDirectory(path)
+            let target = RunOnTarget(
+                name: name,
+                path: path,
+                branch: exists ? branch(path) : nil,
+                host: host,
+                scope: exists ? .local : .unavailable,
+                isRecent: recent
+            )
+            if exists { availableLocal.append(target) } else { unavailable.append(target) }
+        }
+
+        for project in projects {
+            appendLocal(name: project.name, path: project.path, recent: false)
+        }
+        for recentPath in recentPaths {
+            appendLocal(
+                name: URL(fileURLWithPath: recentPath, isDirectory: true).lastPathComponent,
+                path: recentPath,
+                recent: true
+            )
+        }
+        for worktree in worktrees {
+            let path = normalized(worktree.path)
+            guard seen.insert(path).inserted else { continue }
+            let exists = isDirectory(path)
+            let target = RunOnTarget(
+                name: worktree.name,
+                path: path,
+                branch: worktree.branch,
+                host: host,
+                scope: exists ? .worktree : .unavailable,
+                isRecent: false
+            )
+            if exists { availableWorktrees.append(target) } else { unavailable.append(target) }
+        }
+        return availableLocal + availableWorktrees + unavailable
+    }
+}
+
+/// AppKit coordinator for the launch sheet. The four controls are ordered to
+/// match the authority decision: location, scoped search, exact target, then
+/// provider account. The summary is the final confirmation, not placeholder
+/// prose.
+@MainActor
+final class RunOnPickerController: NSObject {
+    private var model: RunOnPickerModel
+    private let profiles: [UsageAccountProfile]
+    private let removeRecent: (String) -> Void
+
+    let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 220))
+    let scopePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let searchField = NSSearchField(frame: .zero)
+    private let targetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let accountPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let removeRecentButton = NSButton(title: "Remove from Recents", target: nil, action: nil)
+    private let confirmationLabel = NSTextField(wrappingLabelWithString: "")
+    weak var startButton: NSButton?
+
+    init(
+        model: RunOnPickerModel,
+        profiles: [UsageAccountProfile],
+        provider: UsageAccountProfile.Provider?,
+        preferNamedAccount: Bool,
+        removeRecent: @escaping (String) -> Void
+    ) {
+        self.model = model
+        self.profiles = profiles
+        self.removeRecent = removeRecent
+        super.init()
+
+        scopePopup.setAccessibilityLabel("Execution location")
+        scopePopup.target = self
+        scopePopup.action = #selector(scopeChanged)
+        for scope in RunOnScope.allCases {
+            let count = model.targets.filter { $0.scope == scope }.count
+            scopePopup.addItem(withTitle: "\(scope.sectionTitle) (\(count))")
+            if let item = scopePopup.lastItem {
+                item.image = NSImage(systemSymbolName: scope.systemImage, accessibilityDescription: scope.sectionTitle)
+                item.representedObject = scope.rawValue
+            }
+        }
+
+        searchField.placeholderString = "Search this location"
+        searchField.setAccessibilityLabel("Search selected execution location")
+        searchField.sendsSearchStringImmediately = true
+        searchField.target = self
+        searchField.action = #selector(searchChanged)
+
+        targetPopup.setAccessibilityLabel("Project, root, or branch")
+        targetPopup.target = self
+        targetPopup.action = #selector(targetChanged)
+
+        accountPopup.setAccessibilityLabel("Account")
+        accountPopup.addItem(withTitle: "Project/default")
+        accountPopup.item(at: 0)?.toolTip = provider.map {
+            "Use this project's effective \($0.environmentKey)"
+        } ?? "Use the project's default environment"
+        for profile in profiles {
+            accountPopup.addItem(withTitle: profile.label)
+            accountPopup.lastItem?.toolTip = profile.expandedDirectory
+        }
+        if preferNamedAccount, !profiles.isEmpty { accountPopup.selectItem(at: 1) }
+        accountPopup.target = self
+        accountPopup.action = #selector(accountChanged)
+
+        removeRecentButton.setAccessibilityLabel("Remove selected target from recents")
+        removeRecentButton.bezelStyle = .inline
+        removeRecentButton.target = self
+        removeRecentButton.action = #selector(removeSelectedRecent)
+
+        confirmationLabel.maximumNumberOfLines = 4
+        confirmationLabel.lineBreakMode = .byTruncatingMiddle
+        confirmationLabel.font = .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        confirmationLabel.setAccessibilityLabel("Execution confirmation")
+
+        let labels = ["Location", "Search", "Project / root / branch", "Account"].map {
+            NSTextField(labelWithString: $0)
+        }
+        let grid = NSGridView(views: [
+            [labels[0], scopePopup],
+            [labels[1], searchField],
+            [labels[2], targetPopup],
+            [labels[3], accountPopup],
+        ])
+        grid.rowSpacing = 7
+        grid.columnSpacing = 12
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 1).width = 350
+        scopePopup.widthAnchor.constraint(equalToConstant: 350).isActive = true
+        searchField.widthAnchor.constraint(equalToConstant: 350).isActive = true
+        targetPopup.widthAnchor.constraint(equalToConstant: 350).isActive = true
+        accountPopup.widthAnchor.constraint(equalToConstant: 350).isActive = true
+
+        let actions = NSStackView(views: [NSView(), removeRecentButton])
+        actions.orientation = .horizontal
+        let stack = NSStackView(views: [grid, actions, confirmationLabel])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        accessoryView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: accessoryView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: accessoryView.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: accessoryView.topAnchor),
+            confirmationLabel.widthAnchor.constraint(equalTo: accessoryView.widthAnchor),
+        ])
+    }
+
+    var selectedTarget: RunOnTarget? { model.selectedTarget }
+
+    var selectedProfile: UsageAccountProfile? {
+        let index = accountPopup.indexOfSelectedItem
+        guard index > 0, profiles.indices.contains(index - 1) else { return nil }
+        return profiles[index - 1]
+    }
+
+    func refresh() {
+        for (index, scope) in RunOnScope.allCases.enumerated() {
+            let count = model.targets.filter { $0.scope == scope }.count
+            scopePopup.item(at: index)?.title = "\(scope.sectionTitle) (\(count))"
+        }
+        if let index = RunOnScope.allCases.firstIndex(of: model.selectedScope) {
+            scopePopup.selectItem(at: index)
+        }
+        let selectedID = model.selectedTarget?.id
+        targetPopup.removeAllItems()
+        for target in model.filteredTargets {
+            targetPopup.addItem(withTitle: target.name)
+            guard let item = targetPopup.lastItem else { continue }
+            item.image = NSImage(
+                systemSymbolName: target.scope.systemImage,
+                accessibilityDescription: target.scope.sectionTitle
+            )
+            item.representedObject = target.id
+            item.toolTip = [target.path, target.branch].compactMap { $0 }.joined(separator: " — ")
+        }
+        if targetPopup.numberOfItems == 0 {
+            targetPopup.addItem(withTitle: "No matching targets")
+            targetPopup.lastItem?.isEnabled = false
+        } else if let selectedID,
+                  let item = targetPopup.itemArray.first(where: {
+                      ($0.representedObject as? String) == selectedID
+                  }) {
+            targetPopup.select(item)
+        }
+        refreshConfirmation()
+    }
+
+    @objc private func scopeChanged() {
+        guard scopePopup.indexOfSelectedItem >= 0,
+              let rawValue = scopePopup.selectedItem?.representedObject as? String,
+              let scope = RunOnScope(rawValue: rawValue) else { return }
+        model.selectScope(scope)
+        searchField.stringValue = ""
+        refresh()
+    }
+
+    @objc private func searchChanged() {
+        model.updateQuery(searchField.stringValue)
+        refresh()
+    }
+
+    @objc private func targetChanged() {
+        model.selectTarget(targetPopup.selectedItem?.representedObject as? String)
+        refreshConfirmation()
+    }
+
+    @objc private func accountChanged() {
+        refreshConfirmation()
+    }
+
+    @objc private func removeSelectedRecent() {
+        guard let target = model.selectedTarget,
+              let path = model.removeRecent(targetID: target.id) else { return }
+        removeRecent(path)
+        refresh()
+    }
+
+    private func refreshConfirmation() {
+        let target = model.selectedTarget
+        removeRecentButton.isEnabled = target?.isRecent == true
+        startButton?.isEnabled = target?.canStart == true
+        confirmationLabel.stringValue = target?.confirmation(accountName: accountName)
+            ?? "No target in this execution location matches the search."
+    }
+
+    private var accountName: String {
+        selectedProfile?.label ?? "Project/default"
+    }
+}
+
 private struct ConnectionFooter: View {
     @EnvironmentObject private var auth: AuthModel
     let state: AppModel.ConnectionState
     let brokerUpgradeState: BrokerUpgradeState
     let brokerGenerationDetail: String
+    /// Non-nil while the app is holding terminal-continuity updates back
+    /// because a live terminal's agent activity never reached the broker. The
+    /// toast that announced it is long gone by the time anyone wonders why
+    /// updates stopped, so the reason lives here too.
+    var brokerUpdateGateBlockedDetail: String?
     let brokerRollbackCandidates: [BrokerRollbackCandidate]
     let rollbackBrokerGeneration: (String) -> Void
     let reload: () -> Void
@@ -4698,7 +5393,7 @@ private struct ConnectionFooter: View {
         Button(action: showSettings) {
             Image(systemName: "gearshape")
                 .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
                 .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
         }
@@ -4823,7 +5518,7 @@ private struct ConnectionFooter: View {
         } label: {
             Image(systemName: "ellipsis")
                 .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
                 .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
         }
@@ -4885,6 +5580,9 @@ private struct ConnectionFooter: View {
                 EmptyView()
             } else {
                 Text(brokerUpgradeState.detail)
+            }
+            if let brokerUpdateGateBlockedDetail {
+                Text(brokerUpdateGateBlockedDetail)
             }
             if usage.totalPeakTokens > 0 {
                 Text("Usage: \(usage.totalPeakTokens / 1000)k tokens · \(Int((usage.contextPressure * 100).rounded()))% context")
@@ -4966,19 +5664,26 @@ private struct ConnectionFooter: View {
 
     @ViewBuilder
     private var attentionButton: some View {
-        if attention.count > 0 {
+        // A storage problem keeps the bell reachable on its own: the notice
+        // explaining lost or unsaved work would otherwise have nowhere to live
+        // once the inbox reads empty.
+        if attention.count > 0 || !attention.storageNotices.isEmpty {
             Button {
                 showInbox.toggle()
             } label: {
                 KaisolaStatusBadge(
-                    text: "\(attention.count)",
+                    text: attention.count > 0 ? "\(attention.count)" : "!",
                     systemImage: "bell.fill",
                     tone: .needsYou
                 )
             }
             .buttonStyle(.borderless)
             .help("Needs you — permission asks and finished agents")
-            .accessibilityLabel("Attention inbox, \(attention.count) items")
+            .accessibilityLabel(
+                attention.count > 0
+                    ? "Attention inbox, \(attention.count) items"
+                    : "Attention inbox, saved inbox needs attention"
+            )
             .accessibilityIdentifier("footer.attention")
             .popover(isPresented: $showInbox, arrowEdge: .top) {
                 attentionInbox
@@ -4996,6 +5701,7 @@ private struct ConnectionFooter: View {
             context: attentionContext ?? { _ in (nil, true) }
         )
         return VStack(alignment: .leading, spacing: 0) {
+            attentionStorageNotices
             HStack(spacing: 6) {
                 inboxFilterChip(label: "All", kinds: nil)
                 ForEach(AttentionInboxModel.filterChips, id: \.label) { chip in
@@ -5011,7 +5717,7 @@ private struct ConnectionFooter: View {
                         if attentionContext != nil {
                             Text(section.title)
                                 .font(.caption2.weight(.semibold))
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .textCase(.uppercase)
                                 .padding(.horizontal, 12)
                                 .padding(.top, 8)
@@ -5024,7 +5730,7 @@ private struct ConnectionFooter: View {
                     if sections.isEmpty {
                         Text("Nothing needs you in this filter.")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                             .padding(12)
                     }
                 }
@@ -5040,12 +5746,47 @@ private struct ConnectionFooter: View {
         .padding(.vertical, 6)
     }
 
+    /// What the saved inbox lost, or is failing to save, in the one place the
+    /// user goes to read it. Reset is offered only when saving is actually
+    /// blocked, because it throws the kept damaged copy away.
+    @ViewBuilder
+    private var attentionStorageNotices: some View {
+        if !attention.storageNotices.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(attention.storageNotices) { notice in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(notice.title).font(.caption.weight(.semibold))
+                        Text(notice.message)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                HStack(spacing: 10) {
+                    if attention.storageNotices.contains(where: \.blocksSaving) {
+                        Button("Reset Saved Inbox") { attention.resetStorage() }
+                            .buttonStyle(.borderless)
+                    }
+                    Button("Dismiss") { attention.dismissStorageNotices() }
+                        .buttonStyle(.borderless)
+                    Spacer()
+                }
+                .font(.caption2)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+            .accessibilityIdentifier("footer.attention.storageNotice")
+            Divider()
+                .padding(.bottom, 6)
+        }
+    }
+
     private func inboxFilterChip(label: String, kinds: Set<AttentionCenter.Kind>?) -> some View {
         let selected = inboxFilter == kinds
         return Button(label) { inboxFilter = kinds }
             .buttonStyle(.borderless)
             .font(.caption2.weight(selected ? .semibold : .regular))
-            .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+            .foregroundStyle(selected ? Color.accentColor : Color.kaisolaSecondary)
             .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
@@ -5070,7 +5811,7 @@ private struct ConnectionFooter: View {
                     attention.clear(targetID: row.entry.targetID)
                 } label: {
                     Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
                 .buttonStyle(.plain)
                 .help("This session is gone; clear the entry")
@@ -5087,7 +5828,7 @@ private struct ConnectionFooter: View {
             )
             VStack(alignment: .leading, spacing: 1) {
                 Text(row.entry.title).font(.callout).lineLimit(1)
-                Text(row.entry.detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                Text(row.entry.detail).font(.caption).foregroundStyle(.kaisolaSecondary).lineLimit(1)
             }
             Spacer()
         }

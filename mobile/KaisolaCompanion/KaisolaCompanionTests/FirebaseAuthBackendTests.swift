@@ -4,6 +4,66 @@ import XCTest
 @testable import KaisolaCompanion
 
 final class FirebaseAuthBackendTests: XCTestCase {
+    func testMissingEntitlementRetriesDataProtectionOnceThenFailsClosedOnLegacy() {
+        let fallback = KeychainAuthFallbackState()
+
+        XCTAssertEqual(fallback.queryMode, .dataProtection)
+        XCTAssertEqual(
+            fallback.retryMode(afterMissingEntitlementIn: .dataProtection),
+            .legacy
+        )
+        XCTAssertEqual(fallback.queryMode, .legacy)
+        XCTAssertNil(fallback.retryMode(afterMissingEntitlementIn: .legacy))
+    }
+
+    func testStaleDataProtectionAttemptCanJoinAnActivatedLegacyFallback() {
+        let fallback = KeychainAuthFallbackState()
+
+        XCTAssertEqual(
+            fallback.retryMode(afterMissingEntitlementIn: .dataProtection),
+            .legacy
+        )
+        XCTAssertEqual(
+            fallback.retryMode(afterMissingEntitlementIn: .dataProtection),
+            .legacy
+        )
+        XCTAssertEqual(fallback.queryMode, .legacy)
+    }
+
+    func testKeychainReadStopsAfterDataProtectionAndLegacyBothLackEntitlement() {
+        let security = MissingEntitlementSecurityOperations()
+        let store = KeychainAuthSecureStore(
+            service: "test.read",
+            securityOperations: security.operations
+        )
+
+        XCTAssertThrowsError(try store.data(for: "account"))
+        XCTAssertEqual(security.copyMatchingCount, 2)
+    }
+
+    func testKeychainWriteStopsAfterDataProtectionAndLegacyBothLackEntitlement() {
+        let security = MissingEntitlementSecurityOperations()
+        let store = KeychainAuthSecureStore(
+            service: "test.write",
+            securityOperations: security.operations
+        )
+
+        XCTAssertThrowsError(try store.set(Data("value".utf8), for: "account"))
+        XCTAssertEqual(security.updateCount, 2)
+        XCTAssertEqual(security.addCount, 0)
+    }
+
+    func testKeychainDeleteStopsAfterDataProtectionAndLegacyBothLackEntitlement() {
+        let security = MissingEntitlementSecurityOperations()
+        let store = KeychainAuthSecureStore(
+            service: "test.delete",
+            securityOperations: security.operations
+        )
+
+        XCTAssertThrowsError(try store.removeData(for: "account"))
+        XCTAssertEqual(security.deleteCount, 2)
+    }
+
     func testConfigurationParsesBundledShape() throws {
         let data = Data(#"""
         {
@@ -112,6 +172,47 @@ final class FirebaseAuthBackendTests: XCTestCase {
         XCTAssertNil(clearedToken)
         XCTAssertNil(clearedAccount)
         XCTAssertTrue(store.values.isEmpty)
+    }
+}
+
+private final class MissingEntitlementSecurityOperations: @unchecked Sendable {
+    private let lock = NSLock()
+    private var counts = ["copy": 0, "update": 0, "add": 0, "delete": 0]
+
+    lazy var operations = KeychainAuthSecurityOperations(
+        copyMatching: { [weak self] _, _ in
+            self?.increment("copy")
+            return errSecMissingEntitlement
+        },
+        update: { [weak self] _, _ in
+            self?.increment("update")
+            return errSecMissingEntitlement
+        },
+        add: { [weak self] _, _ in
+            self?.increment("add")
+            return errSecMissingEntitlement
+        },
+        delete: { [weak self] _ in
+            self?.increment("delete")
+            return errSecMissingEntitlement
+        }
+    )
+
+    var copyMatchingCount: Int { count("copy") }
+    var updateCount: Int { count("update") }
+    var addCount: Int { count("add") }
+    var deleteCount: Int { count("delete") }
+
+    private func increment(_ key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        counts[key, default: 0] += 1
+    }
+
+    private func count(_ key: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return counts[key, default: 0]
     }
 }
 

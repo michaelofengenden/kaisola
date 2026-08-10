@@ -20,6 +20,18 @@ enum ControlBrokerMethod: String, CaseIterable, Sendable {
     case controlLease = "terminal.controlLease"
 }
 
+enum TerminalWriteError: Error, Equatable, LocalizedError {
+    case ended
+    case missing
+
+    var errorDescription: String? {
+        switch self {
+        case .ended: "This terminal has ended and cannot accept input."
+        case .missing: "This terminal is no longer available."
+        }
+    }
+}
+
 struct TerminalCreation: Equatable, Sendable {
     let terminalID: String
     let projectID: String
@@ -39,6 +51,16 @@ struct TerminalCreation: Equatable, Sendable {
 struct TerminalRecoveredScrollback: Equatable, Sendable {
     let text: String
     let truncated: Bool
+}
+
+/// A terminal release is complete both when a broker acknowledges the
+/// idempotent request and when validated generation routing proves there is no
+/// broker left that could still own it. Transport/identity errors throw and
+/// remain retryable instead of being confused with either safe outcome.
+enum BrokerTerminalReleaseDisposition: Equatable, Sendable {
+    case released
+    case terminalAbsent
+    case generationAbsent
 }
 
 protocol BrokerControlServing: Sendable {
@@ -61,6 +83,11 @@ protocol BrokerControlServing: Sendable {
     func resize(projectID: String, terminalID: String, columns: Int, rows: Int) async throws
     func kill(projectID: String, terminalID: String) async throws
     func release(projectID: String, terminalID: String) async throws
+    func release(
+        projectID: String,
+        terminalID: String,
+        brokerGenerationID: String?
+    ) async throws -> BrokerTerminalReleaseDisposition
     func detachOwner(projectID: String, terminalID: String) async throws
     func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws
     func setControlLease(projectID: String, terminalID: String, active: Bool) async throws
@@ -104,6 +131,17 @@ extension BrokerControlServing {
     /// disconnect so AppModel can stop accepting writes and reattach ownership.
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {}
     func detachGenerations(_ generationIDs: Set<String>) async {}
+
+    /// Single-generation clients and focused doubles need no routing metadata:
+    /// their ordinary idempotent release is an acknowledgement.
+    func release(
+        projectID: String,
+        terminalID: String,
+        brokerGenerationID: String?
+    ) async throws -> BrokerTerminalReleaseDisposition {
+        try await release(projectID: projectID, terminalID: terminalID)
+        return .released
+    }
 }
 
 /// A second, write-capable connection to the same broker the observer client
@@ -112,6 +150,15 @@ extension BrokerControlServing {
 /// stays the final authority on every mutation.
 actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     typealias DisconnectHandler = @Sendable (any Error) -> Void
+    private enum ConnectionAccess: String, Equatable {
+        case controller
+        case administrator
+    }
+
+    private struct PendingRequest {
+        let method: String
+        let continuation: CheckedContinuation<JSONValue, any Error>
+    }
     /// Compatibility values for a durable pre-fix broker. Older brokers merge
     /// their own launcher environment after receiving terminal.create; an
     /// outer Codex process can therefore leak NO_COLOR=1 into every nested CLI.
@@ -127,19 +174,35 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         "CODEX_THREAD_ID": .string(""),
     ]
 
+    /// The broker plus owner a controller connection speaks for. Reuse is only
+    /// safe for this exact identity. Concurrent callers naming the same broker
+    /// and owner share one handshake; any other identity is refused.
+    private struct ConnectionIdentity: Equatable {
+        let info: BrokerInfo
+        let ownerID: String
+        let access: ConnectionAccess
+    }
+
     private let transport: any BrokerByteTransport
     private let operationTimeoutNanoseconds: UInt64
     nonisolated let connectionInstanceID: String
     private var decoder = BrokerLineFrameDecoder()
     private var connected = false
     private var connectedFeatures: Set<String> = []
-    private var ownerID = ""
-    private var helloWaiter: CheckedContinuation<Void, any Error>?
+    private var connectedIdentity: ConnectionIdentity?
+    private var connectInFlight: ConnectionIdentity?
+    private var ownerID: String { connectedIdentity?.ownerID ?? "" }
+    /// Every caller waiting on the single in-flight handshake, in arrival
+    /// order. A list rather than one slot: the old single continuation was
+    /// overwritten by a second concurrent connect, and the first caller then
+    /// waited forever on a continuation nobody could resume.
+    private var helloWaiters: [CheckedContinuation<Void, any Error>] = []
     private var handshakeTimeoutTask: Task<Void, Never>?
-    private var pending: [String: CheckedContinuation<JSONValue, any Error>] = [:]
+    private var pending: [String: PendingRequest] = [:]
     private var requestTimeoutTasks: [String: Task<Void, Never>] = [:]
     private var readerTask: Task<Void, Never>?
     private var disconnectHandler: DisconnectHandler?
+    private var connectionAbortInProgress = false
 
     init(
         transport: any BrokerByteTransport = UnixBrokerTransport(),
@@ -157,28 +220,85 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         disconnectHandler = handler
     }
 
+    /// Test seam: how many callers are parked on the in-flight handshake right
+    /// now. Lets a concurrency test wait for a second connect to coalesce
+    /// instead of guessing at a sleep.
+    var connectWaiterCount: Int { helloWaiters.count }
+
     func connect(to info: BrokerInfo, ownerID: String) async throws {
-        if connected { return }
+        try await connect(to: info, ownerID: ownerID, access: .controller)
+    }
+
+    /// Administrative control is a distinct authenticated lane. Keeping this
+    /// internal lets the upgrade coordinator request it without exposing it
+    /// through the ordinary terminal-control protocol.
+    func connectForAdministration(to info: BrokerInfo) async throws {
+        try await connect(to: info, ownerID: "0", access: .administrator)
+    }
+
+    private func connect(
+        to info: BrokerInfo,
+        ownerID: String,
+        access: ConnectionAccess
+    ) async throws {
         try info.validate()
-        guard !ownerID.isEmpty else { throw BrokerClientError.requestFailed("controller owner id") }
-        self.ownerID = ownerID
-        try await transport.connect(path: info.socketPath)
+        let ownerIDIsValid = access == .administrator
+            ? ownerID == "0"
+            : !ownerID.isEmpty && ownerID != "0"
+        guard ownerIDIsValid else {
+            throw BrokerClientError.requestFailed("controller owner id")
+        }
+        let requested = ConnectionIdentity(info: info, ownerID: ownerID, access: access)
+        if let connectedIdentity {
+            // Reusing this lane for a different broker or owner would hand the
+            // caller a success it cannot act on: later mutations would still
+            // travel to the connection recorded here.
+            guard connectedIdentity == requested else { throw BrokerClientError.identityChanged }
+            if connected { return }
+        }
+        if let connectInFlight {
+            // Opening the socket and awaiting hello both suspend, so a second
+            // caller can arrive mid-handshake. Same broker: wait on the one
+            // already running. Different broker: refuse, because succeeding
+            // here would hand the caller a connection to somebody else's.
+            guard connectInFlight == requested else { throw BrokerClientError.identityChanged }
+            return try await withCheckedThrowingContinuation { continuation in
+                helloWaiters.append(continuation)
+            }
+        }
+        connectedIdentity = requested
+        connectInFlight = requested
+
+        let encoded: Data
+        do {
+            try await transport.connect(path: info.socketPath)
+            let requestedFeatures: [JSONValue] = access == .administrator
+                ? [.string(BrokerWire.brokerAdministrationFeature)]
+                : []
+            let frame: JSONValue = .object([
+                "type": .string("hello"),
+                "protocol": .integer(Int64(BrokerWire.protocolVersion)),
+                "token": .string(info.token),
+                // The broker validates instanceId as a UUID shape; the durable
+                // owner identity travels in request params instead, and reattach
+                // is authorized by project capability rather than instance.
+                "instanceId": .string(connectionInstanceID),
+                "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native"),
+                "access": .string(access.rawValue),
+                "features": .array(requestedFeatures),
+            ])
+            encoded = try encode(frame, purpose: .hello)
+        } catch {
+            // Callers that joined while the socket was opening fail with the
+            // error this one saw instead of waiting on a handshake that will
+            // never be sent.
+            failConnect(with: error)
+            throw error
+        }
         readerTask = Task { await readLoop() }
 
-        let frame: JSONValue = .object([
-            "type": .string("hello"),
-            "protocol": .integer(Int64(BrokerWire.protocolVersion)),
-            "token": .string(info.token),
-            // The broker validates instanceId as a UUID shape; the durable
-            // owner identity travels in request params instead, and reattach
-            // is authorized by project capability rather than instance.
-            "instanceId": .string(connectionInstanceID),
-            "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native"),
-            "access": .string("controller"),
-        ])
-        let encoded = try encode(frame)
         return try await withCheckedThrowingContinuation { continuation in
-            helloWaiter = continuation
+            helloWaiters.append(continuation)
             handshakeTimeoutTask?.cancel()
             handshakeTimeoutTask = Task {
                 do {
@@ -226,8 +346,15 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             params["restore"] = .bool(true)
         }
         let result = try await request(.create, params: .object(params))
-        guard let object = result.objectValue,
-              object["ok"]?.boolValue != false else {
+        guard let object = result.objectValue else {
+            throw BrokerClientError.requestFailed("terminal.create")
+        }
+        if object["ok"]?.boolValue == false {
+            if object["code"]?.stringValue == "terminal_capacity_exceeded",
+               let maximum = object["maximumLiveTerminals"]?.intValue.flatMap(Int.init(exactly:)),
+               (1...BrokerWire.maximumConfigurableLiveTerminals).contains(maximum) {
+                throw BrokerClientError.terminalCapacityExceeded(maximum: maximum)
+            }
             throw BrokerClientError.requestFailed("terminal.create")
         }
         let pid = object["pid"]?.intValue.flatMap(Int32.init(exactly:))
@@ -256,7 +383,15 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     func attach(projectID: String, terminalID: String) async throws {
-        _ = try await request(.attach, params: identity(projectID: projectID, terminalID: terminalID))
+        let result = try await request(
+            .attach,
+            params: identity(projectID: projectID, terminalID: terminalID)
+        )
+        guard let object = result.objectValue,
+              object["ok"]?.boolValue == true,
+              object["id"]?.stringValue == terminalID else {
+            throw BrokerClientError.requestFailed("terminal.attach")
+        }
     }
 
     func write(projectID: String, terminalID: String, data: String) async throws {
@@ -264,7 +399,20 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.malformedResponse
         }
         params["data"] = .string(data)
-        _ = try await request(.write, params: .object(params))
+        let result = try await request(.write, params: .object(params))
+        guard let object = result.objectValue,
+              let accepted = object["ok"]?.boolValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        guard accepted else {
+            if object["message"]?.stringValue == "terminal already ended" {
+                throw TerminalWriteError.ended
+            }
+            if object["message"] == nil {
+                throw TerminalWriteError.missing
+            }
+            throw BrokerClientError.requestFailed("terminal.write")
+        }
     }
 
     func resize(projectID: String, terminalID: String, columns: Int, rows: Int) async throws {
@@ -280,7 +428,15 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     func kill(projectID: String, terminalID: String) async throws {
-        _ = try await request(.kill, params: identity(projectID: projectID, terminalID: terminalID))
+        let result = try await request(
+            .kill,
+            params: identity(projectID: projectID, terminalID: terminalID)
+        )
+        guard let object = result.objectValue,
+              object["ok"]?.boolValue == true,
+              object["id"]?.stringValue == terminalID else {
+            throw BrokerClientError.requestFailed("terminal.kill")
+        }
     }
 
     /// Permanently ends an owned terminal and removes its retained broker
@@ -299,7 +455,14 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.malformedResponse
         }
         params["busy"] = .bool(busy)
-        _ = try await request(.agentTurn, params: .object(params))
+        let result = try await request(.agentTurn, params: .object(params))
+        // The broker answers `{ok:false}` when the record is gone or predates
+        // activity tracking. Discarding that left the app believing a turn was
+        // protected while the broker still counted the terminal idle and
+        // eligible for rolling cutover, so the rejection has to travel.
+        guard result.objectValue?["ok"]?.boolValue == true else {
+            throw BrokerClientError.requestFailed("terminal.agentTurn")
+        }
     }
 
     func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {
@@ -324,7 +487,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.requestFailed("broker helper identity")
         }
         do {
-            try await connect(to: info, ownerID: "0")
+            try await connectForAdministration(to: info)
             guard connectedFeatures.contains(BrokerWire.brokerUpdateFeature) else {
                 throw BrokerClientError.requestFailed("broker sealed update capability")
             }
@@ -339,7 +502,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                !connectedFeatures.contains(BrokerWire.brokerRollingUpdateFeature) {
                 throw BrokerClientError.requestFailed("broker rolling update capability")
             }
-            let result = try await request(
+            let result = try await requestMutation(
                 rolling ? "broker.prepareRollingUpdate" : "broker.shutdownForUpdate",
                 params: .object([
                     "ownerId": .string("0"),
@@ -367,8 +530,8 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.requestFailed("broker helper identity")
         }
         do {
-            try await connect(to: info, ownerID: "0")
-            let result = try await request(
+            try await connectForAdministration(to: info)
+            let result = try await requestMutation(
                 "broker.cancelRollingUpdate",
                 params: .object([
                     "ownerId": .string("0"),
@@ -397,13 +560,13 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.requestFailed("broker helper identity")
         }
         do {
-            try await connect(to: info, ownerID: "0")
+            try await connectForAdministration(to: info)
             let status = try await request(
                 "broker.status",
                 params: .object(["ownerId": .string("0")])
             )
             try Self.validateUpgradeStatus(status, expected: info)
-            let result = try await request(
+            let result = try await requestMutation(
                 "broker.retireDraining",
                 params: .object([
                     "ownerId": .string("0"),
@@ -445,7 +608,26 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     private func request(_ method: ControlBrokerMethod, params: JSONValue) async throws -> JSONValue {
-        try await request(method.rawValue, params: params)
+        try await requestMutation(method.rawValue, params: params)
+    }
+
+    private func requestMutation(_ method: String, params: JSONValue) async throws -> JSONValue {
+        guard var mutationParams = params.objectValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        // A timeout only proves the response was not observed. Retrying once
+        // with the same idempotency key lets the broker join/replay the exact
+        // mutation instead of duplicating input, processes, or lifecycle work.
+        mutationParams["mutationId"] = .string(UUID().uuidString.lowercased())
+        let reconciledParams = JSONValue.object(mutationParams)
+        do {
+            return try await request(method, params: reconciledParams)
+        } catch BrokerClientError.requestTimedOut {
+            guard connectedFeatures.contains(BrokerWire.brokerMutationIdempotencyFeature) else {
+                throw BrokerClientError.requestTimedOut
+            }
+            return try await request(method, params: reconciledParams)
+        }
     }
 
     private func request(_ method: String, params: JSONValue) async throws -> JSONValue {
@@ -457,9 +639,9 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             "method": .string(method),
             "params": params,
         ])
-        let encoded = try encode(frame)
+        let encoded = try encode(frame, purpose: .request(method))
         return try await withCheckedThrowingContinuation { continuation in
-            pending[requestID] = continuation
+            pending[requestID] = PendingRequest(method: method, continuation: continuation)
             requestTimeoutTasks[requestID] = Task {
                 do {
                     try await Task.sleep(nanoseconds: operationTimeoutNanoseconds)
@@ -471,7 +653,10 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             }
             Task {
                 do { try await transport.send(encoded) }
-                catch { failRequest(requestID, with: error) }
+                // A failed socket write is verified controller-connection
+                // loss, not a terminal rejection. Abort the lane so the
+                // router cannot reuse a poisoned child on reconnect.
+                catch { await abortConnection(with: error) }
             }
         }
     }
@@ -579,6 +764,9 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                 if data.isEmpty { continue }
                 var activeDecoder = decoder
                 try activeDecoder.consume(data) { data in
+                    _ = try BrokerWire.validateDecodedFrame(data) { id in
+                        pending[id]?.method
+                    }
                     let frame = try JSONDecoder().decode(JSONValue.self, from: data)
                     try handle(frame)
                 }
@@ -590,6 +778,12 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     }
 
     private func abortConnection(with error: any Error) async {
+        // Closing the transport wakes the reader, which can observe the same
+        // failure. Settle and report the connection only once.
+        guard !connectionAbortInProgress,
+              connected || connectInFlight != nil || !helloWaiters.isEmpty || !pending.isEmpty else { return }
+        connectionAbortInProgress = true
+        defer { connectionAbortInProgress = false }
         await transport.close()
         readerTask = nil
         decoder = BrokerLineFrameDecoder()
@@ -603,12 +797,42 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         }
         switch type {
         case "hello":
+            guard let info = connectInFlight?.info else { throw BrokerClientError.notConnected }
             guard object["ok"]?.boolValue == true else { throw BrokerClientError.authenticationRejected }
-            guard object["protocol"]?.intValue == Int64(BrokerWire.protocolVersion) else {
+            guard object["protocol"]?.intValue == Int64(info.protocolVersion) else {
                 throw BrokerClientError.protocolMismatch
             }
-            guard object["securityEpoch"]?.intValue == Int64(BrokerWire.securityEpoch) else {
+            guard object["securityEpoch"]?.intValue == Int64(info.securityEpoch) else {
                 throw BrokerClientError.securityEpochMismatch
+            }
+            let advertisedImplementation = object["implementationVersion"]?.intValue
+                .flatMap(Int.init(exactly:))
+            guard BrokerWire.accepts(
+                protocolVersion: info.protocolVersion,
+                securityEpoch: info.securityEpoch,
+                implementationVersion: advertisedImplementation
+            ) else {
+                throw BrokerClientError.implementationMismatch
+            }
+            let implementationVersion = advertisedImplementation ?? 1
+            let packageSchema = object["packageSchema"]?.intValue.flatMap(Int.init(exactly:))
+            let packageVersion = object["packageVersion"]?.stringValue
+            let contentDigest = object["contentDigest"]?.stringValue
+            if let contentDigest,
+               !BrokerHelperPackageVerification.isLowercaseSHA256(contentDigest) {
+                throw BrokerClientError.identityChanged
+            }
+            // The socket path selected the peer and the token authenticated it;
+            // every non-secret immutable field echoed by hello must still bind
+            // that endpoint to the exact BrokerInfo reviewed before connect.
+            guard object["pid"]?.intValue == Int64(info.pid),
+                  object["startedAt"]?.intValue == info.startedAt,
+                  object["version"]?.stringValue == info.version,
+                  info.implementationVersion == nil || info.implementationVersion == implementationVersion,
+                  info.packageSchema == nil || info.packageSchema == packageSchema,
+                  info.packageVersion == nil || info.packageVersion == packageVersion,
+                  info.contentDigest == nil || info.contentDigest == contentDigest else {
+                throw BrokerClientError.identityChanged
             }
             // Control requires a broker modern enough to advertise observation:
             // the same generation that enforces roles server-side. Older live
@@ -617,21 +841,37 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             guard features.contains(BrokerWire.terminalObserveFeature) else {
                 throw BrokerClientError.observeFeatureMissing
             }
+            guard let expectedIdentity = connectInFlight ?? connectedIdentity,
+                  object["access"]?.stringValue == expectedIdentity.access.rawValue else {
+                throw BrokerClientError.authenticationRejected
+            }
+            let negotiatedFeatures = Set(
+                object["negotiatedFeatures"]?.arrayValue?.compactMap(\.stringValue) ?? []
+            )
+            if expectedIdentity.access == .administrator {
+                guard features.contains(BrokerWire.brokerAdministrationFeature),
+                      negotiatedFeatures.contains(BrokerWire.brokerAdministrationFeature) else {
+                    throw BrokerClientError.authenticationRejected
+                }
+            } else if negotiatedFeatures.contains(BrokerWire.brokerAdministrationFeature) {
+                throw BrokerClientError.authenticationRejected
+            }
             connected = true
             connectedFeatures = features
             handshakeTimeoutTask?.cancel()
             handshakeTimeoutTask = nil
-            helloWaiter?.resume(returning: ())
-            helloWaiter = nil
+            completeConnect()
         case "response":
-            guard let id = object["id"]?.stringValue, let continuation = pending.removeValue(forKey: id) else {
+            guard let id = object["id"]?.stringValue, let request = pending.removeValue(forKey: id) else {
                 return
             }
             requestTimeoutTasks.removeValue(forKey: id)?.cancel()
             if object["ok"]?.boolValue == true, let result = object["result"] {
-                continuation.resume(returning: result)
+                request.continuation.resume(returning: result)
             } else {
-                continuation.resume(throwing: BrokerClientError.requestFailed(object["message"]?.stringValue ?? "request"))
+                request.continuation.resume(
+                    throwing: BrokerClientError.requestFailed(object["message"]?.stringValue ?? "request")
+                )
             }
         case "event":
             // The controller connection carries no streams; events belong to
@@ -642,28 +882,51 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         }
     }
 
-    private func encode(_ frame: JSONValue) throws -> Data {
+    private func encode(_ frame: JSONValue, purpose: BrokerFramePurpose) throws -> Data {
         var data = try JSONEncoder().encode(frame)
-        guard data.count <= BrokerWire.maximumFrameBytes else { throw BrokerClientError.frameRejected }
+        do {
+            try BrokerWire.validateEncodedFrame(data, purpose: purpose)
+        } catch {
+            throw BrokerClientError.frameRejected
+        }
         data.append(0x0A)
         return data
     }
 
     private func failRequest(_ id: String, with error: any Error) {
         requestTimeoutTasks.removeValue(forKey: id)?.cancel()
-        pending.removeValue(forKey: id)?.resume(throwing: error)
+        pending.removeValue(forKey: id)?.continuation.resume(throwing: error)
+    }
+
+    /// Hands the settled handshake to everyone who coalesced onto it and closes
+    /// the window, so the next connect starts a fresh one.
+    private func completeConnect() {
+        connectInFlight = nil
+        let waiters = helloWaiters
+        helloWaiters.removeAll()
+        for waiter in waiters { waiter.resume(returning: ()) }
+    }
+
+    private func failConnect(with error: any Error) {
+        connectInFlight = nil
+        connectedIdentity = nil
+        let waiters = helloWaiters
+        helloWaiters.removeAll()
+        for waiter in waiters { waiter.resume(throwing: error) }
     }
 
     private func failConnection(with error: any Error) {
         handshakeTimeoutTask?.cancel()
         handshakeTimeoutTask = nil
-        helloWaiter?.resume(throwing: error)
-        helloWaiter = nil
+        failConnect(with: error)
         for task in requestTimeoutTasks.values { task.cancel() }
         requestTimeoutTasks.removeAll()
-        for continuation in pending.values { continuation.resume(throwing: error) }
+        for request in pending.values { request.continuation.resume(throwing: error) }
         pending.removeAll()
         connected = false
         connectedFeatures = []
+        // A dead lane holds no identity: the next connect is free to adopt a
+        // replacement broker or a new owner.
+        connectedIdentity = nil
     }
 }

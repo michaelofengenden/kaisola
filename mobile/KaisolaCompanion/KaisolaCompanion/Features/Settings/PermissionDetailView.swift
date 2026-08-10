@@ -11,6 +11,7 @@ struct PermissionDetailView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.dismiss) private var dismiss
     @State private var resolving = false
+    @State private var accountIntent: CompanionConnectionCoordinator.AccountIntent?
 
     private var canDecide: Bool {
         // Must mirror coordinator.respond(to:option:)'s preconditions exactly:
@@ -46,6 +47,11 @@ struct PermissionDetailView: View {
             }
             .scrollIndicators(.hidden)
             .safeAreaInset(edge: .bottom) { decisionBar }
+        }
+        .onAppear { accountIntent = coordinator.captureAccountIntent() }
+        .onChange(of: coordinator.accountGeneration) { _, generation in
+            guard accountIntent?.generation != generation else { return }
+            dismiss()
         }
         .navigationTitle("Permission")
         .navigationBarTitleDisplayMode(.inline)
@@ -83,7 +89,8 @@ struct PermissionDetailView: View {
                     ForEach(permission.options) { option in
                         let reject = option.id.lowercased().contains("reject") || option.label.lowercased().contains("reject")
                         Button {
-                            Task { await resolve(option) }
+                            let intent = accountIntent
+                            Task { await resolve(option, intent: intent) }
                         } label: {
                             Group {
                                 if resolving { ProgressView().controlSize(.small) }
@@ -111,10 +118,13 @@ struct PermissionDetailView: View {
         .background(.ultraThinMaterial)
     }
 
-    private func resolve(_ option: CompanionPermissionOption) async {
+    private func resolve(
+        _ option: CompanionPermissionOption,
+        intent: CompanionConnectionCoordinator.AccountIntent?
+    ) async {
         guard !resolving else { return }
         resolving = true
-        if await coordinator.respond(to: permission, option: option) { dismiss() }
+        if await coordinator.respond(to: permission, option: option, intent: intent) { dismiss() }
         resolving = false
     }
 }

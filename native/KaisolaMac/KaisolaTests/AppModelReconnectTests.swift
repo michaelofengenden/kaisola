@@ -62,6 +62,79 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    func testActivityFromAnotherOwnerOrProjectChangesNoLocalState() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+
+        let target = ReconnectBrokerClient.secondTerminalID
+        let subscribedOwnerID = await fixture.client.subscribedOwnerID(
+            for: ReconnectBrokerClient.firstTerminalID
+        )
+        let observerOwnerID = try XCTUnwrap(subscribedOwnerID)
+        XCTAssertEqual(fixture.model.sessions.first(where: { $0.id == target })?.agentActivity, .idle)
+
+        // Right terminal, another owner: the row must not start working.
+        await fixture.client.emitActivity(
+            for: target,
+            ownerID: "kaisola-native-someone-else",
+            busy: true
+        )
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(fixture.model.sessions.first(where: { $0.id == target })?.agentActivity, .idle)
+
+        // Right owner, another project: the terminal is filed under
+        // project.one, so a frame routed through a different project is just
+        // as untrustworthy.
+        await fixture.client.emitActivity(
+            for: target,
+            ownerID: observerOwnerID,
+            projectID: "project.two",
+            busy: true
+        )
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(fixture.model.sessions.first(where: { $0.id == target })?.agentActivity, .idle)
+        XCTAssertTrue(fixture.attentionCenter.entries.isEmpty)
+
+        // An authentic frame still lands, so the rejections above are the
+        // identity check and not a dead event path.
+        await fixture.client.emitActivity(for: target, ownerID: observerOwnerID, busy: true)
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(
+            fixture.model.sessions.first(where: { $0.id == target })?.agentActivity,
+            .working
+        )
+
+        // A forged completion is the expensive one: it would end the turn and
+        // raise a durable needs-you badge for work that never finished.
+        await fixture.client.emitActivity(
+            for: target,
+            ownerID: "kaisola-native-someone-else",
+            busy: false,
+            completedAt: 1_785_000_400_000
+        )
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(
+            fixture.model.sessions.first(where: { $0.id == target })?.agentActivity,
+            .working
+        )
+        XCTAssertTrue(fixture.attentionCenter.entries.isEmpty)
+
+        await fixture.client.emitActivity(
+            for: target,
+            ownerID: observerOwnerID,
+            busy: false,
+            completedAt: 1_785_000_500_000
+        )
+        try await Task.sleep(for: .milliseconds(40))
+        XCTAssertEqual(
+            fixture.model.sessions.first(where: { $0.id == target })?.agentActivity,
+            .responded(at: 1_785_000_500_000)
+        )
+        XCTAssertEqual(fixture.attentionCenter.entries.map(\.targetID), [target])
+        await fixture.model.disconnect()
+    }
+
     func testDisconnectRetriesAndResubscribesFromTheVisibleCursor() async throws {
         let fixture = try Fixture(failingConnectAttempts: [2])
         defer { fixture.cleanUp() }
@@ -637,6 +710,218 @@ final class AppModelReconnectTests: XCTestCase {
         XCTAssertNil(entry)
     }
 
+    func testTranscriptRemovalFailureIsCallerVisibleAndKeepsNewestTailRetryable() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            transcriptRemovalFailure: .delete
+        )
+        defer { fixture.cleanUp() }
+        let chatID = "failed-explicit-removal"
+        let durableRows: [AcpTranscriptRow] = [.message(id: "1", text: "durable")]
+        let newestRows: [AcpTranscriptRow] = [
+            .message(id: "1", text: "durable"),
+            .message(id: "2", text: "newest buffered tail"),
+        ]
+
+        fixture.model.enqueueTranscriptSave(durableRows, chatID: chatID)
+        await fixture.model.flushTranscriptPersistence()
+        fixture.model.enqueueTranscriptSave(newestRows, chatID: chatID)
+
+        let result = await fixture.model.enqueueTranscriptRemoval(chatID: chatID).value
+        XCTAssertEqual(
+            result,
+            .failed(.database("injected transcript removal DELETE failure"))
+        )
+
+        await fixture.model.flushTranscriptPersistence()
+        let restored = await fixture.transcriptStore.entry(for: chatID)
+        XCTAssertEqual(restored?.rows, newestRows)
+    }
+
+    func testTranscriptRemovalBatchAttemptsLaterIDsAfterAnEarlierFailure() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            transcriptRemovalFailure: .delete
+        )
+        defer { fixture.cleanUp() }
+        let firstID = "failed-batch-removal"
+        let secondID = "healthy-batch-removal"
+        let firstRows: [AcpTranscriptRow] = [.message(id: "1", text: "retry me")]
+        let secondRows: [AcpTranscriptRow] = [.message(id: "2", text: "erase me")]
+        fixture.model.enqueueTranscriptSave(firstRows, chatID: firstID)
+        fixture.model.enqueueTranscriptSave(secondRows, chatID: secondID)
+        await fixture.model.flushTranscriptPersistence()
+
+        let removals = fixture.model.enqueueTranscriptRemovals(
+            chatIDs: [firstID, secondID]
+        )
+        XCTAssertEqual(removals.count, 2)
+        let firstResult = await removals[0].value
+        let secondResult = await removals[1].value
+        XCTAssertEqual(
+            firstResult,
+            .failed(.database("injected transcript removal DELETE failure"))
+        )
+        XCTAssertEqual(secondResult, .removed)
+
+        await fixture.model.flushTranscriptPersistence()
+        let retained = await fixture.transcriptStore.entry(for: firstID)
+        let erased = await fixture.transcriptStore.entry(for: secondID)
+        XCTAssertEqual(retained?.rows, firstRows)
+        XCTAssertNil(erased)
+    }
+
+    func testTombstoneFailureIsCallerVisibleAndKeepsBufferedTailRetryable() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            transcriptTombstoneFailure: .commit
+        )
+        defer { fixture.cleanUp() }
+        let chatID = "failed-tombstone"
+        let durableRows: [AcpTranscriptRow] = [.message(id: "1", text: "durable")]
+        let newestRows: [AcpTranscriptRow] = [
+            .message(id: "1", text: "durable"),
+            .message(id: "2", text: "newest buffered tail"),
+        ]
+
+        await fixture.transcriptStore.scheduleSave(durableRows, for: chatID, now: 1)
+        await fixture.transcriptStore.flush()
+        await fixture.transcriptStore.scheduleSave(newestRows, for: chatID, now: 2)
+
+        let result = await fixture.model.deleteChat(chatID)
+        XCTAssertEqual(
+            result,
+            .failed(.database("injected transcript tombstone commit failure"))
+        )
+
+        await fixture.transcriptStore.flush()
+        let restored = await fixture.transcriptStore.entry(for: chatID)
+        XCTAssertEqual(restored?.rows, newestRows)
+    }
+
+    func testTombstoneFailurePreservesEveryDraftStoreUntilRetryCommitsDeletion() async throws {
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            transcriptTombstoneFailure: .commit
+        )
+        defer { fixture.cleanUp() }
+        let chatID = "failed-tombstone-\(UUID().uuidString)"
+        let unrelatedChatID = "unrelated-\(UUID().uuidString)"
+        let defaultsKeys = AcpConversation.persistedDraftDefaultsKeys(for: chatID)
+        let unrelatedDefaultsKeys = AcpConversation.persistedDraftDefaultsKeys(
+            for: unrelatedChatID
+        )
+        defer {
+            for key in defaultsKeys + unrelatedDefaultsKeys {
+                fixture.chatDraftDefaults.removeObject(forKey: key)
+                fixture.migratedChatDraftDefaults.removeObject(forKey: key)
+            }
+        }
+        let durableRows: [AcpTranscriptRow] = [.message(id: "1", text: "durable")]
+        let newestRows: [AcpTranscriptRow] = [
+            .message(id: "1", text: "durable"),
+            .message(id: "2", text: "newest buffered tail"),
+        ]
+        let transcriptSecret = "CURRENT_TRANSCRIPT_DRAFT_493_\(UUID().uuidString)"
+        let workspaceSecret = "MIGRATED_WORKSPACE_DRAFT_493_\(UUID().uuidString)"
+        let defaultsSecret = "CURRENT_USER_DEFAULTS_DRAFT_493_\(UUID().uuidString)"
+        let migratedDefaultsSecret = "MIGRATED_USER_DEFAULTS_DRAFT_493_\(UUID().uuidString)"
+        let unrelatedSecret = "UNRELATED_CURRENT_DEFAULTS_493_\(UUID().uuidString)"
+        let unrelatedMigratedSecret = "UNRELATED_MIGRATED_DEFAULTS_493_\(UUID().uuidString)"
+        let workspaceStableKey = "chat|\(chatID)"
+
+        await fixture.transcriptStore.scheduleSave(durableRows, for: chatID, now: 1)
+        await fixture.transcriptStore.flush()
+        await fixture.transcriptStore.scheduleSave(newestRows, for: chatID, now: 2)
+        await fixture.transcriptStore.scheduleDraft(transcriptSecret, for: chatID, now: 3)
+        try await fixture.workspaceStore.saveDraft(
+            workspaceSecret,
+            stableKey: workspaceStableKey,
+            projectID: "project-493",
+            agentID: "claude-code",
+            workspacePath: fixture.root.path,
+            updatedAt: 4
+        )
+        for key in defaultsKeys {
+            fixture.chatDraftDefaults.set(defaultsSecret, forKey: key)
+            fixture.migratedChatDraftDefaults.set(migratedDefaultsSecret, forKey: key)
+        }
+        for key in unrelatedDefaultsKeys {
+            fixture.chatDraftDefaults.set(unrelatedSecret, forKey: key)
+            fixture.migratedChatDraftDefaults.set(unrelatedMigratedSecret, forKey: key)
+        }
+
+        let result = await fixture.model.deleteChat(chatID)
+        XCTAssertEqual(
+            result,
+            .failed(.database("injected transcript tombstone commit failure"))
+        )
+
+        await fixture.transcriptStore.flush()
+        let restored = await fixture.transcriptStore.entry(for: chatID)
+        XCTAssertEqual(restored?.rows, newestRows)
+        XCTAssertEqual(restored?.draft, transcriptSecret)
+        let preservedWorkspaceDraft = try await fixture.workspaceStore.draft(
+            for: workspaceStableKey
+        )
+        XCTAssertEqual(preservedWorkspaceDraft, workspaceSecret)
+        for key in defaultsKeys {
+            XCTAssertEqual(fixture.chatDraftDefaults.string(forKey: key), defaultsSecret)
+            XCTAssertEqual(
+                fixture.migratedChatDraftDefaults.string(forKey: key),
+                migratedDefaultsSecret
+            )
+        }
+
+        let databaseURL = fixture.transcriptStore.databaseURL
+        let workspaceURL = fixture.workspaceStore.archiveURL
+        XCTAssertNotNil(try Data(contentsOf: databaseURL).range(of: Data(transcriptSecret.utf8)))
+        XCTAssertNotNil(try Data(contentsOf: workspaceURL).range(of: Data(workspaceSecret.utf8)))
+
+        // The deterministic injection is single-use. A successful retry now
+        // commits the tombstone and must clear the current transcript, migrated
+        // workspace archive, and both defaults domains before its caller
+        // observes completion.
+        let retry = await fixture.model.deleteChat(chatID)
+        XCTAssertEqual(retry, .removed)
+
+        let relaunchedTranscript = AcpTranscriptStore(databaseURL: databaseURL)
+        let relaunchedWorkspace = NativeWorkspaceStateStore(fileURL: workspaceURL)
+        let deletedTranscript = await relaunchedTranscript.entry(for: chatID)
+        let deletedWorkspaceDraft = try await relaunchedWorkspace.draft(
+            for: workspaceStableKey
+        )
+        XCTAssertNil(deletedTranscript)
+        XCTAssertNil(deletedWorkspaceDraft)
+        XCTAssertNil(try Data(contentsOf: databaseURL).range(of: Data(transcriptSecret.utf8)))
+        XCTAssertNil(try Data(contentsOf: workspaceURL).range(of: Data(workspaceSecret.utf8)))
+        for key in defaultsKeys {
+            XCTAssertNil(fixture.chatDraftDefaults.object(forKey: key))
+            XCTAssertNil(fixture.migratedChatDraftDefaults.object(forKey: key))
+            XCTAssertFalse(fixture.chatDraftDefaults.dictionaryRepresentation().keys.contains(key))
+            XCTAssertFalse(
+                fixture.migratedChatDraftDefaults.dictionaryRepresentation().keys.contains(key)
+            )
+        }
+        XCTAssertFalse(
+            fixture.chatDraftDefaults.dictionaryRepresentation().values.contains {
+                ($0 as? String) == defaultsSecret
+            }
+        )
+        XCTAssertFalse(
+            fixture.migratedChatDraftDefaults.dictionaryRepresentation().values.contains {
+                ($0 as? String) == migratedDefaultsSecret
+            }
+        )
+        for key in unrelatedDefaultsKeys {
+            XCTAssertEqual(fixture.chatDraftDefaults.string(forKey: key), unrelatedSecret)
+            XCTAssertEqual(
+                fixture.migratedChatDraftDefaults.string(forKey: key),
+                unrelatedMigratedSecret
+            )
+        }
+    }
+
     func testTerminalResizeSendsOnlyLatestSettledGeometryAndDeduplicatesRepeats() async throws {
         let fixture = try VisualControlFixture()
         defer { fixture.cleanUp() }
@@ -690,13 +975,443 @@ final class AppModelReconnectTests: XCTestCase {
         defer { fixture.cleanUp() }
         fixture.model.loadVisualFixture(workspace: fixture.root)
 
-        fixture.model.sendInput("a", to: "visual-terminal")
-        fixture.model.sendInput("β", to: "visual-terminal")
-        fixture.model.sendInput("\r", to: "visual-terminal")
-        await waitUntil { await fixture.control.writes().count == 3 }
+        let acceptedInOneOwnershipEpoch = [
+            "text",
+            "\u{1B}",
+            "\u{1B}[A",
+            "\u{1B}[200~pasted line\r\u{1B}[201~",
+            "\r",
+        ]
+        for data in acceptedInOneOwnershipEpoch {
+            fixture.model.sendInput(data, to: "visual-terminal")
+        }
+        await waitUntil {
+            await fixture.control.writes().count == acceptedInOneOwnershipEpoch.count
+        }
 
         let writes = await fixture.control.writes()
-        XCTAssertEqual(writes, ["a", "β", "\r"])
+        XCTAssertEqual(writes, acceptedInOneOwnershipEpoch)
+        await fixture.model.disconnect()
+    }
+
+    func testOversizedTerminalPasteChunksOnUnicodeScalarBoundariesAndReportsAcknowledgedBytes() async throws {
+        let fixture = try GatedVisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        let payload = String(repeating: "aé🙂", count: 10_000)
+        XCTAssertGreaterThan(payload.utf8.count, AppModel.terminalWritePayloadByteLimit)
+
+        fixture.model.sendInput(payload, to: "visual-terminal")
+        await fixture.control.waitForAttemptCount(1)
+
+        let initialAttempts = await fixture.control.writeAttempts()
+        let firstAttempt = try XCTUnwrap(initialAttempts.first)
+        XCTAssertLessThanOrEqual(
+            firstAttempt.utf8.count,
+            AppModel.terminalWritePayloadByteLimit
+        )
+        XCTAssertEqual(
+            fixture.model.terminalPasteProgress(for: "visual-terminal"),
+            TerminalPasteProgress(sentBytes: 0, totalBytes: payload.utf8.count)
+        )
+
+        await fixture.control.resolveAttempt(0, with: .success)
+        await fixture.control.waitForAttemptCount(2)
+        await waitUntil {
+            fixture.model.terminalPasteProgress(for: "visual-terminal")?.sentBytes
+                == firstAttempt.utf8.count
+        }
+        let attemptsAfterFirstAcknowledgement = await fixture.control.writeAttempts()
+        let secondAttempt = attemptsAfterFirstAcknowledgement[1]
+        XCTAssertLessThanOrEqual(
+            secondAttempt.utf8.count,
+            AppModel.terminalWritePayloadByteLimit
+        )
+
+        await fixture.control.resolveAttempt(1, with: .success)
+        await waitUntil {
+            fixture.model.terminalPasteProgress(for: "visual-terminal") == nil
+        }
+        let attempts = await fixture.control.writeAttempts()
+        XCTAssertEqual(attempts.joined(), payload)
+        XCTAssertTrue(attempts.allSatisfy {
+            $0.utf8.count <= AppModel.terminalWritePayloadByteLimit
+        })
+        await fixture.model.disconnect()
+    }
+
+    func testOversizedBracketedPasteClosesEveryCancellableChunk() {
+        let opening = "\u{1B}[200~"
+        let closing = "\u{1B}[201~"
+        let body = String(
+            repeating: "aé🙂",
+            count: AppModel.terminalWritePayloadByteLimit / 4
+        )
+
+        let chunks = AppModel.terminalWriteChunks(opening + body + closing)
+
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertTrue(chunks.allSatisfy {
+            $0.hasPrefix(opening)
+                && $0.hasSuffix(closing)
+                && $0.utf8.count <= AppModel.terminalWritePayloadByteLimit
+        })
+        XCTAssertEqual(
+            chunks.map {
+                String($0.dropFirst(opening.count).dropLast(closing.count))
+            }.joined(),
+            body,
+            "Cancelling between chunks must not strand the terminal inside bracketed-paste mode."
+        )
+    }
+
+    func testCancellingOversizedTerminalPasteDropsOnlyUnsentChunks() async throws {
+        let fixture = try GatedVisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        let payload = String(
+            repeating: "x",
+            count: AppModel.terminalWritePayloadByteLimit * 2 + 1
+        )
+
+        fixture.model.sendInput(payload, to: "visual-terminal")
+        await fixture.control.waitForAttemptCount(1)
+        XCTAssertNotNil(fixture.model.terminalPasteProgress(for: "visual-terminal"))
+
+        fixture.model.cancelTerminalPaste(for: "visual-terminal")
+        XCTAssertNil(fixture.model.terminalPasteProgress(for: "visual-terminal"))
+        await fixture.control.resolveAttempt(0, with: .success)
+        await Task.yield()
+        fixture.model.sendInput("live", to: "visual-terminal")
+        await fixture.control.waitForAttemptCount(2)
+
+        let attempts = await fixture.control.writeAttempts()
+        XCTAssertEqual(attempts.count, 2)
+        XCTAssertEqual(attempts[0].utf8.count, AppModel.terminalWritePayloadByteLimit)
+        XCTAssertEqual(attempts[1], "live")
+        await fixture.control.resolveAttempt(1, with: .success)
+        await fixture.model.disconnect()
+    }
+
+    func testStaleSurfaceCallbackCannotWriteAcrossVisualOwnershipFlap() async throws {
+        let fixture = try VisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        defer {
+            for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        }
+        await fixture.model.reload()
+        let fixtureConnectionCount = await fixture.control.connectionCount()
+        XCTAssertEqual(
+            fixtureConnectionCount,
+            0,
+            "A fixture-side reload must remain broker-free even if future UI automation invokes it."
+        )
+        let staleSurfaceCallback = {
+            fixture.model.sendInput("stale", to: "visual-terminal")
+        }
+
+        // Both packets are accepted while owned but remain queued until the
+        // drain task gets an actor turn. Revocation must invalidate that whole
+        // capability generation, not leave them waiting for the next owner.
+        fixture.model.sendInput("queued-stale-1", to: "visual-terminal")
+        fixture.model.sendInput("queued-stale-2", to: "visual-terminal")
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(false))
+        staleSurfaceCallback()
+        await Task.yield()
+        let staleWrites = await fixture.control.writes()
+        XCTAssertTrue(
+            staleWrites.isEmpty,
+            "AppModel must reject a stale callback even after the view-level capability is revoked."
+        )
+        XCTAssertEqual(
+            ToastCenter.shared.toasts.map(\.message),
+            ["Terminal 2" + AppModel.terminalInputDiscardNoticeSuffix],
+            "Discard feedback must name the same project-local terminal identity shown in the rail."
+        )
+
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(true))
+        fixture.model.sendInput("live", to: "visual-terminal")
+        await waitUntil { await fixture.control.writes().count == 1 }
+        let liveWrites = await fixture.control.writes()
+        XCTAssertEqual(liveWrites, ["live"])
+        await fixture.model.disconnect()
+    }
+
+    func testOwnershipFlapDiscardsEveryQueuedInputFormWithOneRedactedNotice() async throws {
+        let fixture = try VisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        defer {
+            for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        }
+
+        fixture.model.sendInput("baseline", to: "visual-codex")
+        await waitUntil {
+            await fixture.control.writes().count == 1
+                && fixture.model.terminalDraftTextForTesting("visual-codex") == "baseline"
+        }
+
+        let staleInputs = [
+            "stale-text-secret",
+            "\u{1B}",
+            "\u{1B}[A",
+            "\u{1B}[200~private pasted command\r\u{1B}[201~",
+            "\r",
+        ]
+        for data in staleInputs {
+            fixture.model.sendInput(data, to: "visual-codex")
+        }
+
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(
+            false,
+            terminalID: "visual-codex"
+        ))
+        // A repeated loss callback belongs to the same empty epoch and must not
+        // produce another warning after the queue has already been discarded.
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(
+            false,
+            terminalID: "visual-codex"
+        ))
+        fixture.model.sendInput("stale-callback-secret", to: "visual-codex")
+        await Task.yield()
+
+        let discardedWrites = await fixture.control.writes()
+        XCTAssertEqual(discardedWrites, ["baseline"])
+        XCTAssertEqual(
+            fixture.model.terminalDraftTextForTesting("visual-codex"),
+            "baseline",
+            "Discarded text, escape sequences, paste wrappers, and Return must not alter a future draft retype."
+        )
+        let notices = ToastCenter.shared.toasts
+        XCTAssertEqual(notices.count, 1)
+        XCTAssertEqual(
+            notices.first?.message,
+            "Codex · \(fixture.root.lastPathComponent)"
+                + AppModel.terminalInputDiscardNoticeSuffix
+        )
+        XCTAssertEqual(notices.first?.style, .error)
+        for staleInput in staleInputs + ["stale-callback-secret"] where staleInput != "\r" {
+            XCTAssertFalse(
+                notices.first?.message.contains(staleInput) == true,
+                "Discard feedback must never echo terminal input contents."
+            )
+        }
+
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(
+            true,
+            terminalID: "visual-codex"
+        ))
+        fixture.model.sendInput("-fresh", to: "visual-codex")
+        await waitUntil {
+            await fixture.control.writes().count == 2
+                && fixture.model.terminalDraftTextForTesting("visual-codex") == "baseline-fresh"
+        }
+        let resumedWrites = await fixture.control.writes()
+        XCTAssertEqual(resumedWrites, ["baseline", "-fresh"])
+        XCTAssertEqual(ToastCenter.shared.toasts.count, 1)
+        await fixture.model.disconnect()
+    }
+
+    func testOwnershipFlapWithoutQueuedInputDoesNotClaimAnythingWasDiscarded() async throws {
+        let fixture = try VisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        defer {
+            for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        }
+
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(false))
+
+        XCTAssertTrue(ToastCenter.shared.toasts.isEmpty)
+        await fixture.model.disconnect()
+    }
+
+    func testExplicitQuitSealsQueuedInputSilentlyBeforeItsFirstSuspension() async throws {
+        let fixture = try VisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        defer {
+            for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        }
+
+        fixture.model.sendInput("never-send-on-quit", to: "visual-codex")
+        await fixture.model.releaseOwnedSessionsForQuit()
+        await Task.yield()
+
+        let writes = await fixture.control.writes()
+        XCTAssertTrue(writes.isEmpty)
+        XCTAssertNil(fixture.model.terminalDraftTextForTesting("visual-codex"))
+        XCTAssertTrue(
+            ToastCenter.shared.toasts.isEmpty,
+            "An explicit quit is intentional and must not show ownership-loss feedback."
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testLateOldEpochSuccessCannotDrainResidueOrPublishStaleAgentTurn() async throws {
+        let fixture = try GatedVisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        defer {
+            for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        }
+
+        fixture.model.sendInput("old-head\r", to: "visual-codex")
+        await fixture.control.waitForAttemptCount(1)
+        fixture.model.sendInput("old-tail", to: "visual-codex")
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(
+            false,
+            terminalID: "visual-codex"
+        ))
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(
+            true,
+            terminalID: "visual-codex"
+        ))
+
+        fixture.model.sendInput("fresh-head\r", to: "visual-codex")
+        await fixture.control.waitForAttemptCount(2)
+        await fixture.control.resolveAttempt(0, with: .success)
+        await Task.yield()
+
+        // A late generation-zero defer must not clear generation one's drain.
+        // This packet stays behind fresh-head until its acknowledgement.
+        fixture.model.sendInput("fresh-tail", to: "visual-codex")
+        await Task.yield()
+        let attemptsBeforeFreshAcknowledgement = await fixture.control.writeAttempts()
+        XCTAssertEqual(
+            attemptsBeforeFreshAcknowledgement,
+            ["old-head\r", "fresh-head\r"]
+        )
+
+        await fixture.control.resolveAttempt(1, with: .success)
+        await fixture.control.waitForAttemptCount(3)
+        let allAttempts = await fixture.control.writeAttempts()
+        XCTAssertEqual(
+            allAttempts,
+            ["old-head\r", "fresh-head\r", "fresh-tail"]
+        )
+        await fixture.control.resolveAttempt(2, with: .success)
+        await waitUntil { await fixture.control.successfulWrites().count == 3 }
+
+        let agentTurnCount = await fixture.control.agentTurnCount()
+        XCTAssertEqual(agentTurnCount, 1)
+        XCTAssertEqual(
+            fixture.model.terminalDraftTextForTesting("visual-codex"),
+            "fresh-tail",
+            "A late old-epoch acknowledgement must not mutate the persisted composer."
+        )
+        XCTAssertEqual(ToastCenter.shared.toasts.count, 1)
+        await fixture.model.disconnect()
+    }
+
+    func testLateOldEpochFailureCannotInvalidateReplacementEpochOrDuplicateFeedback() async throws {
+        let fixture = try GatedVisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        defer {
+            for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+        }
+
+        fixture.model.sendInput("old-in-flight", to: "visual-codex")
+        await fixture.control.waitForAttemptCount(1)
+        fixture.model.sendInput("old-never-attempted", to: "visual-codex")
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(
+            false,
+            terminalID: "visual-codex"
+        ))
+        XCTAssertTrue(fixture.model.setVisualFixtureTerminalOwnership(
+            true,
+            terminalID: "visual-codex"
+        ))
+
+        fixture.model.sendInput("fresh-one", to: "visual-codex")
+        await fixture.control.waitForAttemptCount(2)
+        await fixture.control.resolveAttempt(0, with: .failure)
+        await fixture.control.resolveAttempt(1, with: .success)
+        await waitUntil { await fixture.control.successfulWrites() == ["fresh-one"] }
+
+        fixture.model.sendInput("fresh-two", to: "visual-codex")
+        await fixture.control.waitForAttemptCount(3)
+        await fixture.control.resolveAttempt(2, with: .success)
+        await waitUntil { await fixture.control.successfulWrites().count == 2 }
+
+        let attempts = await fixture.control.writeAttempts()
+        XCTAssertEqual(
+            attempts,
+            ["old-in-flight", "fresh-one", "fresh-two"]
+        )
+        XCTAssertTrue(fixture.model.isOwned("visual-codex"))
+        XCTAssertEqual(
+            ToastCenter.shared.toasts.count,
+            1,
+            "The discard notice already explains the flap; a stale failure must not add a generic recovery warning."
+        )
+        await fixture.model.disconnect()
+    }
+
+    func testTerminalWriteTimeoutDegradesOnlyThatTerminal() async throws {
+        let fixture = try VisualControlFixture()
+        defer { fixture.cleanUp() }
+        fixture.model.loadVisualFixture(workspace: fixture.root)
+        await fixture.control.failNextWrite(to: "visual-terminal")
+
+        fixture.model.sendInput("uncertain", to: "visual-terminal")
+        await waitUntil {
+            fixture.model.isTerminalInputDegraded("visual-terminal")
+        }
+
+        XCTAssertTrue(fixture.model.connectionState.isConnected)
+        XCTAssertTrue(fixture.model.controlAvailable)
+        XCTAssertTrue(fixture.model.isOwned("visual-terminal"))
+        XCTAssertTrue(fixture.model.isOwned("visual-codex"))
+        let failedTerminalAttemptCount = await fixture.control.writeAttemptCount(for: "visual-terminal")
+        XCTAssertEqual(
+            failedTerminalAttemptCount,
+            1,
+            "a timed-out terminal.write has an unknown outcome and must never be replayed"
+        )
+
+        fixture.model.sendInput("must stay blocked", to: "visual-terminal")
+        await Task.yield()
+        let blockedTerminalAttemptCount = await fixture.control.writeAttemptCount(for: "visual-terminal")
+        XCTAssertEqual(
+            blockedTerminalAttemptCount,
+            1,
+            "later input must remain quarantined until the controller is explicitly re-established"
+        )
+
+        fixture.model.sendInput("still works", to: "visual-codex")
+        await waitUntil { await fixture.control.writes().count == 1 }
+
+        let successfulWrites = await fixture.control.writes()
+        XCTAssertEqual(successfulWrites, ["still works"])
+        XCTAssertFalse(fixture.model.isTerminalInputDegraded("visual-codex"))
+        XCTAssertTrue(fixture.model.isOwned("visual-codex"))
+
+        let controllerConnectionsBeforeRecovery = await fixture.control.connectionCount()
+        await fixture.model.recoverTerminalInput("visual-terminal")
+        XCTAssertFalse(fixture.model.isTerminalInputDegraded("visual-terminal"))
+        XCTAssertTrue(fixture.model.isOwned("visual-terminal"))
+        let targetedAttachCalls = await fixture.control.attachCalls()
+        XCTAssertEqual(targetedAttachCalls, ["visual-terminal"])
+        let controllerConnectionsAfterRecovery = await fixture.control.connectionCount()
+        XCTAssertEqual(
+            controllerConnectionsAfterRecovery,
+            controllerConnectionsBeforeRecovery,
+            "recovering one terminal must not reconnect the shared controller or observer"
+        )
+
+        fixture.model.sendInput("resumed", to: "visual-terminal")
+        await waitUntil { await fixture.control.writes().count == 2 }
+        let writesAfterRecovery = await fixture.control.writes()
+        XCTAssertEqual(writesAfterRecovery, ["still works", "resumed"])
         await fixture.model.disconnect()
     }
 
@@ -722,6 +1437,57 @@ final class AppModelReconnectTests: XCTestCase {
             ToastCenter.shared.toasts.last?.message,
             "Terminal connection is recovering; input was not sent"
         )
+        await fixture.model.disconnect()
+    }
+
+    func testAcknowledgedAgentTurnOpensLocalActivityAndLeavesUpdatesFlowing() async throws {
+        let fixture = try AgentTurnGateFixture(agentTurnAccepted: true)
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+
+        fixture.model.sendInput("go\r", to: fixture.terminalID)
+        await waitUntil { await fixture.control.agentTurnCalls() == [true] }
+
+        XCTAssertEqual(fixture.model.openAgentTurnTerminalIDs, [fixture.terminalID])
+        XCTAssertTrue(fixture.model.agentTurnSignalFailureTerminalIDs.isEmpty)
+        XCTAssertTrue(fixture.model.unprotectedAgentTurnTerminalIDs.isEmpty)
+        XCTAssertNil(fixture.model.brokerUpdateGateBlockedDetail)
+
+        let before = await fixture.upgradeAttempts.count()
+        await fixture.model.refreshInventory()
+        let after = await fixture.upgradeAttempts.count()
+        XCTAssertEqual(after, before + 1, "An acknowledged turn leaves the update gate open.")
+        await fixture.model.disconnect()
+    }
+
+    func testRefusedAgentTurnLeavesNoLocalTurnAndShutsTheUpdateGate() async throws {
+        let fixture = try AgentTurnGateFixture(agentTurnAccepted: false)
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        for toast in ToastCenter.shared.toasts { ToastCenter.shared.dismiss(toast.id) }
+
+        // The broker refuses the turn, so it still counts this terminal idle
+        // and would accept a rolling cutover underneath the running agent.
+        fixture.model.sendInput("go\r", to: fixture.terminalID)
+        await waitUntil { await fixture.control.agentTurnCalls() == [true] }
+
+        XCTAssertTrue(fixture.model.openAgentTurnTerminalIDs.isEmpty)
+        XCTAssertEqual(fixture.model.agentTurnSignalFailureTerminalIDs, [fixture.terminalID])
+        XCTAssertEqual(fixture.model.unprotectedAgentTurnTerminalIDs, [fixture.terminalID])
+        XCTAssertNotNil(fixture.model.brokerUpdateGateBlockedDetail)
+        XCTAssertEqual(
+            ToastCenter.shared.toasts.last?.message,
+            "Agent activity could not be reported; terminal-continuity updates are paused"
+        )
+
+        // A refused signal must not cost the keystrokes themselves.
+        let writes = await fixture.control.writes()
+        XCTAssertEqual(writes, ["go\r"])
+
+        let before = await fixture.upgradeAttempts.count()
+        await fixture.model.refreshInventory()
+        let after = await fixture.upgradeAttempts.count()
+        XCTAssertEqual(after, before, "An unprotected turn must hold the update gate shut.")
         await fixture.model.disconnect()
     }
 
@@ -826,9 +1592,17 @@ private struct RecordedTerminalResize: Equatable, Sendable {
 private actor RecordingBrokerControlClient: BrokerControlServing {
     private var recordedResizes: [RecordedTerminalResize] = []
     private var recordedWrites: [String] = []
+    private var writeFailuresRemainingByTerminalID: [String: Int] = [:]
+    private var writeAttemptCountsByTerminalID: [String: Int] = [:]
     private var disconnectHandler: (@Sendable (any Error) -> Void)?
     private var connectCount = 0
     private var recordedAttaches: [String] = []
+    private let agentTurnAccepted: Bool
+    private var recordedAgentTurns: [Bool] = []
+
+    init(agentTurnAccepted: Bool = true) {
+        self.agentTurnAccepted = agentTurnAccepted
+    }
 
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {
         disconnectHandler = handler
@@ -864,6 +1638,11 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
         // Yield here so the test exercises AppModel's serializer rather than
         // accidentally relying on immediately completing actor calls.
         await Task.yield()
+        writeAttemptCountsByTerminalID[terminalID, default: 0] += 1
+        if writeFailuresRemainingByTerminalID[terminalID, default: 0] > 0 {
+            writeFailuresRemainingByTerminalID[terminalID, default: 0] -= 1
+            throw BrokerClientError.requestTimedOut
+        }
         recordedWrites.append(data)
     }
 
@@ -874,15 +1653,141 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
     func kill(projectID: String, terminalID: String) async throws {}
     func release(projectID: String, terminalID: String) async throws {}
     func detachOwner(projectID: String, terminalID: String) async throws {}
-    func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws {}
+    /// Mirrors `BrokerControlClient`, which now turns the broker's inner
+    /// `{ok:false}` into this error instead of discarding it.
+    func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws {
+        recordedAgentTurns.append(busy)
+        guard agentTurnAccepted else {
+            throw BrokerClientError.requestFailed("terminal.agentTurn")
+        }
+    }
+
     func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {}
     func disconnect() async {}
 
     func resizeCalls() -> [RecordedTerminalResize] { recordedResizes }
+    func agentTurnCalls() -> [Bool] { recordedAgentTurns }
     func writes() -> [String] { recordedWrites }
+    func failNextWrite(to terminalID: String) {
+        writeFailuresRemainingByTerminalID[terminalID, default: 0] += 1
+    }
+    func writeAttemptCount(for terminalID: String) -> Int {
+        writeAttemptCountsByTerminalID[terminalID, default: 0]
+    }
     func connectionCount() -> Int { connectCount }
     func attachCalls() -> [String] { recordedAttaches }
     func simulateDisconnect() { disconnectHandler?(BrokerClientError.connectionClosed) }
+}
+
+private enum GatedWriteResolution: Sendable {
+    case success
+    case failure
+}
+
+/// A cancellation-resistant transport double: ownership can change while the
+/// old request remains suspended, then the test chooses whether its late
+/// completion is success or failure. Attempts and acknowledgements are kept
+/// separate so no sleep or wall-clock threshold defines the epoch boundary.
+private actor GatedBrokerControlClient: BrokerControlServing {
+    private struct AttemptWaiter {
+        let count: Int
+        let continuation: CheckedContinuation<Void, Never>
+    }
+
+    private var attempts: [String] = []
+    private var successes: [String] = []
+    private var pending: [Int: CheckedContinuation<Void, any Error>] = [:]
+    private var attemptWaiters: [AttemptWaiter] = []
+    private var agentTurns = 0
+
+    func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {}
+    func connect(to info: BrokerInfo, ownerID: String) async throws {}
+
+    func createTerminal(
+        projectID: String,
+        terminalID: String,
+        command: String,
+        arguments: [String],
+        cwd: String,
+        columns: Int,
+        rows: Int,
+        restore: Bool
+    ) async throws -> TerminalCreation {
+        TerminalCreation(
+            terminalID: terminalID,
+            projectID: projectID,
+            pid: 1,
+            streamEpoch: "gated"
+        )
+    }
+
+    func attach(projectID: String, terminalID: String) async throws {}
+
+    func write(projectID: String, terminalID: String, data: String) async throws {
+        let index = attempts.count
+        attempts.append(data)
+        resumeSatisfiedWaiters()
+        try await withCheckedThrowingContinuation { continuation in
+            pending[index] = continuation
+        }
+        successes.append(data)
+    }
+
+    func resize(projectID: String, terminalID: String, columns: Int, rows: Int) async throws {}
+    func kill(projectID: String, terminalID: String) async throws {}
+    func release(projectID: String, terminalID: String) async throws {}
+    func detachOwner(projectID: String, terminalID: String) async throws {}
+
+    func setAgentTurn(
+        projectID: String,
+        terminalID: String,
+        busy: Bool
+    ) async throws {
+        if busy { agentTurns += 1 }
+    }
+
+    func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {}
+
+    func disconnect() async {
+        let continuations = pending.values
+        pending.removeAll()
+        for continuation in continuations {
+            continuation.resume(throwing: BrokerClientError.connectionClosed)
+        }
+    }
+
+    func waitForAttemptCount(_ count: Int) async {
+        if attempts.count >= count { return }
+        await withCheckedContinuation { continuation in
+            attemptWaiters.append(AttemptWaiter(count: count, continuation: continuation))
+        }
+    }
+
+    func resolveAttempt(_ index: Int, with resolution: GatedWriteResolution) {
+        guard let continuation = pending.removeValue(forKey: index) else { return }
+        switch resolution {
+        case .success:
+            continuation.resume()
+        case .failure:
+            continuation.resume(throwing: BrokerClientError.connectionClosed)
+        }
+    }
+
+    func writeAttempts() -> [String] { attempts }
+    func successfulWrites() -> [String] { successes }
+    func agentTurnCount() -> Int { agentTurns }
+
+    private func resumeSatisfiedWaiters() {
+        var remaining: [AttemptWaiter] = []
+        for waiter in attemptWaiters {
+            if attempts.count >= waiter.count {
+                waiter.continuation.resume()
+            } else {
+                remaining.append(waiter)
+            }
+        }
+        attemptWaiters = remaining
+    }
 }
 
 @MainActor
@@ -912,6 +1817,38 @@ private final class VisualControlFixture {
     }
 
     func cleanUp() {
+        try? FileManager.default.removeItem(at: root)
+    }
+}
+
+@MainActor
+private final class GatedVisualControlFixture {
+    let root: URL
+    let control = GatedBrokerControlClient()
+    let model: AppModel
+
+    init() throws {
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-gated-control-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let transcriptStore = AcpTranscriptStore(fileURL: root.appendingPathComponent("transcripts.json"))
+        model = AppModel(
+            controlClient: control,
+            sessionStore: NativeSessionStore(fileURL: root.appendingPathComponent("sessions.json")),
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            workspaceStateStore: NativeWorkspaceStateStore(fileURL: root.appendingPathComponent("workspace.json")),
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore),
+            attentionCenter: AttentionCenter(
+                defaults: UserDefaults(suiteName: "kaisola-gated-control-\(UUID().uuidString)")!,
+                postsNotifications: false,
+                updatesDockBadge: false
+            )
+        )
+    }
+
+    func cleanUp() {
+        Task { await control.disconnect() }
         try? FileManager.default.removeItem(at: root)
     }
 }
@@ -983,6 +1920,105 @@ private final class ControllerReconnectFixture {
     }
 }
 
+private actor UpgradeAttemptRecorder {
+    private var attempts = 0
+
+    func record() { attempts += 1 }
+    func count() -> Int { attempts }
+}
+
+/// A preparer that is also the upgrade monitor, so a test can see whether the
+/// app asked for a terminal-continuity update on an inventory tick.
+private struct MonitoredBrokerPreparer: BrokerInfoPreparing, BrokerUpgradeMonitoring {
+    let info: BrokerInfo
+    let attempts: UpgradeAttemptRecorder
+
+    func prepare() async throws -> BrokerInfo { info }
+
+    func upgradeState() async -> BrokerUpgradeState { .unknown }
+
+    func attemptUpgradeIfNeeded() async -> BrokerUpgradeState {
+        await attempts.record()
+        return .unknown
+    }
+
+    func retirementDiagnostics() async -> [BrokerRetirementDiagnostic] { [] }
+}
+
+/// An owned agent terminal on a broker whose upgrade monitor is observable,
+/// so the agent-turn signal and the update gate can be exercised together.
+@MainActor
+private final class AgentTurnGateFixture {
+    let root: URL
+    let client = ReconnectBrokerClient(failingConnectAttempts: [])
+    let control: RecordingBrokerControlClient
+    let upgradeAttempts = UpgradeAttemptRecorder()
+    let model: AppModel
+
+    var terminalID: String { ReconnectBrokerClient.firstTerminalID }
+
+    init(agentTurnAccepted: Bool) throws {
+        control = RecordingBrokerControlClient(agentTurnAccepted: agentTurnAccepted)
+        root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-agent-turn-\(UUID().uuidString.prefix(8))", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let sessionStore = NativeSessionStore(fileURL: root.appendingPathComponent("sessions.json"))
+        sessionStore.upsert(NativeOwnedSession(
+            id: ReconnectBrokerClient.firstTerminalID,
+            projectID: "project.one",
+            cwd: root.path,
+            title: "Codex · agent turn",
+            createdAt: 1,
+            agentID: "codex"
+        ))
+        let transcriptStore = AcpTranscriptStore(fileURL: root.appendingPathComponent("transcripts.json"))
+        model = AppModel(
+            brokerPreparer: MonitoredBrokerPreparer(info: Self.brokerInfo, attempts: upgradeAttempts),
+            client: client,
+            controlClient: control,
+            sessionStore: sessionStore,
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            workspaceStateStore: NativeWorkspaceStateStore(fileURL: root.appendingPathComponent("workspace.json")),
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore),
+            attentionCenter: AttentionCenter(
+                defaults: UserDefaults(suiteName: "kaisola-agent-turn-\(UUID().uuidString)")!,
+                postsNotifications: false,
+                updatesDockBadge: false
+            ),
+            reconnectBackoff: BrokerReconnectBackoff(
+                baseNanoseconds: 1,
+                maximumNanoseconds: 2,
+                jitterFraction: 0
+            ),
+            sleep: { nanoseconds in
+                if nanoseconds >= 1_000_000_000 {
+                    try await Task.sleep(nanoseconds: nanoseconds)
+                } else {
+                    await Task.yield()
+                }
+            },
+            jitter: { 0 }
+        )
+    }
+
+    func cleanUp() {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    private static var brokerInfo: BrokerInfo {
+        BrokerInfo(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            pid: 12_345,
+            socketPath: "/tmp/kaisola-agent-turn.sock",
+            token: String(repeating: "c", count: 64),
+            startedAt: 1_784_250_001_000,
+            version: "test"
+        )
+    }
+}
+
 @MainActor
 private final class Fixture {
     let root: URL
@@ -990,11 +2026,17 @@ private final class Fixture {
     let transcriptStore: AcpTranscriptStore
     let workspaceStore: NativeWorkspaceStateStore
     let attentionCenter: AttentionCenter
+    let chatDraftDefaults: UserDefaults
+    let migratedChatDraftDefaults: UserDefaults
     let model: AppModel
+    private let chatDraftDefaultsSuite: String
+    private let migratedChatDraftDefaultsSuite: String
 
     init(
         failingConnectAttempts: Set<Int>,
-        completedAtByTerminalID: [String: Int64] = [:]
+        completedAtByTerminalID: [String: Int64] = [:],
+        transcriptRemovalFailure: AcpTranscriptStore.RemovalFailurePoint? = nil,
+        transcriptTombstoneFailure: AcpTranscriptStore.TombstoneFailurePoint? = nil
     ) throws {
         root = URL(fileURLWithPath: "/tmp/kaisola-app-model-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(
@@ -1007,12 +2049,24 @@ private final class Fixture {
             failingConnectAttempts: failingConnectAttempts,
             completedAtByTerminalID: completedAtByTerminalID
         )
+        let legacyTranscriptURL = root.appendingPathComponent("agent-chat-transcripts-v1.json")
         transcriptStore = AcpTranscriptStore(
-            fileURL: root.appendingPathComponent("agent-chat-transcripts-v1.json")
+            databaseURL: legacyTranscriptURL.deletingPathExtension().appendingPathExtension("sqlite3"),
+            legacyJSONURL: legacyTranscriptURL,
+            schedulesAutomaticFlush: transcriptRemovalFailure == nil
+                && transcriptTombstoneFailure == nil,
+            injectedRemovalFailure: transcriptRemovalFailure,
+            injectedTombstoneFailure: transcriptTombstoneFailure
         )
         workspaceStore = NativeWorkspaceStateStore(
             fileURL: root.appendingPathComponent("workspace-state-v1.json")
         )
+        chatDraftDefaultsSuite = "kaisola-chat-drafts-\(UUID().uuidString)"
+        migratedChatDraftDefaultsSuite = "kaisola-migrated-chat-drafts-\(UUID().uuidString)"
+        chatDraftDefaults = UserDefaults(suiteName: chatDraftDefaultsSuite)!
+        migratedChatDraftDefaults = UserDefaults(suiteName: migratedChatDraftDefaultsSuite)!
+        chatDraftDefaults.removePersistentDomain(forName: chatDraftDefaultsSuite)
+        migratedChatDraftDefaults.removePersistentDomain(forName: migratedChatDraftDefaultsSuite)
         let defaultsSuite = "kaisola-app-model-attention-\(UUID().uuidString)"
         let attentionDefaults = UserDefaults(suiteName: defaultsSuite)!
         attentionDefaults.removePersistentDomain(forName: defaultsSuite)
@@ -1030,6 +2084,8 @@ private final class Fixture {
             transcriptStore: transcriptStore,
             usageCenter: UsageCenter(persistenceStore: transcriptStore),
             attentionCenter: attentionCenter,
+            chatDraftDefaults: chatDraftDefaults,
+            migratedChatDraftDefaults: migratedChatDraftDefaults,
             reconnectBackoff: BrokerReconnectBackoff(
                 baseNanoseconds: 1,
                 maximumNanoseconds: 2,
@@ -1052,6 +2108,8 @@ private final class Fixture {
     }
 
     func cleanUp() {
+        chatDraftDefaults.removePersistentDomain(forName: chatDraftDefaultsSuite)
+        migratedChatDraftDefaults.removePersistentDomain(forName: migratedChatDraftDefaultsSuite)
         try? FileManager.default.removeItem(at: root)
     }
 
@@ -1255,6 +2313,27 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
             )
         ))
     }
+
+    /// Activity frames are emitted with an explicit routing identity so a test
+    /// can forge one that claims another owner or another project.
+    func emitActivity(
+        for id: String,
+        ownerID: String,
+        projectID: String = "project.one",
+        busy: Bool,
+        completedAt: Int64? = nil
+    ) {
+        eventHandler?(BrokerEvent(
+            ownerID: ownerID,
+            projectID: projectID,
+            terminalID: id,
+            kind: .activity(busy: busy, completedAt: completedAt)
+        ))
+    }
+
+    /// The owner identity the app actually subscribed with, which is the only
+    /// one an authentic observer frame can carry.
+    func subscribedOwnerID(for id: String) -> String? { ownerIDsByTerminal[id] }
 
     func connectionAttempts() -> Int { connectCount }
     func failNextInventoryRequests(_ count: Int) {

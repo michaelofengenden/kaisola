@@ -104,6 +104,123 @@ final class TerminalFileLinkResolverTests: XCTestCase {
         )
     }
 
+    // MARK: - Git diff prefixes
+
+    func testIndexAndWorktreeMnemonicPrefixesResolveTheExactProjectPath() throws {
+        let target = try write("Sources/Unicode folder/同じ name.swift")
+        _ = try write("Tests/同じ name.swift")
+
+        for prefix in ["i", "w"] {
+            let linked = root.appendingPathComponent(
+                "\(prefix)/Sources/Unicode folder/同じ name.swift"
+            )
+            XCTAssertEqual(
+                TerminalFileLinkResolver.resolve(linked, projectRoot: root),
+                .found(target.standardizedFileURL),
+                "Git's \(prefix)/ mnemonic must preserve the path after its semantic prefix"
+            )
+        }
+    }
+
+    func testNoIndexSidePrefixesResolveTheExactProjectPath() throws {
+        let first = try write("fixtures/left/same name.txt")
+        let second = try write("fixtures/right/same name.txt")
+
+        XCTAssertEqual(
+            TerminalFileLinkResolver.resolve(
+                root.appendingPathComponent("1/fixtures/left/same name.txt"),
+                projectRoot: root
+            ),
+            .found(first.standardizedFileURL)
+        )
+        XCTAssertEqual(
+            TerminalFileLinkResolver.resolve(
+                root.appendingPathComponent("2/fixtures/right/same name.txt"),
+                projectRoot: root
+            ),
+            .found(second.standardizedFileURL)
+        )
+    }
+
+    func testSymmetricallyQuotedMnemonicPathSupportsSpaces() throws {
+        let target = try write("docs/Release Notes.md")
+        _ = try write("archive/Release Notes.md")
+        let linked = URL(
+            fileURLWithPath: root.path + "/\"w/docs/Release Notes.md\""
+        )
+
+        XCTAssertEqual(
+            TerminalFileLinkResolver.resolve(linked, projectRoot: root),
+            .found(target.standardizedFileURL)
+        )
+    }
+
+    func testRealDirectoriesNamedLikeDiffPrefixesAlwaysWin() throws {
+        for prefix in ["i", "w", "1", "2"] {
+            let literal = try write("\(prefix)/docs/\(prefix)-guide.md")
+            _ = try write("docs/\(prefix)-guide.md")
+
+            XCTAssertEqual(
+                TerminalFileLinkResolver.resolve(literal, projectRoot: root),
+                .found(literal.standardizedFileURL),
+                "an existing \(prefix)/ directory is ordinary project content, not a diff prefix"
+            )
+        }
+    }
+
+    func testExistingMnemonicDirectoryKeepsMissingChildrenLiteral() throws {
+        _ = try write("docs/guide.md")
+        _ = try write("other/guide.md")
+        let literalDirectory = root.appendingPathComponent("i", isDirectory: true)
+        try FileManager.default.createDirectory(at: literalDirectory, withIntermediateDirectories: true)
+        let missingLiteral = literalDirectory.appendingPathComponent("docs/guide.md")
+
+        guard case let .ambiguous(name, count) = TerminalFileLinkResolver.resolve(
+            missingLiteral,
+            projectRoot: root
+        ) else {
+            return XCTFail("a real i/ directory must suppress semantic prefix stripping")
+        }
+        XCTAssertEqual(name, "guide.md")
+        XCTAssertGreaterThanOrEqual(count, 2)
+    }
+
+    func testTraversalOutsideTheProjectIsRejectedEvenWhenTheFileExists() throws {
+        let external = root.deletingLastPathComponent()
+            .appendingPathComponent("outside-\(UUID().uuidString).txt")
+        try Data("secret".utf8).write(to: external)
+        defer { try? FileManager.default.removeItem(at: external) }
+        let traversing = root.appendingPathComponent(
+            "w/../../\(external.lastPathComponent)"
+        )
+
+        XCTAssertEqual(
+            TerminalFileLinkResolver.resolve(traversing, projectRoot: root),
+            .missing(name: external.lastPathComponent)
+        )
+    }
+
+    func testFallbackSearchDoesNotFollowAFileSymlinkOutsideTheProject() throws {
+        let external = root.deletingLastPathComponent()
+            .appendingPathComponent("external-\(UUID().uuidString).md")
+        try Data("secret".utf8).write(to: external)
+        defer { try? FileManager.default.removeItem(at: external) }
+        let alias = root.appendingPathComponent("nested/\(external.lastPathComponent)")
+        try FileManager.default.createDirectory(
+            at: alias.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: external)
+
+        XCTAssertEqual(
+            TerminalFileLinkResolver.resolve(
+                root.appendingPathComponent(external.lastPathComponent),
+                projectRoot: root
+            ),
+            .missing(name: external.lastPathComponent)
+        )
+    }
+
     // MARK: - Reveal
 
     func testRevealFallsBackToTheNearestFolderThatExists() throws {

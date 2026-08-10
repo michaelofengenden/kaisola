@@ -59,20 +59,13 @@ struct PDFFilePreview: NSViewRepresentable {
 
     func makeNSView(context: Context) -> PDFView {
         let view = PDFView()
-        view.autoScales = true
-        view.displayMode = .singlePageContinuous
-        view.displayDirection = .vertical
-        view.displaysPageBreaks = true
-        view.pageShadowsEnabled = true
-        view.backgroundColor = .underPageBackgroundColor
-        view.document = document
+        PDFPreviewViewConfiguration.install(document: document, in: view)
         return view
     }
 
     func updateNSView(_ view: PDFView, context: Context) {
         guard view.document !== document else { return }
-        view.document = document
-        view.autoScales = true
+        PDFPreviewViewConfiguration.install(document: document, in: view)
     }
 
     static func dismantleNSView(_ view: PDFView, coordinator: ()) {
@@ -336,7 +329,7 @@ struct MarkdownEditingStyle: Sendable {
         guard revealed, role == .syntax else { return attributes(for: role) }
         return [
             .font: NSFont.systemFont(ofSize: max(11, bodySize * 0.85)),
-            .foregroundColor: NSColor.tertiaryLabelColor,
+            .foregroundColor: KaisolaInk.nsColor(.tertiary, on: .solid),
         ]
     }
 }
@@ -1120,6 +1113,7 @@ struct LineTargetTextEditor: NSViewRepresentable {
 /// image link or a line ending.
 struct MarkdownRenderedEditor: NSViewRepresentable {
     @Binding var text: String
+    let baseline: String
     let markdownURL: URL
     let workspaceRoot: URL?
     @Binding var zoom: CGFloat
@@ -1220,6 +1214,10 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         }
 
         scrollView.documentView = textView
+        let diffRuler = MarkdownHybridDiffRulerView(scrollView: scrollView, textView: textView)
+        scrollView.verticalRulerView = diffRuler
+        scrollView.hasVerticalRuler = true
+        scrollView.rulersVisible = true
         scrollView.magnification = zoom
         scrollView.onMagnificationChanged = { [weak coordinator = context.coordinator] value in
             coordinator?.zoom = value
@@ -1227,13 +1225,18 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         scrollView.onDocumentWidthChanged = { [weak coordinator = context.coordinator] in
             coordinator?.restyleIfDocumentWidthChanged()
         }
-        context.coordinator.attach(textView: textView, scrollView: scrollView)
+        context.coordinator.attach(
+            textView: textView,
+            scrollView: scrollView,
+            diffRuler: diffRuler
+        )
         context.coordinator.markdownURL = markdownURL
         context.coordinator.workspaceRoot = workspaceRoot
         context.coordinator.onError = onError
         context.coordinator.onOpenLink = onOpenLink
         context.coordinator.adopt(documentID: documentID, scrollMemory: scrollMemory)
         context.coordinator.scheduleStyling(immediately: true)
+        context.coordinator.updateDiffBaseline(baseline, immediately: true)
         context.coordinator.refreshImages(revision: imageRevision, force: true)
         context.coordinator.scrollIfNeeded(to: targetLine, revision: navigationRevision)
         if automaticallyFocus {
@@ -1250,6 +1253,7 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         coordinator.onOpenLink = onOpenLink
         guard let textView = coordinator.textView else { return }
         coordinator.adopt(documentID: documentID, scrollMemory: scrollMemory)
+        coordinator.updateDiffBaseline(baseline, immediately: false)
 
         // The load-bearing guard. Saving, autosaving, journaling, and
         // reconciling an unchanged file all re-run this body with the string
@@ -1329,6 +1333,9 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
         private var pendingAnchor: (characterIndex: Int, offset: CGFloat)?
         private var importTask: Task<Void, Never>?
         private var imageTask: Task<Void, Never>?
+        private var diffTask: Task<Void, Never>?
+        private weak var diffRuler: MarkdownHybridDiffRulerView?
+        private var diffBaseline = ""
         private var lastScrollKey: String?
         private var appliedImageRevision: Int?
         private var appliedImageSource: String?
@@ -1350,11 +1357,17 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
             styleTask?.cancel()
             importTask?.cancel()
             imageTask?.cancel()
+            diffTask?.cancel()
         }
 
-        func attach(textView: MarkdownNativeTextView, scrollView: NSScrollView) {
+        func attach(
+            textView: MarkdownNativeTextView,
+            scrollView: NSScrollView,
+            diffRuler: MarkdownHybridDiffRulerView
+        ) {
             self.textView = textView
             self.scrollView = scrollView
+            self.diffRuler = diffRuler
             scrollView.contentView.postsBoundsChangedNotifications = true
             // Selector-based registration is zeroing-weak, so no explicit
             // removal is needed when the coordinator goes away.
@@ -1453,6 +1466,7 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
                 pendingAnchor = anchor
             }
             programmaticScrollDepth -= 1
+            scheduleHybridDiff(immediately: true)
         }
 
         // MARK: Editing
@@ -1467,6 +1481,68 @@ struct MarkdownRenderedEditor: NSViewRepresentable {
             lastScan = nil
             scheduleStyling(immediately: false)
             scheduleImageRefresh()
+            scheduleHybridDiff(immediately: false)
+        }
+
+        func updateDiffBaseline(_ baseline: String, immediately: Bool) {
+            guard diffBaseline != baseline else {
+                if immediately { scheduleHybridDiff(immediately: true) }
+                return
+            }
+            diffBaseline = baseline
+            scheduleHybridDiff(immediately: immediately)
+        }
+
+        private func scheduleHybridDiff(immediately: Bool) {
+            diffTask?.cancel()
+            guard let textView else { return }
+            let baseline = diffBaseline
+            let source = textView.string
+            diffTask = Task { [weak self, weak textView] in
+                if !immediately {
+                    try? await Task.sleep(for: .milliseconds(90))
+                }
+                guard !Task.isCancelled else { return }
+                let plan = await Task.detached(priority: .utility) {
+                    MarkdownHybridDiffPlan.build(baseline: baseline, edited: source)
+                }.value
+                guard !Task.isCancelled,
+                      let self,
+                      let textView,
+                      textView.string == source,
+                      self.diffBaseline == baseline else { return }
+                self.applyHybridDiff(plan, to: textView)
+            }
+        }
+
+        private func applyHybridDiff(
+            _ plan: MarkdownHybridDiffPlan,
+            to textView: NSTextView
+        ) {
+            guard let layoutManager = textView.layoutManager else { return }
+            let before = textView.string
+            let fullRange = NSRange(location: 0, length: (before as NSString).length)
+            layoutManager.removeTemporaryAttribute(.backgroundColor, forCharacterRange: fullRange)
+            for marker in plan.markers where marker.editedRange.length > 0 {
+                let range = NSIntersectionRange(marker.editedRange, fullRange)
+                guard range.length > 0 else { continue }
+                let color: NSColor
+                switch marker.kind {
+                case .addition:
+                    color = NSColor.systemGreen.withAlphaComponent(0.12)
+                case .changed:
+                    color = NSColor.systemOrange.withAlphaComponent(0.12)
+                case .deletion:
+                    continue
+                }
+                layoutManager.addTemporaryAttribute(
+                    .backgroundColor,
+                    value: color,
+                    forCharacterRange: range
+                )
+            }
+            diffRuler?.apply(plan.markers)
+            assert(textView.string == before, "Hybrid diff presentation changed Markdown source")
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {

@@ -45,9 +45,12 @@ enum MeshLifecycleHookFailurePolicy: String, Codable, Equatable, Sendable {
 /// through a shell), receive one bounded JSON payload on stdin, inherit no host
 /// secrets, and are killed when their declared timeout expires.
 struct MeshLifecycleHookConfiguration: Codable, Equatable, Sendable {
-    static let apiVersion = 1
-    static let minimumTimeoutMilliseconds = 10
-    static let maximumTimeoutMilliseconds = 5_000
+    // Keep these value-only constants out of stored global initializers. Xcode
+    // 16.4 / Swift 6.1 crashes while lowering newly added lazy globals after
+    // this integrated module reaches its current size.
+    static var apiVersion: Int { 1 }
+    static var minimumTimeoutMilliseconds: Int { 10 }
+    static var maximumTimeoutMilliseconds: Int { 5_000 }
 
     let apiVersion: Int
     let id: String
@@ -122,10 +125,10 @@ struct MeshLifecycleHookConfiguration: Codable, Equatable, Sendable {
 /// - subagentStarted/subagentStopped: agentID, role
 /// - turnCompleted: agentID, role, response
 struct MeshLifecycleHookPayload: Codable, Equatable, Sendable {
-    static let apiVersion = 1
-    static let maximumEncodedBytes = 16_384
-    private static let maximumFieldBytes = 4_096
-    private static let maximumFields = 32
+    static var apiVersion: Int { 1 }
+    static var maximumEncodedBytes: Int { 16_384 }
+    private static var maximumFieldBytes: Int { 4_096 }
+    private static var maximumFields: Int { 32 }
 
     let apiVersion: Int
     let event: MeshLifecycleHookEvent

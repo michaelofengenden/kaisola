@@ -142,7 +142,7 @@ struct CustomAdapterInstallAttempt: Equatable, Sendable {
 /// tests. The short first line stays readable in a roster; Copy Details keeps
 /// the complete diagnostic for support without making the row unbounded.
 struct CustomAdapterInstallFailure: Equatable, Sendable {
-    private static let inlineCharacterLimit = 240
+    private static var inlineCharacterLimit: Int { 240 }
 
     let attempt: CustomAdapterInstallAttempt
     let diagnostic: String

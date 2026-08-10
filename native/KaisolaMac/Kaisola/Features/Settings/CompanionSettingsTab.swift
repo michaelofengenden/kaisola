@@ -5,6 +5,7 @@ import SwiftUI
 
 struct CompanionSettingsTab: View {
     @ObservedObject private var host = CompanionHost.shared
+    @StateObject private var offerActivation = CompanionPairingOfferActivation()
     @State private var allowsTerminalControl = false
     @State private var operationError: String?
     @State private var pendingRevocation: CompanionPairedDeviceRecord?
@@ -77,7 +78,7 @@ struct CompanionSettingsTab: View {
                         SettingsDivider()
                         HStack {
                             VStack(alignment: .leading, spacing: 3) {
-                                Text(host.pairingCode == nil ? "Create a single-use code" : "Code expires after two minutes")
+                                Text(offerTitle)
                                     .font(.callout.weight(.medium))
                                 Text("Scan on iPhone, or copy the code into kaisola.com/app.")
                                     .font(.caption)
@@ -85,11 +86,26 @@ struct CompanionSettingsTab: View {
                             }
                             Spacer()
                             if host.pairingCode == nil {
-                                Button("Pair New Device") { createOffer() }
-                                    .buttonStyle(.borderedProminent)
-                                    .controlSize(.small)
+                                Button { createOffer() } label: {
+                                    if offerActivation.isCreating {
+                                        HStack(spacing: 5) {
+                                            ProgressView().controlSize(.mini)
+                                            Text("Creating…")
+                                        }
+                                    } else {
+                                        Text("Pair New Device")
+                                    }
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .controlSize(.small)
+                                .disabled(offerActivation.isCreating)
+                                .accessibilityLabel(
+                                    offerActivation.isCreating
+                                        ? CompanionPairingOfferActivation.progressLabel
+                                        : "Pair New Device"
+                                )
                             } else {
-                                Button("Cancel", action: host.cancelPairing)
+                                Button("Cancel", action: cancelPairing)
                                     .buttonStyle(.bordered)
                                     .controlSize(.small)
                             }
@@ -177,6 +193,13 @@ struct CompanionSettingsTab: View {
             }
             .padding(18)
         }
+        .onChange(of: host.state) { _, state in
+            // Companion leaving ready tears this card down. An offer request
+            // that is still outstanding must not come back to a button the
+            // user can no longer press.
+            if case .ready = state { return }
+            offerActivation.discard()
+        }
         .confirmationDialog(
             "Revoke \(pendingRevocation?.displayName ?? "Device")?",
             isPresented: Binding(
@@ -231,12 +254,30 @@ struct CompanionSettingsTab: View {
         }
     }
 
+    private var offerTitle: String {
+        if host.pairingCode != nil { return "Code expires after two minutes" }
+        return offerActivation.isCreating
+            ? CompanionPairingOfferActivation.progressLabel
+            : "Create a single-use code"
+    }
+
     private func createOffer() {
+        guard let attempt = offerActivation.begin() else { return }
         operationError = nil
         Task {
-            do { try await host.createPairingOffer(allowsTerminalControl: allowsTerminalControl) }
-            catch { operationError = error.localizedDescription }
+            do {
+                try await host.createPairingOffer(allowsTerminalControl: allowsTerminalControl)
+                offerActivation.finish(attempt)
+            } catch {
+                guard offerActivation.finish(attempt) else { return }
+                operationError = error.localizedDescription
+            }
         }
+    }
+
+    private func cancelPairing() {
+        offerActivation.discard()
+        host.cancelPairing()
     }
 
     private func confirmPairing() {
@@ -257,6 +298,51 @@ struct CompanionSettingsTab: View {
 
     private func capabilityDetail(_ values: [CompanionCapability]) -> String {
         values.contains(.terminalControl) ? "View and control terminals" : "View only"
+    }
+}
+
+/// Serializes Pair New Device activations.
+///
+/// Creating an offer is asynchronous, so an ordinary enabled button lets
+/// repeated presses launch overlapping requests whose code and error land in
+/// an unpredictable order. Exactly one activation holds the slot at a time,
+/// and it hands back a token so only the newest request may apply its result.
+@MainActor
+final class CompanionPairingOfferActivation: ObservableObject {
+    /// The words the row and the accessibility label both use while a request
+    /// is outstanding, so assistive tech hears the visible progress state.
+    static let progressLabel = "Creating pairing code"
+
+    @Published private(set) var isCreating = false
+
+    private var attempt: UUID?
+
+    /// Claims the single in-flight slot, or returns nil when a request is
+    /// already outstanding and this activation must be ignored.
+    func begin() -> UUID? {
+        guard !isCreating else { return nil }
+        let token = UUID()
+        attempt = token
+        isCreating = true
+        return token
+    }
+
+    /// Releases the slot and reports whether `token` still owns it. A false
+    /// result means the request was superseded or discarded, so its code and
+    /// error are stale and the caller must drop them.
+    @discardableResult
+    func finish(_ token: UUID) -> Bool {
+        guard attempt == token else { return false }
+        attempt = nil
+        isCreating = false
+        return true
+    }
+
+    /// Abandons the outstanding request and restores an actionable button. A
+    /// result that arrives afterwards no longer owns the slot.
+    func discard() {
+        attempt = nil
+        isCreating = false
     }
 }
 

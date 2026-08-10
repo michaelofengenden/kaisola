@@ -1,9 +1,50 @@
+import SQLite3
 import XCTest
 @testable import Kaisola
 
 final class AcpTranscriptStoreTests: XCTestCase {
     private struct LegacyPayload: Encodable {
         let entries: [String: AcpTranscriptStore.Entry]
+    }
+
+    private enum ReadLockError: Error {
+        case open
+        case read
+    }
+
+    /// A second connection parked inside a read transaction. SQLite hands out
+    /// the shared lock this holds only until a writer needs the exclusive one,
+    /// so the store's tombstone COMMIT is rejected once its busy timeout ends.
+    private final class SQLiteReadLock {
+        private var handle: OpaquePointer?
+
+        init(path: String) throws {
+            var connection: OpaquePointer?
+            guard sqlite3_open_v2(path, &connection, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK,
+                  let connection else {
+                if let connection { sqlite3_close_v2(connection) }
+                throw ReadLockError.open
+            }
+            handle = connection
+            guard sqlite3_exec(connection, "BEGIN", nil, nil, nil) == SQLITE_OK else {
+                throw ReadLockError.read
+            }
+            // The shared lock is taken by the read itself, not by BEGIN.
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(connection, "SELECT COUNT(*) FROM chats", -1, &statement, nil) == SQLITE_OK,
+                  let statement else { throw ReadLockError.read }
+            defer { sqlite3_finalize(statement) }
+            guard sqlite3_step(statement) == SQLITE_ROW else { throw ReadLockError.read }
+        }
+
+        func release() {
+            guard let handle else { return }
+            sqlite3_exec(handle, "COMMIT", nil, nil, nil)
+            sqlite3_close_v2(handle)
+            self.handle = nil
+        }
+
+        deinit { release() }
     }
 
     private func temporaryStore() -> (AcpTranscriptStore, URL) {
@@ -365,5 +406,97 @@ final class AcpTranscriptStoreTests: XCTestCase {
         let relaunched = AcpTranscriptStore(fileURL: legacyURL)
         let restoration = await relaunched.restoration(for: "late-chat", tailLimit: 120)
         XCTAssertEqual(try XCTUnwrap(restoration).page.rows, rows)
+    }
+
+    // MARK: - Deletion tombstones
+
+    func testFailedTombstoneOpenKeepsTheChatAndItsBufferedTail() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-tombstone-open-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let databaseURL = directory.appendingPathComponent("transcripts-v2.sqlite3")
+        // A directory standing where the database file belongs fails the leaf
+        // check on every open, so the tombstone throws before it writes.
+        try FileManager.default.createDirectory(at: databaseURL, withIntermediateDirectories: true)
+
+        let store = AcpTranscriptStore(databaseURL: databaseURL)
+        let buffered: [AcpTranscriptRow] = [
+            .user(id: "1", text: "delete me", failed: false),
+            .message(id: "1", text: "newest buffered tail"),
+        ]
+        await store.scheduleSave(buffered, for: "chat-open-failure", now: 1)
+
+        do {
+            try await store.tombstone(chatID: "chat-open-failure")
+            XCTFail("a tombstone that cannot open the database must throw")
+        } catch {}
+
+        try FileManager.default.removeItem(at: databaseURL)
+        await store.flush()
+
+        let reopened = AcpTranscriptStore(databaseURL: databaseURL)
+        let tombstoned = await reopened.isTombstoned(chatID: "chat-open-failure")
+        XCTAssertFalse(tombstoned)
+        let restored = await reopened.rows(for: "chat-open-failure")
+        XCTAssertEqual(restored, buffered)
+    }
+
+    func testFailedTombstoneCommitKeepsTheChatAndItsBufferedTail() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-tombstone-commit-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let databaseURL = directory.appendingPathComponent("transcripts-v2.sqlite3")
+
+        let store = AcpTranscriptStore(databaseURL: databaseURL)
+        let saved: [AcpTranscriptRow] = [.message(id: "1", text: "already durable")]
+        await store.scheduleSave(saved, for: "chat-commit-failure", now: 1)
+        await store.flush()
+
+        let reader = try SQLiteReadLock(path: databaseURL.path)
+        defer { reader.release() }
+
+        let buffered = saved + [.message(id: "2", text: "newest buffered tail")]
+        await store.scheduleSave(buffered, for: "chat-commit-failure", now: 2)
+        do {
+            try await store.tombstone(chatID: "chat-commit-failure")
+            XCTFail("a tombstone whose transaction cannot commit must throw")
+        } catch {}
+        reader.release()
+
+        await store.flush()
+        let reopened = AcpTranscriptStore(databaseURL: databaseURL)
+        let tombstoned = await reopened.isTombstoned(chatID: "chat-commit-failure")
+        XCTAssertFalse(tombstoned)
+        let restored = await reopened.rows(for: "chat-commit-failure")
+        XCTAssertEqual(restored, buffered)
+    }
+
+    func testCommittedTombstoneStillDiscardsTheBufferedTail() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-transcript-tombstone-commit-ok-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let databaseURL = directory.appendingPathComponent("transcripts-v2.sqlite3")
+
+        let store = AcpTranscriptStore(databaseURL: databaseURL)
+        let saved: [AcpTranscriptRow] = [.message(id: "1", text: "already durable")]
+        await store.scheduleSave(saved, for: "chat-deleted", now: 1)
+        await store.flush()
+
+        await store.scheduleSave(
+            saved + [.message(id: "2", text: "chunk landing as the user deletes")],
+            for: "chat-deleted",
+            now: 2
+        )
+        try await store.tombstone(chatID: "chat-deleted")
+        await store.flush()
+
+        let reopened = AcpTranscriptStore(databaseURL: databaseURL)
+        let tombstoned = await reopened.isTombstoned(chatID: "chat-deleted")
+        XCTAssertTrue(tombstoned)
+        let restored = await reopened.rows(for: "chat-deleted")
+        XCTAssertEqual(restored, saved)
     }
 }

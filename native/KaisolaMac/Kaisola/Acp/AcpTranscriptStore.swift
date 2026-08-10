@@ -384,7 +384,6 @@ actor AcpTranscriptStore {
     /// surface a failed delete instead of reporting success.
     func tombstone(chatID: String) throws {
         guard Self.validChatID(chatID) else { return }
-        pending.removeValue(forKey: chatID)
         let database = try openDatabase()
         try transaction(database) {
             try execute(
@@ -405,6 +404,12 @@ actor AcpTranscriptStore {
                 try stepDone($0, database: database)
             }
         }
+        // Only a committed tombstone may discard the coalesced tail. A delete
+        // that failed to open or commit leaves the chat visible, so its newest
+        // buffered rows have to survive for the next flush to persist. The
+        // flush itself re-checks isTombstoned, so a committed tombstone still
+        // suppresses any write that raced this call.
+        pending.removeValue(forKey: chatID)
     }
 
     func isTombstoned(chatID: String) -> Bool {

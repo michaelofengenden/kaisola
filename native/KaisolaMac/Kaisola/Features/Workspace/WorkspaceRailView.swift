@@ -121,6 +121,12 @@ struct WorkspaceRailView: View {
     @State private var trashTarget: FileNode?
     @State private var instructionFileFailure: WorkspaceInstructionFile.Failure?
     @State private var isMutating = false
+    /// Which row the pointer is over, and which row the keyboard is on. Either
+    /// one earns that row its "⋯" button; every other row keeps it transparent.
+    @State private var hoveredRow: String?
+    @FocusState private var focusedRow: String?
+    /// Sticky fallback for inputs that cannot hover — see `WorkspaceRowActions`.
+    @State private var rowActionsAlwaysVisible = false
     /// Live FSEvents watcher — agent writes refresh the tree automatically.
     @StateObject private var watcher: WorkspaceWatcher
     @StateObject private var tree: WorkspaceTreeModel
@@ -240,8 +246,12 @@ struct WorkspaceRailView: View {
                 ScrollView {
                     LazyVStack(alignment: .leading, spacing: 1) {
                         ForEach(tree.searchResults, id: \.self) { path in
+                            let node = FileNode(
+                                url: root.appendingPathComponent(path).standardizedFileURL,
+                                isDirectory: false
+                            )
                             Button {
-                                openFile(root.appendingPathComponent(path), false)
+                                openFile(node.url, false)
                             } label: {
                                 HStack(spacing: 7) {
                                     Image(systemName: "doc.text")
@@ -254,8 +264,7 @@ struct WorkspaceRailView: View {
                                 .padding(.vertical, 4)
                                 .padding(.trailing, Self.optionsClearance - 10)
                                 .background(
-                                    selectedFile?.standardizedFileURL.path
-                                        == root.appendingPathComponent(path).standardizedFileURL.path
+                                    isSelected(node)
                                         ? Color.accentColor.opacity(0.15)
                                         : .clear,
                                     in: RoundedRectangle(cornerRadius: 6, style: .continuous)
@@ -264,19 +273,15 @@ struct WorkspaceRailView: View {
                             }
                             .buttonStyle(.plain)
                             .accessibilityLabel(path)
-                            .overlay(alignment: .trailing) {
-                                itemMenu(FileNode(
-                                    url: root.appendingPathComponent(path).standardizedFileURL,
-                                    isDirectory: false
-                                ))
-                                .padding(.trailing, 6)
-                            }
+                            .focused($focusedRow, equals: node.id)
                             .contextMenu {
-                                itemActions(FileNode(
-                                    url: root.appendingPathComponent(path).standardizedFileURL,
-                                    isDirectory: false
-                                ))
+                                itemActions(node)
                             }
+                            .overlay(alignment: .trailing) {
+                                itemMenu(node, revealed: revealsRowActions(node))
+                                    .padding(.trailing, 6)
+                            }
+                            .onHover { inside in setRowHover(node, inside) }
                         }
                     }
                     .padding(.vertical, 5)
@@ -300,6 +305,7 @@ struct WorkspaceRailView: View {
             tree.load(root)
             tree.search(searchText)
             revealSelection()
+            rowActionsAlwaysVisible = WorkspaceRowActions.systemAlwaysVisible()
             // Deterministic broker-free visual QA: present a real file-action
             // sheet over the real lazy tree without mutating any fixture file.
             if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
@@ -325,6 +331,11 @@ struct WorkspaceRailView: View {
             revealSelection()
         }
         .onChange(of: searchText) { _, query in tree.search(query) }
+        .onReceive(NotificationCenter.default.publisher(
+            for: NSApplication.didBecomeActiveNotification
+        )) { _ in
+            rowActionsAlwaysVisible = WorkspaceRowActions.systemAlwaysVisible()
+        }
         .onChange(of: watcher.changeBatch) { _, batch in
             tree.refresh(
                 changeBatch: batch,
@@ -874,6 +885,7 @@ struct WorkspaceRailView: View {
         ))
         .accessibilityLabel(node.name)
         .id(node.id)
+        .focused($focusedRow, equals: node.id)
         .simultaneousGesture(
             TapGesture(count: 2).onEnded {
                 guard !node.isDirectory else { return }
@@ -884,9 +896,35 @@ struct WorkspaceRailView: View {
             itemActions(node)
         }
         .overlay(alignment: .trailing) {
-            itemMenu(node)
+            itemMenu(node, revealed: revealsRowActions(node))
                 .padding(.trailing, 6)
         }
+        .onHover { inside in setRowHover(node, inside) }
+    }
+
+    private func isSelected(_ node: FileNode) -> Bool {
+        !node.isDirectory
+            && selectedFile?.standardizedFileURL.path == node.url.standardizedFileURL.path
+    }
+
+    /// The pointer can only be over one row, but SwiftUI delivers the leave of
+    /// the row it left after the enter of the row it reached, so a blind clear
+    /// would erase the new row's hover.
+    private func setRowHover(_ node: FileNode, _ inside: Bool) {
+        if inside {
+            hoveredRow = node.id
+        } else if hoveredRow == node.id {
+            hoveredRow = nil
+        }
+    }
+
+    private func revealsRowActions(_ node: FileNode) -> Bool {
+        WorkspaceRowActions.isRevealed(
+            isHovering: hoveredRow == node.id,
+            isFocused: focusedRow == node.id,
+            isSelected: isSelected(node),
+            alwaysVisible: rowActionsAlwaysVisible
+        )
     }
 
     /// Room kept clear at the trailing edge for the floating options button.
@@ -905,7 +943,11 @@ struct WorkspaceRailView: View {
         FadingFileName(text: name)
     }
 
-    private func itemMenu(_ node: FileNode) -> some View {
+    /// `revealed` drives opacity only. Dropping the menu from the hierarchy
+    /// would take its accessibility label with it and leave VoiceOver nothing
+    /// to land on, so a resting row keeps a fully described, fully hit-testable
+    /// control that simply is not drawn.
+    private func itemMenu(_ node: FileNode, revealed: Bool) -> some View {
         Menu {
             itemActions(node)
         } label: {
@@ -919,6 +961,8 @@ struct WorkspaceRailView: View {
         .fixedSize()
         .help("File options")
         .accessibilityLabel("Options for \(node.name)")
+        .opacity(revealed ? 1 : 0)
+        .animation(.easeInOut(duration: KaisolaVisualSystem.stateDuration), value: revealed)
     }
 
     @ViewBuilder

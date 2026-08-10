@@ -501,7 +501,8 @@ jobs:
           # so the same inspection holds on a Retina host.
           for surface in settings-minimum settings-ideal; do
             capture="$output/nonretina-$surface.png"
-            run_fixture "$surface" "$capture" \
+            log="$output/nonretina-$surface.log"
+            run_fixture "$surface" "$capture" "$log" \
               /usr/bin/env KAISOLA_NATIVE_VISUAL_SCALE=1 "$binary"
             verify_capture "$capture" "$surface"
           done

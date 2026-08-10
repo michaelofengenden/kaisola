@@ -312,6 +312,25 @@ final class AccountSignInControllerTests: XCTestCase {
         XCTAssertEqual(bytewise, expected)
     }
 
+    func testIncrementalUTF8DecoderMarksATruncatedScalarAtEOF() {
+        var decoder = AccountSignInUTF8Decoder()
+
+        // "ok " followed by the first two bytes of the three-byte ellipsis.
+        XCTAssertEqual(decoder.decode(Data([0x6F, 0x6B, 0x20, 0xE2, 0x80])), "ok ")
+        XCTAssertEqual(decoder.finish(), "\u{FFFD}")
+        XCTAssertEqual(decoder.finish(), "", "finishing spends the pending bytes exactly once")
+    }
+
+    func testIncrementalUTF8DecoderDoesNotCarryAnImpossibleByte() {
+        var decoder = AccountSignInUTF8Decoder()
+
+        let text = decoder.decode(Data([0x41, 0xFF, 0x42]))
+
+        XCTAssertTrue(text.hasPrefix("A"), text)
+        XCTAssertTrue(text.hasSuffix("B"), "text after an invalid byte must arrive immediately: \(text)")
+        XCTAssertEqual(decoder.finish(), "")
+    }
+
     /// The code field unlocks on this and nothing else. Codex runs a local
     /// callback and never prints it, which is why the field must stay locked
     /// rather than inviting a paste that would go nowhere.

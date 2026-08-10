@@ -70,6 +70,23 @@ final class QuickActionStoreTests: XCTestCase {
         XCTAssertEqual(store.actions(forProject: "p").count, 8)
     }
 
+    func testSaveNormalizesAfterTheCapSoEightRowsStayDistinct() throws {
+        let actions = (0..<12).map {
+            QuickAction(id: "same", title: "t\($0)", command: "c\($0)")
+        }
+
+        try store.save(actions, forProject: "p")
+
+        let persisted = try XCTUnwrap(readFixture().actionsByProject["p"])
+        XCTAssertEqual(persisted.count, 8)
+        XCTAssertEqual(persisted.map(\.title), (4..<12).map { "t\($0)" })
+        XCTAssertEqual(Set(persisted.map(\.id)).count, 8)
+        XCTAssertTrue(persisted.allSatisfy { !$0.id.isEmpty })
+
+        let reopened = QuickActionStore(fileURL: fileURL).actions(forProject: "p")
+        XCTAssertEqual(reopened, persisted)
+    }
+
     // MARK: - Stable identifiers
 
     func testLoadNormalizesDuplicateAndWhitespaceOnlyIdentifiersDeterministically() throws {

@@ -7,6 +7,7 @@ import ScreenCaptureKit
 import Security
 import SwiftTerm
 import SwiftUI
+import UniformTypeIdentifiers
 import WebKit
 
 private let linkSmokeTimeoutSignalHandler: @convention(c) (Int32) -> Void = { _ in
@@ -4172,12 +4173,15 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         guard alert.runModal() == .alertFirstButtonReturn else { return }
         let name = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !name.isEmpty else { return }
-        savedWindows.save(SavedWindowState(
+        guard savedWindows.save(SavedWindowState(
             name: name,
             frame: NSStringFromRect(window.frame),
             projectName: model.selectedProjectName,
             projectPath: model.currentProjectDirectory?.standardizedFileURL.path
-        ))
+        )) else {
+            ToastCenter.shared.show("Layout not saved: see Saved Windows", style: .error)
+            return
+        }
         ToastCenter.shared.show("Layout saved", style: .success)
     }
 
@@ -4205,7 +4209,48 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
     @objc private func deleteSavedWindow(_ sender: Any?) {
         guard let name = (sender as? NSMenuItem)?.representedObject as? String else { return }
-        savedWindows.remove(name: name)
+        if !savedWindows.remove(name: name) {
+            ToastCenter.shared.show("Layout not deleted: see Saved Windows", style: .error)
+        }
+    }
+
+    /// Explain a Saved Windows list that is short or empty, and hand back
+    /// whatever this build kept aside. An unexplained gap where the user's
+    /// layouts used to be is the failure this path exists to avoid, so the row
+    /// that says so is always clickable.
+    @objc private func showSavedWindowsNotice(_ sender: Any?) {
+        guard let notice = savedWindows.load().notice else { return }
+        let preservedCopy = savedWindows.preservedCopy()
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = notice.title
+        if let preservedCopy {
+            let kept = preservedCopy.savedAt.formatted(date: .abbreviated, time: .shortened)
+            alert.informativeText = notice.message
+                + "\n\nKaisola kept the original data from \(kept). Export it to "
+                + "recover the missing entries by hand."
+            alert.addButton(withTitle: "Export Kept Copy…")
+        } else {
+            alert.informativeText = notice.message
+        }
+        alert.addButton(withTitle: "OK")
+        guard let preservedCopy, alert.runModal() == .alertFirstButtonReturn else { return }
+        exportSavedWindowsCopy(preservedCopy)
+    }
+
+    private func exportSavedWindowsCopy(_ copy: SavedWindowsPreservedCopy) {
+        let panel = NSSavePanel()
+        panel.title = "Export Kept Saved Windows"
+        panel.prompt = "Export"
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "saved-windows-kept-copy.json"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try copy.payload.write(to: url, options: .atomic)
+            ToastCenter.shared.show("Kept copy exported", style: .success)
+        } catch {
+            ToastCenter.shared.show("Export failed: \(error.localizedDescription)", style: .error)
+        }
     }
 
     /// Populates the dynamic submenus (Open Recent / Saved Windows) on open.
@@ -4227,8 +4272,19 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 item.representedObject = path
             }
         case "Saved Windows":
-            let states = savedWindows.all()
-            if states.isEmpty {
+            let catalog = savedWindows.load()
+            let states = catalog.windows
+            if let notice = catalog.notice {
+                // The warning replaces "No Saved Windows" when nothing decoded:
+                // a damaged list must never read as a list the user emptied.
+                let item = menu.addItem(
+                    withTitle: notice.summary,
+                    action: #selector(showSavedWindowsNotice(_:)),
+                    keyEquivalent: ""
+                )
+                item.target = self
+                if !states.isEmpty { menu.addItem(.separator()) }
+            } else if states.isEmpty {
                 menu.addItem(NSMenuItem(title: "No Saved Windows", action: nil, keyEquivalent: ""))
             }
             for state in states {
@@ -4236,7 +4292,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 item.target = self
                 item.representedObject = state.name
             }
-            if !states.isEmpty {
+            // Deleting is off while a newer build owns the list, so the submenu
+            // stays out rather than offering an action that cannot land.
+            if !states.isEmpty, catalog.notice?.blocksWrites != true {
                 menu.addItem(.separator())
                 let deleteItem = menu.addItem(withTitle: "Delete Saved Window", action: nil, keyEquivalent: "")
                 let deleteMenu = NSMenu(title: "Delete Saved Window")

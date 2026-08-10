@@ -194,7 +194,12 @@ final class AcpTerminalHostTests: XCTestCase {
     @MainActor
     func testTerminalContentDisappearingAfterOutputPreservesOutputAndBecomesUnavailable() async {
         let snapshots = TerminalSnapshotSequence([
-            AcpTerminalHost.Snapshot(output: "work in progress", truncated: true, exitStatus: nil),
+            AcpTerminalHost.Snapshot(
+                output: "work in progress",
+                truncated: true,
+                exitStatus: nil,
+                outputDetached: false
+            ),
             nil,
         ])
         let model = AcpTerminalContentModel(pollIntervalNanoseconds: 0)
@@ -215,7 +220,8 @@ final class AcpTerminalHostTests: XCTestCase {
         let staleSnapshot = AcpTerminalHost.Snapshot(
             output: "stale output",
             truncated: false,
-            exitStatus: .init(exitCode: 0, signal: nil)
+            exitStatus: .init(exitCode: 0, signal: nil),
+            outputDetached: false
         )
 
         let staleTask = Task { @MainActor in

@@ -181,6 +181,26 @@ final class CustomGrammarRegistryTests: XCTestCase {
         XCTAssertEqual(try Data(contentsOf: copyURL), malformed)
     }
 
+    func testRepeatedMalformedReadsReuseOnePrivateRecoveryCopy() throws {
+        let store = try temporaryStore()
+        let malformed = Data("not json at all".utf8)
+        try malformed.write(to: store.fileURL)
+
+        let first = try XCTUnwrap(store.load().state.preservedCopyURL)
+        let second = try XCTUnwrap(store.load().state.preservedCopyURL)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(try Data(contentsOf: first), malformed)
+
+        let siblings = try FileManager.default.contentsOfDirectory(
+            atPath: store.fileURL.deletingLastPathComponent().path
+        )
+        XCTAssertEqual(siblings.count, 2, "Expected the registry and exactly one recovery copy")
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: first.path)
+        let permissions = try XCTUnwrap(attributes[.posixPermissions] as? NSNumber)
+        XCTAssertEqual(permissions.intValue & 0o777, 0o600)
+    }
+
     func testDamagedRecoveryCopyFailsClosedAndCannotAuthorizeReset() throws {
         let store = try temporaryStore()
         let baseline = tomlGrammar()

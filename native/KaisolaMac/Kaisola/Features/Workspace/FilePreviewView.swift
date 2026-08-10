@@ -1,6 +1,7 @@
 import AppKit
 import PDFKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// File preview/editor pane: UTF-8 text is editable with ⌘S save + revert,
 /// markdown renders styled (with a raw-source toggle), images display, and
@@ -417,6 +418,11 @@ struct FilePreviewView: View {
                 .textSelection(.enabled)
                 .accessibilityLabel(notice.accessibilityLabel)
             Spacer(minLength: 8)
+            ForEach(notice.recovery, id: \.self) { recovery in
+                Button(recovery.title) { perform(recovery) }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
             Button {
                 previewNotice = nil
             } label: {
@@ -696,7 +702,7 @@ struct FilePreviewView: View {
                 }
                 .disabled(copyableContents == nil)
                 Button("Open Externally") {
-                    NSWorkspace.shared.open(loadedURL ?? url)
+                    openCurrentFileExternally()
                 }
             }
             if case .docx = content {
@@ -791,6 +797,87 @@ struct FilePreviewView: View {
             return
         }
         NSWorkspace.shared.activateFileViewerSelecting([reachable])
+    }
+
+    /// Hand the file to its default app and say so when macOS declines.
+    ///
+    /// `NSWorkspace.open` returning false is the ordinary outcome for a file
+    /// type nothing on this Mac claims, and the menu item used to swallow it —
+    /// the user clicked, nothing happened, and the control read as broken. The
+    /// refusal now raises the persistent banner with both real ways forward.
+    private func openCurrentFileExternally() {
+        let target = loadedURL ?? url
+        apply(FilePreviewExternalOpen.defaultApplicationOutcome(
+            accepted: NSWorkspace.shared.open(target),
+            fileName: target.lastPathComponent
+        ))
+    }
+
+    /// The Choose Application recovery: launch the picked app against this file
+    /// and report its launch error rather than assuming the second try worked.
+    private func openCurrentFile(with application: URL) {
+        let target = loadedURL ?? url
+        Task { @MainActor in
+            var failure: String?
+            do {
+                _ = try await NSWorkspace.shared.open(
+                    [target],
+                    withApplicationAt: application,
+                    configuration: NSWorkspace.OpenConfiguration()
+                )
+            } catch {
+                failure = error.localizedDescription
+            }
+            apply(FilePreviewExternalOpen.chosenApplicationOutcome(
+                failure: failure,
+                fileName: target.lastPathComponent,
+                applicationName: FilePreviewExternalOpen.applicationName(for: application)
+            ))
+        }
+    }
+
+    private func apply(_ outcome: FilePreviewExternalOpen.Outcome) {
+        switch outcome {
+        case let .opened(message):
+            // A success retires only the banner that asked for it; a recovered
+            // draft or a save warning keeps its place.
+            if previewNotice?.isExternalOpenRefusal == true { previewNotice = nil }
+            ToastCenter.shared.show(message, style: .success)
+        case let .refused(notice):
+            previewNotice = notice
+        }
+    }
+
+    private func perform(_ recovery: FilePreviewNotice.Recovery) {
+        switch recovery {
+        case .revealInFinder:
+            revealCurrentFileInFinder()
+        case .chooseApplication:
+            Self.chooseApplication(for: loadedURL ?? url) { application in
+                openCurrentFile(with: application)
+            }
+        }
+    }
+
+    /// Async for the same reason as the project pickers: `runModal()` freezes
+    /// the run loop while Launch Services enumerates /Applications, and this
+    /// panel opens over a live editor that may still be saving.
+    @MainActor
+    private static func chooseApplication(
+        for file: URL,
+        then handle: @escaping @MainActor (URL) -> Void
+    ) {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.allowedContentTypes = [.application]
+        panel.message = "Choose the app that should open \(file.lastPathComponent)."
+        panel.prompt = "Open"
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.begin { response in
+            guard response == .OK, let application = panel.url else { return }
+            Task { @MainActor in handle(application) }
+        }
     }
 
     private var supportsZoom: Bool {
@@ -939,7 +1026,7 @@ struct FilePreviewView: View {
             HStack {
                 Button("Reveal in Finder", action: revealCurrentFileInFinder)
                 Button("Open Externally") {
-                    NSWorkspace.shared.open(loadedURL ?? url)
+                    openCurrentFileExternally()
                 }
             }
         }

@@ -296,11 +296,48 @@ struct FilePreviewNotice: Equatable {
         }
     }
 
+    /// A named door out of the failure the notice describes. The banner renders
+    /// one button per case, in order; a notice with none is dismiss-only.
+    enum Recovery: Hashable {
+        case revealInFinder
+        case chooseApplication
+
+        var title: String {
+            switch self {
+            case .revealInFinder: "Reveal in Finder"
+            case .chooseApplication: "Choose Application…"
+            }
+        }
+    }
+
     let severity: Severity
     let message: String
+    let recovery: [Recovery]
+
+    init(severity: Severity, message: String, recovery: [Recovery] = []) {
+        self.severity = severity
+        self.message = message
+        self.recovery = recovery
+    }
 
     var accessibilityLabel: String {
         "\(severity.accessibilityName): \(message)"
+    }
+
+    /// True for the banner a refused external open raises, so a later success
+    /// can retire exactly that banner and leave an unrelated notice alone.
+    var isExternalOpenRefusal: Bool {
+        recovery.contains(.chooseApplication)
+    }
+
+    /// A launch Launch Services turned down. It stays on screen because the
+    /// user has to pick the way out: find the file, or name the app.
+    static func externalOpenFailed(_ message: String) -> Self {
+        Self(
+            severity: .error,
+            message: message,
+            recovery: [.revealInFinder, .chooseApplication]
+        )
     }
 
     static func recoveredDraft(diskChanged: Bool) -> Self {
@@ -318,6 +355,50 @@ struct FilePreviewNotice: Equatable {
 
     static func error(_ message: String) -> Self {
         Self(severity: .error, message: message)
+    }
+}
+
+/// Launch Services answers `NSWorkspace.open` with a bare Bool: a file with no
+/// associated app, a handler that will not launch, and a file that vanished all
+/// come back as the same `false`. Turning that flag into what the user sees is
+/// the whole policy, so it lives here where tests can drive both answers rather
+/// than inside a button that used to drop the result on the floor.
+enum FilePreviewExternalOpen {
+    enum Outcome: Equatable {
+        /// macOS took the request; the message names the file that left.
+        case opened(String)
+        /// macOS refused; the notice stays until the user recovers or dismisses.
+        case refused(FilePreviewNotice)
+    }
+
+    /// The default-handler path, from `NSWorkspace.open(_:)`'s return value.
+    static func defaultApplicationOutcome(accepted: Bool, fileName: String) -> Outcome {
+        guard accepted else {
+            return .refused(.externalOpenFailed(
+                "macOS could not open \(fileName). It may have no associated app, or it may no longer be on disk."
+            ))
+        }
+        return .opened("Opened \(fileName)")
+    }
+
+    /// The explicit-app path, after the user picked a handler. `failure` is the
+    /// launch error's description, or nil when the app came up.
+    static func chosenApplicationOutcome(
+        failure: String?,
+        fileName: String,
+        applicationName: String
+    ) -> Outcome {
+        guard let failure else {
+            return .opened("Opened \(fileName) in \(applicationName)")
+        }
+        return .refused(.externalOpenFailed(
+            "\(applicationName) could not open \(fileName). \(failure)"
+        ))
+    }
+
+    /// Apps are bundles, so the display name is the bundle name without `.app`.
+    static func applicationName(for application: URL) -> String {
+        application.deletingPathExtension().lastPathComponent
     }
 }
 

@@ -321,6 +321,101 @@ final class WorkspaceFilesTests: XCTestCase {
         let warning = FilePreviewNotice.warning("The file changed on disk.")
         XCTAssertEqual(warning.severity, .warning)
         XCTAssertEqual(warning.message, "The file changed on disk.")
+
+        // Save and recovery notices are dismiss-only; only a refused external
+        // open earns buttons in the banner.
+        XCTAssertTrue(failure.recovery.isEmpty)
+        XCTAssertFalse(failure.isExternalOpenRefusal)
+        XCTAssertTrue(recovered.recovery.isEmpty)
+        XCTAssertFalse(conflicted.isExternalOpenRefusal)
+    }
+
+    func testRefusedExternalOpenRaisesAPersistentErrorWithBothRecoveryDoors() throws {
+        let outcome = FilePreviewExternalOpen.defaultApplicationOutcome(
+            accepted: false,
+            fileName: "quarterly.numbers"
+        )
+        guard case let .refused(notice) = outcome else {
+            return XCTFail("A refused open must surface a notice, not silence")
+        }
+        XCTAssertEqual(notice.severity, .error)
+        XCTAssertTrue(
+            notice.message.contains("quarterly.numbers"),
+            "The banner has to name the file: \(notice.message)"
+        )
+        XCTAssertEqual(notice.recovery, [.revealInFinder, .chooseApplication])
+        XCTAssertEqual(notice.recovery.map(\.title), ["Reveal in Finder", "Choose Application…"])
+        XCTAssertTrue(notice.isExternalOpenRefusal)
+        XCTAssertEqual(notice.accessibilityLabel, "Error: \(notice.message)")
+    }
+
+    func testExternalOpenConfirmsOnlyWhenMacOSAcceptsTheRequest() {
+        guard case let .opened(message) = FilePreviewExternalOpen.defaultApplicationOutcome(
+            accepted: true,
+            fileName: "README.md"
+        ) else {
+            return XCTFail("An accepted open must confirm")
+        }
+        XCTAssertEqual(message, "Opened README.md")
+
+        // The refusal is never reported as a success, however it is phrased.
+        if case .opened = FilePreviewExternalOpen.defaultApplicationOutcome(
+            accepted: false,
+            fileName: "README.md"
+        ) {
+            XCTFail("A refused open must not be confirmed as opened")
+        }
+    }
+
+    func testChosenApplicationFailureKeepsTheRecoveryBannerAndNamesTheApp() throws {
+        let application = URL(fileURLWithPath: "/Applications/Numbers.app")
+        XCTAssertEqual(FilePreviewExternalOpen.applicationName(for: application), "Numbers")
+
+        let refused = FilePreviewExternalOpen.chosenApplicationOutcome(
+            failure: "The application is damaged.",
+            fileName: "quarterly.numbers",
+            applicationName: FilePreviewExternalOpen.applicationName(for: application)
+        )
+        guard case let .refused(notice) = refused else {
+            return XCTFail("A failed launch must keep the banner up")
+        }
+        XCTAssertEqual(notice.severity, .error)
+        XCTAssertTrue(notice.message.contains("Numbers"))
+        XCTAssertTrue(notice.message.contains("The application is damaged."))
+        XCTAssertEqual(notice.recovery, [.revealInFinder, .chooseApplication])
+
+        guard case let .opened(message) = FilePreviewExternalOpen.chosenApplicationOutcome(
+            failure: nil,
+            fileName: "quarterly.numbers",
+            applicationName: "Numbers"
+        ) else {
+            return XCTFail("A launch that threw nothing is a success")
+        }
+        XCTAssertEqual(message, "Opened quarterly.numbers in Numbers")
+    }
+
+    /// The policy above only helps if the preview's buttons actually consult it.
+    /// A discarded `NSWorkspace.shared.open(…)` statement is exactly the bug
+    /// this file regressed on, and nothing else in a unit test can see a
+    /// SwiftUI button's action, so the source is the assertion.
+    func testFilePreviewNeverDiscardsTheExternalOpenResult() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Kaisola/Features/Workspace/FilePreviewView.swift"),
+            encoding: .utf8
+        )
+        for (index, line) in source.components(separatedBy: .newlines).enumerated() {
+            XCTAssertFalse(
+                line.trimmingCharacters(in: .whitespaces).hasPrefix("NSWorkspace.shared.open("),
+                """
+                FilePreviewView.swift:\(index + 1) drops the result of NSWorkspace.open, \
+                so a refused launch would look like a dead button. Route it through \
+                FilePreviewExternalOpen instead.
+                """
+            )
+        }
     }
     private var root: URL!
 

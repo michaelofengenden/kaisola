@@ -302,9 +302,11 @@ test('the shared Swift workflow has no switch that skips the iPhone lane', () =>
   }
 
   assert.match(contracts, /runs-on: macos-15/)
-  assert.match(contracts, /COMPANION_TEST_DESTINATION: 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest'/)
-  assert.match(step(contracts, 'Run iPhone contract and app tests'), /-destination "\$COMPANION_TEST_DESTINATION"/)
-  assert.match(step(contracts, 'Run iPhone contract and app tests'), /tee "\$RUNNER_TEMP\/companion-contract\/companion-tests\.log"/)
+  assert.match(contracts, /KAISOLA_COMPANION_SIMULATOR_OS: '18\.5'/)
+  assert.match(contracts, /COMPANION_TEST_DESTINATION: 'platform=iOS Simulator,name=iPhone 16 Pro,OS=18\.5'/)
+  const testStep = step(contracts, 'Run iPhone contract and app tests')
+  assert.match(testStep, /-destination "\$\{\{ steps\.companion-simulator\.outputs\.destination \}\}"/)
+  assert.match(testStep, /"\$RUNNER_TEMP\/companion-contract\/companion-tests\.log"/)
 
   const receiptStep = step(contracts, 'Receipt the executed iPhone contract run')
   assert.match(receiptStep, /node scripts\/companion-contract-receipt\.cjs create/)

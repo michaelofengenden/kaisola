@@ -610,6 +610,70 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertNotNil(store.add(provider: .claude, label: "Work", directory: target.path))
         XCTAssertNil(store.add(provider: .claude, label: "Lowercase", directory: lowercased.path))
         XCTAssertEqual(store.profiles().map(\.label), ["Work"])
+    /// Fault injection: a locked (`uchg`) destination makes `replaceItemAt`
+    /// fail with EPERM long after the temporary file has landed on disk. The
+    /// write must report failure *and* take its fragment with it, or the
+    /// credential directory accumulates one `.usage-accounts.json.<uuid>` per
+    /// retry.
+    func testUsageAccountStoreRemovesTemporaryWhenReplacingLockedFileFails() throws {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-locked-\(UUID().uuidString)", isDirectory: true)
+        let fileURL = directory.appendingPathComponent("usage-accounts.json")
+        defer {
+            try? fileManager.setAttributes([.immutable: false], ofItemAtPath: fileURL.path)
+            try? fileManager.removeItem(at: directory)
+        }
+        let store = UsageAccountStore(fileURL: fileURL)
+        XCTAssertNotNil(store.add(provider: .claude, label: "Work", directory: "~/.claude-work"))
+        try fileManager.setAttributes([.immutable: true], ofItemAtPath: fileURL.path)
+
+        XCTAssertNil(
+            store.add(provider: .codex, label: "Research", directory: "~/.codex-research"),
+            "a locked destination cannot be replaced, so the add reports failure"
+        )
+        XCTAssertEqual(store.profiles().map(\.label), ["Work"], "the locked file is untouched")
+        XCTAssertEqual(
+            Self.temporaryFragments(in: directory, for: fileURL, fileManager: fileManager),
+            [],
+            "the failed write left a temporary fragment behind"
+        )
+    }
+
+    /// Fault injection for the other branch: a dangling symlink reads as
+    /// absent to `fileExists`, so `write` takes the `moveItem` path and that
+    /// move fails with EEXIST once the temporary is already on disk.
+    func testUsageAccountStoreRemovesTemporaryWhenMovingOntoDanglingSymlinkFails() throws {
+        let fileManager = FileManager.default
+        let directory = fileManager.temporaryDirectory
+            .appendingPathComponent("kaisola-usage-dangling-\(UUID().uuidString)", isDirectory: true)
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        defer { try? fileManager.removeItem(at: directory) }
+        let fileURL = directory.appendingPathComponent("usage-accounts.json")
+        try fileManager.createSymbolicLink(
+            atPath: fileURL.path,
+            withDestinationPath: directory.appendingPathComponent("missing-target").path
+        )
+        let store = UsageAccountStore(fileURL: fileURL)
+
+        XCTAssertNil(
+            store.add(provider: .claude, label: "Work", directory: "~/.claude-work"),
+            "the move onto an occupied path fails, so the add reports failure"
+        )
+        XCTAssertEqual(
+            Self.temporaryFragments(in: directory, for: fileURL, fileManager: fileManager),
+            [],
+            "the failed write left a temporary fragment behind"
+        )
+    }
+
+    private static func temporaryFragments(
+        in directory: URL,
+        for fileURL: URL,
+        fileManager: FileManager
+    ) -> [String] {
+        let contents = (try? fileManager.contentsOfDirectory(atPath: directory.path)) ?? []
+        return contents.filter { $0.hasPrefix(".\(fileURL.lastPathComponent).") }.sorted()
     }
 
     func testUsageAccountStoreSuggestedDirectoriesMatchProviderIsolation() {

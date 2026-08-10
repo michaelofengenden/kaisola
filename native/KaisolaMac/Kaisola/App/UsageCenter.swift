@@ -557,6 +557,15 @@ struct UsageAccountStore: Sendable {
 
     private func write(_ profiles: [UsageAccountProfile]) -> Bool {
         let directory = fileURL.deletingLastPathComponent()
+        // Named ahead of the `do` so the catch can delete this exact fragment.
+        // A locked destination fails `replaceItemAt` and a dangling symlink
+        // fails `moveItem` *after* the temporary already exists, so a catch
+        // that only returned false silted up the credential directory with
+        // `.usage-accounts.json.<uuid>` leftovers on every retry.
+        let temporary = directory.appendingPathComponent(
+            ".\(fileURL.lastPathComponent).\(UUID().uuidString)",
+            isDirectory: false
+        )
         do {
             try FileManager.default.createDirectory(
                 at: directory,
@@ -565,10 +574,6 @@ struct UsageAccountStore: Sendable {
             )
             let payload = Payload(schemaVersion: Self.schemaVersion, profiles: profiles)
             let data = try JSONEncoder().encode(payload)
-            let temporary = directory.appendingPathComponent(
-                ".\(fileURL.lastPathComponent).\(UUID().uuidString)",
-                isDirectory: false
-            )
             try data.write(to: temporary, options: [.atomic])
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
             if FileManager.default.fileExists(atPath: fileURL.path) {
@@ -578,6 +583,7 @@ struct UsageAccountStore: Sendable {
             }
             return true
         } catch {
+            try? FileManager.default.removeItem(at: temporary)
             return false
         }
     }

@@ -1,8 +1,35 @@
+import AppKit
 import Foundation
 import ImageIO
 import KaisolaCore
+import SwiftUI
 import XCTest
 @testable import Kaisola
+
+@MainActor
+private final class AcpAttachmentShortcutProbe: ObservableObject {
+    @Published var menuPresented: Bool
+    private(set) var panelPresentationCount = 0
+
+    init(menuPresented: Bool) {
+        self.menuPresented = menuPresented
+    }
+
+    func presentPanel() {
+        menuPresented = false
+        panelPresentationCount += 1
+    }
+}
+
+/// Deterministic key-window state without activating the XCTest host. AppKit's
+/// real property is still what production reads; this override only lets two
+/// mounted fixture windows trade that ownership without touching another app.
+@MainActor
+private final class AcpAttachmentShortcutTestWindow: NSWindow {
+    var reportsKeyWindow = false
+
+    override var isKeyWindow: Bool { reportsKeyWindow }
+}
 
 /// Prompt-attachment coverage: the pure ACP content-block encoding
 /// (image base64 + mime, embedded text-file `resource` block), the file
@@ -10,6 +37,11 @@ import XCTest
 /// pendingAttachments add/remove round-trip. The "cleared after send" path is
 /// not exercised here — it needs a live transport — see AcpClientTests.
 final class AcpAttachmentsTests: XCTestCase {
+    /// SwiftUI/AppKit fixture windows are intentionally retained for the test
+    /// process lifetime. Releasing an un-ordered overridden-key window during
+    /// XCTest's autorelease-pool drain is an AppKit 26 crash unrelated to the
+    /// command contract under test.
+    @MainActor private static var shortcutFixtureWindows: [NSWindow] = []
 
     // MARK: - Prompt block encoding
 
@@ -268,12 +300,155 @@ final class AcpAttachmentsTests: XCTestCase {
     }
 
     @MainActor
+    func testCommandUFromClosedAttachmentPopoverPresentsPanelExactlyOnce() throws {
+        let probe = AcpAttachmentShortcutProbe(menuPresented: false)
+        let window = shortcutWindow(probe: probe, isEnabled: true, isKeyWindow: true)
+
+        XCTAssertTrue(window.performKeyEquivalent(with: commandUEvent(for: window)))
+        XCTAssertEqual(probe.panelPresentationCount, 1)
+        XCTAssertFalse(probe.menuPresented)
+    }
+
+    @MainActor
+    func testCommandUWhileDisconnectedDoesNotPresentOrConsume() throws {
+        let probe = AcpAttachmentShortcutProbe(menuPresented: false)
+        let window = shortcutWindow(probe: probe, isEnabled: false, isKeyWindow: true)
+
+        XCTAssertFalse(window.performKeyEquivalent(with: commandUEvent(for: window)))
+        XCTAssertEqual(probe.panelPresentationCount, 0)
+    }
+
+    @MainActor
+    func testCommandUFromOpenAttachmentPopoverDismissesThenPresentsExactlyOnce() throws {
+        let probe = AcpAttachmentShortcutProbe(menuPresented: true)
+        let window = shortcutWindow(probe: probe, isEnabled: true, isKeyWindow: true)
+
+        XCTAssertTrue(window.performKeyEquivalent(with: commandUEvent(for: window)))
+        XCTAssertFalse(probe.menuPresented)
+        XCTAssertEqual(probe.panelPresentationCount, 1)
+    }
+
+    @MainActor
+    func testCommandURoutesOnlyToTheActiveComposerWindow() throws {
+        let first = AcpAttachmentShortcutProbe(menuPresented: false)
+        let second = AcpAttachmentShortcutProbe(menuPresented: false)
+        let firstWindow = shortcutWindow(probe: first, isEnabled: true, isKeyWindow: true)
+        let secondWindow = shortcutWindow(probe: second, isEnabled: true, isKeyWindow: false)
+
+        XCTAssertTrue(firstWindow.performKeyEquivalent(with: commandUEvent(for: firstWindow)))
+        XCTAssertFalse(secondWindow.performKeyEquivalent(with: commandUEvent(for: secondWindow)))
+        XCTAssertEqual(first.panelPresentationCount, 1)
+        XCTAssertEqual(second.panelPresentationCount, 0)
+
+        firstWindow.reportsKeyWindow = false
+        secondWindow.reportsKeyWindow = true
+        XCTAssertFalse(firstWindow.performKeyEquivalent(with: commandUEvent(for: firstWindow)))
+        XCTAssertTrue(secondWindow.performKeyEquivalent(with: commandUEvent(for: secondWindow)))
+        XCTAssertEqual(first.panelPresentationCount, 1)
+        XCTAssertEqual(second.panelPresentationCount, 1)
+    }
+
+    @MainActor
+    func testCommandUWithinKeyWindowSkipsInactiveComposer() throws {
+        let inactive = AcpAttachmentShortcutProbe(menuPresented: false)
+        let active = AcpAttachmentShortcutProbe(menuPresented: false)
+        let host = NSHostingView(
+            rootView: HStack {
+                AcpAttachmentCommandKeyEquivalent(
+                    isEnabled: false,
+                    panelPresenter: inactive.presentPanel
+                )
+                AcpAttachmentCommandKeyEquivalent(
+                    isEnabled: true,
+                    panelPresenter: active.presentPanel
+                )
+            }
+            .frame(width: 2, height: 1)
+        )
+        let window = mountedShortcutWindow(host: host, isKeyWindow: true)
+
+        XCTAssertTrue(window.performKeyEquivalent(with: commandUEvent(for: window)))
+        XCTAssertEqual(inactive.panelPresentationCount, 0)
+        XCTAssertEqual(active.panelPresentationCount, 1)
+    }
+
+    @MainActor
+    func testCommandUUsesRealKeyEventInLightAndDarkAppearances() throws {
+        for appearanceName in [NSAppearance.Name.aqua, .darkAqua] {
+            let probe = AcpAttachmentShortcutProbe(menuPresented: false)
+            let window = shortcutWindow(probe: probe, isEnabled: true, isKeyWindow: true)
+            window.appearance = NSAppearance(named: appearanceName)
+            window.contentView?.displayIfNeeded()
+
+            XCTAssertEqual(
+                window.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]),
+                appearanceName
+            )
+            XCTAssertTrue(window.performKeyEquivalent(with: commandUEvent(for: window)))
+            XCTAssertEqual(probe.panelPresentationCount, 1, "appearance=\(appearanceName.rawValue)")
+        }
+    }
+
+    @MainActor
     func testPendingAttachmentsHaveAnAggregateCountLimit() {
         let conversation = makeConversation()
         for index in 0..<(AcpConversation.maxPendingAttachmentCount + 3) {
             conversation.addImageData(Data([UInt8(index)]), name: "shot-\(index).png")
         }
         XCTAssertEqual(conversation.pendingAttachments.count, AcpConversation.maxPendingAttachmentCount)
+    }
+
+    @MainActor
+    private func shortcutWindow(
+        probe: AcpAttachmentShortcutProbe,
+        isEnabled: Bool,
+        isKeyWindow: Bool
+    ) -> AcpAttachmentShortcutTestWindow {
+        let host = NSHostingView(
+            rootView: AcpAttachmentCommandKeyEquivalent(
+                isEnabled: isEnabled,
+                panelPresenter: probe.presentPanel
+            )
+            .frame(width: 1, height: 1)
+        )
+        return mountedShortcutWindow(host: host, isKeyWindow: isKeyWindow)
+    }
+
+    @MainActor
+    private func mountedShortcutWindow<Content: View>(
+        host: NSHostingView<Content>,
+        isKeyWindow: Bool
+    ) -> AcpAttachmentShortcutTestWindow {
+        host.frame = NSRect(x: 0, y: 0, width: 80, height: 40)
+        let window = AcpAttachmentShortcutTestWindow(
+            contentRect: host.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = host
+        window.reportsKeyWindow = isKeyWindow
+        XCTAssertEqual(window.isKeyWindow, isKeyWindow)
+        host.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
+        Self.shortcutFixtureWindows.append(window)
+        return window
+    }
+
+    @MainActor
+    private func commandUEvent(for window: NSWindow) -> NSEvent {
+        NSEvent.keyEvent(
+            with: .keyDown,
+            location: .zero,
+            modifierFlags: .command,
+            timestamp: ProcessInfo.processInfo.systemUptime,
+            windowNumber: window.windowNumber,
+            context: nil,
+            characters: "u",
+            charactersIgnoringModifiers: "u",
+            isARepeat: false,
+            keyCode: 32
+        )!
     }
 
     @MainActor

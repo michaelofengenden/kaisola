@@ -185,6 +185,24 @@ struct AcpComposerCard: View {
         .focusable()
         .focused($attachmentFocused)
         .accessibilityFocused(attachmentAccessibilityFocused)
+        .background {
+            // Popover content is not mounted while it is closed, so a shortcut
+            // declared on the row inside it disappears from AppKit's command
+            // routing. Keep one zero-layout key-equivalent owner beside the
+            // always-mounted trigger instead. Focus scopes it to the composer
+            // the user is actually operating; the AppKit bridge adds the key-
+            // window gate so another project window cannot answer the press.
+            AcpAttachmentCommandKeyEquivalent(
+                isEnabled: conversation.isConnected
+                    && (focused || attachmentFocused || attachmentMenuPresented),
+                panelPresenter: {
+                    attachmentMenuPresented = false
+                    openAttachmentPanel()
+                }
+            )
+            .frame(width: 1, height: 1)
+            .accessibilityHidden(true)
+        }
         .popover(isPresented: $attachmentMenuPresented, arrowEdge: .bottom) {
             VStack(alignment: .leading, spacing: 4) {
                 Button {
@@ -195,7 +213,6 @@ struct AcpComposerCard: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                 }
-                .keyboardShortcut("u", modifiers: .command)
 
                 // "Add folder" and "Import GitHub issue" are deliberately absent:
                 // `AcpAttachmentClassifier` rejects directories, and nothing in the
@@ -456,6 +473,51 @@ struct AcpComposerCard: View {
             .help(sendAction == .queue ? "Queue this as a follow-up" : "Send")
             .accessibilityLabel(sendAction == .queue ? "Queue follow-up" : "Send message")
             .accessibilityIdentifier("acp.composer.send")
+        }
+    }
+}
+
+/// The attachment shortcut has to outlive the popover it can dismiss.
+///
+/// SwiftUI's `.keyboardShortcut` is presentation-scoped: putting Command-U on
+/// a button inside a closed popover leaves no registered command. This mounted
+/// AppKit view participates in the normal key-equivalent traversal instead. It
+/// deliberately refuses repeats, extra modifiers, inactive windows, and an
+/// inactive/disconnected composer before invoking the injected panel action.
+@MainActor
+struct AcpAttachmentCommandKeyEquivalent: NSViewRepresentable {
+    let isEnabled: Bool
+    let panelPresenter: @MainActor () -> Void
+
+    func makeNSView(context: Context) -> CommandView {
+        let view = CommandView()
+        view.setAccessibilityElement(false)
+        return view
+    }
+
+    func updateNSView(_ nsView: CommandView, context: Context) {
+        nsView.isShortcutEnabled = isEnabled
+        nsView.panelPresenter = panelPresenter
+    }
+
+    @MainActor
+    final class CommandView: NSView {
+        var isShortcutEnabled = false
+        var panelPresenter: (@MainActor () -> Void)?
+
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard isShortcutEnabled,
+                  window?.isKeyWindow == true,
+                  event.type == .keyDown,
+                  !event.isARepeat,
+                  modifiers == [.command],
+                  event.charactersIgnoringModifiers?.lowercased() == "u",
+                  let panelPresenter else {
+                return super.performKeyEquivalent(with: event)
+            }
+            panelPresenter()
+            return true
         }
     }
 }

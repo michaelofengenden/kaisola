@@ -134,7 +134,9 @@ struct SettingsView: View {
     /// per body evaluation is too slow.
     @State private var fontFamilies = [TerminalFontOptions.systemMonoSentinel]
     @State private var selectedSection: SettingsSection = .general
+    @State private var settingsSearchQuery = ""
     @State private var extensionsRoute: ExtensionsSettingsRoute?
+    @FocusState private var settingsSearchFocused: Bool
     /// Update affordance from the app delegate (Sparkle).
     var checkForUpdates: (() -> Void)?
     var updateDetail: String?
@@ -369,6 +371,10 @@ struct SettingsView: View {
         dismiss == nil ? SettingsWindowChrome.titleBarSafeArea : 0
     }
 
+    private var settingsSearchResults: [SettingsSection] {
+        SettingsCatalogSearch.matches(query: settingsSearchQuery)
+    }
+
     private var externalEditorDetail: String {
         externalEditorFeedback ?? settings.externalEditorResolution.detail
     }
@@ -499,6 +505,43 @@ struct SettingsView: View {
             // if it ever drifts back up the column.
             .allowsHitTesting(false)
 
+            HStack(spacing: 7) {
+                Image(systemName: "magnifyingglass")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.kaisolaTertiary)
+                    .accessibilityHidden(true)
+                TextField("Search Settings", text: $settingsSearchQuery)
+                    .textFieldStyle(.plain)
+                    .focused($settingsSearchFocused)
+                    .onSubmit {
+                        if let first = settingsSearchResults.first {
+                            selectedSection = first
+                        }
+                    }
+                    .accessibilityLabel("Search settings")
+                    .accessibilityValue(SettingsCatalogSearch.accessibilityValue(
+                        query: settingsSearchQuery,
+                        resultCount: settingsSearchResults.count
+                    ))
+                    .accessibilityIdentifier(SettingsCatalogSearch.fieldIdentifier)
+                if SettingsCatalogSearch.isFiltering(settingsSearchQuery) {
+                    Button {
+                        settingsSearchQuery = ""
+                        settingsSearchFocused = true
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.kaisolaTertiary)
+                    .accessibilityLabel("Clear Settings search")
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(height: 30)
+            .background(.quaternary.opacity(0.42), in: RoundedRectangle(cornerRadius: 8))
+            .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
+            .padding(.bottom, 8)
+
             // Grouped clusters (spec §3a): quiet headers, eleven sections in
             // four families instead of one flat run.
             //
@@ -510,15 +553,38 @@ struct SettingsView: View {
             // does not bounce when the list already fits.
             ScrollView(.vertical, showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 5) {
-                    ForEach(SettingsGroup.allCases) { group in
-                        Text(group.title.uppercased())
-                            .font(.system(size: 10.5, weight: .semibold))
+                    if SettingsCatalogSearch.isFiltering(settingsSearchQuery) {
+                        Text(SettingsCatalogSearch.resultCountLabel(settingsSearchResults.count))
+                            .font(.caption2.weight(.semibold))
                             .foregroundStyle(.kaisolaTertiary)
                             .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
-                            .padding(.top, group == SettingsGroup.allCases.first ? 0 : 10)
-                            .accessibilityAddTraits(.isHeader)
-                        ForEach(group.sections) { section in
-                            sectionButton(section)
+                            .accessibilityLabel(
+                                "Settings search, \(SettingsCatalogSearch.resultCountLabel(settingsSearchResults.count))"
+                            )
+                            .accessibilityIdentifier(SettingsCatalogSearch.resultCountIdentifier)
+                        if settingsSearchResults.isEmpty {
+                            Text("No settings match this search.")
+                                .font(.caption)
+                                .foregroundStyle(.kaisolaSecondary)
+                                .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
+                                .padding(.top, 4)
+                                .accessibilityIdentifier(SettingsCatalogSearch.emptyStateIdentifier)
+                        } else {
+                            ForEach(settingsSearchResults) { section in
+                                sectionButton(section)
+                            }
+                        }
+                    } else {
+                        ForEach(SettingsGroup.allCases) { group in
+                            Text(group.title.uppercased())
+                                .font(.system(size: 10.5, weight: .semibold))
+                                .foregroundStyle(.kaisolaTertiary)
+                                .padding(.horizontal, SettingsWindowChrome.navigationContentPadding)
+                                .padding(.top, group == SettingsGroup.allCases.first ? 0 : 10)
+                                .accessibilityAddTraits(.isHeader)
+                            ForEach(group.sections) { section in
+                                sectionButton(section)
+                            }
                         }
                     }
                 }
@@ -1495,6 +1561,34 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .updates: "Version, automatic checks, and downloads"
         }
     }
+    /// Visible row names and useful vocabulary that users reasonably search
+    /// for even when it differs from the owning section title.
+    var searchTerms: [String] {
+        switch self {
+        case .general:
+            ["Default Project Directory", "On Launch", "External Editor", "Appearance", "sidebar transparency"]
+        case .terminal:
+            ["Font", "Font Size", "Theme", "Palette", "Copy on Select", "Option as Meta", "Scrollback", "Shell"]
+        case .companion:
+            ["Pair Device", "pairing code", "QR code", "nearby device", "remote access", "permissions"]
+        case .guardrails:
+            ["Standing Allow Rules", "Sensitive Files", "sensitive file patterns", "always ask", "safety approvals"]
+        case .extensions:
+            ["Custom Agents", "MCP Servers", "Themes", "Grammars", "Preview Mappings", "plugins"]
+        case .accounts:
+            ["Sign In", "Named Accounts", "Account Directory", "Project Overrides", "project assignments", "Claude", "Codex"]
+        case .agents:
+            ["Claude", "Codex", "Custom Agent", "ACP Adapter", "launch command"]
+        case .models:
+            ["API Keys", "Provider Credentials", "Models", "Routing", "default model"]
+        case .shortcuts:
+            ["Keyboard Shortcuts", "keymap", "Command Palette", "key bindings"]
+        case .usage:
+            ["Provider Limits", "Rate Limits", "Context Window", "Reset Time", "headroom"]
+        case .updates:
+            ["Check Now", "Automatic Updates", "Background Downloads", "Version", "restart"]
+        }
+    }
     var symbol: String {
         switch self {
         case .general: "slider.horizontal.3"
@@ -1509,6 +1603,59 @@ enum SettingsSection: String, CaseIterable, Identifiable {
         case .usage: "gauge.with.dots.needle.bottom.50percent"
         case .updates: "arrow.triangle.2.circlepath"
         }
+    }
+}
+
+enum SettingsCatalogSearch {
+    static let fieldIdentifier = "settings.catalog-search"
+    static let resultCountIdentifier = "settings.catalog-search.result-count"
+    static let emptyStateIdentifier = "settings.catalog-search.empty"
+
+    static func isFiltering(_ query: String) -> Bool {
+        !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    static func matches(query: String) -> [SettingsSection] {
+        let queryTokens = tokens(in: query)
+        guard !queryTokens.isEmpty else { return [] }
+        return SettingsSection.allCases.filter { section in
+            let haystack = normalized(
+                ([section.title, section.subtitle, section.rawValue, section.group.title] + section.searchTerms)
+                    .joined(separator: " ")
+            )
+            return queryTokens.allSatisfy { haystack.contains($0) }
+        }
+    }
+
+    static func resultCountLabel(_ count: Int) -> String {
+        switch count {
+        case 0: "No results"
+        case 1: "1 result"
+        default: "\(count) results"
+        }
+    }
+
+    static func accessibilityValue(query: String, resultCount: Int) -> String {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "Empty. Showing grouped Settings."
+        }
+        return "\(trimmed). \(resultCountLabel(resultCount))."
+    }
+
+    private static func tokens(in value: String) -> [String] {
+        normalized(value)
+            .split(whereSeparator: { $0.isWhitespace })
+            .map(String.init)
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value
+            .folding(
+                options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive],
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+            .lowercased()
     }
 }
 

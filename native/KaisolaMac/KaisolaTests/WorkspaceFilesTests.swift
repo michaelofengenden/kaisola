@@ -9,6 +9,156 @@ import XCTest
 /// ProjectFiles (tree listing + bounded enumeration) and FilePreviewContent
 /// (what a file renders as) — the workspace rail's foundations.
 final class WorkspaceFilesTests: XCTestCase {
+    func testAllDocumentsPresentationKeepsEveryTabReachableInSourceOrder() {
+        let project = URL(fileURLWithPath: "/tmp/Overflow project", isDirectory: true)
+        let first = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("README.md"),
+            isPinned: true,
+            line: nil
+        )
+        let selected = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("Sources/main.swift"),
+            isPinned: false,
+            line: nil
+        )
+        let last = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("Tests/main.swift"),
+            isPinned: true,
+            line: nil
+        )
+
+        let presentation = FilePreviewTabOverflowPresentation(
+            tabs: [first, selected, last],
+            selectedURL: selected.url,
+            workspaceRoot: project,
+            loadedURL: selected.url,
+            isDirty: true
+        )
+
+        XCTAssertEqual(presentation.label, "All Documents")
+        XCTAssertEqual(presentation.value, "3 open, main.swift — Sources selected")
+        XCTAssertEqual(presentation.selectedScrollTarget, selected.url.standardizedFileURL)
+        XCTAssertEqual(
+            presentation.entries.map(\.url),
+            [first.url, selected.url, last.url].map(\.standardizedFileURL)
+        )
+        XCTAssertEqual(
+            presentation.entries.map(\.accessibilityLabel),
+            [
+                "README.md, kept open",
+                "main.swift — Sources, selected, preview, modified",
+                "main.swift — Tests, kept open",
+            ]
+        )
+    }
+
+    func testAllDocumentsPresentationHasAStableKeyboardAndVoiceOverTarget() {
+        XCTAssertEqual(
+            FilePreviewTabOverflowPresentation.accessibilityIdentifier,
+            "preview.allDocuments"
+        )
+        XCTAssertEqual(
+            FilePreviewTabOverflowPresentation.visibleTitle(openDocumentCount: 12),
+            "All 12"
+        )
+    }
+
+    func testEditorModeControlsSpeakTheirActionAndCurrentToggleValue() {
+        let cases: [(FilePreviewEditorControlAccessibility.Kind, Bool, String, String)] = [
+            (.markdown, false, "Edit Markdown source", "Markdown preview shown"),
+            (.markdown, true, "Show Markdown preview", "Markdown source editor shown"),
+            (.text, false, "Edit text", "Text preview shown"),
+            (.text, true, "Show text preview", "Text editor shown"),
+            (.html, false, "Edit HTML source", "HTML preview shown"),
+            (.html, true, "Show HTML preview", "HTML source editor shown"),
+        ]
+
+        for (kind, editorVisible, label, value) in cases {
+            let accessibility = FilePreviewEditorControlAccessibility(
+                kind: kind,
+                editorVisible: editorVisible
+            )
+            XCTAssertEqual(accessibility.label, label)
+            XCTAssertEqual(accessibility.value, value)
+        }
+    }
+
+    func testSaveControlSpeaksCleanDirtySavingAndConflictStates() {
+        let file = URL(fileURLWithPath: "/tmp/main.swift")
+
+        let clean = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: false,
+            isLoading: false,
+            isSaving: false,
+            hasConflict: false
+        )
+        XCTAssertEqual(clean.label, "Save main.swift")
+        XCTAssertEqual(clean.value, "Saved")
+        XCTAssertFalse(clean.isEnabled)
+
+        let dirty = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: true,
+            isLoading: false,
+            isSaving: false,
+            hasConflict: true
+        )
+        XCTAssertEqual(dirty.value, "Changes pending, file changed on disk")
+        XCTAssertTrue(dirty.isEnabled)
+
+        let saving = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: true,
+            isLoading: false,
+            isSaving: true,
+            hasConflict: false
+        )
+        XCTAssertEqual(saving.value, "Saving")
+        XCTAssertFalse(saving.isEnabled)
+    }
+
+    func testDocumentHeaderFocusOrderIsStable() {
+        XCTAssertEqual(
+            FilePreviewControlAccessibility.headerFocusOrder,
+            ["preview.editorMode", "preview.save", "preview.options", "preview.hide"]
+        )
+    }
+
+    func testRevertConfirmationNamesTheExactDocumentAndRecoveredDraft() {
+        let confirmation = FilePreviewRevertConfirmation(
+            fileURL: URL(fileURLWithPath: "/tmp/Incident notes.md"),
+            includesRecoveredDraft: true
+        )
+
+        XCTAssertEqual(confirmation.title, "Revert changes in Incident notes.md?")
+        XCTAssertEqual(confirmation.confirmLabel, "Revert Incident notes.md")
+        XCTAssertEqual(
+            confirmation.message,
+            "This permanently discards current edits and the recovered draft for Incident notes.md. Recovery data is kept until you confirm."
+        )
+        XCTAssertTrue(confirmation.matchesCurrentDocument(
+            URL(fileURLWithPath: "/tmp/Incident notes.md")
+        ))
+        XCTAssertFalse(confirmation.matchesCurrentDocument(
+            URL(fileURLWithPath: "/tmp/another.md")
+        ))
+    }
+
+    func testOrdinaryRevertConfirmationDoesNotClaimARecoveredDraft() {
+        let confirmation = FilePreviewRevertConfirmation(
+            fileURL: URL(fileURLWithPath: "/tmp/main.swift"),
+            includesRecoveredDraft: false
+        )
+
+        XCTAssertEqual(confirmation.title, "Revert changes in main.swift?")
+        XCTAssertEqual(
+            confirmation.message,
+            "This permanently discards current edits in main.swift. Recovery data is kept until you confirm."
+        )
+        XCTAssertFalse(confirmation.message.contains("recovered draft"))
+    }
+
     func testMarkdownListContinuationHandlesBulletsTasksAndOrderedLists() {
         XCTAssertEqual(MarkdownListContinuation.action(for: "- first"), .continueWith("- "))
         XCTAssertEqual(MarkdownListContinuation.action(for: "  * nested"), .continueWith("  * "))
@@ -2897,6 +3047,74 @@ final class WorkspaceFilesTests: XCTestCase {
     }
 
     // MARK: - Continuous Markdown editing
+
+    func testMarkdownHybridDiffMarksSeparatedChangesWithoutRewritingTheDraft() {
+        let baseline = """
+        # Title
+        keep
+        old value
+        same
+        remove [unsafe](javascript:alert(1))
+        tail
+        """
+        let edited = """
+        # Title
+        keep
+        new value
+        same
+        tail
+        | added | table |
+        """
+
+        let plan = MarkdownHybridDiffPlan.build(baseline: baseline, edited: edited)
+
+        XCTAssertEqual(plan.editedSource, edited)
+        XCTAssertEqual(plan.markers.map(\.kind), [.changed, .deletion, .addition])
+        XCTAssertEqual(plan.markers[0].oldText, "old value")
+        XCTAssertEqual(plan.markers[0].newText, "new value")
+        XCTAssertEqual(
+            (edited as NSString).substring(with: plan.markers[0].editedRange),
+            "new value"
+        )
+        XCTAssertEqual(plan.markers[1].editedRange.length, 0)
+        XCTAssertTrue(plan.markers[1].inspectionText.contains("[unsafe](javascript:alert(1))"))
+        XCTAssertEqual(
+            (edited as NSString).substring(with: plan.markers[2].editedRange),
+            "| added | table |"
+        )
+    }
+
+    func testMarkdownHybridDiffKeepsCodeTablesLinksAndLineEndingsAsPlainExactText() {
+        let baseline = "| name | value |\r\n| --- | --- |\r\n| old | [site](https://example.com) |\r\n"
+        let edited = "| name | value |\r\n| --- | --- |\r\n| new | `code <tag>` |\r\n"
+
+        let plan = MarkdownHybridDiffPlan.build(baseline: baseline, edited: edited)
+        let marker = try? XCTUnwrap(plan.markers.first)
+
+        XCTAssertEqual(plan.editedSource.utf8.count, edited.utf8.count)
+        XCTAssertEqual(marker?.kind, .changed)
+        XCTAssertEqual(marker?.newText, "| new | `code <tag>` |")
+        XCTAssertEqual(marker?.inspectionPresentation, .plainText)
+        XCTAssertFalse(marker?.inspectionAllowsLinkActivation ?? true)
+    }
+
+    func testMarkdownHybridDiffIsEmptyForIdenticalBytesAndBoundedForHugeFiles() {
+        XCTAssertTrue(
+            MarkdownHybridDiffPlan.build(baseline: "same\n", edited: "same\n").markers.isEmpty
+        )
+
+        let baseline = (0...MarkdownHybridDiffPlan.maximumComparedLines)
+            .map { "old-\($0)" }
+            .joined(separator: "\n")
+        let edited = (0...MarkdownHybridDiffPlan.maximumComparedLines)
+            .map { "new-\($0)" }
+            .joined(separator: "\n")
+        let plan = MarkdownHybridDiffPlan.build(baseline: baseline, edited: edited)
+
+        XCTAssertTrue(plan.isTruncated)
+        XCTAssertLessThanOrEqual(plan.markers.count, MarkdownHybridDiffPlan.maximumMarkers)
+        XCTAssertEqual(plan.editedSource, edited)
+    }
 
     /// The jump this surface exists to remove. Save, autosave, the recovery
     /// journal, and external reconciliation of identical bytes all re-run the

@@ -1,5 +1,7 @@
+import AppKit
 import Foundation
 import KaisolaCore
+import SwiftUI
 import XCTest
 @testable import Kaisola
 
@@ -23,6 +25,43 @@ private actor TranscriptPageFixture {
     }
 
     func requestCount() -> Int { requests.count }
+}
+
+@MainActor
+private final class TranscriptViewportFixtureModel: ObservableObject {
+    @Published var rowIDs: [String]
+    @Published var rowHeight: CGFloat = 72
+
+    init(rowIDs: [String]) {
+        self.rowIDs = rowIDs
+    }
+}
+
+@MainActor
+private struct TranscriptViewportFixtureView: View {
+    @ObservedObject var model: TranscriptViewportFixtureModel
+    let anchor: AcpTranscriptViewportAnchor
+
+    var body: some View {
+        ScrollView {
+            LazyVStack(spacing: 8) {
+                ForEach(model.rowIDs, id: \.self) { rowID in
+                    Text(rowID)
+                        .frame(
+                            maxWidth: .infinity,
+                            minHeight: model.rowHeight,
+                            maxHeight: model.rowHeight
+                        )
+                        .background {
+                            AcpTranscriptViewportMarker(rowID: rowID, anchor: anchor)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        }
+                        .accessibilityIdentifier("fixture.\(rowID)")
+                }
+            }
+            .padding(12)
+        }
+    }
 }
 
 /// Unit tests for two Electron-parity behaviors on `AcpConversation` that need
@@ -159,6 +198,224 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertEqual(persistenceEvents, 0, "Reading durable pages must not schedule redundant writes")
         let requestCount = await fixture.requestCount()
         XCTAssertEqual(requestCount, 5)
+    }
+
+    func testTranscriptSearchCountsVisibleOccurrencesAndNavigatesInOrder() {
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "u", text: "Needle once", failed: false),
+            .message(id: "m", text: "needle twice NEEDLE"),
+            .plan(id: "p", entries: [
+                AcpPlanEntry(id: "e", content: "No match", priority: "medium", status: "pending"),
+            ]),
+        ]
+        var state = AcpTranscriptSearchState()
+
+        state.updateQuery("needle", rows: rows)
+
+        XCTAssertEqual(state.matchCount, 3)
+        XCTAssertNil(state.currentRowID, "typing must not jump the reading anchor")
+        XCTAssertEqual(state.statusText(hasHiddenEarlierRows: false), "3 matches")
+        XCTAssertEqual(state.move(.next), "user-u")
+        XCTAssertEqual(state.statusText(hasHiddenEarlierRows: false), "1 of 3")
+        XCTAssertEqual(state.move(.next), "msg-m")
+        XCTAssertEqual(state.move(.next), "msg-m")
+        XCTAssertEqual(state.move(.next), "user-u", "next wraps")
+        XCTAssertEqual(state.move(.previous), "msg-m", "previous wraps")
+    }
+
+    func testTranscriptSearchRefreshPreservesSelectionDuringStreaming() {
+        var state = AcpTranscriptSearchState()
+        state.updateQuery("ship", rows: [
+            .message(id: "one", text: "ship it"),
+            .message(id: "two", text: "waiting"),
+        ])
+        XCTAssertEqual(state.move(.next), "msg-one")
+
+        state.refresh(rows: [
+            .message(id: "one", text: "ship it"),
+            .message(id: "two", text: "waiting, then ship"),
+        ])
+
+        XCTAssertEqual(state.matchCount, 2)
+        XCTAssertEqual(state.currentRowID, "msg-one")
+        XCTAssertEqual(state.statusText(hasHiddenEarlierRows: false), "1 of 2")
+    }
+
+    func testPagedTranscriptSearchFindsOlderRowsWithoutDiscardingReadingAnchor() async throws {
+        var rows = Self.messageRows(count: 500)
+        rows[0] = .message(id: "oldest", text: "the buried needle")
+        let conversation = makeConversation()
+        conversation.seedRowsForTesting(rows)
+        let readingAnchor = try XCTUnwrap(conversation.visibleRows.first?.id)
+        var search = AcpTranscriptSearchState()
+        search.updateQuery("needle", rows: conversation.visibleRows)
+        XCTAssertEqual(search.matchCount, 0)
+        XCTAssertEqual(search.statusText(hasHiddenEarlierRows: true), "No matches loaded")
+
+        while search.matchCount == 0, conversation.hiddenEarlierCount > 0 {
+            await conversation.expandEarlier()
+            search.refresh(rows: conversation.visibleRows)
+            XCTAssertTrue(
+                conversation.visibleRows.contains(where: { $0.id == readingAnchor }),
+                "prepending a search page must keep the prior reading anchor addressable"
+            )
+        }
+
+        XCTAssertEqual(search.matchCount, 1)
+        XCTAssertEqual(search.statusText(hasHiddenEarlierRows: false), "1 match")
+        XCTAssertNil(search.currentRowID, "fetching older matches does not move the viewport")
+        XCTAssertEqual(search.move(.next), "msg-oldest")
+    }
+
+    func testMountedViewportAnchorPreservesExactReadingOffsetAcrossPrepend() throws {
+        let originalRows = (0..<18).map { "row-\($0)" }
+        let model = TranscriptViewportFixtureModel(rowIDs: originalRows)
+        let anchor = AcpTranscriptViewportAnchor()
+        let host = NSHostingView(
+            rootView: TranscriptViewportFixtureView(model: model, anchor: anchor)
+                .frame(width: 360, height: 240)
+        )
+        host.frame = NSRect(x: 0, y: 0, width: 360, height: 240)
+        let window = NSWindow(
+            contentRect: host.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        host.layoutSubtreeIfNeeded()
+
+        let positioned = try XCTUnwrap(anchor.restore(.init(
+            rowID: "row-2",
+            offsetFromViewportTop: -17.25
+        )))
+        XCTAssertEqual(positioned.restoredOffset, -17.25, accuracy: 0.75)
+        let captured = try XCTUnwrap(anchor.capture())
+        XCTAssertEqual(captured.rowID, "row-2")
+        XCTAssertEqual(captured.offsetFromViewportTop, -17.25, accuracy: 0.75)
+
+        let scrollView = try XCTUnwrap(Self.firstScrollView(in: host))
+        model.rowIDs = (0..<200).map { "earlier-\($0)" } + originalRows
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        host.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
+
+        let originBeforeFallback = scrollView.contentView.bounds.origin.y
+        var restored = anchor.restore(captured)
+        let originAfterFallback = scrollView.contentView.bounds.origin.y
+        if restored == nil {
+            // The first call applies the captured clip-geometry fallback when
+            // LazyVStack evicts the row; the next mounted pass must validate
+            // the same row's real intra-row offset.
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            host.layoutSubtreeIfNeeded()
+            window.layoutIfNeeded()
+            restored = anchor.restore(captured)
+        }
+        guard let finalRestoration = restored else {
+            XCTFail(
+                "clip origin \(originBeforeFallback) -> \(originAfterFallback); "
+                    + "document=\(String(describing: scrollView.documentView?.bounds)) "
+                    + "viewport=\(scrollView.documentVisibleRect)"
+            )
+            return
+        }
+        XCTAssertEqual(finalRestoration.rowID, "row-2")
+        XCTAssertEqual(
+            finalRestoration.restoredOffset,
+            captured.offsetFromViewportTop,
+            accuracy: 0.75
+        )
+        XCTAssertLessThanOrEqual(finalRestoration.error, 0.75)
+    }
+
+    func testMountedViewportAnchorPreservesExactReadingOffsetAcrossRowHeightChange() throws {
+        let model = TranscriptViewportFixtureModel(
+            rowIDs: (0..<18).map { "density-row-\($0)" }
+        )
+        let anchor = AcpTranscriptViewportAnchor()
+        let host = NSHostingView(
+            rootView: TranscriptViewportFixtureView(model: model, anchor: anchor)
+                .frame(width: 360, height: 240)
+        )
+        host.frame = NSRect(x: 0, y: 0, width: 360, height: 240)
+        let window = NSWindow(
+            contentRect: host.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        window.contentView = host
+        host.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        let positioned = try XCTUnwrap(anchor.restore(.init(
+            rowID: "density-row-2",
+            offsetFromViewportTop: -13.5
+        )))
+        XCTAssertEqual(positioned.restoredOffset, -13.5, accuracy: 0.75)
+        let captured = try XCTUnwrap(anchor.capture())
+        XCTAssertEqual(captured.rowID, "density-row-2")
+
+        let scrollView = try XCTUnwrap(Self.firstScrollView(in: host))
+        let documentHeightBefore = try XCTUnwrap(scrollView.documentView).bounds.height
+        model.rowHeight = 118
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        host.layoutSubtreeIfNeeded()
+        window.layoutIfNeeded()
+        XCTAssertGreaterThan(
+            try XCTUnwrap(scrollView.documentView).bounds.height,
+            documentHeightBefore,
+            "the mounted contract must exercise a real document-height change"
+        )
+
+        var restoration = anchor.restore(captured)
+        if restoration == nil {
+            RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+            host.layoutSubtreeIfNeeded()
+            restoration = anchor.restore(captured)
+        }
+        let finalRestoration = try XCTUnwrap(restoration)
+        XCTAssertEqual(finalRestoration.rowID, "density-row-2")
+        XCTAssertEqual(
+            finalRestoration.restoredOffset,
+            captured.offsetFromViewportTop,
+            accuracy: 0.75
+        )
+        XCTAssertLessThanOrEqual(finalRestoration.error, 0.75)
+    }
+
+    func testTranscriptSearchIsBoundedAndDismissalRetainsNoActiveMatch() {
+        let text = Array(repeating: "needle", count: AcpTranscriptSearchIndex.maximumMatches + 10)
+            .joined(separator: " ")
+        var state = AcpTranscriptSearchState()
+        state.present()
+        state.updateQuery("needle", rows: [.message(id: "many", text: text)])
+
+        XCTAssertEqual(state.matchCount, AcpTranscriptSearchIndex.maximumMatches)
+        XCTAssertTrue(state.hasAdditionalMatches)
+        XCTAssertEqual(
+            state.statusText(hasHiddenEarlierRows: false),
+            "\(AcpTranscriptSearchIndex.maximumMatches)+ matches"
+        )
+        XCTAssertEqual(state.move(.next), "msg-many")
+
+        state.dismiss()
+        XCTAssertFalse(state.isPresented)
+        XCTAssertNil(state.currentRowID)
+        XCTAssertEqual(state.query, "needle", "reopening Find should retain the last query")
+    }
+
+    private static func firstScrollView(in view: NSView) -> NSScrollView? {
+        if let scrollView = view as? NSScrollView { return scrollView }
+        for subview in view.subviews {
+            if let scrollView = firstScrollView(in: subview) { return scrollView }
+        }
+        return nil
     }
 
     /// Chunks after the first are held for `chunkFlushInterval` and published

@@ -57,8 +57,9 @@ const NATIVE_DIRECTORY_TESTS = Object.freeze([
     'TerminalDocumentTests', 'TerminalLinkRoutingTests', 'TerminalScrollPinTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/', [
-    'DataPreviewsTests', 'LocalhostDetectorTests', 'QuickActionStoreTests',
-    'SyntaxHighlighterTests', 'WorkspaceFilesTests', 'WorkspaceWatcherTests',
+    'BrowserCardAccessibilityTests', 'DataPreviewsTests', 'LocalhostDetectorTests',
+    'QuickActionStoreTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+    'WorkspaceWatcherTests',
   ]],
   ['native/KaisolaMac/Kaisola/Git/', ['GitPRTests', 'GitPanelModelTests', 'GitServiceTests']],
   ['native/KaisolaMac/Kaisola/Mesh/', [
@@ -153,7 +154,8 @@ const NATIVE_FILE_TESTS = Object.freeze(new Map([
     'TerminalReplayFidelityTests',
   ]],
   ['native/KaisolaMac/Kaisola/Features/Workspace/BrowserCardView.swift', [
-    'AppModelProjectContextTests', 'LocalhostDetectorTests',
+    'AppModelProjectContextTests', 'BrowserCardAccessibilityTests',
+    'LocalhostDetectorTests',
   ]],
   // The panel's layout tests are named for the layout, not the file, so the
   // stem heuristic would miss them.

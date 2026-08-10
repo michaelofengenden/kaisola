@@ -5006,19 +5006,26 @@ private struct ConnectionFooter: View {
 
     @ViewBuilder
     private var attentionButton: some View {
-        if attention.count > 0 {
+        // A storage problem keeps the bell reachable on its own: the notice
+        // explaining lost or unsaved work would otherwise have nowhere to live
+        // once the inbox reads empty.
+        if attention.count > 0 || !attention.storageNotices.isEmpty {
             Button {
                 showInbox.toggle()
             } label: {
                 KaisolaStatusBadge(
-                    text: "\(attention.count)",
+                    text: attention.count > 0 ? "\(attention.count)" : "!",
                     systemImage: "bell.fill",
                     tone: .needsYou
                 )
             }
             .buttonStyle(.borderless)
             .help("Needs you — permission asks and finished agents")
-            .accessibilityLabel("Attention inbox, \(attention.count) items")
+            .accessibilityLabel(
+                attention.count > 0
+                    ? "Attention inbox, \(attention.count) items"
+                    : "Attention inbox, saved inbox needs attention"
+            )
             .accessibilityIdentifier("footer.attention")
             .popover(isPresented: $showInbox, arrowEdge: .top) {
                 attentionInbox
@@ -5036,6 +5043,7 @@ private struct ConnectionFooter: View {
             context: attentionContext ?? { _ in (nil, true) }
         )
         return VStack(alignment: .leading, spacing: 0) {
+            attentionStorageNotices
             HStack(spacing: 6) {
                 inboxFilterChip(label: "All", kinds: nil)
                 ForEach(AttentionInboxModel.filterChips, id: \.label) { chip in
@@ -5078,6 +5086,41 @@ private struct ConnectionFooter: View {
         }
         .frame(width: 320)
         .padding(.vertical, 6)
+    }
+
+    /// What the saved inbox lost, or is failing to save, in the one place the
+    /// user goes to read it. Reset is offered only when saving is actually
+    /// blocked, because it throws the kept damaged copy away.
+    @ViewBuilder
+    private var attentionStorageNotices: some View {
+        if !attention.storageNotices.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(attention.storageNotices) { notice in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(notice.title).font(.caption.weight(.semibold))
+                        Text(notice.message)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                HStack(spacing: 10) {
+                    if attention.storageNotices.contains(where: \.blocksSaving) {
+                        Button("Reset Saved Inbox") { attention.resetStorage() }
+                            .buttonStyle(.borderless)
+                    }
+                    Button("Dismiss") { attention.dismissStorageNotices() }
+                        .buttonStyle(.borderless)
+                    Spacer()
+                }
+                .font(.caption2)
+            }
+            .padding(.horizontal, 12)
+            .padding(.bottom, 8)
+            .accessibilityIdentifier("footer.attention.storageNotice")
+            Divider()
+                .padding(.bottom, 6)
+        }
     }
 
     private func inboxFilterChip(label: String, kinds: Set<AttentionCenter.Kind>?) -> some View {

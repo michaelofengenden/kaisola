@@ -27,6 +27,7 @@ on:
       - 'protocol/broker/**'
       - 'runtime/**'
       - 'tests/**'
+      - 'scripts/companion-contract-receipt.cjs'
       - 'scripts/download-native-node-runtime.cjs'
       - 'scripts/native-*.cjs'
       - 'scripts/release-fast.cjs'
@@ -42,6 +43,7 @@ on:
       - 'protocol/broker/**'
       - 'runtime/**'
       - 'tests/**'
+      - 'scripts/companion-contract-receipt.cjs'
       - 'scripts/download-native-node-runtime.cjs'
       - 'scripts/native-*.cjs'
       - 'scripts/release-fast.cjs'
@@ -50,7 +52,7 @@ on:
 
 concurrency:
   group: >-
-    swift-contracts-${{ github.event.pull_request.number || github.ref }}-${{ inputs.skip-ios }}-${{ inputs.skip-macos-release-build }}
+    swift-contracts-${{ github.event.pull_request.number || github.ref }}-${{ inputs.skip-macos-release-build }}
   cancel-in-progress: true
 
 permissions:

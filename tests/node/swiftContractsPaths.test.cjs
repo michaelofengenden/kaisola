@@ -16,6 +16,7 @@ const releaseWorkflowFiles = [
 ]
 
 const releaseScriptFiles = [
+  'scripts/companion-contract-receipt.cjs',
   'scripts/download-native-node-runtime.cjs',
   'scripts/native-appcast.cjs',
   'scripts/native-broker-helper-probe.cjs',

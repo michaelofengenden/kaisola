@@ -96,8 +96,9 @@ test('superseded contract and candidate runs are cancelled by ref', () => {
   )
   assert.match(
     contracts,
-    /-\$\{\{ inputs\.skip-ios \}\}-\$\{\{ inputs\.skip-macos-release-build \}\}/,
+    /-\$\{\{ inputs\.skip-macos-release-build \}\}/,
   )
+  assert.doesNotMatch(contracts, /inputs\.skip-ios/)
   assert.match(contracts, /cancel-in-progress: true/)
   assert.doesNotMatch(contracts, /concurrency:[\s\S]*?github\.sha/)
 

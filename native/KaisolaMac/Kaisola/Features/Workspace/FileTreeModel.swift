@@ -90,6 +90,7 @@ enum WorkspaceFileOperations {
         case unchangedLocation
         case destinationExists
         case destinationInsideItem
+        case crossVolume
 
         var errorDescription: String? {
             switch self {
@@ -117,7 +118,73 @@ enum WorkspaceFileOperations {
                 return "An item with that name already exists."
             case .destinationInsideItem:
                 return "A folder can't be moved inside itself."
+            case .crossVolume:
+                return "That item can't be moved to another volume from here."
             }
+        }
+    }
+
+    /// An open directory that the mutation syscalls anchor to. Every component
+    /// from the workspace root is opened with `O_NOFOLLOW`, so the descriptor
+    /// names the directory that was verified instead of a path another process
+    /// can swap for a symbolic link in the window after validation.
+    final class DirectoryHandle {
+        let descriptor: Int32
+        private var isOpen = true
+
+        fileprivate init(descriptor: Int32) {
+            self.descriptor = descriptor
+        }
+
+        deinit {
+            close()
+        }
+
+        func close() {
+            guard isOpen else { return }
+            isOpen = false
+            Darwin.close(descriptor)
+        }
+
+        /// Opens one child directory, refusing a symlinked component. The child
+        /// is resolved by the kernel relative to this descriptor, so nothing
+        /// above it can be re-pointed once this handle exists.
+        fileprivate func openChild(named name: String) throws -> DirectoryHandle {
+            let child = openat(
+                descriptor,
+                name,
+                O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+            )
+            guard child >= 0 else {
+                throw WorkspaceFileOperations.openFailure(errno, in: self, named: name)
+            }
+            return DirectoryHandle(descriptor: child)
+        }
+
+        /// The entry's own metadata, never following a final symbolic link.
+        fileprivate func entry(named name: String) -> stat? {
+            var entry = stat()
+            guard fstatat(descriptor, name, &entry, AT_SYMLINK_NOFOLLOW) == 0 else {
+                return nil
+            }
+            return entry
+        }
+
+        /// The path this directory occupies right now. Only for the one API
+        /// that has no descriptor form; every other call anchors to `descriptor`.
+        fileprivate func currentPath() throws -> URL {
+            var buffer = [UInt8](repeating: 0, count: Int(PATH_MAX))
+            let result = buffer.withUnsafeMutableBufferPointer { raw -> Int32 in
+                guard let base = raw.baseAddress else { return -1 }
+                return fcntl(descriptor, F_GETPATH, base)
+            }
+            guard result == 0 else {
+                throw OperationError.missingItem
+            }
+            return URL(
+                fileURLWithPath: String(decoding: buffer.prefix { $0 != 0 }, as: UTF8.self),
+                isDirectory: true
+            )
         }
     }
 
@@ -139,11 +206,17 @@ enum WorkspaceFileOperations {
         )
     }
 
-    /// Performs the already-validated same-directory rename. `moveItem` keeps
-    /// Finder/APFS collision behavior authoritative and never overwrites.
+    /// Performs the already-validated same-directory rename against an open
+    /// descriptor for the parent that was verified, so an ancestor swapped for
+    /// a symbolic link after validation cannot redirect the rename.
     static func rename(item: URL, to proposedName: String, workspaceRoot: URL) throws -> Move {
         let move = try renameMove(item: item, to: proposedName, workspaceRoot: workspaceRoot)
-        try FileManager.default.moveItem(at: move.source, to: move.destination)
+        let parent = try openDirectory(
+            move.source.deletingLastPathComponent(),
+            workspaceRoot: workspaceRoot
+        )
+        defer { parent.close() }
+        try commitMove(move, from: parent, to: parent)
         return move
     }
 
@@ -164,57 +237,149 @@ enum WorkspaceFileOperations {
         )
     }
 
-    /// Move one item to an exact validated destination. FileManager remains the
-    /// final collision authority if the filesystem changes after planning.
+    /// Move one item to an exact validated destination. Both parents are held
+    /// open across the mutation, and the kernel remains the final collision
+    /// authority if the filesystem changes after planning.
     static func move(item: URL, to destination: URL, workspaceRoot: URL) throws -> Move {
         let move = try movePlan(item: item, to: destination, workspaceRoot: workspaceRoot)
-        try FileManager.default.moveItem(at: move.source, to: move.destination)
+        let sourceParent = try openDirectory(
+            move.source.deletingLastPathComponent(),
+            workspaceRoot: workspaceRoot
+        )
+        defer { sourceParent.close() }
+        let destinationParent = try openDirectory(
+            move.destination.deletingLastPathComponent(),
+            workspaceRoot: workspaceRoot
+        )
+        defer { destinationParent.close() }
+        try commitMove(move, from: sourceParent, to: destinationParent)
         return move
+    }
+
+    /// Opens a directory one path component at a time from the workspace root,
+    /// refusing a symlinked component at every step. Callers hold the handle
+    /// across the mutation itself: that, rather than the path check, is what
+    /// closes the window between validating a path and acting on it.
+    static func openDirectory(_ directory: URL, workspaceRoot: URL) throws -> DirectoryHandle {
+        let root = workspaceRoot.standardizedFileURL
+        // Only the root is opened by path. Real projects sit behind symlinked
+        // ancestors nobody chose (`/tmp`, `/var`), and the root is the boundary
+        // the user mounted rather than something an operation navigated to.
+        let rootDescriptor = root.path.withCString { path in
+            Darwin.open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        }
+        guard rootDescriptor >= 0 else {
+            throw OperationError.workspaceUnavailable
+        }
+        var handle = DirectoryHandle(descriptor: rootDescriptor)
+        for component in try relativeComponents(of: directory, under: root) {
+            handle = try handle.openChild(named: component)
+        }
+        return handle
+    }
+
+    /// Performs a validated move through the two verified parent descriptors.
+    /// `RENAME_EXCL` makes "never overwrite" a property of the syscall instead
+    /// of an existence check followed by a separate path-based move.
+    static func commitMove(
+        _ move: Move,
+        from sourceParent: DirectoryHandle,
+        to destinationParent: DirectoryHandle
+    ) throws {
+        let sourceName = move.source.lastPathComponent
+        let destinationName = move.destination.lastPathComponent
+        var result = renameatx_np(
+            sourceParent.descriptor,
+            sourceName,
+            destinationParent.descriptor,
+            destinationName,
+            UInt32(RENAME_EXCL)
+        )
+        var failure = errno
+        if result != 0,
+           failure == EEXIST,
+           isSameEntry(sourceParent, sourceName, destinationParent, destinationName) {
+            // A case-only rename collides with the very item being renamed on a
+            // case-insensitive volume. Only a plain rename can express that one.
+            result = renameat(
+                sourceParent.descriptor,
+                sourceName,
+                destinationParent.descriptor,
+                destinationName
+            )
+            failure = errno
+        }
+        guard result == 0 else { throw renameFailure(failure) }
+    }
+
+    /// The path `candidate` occupies right now as seen through its verified
+    /// parent descriptor. `trashItem` has no descriptor form, so this is as
+    /// narrow as the OS allows: the path comes from the descriptor that was
+    /// opened component by component, and the entry it names is re-identified
+    /// immediately before the Trash call instead of trusted from validation.
+    static func trashTarget(for candidate: URL, in parent: DirectoryHandle) throws -> URL {
+        let name = candidate.lastPathComponent
+        guard let anchored = parent.entry(named: name) else {
+            throw OperationError.missingItem
+        }
+        guard anchored.st_mode & S_IFMT != S_IFLNK else {
+            throw OperationError.symbolicLink
+        }
+        let target = try parent.currentPath().appendingPathComponent(name)
+        var resolved = stat()
+        guard target.path.withCString({ lstat($0, &resolved) }) == 0,
+              resolved.st_dev == anchored.st_dev,
+              resolved.st_ino == anchored.st_ino else {
+            throw OperationError.missingItem
+        }
+        return target
     }
 
     /// Creates a zero-byte file without replacing an item that appears between
     /// validation and the write. The parent may be the workspace root, but may
     /// not be a symlink or escape through an intermediate symlink.
     static func createFile(named proposedName: String, in parent: URL, workspaceRoot: URL) throws -> CreatedItem {
-        let destination = try createDestination(
+        let plan = try createDestination(
             named: proposedName,
             in: parent,
             workspaceRoot: workspaceRoot,
             isDirectory: false
         )
-        let descriptor = destination.path.withCString { path in
-            Darwin.open(path, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH)
-        }
+        defer { plan.parent.close() }
+        let descriptor = openat(
+            plan.parent.descriptor,
+            proposedName,
+            O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+            S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH
+        )
         guard descriptor >= 0 else {
             if errno == EEXIST { throw OperationError.destinationExists }
             throw CocoaError(.fileWriteUnknown)
         }
         guard Darwin.close(descriptor) == 0 else {
-            try? FileManager.default.removeItem(at: destination)
+            _ = unlinkat(plan.parent.descriptor, proposedName, 0)
             throw CocoaError(.fileWriteUnknown)
         }
-        return CreatedItem(url: destination, kind: .file)
+        return CreatedItem(url: plan.destination, kind: .file)
     }
 
     /// Creates exactly one directory. Intermediate directory creation is
     /// intentionally disabled so a single action cannot create an unchecked
     /// path hierarchy.
     static func createFolder(named proposedName: String, in parent: URL, workspaceRoot: URL) throws -> CreatedItem {
-        let destination = try createDestination(
+        let plan = try createDestination(
             named: proposedName,
             in: parent,
             workspaceRoot: workspaceRoot,
             isDirectory: true
         )
-        do {
-            try FileManager.default.createDirectory(
-                at: destination,
-                withIntermediateDirectories: false
-            )
-        } catch let error as CocoaError where error.code == .fileWriteFileExists {
-            throw OperationError.destinationExists
+        defer { plan.parent.close() }
+        // 0o777 matches FileManager's own default; the process umask narrows it.
+        guard mkdirat(plan.parent.descriptor, proposedName, 0o777) == 0 else {
+            if errno == EEXIST { throw OperationError.destinationExists }
+            throw CocoaError(.fileWriteUnknown)
         }
-        return CreatedItem(url: destination, kind: .folder)
+        return CreatedItem(url: plan.destination, kind: .folder)
     }
 
     /// Returns the normalized item that may be sent to the recoverable system
@@ -228,8 +393,14 @@ enum WorkspaceFileOperations {
     /// resulting URL. macOS can change the name to avoid a Trash collision.
     static func moveToTrash(item: URL, workspaceRoot: URL) throws -> TrashMove {
         let candidate = try trashCandidate(item: item, workspaceRoot: workspaceRoot)
+        let parent = try openDirectory(
+            candidate.deletingLastPathComponent(),
+            workspaceRoot: workspaceRoot
+        )
+        defer { parent.close() }
+        let target = try trashTarget(for: candidate, in: parent)
         var resultingURL: NSURL?
-        try FileManager.default.trashItem(at: candidate, resultingItemURL: &resultingURL)
+        try FileManager.default.trashItem(at: target, resultingItemURL: &resultingURL)
         guard let trashed = resultingURL as URL? else {
             throw CocoaError(.fileWriteUnknown)
         }
@@ -366,7 +537,7 @@ enum WorkspaceFileOperations {
         in parent: URL,
         workspaceRoot: URL,
         isDirectory: Bool
-    ) throws -> URL {
+    ) throws -> (destination: URL, parent: DirectoryHandle) {
         try validateLeafName(proposedName)
         let parent = try validatedDirectory(parent, workspaceRoot: workspaceRoot)
         let destination = parent.appendingPathComponent(
@@ -376,7 +547,80 @@ enum WorkspaceFileOperations {
         guard !FileManager.default.fileExists(atPath: destination.path) else {
             throw OperationError.destinationExists
         }
-        return destination
+        return (destination, try openDirectory(parent, workspaceRoot: workspaceRoot))
+    }
+
+    private static func relativeComponents(of item: URL, under root: URL) throws -> [String] {
+        let rootPath = root.standardizedFileURL.path
+        let itemPath = item.standardizedFileURL.path
+        if itemPath == rootPath { return [] }
+        guard itemPath.hasPrefix(rootPath + "/") else {
+            throw OperationError.outsideWorkspace
+        }
+        let components = itemPath
+            .dropFirst(rootPath.count + 1)
+            .split(separator: "/")
+            .map(String.init)
+        guard !components.isEmpty,
+              !components.contains(where: { $0 == "." || $0 == ".." }) else {
+            throw OperationError.outsideWorkspace
+        }
+        return components
+    }
+
+    /// Maps an `openat` failure onto this boundary's own vocabulary. macOS
+    /// reports `O_DIRECTORY` plus `O_NOFOLLOW` on a link as `ENOTDIR`, so the
+    /// entry itself has to separate "not a folder" from "symbolic link".
+    private static func openFailure(
+        _ code: Int32,
+        in parent: DirectoryHandle,
+        named name: String
+    ) -> Error {
+        switch code {
+        case ENOENT:
+            return OperationError.missingItem
+        case ELOOP:
+            return OperationError.symbolicLink
+        case ENOTDIR:
+            if let entry = parent.entry(named: name), entry.st_mode & S_IFMT == S_IFLNK {
+                return OperationError.symbolicLink
+            }
+            return OperationError.notDirectory
+        case EACCES, EPERM:
+            return CocoaError(.fileReadNoPermission)
+        default:
+            return CocoaError(.fileReadUnknown)
+        }
+    }
+
+    private static func renameFailure(_ code: Int32) -> Error {
+        switch code {
+        case EEXIST, ENOTEMPTY:
+            return OperationError.destinationExists
+        case ENOENT:
+            return OperationError.missingItem
+        case EINVAL:
+            return OperationError.destinationInsideItem
+        case EXDEV:
+            return OperationError.crossVolume
+        case EACCES, EPERM:
+            return CocoaError(.fileWriteNoPermission)
+        default:
+            return CocoaError(.fileWriteUnknown)
+        }
+    }
+
+    private static func isSameEntry(
+        _ firstParent: DirectoryHandle,
+        _ firstName: String,
+        _ secondParent: DirectoryHandle,
+        _ secondName: String
+    ) -> Bool {
+        guard let first = firstParent.entry(named: firstName),
+              let second = secondParent.entry(named: secondName) else {
+            return false
+        }
+        return first.st_dev == second.st_dev && first.st_ino == second.st_ino
     }
 
     private static func validatedDirectory(_ directory: URL, workspaceRoot: URL) throws -> URL {

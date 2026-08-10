@@ -32,6 +32,130 @@ struct SettingsView: View {
     /// Identifiable wrapper so the confirmation presents via `.alert(item:)`.
     private struct RestartRequest: Identifiable { let id = UUID() }
 
+    enum SoftwareUpdateActionPresentation: Equatable {
+        case restart
+        case installing
+        case checking
+        case check(SoftwareUpdateCheckAvailability)
+
+        static let installingAccessibilityLabel = "Installing update and restarting Kaisola"
+
+        var checkAvailability: SoftwareUpdateCheckAvailability? {
+            guard case .check(let availability) = self else { return nil }
+            return availability
+        }
+
+        static func resolve(
+            canInstall: Bool,
+            isInstalling: Bool,
+            isChecking: Bool,
+            canCheck: Bool,
+            sparkleIsPresenting: Bool
+        ) -> SoftwareUpdateActionPresentation {
+            // Installing wins even if an inconsistent caller also claims the
+            // ready action is available: fail closed against a second invocation.
+            if isInstalling { return .installing }
+            if canInstall { return .restart }
+            if isChecking { return .checking }
+            if sparkleIsPresenting { return .check(.updateWindowOpen) }
+            if !canCheck { return .check(.unavailable) }
+            return .check(.ready)
+        }
+    }
+
+    enum SoftwareUpdateCheckAvailability: Equatable {
+        case ready
+        case unavailable
+        case updateWindowOpen
+
+        var isEnabled: Bool { self == .ready }
+
+        var visibleTitle: String {
+            switch self {
+            case .ready: "Check Now"
+            case .unavailable: "Unavailable"
+            case .updateWindowOpen: "Update Window Open"
+            }
+        }
+
+        var accessibilityLabel: String {
+            switch self {
+            case .ready: "Check for updates now"
+            case .unavailable: "Check for updates unavailable"
+            case .updateWindowOpen: "Update window already open"
+            }
+        }
+
+        var accessibilityHint: String {
+            switch self {
+            case .ready: "Opens Kaisola's update checker."
+            case .unavailable: "This build does not include an update checker."
+            case .updateWindowOpen:
+                "Finish or close the existing update window before checking again."
+            }
+        }
+    }
+
+    enum SoftwareUpdateDownloadAvailability: Equatable {
+        case ready
+        case updaterUnavailable
+        case interactiveUpdateRequired
+        case automaticChecksRequired
+
+        static func resolve(
+            canConfigureUpdates: Bool,
+            allowsAutomaticUpdates: Bool,
+            automaticallyChecksForUpdates: Bool
+        ) -> SoftwareUpdateDownloadAvailability {
+            if !canConfigureUpdates { return .updaterUnavailable }
+            if !allowsAutomaticUpdates { return .interactiveUpdateRequired }
+            if !automaticallyChecksForUpdates { return .automaticChecksRequired }
+            return .ready
+        }
+
+        var isEnabled: Bool { self == .ready }
+
+        var visibleDetail: String {
+            switch self {
+            case .ready:
+                "Kaisola asks before restarting to install"
+            case .updaterUnavailable:
+                "Unavailable because this build cannot configure automatic updates"
+            case .interactiveUpdateRequired:
+                "This update type must be downloaded interactively"
+            case .automaticChecksRequired:
+                "Turn on automatic checks first"
+            }
+        }
+
+        var accessibilityHint: String {
+            switch self {
+            case .ready:
+                "Downloads updates in the background. Kaisola asks before restarting to install."
+            case .updaterUnavailable:
+                "Background downloads are unavailable because this build cannot configure automatic updates."
+            case .interactiveUpdateRequired:
+                "Background downloads are unavailable because this update type requires an interactive download."
+            case .automaticChecksRequired:
+                "Enable Check for updates automatically before enabling background downloads."
+            }
+        }
+    }
+
+    private struct SoftwareUpdateInstallingIndicator: View {
+        var body: some View {
+            HStack(spacing: 7) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Restarting…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(SoftwareUpdateActionPresentation.installingAccessibilityLabel)
+        }
+    }
+
     /// Names exactly what a relaunch costs. Terminals are called out as safe
     /// because they genuinely are — they live in the detached broker and resume
     /// from their byte cursor — and saying so is what makes the prompt
@@ -51,7 +175,12 @@ struct SettingsView: View {
             forInfoDictionaryKey: "CFBundleShortVersionString"
         ) as? String ?? "—"
         if let pending = updates.pendingUpdate {
-            return "Kaisola \(version) — \(pending.version) is downloaded and ready to install"
+            switch pending.phase {
+            case .ready:
+                return "Kaisola \(version) — \(pending.version) is downloaded and ready to install"
+            case .installing:
+                return "Kaisola \(version) — installing \(pending.version) and restarting…"
+            }
         }
         if let updateDetail {
             // An unavailable updater states its reason, not a channel name.
@@ -70,6 +199,27 @@ struct SettingsView: View {
             }
             return "Kaisola \(version)"
         }
+    }
+
+    private var softwareUpdateActionPresentation: SoftwareUpdateActionPresentation {
+        SoftwareUpdateActionPresentation.resolve(
+            canInstall: updates.canInstallPendingUpdate,
+            isInstalling: updates.isInstallingUpdate,
+            isChecking: {
+                if case .checking = updates.checkStatus { return true }
+                return false
+            }(),
+            canCheck: checkForUpdates != nil,
+            sparkleIsPresenting: updates.sparkleIsPresentingUpdate
+        )
+    }
+
+    private var softwareUpdateDownloadAvailability: SoftwareUpdateDownloadAvailability {
+        SoftwareUpdateDownloadAvailability.resolve(
+            canConfigureUpdates: updates.canConfigureUpdates,
+            allowsAutomaticUpdates: updates.allowsAutomaticUpdates,
+            automaticallyChecksForUpdates: updates.automaticallyChecksForUpdates
+        )
     }
 
     private static func relative(_ date: Date) -> String {
@@ -144,6 +294,7 @@ struct SettingsView: View {
                 title: Text("Restart Kaisola to install?"),
                 message: Text(restartWarning),
                 primaryButton: .default(Text("Restart and Update")) {
+                    restartRequest = nil
                     UpdateCenter.shared.installAndRelaunch()
                 },
                 secondaryButton: .cancel(Text("Later"))
@@ -168,6 +319,11 @@ struct SettingsView: View {
         }
         .onChange(of: selectedSection) { _, section in
             sectionChanged?(section.rawValue)
+        }
+        .onChange(of: updates.canInstallPendingUpdate) { _, canInstall in
+            // `UpdateCenter` is app-global: if another window starts the
+            // install, dismiss this window's now-stale confirmation too.
+            if !canInstall { restartRequest = nil }
         }
     }
 
@@ -487,22 +643,30 @@ struct SettingsView: View {
                         detail: softwareUpdateDetail,
                         symbol: "app.badge.checkmark"
                     ) {
-                        if updates.pendingUpdate != nil {
+                        switch softwareUpdateActionPresentation {
+                        case .restart:
                             Button("Restart and Update") { restartRequest = RestartRequest() }
                                 .buttonStyle(.borderedProminent)
                                 .controlSize(.small)
-                        } else if case .checking = updates.checkStatus {
+                        case .installing:
+                            SoftwareUpdateInstallingIndicator()
+                        case .checking:
                             ProgressView()
                                 .controlSize(.small)
                                 .accessibilityLabel("Checking for updates")
-                        } else {
+                        case .check(let availability):
                             // Steps aside while Sparkle's own window is up so
                             // the two UIs never fight over one check.
-                            Button("Check Now") { checkForUpdates?() }
+                            Button(availability.visibleTitle) {
+                                guard availability.isEnabled else { return }
+                                checkForUpdates?()
+                            }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
-                                .disabled(checkForUpdates == nil
-                                          || updates.sparkleIsPresentingUpdate)
+                                .disabled(!availability.isEnabled)
+                                .accessibilityLabel(availability.accessibilityLabel)
+                                .accessibilityHint(availability.accessibilityHint)
+                                .help(availability.accessibilityHint)
                         }
                     }
                     SettingsDivider()
@@ -523,7 +687,7 @@ struct SettingsView: View {
                     SettingsDivider()
                     SettingsRow(
                         title: "Download updates in the background",
-                        detail: "Kaisola asks before restarting to install",
+                        detail: softwareUpdateDownloadAvailability.visibleDetail,
                         symbol: "arrow.down.circle"
                     ) {
                         Toggle("", isOn: Binding(
@@ -532,12 +696,10 @@ struct SettingsView: View {
                         ))
                         .labelsHidden()
                         .toggleStyle(.switch)
-                        // Sparkle refuses silent downloads for update kinds it
-                        // insists on showing (a major upgrade, for instance).
-                        .disabled(!updates.canConfigureUpdates
-                                  || !updates.allowsAutomaticUpdates
-                                  || !updates.automaticallyChecksForUpdates)
+                        .disabled(!softwareUpdateDownloadAvailability.isEnabled)
                         .accessibilityLabel("Download updates in the background")
+                        .accessibilityHint(softwareUpdateDownloadAvailability.accessibilityHint)
+                        .help(softwareUpdateDownloadAvailability.accessibilityHint)
                     }
                 }
             }

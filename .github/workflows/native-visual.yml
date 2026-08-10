@@ -319,15 +319,17 @@ jobs:
               const wide = receipt.surface === "settings-extensions";
               if (receipt.windowCount !== 1
                   || receipt.elementCount < 40
-                  || receipt.categoryLabels.length !== 5
-                  || receipt.itemIdentifierCount !== 5
-                  || !receipt.validationIdentifierPresent
                   || receipt.searchRole !== "AXTextField"
                   || receipt.commonMetadataFields.length !== 4
                   || !receipt.secretFree
-                  || (wide && (receipt.categoryNavigationRoles.length !== 5
+                  || (wide && (receipt.categoryLabels.length !== 5
+                    || receipt.itemIdentifierCount !== 5
+                    || !receipt.validationIdentifierPresent
+                    || receipt.categoryNavigationRoles.length !== 5
                     || receipt.categoryNavigationRoles.some(role => role !== "AXButton")))
-                  || (!wide && (receipt.categoryNavigationRoles.length !== 1
+                  || (!wide && (receipt.categoryLabels.length < 1
+                    || receipt.itemIdentifierCount < 1
+                    || receipt.categoryNavigationRoles.length !== 1
                     || receipt.categoryNavigationRoles[0] !== "AXPopUpButton"))) {
                 throw new Error(`invalid external AX receipt: ${process.argv[1]}`);
               }

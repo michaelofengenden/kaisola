@@ -201,11 +201,15 @@ test('custom ACP containment sources select launch and approval contracts', () =
   assert.equal(plan.fallback, false)
 })
 
-test('terminal theme persistence and settings retain recovery contracts', () => {
+test('extension registry persistence and settings retain recovery contracts', () => {
   const expectations = [
     [
       'native/KaisolaMac/Kaisola/Features/Sessions/CustomThemeStore.swift',
       ['ExtensionsSettingsHubTests', 'TerminalThemeRegistryTests'],
+    ],
+    [
+      'native/KaisolaMac/Kaisola/Features/Workspace/CustomGrammarStore.swift',
+      ['CustomGrammarRegistryTests', 'ExtensionsSettingsHubTests', 'SyntaxHighlighterTests'],
     ],
     [
       'native/KaisolaMac/Kaisola/Features/Settings/ExtensionsSettingsHub.swift',

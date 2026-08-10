@@ -844,21 +844,67 @@ private struct TerminalThemesExtensionEditor: View {
 
 private struct LanguageGrammarsExtensionEditor: View {
     let highlightedID: String?
-    @State private var specs: [CustomGrammarSpec] = []
+    @State private var snapshot = CustomGrammarStore.Snapshot(specs: [], state: .missing)
     @State private var name = ""
     @State private var extensionsText = ""
     @State private var fencesText = ""
     @State private var pattern = ""
     @State private var role = "keyword"
+    @State private var operationError: String?
+    @State private var confirmReset = false
     private let store = CustomGrammarStore()
 
     var body: some View {
         ScrollViewReader { proxy in
             Form {
                 ExtensionCategoryIntro(category: .languageGrammars, workspace: nil)
+                if !snapshot.state.allowsMutations {
+                    Section("Registry Recovery") {
+                        let item = ExtensionSettingsItem.languageGrammarRegistryIssue(snapshot.state)
+                        Label(item.versionIntegrity, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                            .accessibilityIdentifier("extensions.grammars.registry-warning")
+                        if let message = item.validationMessage {
+                            Text(message)
+                                .font(.callout)
+                                .foregroundStyle(.kaisolaSecondary)
+                        }
+                        if let recoveryURL = snapshot.state.preservedCopyURL {
+                            Text(recoveryURL.path)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.kaisolaSecondary)
+                                .textSelection(.enabled)
+                                .lineLimit(2)
+                                .accessibilityLabel("Language grammar recovery copy \(recoveryURL.lastPathComponent)")
+                            HStack {
+                                Button("Reveal Recovery Copy") {
+                                    NSWorkspace.shared.activateFileViewerSelecting([recoveryURL])
+                                }
+                                Button("Reset Registry", role: .destructive) {
+                                    confirmReset = true
+                                }
+                                .disabled(!snapshot.state.canReset)
+                                .accessibilityHint("Replaces the active unreadable registry with an empty version. The recovery copy is kept.")
+                            }
+                        } else {
+                            Button("Reload Registry") { reload() }
+                                .accessibilityHint("Tries to read and preserve the language-grammar registry again.")
+                        }
+                    }
+                    .id(CustomGrammarStore.registryIssueID)
+                }
+                if let operationError {
+                    Section("Save Error") {
+                        Label(operationError, systemImage: "xmark.circle.fill")
+                            .foregroundStyle(.red)
+                            .accessibilityIdentifier("extensions.grammars.save-error")
+                    }
+                }
                 Section("Installed Grammars") {
                     if specs.isEmpty {
-                        Text("No custom grammars. Built-in languages keep working as usual.")
+                        Text(snapshot.state.allowsMutations
+                            ? "No custom grammars. Built-in languages keep working as usual."
+                            : "No last-known-good custom grammars are available. Recover or reset the registry before adding one.")
                             .font(.callout)
                             .foregroundStyle(.kaisolaSecondary)
                             .accessibilityIdentifier("extensions.grammars.empty")
@@ -869,6 +915,7 @@ private struct LanguageGrammarsExtensionEditor: View {
                                 Image(systemName: "trash")
                             }
                             .buttonStyle(.borderless)
+                            .disabled(!snapshot.state.allowsMutations)
                             .accessibilityLabel("Remove grammar \(spec.title)")
                         }
                         .id(spec.id)
@@ -906,11 +953,23 @@ private struct LanguageGrammarsExtensionEditor: View {
             .formStyle(.grouped)
             .padding(6)
             .onAppear {
-                specs = store.specs()
+                reload()
                 scrollToHighlight(using: proxy)
+            }
+            .confirmationDialog(
+                "Reset custom language grammars?",
+                isPresented: $confirmReset,
+                titleVisibility: .visible
+            ) {
+                Button("Reset Registry", role: .destructive) { reset() }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Kaisola will replace the active unreadable registry with an empty version. The recovery copy will remain on disk.")
             }
         }
     }
+
+    private var specs: [CustomGrammarSpec] { snapshot.specs }
 
     private func scrollToHighlight(using proxy: ScrollViewProxy) {
         guard let highlightedID else { return }
@@ -920,7 +979,8 @@ private struct LanguageGrammarsExtensionEditor: View {
     }
 
     private var canAdd: Bool {
-        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        snapshot.state.allowsMutations
+            && !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !extensionsText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             && !pattern.isEmpty
     }
@@ -942,23 +1002,54 @@ private struct LanguageGrammarsExtensionEditor: View {
                 anchorsMatchLines: nil
             )]
         )
-        if let reason = store.upsert(spec) {
-            ToastCenter.shared.show("Added as disabled: \(reason)", style: .info, duration: 6)
-        } else {
-            ToastCenter.shared.show("Added \(spec.title)", style: .success)
+        do {
+            let reason = try store.upsert(spec)
+            reload()
+            name = ""
+            extensionsText = ""
+            fencesText = ""
+            pattern = ""
+            if let reason {
+                ToastCenter.shared.show("Added as disabled: \(reason)", style: .info, duration: 6)
+            } else {
+                ToastCenter.shared.show("Added \(spec.title)", style: .success)
+            }
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
         }
-        specs = store.specs()
-        name = ""
-        extensionsText = ""
-        fencesText = ""
-        pattern = ""
-        NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
     }
 
     private func remove(_ spec: CustomGrammarSpec) {
-        _ = store.remove(id: spec.id)
-        specs = store.specs()
-        NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        do {
+            _ = try store.remove(id: spec.id)
+            reload()
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
+        }
+    }
+
+    private func reset() {
+        do {
+            snapshot = try store.resetUnreadableRegistry()
+            operationError = nil
+            ToastCenter.shared.show("Reset language grammars; recovery copy kept", style: .success, duration: 6)
+            NotificationCenter.default.post(name: .kaisolaExtensionsChanged, object: nil)
+        } catch {
+            report(error)
+        }
+    }
+
+    private func reload() {
+        snapshot = store.load()
+        operationError = nil
+    }
+
+    private func report(_ error: Error) {
+        snapshot = store.load()
+        operationError = error.localizedDescription
+        ToastCenter.shared.show(error.localizedDescription, style: .error, duration: 6)
     }
 }
 

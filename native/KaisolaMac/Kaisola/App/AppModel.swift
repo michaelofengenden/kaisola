@@ -2481,6 +2481,14 @@ final class AppModel: ObservableObject {
         return removal
     }
 
+    /// Enqueue every member before any outcome is awaited. A failure for one
+    /// Mesh column must not leave the remaining column transcripts unattempted.
+    func enqueueTranscriptRemovals(
+        chatIDs: [String]
+    ) -> [Task<AcpTranscriptStore.Removal, Never>] {
+        chatIDs.map { enqueueTranscriptRemoval(chatID: $0) }
+    }
+
     /// Wait for queued transcript deletions and report the first that did not
     /// commit, so a caller can replace its success message with the truth.
     private func firstTranscriptRemovalFailure(
@@ -2769,8 +2777,10 @@ final class AppModel: ObservableObject {
                       chats.contains(where: { $0.id == descriptor.id }) == false,
                       // A tombstoned chat was deleted; a stale archived pane
                       // (crash between phases, another window) must not
-                      // revive it (§4e).
-                      await transcriptStore.isTombstoned(chatID: descriptor.id) == false,
+                      // revive it (§4e). Only a proven `.absent` restores, so a
+                      // lookup the store cannot complete on a busy, corrupt, or
+                      // unreadable database leaves the pane out instead.
+                      await transcriptStore.tombstoneState(chatID: descriptor.id) == .absent,
                       let agent = AgentRegistry.profile(id: descriptor.agentID) else { continue }
                 let directory = URL(fileURLWithPath: descriptor.workspacePath, isDirectory: true)
                     .standardizedFileURL
@@ -3392,20 +3402,20 @@ final class AppModel: ObservableObject {
     }
 
     /// The explicit permanent-delete boundary for a live chat.
-    func deleteChat(_ chatID: String) async {
+    @discardableResult
+    func deleteChat(_ chatID: String) async -> AcpTranscriptStore.Removal {
         // Tombstone FIRST (§4e): the durable record of intent that every
         // later phase — and every other window sharing the database —
         // converges on, even across a crash. A failed write aborts the
         // delete instead of reporting success. If the app dies before this
         // lands, the delete simply didn't happen — never half-happened.
-        do {
-            try await transcriptStore.tombstone(chatID: chatID)
-        } catch {
+        let tombstoneResult = await transcriptStore.tombstone(chatID: chatID)
+        if case let .failed(error) = tombstoneResult {
             ToastCenter.shared.show(
-                "Couldn't delete the chat: \(error.kaisolaSafeDescription)",
+                "Couldn't delete the chat: \(error.message)",
                 style: .error
             )
-            return
+            return .failed(error)
         }
         let closingChat = chats.first(where: { $0.id == chatID })
         if let closingChat {
@@ -3450,12 +3460,14 @@ final class AppModel: ObservableObject {
         // The tombstone already keeps the chat closed, but a DELETE that never
         // committed left its bytes on disk. Say that instead of letting the
         // silent close read as a finished permanent delete.
-        if let failure = await removal.value.failureMessage {
+        let removalResult = await removal.value
+        if let failure = removalResult.failureMessage {
             ToastCenter.shared.show(
                 "The chat is closed, but its transcript could not be erased from disk: \(failure)",
                 style: .error
             )
         }
+        return removalResult
     }
 
     /// Stop the adapter without deleting the surface, transcript, or draft.
@@ -3743,7 +3755,7 @@ final class AppModel: ObservableObject {
             var layout = paneLayouts[projectID] ?? SessionPaneLayout()
             layout.remove(meshID)
             paneLayouts[projectID] = layout
-            let removals = columnIDs.map { enqueueTranscriptRemoval(chatID: $0) }
+            let removals = enqueueTranscriptRemovals(chatIDs: columnIDs)
             enqueueDraftRemoval(stableKey: "mesh|\(meshID)")
             await persistWorkspaceStateImmediately(projectID: projectID)
             if let failure = await firstTranscriptRemovalFailure(removals) {
@@ -3935,7 +3947,7 @@ final class AppModel: ObservableObject {
         case .safe:
             // The user crossed the permanent-delete boundary. Remove column
             // data even if writing the final archive tombstone needs a retry.
-            let removals = columnIDs.map { enqueueTranscriptRemoval(chatID: $0) }
+            let removals = enqueueTranscriptRemovals(chatIDs: columnIDs)
             enqueueDraftRemoval(stableKey: "mesh|\(surfaceID)")
             do {
                 try await workspaceStateStore.removeMeshState(

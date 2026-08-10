@@ -751,13 +751,10 @@ final class AppModelProjectContextTests: XCTestCase {
         let root = storeFile.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let transcriptStore = AcpTranscriptStore(
-            fileURL: root.appendingPathComponent("transcripts.json")
-        )
-        // A directory standing where the database file belongs fails every
-        // open, so the DELETE can never commit.
-        try FileManager.default.createDirectory(
-            at: transcriptStore.databaseURL,
-            withIntermediateDirectories: true
+            databaseURL: root.appendingPathComponent("transcripts.sqlite3"),
+            writerID: "project-context-removal-failure",
+            schedulesAutomaticFlush: false,
+            injectedRemovalFailure: .open
         )
         let model = AppModel(
             sessionStore: NativeSessionStore(fileURL: storeFile),

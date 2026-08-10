@@ -3,6 +3,7 @@ import KaisolaBrokerProtocol
 
 enum ObserveOnlyBrokerMethod: String, CaseIterable, Sendable {
     case status = "broker.status"
+    case inventory = "broker.inventory"
     case list = "terminal.list"
     case diagnostics = "terminal.diagnostics"
     case history = "terminal.history"

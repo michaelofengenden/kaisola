@@ -9,6 +9,10 @@ enum AcpTranscriptRow: Codable, Identifiable, Equatable, Sendable {
     /// `failed` marks an optimistic send whose prompt request errored — the row
     /// stays visible with a retry affordance instead of vanishing.
     case user(id: String, text: String, failed: Bool)
+    /// Client-owned immutable launch-policy evidence emitted immediately
+    /// before each user turn. It is durable and contains identifiers only — no
+    /// credentials, prompt text, or environment values.
+    case runProfileAudit(id: String, snapshot: AcpRunProfile)
     case message(id: String, text: String)
     case thought(id: String, text: String)
     case tool(AcpToolCall)
@@ -21,6 +25,7 @@ enum AcpTranscriptRow: Codable, Identifiable, Equatable, Sendable {
     var id: String {
         switch self {
         case let .user(id, _, _): "user-\(id)"
+        case let .runProfileAudit(id, _): "run-profile-\(id)"
         case let .message(id, _): "msg-\(id)"
         case let .thought(id, _): "thought-\(id)"
         case let .tool(call): "tool-\(call.id)"
@@ -259,10 +264,20 @@ final class AcpConversation: ObservableObject {
     @Published private(set) var modes: [AcpSessionInfo.Mode] = []
     @Published private(set) var currentModeID: String?
     @Published private(set) var configOptions: [AcpConfigOption] = []
+    /// Durable, adapter-confirmed boolean values only. Select controls remain
+    /// adapter-session state; these values are explicitly persisted because an
+    /// ACP boolean has no safe string fallback when a session must be recreated.
+    @Published private(set) var confirmedBooleanConfigValues: [String: Bool]
     /// The one adapter-owned setting currently awaiting confirmation. Keeping
     /// the prior value visible until this clears prevents a rejected effort
     /// level from masquerading as the value the next prompt will use.
     @Published private(set) var pendingConfigOptionID: String?
+    /// Present before any prompt can be dispatched when a restored/requested
+    /// model was silently substituted by the adapter.
+    @Published private(set) var pendingModelFallback: AcpModelFallback?
+    /// Context-rich adapter launch failure with a direct Settings recovery
+    /// destination. Cleared on every new start attempt.
+    @Published private(set) var providerStartupFailure: AcpProviderStartupFailure?
     @Published private(set) var commands: [AcpCommand] = []
     /// Whether this adapter advertised `_session/steering` at `initialize`.
     /// Reset on every connect so a swapped agent can never inherit the previous
@@ -372,6 +387,9 @@ final class AcpConversation: ObservableObject {
     /// ephemeral view state. AppModel uses this hook to archive their exact
     /// FIFO order whenever the queue changes.
     var onQueueChanged: (([String]) -> Void)?
+    /// AppModel persists the accepted actual model while retaining this chat's
+    /// immutable account binding and live conversation identity.
+    var onConfirmedModelFallback: ((String) -> Void)?
     /// Stable per-chat key for persisting the composer draft across relaunches.
     /// Set by the owner (AppModel passes the chat id) or the `draftKey` init
     /// parameter. Nil disables persistence: `loadDraft` returns "" and
@@ -417,7 +435,9 @@ final class AcpConversation: ObservableObject {
     private let transcriptAgentID: String
     private let transcriptAgentName: String?
     private let transcriptModelID: String?
+    private let providerContext: AcpProviderLaunchContext
     private let mcpServers: [JSONValue]
+    let runProfile: AcpRunProfile
     private let ruleStore: PermissionRuleStore
     private let sensitiveGlobs: [String]
     private let resumeSessionID: String?
@@ -517,7 +537,9 @@ final class AcpConversation: ObservableObject {
         transcriptAgentID: String = "unknown-agent",
         transcriptAgentName: String? = nil,
         transcriptModelID: String? = nil,
+        providerContext: AcpProviderLaunchContext? = nil,
         mcpServers: [JSONValue] = [],
+        runProfile: AcpRunProfile = .write,
         client: AcpClient? = nil,
         clientFactory: (@MainActor () -> AcpClient)? = nil,
         ruleStore: PermissionRuleStore = PermissionRuleStore(),
@@ -546,7 +568,13 @@ final class AcpConversation: ObservableObject {
         self.transcriptAgentID = transcriptAgentID
         self.transcriptAgentName = transcriptAgentName
         self.transcriptModelID = transcriptModelID
+        self.providerContext = providerContext ?? AcpProviderLaunchContext(
+            providerName: transcriptAgentName ?? transcriptAgentID,
+            accountLabel: "Default account",
+            defaultSettingsSectionID: "agents"
+        )
         self.mcpServers = mcpServers
+        self.runProfile = runProfile
         let factory = clientFactory ?? { AcpClient() }
         self.clientFactory = factory
         self.client = client ?? factory()
@@ -572,6 +600,9 @@ final class AcpConversation: ObservableObject {
         self.unloadedEarlierRowCount = max(0, initialEarlierRowCount)
         self.transcriptRetentionStatus = initialRetentionStatus
         self.restoredDraft = initialDraft
+        self.confirmedBooleanConfigValues = draftKey.map {
+            Self.loadPersistedBooleanConfigValues(for: $0)
+        } ?? [:]
         self.pendingAttachments = Self.restoredPendingAttachments(initialAttachments)
         self.attachmentCounter = self.pendingAttachments.count
         self.usage = initialUsage
@@ -594,6 +625,8 @@ final class AcpConversation: ObservableObject {
     func start(resumeQueuedPrompts: Bool = false) async {
         guard !hasStarted else { return }
         hasStarted = true
+        providerStartupFailure = nil
+        pendingModelFallback = nil
         invalidateConfigOptionRequest()
         // One ordered pipe from the client's (off-main) event handler to the
         // MainActor consumer: yields preserve order, and a single draining task
@@ -626,19 +659,52 @@ final class AcpConversation: ObservableObject {
                 cwd: launch.cwd,
                 mcpServers: mcpServers,
                 resumeSessionID: providerSessionID ?? resumeSessionID,
-                access: launch.access
+                access: launch.access,
+                runProfile: runProfile
             )
             providerSessionID = info.sessionID
             onProviderSessionID?(info.sessionID)
             models = info.models
             currentModelID = info.currentModelID
+            if let requestedID = transcriptModelID?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !requestedID.isEmpty,
+               let actualID = info.currentModelID?.trimmingCharacters(in: .whitespacesAndNewlines),
+               !actualID.isEmpty,
+               requestedID != actualID {
+                pendingModelFallback = AcpModelFallback(
+                    requestedID: requestedID,
+                    requestedLabel: info.models.first(where: { $0.id == requestedID })?.name ?? requestedID,
+                    actualID: actualID,
+                    actualLabel: info.models.first(where: { $0.id == actualID })?.name ?? actualID,
+                    providerName: providerContext.providerName,
+                    accountLabel: providerContext.accountLabel
+                )
+            }
             modes = info.modes
             currentModeID = info.currentModeID
-            configOptions = info.configOptions
+            var confirmedOptions = info.configOptions
+            var restorationFailure: String?
+            for (id, desiredValue) in confirmedBooleanConfigValues.sorted(by: { $0.key < $1.key }) {
+                guard let option = confirmedOptions.first(where: { $0.id == id }),
+                      let currentValue = option.booleanValue,
+                      currentValue != desiredValue else { continue }
+                do {
+                    confirmedOptions = try await client.setConfigOption(
+                        id: id,
+                        value: .boolean(desiredValue)
+                    )
+                } catch {
+                    let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    restorationFailure = "Couldn’t restore \(option.name) to \(desiredValue ? "On" : "Off"). \(detail)"
+                }
+            }
+            applyConfirmedConfigOptions(confirmedOptions)
             supportsSteering = info.supportsSteering
             isConnected = true
-            statusMessage = nil
-            lastConfigOptionFailureMessage = nil
+            statusMessage = pendingModelFallback.map {
+                "\($0.providerName) substituted \($0.actualLabel) for requested \($0.requestedLabel). Accept the actual model or cancel before inference."
+            } ?? restorationFailure
+            lastConfigOptionFailureMessage = restorationFailure
             // Only entries still in `queued` are known never to have been
             // dispatched. An explicit adapter restart resumes them; ordinary
             // app restoration leaves them paused until the user chooses Resume
@@ -650,10 +716,33 @@ final class AcpConversation: ObservableObject {
             eventContinuation = nil
             eventConsumerTask?.cancel()
             eventConsumerTask = nil
-            statusMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            let failure = AcpProviderStartupFailure(context: providerContext, detail: detail)
+            providerStartupFailure = failure
+            statusMessage = failure.summary
             isConnected = false
             supportsSteering = false
         }
+    }
+
+    /// A connected adapter is not inference-ready while it is waiting for an
+    /// explicit model-substitution decision.
+    var allowsInference: Bool {
+        isConnected && pendingModelFallback == nil
+    }
+
+    func acceptModelFallback() {
+        guard let fallback = pendingModelFallback else { return }
+        pendingModelFallback = nil
+        statusMessage = "Using \(fallback.actualLabel) instead of requested \(fallback.requestedLabel)."
+        onConfirmedModelFallback?(fallback.actualID)
+        flushQueue()
+    }
+
+    func cancelModelFallback() async {
+        guard let fallback = pendingModelFallback else { return }
+        _ = await stop()
+        statusMessage = "Model fallback from \(fallback.requestedLabel) to \(fallback.actualLabel) was cancelled before inference."
     }
 
     var canRestart: Bool {
@@ -690,7 +779,7 @@ final class AcpConversation: ObservableObject {
     func send(_ text: String) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachments = pendingAttachments.map(\.attachment)
-        guard isConnected, !trimmed.isEmpty || !attachments.isEmpty else { return false }
+        guard allowsInference, !trimmed.isEmpty || !attachments.isEmpty else { return false }
         if isRunning {
             // A running turn queues this as a TEXT-ONLY follow-up. Queued
             // follow-ups deliberately never carry attachments (the flush path
@@ -779,6 +868,7 @@ final class AcpConversation: ObservableObject {
     /// rather than shown a second time.
     private func appendInjectedUserRow(_ text: String) {
         turnCounter += 1
+        rows.append(.runProfileAudit(id: "\(turnCounter)", snapshot: runProfile))
         rows.append(.user(id: "\(turnCounter)", text: text, failed: false))
         userMessageLedger.recordLocal(text: text)
     }
@@ -958,6 +1048,7 @@ final class AcpConversation: ObservableObject {
         let rowID = "\(turnCounter)"
         let turn = turnCounter
         let displayText = Self.userText(trimmed, attachments: attachments)
+        rows.append(.runProfileAudit(id: rowID, snapshot: runProfile))
         rows.append(.user(id: rowID, text: displayText, failed: false))
         // Claude echoes any prompt carrying more than one content block (i.e.
         // every attachment send) straight back as `user_message_chunk`, and a
@@ -1027,20 +1118,48 @@ final class AcpConversation: ObservableObject {
     /// One request at a time also makes response order unambiguous.
     func selectConfigOption(_ id: String, value: String) {
         guard isConnected, pendingConfigOptionID == nil,
-              let option = configOptions.first(where: { $0.id == id }),
-              option.currentValue != value,
+              let option = configOptions.first(where: { $0.id == id }) else { return }
+
+        if option.booleanValue != nil {
+            guard let boolean = Bool(value) else { return }
+            selectBooleanConfigOption(id, value: boolean)
+            return
+        }
+
+        guard option.currentValue != value,
               let choice = option.choices.first(where: { $0.value == value }) else { return }
 
+        requestConfigOptionChange(option, value: .select(value), requestedLabel: choice.name)
+    }
+
+    func selectBooleanConfigOption(_ id: String, value: Bool) {
+        guard isConnected, pendingConfigOptionID == nil,
+              let option = configOptions.first(where: { $0.id == id }),
+              let confirmed = option.booleanValue,
+              confirmed != value else { return }
+
+        requestConfigOptionChange(
+            option,
+            value: .boolean(value),
+            requestedLabel: value ? "On" : "Off"
+        )
+    }
+
+    private func requestConfigOptionChange(
+        _ option: AcpConfigOption,
+        value: AcpConfigOption.Value,
+        requestedLabel: String
+    ) {
         configOptionRequestGeneration &+= 1
         let generation = configOptionRequestGeneration
-        pendingConfigOptionID = id
+        pendingConfigOptionID = option.id
         let requestClient = client
         Task { [weak self] in
             do {
-                let confirmed = try await requestClient.setConfigOption(id: id, value: value)
+                let confirmed = try await requestClient.setConfigOption(id: option.id, value: value)
                 guard let self, self.configOptionRequestGeneration == generation else { return }
                 self.pendingConfigOptionID = nil
-                self.configOptions = confirmed
+                self.applyConfirmedConfigOptions(confirmed)
                 if self.statusMessage == self.lastConfigOptionFailureMessage {
                     self.statusMessage = nil
                 }
@@ -1049,10 +1168,23 @@ final class AcpConversation: ObservableObject {
                 guard let self, self.configOptionRequestGeneration == generation else { return }
                 self.pendingConfigOptionID = nil
                 let detail = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                let message = "Couldn’t change \(option.name) to \(choice.name). \(detail)"
+                let message = "Couldn’t change \(option.name) to \(requestedLabel). \(detail)"
                 self.lastConfigOptionFailureMessage = message
                 self.statusMessage = message
             }
+        }
+    }
+
+    private func applyConfirmedConfigOptions(_ options: [AcpConfigOption]) {
+        configOptions = options
+        var booleans: [String: Bool] = [:]
+        for option in options {
+            if let value = option.booleanValue { booleans[option.id] = value }
+        }
+        guard booleans != confirmedBooleanConfigValues else { return }
+        confirmedBooleanConfigValues = booleans
+        if let draftStorageKey {
+            Self.persistBooleanConfigValues(booleans, for: draftStorageKey)
         }
     }
 
@@ -1457,6 +1589,7 @@ final class AcpConversation: ObservableObject {
         flushPendingChunk()
         isConnected = false
         isRunning = false
+        pendingModelFallback = nil
         supportsSteering = false
         injectingQueuedIDs.removeAll()
         statusMessage = queued.isEmpty
@@ -1592,6 +1725,46 @@ final class AcpConversation: ObservableObject {
         ["chatDraft.\(draftStorageKey)"]
     }
 
+    static func persistedBooleanConfigDefaultsKeys(for draftStorageKey: String) -> [String] {
+        ["chatBooleanConfig.\(draftStorageKey)"]
+    }
+
+    static func loadPersistedBooleanConfigValues(
+        for draftStorageKey: String,
+        defaults: UserDefaults = .standard
+    ) -> [String: Bool] {
+        guard let key = persistedBooleanConfigDefaultsKeys(for: draftStorageKey).first,
+              let data = defaults.data(forKey: key),
+              let decoded = try? JSONDecoder().decode([String: Bool].self, from: data) else {
+            return [:]
+        }
+        return Dictionary(
+            uniqueKeysWithValues: decoded.keys.sorted().prefix(64).compactMap { id in
+                guard !id.isEmpty, id.utf8.count <= 256, let value = decoded[id] else { return nil }
+                return (id, value)
+            }
+        )
+    }
+
+    private static func persistBooleanConfigValues(
+        _ values: [String: Bool],
+        for draftStorageKey: String,
+        defaults: UserDefaults = .standard
+    ) {
+        guard let key = persistedBooleanConfigDefaultsKeys(for: draftStorageKey).first else { return }
+        let bounded: [String: Bool] = Dictionary(
+            uniqueKeysWithValues: values.keys.sorted().prefix(64).compactMap { id in
+                guard !id.isEmpty, id.utf8.count <= 256, let value = values[id] else { return nil }
+                return (id, value)
+            }
+        )
+        guard !bounded.isEmpty, let data = try? JSONEncoder().encode(bounded) else {
+            defaults.removeObject(forKey: key)
+            return
+        }
+        defaults.set(data, forKey: key)
+    }
+
     static func removePersistedDraft(
         for draftStorageKey: String,
         currentDefaults: UserDefaults = .standard,
@@ -1599,7 +1772,9 @@ final class AcpConversation: ObservableObject {
             suiteName: KaisolaProductMigration.legacyBundleIdentifier
         )
     ) {
-        for key in persistedDraftDefaultsKeys(for: draftStorageKey) {
+        let keys = persistedDraftDefaultsKeys(for: draftStorageKey)
+            + persistedBooleanConfigDefaultsKeys(for: draftStorageKey)
+        for key in keys {
             currentDefaults.removeObject(forKey: key)
             migratedDefaults?.removeObject(forKey: key)
         }
@@ -1827,7 +2002,7 @@ final class AcpConversation: ObservableObject {
         case let .commands(list):
             commands = list
         case let .configOptions(options):
-            configOptions = options
+            applyConfirmedConfigOptions(options)
         case let .permission(request):
             handlePermission(request)
         case .turnEnded:
@@ -1869,7 +2044,7 @@ final class AcpConversation: ObservableObject {
     /// `applySteerOutcome` flushes again once the answer is in, so a refused
     /// injection is sent as its own turn immediately afterwards.
     private func flushQueue() {
-        guard !isRunning, isConnected, injectingQueuedIDs.isEmpty, !queued.isEmpty else { return }
+        guard !isRunning, allowsInference, injectingQueuedIDs.isEmpty, !queued.isEmpty else { return }
         let next = queued.removeFirst()
         dispatch(next.text)
     }

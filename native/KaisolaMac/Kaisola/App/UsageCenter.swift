@@ -36,17 +36,14 @@ enum AccountDirectory {
     /// silently redirect an existing provider continuation to different
     /// credentials.
     static func canonicalPath(_ rawValue: String) -> String? {
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              trimmed.count <= 4_096,
-              !trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
-        else { return nil }
+        guard let trimmed = UsageAccountProfile.validatedDirectory(rawValue) else { return nil }
         let expanded = (trimmed as NSString).expandingTildeInPath
         guard expanded.hasPrefix("/") else { return nil }
-        return URL(fileURLWithPath: expanded, isDirectory: true)
+        let canonical = URL(fileURLWithPath: expanded, isDirectory: true)
             .standardizedFileURL
             .resolvingSymlinksInPath()
             .path
+        return UsageAccountProfile.validatedDirectory(canonical)
     }
 
     /// Volume + inode of a directory that exists, as a comparable key. Resolved
@@ -91,10 +88,24 @@ struct UsageAccountProfile: Codable, Equatable, Identifiable, Sendable {
     var label: String
     var directory: String
 
+    /// Credential-directory pointers are persisted and later copied into a
+    /// provider subprocess environment. Keep their UTF-8 representation within
+    /// one 4 KiB field and reject terminal/NUL control bytes before storage.
+    static let maximumDirectoryBytes = 4_096
+
+    static func validatedDirectory(_ rawValue: String) -> String? {
+        guard rawValue.utf8.count <= maximumDirectoryBytes,
+              !rawValue.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else { return nil }
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+
     var normalized: UsageAccountProfile? {
         let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanDirectory = directory.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanLabel.isEmpty, !cleanDirectory.isEmpty else { return nil }
+        guard !cleanLabel.isEmpty,
+              let cleanDirectory = Self.validatedDirectory(directory) else { return nil }
         return UsageAccountProfile(
             id: id,
             provider: provider,
@@ -784,6 +795,7 @@ final class UsageCenter: ObservableObject {
         let profileID: String?
         let profileLabel: String?
         let ok: Bool
+        let authRequired: Bool?
         let sourceLabel: String
         let experimental: Bool?
         let account: String?
@@ -830,6 +842,7 @@ final class UsageCenter: ObservableObject {
             profileID: String? = nil,
             profileLabel: String? = nil,
             ok: Bool,
+            authRequired: Bool? = nil,
             sourceLabel: String,
             experimental: Bool? = nil,
             account: String? = nil,
@@ -843,6 +856,7 @@ final class UsageCenter: ObservableObject {
             self.profileID = profileID
             self.profileLabel = profileLabel
             self.ok = ok
+            self.authRequired = authRequired
             self.sourceLabel = sourceLabel
             self.experimental = experimental
             self.account = account
@@ -859,6 +873,7 @@ final class UsageCenter: ObservableObject {
                 profileID: request.profileID,
                 profileLabel: request.profileLabel,
                 ok: ok,
+                authRequired: authRequired,
                 sourceLabel: sourceLabel,
                 experimental: experimental,
                 account: account,
@@ -976,6 +991,7 @@ final class UsageCenter: ObservableObject {
     private let persistenceStore: AcpTranscriptStore?
     private let planUsageContextResolver: PlanUsageContextResolver
     private let usageAccountStore: UsageAccountStore
+    private let projectAccountRecoveryCenter: ProjectAccountRecoveryCenter
     private var persistenceTask: Task<Void, Never>?
     private var chatSources: [String: Set<String>] = [:]
 
@@ -983,6 +999,7 @@ final class UsageCenter: ObservableObject {
         now: @escaping () -> Date = Date.init,
         persistenceStore: AcpTranscriptStore? = nil,
         usageAccountStore: UsageAccountStore = UsageAccountStore(),
+        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = .shared,
         planUsageContextResolver: @escaping PlanUsageContextResolver = { workspace, environment in
             UsageCenter.planUsageContextKey(workspace: workspace, environment: environment)
         }
@@ -990,6 +1007,7 @@ final class UsageCenter: ObservableObject {
         self.now = now
         self.persistenceStore = persistenceStore
         self.usageAccountStore = usageAccountStore
+        self.projectAccountRecoveryCenter = projectAccountRecoveryCenter
         self.planUsageContextResolver = planUsageContextResolver
     }
 
@@ -1203,15 +1221,26 @@ final class UsageCenter: ObservableObject {
     /// credential reads, package hashing, and provider processes stay off the
     /// main actor.
     func refreshPlanUsage(workspace: URL?, force: Bool = false) {
-        let projectOverride = workspace.map {
-            ProjectAccountStore().override(
-                forProject: NativeSessionStore.projectID(forDirectory: $0.path)
-            )
-        } ?? nil
-        let overlay = ProjectAccountStore.mergedOverlay(
-            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-            project: projectOverride
-        )
+        let appOverlay = NativePreviewSettings.shared.agentEnvironmentOverlay
+        let overlay: [String: String]
+        if let workspace {
+            switch projectAccountRecoveryCenter.launchOverlay(
+                app: appOverlay,
+                forProject: NativeSessionStore.projectID(forDirectory: workspace.path)
+            ) {
+            case .success(let resolved):
+                overlay = resolved
+            case .failure(let issue):
+                planRefreshTask?.cancel()
+                planRefreshTask = nil
+                planRefreshGeneration &+= 1
+                isRefreshingPlanUsage = false
+                planUsageError = issue.message
+                return
+            }
+        } else {
+            overlay = appOverlay
+        }
         let environment = ProcessInfo.processInfo.environment.merging(overlay) { _, project in project }
         let profiles = usageAccountStore.profiles()
         let requests = Self.planUsageRequests(

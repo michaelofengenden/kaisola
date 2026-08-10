@@ -21,23 +21,33 @@ const {
   terminalCreateRoute,
   terminalIdLengthRejection,
   terminalKillRoute,
+  terminalReleaseRoute,
   terminalResizeRoute,
 } = require('./ipc/terminalCreateRoute.cjs')
 const { terminalDetachOwnerRoute } = require('./ipc/terminalDetachOwnerRoute.cjs')
-const { BrokerRequestGate, dispatchBrokerRequest } = require('./ipc/brokerRequestGate.cjs')
+const { BrokerMutationLedger, BrokerRequestGate, dispatchBrokerRequest } = require('./ipc/brokerRequestGate.cjs')
+const { collectBrokerInventorySnapshot } = require('./ipc/brokerInventorySnapshot.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
   SECURITY_EPOCH,
   BROKER_IMPLEMENTATION_VERSION,
   BROKER_PACKAGE_SCHEMA,
+  BROKER_ADMINISTRATION_FEATURE,
   FEATURES,
-  OBSERVER_ACCESS,
+  CONTROLLER_ACCESS,
+  ADMINISTRATOR_ACCESS,
   MAX_FRAME,
   inspectBrokerFrame,
   validateEncodedBrokerFrame,
   atomicJson,
+  administratorMethod,
+  brokerAccessSupported,
   brokerMethodAllowedForAccess,
+  brokerAccessGrantsAdministration,
+  brokerAccessGrantsGlobalObservation,
+  normalizeBrokerOwnerID,
+  brokerOwnerIDAllowedForAccess,
   negotiateFeatures,
   eventPayloadForFeatures,
   // Framing and queue accounting live in brokerWire so the observer layer can
@@ -85,6 +95,12 @@ function readLaunch() {
   for (const key of ['socketPath', 'infoFile', 'lockFile', 'storageDir', 'logFile']) {
     if (!path.isAbsolute(String(config[key] || ''))) throw new Error(`invalid ${key}`)
   }
+  if (config.maximumLiveTerminals != null
+      && (!Number.isSafeInteger(config.maximumLiveTerminals)
+        || config.maximumLiveTerminals < 1
+        || config.maximumLiveTerminals > mgr.MAX_CONFIGURABLE_LIVE_TERMINALS)) {
+    throw new Error('invalid maximumLiveTerminals')
+  }
   return config
 }
 
@@ -92,6 +108,7 @@ const config = readLaunch()
 const smoke = config.smoke === true
 process.umask(0o077)
 mgr.configureStorage(config.storageDir)
+mgr.configureCapacity(config.maximumLiveTerminals ?? mgr.DEFAULT_MAX_LIVE_TERMINALS)
 
 function log(message) {
   try {
@@ -124,6 +141,7 @@ let companionLeaseEpoch = 1
 const companionLeases = new Set()
 let inFlightMutations = 0
 const requestGate = new BrokerRequestGate()
+const mutationLedger = new BrokerMutationLedger()
 let everConnected = false
 
 const MUTATING_METHODS = new Set([
@@ -142,6 +160,41 @@ const MUTATING_METHODS = new Set([
   'terminal.setFocused',
   'terminal.controlLease',
 ])
+const IDEMPOTENT_METHODS = new Set([
+  ...MUTATING_METHODS,
+  'broker.shutdownForUpdate',
+  'broker.prepareRollingUpdate',
+  'broker.cancelRollingUpdate',
+  'broker.retireDraining',
+])
+
+const MUTATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function canonicalMutationValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalMutationValue)
+  if (!value || typeof value !== 'object') return value
+  const result = {}
+  for (const key of Object.keys(value).sort()) {
+    if (key !== 'mutationId') result[key] = canonicalMutationValue(value[key])
+  }
+  return result
+}
+
+function mutationIdempotency(client, method, params) {
+  if (params?.mutationId == null) return null
+  const mutationId = String(params.mutationId)
+  if (!MUTATION_ID_PATTERN.test(mutationId)) return { invalid: true }
+  const key = JSON.stringify([
+    client.instanceId,
+    String(params.ownerId ?? '0'),
+    String(params.projectId ?? LEGACY_PROJECT_SCOPE),
+    mutationId,
+  ])
+  const fingerprint = crypto.createHash('sha256')
+    .update(JSON.stringify([method, canonicalMutationValue(params)]))
+    .digest('hex')
+  return { ledger: mutationLedger, key, fingerprint }
+}
 
 function noteActivity() {
   activityEpoch = activityEpoch >= Number.MAX_SAFE_INTEGER ? 1 : activityEpoch + 1
@@ -173,13 +226,8 @@ function projectScope(value) {
   return scope
 }
 
-function ownerId(value) {
-  const id = String(value ?? '0').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80)
-  return id || '0'
-}
-
 function ownerKey(instanceId, rendererId, projectId) {
-  return `${instanceId}|${ownerId(rendererId)}|${projectScope(projectId)}`
+  return `${instanceId}|${normalizeBrokerOwnerID(rendererId)}|${projectScope(projectId)}`
 }
 
 function clearNoClientTimer() {
@@ -211,6 +259,35 @@ function scheduleNoClientExit() {
   noClientTimer.unref?.()
 }
 
+function brokerStatusSnapshot(terminals, terminalCapacity = null) {
+  return {
+    ok: true,
+    protocol: PROTOCOL,
+    securityEpoch: SECURITY_EPOCH,
+    implementationVersion: BROKER_IMPLEMENTATION_VERSION,
+    packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
+    packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
+    contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
+    features: FEATURES,
+    pid: process.pid,
+    startedAt: config.startedAt,
+    version: config.version,
+    activityEpoch,
+    companionLeaseEpoch,
+    companionLeaseCount: companionLeases.size,
+    inFlightMutations,
+    generationState: drainingTarget ? 'draining' : 'current',
+    drainingTargetContentDigest: drainingTarget?.targetContentDigest ?? null,
+    // Degraded means the live sockets and PTYs are fine but the info file is
+    // stale or absent, so a restarted GUI cannot rendezvous yet.
+    rendezvous: rendezvousStatus(),
+    health: rejectionSupervisor.status(),
+    authenticatedClientCount: clients.size,
+    ...(terminalCapacity == null ? {} : { terminalCapacity }),
+    terminals,
+  }
+}
+
 function detachInstance(instanceId) {
   if (!instanceId) return
   mgr.detachSenderPrefix(`${instanceId}|`)
@@ -240,7 +317,12 @@ mgr.setActivitySink(() => noteActivity())
 
 async function dispatch(client, method, params = {}) {
   if (!brokerMethodAllowedForAccess(client.access, method)) {
-    throw new Error('observer access cannot invoke broker mutations')
+    throw new Error(client.access === CONTROLLER_ACCESS && administratorMethod(method)
+      ? 'controller access cannot invoke broker administration'
+      : 'observer access cannot invoke broker mutations')
+  }
+  if (!brokerOwnerIDAllowedForAccess(client.access, params.ownerId)) {
+    throw new Error('controller access requires a nonzero owner identity')
   }
   if (!rejectionSupervisor.allows(method)) {
     throw new Error('broker mutations are fenced after an invariant failure')
@@ -248,7 +330,8 @@ async function dispatch(client, method, params = {}) {
   if (updateCommitted && method !== 'broker.status') {
     throw new Error('broker helper update is already committed')
   }
-  const admin = String(params.ownerId ?? '0') === '0'
+  const admin = brokerAccessGrantsAdministration(client.access)
+  const globalObservation = brokerAccessGrantsGlobalObservation(client.access)
   const requestProject = projectScope(params.projectId)
   const owner = ownerKey(client.instanceId, params.ownerId, requestProject)
   const rawTerminalId = String(params.id || '')
@@ -280,33 +363,29 @@ async function dispatch(client, method, params = {}) {
   const requireAllowed = (id, adopt = false) => {
     if (!allowed(id, adopt)) throw new Error('terminal access denied')
   }
+  const visibleRows = (rows) => globalObservation ? rows : rows.filter((row) => terminalOwnerAllowed({
+    recordOwner: row.owner,
+    recordLastOwner: row.lastOwner,
+    requestOwner: owner,
+    requestProject,
+  }))
   switch (method) {
     case 'broker.status':
-      return {
-        ok: true,
-        protocol: PROTOCOL,
-        securityEpoch: SECURITY_EPOCH,
-        implementationVersion: BROKER_IMPLEMENTATION_VERSION,
-        packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
-        packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
-        contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
-        features: FEATURES,
-        pid: process.pid,
-        startedAt: config.startedAt,
-        version: config.version,
-        activityEpoch,
-        companionLeaseEpoch,
-        companionLeaseCount: companionLeases.size,
-        inFlightMutations,
-        generationState: drainingTarget ? 'draining' : 'current',
-        drainingTargetContentDigest: drainingTarget?.targetContentDigest ?? null,
-        // Degraded means the live sockets and PTYs are fine but the info file
-        // is stale or absent, so a restarted GUI cannot rendezvous yet.
-        rendezvous: rendezvousStatus(),
-        health: rejectionSupervisor.status(),
-        authenticatedClientCount: clients.size,
-        terminals: mgr.diagnostics(),
-      }
+      return brokerStatusSnapshot(
+        visibleRows(mgr.diagnostics()),
+        globalObservation ? mgr.capacity() : null,
+      )
+    case 'broker.inventory':
+      return collectBrokerInventorySnapshot({
+        activityEpoch: () => activityEpoch,
+        inFlightMutations: () => inFlightMutations,
+        status: () => brokerStatusSnapshot(
+          visibleRows(mgr.diagnostics()),
+          globalObservation ? mgr.capacity() : null,
+        ),
+        diagnostics: () => visibleRows(mgr.diagnostics()),
+        live: () => visibleRows(mgr.list()),
+      })
     case 'broker.shutdown':
       setTimeout(() => gracefulExit(true), 20).unref?.()
       return { ok: true }
@@ -501,7 +580,7 @@ async function dispatch(client, method, params = {}) {
     case 'terminal.write': {
       const id = terminalId()
       requireAllowed(id)
-      return mgr.write(id, String(params.data ?? ''))
+      return mgr.write(id, params.data)
     }
     case 'terminal.agentTurn': {
       const id = terminalId()
@@ -528,7 +607,7 @@ async function dispatch(client, method, params = {}) {
     case 'terminal.output': {
       const id = terminalId()
       requireAllowed(id)
-      return mgr.snapshot(id)
+      return mgr.snapshot(id, { responseBarrier: true })
     }
     case 'terminal.waitForExit': {
       const id = terminalId()
@@ -548,10 +627,9 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.release': {
       const id = terminalId()
-      requireAllowed(id)
-      mgr.release(id)
+      const result = terminalReleaseRoute({ manager: mgr, id, requireAllowed })
       scheduleNoClientExit()
-      return { ok: true }
+      return result
     }
     case 'terminal.scheduleRelease': {
       const id = terminalId()
@@ -566,22 +644,10 @@ async function dispatch(client, method, params = {}) {
       return { ok: mgr.cancelRelease(id) }
     }
     case 'terminal.list': {
-      const rows = mgr.list()
-      return admin ? rows : rows.filter((row) => terminalOwnerAllowed({
-        recordOwner: row.owner,
-        recordLastOwner: row.lastOwner,
-        requestOwner: owner,
-        requestProject,
-      }))
+      return visibleRows(mgr.list())
     }
     case 'terminal.diagnostics': {
-      const rows = mgr.diagnostics()
-      return admin ? rows : rows.filter((row) => terminalOwnerAllowed({
-        recordOwner: row.owner,
-        recordLastOwner: row.lastOwner,
-        requestOwner: owner,
-        requestProject,
-      }))
+      return visibleRows(mgr.diagnostics())
     }
     case 'terminal.setFocused':
       mgr.setAppFocused(!!params.focused)
@@ -623,16 +689,27 @@ function handleLine(client, line) {
       client.socket.destroy()
       return
     }
-    const prior = clients.get(instanceId)
-    if (prior && prior.socket !== client.socket) prior.socket.destroy()
-    const access = frame.access == null ? 'controller' : String(frame.access)
-    if (access !== 'controller' && access !== OBSERVER_ACCESS) {
+    const access = frame.access == null ? CONTROLLER_ACCESS : String(frame.access)
+    if (!brokerAccessSupported(access)) {
+      send(client.socket, { type: 'hello', ok: false, message: 'broker authentication failed' })
       client.socket.destroy()
       return
     }
+    const negotiatedFeatures = negotiateFeatures(frame.features)
+    if (access === ADMINISTRATOR_ACCESS
+        && !negotiatedFeatures.has(BROKER_ADMINISTRATION_FEATURE)) {
+      send(client.socket, { type: 'hello', ok: false, message: 'broker authentication failed' })
+      client.socket.destroy()
+      return
+    }
+    if (access !== ADMINISTRATOR_ACCESS) {
+      negotiatedFeatures.delete(BROKER_ADMINISTRATION_FEATURE)
+    }
+    const prior = clients.get(instanceId)
+    if (prior && prior.socket !== client.socket) prior.socket.destroy()
     client.instanceId = instanceId
     client.access = access
-    client.features = negotiateFeatures(frame.features)
+    client.features = negotiatedFeatures
     client.authenticated = true
     everConnected = true
     clients.set(instanceId, client)
@@ -659,6 +736,16 @@ function handleLine(client, line) {
   }
   if (frame?.type !== 'request' || typeof frame.id !== 'string' || typeof frame.method !== 'string') return
   const mutating = MUTATING_METHODS.has(frame.method)
+  const idempotency = IDEMPOTENT_METHODS.has(frame.method)
+    ? mutationIdempotency(client, frame.method, frame.params)
+    : null
+  if (idempotency?.invalid) {
+    send(client.socket, {
+      type: 'response', id: frame.id, ok: false,
+      code: 'invalid_mutation_id', message: 'broker mutation id is invalid',
+    }, { method: frame.method })
+    return
+  }
   dispatchBrokerRequest({
     gate: requestGate,
     client,
@@ -671,6 +758,7 @@ function handleLine(client, line) {
     // the originating method to enforce its response-specific encoded cap.
     respond: (response) => send(client.socket, response, { method: frame.method }),
     onSuccess: scheduleNoClientExit,
+    idempotency,
   })
 }
 
@@ -680,7 +768,7 @@ function acceptClient(socket) {
     socket,
     authenticated: false,
     instanceId: null,
-    access: 'controller',
+    access: CONTROLLER_ACCESS,
     features: new Set(),
     buffer: '',
     decoder: new StringDecoder('utf8'),
@@ -873,21 +961,25 @@ function gracefulExit(killSessions) {
   clearRendezvousRetry()
   if (socketPathTimer) clearInterval(socketPathTimer)
   socketPathTimer = null
-  if (killSessions) mgr.killAll()
-  else for (const client of clients.values()) detachInstance(client.instanceId)
+  const draining = killSessions ? mgr.killAll() : null
+  if (!killSessions) for (const client of clients.values()) detachInstance(client.instanceId)
   for (const client of clients.values()) client.socket.destroy()
   clients.clear()
-  const active = server
-  for (const candidate of servers) {
-    if (candidate === active) continue
-    try { candidate.close() } catch {}
-  }
-  active.close(() => {
-    cleanupFiles()
-    process.exit(0)
-  })
   const hard = setTimeout(() => { cleanupFiles(); process.exit(0) }, 1500)
   hard.unref?.()
+  const finish = () => {
+    const active = server
+    for (const candidate of servers) {
+      if (candidate === active) continue
+      try { candidate.close() } catch {}
+    }
+    active.close(() => {
+      cleanupFiles()
+      process.exit(0)
+    })
+  }
+  if (draining && typeof draining.then === 'function') draining.then(finish, finish)
+  else finish()
 }
 
 process.on('SIGTERM', () => gracefulExit(true))

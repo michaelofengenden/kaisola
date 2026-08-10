@@ -53,7 +53,7 @@ test('terminal attach authorizes before revealing existence or changing ownershi
   assert.deepEqual(calls, [['authorize', 'terminal-denied', true]])
 })
 
-test('terminal attach seals explicit success and exact identity after ownership adoption', () => {
+test('terminal attach awaits its durable snapshot and then seals success and identity', async () => {
   const calls = []
   const id = 'terminal-existing'
   const result = terminalAttachRoute({
@@ -69,8 +69,8 @@ test('terminal attach seals explicit success and exact identity after ownership 
           previousOwner: 'previous-instance|native-owner|project-one',
         }
       },
-      snapshot: (candidate) => {
-        calls.push(['snapshot', candidate])
+      snapshot: async (candidate, options) => {
+        calls.push(['snapshot', candidate, options])
         return { id: 'forged-id', ok: false, output: 'retained', exited: false }
       },
     },
@@ -82,7 +82,7 @@ test('terminal attach seals explicit success and exact identity after ownership 
     brokerPid: 789,
   })
 
-  assert.deepEqual(result, {
+  assert.deepEqual(await result, {
     id,
     ok: true,
     output: 'retained',
@@ -99,6 +99,6 @@ test('terminal attach seals explicit success and exact identity after ownership 
     ['authorize', id, true],
     ['has', id],
     ['setSender', id, 'native-owner'],
-    ['snapshot', id],
+    ['snapshot', id, { responseBarrier: true }],
   ])
 })

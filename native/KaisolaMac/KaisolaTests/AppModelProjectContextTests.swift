@@ -1510,11 +1510,107 @@ final class AppModelProjectContextTests: XCTestCase {
     }
 
     @MainActor
+    func testCorruptProjectAccountsBlockChatMeshAndTerminalCreationFunnels() async throws {
+        let root = storeFile.deletingLastPathComponent()
+            .appendingPathComponent("corrupt-project-account-launches", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let accountURL = root.appendingPathComponent("project-accounts.json")
+        let corruptBytes = Data("corrupt account mapping".utf8)
+        try corruptBytes.write(to: accountURL)
+        let recoveryCenter = ProjectAccountRecoveryCenter(
+            store: ProjectAccountStore(fileURL: accountURL)
+        )
+        let control = ProjectAccountNoLaunchBrokerControlClient()
+        let transcriptStore = AcpTranscriptStore(fileURL: root.appendingPathComponent("transcripts.json"))
+        let model = AppModel(
+            controlClient: control,
+            sessionStore: NativeSessionStore(fileURL: root.appendingPathComponent("sessions.json")),
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            workspaceStateStore: NativeWorkspaceStateStore(fileURL: root.appendingPathComponent("workspace.json")),
+            transcriptStore: transcriptStore,
+            projectAccountRecoveryCenter: recoveryCenter,
+            usageCenter: UsageCenter(
+                persistenceStore: transcriptStore,
+                projectAccountRecoveryCenter: recoveryCenter
+            )
+        )
+        model.loadVisualFixture(workspace: root)
+        let agent = try XCTUnwrap(AgentRegistry.profile(id: "codex"))
+
+        model.openChat(agent, inDirectory: root)
+        model.openMesh(inDirectory: root)
+        await model.createAgentSession(agent, inDirectory: root)
+        let terminalCreationCount = await control.createCount()
+
+        XCTAssertTrue(model.chats.isEmpty, "the ACP child-process funnel must not materialize a chat")
+        XCTAssertTrue(model.meshes.isEmpty, "the Mesh funnel must not schedule any columns")
+        XCTAssertEqual(terminalCreationCount, 0, "terminal.create must never reach the broker")
+        XCTAssertEqual(recoveryCenter.issue?.kind, .corrupt)
+        XCTAssertEqual(try Data(contentsOf: accountURL), corruptBytes)
+    }
+
+    @MainActor
+    func testCorruptProjectAccountsBlockWorkspaceChatAndMeshRestorationFunnels() async throws {
+        let root = storeFile.deletingLastPathComponent()
+            .appendingPathComponent("corrupt-project-account-restore", isDirectory: true)
+        let projectDirectory = root.appendingPathComponent("project", isDirectory: true)
+        try FileManager.default.createDirectory(at: projectDirectory, withIntermediateDirectories: true)
+        let projectID = NativeSessionStore.projectID(forDirectory: projectDirectory.path)
+        let agent = try XCTUnwrap(AgentRegistry.profile(id: "codex"))
+        let chatID = "blocked-restored-chat"
+        let chatDescriptor = NativeRestorableAgentChatDescriptor(
+            id: chatID,
+            projectID: projectID,
+            agentID: agent.id,
+            workspacePath: projectDirectory.path,
+            acpSessionID: "must-not-resume",
+            accountBinding: nil,
+            title: "Blocked restored chat"
+        )
+        let chatPane = NativeRestorablePaneState(
+            id: chatID,
+            surface: NativeRestorableSurfaceState(agentChat: chatDescriptor)
+        )
+        let meshPane = Self.meshPane(id: "blocked-restored-mesh", basePath: projectDirectory.path)
+        let workspaceStore = NativeWorkspaceStateStore(fileURL: root.appendingPathComponent("workspace.json"))
+        try await workspaceStore.saveRestorationState(NativeWorkspaceRestorationState(
+            selectedProjectID: projectID,
+            projects: [NativeProjectWorkspaceState(
+                projectID: projectID,
+                layout: SessionPaneLayout(columns: [
+                    .init(sessionIDs: [chatPane.id, meshPane.id]),
+                ]),
+                panes: [chatPane, meshPane],
+                focusedPaneID: chatPane.id
+            )]
+        ))
+        let accountURL = root.appendingPathComponent("project-accounts.json")
+        try Data("corrupt restored mapping".utf8).write(to: accountURL)
+        let recoveryCenter = ProjectAccountRecoveryCenter(
+            store: ProjectAccountStore(fileURL: accountURL)
+        )
+        let model = makeRestoringModel(
+            workspaceStore: workspaceStore,
+            root: root,
+            identity: "blocked-restore",
+            projectDirectory: projectDirectory,
+            projectAccountRecoveryCenter: recoveryCenter
+        )
+
+        await model.restoreWorkspaceStateIfNeeded()
+
+        XCTAssertTrue(model.chats.isEmpty)
+        XCTAssertTrue(model.meshes.isEmpty)
+        XCTAssertEqual(recoveryCenter.issue?.kind, .corrupt)
+    }
+
+    @MainActor
     private func makeRestoringModel(
         workspaceStore: NativeWorkspaceStateStore,
         root: URL,
         identity: String,
-        projectDirectory: URL
+        projectDirectory: URL,
+        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = .shared
     ) -> AppModel {
         let sessionStore = NativeSessionStore(
             fileURL: root.appendingPathComponent("native-sessions-\(identity).json")
@@ -1533,7 +1629,11 @@ final class AppModelProjectContextTests: XCTestCase {
             ),
             workspaceStateStore: workspaceStore,
             transcriptStore: transcriptStore,
-            usageCenter: UsageCenter(persistenceStore: transcriptStore),
+            projectAccountRecoveryCenter: projectAccountRecoveryCenter,
+            usageCenter: UsageCenter(
+                persistenceStore: transcriptStore,
+                projectAccountRecoveryCenter: projectAccountRecoveryCenter
+            ),
             reconnectBackoff: BrokerReconnectBackoff(
                 baseNanoseconds: 1,
                 maximumNanoseconds: 2,
@@ -1567,6 +1667,44 @@ final class AppModelProjectContextTests: XCTestCase {
             surface: NativeRestorableSurfaceState(mesh: descriptor)
         )
     }
+}
+
+private actor ProjectAccountNoLaunchBrokerControlClient: BrokerControlServing {
+    private var creations = 0
+
+    func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {}
+    func connect(to info: BrokerInfo, ownerID: String) async throws {}
+
+    func createTerminal(
+        projectID: String,
+        terminalID: String,
+        command: String,
+        arguments: [String],
+        cwd: String,
+        columns: Int,
+        rows: Int,
+        restore: Bool
+    ) async throws -> TerminalCreation {
+        creations += 1
+        return TerminalCreation(
+            terminalID: terminalID,
+            projectID: projectID,
+            pid: 1,
+            streamEpoch: "unexpected"
+        )
+    }
+
+    func attach(projectID: String, terminalID: String) async throws {}
+    func write(projectID: String, terminalID: String, data: String) async throws {}
+    func resize(projectID: String, terminalID: String, columns: Int, rows: Int) async throws {}
+    func kill(projectID: String, terminalID: String) async throws {}
+    func release(projectID: String, terminalID: String) async throws {}
+    func detachOwner(projectID: String, terminalID: String) async throws {}
+    func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws {}
+    func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {}
+    func disconnect() async {}
+
+    func createCount() -> Int { creations }
 }
 
 private struct ProjectContextBrokerPreparer: BrokerInfoPreparing {

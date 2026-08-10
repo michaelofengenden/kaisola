@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// What a project's stored account directory currently points at.
@@ -127,6 +128,186 @@ enum ProjectAccountSelection: Equatable {
     }
 }
 
+/// The spoken contract for the provider control in the add-account form.
+///
+/// The segmented picker hides its visual label to preserve the compact row, so
+/// it must name both what it changes and the value that is currently selected.
+enum NewAccountProviderAccessibility {
+    static let label = "New account provider"
+
+    static func value(_ provider: UsageAccountProfile.Provider) -> String {
+        provider.displayName
+    }
+}
+
+/// Copy for the destructive named-account confirmation. Keeping the wording in
+/// a value lets tests prove that affected projects are listed and that the only
+/// destructive choice says what replaces their assignment.
+struct NamedAccountRemovalConfirmation: Equatable {
+    let accountLabel: String
+    let projectLabels: [String]
+
+    var actionTitle: String {
+        projectLabels.isEmpty ? "Remove Account" : "Use App Default and Remove Account"
+    }
+
+    var message: String {
+        guard !projectLabels.isEmpty else {
+            return "Kaisola will forget \(accountLabel). Its provider files and sign-in stay on disk."
+        }
+        let count = projectLabels.count
+        return "\(accountLabel) is assigned to \(count) \(count == 1 ? "project" : "projects"): \(Self.list(projectLabels)). Those projects will use App Default. The provider files and sign-in stay on disk."
+    }
+
+    private static func list(_ values: [String]) -> String {
+        switch values.count {
+        case 0: return ""
+        case 1: return values[0]
+        case 2: return "\(values[0]) and \(values[1])"
+        default: return values.dropLast().joined(separator: ", ") + ", and " + values.last!
+        }
+    }
+}
+
+/// Non-secret account state derived from the signed usage helper's latest
+/// provider-scoped result. The UI never inspects credential files or retains
+/// provider identity data; it shows only readiness, a bounded diagnostic, and
+/// when the helper last answered.
+struct NamedAccountAuthenticationPresentation: Equatable {
+    enum Status: Equatable {
+        case checking
+        case unchecked
+        case signedIn
+        case signedOut
+        case expired
+        case failed
+    }
+
+    enum Action: Equatable {
+        case signIn
+        case reauthenticate
+        case check
+    }
+
+    let status: Status
+    let action: Action
+    let lastVerification: Date?
+    let diagnostic: String?
+
+    static func resolve(
+        reading: UsageCenter.ProviderPlanUsage?,
+        isRefreshing: Bool
+    ) -> NamedAccountAuthenticationPresentation {
+        guard let reading else {
+            return NamedAccountAuthenticationPresentation(
+                status: isRefreshing ? .checking : .unchecked,
+                action: .check,
+                lastVerification: nil,
+                diagnostic: nil
+            )
+        }
+        if reading.ok {
+            return NamedAccountAuthenticationPresentation(
+                status: .signedIn,
+                action: .check,
+                lastVerification: reading.updatedDate,
+                diagnostic: nil
+            )
+        }
+        let message = reading.message?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if reading.authRequired == true {
+            let expired = message.map(isExpiredAuthenticationMessage) ?? false
+            return NamedAccountAuthenticationPresentation(
+                status: expired ? .expired : .signedOut,
+                action: expired ? .reauthenticate : .signIn,
+                lastVerification: reading.updatedDate,
+                diagnostic: message
+            )
+        }
+        return NamedAccountAuthenticationPresentation(
+            status: .failed,
+            action: .check,
+            lastVerification: reading.updatedDate,
+            diagnostic: message
+        )
+    }
+
+    var title: String {
+        switch status {
+        case .checking: "Checking"
+        case .unchecked: "Not checked"
+        case .signedIn: "Signed in"
+        case .signedOut: "Not signed in"
+        case .expired: "Sign-in expired"
+        case .failed: "Check failed"
+        }
+    }
+
+    var actionTitle: String {
+        switch action {
+        case .signIn: "Sign In"
+        case .reauthenticate: "Reauthenticate"
+        case .check: "Check"
+        }
+    }
+
+    var symbolName: String {
+        switch status {
+        case .checking: "clock.arrow.circlepath"
+        case .unchecked: "circle.dotted"
+        case .signedIn: "checkmark.circle.fill"
+        case .signedOut: "person.crop.circle.badge.questionmark"
+        case .expired: "clock.badge.exclamationmark"
+        case .failed: "exclamationmark.circle.fill"
+        }
+    }
+
+    func detail(now: Date) -> String {
+        let checked = Self.lastCheckedCaption(lastVerification, now: now)
+        switch status {
+        case .checking:
+            return "Checking provider authentication…"
+        case .unchecked:
+            return "No verification yet."
+        case .signedIn:
+            return checked
+        case .signedOut, .expired, .failed:
+            guard let diagnostic, !diagnostic.isEmpty else { return checked }
+            return "\(diagnostic) · \(checked)"
+        }
+    }
+
+    static func lastCheckedCaption(_ date: Date?, now: Date) -> String {
+        guard let date else { return "No verification time." }
+        let elapsed = max(0, now.timeIntervalSince(date))
+        if elapsed < 60 { return "Last checked just now" }
+        if elapsed < 3_600 { return "Last checked \(Int(elapsed / 60))m ago" }
+        if elapsed < 86_400 { return "Last checked \(Int(elapsed / 3_600))h ago" }
+        return "Last checked \(Int(elapsed / 86_400))d ago"
+    }
+
+    private static func isExpiredAuthenticationMessage(_ message: String) -> Bool {
+        let normalized = message.lowercased()
+        return ["expired", "revoked", "unauthorized", "invalidated oauth"].contains {
+            normalized.contains($0)
+        }
+    }
+}
+
+/// Which surface the per-project card must show. Store recovery outranks an
+/// ordinary project row because unreadable account data cannot safely be
+/// interpreted as App Default or as a missing named-account assignment.
+enum ProjectAccountCardMode: Equatable {
+    case recovery
+    case project
+    case noProject
+
+    static func resolve(hasRecoveryIssue: Bool, projectID: String?) -> ProjectAccountCardMode {
+        if hasRecoveryIssue { return .recovery }
+        return projectID == nil ? .noProject : .project
+    }
+}
+
 /// Settings ▸ Accounts section that pins a per-project Claude/Codex account on top
 /// of the app-wide one. Overrides are project-scoped, so a nil `projectID` (no
 /// active project) has nowhere to store them — the section shows a hint instead
@@ -138,6 +319,9 @@ struct ProjectAccountsSection: View {
     let projectID: String?
     /// The active project's display name, for the caption.
     let projectName: String?
+    /// The usage helper scopes provider probes to the same effective account
+    /// environment as the active workspace.
+    let workspace: URL?
 
     @State private var claudeConfigDir = ""
     @State private var codexHome = ""
@@ -147,10 +331,27 @@ struct ProjectAccountsSection: View {
     @State private var newDirectory = ""
     @State private var accountError: String?
     @State private var pendingRemoval: UsageAccountProfile?
+    @State private var pendingRemovalProjectLabels: [String] = []
+    @State private var confirmingRecoveryReset = false
     /// The account whose sign-in sheet is open, if any.
     @State private var signingIn: UsageAccountProfile?
-    private let store = ProjectAccountStore()
+    @ObservedObject private var recoveryCenter: ProjectAccountRecoveryCenter
+    @ObservedObject private var usage: UsageCenter
     private let usageAccountStore = UsageAccountStore()
+
+    init(
+        projectID: String?,
+        projectName: String?,
+        workspace: URL? = nil,
+        recoveryCenter: ProjectAccountRecoveryCenter = .shared,
+        usage: UsageCenter = .shared
+    ) {
+        self.projectID = projectID
+        self.projectName = projectName
+        self.workspace = workspace
+        _recoveryCenter = ObservedObject(wrappedValue: recoveryCenter)
+        _usage = ObservedObject(wrappedValue: usage)
+    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -161,51 +362,111 @@ struct ProjectAccountsSection: View {
         .onAppear {
             load()
             loadUsageProfiles()
+            refreshAuthentication()
         }
-        .onChange(of: projectID) { _, _ in load() }
+        .onChange(of: projectID) { _, _ in
+            load()
+            refreshAuthentication()
+        }
         // Persist on every edit — the store no-ops when nothing changed, so the
         // load above never triggers a spurious write.
         .onChange(of: claudeConfigDir) { _, _ in if let projectID { save(projectID) } }
         .onChange(of: codexHome) { _, _ in if let projectID { save(projectID) } }
         .onReceive(NotificationCenter.default.publisher(for: .kaisolaUsageAccountsChanged)) { _ in
             loadUsageProfiles()
+            refreshAuthentication(force: true)
         }
         .sheet(item: $signingIn) { profile in
             AccountSignInSheet(profile: profile) {
                 signingIn = nil
                 loadUsageProfiles()
+                refreshAuthentication(force: true)
             }
         }
         .confirmationDialog(
             "Remove \(pendingRemoval?.label ?? "Account")?",
             isPresented: Binding(
                 get: { pendingRemoval != nil },
-                set: { if !$0 { pendingRemoval = nil } }
+                set: {
+                    if !$0 {
+                        pendingRemoval = nil
+                        pendingRemovalProjectLabels = []
+                    }
+                }
             ),
             titleVisibility: .visible
         ) {
-            Button("Remove Account", role: .destructive) {
+            Button(removalConfirmation.actionTitle, role: .destructive) {
                 guard let profile = pendingRemoval else { return }
                 pendingRemoval = nil
+                pendingRemovalProjectLabels = []
                 removeProfile(profile)
             }
-            Button("Cancel", role: .cancel) { pendingRemoval = nil }
+            Button("Cancel", role: .cancel) {
+                pendingRemoval = nil
+                pendingRemovalProjectLabels = []
+            }
         } message: {
-            Text("Kaisola will forget this named account. Its provider files and sign-in stay on disk.")
+            Text(removalConfirmation.message)
+        }
+        .confirmationDialog(
+            "Reset all project account overrides?",
+            isPresented: $confirmingRecoveryReset,
+            titleVisibility: .visible
+        ) {
+            Button("Reset Project Accounts", role: .destructive) { resetAfterFailure() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Kaisola will keep the damaged or unsupported file beside the active one, then clear every project's Claude and Codex selection. Agent launches can use app defaults again only after this explicit reset.")
         }
     }
 
     private func load() {
-        let override = projectID.flatMap { store.override(forProject: $0) }
-        claudeConfigDir = override?.claudeConfigDir ?? ""
-        codexHome = override?.codexHome ?? ""
+        switch recoveryCenter.loadStatus() {
+        case .missing:
+            claudeConfigDir = ""
+            codexHome = ""
+        case .loaded(let payload):
+            let override = projectID.flatMap { payload.projects[$0] }
+            claudeConfigDir = override?.claudeConfigDir ?? ""
+            codexHome = override?.codexHome ?? ""
+        case .blocked:
+            claudeConfigDir = ""
+            codexHome = ""
+        }
     }
 
     private func save(_ projectID: String) {
-        store.set(
-            ProjectAccountOverride(claudeConfigDir: claudeConfigDir, codexHome: codexHome),
-            forProject: projectID
-        )
+        guard recoveryCenter.issue == nil else { return }
+        do {
+            try recoveryCenter.set(
+                ProjectAccountOverride(claudeConfigDir: claudeConfigDir, codexHome: codexHome),
+                forProject: projectID
+            )
+        } catch ProjectAccountStore.StoreError.recoveryRequired {
+        } catch {
+            accountError = error.localizedDescription
+        }
+    }
+
+    private func revealRecoveryFile() {
+        guard let recoveryIssue = recoveryCenter.issue else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([recoveryIssue.revealURL])
+    }
+
+    private func resetAfterFailure() {
+        do {
+            let preserved = try recoveryCenter.resetAfterFailure()
+            load()
+            ToastCenter.shared.show(
+                "Reset project account overrides; kept \(preserved.lastPathComponent)",
+                style: .success,
+                duration: 6
+            )
+        } catch {
+            load()
+            accountError = error.localizedDescription
+        }
     }
 
     private var suggestedDirectory: String? {
@@ -294,40 +555,91 @@ struct ProjectAccountsSection: View {
     /// starburst there, which made two views of one account look like two
     /// different things.
     private func accountRow(_ profile: UsageAccountProfile) -> some View {
-        HStack(spacing: 12) {
-            QuietIdentityMarkView(
-                identity: profile.provider == .claude ? .claude : .openai,
-                size: 18
-            )
-            .frame(width: 22)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(profile.label)
-                    .font(.callout.weight(.medium))
-                    .lineLimit(1)
-                Text(profile.directory)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.kaisolaSecondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer(minLength: 12)
-            // Sign-in belongs beside the account it signs in, not one tab away
-            // under Usage. Adding a subscription and logging into it are one
-            // intention; splitting them across two screens is why five logins
-            // could go into one directory without a single new card appearing.
-            Button("Sign In") { signingIn = profile }
+        TimelineView(.periodic(from: .now, by: 60)) { timeline in
+            let authentication = authenticationPresentation(for: profile)
+            HStack(spacing: 12) {
+                QuietIdentityMarkView(
+                    identity: profile.provider == .claude ? .claude : .openai,
+                    size: 18
+                )
+                .frame(width: 22)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(profile.label)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    Text(profile.directory)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.kaisolaSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Label(authentication.title, systemImage: authentication.symbolName)
+                        .font(.caption)
+                        .foregroundStyle(authenticationColor(authentication.status))
+                    Text(authentication.detail(now: timeline.date))
+                        .font(.caption2)
+                        .foregroundStyle(.kaisolaSecondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Spacer(minLength: 12)
+                Button(authentication.actionTitle) {
+                    performAuthenticationAction(authentication.action, profile: profile)
+                }
                 .controlSize(.small)
-                .accessibilityLabel("Sign in to \(profile.label)")
-            Button(role: .destructive) { pendingRemoval = profile } label: {
-                Image(systemName: "xmark")
-                    .font(.caption.weight(.semibold))
+                .disabled(authentication.status == .checking)
+                .accessibilityLabel("\(authentication.actionTitle) \(profile.label)")
+                if usage.isRefreshingPlanUsage, authentication.action == .check {
+                    ProgressView().controlSize(.mini)
+                        .accessibilityLabel("Checking \(profile.label)")
+                }
+                Button(role: .destructive) { prepareRemoval(profile) } label: {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.borderless)
+                .help("Remove this account from Kaisola; its provider files stay on disk")
+                .accessibilityLabel("Remove account \(profile.label)")
             }
-            .buttonStyle(.borderless)
-            .help("Remove this account from Kaisola; its provider files stay on disk")
-            .accessibilityLabel("Remove account \(profile.label)")
+            .padding(.horizontal, 16)
+            .frame(minHeight: 86)
         }
-        .padding(.horizontal, 16)
-        .frame(minHeight: 58)
+    }
+
+    private func authenticationPresentation(
+        for profile: UsageAccountProfile
+    ) -> NamedAccountAuthenticationPresentation {
+        let reading = usage.planUsage.first { $0.profileID == profile.id }
+        return NamedAccountAuthenticationPresentation.resolve(
+            reading: reading,
+            isRefreshing: usage.isRefreshingPlanUsage
+        )
+    }
+
+    private func performAuthenticationAction(
+        _ action: NamedAccountAuthenticationPresentation.Action,
+        profile: UsageAccountProfile
+    ) {
+        switch action {
+        case .signIn, .reauthenticate:
+            signingIn = profile
+        case .check:
+            refreshAuthentication(force: true)
+        }
+    }
+
+    private func refreshAuthentication(force: Bool = false) {
+        usage.refreshPlanUsage(workspace: workspace, force: force)
+    }
+
+    private func authenticationColor(
+        _ status: NamedAccountAuthenticationPresentation.Status
+    ) -> Color {
+        switch status {
+        case .signedIn: .green
+        case .expired, .failed: KaisolaStatusTone.failed.foregroundColor
+        case .signedOut: KaisolaStatusTone.needsYou.foregroundColor
+        case .checking, .unchecked: .secondary
+        }
     }
 
     /// Adding an account is a label and a provider; the directory is derived
@@ -336,7 +648,7 @@ struct ProjectAccountsSection: View {
     private var addAccountRow: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(spacing: 10) {
-                Picker("", selection: $newProvider) {
+                Picker(NewAccountProviderAccessibility.label, selection: $newProvider) {
                     ForEach(UsageAccountProfile.Provider.allCases) { provider in
                         Text(provider.displayName).tag(provider)
                     }
@@ -344,6 +656,8 @@ struct ProjectAccountsSection: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .fixedSize()
+                .accessibilityLabel(Text(NewAccountProviderAccessibility.label))
+                .accessibilityValue(Text(NewAccountProviderAccessibility.value(newProvider)))
                 .onChange(of: newProvider) { _, _ in accountError = nil }
 
                 TextField("Label", text: $newLabel, prompt: Text("Work, Personal, Research…"))
@@ -382,11 +696,48 @@ struct ProjectAccountsSection: View {
     /// Which account this project's sessions actually run as.
     private var perProjectCard: some View {
         SettingsCard(title: "This project", symbol: "folder") {
-            if let projectID {
-                projectAccountRow(provider: .claude, value: $claudeConfigDir, projectID: projectID)
-                SettingsDivider()
-                projectAccountRow(provider: .codex, value: $codexHome, projectID: projectID)
-            } else {
+            switch ProjectAccountCardMode.resolve(
+                hasRecoveryIssue: recoveryCenter.issue != nil,
+                projectID: projectID
+            ) {
+            case .recovery:
+                if let recoveryIssue = recoveryCenter.issue {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Label(recoveryIssue.title, systemImage: "exclamationmark.triangle.fill")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                        Text(recoveryIssue.message)
+                            .font(.caption)
+                            .foregroundStyle(.kaisolaSecondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        HStack(spacing: 8) {
+                            Button("Retry") { load() }
+                                .buttonStyle(.borderedProminent)
+                            Button(recoveryIssue.preservedCopyURL == nil
+                                ? "Reveal Original in Finder"
+                                : "Reveal Preserved Copy in Finder") {
+                                revealRecoveryFile()
+                            }
+                            .buttonStyle(.bordered)
+                            Button("Reset…", role: .destructive) {
+                                confirmingRecoveryReset = true
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                        .controlSize(.small)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 14)
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("kaisola.project-account-recovery")
+                }
+            case .project:
+                if let projectID {
+                    projectAccountRow(provider: .claude, value: $claudeConfigDir, projectID: projectID)
+                    SettingsDivider()
+                    projectAccountRow(provider: .codex, value: $codexHome, projectID: projectID)
+                }
+            case .noProject:
                 Text("Open a project to give it its own account. Until then, sessions use the app default.")
                     .font(.callout)
                     .foregroundStyle(.kaisolaSecondary)
@@ -486,8 +837,58 @@ struct ProjectAccountsSection: View {
     }
 
     private func removeProfile(_ profile: UsageAccountProfile) {
-        guard usageAccountStore.remove(id: profile.id) else { return }
-        loadUsageProfiles()
-        NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+        do {
+            _ = try recoveryCenter.clearAssignments(
+                to: profile.directory,
+                provider: profile.provider
+            )
+            guard usageAccountStore.remove(id: profile.id) else {
+                load()
+                accountError = "Kaisola reassigned affected projects to App Default, but couldn't remove \(profile.label). Try removing the account again."
+                return
+            }
+            load()
+            loadUsageProfiles()
+            accountError = nil
+            NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+        } catch {
+            accountError = error.localizedDescription
+        }
+    }
+
+    private var removalConfirmation: NamedAccountRemovalConfirmation {
+        NamedAccountRemovalConfirmation(
+            accountLabel: pendingRemoval?.label ?? "Account",
+            projectLabels: pendingRemovalProjectLabels
+        )
+    }
+
+    private func prepareRemoval(_ profile: UsageAccountProfile) {
+        do {
+            let projectIDs = try recoveryCenter.projectIDs(
+                assignedTo: profile.directory,
+                provider: profile.provider
+            )
+            let projectNames = NativeSessionStore().projects().reduce(into: [String: String]()) {
+                // A malformed legacy session archive must not make the removal
+                // confirmation trap. The account store remains authoritative;
+                // this map is display-only, so the first known name is enough.
+                if $0[$1.id] == nil { $0[$1.id] = $1.name }
+            }
+            pendingRemovalProjectLabels = projectIDs.map { projectID in
+                if projectID == self.projectID,
+                   let projectName,
+                   !projectName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return projectName
+                }
+                return projectNames[projectID] ?? projectID
+            }
+            pendingRemoval = profile
+            accountError = nil
+        } catch {
+            pendingRemoval = nil
+            pendingRemovalProjectLabels = []
+            accountError = error.localizedDescription
+        }
     }
 }

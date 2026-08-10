@@ -260,6 +260,31 @@ function terminalKillRoute({ manager, id, requireAllowed }) {
   return manager.kill(id)
 }
 
+/** Preserve the typed deletion receipt and cleanup action exactly. A released
+ * PTY may still have an artifact whose unlink needs another idempotent call. */
+function terminalReleaseRoute({ manager, id, requireAllowed }) {
+  requireAllowed(id)
+  return manager.release(id)
+}
+
+function mapMaybePromise(value, transform, reject) {
+  return value && typeof value.then === 'function' ? value.then(transform, reject) : transform(value)
+}
+
+function terminalCapacityResponse(error) {
+  if (error?.code !== 'TERMINAL_CAPACITY_EXCEEDED'
+      || !Number.isSafeInteger(error.maximumLiveTerminals)
+      || error.maximumLiveTerminals < 1) {
+    throw error
+  }
+  return {
+    ok: false,
+    code: 'terminal_capacity_exceeded',
+    message: 'broker terminal capacity reached',
+    maximumLiveTerminals: error.maximumLiveTerminals,
+  }
+}
+
 /** Attach is an ownership mutation, so absence must be decided explicitly
  * before setSender can make the caller believe it adopted a terminal. */
 function terminalAttachRoute({
@@ -288,14 +313,14 @@ function terminalAttachRoute({
   const continuation = continuity && previousInstance && previousInstance !== clientInstanceId
     ? { ...continuity, acrossRestart: true, reattachedAt: now(), brokerPid }
     : null
-  return {
-    ...manager.snapshot(id),
+  return mapMaybePromise(manager.snapshot(id, { responseBarrier: true }), (snapshot) => ({
+    ...snapshot,
     // Seal the authority-bearing fields after the snapshot so a future
     // snapshot extension cannot accidentally override the attach contract.
     id,
     ok: true,
     continuation,
-  }
+  }))
 }
 
 /** The authenticated `terminal.create` operation after access selection. Kept
@@ -336,39 +361,45 @@ function terminalCreateRoute({
       return { ok: false, message: 'terminal restore denied: project mismatch' }
     }
   }
-  const rec = manager.spawn({
-    id,
-    command: typeof params.command === 'string' ? params.command : undefined,
-    args: args.value,
-    cwd: typeof params.cwd === 'string' ? params.cwd : os.homedir(),
-    env: env.value,
-    outputByteLimit: Number.isFinite(Number(params.outputByteLimit))
-      ? Math.max(0, Math.min(Math.floor(Number(params.outputByteLimit)), 8 * 1024 * 1024))
-      : undefined,
-    cols: geometry.value.cols,
-    rows: geometry.value.rows,
-    sender: owner,
-    restore,
-  })
-  if (!rec) {
-    return manager.available()
-      ? { ok: false, message: 'could not start terminal' }
-      : { ok: false, message: 'node-pty unavailable in session broker' }
+  let rec
+  try {
+    rec = manager.spawn({
+      id,
+      command: typeof params.command === 'string' ? params.command : undefined,
+      args: args.value,
+      cwd: typeof params.cwd === 'string' ? params.cwd : os.homedir(),
+      env: env.value,
+      outputByteLimit: Number.isFinite(Number(params.outputByteLimit))
+        ? Math.max(0, Math.min(Math.floor(Number(params.outputByteLimit)), 8 * 1024 * 1024))
+        : undefined,
+      cols: geometry.value.cols,
+      rows: geometry.value.rows,
+      sender: owner,
+      restore,
+    })
+  } catch (error) {
+    return terminalCapacityResponse(error)
   }
-
-  const continuity = manager.setSender(id, owner)
-  const previousInstance = continuity?.previousOwner?.split('|')[0]
-  const continuation = continuity && previousInstance && previousInstance !== clientInstanceId
-    ? { ...continuity, acrossRestart: true, reattachedAt: now(), brokerPid, terminalPid: rec.pty?.pid }
-    : null
-  return {
-    ok: true,
-    existed,
-    pid: rec.pty?.pid ?? null,
-    continuation,
-    ...manager.snapshot(id),
-    recovered: null,
-  }
+  return mapMaybePromise(rec, (record) => {
+    if (!record) {
+      return manager.available()
+        ? { ok: false, message: 'could not start terminal' }
+        : { ok: false, message: 'node-pty unavailable in session broker' }
+    }
+    const continuity = manager.setSender(id, owner)
+    const previousInstance = continuity?.previousOwner?.split('|')[0]
+    const continuation = continuity && previousInstance && previousInstance !== clientInstanceId
+      ? { ...continuity, acrossRestart: true, reattachedAt: now(), brokerPid, terminalPid: record.pty?.pid }
+      : null
+    return mapMaybePromise(manager.snapshot(id, { responseBarrier: true }), (snapshot) => ({
+      ok: true,
+      existed,
+      pid: record.pty?.pid ?? null,
+      continuation,
+      ...snapshot,
+      recovered: null,
+    }))
+  }, terminalCapacityResponse)
 }
 
 module.exports = {
@@ -376,6 +407,7 @@ module.exports = {
   terminalCreateRoute,
   terminalIdLengthRejection,
   terminalKillRoute,
+  terminalReleaseRoute,
   terminalResizeRoute,
   validatedTerminalGeometry,
   TERMINAL_ID_MAX_LENGTH,

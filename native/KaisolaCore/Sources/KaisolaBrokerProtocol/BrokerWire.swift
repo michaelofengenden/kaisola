@@ -18,8 +18,14 @@ public enum BrokerWire {
     public static let observerRoleFeature = "observer-role-v1"
     public static let brokerUpdateFeature = "broker-update-v1"
     public static let brokerRollingUpdateFeature = "broker-rolling-update-v1"
+    public static let brokerMutationIdempotencyFeature = "broker-mutation-idempotency-v1"
+    public static let brokerInventoryFeature = "broker-inventory-v1"
+    public static let brokerAdministrationFeature = "broker-administration-v1"
+    public static let defaultMaximumLiveTerminals = 64
+    public static let maximumConfigurableLiveTerminals = 512
     public static let observerMethods: Set<String> = [
         "broker.status",
+        "broker.inventory",
         "terminal.list",
         "terminal.diagnostics",
         "terminal.history",
@@ -28,6 +34,7 @@ public enum BrokerWire {
     ]
     public static let maximumFrameBytes = 56 * 1_024 * 1_024
     public static let terminalHistoryPageBytes = 4 * 1_024 * 1_024
+    public static let terminalWritePayloadBytes = 64 * 1_024
 
     /// The transport ceiling only exists for the two snapshot-shaped replies
     /// which may contain an 8 MiB terminal tail after worst-case JSON escaping.
@@ -51,6 +58,8 @@ public enum BrokerWire {
                 26 * 1_024 * 1_024
             case "broker.status", "terminal.list", "terminal.diagnostics":
                 4 * 1_024 * 1_024
+            case "broker.inventory":
+                12 * 1_024 * 1_024
             default:
                 256 * 1_024
             }

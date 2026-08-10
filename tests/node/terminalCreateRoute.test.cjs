@@ -28,7 +28,7 @@ const {
 } = TERMINAL_GEOMETRY_LIMITS
 
 const managerSpoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-create-route-'))
-realManager.configureStorage(managerSpoolDir)
+realManager.configureStorage(managerSpoolDir, { asyncWrites: false })
 realManager.setEventSink(() => true)
 after(() => {
   realManager.killAll()
@@ -60,14 +60,21 @@ function fakeManager({ live = false, recovered = null } = {}) {
   }
 }
 
-test('terminal create route forwards restore but never returns a recovered payload', () => {
+test('terminal create route awaits asynchronous replacement and snapshot work', async () => {
   const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
   const manager = fakeManager({
     recovered: { text: 'retained-before-restart', truncated: true },
   })
+  const spawn = manager.spawn
+  const snapshot = manager.snapshot
+  manager.spawn = async (options) => spawn(options)
+  manager.snapshot = async (...args) => {
+    manager.snapshotArgs = args
+    return snapshot()
+  }
   const authorized = []
 
-  const response = terminalCreateRoute({
+  const response = await terminalCreateRoute({
     manager,
     params: {
       id: 'caller-supplied-terminal-id',
@@ -89,6 +96,10 @@ test('terminal create route forwards restore but never returns a recovered paylo
   assert.equal(manager.calls.length, 1)
   assert.equal(manager.calls[0].id, 'caller-supplied-terminal-id')
   assert.equal(manager.calls[0].restore, true)
+  assert.deepEqual(manager.snapshotArgs, [
+    'caller-supplied-terminal-id',
+    { responseBarrier: true },
+  ])
   assert.equal(response.recovered, null)
   assert.equal(response.output, 'new-session-output')
 })
@@ -109,6 +120,60 @@ test('terminal create route always returns recovered null for a plain spawn', ()
 
   assert.equal(manager.calls[0].restore, false)
   assert.equal(response.recovered, null)
+})
+
+test('terminal create route returns only a typed bounded capacity rejection', () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const manager = fakeManager()
+  manager.has = () => false
+  manager.spawn = () => {
+    const error = new Error('sensitive process inventory must not cross the wire')
+    error.code = 'TERMINAL_CAPACITY_EXCEEDED'
+    error.liveTerminalCount = 64
+    error.maximumLiveTerminals = 64
+    error.rawTerminalIDs = ['secret-terminal']
+    throw error
+  }
+
+  assert.deepEqual(terminalCreateRoute({
+    manager,
+    params: { id: 'capacity-rejected-terminal' },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => {},
+  }), {
+    ok: false,
+    code: 'terminal_capacity_exceeded',
+    message: 'broker terminal capacity reached',
+    maximumLiveTerminals: 64,
+  })
+})
+
+test('terminal create route preserves the typed capacity rejection after an async spool close', async () => {
+  const { terminalCreateRoute } = require('../../runtime/node-broker/ipc/terminalCreateRoute.cjs')
+  const manager = fakeManager()
+  manager.has = () => false
+  manager.spawn = async () => {
+    const error = new Error('sensitive process inventory must not cross the wire')
+    error.code = 'TERMINAL_CAPACITY_EXCEEDED'
+    error.liveTerminalCount = 64
+    error.maximumLiveTerminals = 64
+    error.rawTerminalIDs = ['secret-terminal']
+    throw error
+  }
+
+  assert.deepEqual(await terminalCreateRoute({
+    manager,
+    params: { id: 'async-capacity-rejected-terminal' },
+    owner: 'instance|owner|project',
+    clientInstanceId: 'instance',
+    requireAllowed: () => {},
+  }), {
+    ok: false,
+    code: 'terminal_capacity_exceeded',
+    message: 'broker terminal capacity reached',
+    maximumLiveTerminals: 64,
+  })
 })
 
 test('terminal create route preserves safe multibyte arguments and environment', () => {
@@ -695,7 +760,19 @@ test('restore of naturally ended spool registers a history-serving cold record',
   spool.push(oldOutput)
   spool.markExited(exitStatus)
   spool.close()
-  t.after(() => realManager.release(id))
+  const liveID = 'capacity-live-while-restoring-cold-history'
+  realManager.configureCapacity(1)
+  assert.ok(realManager.spawn({
+    id: liveID,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+  }))
+  t.after(() => {
+    realManager.release(id)
+    realManager.release(liveID)
+    realManager.configureCapacity(realManager.DEFAULT_MAX_LIVE_TERMINALS)
+  })
 
   const response = terminalCreateRoute({
     manager: realManager,
@@ -721,6 +798,11 @@ test('restore of naturally ended spool registers a history-serving cold record',
   assert.equal(response.output, '')
   assert.equal(response.startOffset, oldBytes)
   assert.equal(response.endOffset, oldBytes)
+  assert.deepEqual(realManager.capacity(), {
+    liveTerminalCount: 1,
+    maximumLiveTerminals: 1,
+    availableTerminalSlots: 0,
+  })
 
   assert.deepEqual(realManager.history(id, {
     streamEpoch: response.streamEpoch,

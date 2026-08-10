@@ -181,7 +181,7 @@ test('colliding long id prefixes never alias one terminal across projects and ow
   assert.equal(detachOwner.ok, false)
   assert.match(detachOwner.message, /terminal id exceeds 240 characters/)
 
-  const status = await ownerA.request('broker.status', { ownerId: '0' })
+  const status = await ownerA.request('broker.status', { ownerId: '1', projectId: projectA })
   assert.deepEqual(
     status.result.terminals.map((entry) => entry.id),
     [atCap],

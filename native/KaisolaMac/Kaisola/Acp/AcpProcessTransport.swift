@@ -12,6 +12,136 @@ protocol AcpByteTransport: Sendable {
     func exitCode() async -> Int32?
 }
 
+/// Retains only the most recent adapter stderr bytes and turns them into safe,
+/// user-facing failure detail. The pipe itself remains separate from ACP
+/// stdout; this object is diagnostics-only and is replaced for every spawn.
+final class AcpStderrTail: @unchecked Sendable {
+    struct Snapshot: Equatable, Sendable {
+        let retainedByteCount: Int
+        let didTruncate: Bool
+        let failureDetail: String?
+    }
+
+    static let defaultByteLimit = 32 * 1_024
+
+    private let byteLimit: Int
+    private let sensitiveValues: [String]
+    private let lock = NSLock()
+    private var retained = Data()
+    private var didTruncate = false
+
+    init(
+        byteLimit: Int = AcpStderrTail.defaultByteLimit,
+        sensitiveValues: [String] = []
+    ) {
+        self.byteLimit = max(0, byteLimit)
+        self.sensitiveValues = Array(Set(sensitiveValues.filter { $0.utf8.count >= 4 }))
+            .sorted { $0.utf8.count > $1.utf8.count }
+    }
+
+    func append(_ data: Data) {
+        guard !data.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+
+        let total = retained.count + data.count
+        if total > byteLimit { didTruncate = true }
+        guard byteLimit > 0 else {
+            retained.removeAll(keepingCapacity: false)
+            return
+        }
+        if data.count >= byteLimit {
+            retained = Data(data.suffix(byteLimit))
+            return
+        }
+        let bytesToDiscard = max(0, total - byteLimit)
+        if bytesToDiscard > 0 { retained.removeFirst(bytesToDiscard) }
+        retained.append(data)
+    }
+
+    func failureDetail() -> String? {
+        lock.lock()
+        let data = retained
+        let truncated = didTruncate
+        lock.unlock()
+        return Self.failureDetail(
+            data: data,
+            truncated: truncated,
+            sensitiveValues: sensitiveValues
+        )
+    }
+
+    func snapshotForTesting() -> Snapshot {
+        lock.lock()
+        let data = retained
+        let truncated = didTruncate
+        lock.unlock()
+        return Snapshot(
+            retainedByteCount: data.count,
+            didTruncate: truncated,
+            failureDetail: Self.failureDetail(
+                data: data,
+                truncated: truncated,
+                sensitiveValues: sensitiveValues
+            )
+        )
+    }
+
+    private static func failureDetail(
+        data: Data,
+        truncated: Bool,
+        sensitiveValues: [String]
+    ) -> String? {
+        guard !data.isEmpty else { return nil }
+        // A tail can begin in the middle of `api_key=<value>`. Never expose
+        // that orphaned prefix: when bytes were discarded, start at the next
+        // complete line before applying content redaction.
+        let displayData: Data
+        if truncated, let newline = data.firstIndex(of: 0x0A) {
+            displayData = Data(data[data.index(after: newline)...])
+        } else if truncated {
+            displayData = Data()
+        } else {
+            displayData = data
+        }
+        var text = String(decoding: displayData, as: UTF8.self)
+        for value in sensitiveValues {
+            text = text.replacingOccurrences(of: value, with: "[redacted]")
+        }
+        let replacements: [(String, String)] = [
+            // OSC/CSI and remaining C0 control bytes cannot alter or obscure
+            // the visible failure message.
+            (#"\x1B\][^\x07\x1B]*(?:\x07|\x1B\\)"#, ""),
+            (#"\x1B\[[0-?]*[ -/]*[@-~]"#, ""),
+            (#"(?i)(https?://)[^/\s:@]+:[^@\s/]+@"#, "$1[redacted]@"),
+            (#"(?i)\b(authorization\s*:\s*(?:bearer|basic)\s+)[^\s,;]+"#, "$1[redacted]"),
+            (#"(?i)\b(api[_-]?(?:key|token)|access[_-]?token|auth[_-]?token|password|passwd|secret)\s*[:=]\s*[^\s,;]+"#, "$1=[redacted]"),
+            (#"(?i)\b(?:sk-[A-Za-z0-9_-]{12,}|gh[opsu]_[A-Za-z0-9_]{12,}|xox[abprs]-[A-Za-z0-9-]{12,}|AKIA[A-Z0-9]{16})\b"#, "[redacted]"),
+            (#"(?i)(?:/Users/[^/\s]+|/home/[^/\s]+|[A-Z]:\\Users\\[^\\\s]+)(?:[/\\][^\s,;]*)?"#, "[local path]"),
+            (#"(?i)(?:/private/(?:var|tmp)|/var|/tmp)(?:/[^\s,;]*)+"#, "[local path]"),
+            (#"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]"#, ""),
+        ]
+        for (pattern, replacement) in replacements {
+            guard let expression = try? NSRegularExpression(pattern: pattern) else { continue }
+            let range = NSRange(text.startIndex..<text.endIndex, in: text)
+            text = expression.stringByReplacingMatches(
+                in: text,
+                range: range,
+                withTemplate: replacement
+            )
+        }
+        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if truncated, text.isEmpty {
+            return "Earlier adapter stderr was truncated; no complete diagnostic line was safe to display."
+        }
+        guard !text.isEmpty else { return nil }
+        if truncated {
+            return "Earlier adapter stderr was truncated.\n\(text)"
+        }
+        return text
+    }
+}
+
 /// A single ordered writer for the adapter's stdin. Calls to `send` enqueue
 /// complete JSON-RPC frames, but the potentially backpressured descriptor work
 /// happens in a separate task so it can never monopolize `AcpProcessTransport`.
@@ -288,15 +418,18 @@ actor AcpProcessTransport: AcpByteTransport {
     private var runGeneration: UInt64 = 0
     private var terminatingGeneration: UInt64?
     private var stdinWriter: AcpStdinWriteQueue?
+    private var stderrTail: AcpStderrTail?
 
     private let stdinFrameDeadlineNanoseconds: UInt64
     private let maximumQueuedStdinFrames: Int
     private let maximumQueuedStdinBytes: Int
     private let stdinWriteOperation: AcpStdinWriteQueue.WriteOperation
+    private let stderrByteLimit: Int
 
     private static let eofGrace: Duration = .milliseconds(100)
     private static let terminateGrace: Duration = .milliseconds(1_500)
     private static let killGrace: Duration = .milliseconds(500)
+    private static let exitStatusGrace: Duration = .milliseconds(500)
 
     init(
         stdinFrameDeadlineNanoseconds: UInt64 =
@@ -304,12 +437,14 @@ actor AcpProcessTransport: AcpByteTransport {
         maximumQueuedStdinFrames: Int = AcpStdinWriteQueue.defaultMaximumQueuedFrames,
         maximumQueuedStdinBytes: Int = AcpStdinWriteQueue.defaultMaximumQueuedBytes,
         stdinWriteOperation: @escaping AcpStdinWriteQueue.WriteOperation =
-            AcpStdinWriteQueue.writeFrame
+            AcpStdinWriteQueue.writeFrame,
+        stderrByteLimit: Int = AcpStderrTail.defaultByteLimit
     ) {
         self.stdinFrameDeadlineNanoseconds = stdinFrameDeadlineNanoseconds
         self.maximumQueuedStdinFrames = maximumQueuedStdinFrames
         self.maximumQueuedStdinBytes = maximumQueuedStdinBytes
         self.stdinWriteOperation = stdinWriteOperation
+        self.stderrByteLimit = max(0, stderrByteLimit)
     }
 
     func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
@@ -345,10 +480,18 @@ actor AcpProcessTransport: AcpByteTransport {
         )
         stdoutHandle = FileHandle(fileDescriptor: spawned.stdoutDescriptor, closeOnDealloc: true)
         let stderr = FileHandle(fileDescriptor: spawned.stderrDescriptor, closeOnDealloc: true)
+        let tail = AcpStderrTail(
+            byteLimit: stderrByteLimit,
+            sensitiveValues: Self.sensitiveEnvironmentValues(environment)
+        )
         stderrHandle = stderr
+        stderrTail = tail
         // Drain stderr so a chatty adapter never blocks on a full pipe. Its
         // contents are diagnostics only; the protocol is stdout.
-        stderr.readabilityHandler = { handle in _ = handle.availableData }
+        stderr.readabilityHandler = { handle in
+            let data = handle.availableData
+            if !data.isEmpty { tail.append(data) }
+        }
         waitTask = nil
     }
 
@@ -373,7 +516,7 @@ actor AcpProcessTransport: AcpByteTransport {
 
     func receive(maximumBytes: Int) async throws -> Data? {
         guard let descriptor = stdoutHandle?.fileDescriptor else { throw AcpClientError.notRunning }
-        return try await Task.detached(priority: .userInitiated) {
+        let data: Data? = try await Task.detached(priority: .userInitiated) {
             var bytes = [UInt8](repeating: 0, count: maximumBytes)
             let count = read(descriptor, &bytes, bytes.count)
             if count == 0 { return nil }
@@ -383,6 +526,21 @@ actor AcpProcessTransport: AcpByteTransport {
             }
             return Data(bytes.prefix(count))
         }.value
+        guard let data else {
+            // Capture the final stderr bytes only after the owned process group
+            // has closed its pipe. Clean stderr preserves the existing EOF
+            // contract; diagnostics become the failure detail readLoop exposes.
+            let generation = runGeneration
+            let tail = stderrTail
+            await terminate()
+            let recordedCode = await waitForTerminationCode(generation: generation)
+            guard let detail = tail?.failureDetail() else { return nil }
+            let code = recordedCode.map(String.init) ?? "unknown"
+            throw AcpClientError.requestFailed(
+                "The agent process exited (code \(code)). Adapter stderr:\n\(detail)"
+            )
+        }
+        return data
     }
 
     /// Close the stdio ownership edge, then terminate the entire adapter group.
@@ -455,15 +613,42 @@ actor AcpProcessTransport: AcpByteTransport {
         terminationCode
     }
 
+    private func waitForTerminationCode(generation: UInt64) async -> Int32? {
+        let deadline = ContinuousClock.now.advanced(by: Self.exitStatusGrace)
+        while generation == runGeneration,
+              terminationCode == nil,
+              ContinuousClock.now < deadline {
+            await Self.pause(.milliseconds(10))
+        }
+        guard generation == runGeneration else { return nil }
+        return terminationCode
+    }
+
     private func closeHandles() {
         try? stdinHandle?.close()
         try? stdoutHandle?.close()
-        stderrHandle?.readabilityHandler = nil
+        drainRemainingStderr()
         try? stderrHandle?.close()
         stdinHandle = nil
         stdinWriter = nil
         stdoutHandle = nil
         stderrHandle = nil
+    }
+
+    private func drainRemainingStderr() {
+        guard let handle = stderrHandle else { return }
+        handle.readabilityHandler = nil
+        let descriptor = handle.fileDescriptor
+        var bytes = [UInt8](repeating: 0, count: 16 * 1_024)
+        while true {
+            let count = Darwin.read(descriptor, &bytes, bytes.count)
+            if count > 0 {
+                stderrTail?.append(Data(bytes.prefix(count)))
+                continue
+            }
+            if count < 0, errno == EINTR { continue }
+            return
+        }
     }
 
     private func signalOwnedGroup(_ signal: Int32, pid: pid_t, group: pid_t, generation: UInt64) -> Bool {
@@ -559,7 +744,8 @@ actor AcpProcessTransport: AcpByteTransport {
             closeDescriptors(stdinPipe + stdoutPipe + stderrPipe)
             throw POSIXError(.EMFILE)
         }
-        guard makeNonblockingAndSuppressSIGPIPE(stdinPipe[1]) else {
+        guard makeNonblockingAndSuppressSIGPIPE(stdinPipe[1]),
+              makeNonblocking(stderrPipe[0]) else {
             let code = errno
             closeDescriptors(stdinPipe + stdoutPipe + stderrPipe)
             throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
@@ -652,11 +838,26 @@ actor AcpProcessTransport: AcpByteTransport {
     }
 
     private static func makeNonblockingAndSuppressSIGPIPE(_ descriptor: Int32) -> Bool {
-        let flags = Darwin.fcntl(descriptor, F_GETFL)
-        guard flags >= 0,
-              Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0,
+        guard makeNonblocking(descriptor),
               Darwin.fcntl(descriptor, F_SETNOSIGPIPE, 1) == 0 else { return false }
         return true
+    }
+
+    private static func makeNonblocking(_ descriptor: Int32) -> Bool {
+        let flags = Darwin.fcntl(descriptor, F_GETFL)
+        return flags >= 0 && Darwin.fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) == 0
+    }
+
+    private static func sensitiveEnvironmentValues(_ environment: [String: String]) -> [String] {
+        let sensitiveKeyFragments = [
+            "API_KEY", "APIKEY", "AUTH", "CREDENTIAL", "OAUTH", "PASSWD", "PASSWORD",
+            "PRIVATE_KEY", "SECRET", "TOKEN",
+        ]
+        return environment.compactMap { key, value in
+            let normalizedKey = key.uppercased()
+            guard sensitiveKeyFragments.contains(where: normalizedKey.contains) else { return nil }
+            return value
+        }
     }
 
     private static func closeDescriptors(_ descriptors: [Int32]) {

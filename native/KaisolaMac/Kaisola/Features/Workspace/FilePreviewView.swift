@@ -286,12 +286,18 @@ struct FilePreviewSaveControlAccessibility: Equatable {
 }
 
 enum FilePreviewControlAccessibility {
-    static let headerFocusOrder = [
-        "preview.editorMode",
-        "preview.save",
-        "preview.options",
-        "preview.hide",
-    ]
+    // Xcode 16.4's Swift 6.1.2 frontend crashes while lowering this array as a
+    // module-level lazy global initializer once the integrated app module is
+    // large enough. A computed value has the same immutable contract without
+    // emitting that initializer; newer toolchains compile both forms.
+    static var headerFocusOrder: [String] {
+        [
+            "preview.editorMode",
+            "preview.save",
+            "preview.options",
+            "preview.hide",
+        ]
+    }
 }
 
 /// File preview/editor pane: UTF-8 text is editable with ⌘S save + revert,

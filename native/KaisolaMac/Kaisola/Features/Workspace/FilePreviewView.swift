@@ -178,7 +178,10 @@ struct FilePreviewTabOverflowPresentation {
         }
     }
 
-    static let accessibilityIdentifier = "preview.allDocuments"
+    // Keep this computed for Xcode 16.4 / Swift 6.1. A stored String here is
+    // lowered as a lazy global initializer and crashes that compiler while
+    // emitting the optimized Kaisola module, before any tests can run.
+    static var accessibilityIdentifier: String { "preview.allDocuments" }
 
     let entries: [Entry]
     let selectedScrollTarget: URL?

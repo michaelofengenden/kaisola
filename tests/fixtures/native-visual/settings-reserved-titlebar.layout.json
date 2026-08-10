@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "surface": "settings",
+  "appearance": "light",
+  "contentWidth": 810,
+  "contentHeight": 540,
+  "inventorySource": "accessibility",
+  "windowControls": [
+    { "name": "close", "isHidden": false, "frame": { "x": 0.01111, "y": 0.01481, "width": 0.01728, "height": 0.02593 } },
+    { "name": "miniaturize", "isHidden": false, "frame": { "x": 0.03580, "y": 0.01481, "width": 0.01728, "height": 0.02593 } },
+    { "name": "zoom", "isHidden": false, "frame": { "x": 0.06049, "y": 0.01481, "width": 0.01728, "height": 0.02593 } }
+  ],
+  "controlZone": { "x": 0.00370, "y": 0.00370, "width": 0.08149, "height": 0.04815 },
+  "controlZoneInk": {
+    "coverage": 0.94,
+    "minimumLuminance": 0.79,
+    "maximumLuminance": 0.86,
+    "samples": 768
+  },
+  "contentInk": {
+    "columns": 3,
+    "rows": 3,
+    "cells": [
+      { "coverage": 0.94, "minimumLuminance": 0.11, "maximumLuminance": 0.97, "samples": 16 },
+      { "coverage": 0.9, "minimumLuminance": 0.2, "maximumLuminance": 0.93, "samples": 16 },
+      { "coverage": 0.9, "minimumLuminance": 0.2, "maximumLuminance": 0.93, "samples": 16 },
+      { "coverage": 0.92, "minimumLuminance": 0.18, "maximumLuminance": 0.95, "samples": 16 },
+      { "coverage": 0.9, "minimumLuminance": 0.2, "maximumLuminance": 0.93, "samples": 16 },
+      { "coverage": 0.9, "minimumLuminance": 0.2, "maximumLuminance": 0.93, "samples": 16 },
+      { "coverage": 0.92, "minimumLuminance": 0.18, "maximumLuminance": 0.95, "samples": 16 },
+      { "coverage": 0.9, "minimumLuminance": 0.2, "maximumLuminance": 0.93, "samples": 16 },
+      { "coverage": 0.9, "minimumLuminance": 0.2, "maximumLuminance": 0.93, "samples": 16 }
+    ]
+  },
+  "elements": [
+    {
+      "id": "0",
+      "role": "AXGroup",
+      "label": "Settings",
+      "frame": { "x": 0, "y": 0, "width": 1, "height": 1 },
+      "isLeaf": false,
+      "isInteractive": false,
+      "isFocused": false,
+      "isTruncated": false,
+      "pointHeight": 540
+    },
+    {
+      "id": "0/0/0",
+      "role": "AXImage",
+      "label": "Settings mark",
+      "frame": { "x": 0.02716, "y": 0.05185, "width": 0.03704, "height": 0.05556 },
+      "isLeaf": true,
+      "isInteractive": false,
+      "isFocused": false,
+      "isTruncated": false,
+      "pointHeight": 30
+    },
+    {
+      "id": "0/0/1",
+      "role": "AXStaticText",
+      "label": "Settings",
+      "frame": { "x": 0.07531, "y": 0.06296, "width": 0.08395, "height": 0.03333 },
+      "isLeaf": true,
+      "isInteractive": false,
+      "isFocused": false,
+      "isTruncated": false,
+      "pointHeight": 18
+    },
+    {
+      "id": "0/0/2",
+      "role": "AXButton",
+      "label": "General",
+      "frame": { "x": 0.01235, "y": 0.16296, "width": 0.19259, "height": 0.06296 },
+      "isLeaf": true,
+      "isInteractive": true,
+      "isFocused": false,
+      "isTruncated": false,
+      "pointHeight": 34
+    }
+  ],
+  "focusedElementID": null
+}

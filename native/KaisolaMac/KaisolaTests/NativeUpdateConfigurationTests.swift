@@ -115,6 +115,31 @@ final class NativeUpdateConfigurationTests: XCTestCase {
         XCTAssertEqual(replacementCallCount, 0)
     }
 
+    func testReadyUpdateReplacementInvokesOnlyTheNewestInstallClosure() {
+        let center = UpdateCenter(environment: [:])
+        var replacedInstallCallCount = 0
+        var currentInstallCallCount = 0
+
+        center.markReady(version: "2.0.0") { replacedInstallCallCount += 1 }
+        center.markReady(version: "2.0.1") { currentInstallCallCount += 1 }
+
+        XCTAssertEqual(center.pendingUpdate?.version, "2.0.1")
+        XCTAssertEqual(center.pendingUpdate?.phase, .ready)
+        center.installAndRelaunch()
+        XCTAssertEqual(replacedInstallCallCount, 0)
+        XCTAssertEqual(currentInstallCallCount, 1)
+    }
+
+    func testInstallWithNoPendingUpdateIsANoOp() {
+        let center = UpdateCenter(environment: [:])
+
+        center.installAndRelaunch()
+
+        XCTAssertNil(center.pendingUpdate)
+        XCTAssertFalse(center.canInstallPendingUpdate)
+        XCTAssertFalse(center.isInstallingUpdate)
+    }
+
     func testSettingsPresentationFailsClosedToAccessibleInstallingState() {
         XCTAssertEqual(
             SettingsView.SoftwareUpdateActionPresentation.resolve(

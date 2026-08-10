@@ -5,6 +5,7 @@ import KaisolaCore
 import QuartzCore
 import ScreenCaptureKit
 import Security
+import SwiftTerm
 import SwiftUI
 import WebKit
 
@@ -715,11 +716,24 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     ] == "1"
     private var resourceFrameCadenceProbe: NativeFrameCadenceProbe?
     private var visualStreamingFixtureTask: Task<Void, Never>?
+    private var visualOwnershipFlapTask: Task<Void, Never>?
     private struct ResourceTerminalReceipt {
         let terminalID: String
         let observedOffset: Int64
         let windowWidth: Int
         let windowHeight: Int
+    }
+    private struct VisualOwnershipSurfaceState: Equatable {
+        let selectionRange: NSRange
+        let topVisibleRow: Int
+        let scrollPosition: Double
+        let cursorX: Int
+        let cursorY: Int
+        let cursorStyle: String
+        let linkMode: String
+        let explicitLinkURL: String?
+        let workingDirectory: URL?
+        let followsLiveOutput: Bool
     }
     private var resourceTerminalReceipts: [ResourceTerminalReceipt] = []
     private var resourceReceiptEmitted = false
@@ -787,8 +801,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         MemoryPressureResponder.shared.start()
         // Usage stats stay fresh on their own (spec §3e): frontmost window's
         // workspace, every 5 minutes while active.
-        UsageCenter.shared.startBackgroundRefresh { [weak self] in
-            self?.activeSettingsModel()?.currentProjectDirectory
+        if !visualFixture && resourceWorkload == nil {
+            UsageCenter.shared.startBackgroundRefresh { [weak self] in
+                self?.activeSettingsModel()?.currentProjectDirectory
+            }
         }
         if resourceWorkloadRequested, resourceWorkload == nil {
             print("KAISOLA_NATIVE_RESOURCE_WORKLOAD_READY=FAIL invalid-private-temporary-root")
@@ -1310,6 +1326,9 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         if visualFixture, visualSurface == "terminal-scroll-output" {
             scheduleVisualTerminalStreamingFixture(in: window, model: model)
         }
+        if visualFixture, visualSurface == "terminal-ownership-flap" {
+            scheduleVisualTerminalOwnershipFlapFixture(in: window, model: model)
+        }
         if visualFixture, visualSurface == "preview-tab-overflow" {
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 350_000_000)
@@ -1668,6 +1687,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                let streamingTask = visualStreamingFixtureTask {
                 await streamingTask.value
             }
+            if visualSurface == "terminal-ownership-flap",
+               let ownershipFlapTask = visualOwnershipFlapTask {
+                await ownershipFlapTask.value
+            }
             guard let captureWindow = NativeVisualCaptureTarget.window(
                 rootedAt: window,
                 surface: visualSurface
@@ -2002,6 +2025,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private func requestVisualFixtureTermination() {
         visualStreamingFixtureTask?.cancel()
         visualStreamingFixtureTask = nil
+        visualOwnershipFlapTask?.cancel()
+        visualOwnershipFlapTask = nil
         DispatchQueue.main.async { [visualFixture] in
             if visualFixture {
                 // A SwiftUI sheet can keep AppKit's terminate path inside its
@@ -2099,6 +2124,312 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             )
             self.visualStreamingFixtureTask = nil
         }
+    }
+
+    /// Drive a real SwiftUI/AppKit ownership transition against the exact
+    /// maximum retained transcript. This fixture is broker-free and runs only
+    /// under `KAISOLA_NATIVE_VISUAL_FIXTURE=1`; its receipt proves that the
+    /// mounted view/parser state never changed while input was revoked.
+    private func scheduleVisualTerminalOwnershipFlapFixture(
+        in window: NSWindow,
+        model: AppModel
+    ) {
+        visualOwnershipFlapTask?.cancel()
+        visualOwnershipFlapTask = Task { @MainActor [weak self, weak window, weak model] in
+            guard let self, let window, let model else { return }
+            let expectedBytes = TerminalDocument.maximumRetainedBytes
+            let readyDeadline = ContinuousClock().now.advanced(by: .seconds(20))
+            var mountedView: OwnedTerminalView?
+            var mountedCoordinator: NativeTerminalSurface.Coordinator?
+            while ContinuousClock().now < readyDeadline, !Task.isCancelled {
+                window.displayIfNeeded()
+                if let view = window.contentView.flatMap({ self.firstTerminalView(in: $0) })
+                    as? OwnedTerminalView,
+                   let coordinator = view.terminalDelegate
+                    as? NativeTerminalSurface.Coordinator,
+                   !coordinator.isProgressivelyReplaying,
+                   coordinator.replayMetrics.fullReplayStarts == 1,
+                   coordinator.replayMetrics.progressiveBytesFed == expectedBytes {
+                    mountedView = view
+                    mountedCoordinator = coordinator
+                    break
+                }
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            guard !Task.isCancelled,
+                  let view = mountedView,
+                  let coordinator = mountedCoordinator else {
+                self.emitVisualOwnershipFlapReceipt(ok: false, reason: "surface-not-ready")
+                self.requestVisualFixtureTermination()
+                return
+            }
+
+            let terminal = view.getTerminal()
+            guard let linkAnchor = self.visualOwnershipLinkAnchor(in: terminal) else {
+                self.emitVisualOwnershipFlapReceipt(ok: false, reason: "missing-explicit-link")
+                self.requestVisualFixtureTermination()
+                return
+            }
+            view.selectAll(nil)
+            TerminalScrollGestureMonitor.noteGestureForTesting(view: view)
+            view.scroll(toPosition: 0.35)
+            coordinator.scrolled(source: view, position: view.scrollPosition)
+            let initialSelection = view.getSelection()
+            let initialState = self.visualOwnershipSurfaceState(
+                view: view,
+                coordinator: coordinator,
+                linkPosition: linkAnchor.position
+            )
+            let initialMetrics = coordinator.replayMetrics
+            let viewIdentity = ObjectIdentifier(view)
+            let coordinatorIdentity = ObjectIdentifier(coordinator)
+            let terminalIdentity = ObjectIdentifier(terminal)
+            let linkPresent = linkAnchor.url == VisualTerminalOwnershipFlapFixture.linkURL
+                && initialState.explicitLinkURL == VisualTerminalOwnershipFlapFixture.linkURL
+            guard initialSelection != nil,
+                  !coordinator.isFollowingLiveOutput,
+                  linkPresent,
+                  initialMetrics == .init(
+                    fullReplayStarts: 1,
+                    scheduledProgressiveBytes: expectedBytes,
+                    progressiveBytesFed: expectedBytes,
+                    synchronousReplayBytes: 0
+                  ) else {
+                self.emitVisualOwnershipFlapReceipt(ok: false, reason: "invalid-initial-state")
+                self.requestVisualFixtureTermination()
+                return
+            }
+
+            var samples: [Double] = []
+            var revokedPresentationObserved = true
+            var stateStayedExact = true
+            var scrollStayedExact = true
+            var cursorStayedExact = true
+            var linkStayedExact = true
+            var liveFollowStayedExact = true
+            let recordState: (VisualOwnershipSurfaceState) -> Void = { state in
+                stateStayedExact = stateStayedExact && state == initialState
+                scrollStayedExact = scrollStayedExact
+                    && state.topVisibleRow == initialState.topVisibleRow
+                    && state.scrollPosition == initialState.scrollPosition
+                cursorStayedExact = cursorStayedExact
+                    && state.cursorX == initialState.cursorX
+                    && state.cursorY == initialState.cursorY
+                    && state.cursorStyle == initialState.cursorStyle
+                linkStayedExact = linkStayedExact
+                    && state.linkMode == initialState.linkMode
+                    && state.explicitLinkURL == initialState.explicitLinkURL
+                liveFollowStayedExact = liveFollowStayedExact
+                    && state.followsLiveOutput == initialState.followsLiveOutput
+            }
+
+            for toast in ToastCenter.shared.toasts
+                where toast.message.hasSuffix(AppModel.terminalInputDiscardNoticeSuffix)
+                    || toast.message == AppModel.terminalInputDiscardAggregateNotice {
+                ToastCenter.shared.dismiss(toast.id)
+            }
+            let queuedInputSecrets = [
+                "visual-stale-text-secret",
+                "private visual paste",
+            ]
+            let queuedInputs = [
+                queuedInputSecrets[0],
+                "\u{1B}[A",
+                "\u{1B}[200~\(queuedInputSecrets[1])\r\u{1B}[201~",
+                "\r",
+            ]
+            for data in queuedInputs {
+                model.sendInput(data, to: "visual-terminal")
+            }
+
+            var discardNoticeVisible = false
+            var discardNoticeRedacted = false
+            for _ in 0..<7 {
+                let started = ProcessInfo.processInfo.systemUptime
+                guard model.setVisualFixtureTerminalOwnership(false),
+                      await self.waitForVisualTerminalAuthorization(
+                        false,
+                        view: view,
+                        coordinator: coordinator,
+                        window: window
+                      ) else {
+                    self.emitVisualOwnershipFlapReceipt(ok: false, reason: "revoke-timeout")
+                    self.requestVisualFixtureTermination()
+                    return
+                }
+                let discardNotices = ToastCenter.shared.toasts.filter {
+                    $0.message.hasSuffix(AppModel.terminalInputDiscardNoticeSuffix)
+                        || $0.message == AppModel.terminalInputDiscardAggregateNotice
+                }
+                discardNoticeVisible = discardNoticeVisible || discardNotices.count == 1
+                discardNoticeRedacted = discardNoticeRedacted
+                    || (discardNotices.count == 1 && queuedInputSecrets.allSatisfy {
+                        !discardNotices[0].message.contains($0)
+                    })
+                revokedPresentationObserved = revokedPresentationObserved
+                    && !view.allowMouseReporting
+                    && view.accessibilityLabel() == "Read-only terminal output"
+                recordState(self.visualOwnershipSurfaceState(
+                    view: view,
+                    coordinator: coordinator,
+                    linkPosition: linkAnchor.position
+                ))
+                stateStayedExact = stateStayedExact
+                    && coordinator.replayMetrics == initialMetrics
+
+                guard model.setVisualFixtureTerminalOwnership(true),
+                      await self.waitForVisualTerminalAuthorization(
+                        true,
+                        view: view,
+                        coordinator: coordinator,
+                        window: window
+                      ) else {
+                    self.emitVisualOwnershipFlapReceipt(ok: false, reason: "restore-timeout")
+                    self.requestVisualFixtureTermination()
+                    return
+                }
+                samples.append((ProcessInfo.processInfo.systemUptime - started) * 1_000)
+                recordState(self.visualOwnershipSurfaceState(
+                    view: view,
+                    coordinator: coordinator,
+                    linkPosition: linkAnchor.position
+                ))
+                stateStayedExact = stateStayedExact
+                    && coordinator.replayMetrics == initialMetrics
+            }
+
+            let sortedSamples = samples.sorted()
+            let p95Index = max(0, Int(ceil(Double(sortedSamples.count) * 0.95)) - 1)
+            let p95Milliseconds = sortedSamples[p95Index]
+            let sameView = ObjectIdentifier(view) == viewIdentity
+            let sameCoordinator = ObjectIdentifier(coordinator) == coordinatorIdentity
+                && (view.terminalDelegate as? NativeTerminalSurface.Coordinator) === coordinator
+            let sameTerminal = ObjectIdentifier(view.getTerminal()) == terminalIdentity
+            let mountedViewStable = window.contentView.flatMap({ self.firstTerminalView(in: $0) }) === view
+            let identitiesStable = sameView && sameCoordinator && sameTerminal && mountedViewStable
+            let selectionStable = view.getSelection() == initialSelection
+                && view.selectedRange() == initialState.selectionRange
+            let ok = identitiesStable
+                && stateStayedExact
+                && selectionStable
+                && revokedPresentationObserved
+                && discardNoticeVisible
+                && discardNoticeRedacted
+                && view.isInputAuthorized
+                && coordinator.replayMetrics == initialMetrics
+
+            self.emitVisualOwnershipFlapReceipt(
+                ok: ok,
+                reason: ok ? nil : "state-changed",
+                fields: [
+                    "bytes": expectedBytes,
+                    "samples": samples.count,
+                    "p95Milliseconds": p95Milliseconds,
+                    "sameView": sameView,
+                    "sameCoordinator": sameCoordinator,
+                    "sameTerminal": sameTerminal,
+                    "mountedView": mountedViewStable,
+                    "selectionStable": selectionStable,
+                    "scrollStable": scrollStayedExact,
+                    "cursorStable": cursorStayedExact,
+                    "linkStable": linkPresent && linkStayedExact,
+                    "liveFollowStable": liveFollowStayedExact,
+                    "revokedPresentationObserved": revokedPresentationObserved,
+                    "discardNoticeVisible": discardNoticeVisible,
+                    "discardNoticeRedacted": discardNoticeRedacted,
+                    "additionalReplayStarts": coordinator.replayMetrics.fullReplayStarts
+                        - initialMetrics.fullReplayStarts,
+                ]
+            )
+            self.visualOwnershipFlapTask = nil
+            if !ok { self.requestVisualFixtureTermination() }
+        }
+    }
+
+    private func waitForVisualTerminalAuthorization(
+        _ expected: Bool,
+        view: OwnedTerminalView,
+        coordinator: NativeTerminalSurface.Coordinator,
+        window: NSWindow
+    ) async -> Bool {
+        let deadline = ContinuousClock().now.advanced(by: .seconds(5))
+        while ContinuousClock().now < deadline, !Task.isCancelled {
+            window.displayIfNeeded()
+            if view.isInputAuthorized == expected,
+               window.contentView.flatMap({ firstTerminalView(in: $0) }) === view,
+               (view.terminalDelegate as? NativeTerminalSurface.Coordinator) === coordinator {
+                return true
+            }
+            await Task.yield()
+        }
+        return false
+    }
+
+    private func visualOwnershipSurfaceState(
+        view: OwnedTerminalView,
+        coordinator: NativeTerminalSurface.Coordinator,
+        linkPosition: Position
+    ) -> VisualOwnershipSurfaceState {
+        let terminal = view.getTerminal()
+        let cursor = terminal.getCursorLocation()
+        return VisualOwnershipSurfaceState(
+            selectionRange: view.selectedRange(),
+            topVisibleRow: terminal.getTopVisibleRow(),
+            scrollPosition: view.scrollPosition,
+            cursorX: cursor.x,
+            cursorY: cursor.y,
+            cursorStyle: String(describing: terminal.options.cursorStyle),
+            linkMode: String(describing: view.linkHighlightMode),
+            explicitLinkURL: terminal.link(
+                at: .buffer(linkPosition),
+                mode: .explicitOnly
+            ),
+            workingDirectory: coordinator.workingDirectory,
+            followsLiveOutput: coordinator.isFollowingLiveOutput
+        )
+    }
+
+    /// Resolve the OSC 8 fixture while it is still at live bottom, then retain
+    /// its absolute buffer coordinate while the viewport scrolls away. Checking
+    /// raw visible text is insufficient: a parser reset can preserve glyphs
+    /// while discarding their hyperlink payload.
+    private func visualOwnershipLinkAnchor(
+        in terminal: Terminal
+    ) -> (position: Position, url: String)? {
+        let topVisibleRow = terminal.getTopVisibleRow()
+        for row in stride(from: terminal.rows - 1, through: 0, by: -1) {
+            for column in 0..<terminal.cols {
+                let screenPosition = Position(col: column, row: row)
+                guard let url = terminal.link(
+                    at: .screen(screenPosition),
+                    mode: .explicitOnly
+                ) else { continue }
+                return (
+                    Position(col: column, row: topVisibleRow + row),
+                    url
+                )
+            }
+        }
+        return nil
+    }
+
+    private func emitVisualOwnershipFlapReceipt(
+        ok: Bool,
+        reason: String?,
+        fields: [String: Any] = [:]
+    ) {
+        var payload = fields
+        payload["schemaVersion"] = 1
+        payload["ok"] = ok
+        if let reason { payload["reason"] = reason }
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: payload,
+            options: [.sortedKeys]
+        ) else { return }
+        print(
+            "KAISOLA_NATIVE_VISUAL_OWNERSHIP_FLAP="
+                + String(decoding: data, as: UTF8.self)
+        )
     }
 
     private func firstWebView(in view: NSView) -> WKWebView? {

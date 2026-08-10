@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import SwiftTerm
 import XCTest
 @testable import Kaisola
@@ -10,6 +11,36 @@ import XCTest
 /// reach it without a mouse.
 @MainActor
 final class NativeTerminalInteractionTests: XCTestCase {
+    private enum RequiredFishCompatibilityError: Error, Equatable {
+        case missingRequiredFish
+        case missingExpectedFishVersion
+        case invalidFishExecutableName
+        case fishVersionMismatch(expected: String, actual: String)
+        case invalidRequiredFishConfiguration(String)
+        case fishVersionProbeFailed
+    }
+
+    private struct FishRuntime: Equatable {
+        let path: String
+        let version: String
+    }
+
+    private struct RequiredFishCompatibilityConfiguration: Codable, Equatable {
+        let schemaVersion: Int
+        let fishPath: String
+        let fishVersion: String
+
+        var environment: [String: String] {
+            [
+                "KAISOLA_REQUIRE_FISH_COMPATIBILITY": "1",
+                "KAISOLA_TEST_FISH": fishPath,
+                "KAISOLA_EXPECTED_FISH_VERSION": fishVersion,
+            ]
+        }
+    }
+
+    private static let requiredFishVersion = "4.8.1"
+
     private func osc133(_ value: String) -> String {
         "\u{1B}]133;\(value)\u{7}"
     }
@@ -365,32 +396,80 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertFalse(integration.contains("cmdline_url"))
     }
 
+    func testRequiredFishCompatibilityFailsClosedInsteadOfSkipping() throws {
+        let requiredEnvironment = [
+            "KAISOLA_REQUIRE_FISH_COMPATIBILITY": "1",
+            "KAISOLA_TEST_FISH": "/private/tmp/required/fish",
+            "KAISOLA_EXPECTED_FISH_VERSION": Self.requiredFishVersion,
+        ]
+
+        XCTAssertThrowsError(try Self.resolveFish(
+            environment: requiredEnvironment,
+            isExecutable: { _ in false },
+            versionReader: { _ in XCTFail("a missing executable must not be probed"); return "" }
+        )) { error in
+            XCTAssertEqual(error as? RequiredFishCompatibilityError, .missingRequiredFish)
+        }
+
+        XCTAssertThrowsError(try Self.resolveFish(
+            environment: requiredEnvironment,
+            isExecutable: { _ in true },
+            versionReader: { _ in "4.8.0" }
+        )) { error in
+            XCTAssertEqual(
+                error as? RequiredFishCompatibilityError,
+                .fishVersionMismatch(expected: Self.requiredFishVersion, actual: "4.8.0")
+            )
+        }
+
+        let unknownKey = Data(
+            """
+            {"schemaVersion":1,"fishPath":"/private/tmp/fish","fishVersion":"4.8.1",\
+            "unexpected":true}
+            """.utf8
+        )
+        XCTAssertThrowsError(try Self.decodeRequiredFishConfiguration(unknownKey))
+    }
+
     func testGeneratedFishIntegrationExecutesWhenFishRuntimeIsAvailable() throws {
-        guard let fishPath = ProcessInfo.processInfo.environment["KAISOLA_TEST_FISH"],
-              FileManager.default.isExecutableFile(atPath: fishPath) else {
+        let fileConfiguration = try Self.requiredFishCompatibilityConfiguration()
+        let effectiveEnvironment = fileConfiguration?.environment ?? ProcessInfo.processInfo.environment
+        let requiredCompatibility = effectiveEnvironment["KAISOLA_REQUIRE_FISH_COMPATIBILITY"] == "1"
+        guard let fish = try Self.resolveFish(environment: effectiveEnvironment) else {
             throw XCTSkip("Set KAISOLA_TEST_FISH to exercise the generated launcher with a real Fish runtime")
         }
-        guard URL(fileURLWithPath: fishPath).lastPathComponent == "fish" else {
-            XCTFail("KAISOLA_TEST_FISH must point to an executable named fish")
-            return
+        if requiredCompatibility {
+            XCTAssertEqual(fish.version, Self.requiredFishVersion)
         }
 
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("kaisola-semantic-fish-runtime-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent(
+                "kaisola fish runtime 'quoted path' \(UUID().uuidString)",
+                isDirectory: true
+            )
         let userHome = root.appendingPathComponent("user", isDirectory: true)
         let integrationRoot = root.appendingPathComponent("integration", isDirectory: true)
-        try FileManager.default.createDirectory(at: userHome, withIntermediateDirectories: true)
+        let userConfigDirectory = userHome.appendingPathComponent(".config/fish", isDirectory: true)
+        try FileManager.default.createDirectory(at: userConfigDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
+        try Data(
+            """
+            set -gx KAISOLA_FISH_USER_CONFIG custom-config-ok
+            function fish_prompt
+                printf 'kaisola-custom-prompt> '
+            end
+            """.utf8
+        ).write(to: userConfigDirectory.appendingPathComponent("config.fish"))
 
         let installation = try NativeSemanticShellIntegration.installFish(
-            userShell: fishPath,
+            userShell: fish.path,
             directory: integrationRoot
         )
         let startupFile = installation.startupDirectory
             .appendingPathComponent("kaisola-integration.fish")
 
         let syntax = try run(
-            URL(fileURLWithPath: fishPath),
+            URL(fileURLWithPath: fish.path),
             arguments: ["-n", startupFile.path],
             home: userHome
         )
@@ -398,11 +477,21 @@ final class NativeTerminalInteractionTests: XCTestCase {
 
         let modern = try run(
             installation.launcher,
-            arguments: ["-N", "-ic", "printf modern-path-ok"],
+            arguments: [
+                "-ic",
+                "functions --query __kaisola_semantic_preexec; and exit 91; "
+                    + "bind --function-names | string match -q -- forward-char-passive; or exit 92; "
+                    + "/bin/sh -c 'exit 17'; set -l command_status $status; "
+                    + "printf 'modern-path-ok:%s modern-status-ok:%s\\n' "
+                    + "$KAISOLA_FISH_USER_CONFIG $command_status",
+            ],
             home: userHome
         )
         XCTAssertEqual(modern.status, 0, modern.errors)
-        XCTAssertTrue(modern.output.contains("modern-path-ok"), modern.output)
+        XCTAssertTrue(
+            modern.output.contains("modern-path-ok:custom-config-ok modern-status-ok:17"),
+            modern.output.debugDescription
+        )
 
         let generated = try String(contentsOf: startupFile, encoding: .utf8)
         let capabilityGate = "bind --function-names | string match -q -- forward-char-passive; and return 0"
@@ -422,13 +511,13 @@ final class NativeTerminalInteractionTests: XCTestCase {
             arguments: [
                 "-N",
                 "-ic",
-                "__kaisola_semantic_prompt_start; "
+                "functions --query __kaisola_semantic_preexec __kaisola_semantic_cancel; or exit 93; "
+                    + "__kaisola_semantic_prompt_start; "
                     + "__kaisola_semantic_command_start; "
                     + "__kaisola_semantic_preexec; "
-                    + "false; __kaisola_semantic_postexec; "
-                    + "functions --query __kaisola_semantic_cancel "
-                    + "__kaisola_semantic_posterror __kaisola_semantic_wrap_prompt; "
-                    + "and printf functions-ok",
+                    + "/bin/sh -c 'exit 17'; __kaisola_semantic_postexec; "
+                    + "__kaisola_semantic_command_start; emit fish_cancel; "
+                    + "printf 'fallback-path-ok cancel-path-ok\\n'",
             ],
             home: userHome
         )
@@ -436,8 +525,39 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertTrue(legacy.output.contains(osc133("A")), legacy.output.debugDescription)
         XCTAssertTrue(legacy.output.contains(osc133("B")), legacy.output.debugDescription)
         XCTAssertTrue(legacy.output.contains(osc133("C")), legacy.output.debugDescription)
-        XCTAssertTrue(legacy.output.contains(osc133("D;1")), legacy.output.debugDescription)
-        XCTAssertTrue(legacy.output.contains("functions-ok"), legacy.output)
+        XCTAssertTrue(legacy.output.contains(osc133("D;17")), legacy.output.debugDescription)
+        XCTAssertTrue(legacy.output.contains(osc133("D")), legacy.output.debugDescription)
+        XCTAssertTrue(legacy.output.contains("fallback-path-ok cancel-path-ok"), legacy.output)
+
+        let expectProgram = root.appendingPathComponent("resize-fish.exp")
+        XCTAssertTrue(FileManager.default.isExecutableFile(atPath: "/usr/bin/expect"))
+        try Data(
+            #"""
+            #!/usr/bin/expect -f
+            set timeout 8
+            set launcher [lindex $argv 0]
+            set home [lindex $argv 1]
+            set env(HOME) $home
+            set env(XDG_CONFIG_HOME) "$home/.config"
+            set env(TERM) dumb
+            spawn -noecho $launcher -N -i
+            after 150
+            exec stty rows 41 columns 101 < $spawn_out(slave,name)
+            exec kill -WINCH [exp_pid]
+            after 150
+            send -- "printf 'resize-path-ok:%sx%s\\n' \$COLUMNS \$LINES\r"
+            expect -re {resize-path-ok:101x41}
+            send -- "exit\r"
+            expect eof
+            """#.utf8
+        ).write(to: expectProgram)
+        let resized = try run(
+            URL(fileURLWithPath: "/usr/bin/expect"),
+            arguments: [expectProgram.path, installation.launcher.path, userHome.path],
+            home: userHome
+        )
+        XCTAssertEqual(resized.status, 0, resized.errors)
+        XCTAssertTrue(resized.output.contains("resize-path-ok:101x41"), resized.output)
     }
 
     func testBashAndFishIntegrationsRejectWrongShellAndSymlinkRoot() throws {
@@ -473,6 +593,113 @@ final class NativeTerminalInteractionTests: XCTestCase {
         ))
     }
 
+    private static func requiredFishCompatibilityConfiguration()
+        throws -> RequiredFishCompatibilityConfiguration? {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // KaisolaTests
+            .deletingLastPathComponent()   // KaisolaMac
+            .appendingPathComponent(".artifacts/required-fish-compatibility.json")
+        var metadata = stat()
+        let status = url.path.withCString { Darwin.lstat($0, &metadata) }
+        if status != 0, errno == ENOENT { return nil }
+        guard status == 0,
+              (metadata.st_mode & S_IFMT) == S_IFREG,
+              metadata.st_uid == geteuid(),
+              (metadata.st_mode & 0o777) == 0o600,
+              (1 ... 16 * 1_024).contains(Int(metadata.st_size)) else {
+            throw RequiredFishCompatibilityError.invalidRequiredFishConfiguration(
+                "unsafe configuration file"
+            )
+        }
+        return try decodeRequiredFishConfiguration(Data(contentsOf: url))
+    }
+
+    private static func decodeRequiredFishConfiguration(
+        _ data: Data
+    ) throws -> RequiredFishCompatibilityConfiguration {
+        let object = try JSONSerialization.jsonObject(with: data)
+        guard let dictionary = object as? [String: Any],
+              Set(dictionary.keys) == Set(["schemaVersion", "fishPath", "fishVersion"]) else {
+            throw RequiredFishCompatibilityError.invalidRequiredFishConfiguration(
+                "unexpected configuration keys"
+            )
+        }
+        let configuration = try JSONDecoder().decode(
+            RequiredFishCompatibilityConfiguration.self,
+            from: data
+        )
+        guard configuration.schemaVersion == 1,
+              configuration.fishVersion == requiredFishVersion,
+              configuration.fishPath.hasPrefix("/"),
+              URL(fileURLWithPath: configuration.fishPath).lastPathComponent == "fish" else {
+            throw RequiredFishCompatibilityError.invalidRequiredFishConfiguration(
+                "invalid configuration values"
+            )
+        }
+        return configuration
+    }
+
+    private static func resolveFish(environment: [String: String]) throws -> FishRuntime? {
+        try resolveFish(
+            environment: environment,
+            isExecutable: FileManager.default.isExecutableFile(atPath:),
+            versionReader: fishVersion(at:)
+        )
+    }
+
+    private static func resolveFish(
+        environment: [String: String],
+        isExecutable: (String) -> Bool,
+        versionReader: (String) throws -> String
+    ) throws -> FishRuntime? {
+        let required = environment["KAISOLA_REQUIRE_FISH_COMPATIBILITY"] == "1"
+        guard let path = environment["KAISOLA_TEST_FISH"],
+              !path.isEmpty,
+              isExecutable(path) else {
+            if required { throw RequiredFishCompatibilityError.missingRequiredFish }
+            return nil
+        }
+        guard URL(fileURLWithPath: path).lastPathComponent == "fish" else {
+            throw RequiredFishCompatibilityError.invalidFishExecutableName
+        }
+        let actual = try versionReader(path)
+        if required {
+            guard let expected = environment["KAISOLA_EXPECTED_FISH_VERSION"],
+                  !expected.isEmpty else {
+                throw RequiredFishCompatibilityError.missingExpectedFishVersion
+            }
+            guard actual == expected else {
+                throw RequiredFishCompatibilityError.fishVersionMismatch(
+                    expected: expected,
+                    actual: actual
+                )
+            }
+        }
+        return FishRuntime(path: path, version: actual)
+    }
+
+    private static func fishVersion(at path: String) throws -> String {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["--version"]
+        process.standardInput = FileHandle.nullDevice
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = FileHandle.nullDevice
+        try process.run()
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        let prefix = "fish, version "
+        let rendered = String(decoding: data, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard process.terminationStatus == 0,
+              rendered.hasPrefix(prefix),
+              rendered.count > prefix.count else {
+            throw RequiredFishCompatibilityError.fishVersionProbeFailed
+        }
+        return String(rendered.dropFirst(prefix.count))
+    }
+
     private func run(
         _ executable: URL,
         arguments: [String],
@@ -483,6 +710,8 @@ final class NativeTerminalInteractionTests: XCTestCase {
         process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         environment["HOME"] = home.path
+        environment["XDG_CONFIG_HOME"] = home.appendingPathComponent(".config").path
+        environment["TERM"] = "xterm-256color"
         environment.removeValue(forKey: "BASH_ENV")
         environment.removeValue(forKey: "KAISOLA_BASH_LOGIN")
         environment.removeValue(forKey: "KAISOLA_BASH_STARTUP_ACTIVE")
@@ -754,6 +983,8 @@ final class NativeTerminalInteractionTests: XCTestCase {
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        coordinator.setInputAuthorized(true)
+        view.setInputAuthorized(true)
 
         XCTAssertTrue(
             view.getTerminal().options.enableSixelReported,
@@ -771,13 +1002,15 @@ final class NativeTerminalInteractionTests: XCTestCase {
 
     func testOwnedTerminalPasteUsesCodexBracketedPasteProtocol() {
         let coordinator = NativeTerminalSurface.Coordinator()
-        var captured = ""
-        coordinator.onInput = { captured += $0 }
+        var captured: [String] = []
+        coordinator.onInput = { captured.append($0) }
         let view = OwnedTerminalView(
             frame: NSRect(x: 0, y: 0, width: 640, height: 320),
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        coordinator.setInputAuthorized(true)
+        view.setInputAuthorized(true)
         // Codex enables DEC private mode 2004 while its prompt is active.
         view.feed(text: "\u{1B}[?2004h")
         XCTAssertTrue(view.getTerminal().bracketedPasteMode)
@@ -799,7 +1032,11 @@ final class NativeTerminalInteractionTests: XCTestCase {
 
         view.paste(NSNull())
 
-        XCTAssertEqual(captured, "\u{1B}[200~first line\nsecond line 张\u{1B}[201~")
+        XCTAssertEqual(
+            captured,
+            ["\u{1B}[200~first line\nsecond line 张\u{1B}[201~"],
+            "A bracketed paste must cross the ownership-epoch boundary as one packet."
+        )
     }
 
     func testCommandPasteForwardsImageOnlyClipboardToCodexControlV() throws {
@@ -811,6 +1048,8 @@ final class NativeTerminalInteractionTests: XCTestCase {
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        coordinator.setInputAuthorized(true)
+        view.setInputAuthorized(true)
         view.agentLaunchCommand = "codex"
 
         let pasteboard = NSPasteboard.general
@@ -865,6 +1104,12 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertEqual(readOnly.menu(for: rightClick)?.items.map(\.title), ["Copy", "", "Select All"])
 
         let owned = OwnedTerminalView(frame: .zero, font: font)
+        XCTAssertEqual(
+            owned.menu(for: rightClick)?.items.map(\.title),
+            ["Copy", "", "Select All"],
+            "A controller-capable view starts sealed and must not advertise Paste."
+        )
+        owned.setInputAuthorized(true)
         XCTAssertEqual(owned.menu(for: rightClick)?.items.map(\.title), ["Copy", "Paste", "", "Select All"])
     }
 
@@ -1075,18 +1320,185 @@ final class NativeTerminalInteractionTests: XCTestCase {
     func testOwnedSurfaceForwardsKeyboardBytesToInputCallback() {
         let coordinator = NativeTerminalSurface.Coordinator()
         var captured: [String] = []
-        coordinator.onInput = { captured.append($0) }
         let view = OwnedTerminalView(
             frame: .zero,
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        NativeTerminalSurface.configureAuthority(
+            .localController(active: true),
+            on: view,
+            coordinator: coordinator,
+            onInput: { captured.append($0) },
+            onResize: nil,
+            onTitleChange: nil
+        )
 
-        // The owned view forwards the Terminal engine's outbound bytes (the
-        // path keyboard input travels) to the delegate; the coordinator turns
-        // them into an onInput string bound to the broker controller write.
-        view.send(source: view.getTerminal(), data: ArraySlice(Array("ls -la\r".utf8)))
+        // SwiftTerm's ordinary keyboard path calls this inherited overload
+        // directly; it does not pass through OwnedTerminalView's terminal-query
+        // reply override.
+        view.send(data: ArraySlice(Array("ls -la\r".utf8)))
         XCTAssertEqual(captured, ["ls -la\r"])
+    }
+
+    func testObserverSurfaceCannotBePromotedByMismatchedAuthority() {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        var captured: [String] = []
+        let view = ReadOnlyTerminalView(
+            frame: .zero,
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+
+        NativeTerminalSurface.configureAuthority(
+            .localController(active: true),
+            on: view,
+            coordinator: coordinator,
+            onInput: { captured.append($0) },
+            onResize: nil,
+            onTitleChange: nil
+        )
+        view.send(data: ArraySlice(Array("must-stay-observed".utf8)))
+        coordinator.send(
+            source: view,
+            data: ArraySlice(Array("delegate-mismatch".utf8))
+        )
+
+        XCTAssertTrue(captured.isEmpty)
+        XCTAssertFalse(view.allowMouseReporting)
+        XCTAssertEqual(view.accessibilityLabel(), "Read-only terminal output")
+    }
+
+    func testSealedOwnedSurfaceBlocksEveryOutboundInputPath() throws {
+        let coordinator = NativeTerminalSurface.Coordinator()
+        var captured: [String] = []
+        var resizeCalls: [(Int, Int)] = []
+        var titleCalls: [String] = []
+        coordinator.onInput = { captured.append($0) }
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 320),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+        let terminal = view.getTerminal()
+        let droppedURL = URL(fileURLWithPath: "/tmp/Kaisola ownership flap.txt")
+        let rightClick = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .rightMouseDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+
+        XCTAssertFalse(view.isInputAuthorized, "Controller-capable views must start fail-closed.")
+        XCTAssertFalse(view.allowMouseReporting)
+        XCTAssertEqual(view.accessibilityLabel(), "Read-only terminal output")
+        view.send(data: ArraySlice(Array("sealed-keyboard".utf8)))
+        view.send(source: terminal, data: ArraySlice(Array("sealed-reply".utf8)))
+        coordinator.send(source: view, data: ArraySlice(Array("delegate-bypass".utf8)))
+        view.paste(view)
+        XCTAssertFalse(view.handleControlVIfImagePresent())
+        XCTAssertFalse(view.sendShiftEnter())
+        XCTAssertFalse(view.performFileDrop(urls: [droppedURL]))
+        XCTAssertFalse(view.menu(for: rightClick)?.items.contains { $0.title == "Paste" } == true)
+        XCTAssertTrue(captured.isEmpty)
+
+        NativeTerminalSurface.configureAuthority(
+            .localController(active: true),
+            on: view,
+            coordinator: coordinator,
+            onInput: { captured.append($0) },
+            onResize: { resizeCalls.append(($0, $1)) },
+            onTitleChange: { titleCalls.append($0) }
+        )
+        XCTAssertTrue(view.isInputAuthorized)
+        XCTAssertTrue(view.allowMouseReporting)
+        XCTAssertEqual(view.accessibilityLabel(), "Terminal")
+        view.send(data: ArraySlice(Array("live".utf8)))
+        XCTAssertTrue(view.sendShiftEnter())
+        XCTAssertTrue(view.performFileDrop(urls: [droppedURL]))
+        XCTAssertTrue(view.menu(for: rightClick)?.items.contains { $0.title == "Paste" } == true)
+        XCTAssertEqual(captured.first, "live")
+        XCTAssertEqual(Array(captured.dropFirst().first?.utf8 ?? "".utf8), [0x1B, 0x0D])
+        XCTAssertTrue(captured.joined().contains("Kaisola ownership flap.txt"))
+
+        let countBeforeRevocation = captured.count
+        let resizeCountBeforeRevocation = resizeCalls.count
+        coordinator.setTerminalTitle(source: view, title: "queued-before-revocation")
+        NativeTerminalSurface.configureAuthority(
+            .localController(active: false),
+            on: view,
+            coordinator: coordinator,
+            onInput: { captured.append($0) },
+            onResize: { resizeCalls.append(($0, $1)) },
+            onTitleChange: { titleCalls.append($0) }
+        )
+        view.send(data: ArraySlice(Array("stale-keyboard".utf8)))
+        view.send(source: terminal, data: ArraySlice(Array("stale-reply".utf8)))
+        coordinator.send(source: view, data: ArraySlice(Array("stale-delegate".utf8)))
+        coordinator.sizeChanged(source: view, newCols: 91, newRows: 37)
+        view.paste(view)
+        XCTAssertFalse(view.handleControlVIfImagePresent())
+        XCTAssertFalse(view.sendShiftEnter())
+        XCTAssertFalse(view.performFileDrop(urls: [droppedURL]))
+        XCTAssertEqual(captured.count, countBeforeRevocation)
+        XCTAssertEqual(resizeCalls.count, resizeCountBeforeRevocation)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.2))
+        XCTAssertTrue(titleCalls.isEmpty, "Revocation must cancel a title still waiting in the debounce.")
+        XCTAssertFalse(view.allowMouseReporting)
+        XCTAssertEqual(view.accessibilityLabel(), "Read-only terminal output")
+    }
+
+    func testDismantleSealsOwnedSurfaceBeforeCaching() throws {
+        let cache = TerminalSurfaceCache.shared
+        cache.removeAll()
+        defer { cache.removeAll() }
+        let coordinator = NativeTerminalSurface.Coordinator()
+        coordinator.retainedSessionID = "retained-owned"
+        var captured: [String] = []
+        let view = OwnedTerminalView(
+            frame: NSRect(x: 0, y: 0, width: 640, height: 320),
+            font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        )
+        view.terminalDelegate = coordinator
+        NativeTerminalSurface.configureAuthority(
+            .localController(active: true),
+            on: view,
+            coordinator: coordinator,
+            onInput: { captured.append($0) },
+            onResize: nil,
+            onTitleChange: nil
+        )
+        XCTAssertTrue(view.isInputAuthorized)
+
+        NativeTerminalSurface.dismantleNSView(view, coordinator: coordinator)
+        view.send(data: ArraySlice(Array("parked-keyboard".utf8)))
+        coordinator.send(source: view, data: ArraySlice(Array("parked-delegate".utf8)))
+
+        XCTAssertFalse(view.isInputAuthorized)
+        XCTAssertFalse(view.allowMouseReporting)
+        XCTAssertEqual(view.accessibilityLabel(), "Read-only terminal output")
+        XCTAssertTrue(captured.isEmpty)
+        let rightClick = try XCTUnwrap(NSEvent.mouseEvent(
+            with: .rightMouseDown,
+            location: .zero,
+            modifierFlags: [],
+            timestamp: 0,
+            windowNumber: 0,
+            context: nil,
+            eventNumber: 1,
+            clickCount: 1,
+            pressure: 1
+        ))
+        XCTAssertFalse(view.menu(for: rightClick)?.items.contains { $0.title == "Paste" } == true)
+        XCTAssertTrue(cache.claim(
+            sessionID: "retained-owned",
+            controllerCapable: true
+        )?.view === view)
     }
 
     func testShiftEnterRequiresExactlyShift() {
@@ -1178,6 +1590,8 @@ final class NativeTerminalInteractionTests: XCTestCase {
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        coordinator.setInputAuthorized(true)
+        view.setInputAuthorized(true)
         view.configureTerminalTheme(light: true, themeID: "native")
 
         // These are the exact families seen in the corrupted prompt screenshot:
@@ -1257,6 +1671,8 @@ final class NativeTerminalInteractionTests: XCTestCase {
             font: NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
         )
         view.terminalDelegate = coordinator
+        coordinator.setInputAuthorized(true)
+        view.setInputAuthorized(true)
         view.configureTerminalTheme(light: true, themeID: "native")
 
         coordinator.apply(output: "", epoch: "epoch-a", endOffset: 0, to: view)

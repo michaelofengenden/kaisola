@@ -4792,7 +4792,9 @@ final class AppModel: ObservableObject {
               let terminal = sessions.first,
               terminal.id == terminalDocument.sessionID,
               let cursor = terminalDocument.cursor else { return false }
-        let data = VisualTerminalStreamingFixture.packet(index: index)
+        let data = visualSurface == "terminal-continuous-scroll"
+            ? VisualTerminalContinuousScrollFixture.packet(index: index)
+            : VisualTerminalStreamingFixture.packet(index: index)
         let startOffset = pendingTerminalOutput[terminal.id]?.endOffset ?? cursor.offset
         enqueueTerminalOutput(
             projectID: terminal.projectID,
@@ -8191,6 +8193,22 @@ enum VisualTerminalContinuousScrollFixture {
         }.joined(separator: "\r\n")
         + "\r\n" + mark("D;0") + mark("A")
         + "michael@kaisola Kaisola % " + mark("B")
+
+    /// A hosted window may complete one final grid reflow after its retained
+    /// transcript was replayed. Production deliberately drops row-addressed
+    /// OSC marks across that reflow, so the live lane supplies a new, complete
+    /// lifecycle before the fixture claims that subsequent scrolling and
+    /// repaint traffic preserve semantic navigation.
+    static func packet(index: Int) -> String {
+        let packet = VisualTerminalStreamingFixture.packet(index: index)
+        guard index == VisualTerminalStreamingFixture.packetIndices.lowerBound else {
+            return packet
+        }
+        return "continuous-scroll-probe" + mark("C") + "\r\n"
+            + packet
+            + mark("D;0") + mark("A")
+            + "michael@kaisola Kaisola % " + mark("B")
+    }
 }
 
 /// Resolves terminal launch state independently of the app/broker lifetime.

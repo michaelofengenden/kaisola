@@ -369,13 +369,19 @@ final class NativePreviewSettingsTests: XCTestCase {
             try mutated("measuredHertz", to: 60).failure,
             "measured-cadence-out-of-range-60.0"
         )
+        XCTAssertNil(try mutated("cadenceP95Milliseconds", to: 25).failure)
+        XCTAssertEqual(
+            try mutated("cadenceP95Milliseconds", to: 25.1).failure,
+            "cadence-p95-out-of-range-25.1"
+        )
         XCTAssertEqual(
             try mutated("maximumContinuityError", to: 0.5).failure,
             "continuity-error-0.5"
         )
+        XCTAssertNil(try mutated("processingP95Milliseconds", to: 25).failure)
         XCTAssertEqual(
-            try mutated("processingP95Milliseconds", to: 12.6).failure,
-            "processing-over-budget-12.6"
+            try mutated("processingP95Milliseconds", to: 25.1).failure,
+            "processing-over-budget-25.1"
         )
         XCTAssertEqual(
             try mutated("viewIdentityPreserved", to: false).failure,

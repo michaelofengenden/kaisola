@@ -845,6 +845,170 @@ final class AcpComposerModelTests: XCTestCase {
 }
 
 extension AcpComposerModelTests {
+    func testBooleanConfigOptionBecomesAnAccessibleSwitchRowWithAdapterCopy() {
+        let boolean = AcpConfigOption(
+            id: "brave_mode",
+            name: "Brave Mode",
+            description: "Skip confirmation prompts and act autonomously",
+            category: "model_config",
+            currentBooleanValue: true
+        )
+        let surface = AcpComposerSurface.reconciled(
+            models: [], currentModelID: nil, modes: [], configOptions: [boolean]
+        )
+
+        let row = AcpComposerMenu.rows(agentName: "Agent", surface: surface)[1]
+        XCTAssertEqual(row.target, .option("brave_mode"))
+        XCTAssertEqual(row.label, "Brave Mode")
+        XCTAssertEqual(row.booleanValue, true)
+        XCTAssertEqual(row.hint, "Skip confirmation prompts and act autonomously")
+        XCTAssertEqual(row.accessibilityValue, "On")
+    }
+
+    func testBooleanCapabilityParsingAndMutationPreserveWireType() async throws {
+        let transport = BooleanConfigWireTransport()
+        let client = AcpClient(transport: transport)
+
+        let info = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        XCTAssertEqual(info.configOptions.map(\.id), ["brave_mode"])
+        XCTAssertEqual(info.configOptions.first?.booleanValue, false)
+        XCTAssertNil(info.configOptions.first?.currentValue)
+        let advertised = await transport.advertisedBooleanConfigSupport()
+        XCTAssertTrue(advertised)
+
+        let confirmed = try await client.setConfigOption(id: "brave_mode", value: .boolean(true))
+        XCTAssertEqual(confirmed.first?.booleanValue, true)
+        let recorded = await transport.lastConfigRequest()
+        let request = try XCTUnwrap(recorded)
+        XCTAssertEqual(request["configId"]?.stringValue, "brave_mode")
+        XCTAssertEqual(request["type"]?.stringValue, "boolean")
+        XCTAssertEqual(request["value"]?.boolValue, true)
+    }
+
+    func testUnknownAndMalformedBooleanOptionTypesFailClosed() {
+        let parsed = AcpBooleanConfigWire.parseOptions(.array([
+            .object([
+                "id": .string("known"), "name": .string("Known"),
+                "type": .string("boolean"), "currentValue": .bool(true),
+            ]),
+            .object([
+                "id": .string("future"), "name": .string("Future"),
+                "type": .string("slider"), "currentValue": .integer(3),
+            ]),
+            .object([
+                "id": .string("wrong-shape"), "name": .string("Wrong shape"),
+                "type": .string("boolean"), "currentValue": .string("true"),
+            ]),
+        ]))
+
+        XCTAssertEqual(parsed.map(\.id), ["known"])
+        XCTAssertEqual(parsed.first?.booleanValue, true)
+    }
+
+    @MainActor
+    func testRejectedBooleanChangeKeepsConfirmedValueAndReportsRollback() async throws {
+        let transport = BooleanConfigConversationTransport(rejectChanges: true)
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport)
+        )
+        await conversation.start()
+
+        conversation.selectBooleanConfigOption("brave_mode", value: true)
+
+        XCTAssertEqual(conversation.pendingConfigOptionID, "brave_mode")
+        XCTAssertEqual(conversation.configOptions.first?.booleanValue, false)
+        let deadline = ContinuousClock.now + .seconds(2)
+        while conversation.pendingConfigOptionID != nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertNil(conversation.pendingConfigOptionID)
+        XCTAssertEqual(conversation.configOptions.first?.booleanValue, false)
+        XCTAssertTrue(conversation.statusMessage?.contains("Couldn’t change Brave Mode to On") == true)
+    }
+
+    @MainActor
+    func testPersistedBooleanValueRestoresThroughAdapterConfirmation() async throws {
+        let draftKey = "boolean-config-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(
+                for: draftKey,
+                currentDefaults: .standard,
+                migratedDefaults: nil
+            )
+        }
+        let firstTransport = BooleanConfigConversationTransport()
+        let firstConversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: firstTransport), draftKey: draftKey
+        )
+        await firstConversation.start()
+        firstConversation.selectBooleanConfigOption("brave_mode", value: true)
+        let deadline = ContinuousClock.now + .seconds(2)
+        while firstConversation.pendingConfigOptionID != nil, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(
+            AcpConversation.loadPersistedBooleanConfigValues(for: draftKey),
+            ["brave_mode": true]
+        )
+        _ = await firstConversation.stop()
+
+        let restoredTransport = BooleanConfigConversationTransport()
+        let restoredConversation = AcpConversation(
+            title: "Restored", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: restoredTransport), draftKey: draftKey
+        )
+        await restoredConversation.start()
+
+        XCTAssertEqual(restoredConversation.configOptions.first?.booleanValue, true)
+        XCTAssertEqual(restoredConversation.confirmedBooleanConfigValues, ["brave_mode": true])
+        let restoredSetValues = await restoredTransport.setValues()
+        XCTAssertEqual(restoredSetValues, [true])
+
+        AcpConversation.removePersistedDraft(
+            for: draftKey,
+            currentDefaults: .standard,
+            migratedDefaults: nil
+        )
+        XCTAssertTrue(AcpConversation.loadPersistedBooleanConfigValues(for: draftKey).isEmpty)
+    }
+
+    @MainActor
+    func testBooleanConfirmationArrivingAfterStopCannotOverwriteDurableValue() async {
+        let draftKey = "boolean-stale-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(
+                for: draftKey,
+                currentDefaults: .standard,
+                migratedDefaults: nil
+            )
+        }
+        let transport = BooleanConfigConversationTransport(holdChanges: true)
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport), draftKey: draftKey
+        )
+        await conversation.start()
+
+        conversation.selectBooleanConfigOption("brave_mode", value: true)
+        await transport.waitForSetRequest()
+        _ = await conversation.stop()
+        await transport.resolveHeldChange()
+        await Task.yield()
+
+        XCTAssertNil(conversation.pendingConfigOptionID)
+        XCTAssertEqual(conversation.configOptions.first?.booleanValue, false)
+        XCTAssertEqual(conversation.confirmedBooleanConfigValues, ["brave_mode": false])
+        XCTAssertEqual(
+            AcpConversation.loadPersistedBooleanConfigValues(for: draftKey),
+            ["brave_mode": false]
+        )
+    }
+
     @MainActor
     func testRejectedEffortChangeKeepsTheAdapterConfirmedValueAndDraft() async throws {
         let transport = ReasoningEffortAcpTransport(rejectedValues: ["high"])
@@ -1022,6 +1186,234 @@ private actor ReasoningEffortAcpTransport: AcpByteTransport {
             "id": id,
             "error": .object(["code": .integer(-32602), "message": .string(message)]),
         ]))
+    }
+
+    private func enqueue(_ value: JSONValue) {
+        guard var data = try? JSONEncoder().encode(value) else { return }
+        data.append(0x0A)
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            outbound.append(data)
+        }
+    }
+
+    private func trimmed(_ data: Data) -> Data {
+        data.last == 0x0A ? data.dropLast() : data
+    }
+}
+
+/// Stateful boolean option fixture. Every successful set response is the
+/// adapter's complete confirmed option list, matching ACP rather than letting
+/// the conversation infer success from its own request.
+private actor BooleanConfigConversationTransport: AcpByteTransport {
+    private var outbound: [Data] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+    private var enabled = false
+    private var requestedValues: [Bool] = []
+    private let rejectChanges: Bool
+    private let holdChanges: Bool
+    private var heldChange: (id: JSONValue?, value: Bool)?
+    private var setWaiters: [CheckedContinuation<Void, Never>] = []
+
+    init(rejectChanges: Bool = false, holdChanges: Bool = false) {
+        self.rejectChanges = rejectChanges
+        self.holdChanges = holdChanges
+    }
+
+    func start(
+        command: String,
+        arguments: [String],
+        environment: [String: String],
+        cwd: String
+    ) async throws {}
+
+    func send(_ data: Data) async throws {
+        guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else {
+            return
+        }
+        let id = object["id"]
+        switch object["method"]?.stringValue {
+        case "initialize":
+            reply(id: id, result: .object([
+                "protocolVersion": .integer(1),
+                "agentCapabilities": .object([:]),
+            ]))
+        case "session/new":
+            reply(id: id, result: sessionResult)
+        case "session/set_config_option":
+            guard let params = object["params"]?.objectValue,
+                  params["configId"]?.stringValue == "brave_mode",
+                  params["type"]?.stringValue == "boolean",
+                  let value = params["value"]?.boolValue else {
+                replyError(id: id, message: "Malformed boolean config request")
+                return
+            }
+            requestedValues.append(value)
+            let waiters = setWaiters
+            setWaiters.removeAll()
+            for waiter in waiters { waiter.resume() }
+            guard !rejectChanges else {
+                replyError(id: id, message: "Rejected Brave Mode")
+                return
+            }
+            if holdChanges {
+                heldChange = (id, value)
+                return
+            }
+            enabled = value
+            reply(id: id, result: .object(["configOptions": configOptions]))
+        default:
+            if let id { reply(id: id, result: .null) }
+        }
+    }
+
+    func setValues() -> [Bool] { requestedValues }
+
+    func waitForSetRequest() async {
+        if !requestedValues.isEmpty { return }
+        await withCheckedContinuation { setWaiters.append($0) }
+    }
+
+    func resolveHeldChange() {
+        guard let heldChange else { return }
+        self.heldChange = nil
+        enabled = heldChange.value
+        reply(id: heldChange.id, result: .object(["configOptions": configOptions]))
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !outbound.isEmpty { return outbound.removeFirst() }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func terminate() async {
+        waiter?.resume(returning: nil)
+        waiter = nil
+    }
+
+    func exitCode() async -> Int32? { 0 }
+
+    private var sessionResult: JSONValue {
+        .object(["sessionId": .string("boolean-session"), "configOptions": configOptions])
+    }
+
+    private var configOptions: JSONValue {
+        .array([.object([
+            "id": .string("brave_mode"),
+            "name": .string("Brave Mode"),
+            "description": .string("Skip confirmation prompts and act autonomously"),
+            "type": .string("boolean"),
+            "currentValue": .bool(enabled),
+        ])])
+    }
+
+    private func reply(id: JSONValue?, result: JSONValue) {
+        guard let id else { return }
+        enqueue(.object(["jsonrpc": .string("2.0"), "id": id, "result": result]))
+    }
+
+    private func replyError(id: JSONValue?, message: String) {
+        guard let id else { return }
+        enqueue(.object([
+            "jsonrpc": .string("2.0"),
+            "id": id,
+            "error": .object(["code": .integer(-32602), "message": .string(message)]),
+        ]))
+    }
+
+    private func enqueue(_ value: JSONValue) {
+        guard var data = try? JSONEncoder().encode(value) else { return }
+        data.append(0x0A)
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            outbound.append(data)
+        }
+    }
+
+    private func trimmed(_ data: Data) -> Data {
+        data.last == 0x0A ? data.dropLast() : data
+    }
+}
+
+/// Narrow fixture that retains decoded request objects so boolean negotiation
+/// and mutation are proven at the JSON boundary rather than inferred from UI.
+private actor BooleanConfigWireTransport: AcpByteTransport {
+    private var outbound: [Data] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+    private var initializeParams: [String: JSONValue]?
+    private var configRequest: [String: JSONValue]?
+    private var enabled = false
+
+    func start(
+        command: String,
+        arguments: [String],
+        environment: [String: String],
+        cwd: String
+    ) async throws {}
+
+    func send(_ data: Data) async throws {
+        guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else {
+            return
+        }
+        let id = object["id"]
+        switch object["method"]?.stringValue {
+        case "initialize":
+            initializeParams = object["params"]?.objectValue
+            reply(id: id, result: .object([
+                "protocolVersion": .integer(1),
+                "agentCapabilities": .object([:]),
+            ]))
+        case "session/new":
+            reply(id: id, result: sessionResult)
+        case "session/set_config_option":
+            configRequest = object["params"]?.objectValue
+            if let value = configRequest?["value"]?.boolValue { enabled = value }
+            reply(id: id, result: .object(["configOptions": configOptions]))
+        default:
+            if let id { reply(id: id, result: .null) }
+        }
+    }
+
+    func advertisedBooleanConfigSupport() -> Bool {
+        initializeParams?["clientCapabilities"]?.objectValue?["session"]?
+            .objectValue?["configOptions"]?.objectValue?["boolean"]?.objectValue != nil
+    }
+
+    func lastConfigRequest() -> [String: JSONValue]? { configRequest }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !outbound.isEmpty { return outbound.removeFirst() }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func terminate() async {
+        waiter?.resume(returning: nil)
+        waiter = nil
+    }
+
+    func exitCode() async -> Int32? { 0 }
+
+    private var sessionResult: JSONValue {
+        .object(["sessionId": .string("boolean-session"), "configOptions": configOptions])
+    }
+
+    private var configOptions: JSONValue {
+        .array([.object([
+            "id": .string("brave_mode"),
+            "name": .string("Brave Mode"),
+            "description": .string("Skip confirmation prompts"),
+            "type": .string("boolean"),
+            "currentValue": .bool(enabled),
+        ])])
+    }
+
+    private func reply(id: JSONValue?, result: JSONValue) {
+        guard let id else { return }
+        enqueue(.object(["jsonrpc": .string("2.0"), "id": id, "result": result]))
     }
 
     private func enqueue(_ value: JSONValue) {

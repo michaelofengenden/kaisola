@@ -103,7 +103,8 @@ async function connectClient(config) {
     token: config.token,
     instanceId: crypto.randomUUID(),
     appVersion: 'rendezvous-test',
-    access: 'controller',
+    access: 'administrator',
+    features: ['broker-administration-v1'],
   })}\n`)
   const hello = await next((frame) => frame.type === 'hello')
   assert.equal(hello.ok, true)

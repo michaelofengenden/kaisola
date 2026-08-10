@@ -3,6 +3,38 @@ import KaisolaCore
 import XCTest
 @testable import Kaisola
 
+private enum TestMcpSecretError: Error {
+    case refused
+}
+
+private final class TestMcpSecretBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [String: String] = [:]
+    var writeError: Error?
+
+    var values: [String: String] {
+        lock.withLock { storage }
+    }
+
+    var vault: McpSecretVault {
+        McpSecretVault(
+            read: { [weak self] reference in
+                self?.lock.withLock { self?.storage[reference] }
+            },
+            write: { [weak self] reference, value in
+                guard let self else { return }
+                try self.lock.withLock {
+                    if let writeError = self.writeError { throw writeError }
+                    self.storage[reference] = value
+                }
+            },
+            delete: { [weak self] reference in
+                self?.lock.withLock { self?.storage[reference] = nil }
+            }
+        )
+    }
+}
+
 /// Per-workspace MCP configuration: round-trip persistence in the USER-GLOBAL
 /// store (keyed by workspace digest — a cloned repo must never be able to seed
 /// auto-run commands), corrupt-file → empty, and `jsonValues` session shapes
@@ -15,6 +47,14 @@ final class McpConfigStoreTests: XCTestCase {
 
     private func store(_ workspace: URL) -> McpConfigStore {
         McpConfigStore(workspace: workspace, rootDirectory: root)
+    }
+
+    private func store(_ workspace: URL, secrets: TestMcpSecretBox) -> McpConfigStore {
+        McpConfigStore(
+            workspace: workspace,
+            rootDirectory: root,
+            secretVault: secrets.vault
+        )
     }
 
     override func setUpWithError() throws {
@@ -106,6 +146,204 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertTrue(store(workspace).servers().isEmpty)
     }
 
+    // MARK: - OAuth secret references and consented migration
+
+    func testOAuthSecretReferencesAreStableScopedAndOpaque() {
+        let first = McpOAuthSecretReference.make(
+            projectID: "project-a",
+            serverName: "remote",
+            location: .header,
+            pairName: "Authorization"
+        )
+        let again = McpOAuthSecretReference.make(
+            projectID: "project-a",
+            serverName: "remote",
+            location: .header,
+            pairName: "Authorization"
+        )
+        let otherProject = McpOAuthSecretReference.make(
+            projectID: "project-b",
+            serverName: "remote",
+            location: .header,
+            pairName: "Authorization"
+        )
+
+        XCTAssertEqual(first, again)
+        XCTAssertNotEqual(first, otherProject)
+        XCTAssertTrue(first.hasPrefix("mcp-oauth-v1:"))
+        XCTAssertFalse(first.contains("project-a"))
+        XCTAssertFalse(first.localizedCaseInsensitiveContains("authorization"))
+    }
+
+    func testSecretPolicyCoversOAuthTokensAndKeysWithoutCapturingPlaceholders() {
+        for name in ["Authorization", "OAUTH_CLIENT_SECRET", "GITHUB_TOKEN", "X-API-Key"] {
+            XCTAssertTrue(
+                McpOAuthSecretPolicy.requiresKeychain(.init(name: name, value: "credential")),
+                name
+            )
+        }
+        XCTAssertFalse(
+            McpOAuthSecretPolicy.requiresKeychain(
+                .init(name: "Authorization", value: "Bearer ${MCP_TOKEN}")
+            )
+        )
+        XCTAssertFalse(McpOAuthSecretPolicy.requiresKeychain(.init(name: "REGION", value: "us-east-1")))
+    }
+
+    func testPlaintextOAuthMigrationRequiresConsentThenPersistsOnlyAReference() throws {
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+        let plaintext = "never-write-this-to-json-again"
+        configured.save([
+            McpServerConfig(
+                name: "remote",
+                kind: .http,
+                url: "https://example.test/mcp",
+                headerPairs: [.init(name: "Authorization", value: "Bearer \(plaintext)")]
+            ),
+        ])
+        XCTAssertEqual(configured.pendingPlaintextOAuthSecretCount(), 1)
+        let before = try Data(contentsOf: configured.fileURL)
+        XCTAssertTrue(String(decoding: before, as: UTF8.self).contains(plaintext))
+        XCTAssertFalse(String(decoding: try configured.exportData(), as: UTF8.self).contains(plaintext))
+
+        XCTAssertThrowsError(try configured.migratePlaintextOAuthSecrets(consent: false)) { error in
+            XCTAssertEqual(error as? McpOAuthSecretMigrationError, .consentRequired)
+        }
+        XCTAssertEqual(try Data(contentsOf: configured.fileURL), before)
+        XCTAssertTrue(secrets.values.isEmpty)
+
+        let receipt = try configured.migratePlaintextOAuthSecrets(consent: true)
+        XCTAssertEqual(receipt.migratedCount, 1)
+        let migrated = try XCTUnwrap(receipt.servers.first?.headerPairs.first)
+        let reference = try XCTUnwrap(migrated.secretReference)
+        XCTAssertEqual(migrated.value, "")
+        XCTAssertEqual(secrets.values[reference], "Bearer \(plaintext)")
+
+        let persisted = try Data(contentsOf: configured.fileURL)
+        let persistedText = String(decoding: persisted, as: UTF8.self)
+        XCTAssertFalse(persistedText.contains(plaintext))
+        XCTAssertTrue(persistedText.contains(reference))
+        XCTAssertFalse(String(decoding: try configured.exportData(), as: UTF8.self).contains(plaintext))
+
+        let wire = try XCTUnwrap(configured.sessionJSONValues().first?.objectValue)
+        XCTAssertEqual(
+            wire["headers"],
+            .array([.object([
+                "name": .string("Authorization"),
+                "value": .string("Bearer \(plaintext)"),
+            ])])
+        )
+    }
+
+    func testFailedKeychainMigrationLeavesTheOriginalConfigurationByteExact() throws {
+        let secrets = TestMcpSecretBox()
+        secrets.writeError = TestMcpSecretError.refused
+        let configured = store(workspace, secrets: secrets)
+        configured.save([
+            McpServerConfig(
+                name: "local",
+                kind: .stdio,
+                command: "server",
+                envPairs: [.init(name: "OAUTH_REFRESH_TOKEN", value: "refresh-plaintext")]
+            ),
+        ])
+        let before = try Data(contentsOf: configured.fileURL)
+
+        XCTAssertThrowsError(try configured.migratePlaintextOAuthSecrets(consent: true))
+        XCTAssertEqual(try Data(contentsOf: configured.fileURL), before)
+        XCTAssertEqual(configured.pendingPlaintextOAuthSecretCount(), 1)
+        XCTAssertTrue(secrets.values.isEmpty)
+    }
+
+    func testConfigurationFailureRollsBackTheNewKeychainItem() throws {
+        try Data("not-a-directory".utf8).write(to: root.appendingPathComponent("mcp"))
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+
+        XCTAssertThrowsError(try configured.saveSecuringOAuthSecrets([
+            McpServerConfig(
+                name: "local",
+                kind: .stdio,
+                command: "server",
+                envPairs: [.init(name: "ACCESS_TOKEN", value: "new-access-token")]
+            ),
+        ], consent: true)) { error in
+            XCTAssertEqual(error as? McpOAuthSecretMigrationError, .configurationWriteFailed)
+        }
+        XCTAssertTrue(secrets.values.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: configured.fileURL.path))
+    }
+
+    func testNewOAuthSecretIsInKeychainBeforeConfigurationIsPersisted() throws {
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+        let plaintext = "new-client-secret"
+
+        let receipt = try configured.appendSecuringOAuthServer(
+            McpServerConfig(
+                name: "local",
+                kind: .stdio,
+                command: "server",
+                envPairs: [.init(name: "OAUTH_CLIENT_SECRET", value: plaintext)]
+            ),
+            to: [],
+            consent: true
+        )
+
+        XCTAssertEqual(receipt.migratedCount, 1)
+        let reference = try XCTUnwrap(receipt.servers.first?.envPairs.first?.secretReference)
+        XCTAssertEqual(secrets.values[reference], plaintext)
+        let persisted = String(decoding: try Data(contentsOf: configured.fileURL), as: UTF8.self)
+        XCTAssertTrue(persisted.contains(reference))
+        XCTAssertFalse(persisted.contains(plaintext))
+    }
+
+    func testAddingANewServerDoesNotImplicitlyMigrateOlderPlaintext() throws {
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+        let legacy = McpServerConfig(
+            name: "legacy",
+            kind: .http,
+            url: "https://legacy.example/mcp",
+            headerPairs: [.init(name: "Authorization", value: "Bearer legacy-token")]
+        )
+        configured.save([legacy])
+
+        let receipt = try configured.appendSecuringOAuthServer(
+            McpServerConfig(name: "new", kind: .stdio, command: "server"),
+            to: configured.servers(),
+            consent: true
+        )
+
+        XCTAssertEqual(receipt.migratedCount, 0)
+        XCTAssertEqual(configured.pendingPlaintextOAuthSecretCount(), 1)
+        XCTAssertTrue(String(decoding: try Data(contentsOf: configured.fileURL), as: UTF8.self).contains("legacy-token"))
+        XCTAssertTrue(secrets.values.isEmpty)
+    }
+
+    func testMissingReferencedSecretFailsClosedBeforeSessionLaunch() throws {
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+        configured.save([
+            McpServerConfig(
+                name: "remote",
+                kind: .http,
+                url: "https://example.test/mcp",
+                headerPairs: [
+                    .init(
+                        name: "Authorization",
+                        value: "",
+                        secretReference: "mcp-oauth-v1:missing"
+                    ),
+                ]
+            ),
+        ])
+
+        XCTAssertTrue(configured.sessionJSONValues().isEmpty)
+        XCTAssertFalse(String(decoding: try configured.exportData(), as: UTF8.self).contains("Authorization\":\"Bearer"))
+    }
+
     func testSettingsAddPolicyMatchesBoundedStoreAndSurfacesDuplicates() {
         let servers = [
             McpServerConfig(name: "files", kind: .stdio, command: "server"),
@@ -125,6 +363,410 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertNil(McpSettingsPolicy.duplicateName("other", servers: servers))
     }
 
+    func testSettingsChangeScopeNamesEveryMutationAndOffersANewChatOnlyWhenUseful() {
+        XCTAssertEqual(McpSettingsPolicy.changeScopeTitle, "New chats only")
+        XCTAssertEqual(
+            McpSettingsPolicy.changeScopeDetail(openChatCount: 0),
+            "Enable, disable, add, edit, delete, and import changes apply when you start a new chat."
+        )
+        XCTAssertEqual(
+            McpSettingsPolicy.changeScopeDetail(openChatCount: 2),
+            "2 open chats keep their current MCP tools. Start a new chat to use enable, disable, add, edit, delete, or import changes."
+        )
+        XCTAssertFalse(McpSettingsPolicy.offersNewChatAction(
+            openChatCount: 0,
+            canStartNewChat: true
+        ))
+        XCTAssertFalse(McpSettingsPolicy.offersNewChatAction(
+            openChatCount: 1,
+            canStartNewChat: false
+        ))
+        XCTAssertTrue(McpSettingsPolicy.offersNewChatAction(
+            openChatCount: 1,
+            canStartNewChat: true
+        ))
+    }
+
+    func testSettingsAddPolicyUsesOneCaseInsensitiveTrimmedNameForValidationAndPersistence() {
+        let servers = [
+            McpServerConfig(name: "Project Files", kind: .stdio, command: "server"),
+        ]
+
+        XCTAssertEqual(
+            McpSettingsPolicy.normalizedName("  PROJECT FILES \n"),
+            "PROJECT FILES"
+        )
+        XCTAssertEqual(
+            McpSettingsPolicy.duplicateName("  PROJECT FILES \n", servers: servers),
+            "PROJECT FILES"
+        )
+        XCTAssertFalse(McpSettingsPolicy.canAddServer(
+            rawName: "  PROJECT FILES \n",
+            servers: servers,
+            hasRequiredFields: true,
+            remainingCapacity: 1
+        ))
+        XCTAssertTrue(McpSettingsPolicy.canAddServer(
+            rawName: "  Other Server \n",
+            servers: servers,
+            hasRequiredFields: true,
+            remainingCapacity: 1
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAddServer(
+            rawName: "Other Server",
+            servers: servers,
+            hasRequiredFields: true,
+            remainingCapacity: 0
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAddServer(
+            rawName: " \n ",
+            servers: servers,
+            hasRequiredFields: true,
+            remainingCapacity: 1
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAddServer(
+            rawName: "Other Server",
+            servers: servers,
+            hasRequiredFields: false,
+            remainingCapacity: 1
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAddServer(
+            rawName: "Other Server",
+            servers: servers,
+            hasRequiredFields: true,
+            remainingCapacity: 1,
+            pairText: "MISSING_SEPARATOR"
+        ))
+        XCTAssertTrue(McpSettingsPolicy.canAddServer(
+            rawName: "Other Server",
+            servers: servers,
+            hasRequiredFields: true,
+            remainingCapacity: 1,
+            pairText: "EMPTY="
+        ))
+
+        let persisted = McpServerConfig(
+            name: McpSettingsPolicy.normalizedName("  Other Server \n"),
+            kind: .stdio,
+            command: "server"
+        )
+        store(workspace).save(servers + [persisted])
+        XCTAssertEqual(store(workspace).servers().map(\.name), ["Project Files", "Other Server"])
+    }
+
+    func testSettingsDuplicateMessageIsContentSpecificAndSafeForFieldAndButtonHints() {
+        XCTAssertEqual(
+            McpSettingsPolicy.duplicateMessage("Project Files"),
+            "A server named \"Project Files\" already exists in this project."
+        )
+    }
+
+    // MARK: - In-place server editing (#412)
+
+    func testEditDraftPrefillsEveryFieldWithoutExposingAStoredSecret() throws {
+        let reference = McpOAuthSecretReference.make(
+            projectID: "project",
+            serverName: "remote",
+            location: .header,
+            pairName: "Authorization"
+        )
+        let original = McpServerConfig(
+            name: "remote",
+            kind: .http,
+            url: "https://old.example.test/mcp",
+            headerPairs: [
+                .init(name: "Authorization", value: "", secretReference: reference),
+                .init(name: "X-Region", value: "west"),
+            ],
+            enabled: false
+        )
+
+        var draft = McpServerEditDraft(server: original)
+        XCTAssertEqual(draft.name, "remote")
+        XCTAssertEqual(draft.kind, .http)
+        XCTAssertEqual(draft.url, "https://old.example.test/mcp")
+        XCTAssertTrue(draft.headerText.contains(
+            "Authorization=\(McpSettingsPolicy.storedSecretMarker)"
+        ))
+        XCTAssertTrue(draft.headerText.contains("X-Region=west"))
+        XCTAssertFalse(draft.headerText.contains(reference))
+
+        draft.url = "https://new.example.test/mcp"
+        let edited = try draft.server(preservingIdentityAndEnabledFrom: original)
+        XCTAssertEqual(edited.name, original.name)
+        XCTAssertEqual(edited.enabled, original.enabled)
+        XCTAssertEqual(edited.url, "https://new.example.test/mcp")
+        XCTAssertEqual(edited.headerPairs.first, original.headerPairs.first)
+    }
+
+    func testEditDraftRejectsMalformedLinesAndAnUnmatchedStoredSecretMarker() {
+        let original = McpServerConfig(
+            name: "remote",
+            kind: .http,
+            url: "https://example.test/mcp",
+            headerPairs: [.init(name: "Authorization", value: "Bearer old")]
+        )
+        var malformed = McpServerEditDraft(server: original)
+        malformed.headerText = "BROKEN"
+        XCTAssertThrowsError(try malformed.server(preservingIdentityAndEnabledFrom: original))
+
+        var unmatched = McpServerEditDraft(server: original)
+        unmatched.headerText = "X-Other=\(McpSettingsPolicy.storedSecretMarker)"
+        XCTAssertThrowsError(try unmatched.server(preservingIdentityAndEnabledFrom: original)) { error in
+            XCTAssertEqual(
+                error as? McpServerEditDraft.ValidationError,
+                .storedSecretMarkerDoesNotMatch(line: 1)
+            )
+        }
+    }
+
+    func testEditDraftPrefillsAndRebuildsEveryStdioField() throws {
+        let original = McpServerConfig(
+            name: "local",
+            kind: .stdio,
+            command: "npx",
+            args: ["-y", "server-filesystem"],
+            envPairs: [.init(name: "REGION", value: "west")],
+            enabled: true
+        )
+        var draft = McpServerEditDraft(server: original)
+        XCTAssertEqual(draft.command, "npx")
+        XCTAssertEqual(draft.argsText, "-y\nserver-filesystem")
+        XCTAssertEqual(draft.envText, "REGION=west")
+
+        draft.command = "node"
+        draft.argsText = "server.js\n--safe"
+        draft.envText = "REGION=east\nEMPTY="
+        let edited = try draft.server(preservingIdentityAndEnabledFrom: original)
+        XCTAssertEqual(edited.name, "local")
+        XCTAssertEqual(edited.command, "node")
+        XCTAssertEqual(edited.args, ["server.js", "--safe"])
+        XCTAssertEqual(edited.envPairs, [
+            .init(name: "REGION", value: "east"),
+            .init(name: "EMPTY", value: ""),
+        ])
+        XCTAssertTrue(edited.enabled)
+    }
+
+    func testReplacingServerPreservesOrderIdentityEnabledStateAndUnrelatedLegacySecrets() throws {
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+        let reference = McpOAuthSecretReference.make(
+            projectID: "project",
+            serverName: "remote",
+            location: .header,
+            pairName: "Authorization"
+        )
+        try secrets.vault.write(reference, "Bearer existing")
+        let original = [
+            McpServerConfig(name: "first", kind: .stdio, command: "first"),
+            McpServerConfig(
+                name: "remote",
+                kind: .http,
+                url: "https://old.example.test/mcp",
+                headerPairs: [.init(name: "Authorization", value: "", secretReference: reference)],
+                enabled: false
+            ),
+            McpServerConfig(
+                name: "legacy",
+                kind: .stdio,
+                command: "legacy",
+                envPairs: [.init(name: "ACCESS_TOKEN", value: "unapproved-legacy")]
+            ),
+        ]
+        configured.save(original)
+
+        var replacement = original[1]
+        replacement.url = "https://new.example.test/mcp"
+        replacement.enabled = true // The store seals this to the existing row.
+        replacement.headerPairs.append(.init(name: "X-API-Key", value: "new-secret"))
+        let receipt = try configured.replaceSecuringOAuthServer(
+            replacement,
+            identifiedBy: "remote",
+            in: original,
+            consent: true
+        )
+
+        XCTAssertEqual(receipt.servers.map(\.name), ["first", "remote", "legacy"])
+        XCTAssertFalse(receipt.servers[1].enabled)
+        XCTAssertEqual(receipt.servers[1].headerPairs[0].secretReference, reference)
+        XCTAssertEqual(receipt.servers[2].envPairs[0].value, "unapproved-legacy")
+        XCTAssertEqual(receipt.migratedCount, 1)
+        let newReference = try XCTUnwrap(receipt.servers[1].headerPairs[1].secretReference)
+        XCTAssertEqual(secrets.values[reference], "Bearer existing")
+        XCTAssertEqual(secrets.values[newReference], "new-secret")
+        XCTAssertEqual(configured.servers(), receipt.servers)
+        XCTAssertEqual(configured.pendingPlaintextOAuthSecretCount(), 1)
+    }
+
+    func testReplacingAMissingIdentityLeavesTheCatalogByteExact() throws {
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+        let original = [McpServerConfig(name: "keep", kind: .stdio, command: "keep")]
+        configured.save(original)
+        let before = try Data(contentsOf: configured.fileURL)
+
+        XCTAssertThrowsError(try configured.replaceSecuringOAuthServer(
+            McpServerConfig(name: "missing", kind: .stdio, command: "replacement"),
+            identifiedBy: "missing",
+            in: original,
+            consent: true
+        )) { error in
+            XCTAssertEqual(error as? McpConfigMutationError, .serverNotFound("missing"))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: configured.fileURL), before)
+        XCTAssertEqual(configured.servers(), original)
+        XCTAssertTrue(secrets.values.isEmpty)
+
+        XCTAssertThrowsError(try configured.replaceSecuringOAuthServer(
+            McpServerConfig(name: "renamed", kind: .stdio, command: "replacement"),
+            identifiedBy: "keep",
+            in: original,
+            consent: true
+        )) { error in
+            XCTAssertEqual(error as? McpConfigMutationError, .identityChanged)
+        }
+        XCTAssertEqual(try Data(contentsOf: configured.fileURL), before)
+    }
+
+    func testFailedEditedWriteKeepsThePriorCatalogAndKeychainByteExact() throws {
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+        let original = [
+            McpServerConfig(
+                name: "remote",
+                kind: .http,
+                url: "https://old.example.test/mcp",
+                enabled: false
+            ),
+        ]
+        configured.save(original)
+        let before = try Data(contentsOf: configured.fileURL)
+        let directory = configured.fileURL.deletingLastPathComponent()
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path)
+        }
+
+        var replacement = original[0]
+        replacement.url = "https://new.example.test/mcp"
+        replacement.headerPairs = [.init(name: "Authorization", value: "Bearer new-secret")]
+        XCTAssertThrowsError(try configured.replaceSecuringOAuthServer(
+            replacement,
+            identifiedBy: "remote",
+            in: original,
+            consent: true
+        )) { error in
+            XCTAssertEqual(error as? McpOAuthSecretMigrationError, .configurationWriteFailed)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: configured.fileURL), before)
+        XCTAssertTrue(secrets.values.isEmpty)
+    }
+
+    // MARK: - Environment / header line validation
+
+    /// Every non-blank line either becomes a pair or is reported by number. A
+    /// line that is neither must never exist: that is how a header used to
+    /// vanish while Add reported success.
+    func testEveryMalformedPairLineIsReportedWithItsLineNumber() {
+        let parse = McpSettingsPolicy.parsePairs("""
+        TOKEN=abc
+
+        MISSING_SEPARATOR
+        =orphan-value
+        EMPTY=
+        """)
+
+        XCTAssertEqual(parse.pairs, [
+            .init(name: "TOKEN", value: "abc"),
+            .init(name: "EMPTY", value: ""),
+        ])
+        XCTAssertEqual(parse.problems.map(\.line), [3, 4])
+        XCTAssertTrue(parse.problems[0].reason.contains("\"=\""))
+        XCTAssertTrue(parse.problems[1].reason.contains("name"))
+    }
+
+    /// Blank lines are still counted, and CRLF must not shift the number the
+    /// user is pointed at.
+    func testPairLineNumbersFollowTheEditorIncludingBlankAndCRLFLines() {
+        XCTAssertEqual(
+            McpSettingsPolicy.parsePairs("A=1\r\n\r\nBROKEN").problems.map(\.line),
+            [3]
+        )
+        XCTAssertEqual(
+            McpSettingsPolicy.parsePairs("\n\n\n  \nBROKEN").problems.map(\.line),
+            [5]
+        )
+    }
+
+    /// `NAME=` is a real setting (an explicitly empty variable or header), so it
+    /// must parse and keep its empty value rather than be reported or dropped.
+    func testEmptyValuesParseAndKeepTheirEmptyString() {
+        let parse = McpSettingsPolicy.parsePairs("TOKEN=\n  SPACED  =   ")
+        XCTAssertTrue(parse.problems.isEmpty)
+        XCTAssertEqual(parse.pairs, [
+            .init(name: "TOKEN", value: ""),
+            .init(name: "SPACED", value: ""),
+        ])
+    }
+
+    /// Bounds that `McpServerConfig.safePair` would only reject for the whole
+    /// server are reported against the line that broke them.
+    func testOversizedAndControlCharacterLinesAreReportedPerLine() {
+        let longName = String(repeating: "N", count: 129)
+        let longValue = String(repeating: "v", count: 4_097)
+        let parse = McpSettingsPolicy.parsePairs("""
+        \(longName)=fine
+        NAME=\(longValue)
+        BE\u{7}LL=fine
+        """)
+
+        XCTAssertTrue(parse.pairs.isEmpty)
+        XCTAssertEqual(parse.problems.map(\.line), [1, 2, 3])
+        XCTAssertTrue(parse.problems[0].reason.contains("128"))
+        XCTAssertTrue(parse.problems[1].reason.contains("4096"))
+        XCTAssertTrue(parse.problems[2].reason.contains("control"))
+    }
+
+    /// The Add gate the button binds to: a malformed line blocks the save while
+    /// the draft text stays exactly as typed, and the existing capacity and
+    /// duplicate rules keep applying.
+    func testAddIsBlockedUntilEveryPairLineParses() {
+        let draft = "TOKEN=abc\nMISSING_SEPARATOR"
+        XCTAssertFalse(McpSettingsPolicy.canAdd(
+            hasRequiredFields: true, serverCount: 0, duplicateName: nil, pairText: draft
+        ))
+        XCTAssertTrue(McpSettingsPolicy.canAdd(
+            hasRequiredFields: true, serverCount: 0, duplicateName: nil, pairText: "TOKEN=abc\n\nEMPTY="
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAdd(
+            hasRequiredFields: false, serverCount: 0, duplicateName: nil, pairText: ""
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAdd(
+            hasRequiredFields: true, serverCount: 0, duplicateName: "files", pairText: ""
+        ))
+        XCTAssertFalse(McpSettingsPolicy.canAdd(
+            hasRequiredFields: true,
+            serverCount: McpConfigStore.maximumServerCount,
+            duplicateName: nil,
+            pairText: ""
+        ))
+    }
+
+    /// The message shown when a save is attempted names every bad line, not
+    /// just the first, and says nothing was saved.
+    func testMalformedPairMessageNamesEveryBadLine() {
+        let problems = McpSettingsPolicy.parsePairs("BROKEN\n=orphan\nOK=1").problems
+        let message = McpSettingsPolicy.malformedPairMessage(field: "Headers", problems: problems)
+        XCTAssertEqual(
+            message?.contains("Headers could not be read, so nothing was saved:"), true
+        )
+        XCTAssertEqual(message?.contains("Line 1:"), true)
+        XCTAssertEqual(message?.contains("Line 2:"), true)
+        XCTAssertNil(McpSettingsPolicy.malformedPairMessage(field: "Headers", problems: []))
+    }
     // MARK: - Session wire shapes
 
     func testStdioJsonValueMatchesNodeShape() {
@@ -133,7 +775,7 @@ final class McpConfigStoreTests: XCTestCase {
             kind: .stdio,
             command: "npx",
             args: ["-y", "server-filesystem"],
-            envPairs: [.init(name: "TOKEN", value: "abc")],
+            envPairs: [.init(name: "REGION", value: "us-east-1")],
             enabled: true
         )
         // Hand-built to the exact key set buildSessionServers emits for stdio:
@@ -142,17 +784,23 @@ final class McpConfigStoreTests: XCTestCase {
             "name": .string("files"),
             "command": .string("npx"),
             "args": .array([.string("-y"), .string("server-filesystem")]),
-            "env": .array([.object(["name": .string("TOKEN"), "value": .string("abc")])]),
+            "env": .array([.object(["name": .string("REGION"), "value": .string("us-east-1")])]),
         ])
         XCTAssertEqual(McpConfigStore.jsonValues([server]), [expected])
     }
 
     func testHttpJsonValueMatchesNodeShape() {
+        let reference = McpOAuthSecretReference.make(
+            projectID: "project",
+            serverName: "remote",
+            location: .header,
+            pairName: "Authorization"
+        )
         let server = McpServerConfig(
             name: "remote",
             kind: .http,
             url: "https://example.com/mcp",
-            headerPairs: [.init(name: "Authorization", value: "Bearer xyz")],
+            headerPairs: [.init(name: "Authorization", value: "", secretReference: reference)],
             enabled: true
         )
         // Hand-built to the exact key set buildSessionServers emits for http/sse:
@@ -163,7 +811,10 @@ final class McpConfigStoreTests: XCTestCase {
             "url": .string("https://example.com/mcp"),
             "headers": .array([.object(["name": .string("Authorization"), "value": .string("Bearer xyz")])]),
         ])
-        XCTAssertEqual(McpConfigStore.jsonValues([server]), [expected])
+        XCTAssertEqual(
+            McpConfigStore.jsonValues([server]) { $0 == reference ? "Bearer xyz" : nil },
+            [expected]
+        )
     }
 
     func testStdioOmitsTypeAndAlwaysCarriesEmptyArgsAndEnv() {
@@ -199,6 +850,54 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertNotNil(insecure.validationError)
         XCTAssertNotNil(credentialed.validationError)
         XCTAssertTrue(McpConfigStore.jsonValues([insecure, credentialed]).isEmpty)
+    }
+
+    /// GHSA-7p8r-x3mc-p8w7. A stored URL is read back by `URLComponents` here,
+    /// by WHATWG `new URL` in `scripts/native-mcp-registry.cjs`, and by whatever
+    /// RFC 3986 parser the agent links. These spellings name a different host to
+    /// each of them, so none of them may be allowed to pick one.
+    func testAmbiguousRemoteURLsNeverReachSessionWire() {
+        let ambiguous = [
+            "https:\\\\evil.test/mcp",
+            "https:/\\evil.test/mcp",
+            "https:\\/evil.test/mcp",
+            "https://good.test\\@evil.test/mcp",
+            "https://good.test\\.evil.test/mcp",
+            "https://good.test/schema\\..\\evil.test",
+            "https://good.test%09.evil.test/mcp",
+        ]
+        let servers = ambiguous.enumerated().map { index, url in
+            McpServerConfig(name: "probe\(index)", kind: .http, url: url)
+        }
+        for (url, server) in zip(ambiguous, servers) {
+            XCTAssertEqual(
+                server.validationError,
+                "Remote MCP servers must use a valid HTTPS URL.",
+                "accepted \(url)"
+            )
+        }
+        XCTAssertTrue(McpConfigStore.jsonValues(servers).isEmpty)
+    }
+
+    /// The guard above rejects a spelling, not a destination: ordinary public
+    /// hosts, loopback, IPv6 literals, a private-CA endpoint on its own port,
+    /// and a percent-encoded backslash in the path all stay usable.
+    func testOrdinaryRemoteURLsStillReachSessionWire() {
+        let ordinary = [
+            "https://api.example.test/v1",
+            "https://localhost:8443/mcp",
+            "https://127.0.0.1:8443/mcp",
+            "https://[::1]:8443/mcp",
+            "https://mcp.internal.corp.test:8443/mcp",
+            "https://good.test/a%5Cb",
+        ]
+        let servers = ordinary.enumerated().map { index, url in
+            McpServerConfig(name: "ok\(index)", kind: .http, url: url)
+        }
+        for (url, server) in zip(ordinary, servers) {
+            XCTAssertNil(server.validationError, "rejected \(url)")
+        }
+        XCTAssertEqual(McpConfigStore.jsonValues(servers).count, ordinary.count)
     }
 
     func testInvalidStdioCommandNeverReachesSessionWire() {
@@ -243,7 +942,7 @@ final class McpConfigStoreTests: XCTestCase {
 
     // MARK: - Sibling discovery and disabled import
 
-    func testDiscoveryReadsKnownJSONAndCodexTOMLWithoutMaterializingSecrets() throws {
+    func testDiscoveryReadsKnownJSONAndCodexTOMLWithoutExpandingPlaceholders() throws {
         let home = root.appendingPathComponent("home", isDirectory: true)
         try write(
             #"{"mcpServers":{"cursor-safe":{"command":"npx","args":["-y","safe-server"],"env":{"TOKEN":"${CURSOR_TOKEN}"}},"literal-secret":{"command":"unsafe","env":{"API_KEY":"plaintext"}}}}"#,
@@ -267,9 +966,11 @@ final class McpConfigStoreTests: XCTestCase {
         )
 
         let found = McpConfigDiscovery.scan(homeDirectory: home)
-        XCTAssertEqual(Set(found.map { $0.config.name }), ["cursor-safe", "docs", "local"])
-        XCTAssertFalse(found.contains { $0.config.name == "literal-secret" })
+        XCTAssertEqual(Set(found.map { $0.config.name }), ["cursor-safe", "docs", "local", "literal-secret"])
         XCTAssertTrue(found.allSatisfy { !$0.config.enabled })
+        let literal = try XCTUnwrap(found.first { $0.config.name == "literal-secret" })
+        XCTAssertEqual(literal.plaintextSecretCount, 1)
+        XCTAssertEqual(literal.config.envPairs, [.init(name: "API_KEY", value: "plaintext")])
         let docs = try XCTUnwrap(found.first { $0.config.name == "docs" })
         XCTAssertEqual(docs.origin, "Codex CLI")
         XCTAssertEqual(
@@ -299,7 +1000,18 @@ final class McpConfigStoreTests: XCTestCase {
         XCTAssertTrue(McpConfigDiscovery.scan(homeDirectory: home).isEmpty)
     }
 
-    func testImportIsExplicitDisabledCollisionSafeAndBounded() {
+    func testDiscoveryDropsAmbiguousRemoteURLs() throws {
+        let home = root.appendingPathComponent("confused-home", isDirectory: true)
+        try write(
+            #"{"mcpServers":{"trap":{"url":"https://good.test%09.evil.test/mcp"},"keep":{"url":"https://mcp.internal.corp.test:8443/mcp"}}}"#,
+            relativePath: ".cursor/mcp.json",
+            home: home
+        )
+
+        XCTAssertEqual(McpConfigDiscovery.scan(homeDirectory: home).map { $0.config.name }, ["keep"])
+    }
+
+    func testImportIsExplicitDisabledCollisionSafeAndBounded() throws {
         store(workspace).save([McpServerConfig(name: "existing", kind: .stdio, command: "keep")])
         let discoveries = [
             McpDiscoveredServer(
@@ -312,10 +1024,54 @@ final class McpConfigStoreTests: XCTestCase {
             ),
         ]
 
-        XCTAssertEqual(store(workspace).importDiscovered(discoveries), 1)
+        let receipt = try store(workspace).importDiscovered(
+            discoveries,
+            consentToMigrateSecrets: false
+        )
+        XCTAssertEqual(receipt.importedCount, 1)
+        XCTAssertEqual(receipt.migratedSecretCount, 0)
         let saved = store(workspace).servers()
         XCTAssertEqual(saved.first { $0.name == "existing" }?.command, "keep")
         XCTAssertEqual(saved.first { $0.name == "new" }?.enabled, false)
+    }
+
+    func testImportMigratesLiteralCredentialOnlyAfterConsent() throws {
+        let secrets = TestMcpSecretBox()
+        let configured = store(workspace, secrets: secrets)
+        let plaintext = "imported-access-token"
+        let discovery = McpDiscoveredServer(
+            origin: "Cursor",
+            config: McpServerConfig(
+                name: "remote",
+                kind: .http,
+                url: "https://example.test/mcp",
+                headerPairs: [.init(name: "Authorization", value: "Bearer \(plaintext)")],
+                enabled: false
+            )
+        )
+
+        XCTAssertThrowsError(try configured.importDiscovered(
+            [discovery],
+            consentToMigrateSecrets: false
+        )) { error in
+            XCTAssertEqual(error as? McpOAuthSecretMigrationError, .consentRequired)
+        }
+        XCTAssertTrue(configured.servers().isEmpty)
+        XCTAssertTrue(secrets.values.isEmpty)
+
+        let receipt = try configured.importDiscovered(
+            [discovery],
+            consentToMigrateSecrets: true
+        )
+        XCTAssertEqual(receipt.importedCount, 1)
+        XCTAssertEqual(receipt.migratedSecretCount, 1)
+        let imported = try XCTUnwrap(receipt.servers.first)
+        XCTAssertFalse(imported.enabled)
+        let reference = try XCTUnwrap(imported.headerPairs.first?.secretReference)
+        XCTAssertEqual(secrets.values[reference], "Bearer \(plaintext)")
+        let persisted = String(decoding: try Data(contentsOf: configured.fileURL), as: UTF8.self)
+        XCTAssertTrue(persisted.contains(reference))
+        XCTAssertFalse(persisted.contains(plaintext))
     }
 
     // MARK: - Protocol revision negotiation (pure)

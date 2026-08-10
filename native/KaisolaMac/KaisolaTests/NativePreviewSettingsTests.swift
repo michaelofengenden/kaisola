@@ -417,6 +417,37 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertNil(ProviderRouting.baseURLIssue(""))
     }
 
+    /// GHSA-7p8r-x3mc-p8w7, applied to the provider boundary. A base URL is
+    /// handed to a child process as text, so a spelling that `URLComponents` and
+    /// a WHATWG parser read as different hosts would route API traffic somewhere
+    /// the user never typed. The private-CA shape (internal name, own port) has
+    /// to keep working.
+    func testProviderRoutingRejectsAmbiguousAuthoritiesAndKeepsInternalHosts() {
+        for ambiguous in [
+            "https:\\\\evil.test/v1",
+            "https:/\\evil.test/v1",
+            "https:\\/evil.test/v1",
+            "https://gateway.example.test\\@evil.test/v1",
+            "https://gateway.example.test\\.evil.test/v1",
+            "https://gateway.example.test%09.evil.test/v1",
+        ] {
+            XCTAssertEqual(
+                ProviderRouting.baseURLIssue(ambiguous),
+                "Enter a complete http:// or https:// URL.",
+                "accepted \(ambiguous)"
+            )
+            XCTAssertNil(ProviderRouting.normalizedBaseURL(ambiguous))
+        }
+        XCTAssertEqual(
+            ProviderRouting.normalizedBaseURL("https://gateway.internal.corp.test:8443/v1"),
+            "https://gateway.internal.corp.test:8443/v1"
+        )
+        XCTAssertEqual(
+            ProviderRouting.normalizedBaseURL("https://[::1]:8443/v1"),
+            "https://[::1]:8443/v1"
+        )
+    }
+
     func testProviderRoutingRejectsInvalidModelsButKeepsOrdinaryIDs() {
         XCTAssertEqual(ProviderRouting.normalizedModel("  gpt-custom-1  "), "gpt-custom-1")
         XCTAssertNil(ProviderRouting.normalizedModel("bad\nmodel"))

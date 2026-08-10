@@ -5,6 +5,7 @@
 // transition. Everything else is treated as a mutation and fails closed.
 const DEGRADED_OBSERVATION_METHODS = new Set([
   'broker.status',
+  'broker.inventory',
   'terminal.available',
   'terminal.subscribe',
   'terminal.unsubscribe',

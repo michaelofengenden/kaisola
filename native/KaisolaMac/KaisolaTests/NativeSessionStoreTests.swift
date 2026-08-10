@@ -225,6 +225,17 @@ final class NativeSessionStoreTests: XCTestCase {
         XCTAssertEqual(recents.filter { $0 == "/tmp/recent-3" }.count, 1)
     }
 
+    func testRemovingARecentPersistsWithoutDeletingTheProjectDirectory() throws {
+        let directory = fileURL.deletingLastPathComponent().appendingPathComponent("still-on-disk")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        store.recordRecentFolder(directory.path)
+
+        store.removeRecentFolder(directory.path)
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+        XCTAssertFalse(NativeSessionStore(fileURL: fileURL).recentFolders().contains(directory.path))
+    }
+
     func testSelectedSessionPersistsAcrossInstances() {
         _ = store.openProject(directory: "/tmp/sel")   // ensures the file exists
         store.recordSelectedSession("term-abc")

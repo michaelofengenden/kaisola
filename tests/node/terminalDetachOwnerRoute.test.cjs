@@ -9,7 +9,7 @@ const manager = require('../../runtime/node-broker/ipc/terminalManager.cjs')
 const { terminalDetachOwnerRoute } = require('../../runtime/node-broker/ipc/terminalDetachOwnerRoute.cjs')
 
 const spoolDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-detach-owner-'))
-manager.configureStorage(spoolDir)
+manager.configureStorage(spoolDir, { asyncWrites: false })
 after(() => {
   manager.killAll()
   fs.rmSync(spoolDir, { recursive: true, force: true })

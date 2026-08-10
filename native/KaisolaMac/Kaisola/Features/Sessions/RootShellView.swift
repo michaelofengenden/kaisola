@@ -265,6 +265,15 @@ struct RootShellView: View {
                 }
                 performLocalCommand(AppCommandID(rawValue: rawID))
             }
+            .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenProviderSettings)) { note in
+                guard let target = note.object as? AppModel,
+                      target === model,
+                      let sectionID = note.userInfo?[AcpProviderSettingsNotificationKey.sectionID] as? String else {
+                    return
+                }
+                settingsSectionID = sectionID
+                showSettings = true
+            }
             .onChange(of: model.latestAgentFileActivity) { _, activity in
                 guard let activity,
                       WorkspaceAgentFileFollowPolicy.shouldOpen(
@@ -550,9 +559,52 @@ struct RootShellView: View {
 
     // MARK: - Layouts
 
+    /// The one action surface injected into either navigation shell. Layout
+    /// switching changes presentation only; it cannot select a different
+    /// implementation of project, session, or destructive actions.
+    private var shellActions: RootShellActionModel {
+        RootShellActionModel(
+            openDroppedProjects: { urls in
+                let folders = urls.filter(\.hasDirectoryPath)
+                guard !folders.isEmpty else { return false }
+                for folder in folders { model.openProject(directory: folder) }
+                return true
+            },
+            openProject: { runCommand(.openProject) },
+            useLeftTreeNavigation: { runCommand(.navigationLayout(.leftTree)) },
+            moveProject: { model.moveProject(id: $0, toIndex: $1) },
+            runQuickAction: { action, directory in
+                Task { await model.runQuickAction(action, inProject: directory) }
+            },
+            selectSession: { session in
+                if KaisolaMacAppDelegate.focusWindow(displayingSurface: session.id) { return }
+                guard SurfaceSelectionPolicy.shouldRequestFocus(
+                    focusedPaneID: model.focusedPaneID,
+                    targetID: session.id,
+                    browserOpen: model.browserCardURL != nil,
+                    activeProjectID: model.selectedProjectID,
+                    targetProjectID: session.projectID
+                ) else { return }
+                Task { await model.focusSurface(session.id) }
+            },
+            projectLaunchMenu: { AnyView(projectLaunchMenu($0)) },
+            projectContextMenu: { AnyView(projectContextMenu($0)) },
+            sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
+            chatContextMenu: { AnyView(chatContextMenuContent($0)) },
+            meshContextMenu: { AnyView(meshContextMenuContent($0)) },
+            renameSurface: { renameTarget = $0 },
+            closeChat: { model.closeChat($0.id) },
+            deleteChat: requestDeleteChat,
+            closeMesh: requestMoveMeshToRecentlyClosed,
+            deleteMesh: requestDeleteMesh,
+            deleteRecentlyClosed: requestDeleteRecentlyClosed
+        )
+    }
+
     /// Nested project→session tree in a left sidebar (the default).
     private var leftTreeLayout: some View {
-        NavigationSplitView {
+        let actions = shellActions
+        return RootLeftTreeShell(actions: actions) { actions in
             VStack(spacing: 0) {
                 // No "Projects" title row: the chrome panel already starts below
                 // the traffic lights, the rail's own pinned project names the
@@ -573,23 +625,13 @@ struct RootShellView: View {
                         // uses, so the rail always pins exactly the project
                         // whose sessions are expanded.
                         isActiveProject: { activeProjectID == $0 },
-                        selectSession: { session in
-                            if KaisolaMacAppDelegate.focusWindow(displayingSurface: session.id) { return }
-                            guard SurfaceSelectionPolicy.shouldRequestFocus(
-                                focusedPaneID: model.focusedPaneID,
-                                targetID: session.id,
-                                browserOpen: model.browserCardURL != nil,
-                                activeProjectID: model.selectedProjectID,
-                                targetProjectID: session.projectID
-                            ) else { return }
-                            Task { await model.focusSurface(session.id) }
-                        },
-                        launchMenu: { AnyView(projectLaunchMenu($0)) },
-                        contextMenu: { AnyView(projectContextMenu($0)) },
-                        sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
-                        chatContextMenu: { AnyView(chatContextMenuContent($0)) },
-                        meshContextMenu: { AnyView(meshContextMenuContent($0)) },
-                        deleteRecentlyClosed: requestDeleteRecentlyClosed
+                        selectSession: actions.selectSession,
+                        launchMenu: actions.projectLaunchMenu,
+                        contextMenu: actions.projectContextMenu,
+                        sessionContextMenu: actions.sessionContextMenu,
+                        chatContextMenu: actions.chatContextMenu,
+                        meshContextMenu: actions.meshContextMenu,
+                        deleteRecentlyClosed: actions.deleteRecentlyClosed
                     )
                     addProjectRow
                         .listRowInsets(QuietRailMetrics.listRowBleed)
@@ -603,12 +645,7 @@ struct RootShellView: View {
                 // Typed to URLs, so the rail's own internal text drags (project
                 // reorder) never collide with it.
                 .dropDestination(for: URL.self) { urls, _ in
-                    let folders = urls.filter(\.hasDirectoryPath)
-                    guard !folders.isEmpty else { return false }
-                    for folder in folders {
-                        model.openProject(directory: folder)
-                    }
-                    return true
+                    actions.openDroppedProjects(urls)
                 } isTargeted: { sidebarDropTargeted = $0 }
                 .overlay {
                     if sidebarDropTargeted {
@@ -716,10 +753,9 @@ struct RootShellView: View {
                 ideal: NativeWorkspaceChrome.projectSidebarIdealWidth,
                 max: NativeWorkspaceChrome.projectSidebarMaximumWidth
             )
-        } detail: {
+        } detail: { _ in
             detailArea
         }
-        .navigationSplitViewStyle(.balanced)
     }
 
     /// The detail column: the content on its own inset floating card, gutters
@@ -1135,39 +1171,39 @@ struct RootShellView: View {
     /// A project tab strip over a session row, then the detail pane (Electron's
     /// "Top bar" mode).
     private var topBarLayout: some View {
-        VStack(spacing: 0) {
+        let actions = shellActions
+        return RootTopBarShell(actions: actions) { actions in
             ProjectTabStripView(
                 projects: model.projects,
                 selected: activeProjectBinding,
-                menu: { project in AnyView(self.projectContextMenu(project)) },
-                openFolder: { runCommand(.openProject) },
-                useSidebar: { runCommand(.navigationLayout(.leftTree)) },
-                reorder: { model.moveProject(id: $0, toIndex: $1) }
+                menu: actions.projectContextMenu,
+                openFolder: actions.openProject,
+                useSidebar: actions.useLeftTreeNavigation,
+                reorder: actions.moveProject
             )
             .padding(.leading, NativeWorkspaceChrome.topBarTrafficLightClearance)
-            Divider()
+        } quickActions: { actions in
             if let active = model.projects.first(where: { $0.id == activeProjectID }),
                let activeDir = active.directory {
                 QuickActionsBar(projectID: active.id, projectName: active.name) { action in
-                    Task { await model.runQuickAction(action, inProject: activeDir) }
+                    actions.runQuickAction(action, activeDir)
                 }
             }
+        } sessions: { actions in
             SessionStrip(
                 model: model,
                 projectID: activeProjectID,
-                rename: { renameTarget = $0 },
-                closeChat: { model.closeChat($0.id) },
-                deleteChat: requestDeleteChat,
-                closeMesh: requestMoveMeshToRecentlyClosed,
-                deleteMesh: requestDeleteMesh,
-                deleteRecentlyClosed: requestDeleteRecentlyClosed
+                rename: actions.renameSurface,
+                closeChat: actions.closeChat,
+                deleteChat: actions.deleteChat,
+                closeMesh: actions.closeMesh,
+                deleteMesh: actions.deleteMesh,
+                deleteRecentlyClosed: actions.deleteRecentlyClosed
             )
-            Divider()
+        } detail: { _ in
             detailArea
-            HStack(spacing: 0) {
-                footer.frame(width: 235)
-                Spacer(minLength: 0)
-            }
+        } footer: { _ in
+            footer
         }
     }
 
@@ -1576,16 +1612,17 @@ struct RootShellView: View {
         }
     }
 
-    /// New agent session running the agent's CLI in the active project (or a
-    /// picked folder).
+    /// New agent session with an explicit execution boundary. Even when a
+    /// project is active, the user sees where the process, branch, account, and
+    /// host will be before anything launches.
     @MainActor
     static func promptForNewAgent(_ agent: AgentProfile, model: AppModel) {
-        if let directory = model.currentProjectDirectory {
-            startAgentSession(agent, in: directory, model: model)
-            return
-        }
-        chooseDirectory(prompt: "Start \(agent.name) Here") { directory in
-            startAgentSession(agent, in: directory, model: model)
+        promptForRunOn(agent, model: model) { directory, profile in
+            Task { await model.createAgentSession(
+                agent,
+                inDirectory: directory,
+                accountProfile: profile
+            ) }
         }
     }
 
@@ -1611,49 +1648,187 @@ struct RootShellView: View {
         }
     }
 
-    /// New ACP chat with the agent in the active project (or a picked folder).
+    /// ACP chat launch shares the same location/account authority as a terminal
+    /// agent launch; the transport kind must not change where it runs.
     @MainActor
     static func promptForNewChat(_ agent: AgentProfile, model: AppModel) {
         guard AcpAdapter.forAgent(agent.id) != nil else { return }
-        if let directory = model.currentProjectDirectory {
-            startChat(agent, in: directory, model: model)
-            return
-        }
-        chooseDirectory(prompt: "Chat with \(agent.name) Here") { directory in
-            startChat(agent, in: directory, model: model)
-        }
-    }
-
-    @MainActor
-    private static func startAgentSession(
-        _ agent: AgentProfile,
-        in directory: URL,
-        model: AppModel
-    ) {
-        chooseSessionAccount(for: agent) { profile in
-            Task { await model.createAgentSession(
-                agent,
-                inDirectory: directory,
-                accountProfile: profile
-            ) }
-        }
-    }
-
-    @MainActor
-    private static func startChat(
-        _ agent: AgentProfile,
-        in directory: URL,
-        model: AppModel
-    ) {
-        chooseSessionAccount(for: agent) { profile in
+        promptForRunOn(agent, model: model) { directory, profile in
             model.openChat(agent, inDirectory: directory, accountProfile: profile)
         }
     }
 
-    /// Pick a local provider-owned config directory without ever reading or
-    /// copying its credentials. No named profiles means zero extra ceremony.
-    /// Once selected, AppModel snapshots the resolved path into the session so
-    /// later settings changes cannot redirect an existing continuation.
+    private typealias RunOnLaunch = @MainActor (URL, UsageAccountProfile?) -> Void
+
+    @MainActor
+    private static func promptForRunOn(
+        _ agent: AgentProfile,
+        model: AppModel,
+        additionalDirectory: URL? = nil,
+        then launch: @escaping RunOnLaunch
+    ) {
+        let preferredPath = additionalDirectory?.standardizedFileURL.path
+            ?? model.currentProjectDirectory?.standardizedFileURL.path
+        var projects = model.projects.compactMap { project -> RunOnTargetBuilder.Project? in
+            guard let directory = project.directory?.standardizedFileURL else { return nil }
+            return .init(name: project.name, path: directory.path)
+        }
+        if let additionalDirectory {
+            let path = additionalDirectory.standardizedFileURL.path
+            projects.removeAll { URL(fileURLWithPath: $0.path).standardizedFileURL.path == path }
+            projects.insert(.init(name: additionalDirectory.lastPathComponent, path: path), at: 0)
+        } else if let preferredPath,
+                  let preferredIndex = projects.firstIndex(where: { $0.path == preferredPath }),
+                  preferredIndex != 0 {
+            projects.insert(projects.remove(at: preferredIndex), at: 0)
+        }
+        let worktrees = model.meshes.flatMap { mesh in
+            mesh.columns.compactMap { column -> RunOnTargetBuilder.Worktree? in
+                guard let path = column.worktreePath, let branch = column.branch else { return nil }
+                return .init(
+                    name: "\(mesh.title) — \(column.agent.name)",
+                    path: path,
+                    branch: branch
+                )
+            }
+        }
+        let recentPaths = model.recentFolders
+        let host = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+        let visualFixture = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+            && ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "account-picker"
+        if visualFixture, projects.isEmpty {
+            projects = [.init(name: "Kaisola", path: "/Users/example/Developer/Kaisola")]
+        }
+        let projectSnapshot = projects
+        let worktreeSnapshot = worktrees
+        let recentSnapshot = recentPaths
+        let fixturePaths = visualFixture ? Set(projectSnapshot.map(\.path)) : []
+
+        Task {
+            let targets = await Task.detached(priority: .userInitiated) {
+                [projectSnapshot, worktreeSnapshot, recentSnapshot, host, fixturePaths] in
+                RunOnTargetBuilder.build(
+                    projects: projectSnapshot,
+                    recentPaths: recentSnapshot,
+                    worktrees: worktreeSnapshot,
+                    host: host,
+                    isDirectory: { path in
+                        if fixturePaths.contains(path) { return true }
+                        var isDirectory: ObjCBool = false
+                        return FileManager.default.fileExists(atPath: path, isDirectory: &isDirectory)
+                            && isDirectory.boolValue
+                    },
+                    branch: { path in
+                        if fixturePaths.contains(path) { return "main" }
+                        guard let status = try? GitService(
+                            repoRoot: URL(fileURLWithPath: path, isDirectory: true)
+                        ).status() else { return nil }
+                        return status.branch
+                    }
+                )
+            }.value
+            presentRunOnPicker(
+                agent,
+                model: model,
+                targets: targets,
+                preferredPath: preferredPath,
+                launch: launch
+            )
+        }
+    }
+
+    @MainActor
+    private static func presentRunOnPicker(
+        _ agent: AgentProfile,
+        model: AppModel,
+        targets: [RunOnTarget],
+        preferredPath: String?,
+        launch: @escaping RunOnLaunch
+    ) {
+        let selectedTarget = targets.first { $0.path == preferredPath }
+        let provider = SessionAccountBinding.provider(forAgentID: agent.id)
+        var profiles = provider.map { provider in
+            UsageAccountStore().profiles().filter { $0.provider == provider }
+        } ?? []
+        let visualFixture = ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+            && ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "account-picker"
+        if visualFixture, let provider {
+            profiles = [
+                UsageAccountProfile(
+                    id: "visual-work",
+                    provider: provider,
+                    label: "Work",
+                    directory: "/Users/example/.\(provider.rawValue)-work"
+                ),
+                UsageAccountProfile(
+                    id: "visual-research",
+                    provider: provider,
+                    label: "Research",
+                    directory: "/Users/example/.\(provider.rawValue)-research"
+                ),
+            ]
+        }
+        profiles.sort {
+            $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending
+        }
+
+        let controller = RunOnPickerController(
+            model: RunOnPickerModel(
+                targets: targets,
+                selectedScope: selectedTarget?.scope,
+                selectedTargetID: selectedTarget?.id
+            ),
+            profiles: profiles,
+            provider: provider,
+            preferNamedAccount: visualFixture,
+            removeRecent: { path in model.removeRecentFolder(path) }
+        )
+        let alert = NSAlert()
+        alert.messageText = "Run \(agent.name) on…"
+        alert.informativeText = "Choose the execution location first, then a project, root, or branch. Search stays inside that location."
+        alert.alertStyle = .informational
+        alert.accessoryView = controller.accessoryView
+        alert.addButton(withTitle: "Start")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Choose Folder…")
+        controller.startButton = alert.buttons.first
+        controller.refresh()
+
+        let finish: @MainActor (NSApplication.ModalResponse) -> Void = { response in
+            if response == .alertThirdButtonReturn {
+                chooseDirectory(prompt: "Run \(agent.name) Here") { directory in
+                    promptForRunOn(
+                        agent,
+                        model: model,
+                        additionalDirectory: directory,
+                        then: launch
+                    )
+                }
+                return
+            }
+            guard response == .alertFirstButtonReturn,
+                  let target = controller.selectedTarget,
+                  target.canStart else { return }
+            launch(
+                URL(fileURLWithPath: target.path, isDirectory: true),
+                controller.selectedProfile
+            )
+        }
+        if let window = NSApp.keyWindow
+            ?? NSApp.mainWindow
+            ?? NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) }) {
+            alert.beginSheetModal(for: window) { response in
+                Task { @MainActor in finish(response) }
+            }
+        } else {
+            finish(alert.runModal())
+        }
+    }
+
+    /// Choose only the provider account for an already-restored chat. Its
+    /// execution location is fixed by the existing session, so presenting the
+    /// Run on picker here would incorrectly imply that switching credentials
+    /// can also move the continuation to another project or worktree.
     @MainActor
     private static func chooseSessionAccount(
         for agent: AgentProfile,
@@ -1682,8 +1857,8 @@ struct RootShellView: View {
                 ),
             ]
         }
-        profiles.sort { lhs, rhs in
-                lhs.label.localizedCaseInsensitiveCompare(rhs.label) == .orderedAscending
+        profiles.sort {
+            $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending
         }
         guard !profiles.isEmpty else {
             handle(nil)
@@ -1698,17 +1873,13 @@ struct RootShellView: View {
             picker.item(at: picker.numberOfItems - 1)?.toolTip = profile.expandedDirectory
         }
         picker.setAccessibilityLabel("Account")
-        if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
-           ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "account-picker" {
-            picker.selectItem(at: min(1, picker.numberOfItems - 1))
-        }
 
         let alert = NSAlert()
         alert.messageText = "Choose \(agent.name) account"
-        alert.informativeText = "This account stays locked to the new session and all of its continuations. Credentials remain in the provider's own config directory."
+        alert.informativeText = "This account stays locked to the restored session and its continuations. Credentials remain in the provider's own config directory."
         alert.alertStyle = .informational
         alert.accessoryView = picker
-        alert.addButton(withTitle: "Start")
+        alert.addButton(withTitle: "Switch")
         alert.addButton(withTitle: "Cancel")
 
         let finish: @MainActor (NSApplication.ModalResponse) -> Void = { response in
@@ -2487,6 +2658,31 @@ struct RootShellView: View {
                 .accessibilityElement(children: .contain)
                 .accessibilityLabel("Input paused for \(surfaceTitle(id))")
                 .accessibilityHint("The last write could not be confirmed. Other terminals remain connected. Resume input revalidates only this terminal.")
+            } else if let progress = model.terminalPasteProgress(for: id) {
+                HStack(spacing: 8) {
+                    ProgressView(
+                        value: Double(progress.sentBytes),
+                        total: Double(progress.totalBytes)
+                    )
+                    .controlSize(.small)
+                    .frame(width: 72)
+                    Text("Pasting \(progress.sentBytes) of \(progress.totalBytes) bytes")
+                    Button("Cancel") { model.cancelTerminalPaste(for: id) }
+                        .buttonStyle(.borderless)
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(.regularMaterial, in: Capsule())
+                .overlay {
+                    Capsule().stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+                }
+                .padding(10)
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel("Pasting into \(surfaceTitle(id))")
+                .accessibilityValue("\(progress.sentBytes) of \(progress.totalBytes) bytes sent")
+                .accessibilityHint("Cancel stops chunks that have not started sending")
             } else if case let .reconnecting(attempt) = model.connectionState {
                 Label("Reconnecting…", systemImage: "arrow.triangle.2.circlepath")
                     .font(.caption.weight(.semibold))
@@ -4734,6 +4930,389 @@ enum AddableRecentFolders {
             if result.count == limit { break }
         }
         return result
+    }
+}
+
+/// The first decision in the Run on picker. Unavailable paths are deliberately
+/// their own scope so a search can never make an offline recent look runnable.
+enum RunOnScope: String, CaseIterable, Equatable, Sendable {
+    case local
+    case worktree
+    case unavailable
+
+    var sectionTitle: String {
+        switch self {
+        case .local: "This Computer"
+        case .worktree: "Mesh Worktrees"
+        case .unavailable: "Unavailable"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .local: "desktopcomputer"
+        case .worktree: "arrow.triangle.branch"
+        case .unavailable: "externaldrive.badge.exclamationmark"
+        }
+    }
+}
+
+/// One exact execution boundary. The confirmation string is intentionally a
+/// complete four-line contract: a friendly project name alone is never enough
+/// authority to start a process.
+struct RunOnTarget: Identifiable, Equatable, Sendable {
+    let name: String
+    let path: String
+    let branch: String?
+    let host: String
+    let scope: RunOnScope
+    let isRecent: Bool
+
+    var id: String { "\(scope.rawValue):\(path):\(branch ?? "")" }
+    var canStart: Bool { scope != .unavailable }
+
+    func confirmation(accountName: String) -> String {
+        [
+            "Filesystem: \(path)",
+            "Git branch: \(branch ?? "Not a Git repository")",
+            "Account: \(accountName)",
+            "Execution host: \(host)",
+        ].joined(separator: "\n")
+    }
+}
+
+/// Pure picker state shared by AppKit and contract tests. Filtering starts
+/// with the selected scope and only then applies the query.
+struct RunOnPickerModel: Equatable, Sendable {
+    private(set) var targets: [RunOnTarget]
+    private(set) var selectedScope: RunOnScope
+    private(set) var query = ""
+    private(set) var selectedTargetID: String?
+
+    init(targets: [RunOnTarget], selectedScope: RunOnScope? = nil, selectedTargetID: String? = nil) {
+        self.targets = targets
+        self.selectedScope = selectedScope
+            ?? RunOnScope.allCases.first(where: { scope in targets.contains { $0.scope == scope } })
+            ?? .local
+        self.selectedTargetID = selectedTargetID
+        normalizeSelection()
+    }
+
+    var filteredTargets: [RunOnTarget] {
+        let scoped = targets.filter { $0.scope == selectedScope }
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !needle.isEmpty else { return scoped }
+        return scoped.filter { target in
+            target.name.localizedCaseInsensitiveContains(needle)
+                || target.path.localizedCaseInsensitiveContains(needle)
+                || (target.branch?.localizedCaseInsensitiveContains(needle) ?? false)
+        }
+    }
+
+    var selectedTarget: RunOnTarget? {
+        filteredTargets.first { $0.id == selectedTargetID } ?? filteredTargets.first
+    }
+
+    mutating func selectScope(_ scope: RunOnScope) {
+        selectedScope = scope
+        query = ""
+        selectedTargetID = nil
+        normalizeSelection()
+    }
+
+    mutating func updateQuery(_ query: String) {
+        self.query = query
+        normalizeSelection()
+    }
+
+    mutating func selectTarget(_ id: String?) {
+        selectedTargetID = id
+        normalizeSelection()
+    }
+
+    @discardableResult
+    mutating func removeRecent(targetID: String) -> String? {
+        guard let target = targets.first(where: { $0.id == targetID }), target.isRecent else {
+            return nil
+        }
+        targets.removeAll { $0.id == targetID }
+        if selectedTargetID == targetID { selectedTargetID = nil }
+        normalizeSelection()
+        return target.path
+    }
+
+    private mutating func normalizeSelection() {
+        let visible = filteredTargets
+        if !visible.contains(where: { $0.id == selectedTargetID }) {
+            selectedTargetID = visible.first?.id
+        }
+    }
+}
+
+/// Snapshot inputs used off the main actor so file-system and Git probes never
+/// block terminal rendering while the picker is prepared.
+enum RunOnTargetBuilder {
+    struct Project: Equatable, Sendable {
+        let name: String
+        let path: String
+    }
+
+    struct Worktree: Equatable, Sendable {
+        let name: String
+        let path: String
+        let branch: String
+    }
+
+    static func build(
+        projects: [Project],
+        recentPaths: [String],
+        worktrees: [Worktree],
+        host: String,
+        isDirectory: (String) -> Bool,
+        branch: (String) -> String?
+    ) -> [RunOnTarget] {
+        var seen = Set<String>()
+        var availableLocal: [RunOnTarget] = []
+        var availableWorktrees: [RunOnTarget] = []
+        var unavailable: [RunOnTarget] = []
+
+        func normalized(_ path: String) -> String {
+            URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+        }
+
+        func appendLocal(name: String, path rawPath: String, recent: Bool) {
+            let path = normalized(rawPath)
+            guard seen.insert(path).inserted else { return }
+            let exists = isDirectory(path)
+            let target = RunOnTarget(
+                name: name,
+                path: path,
+                branch: exists ? branch(path) : nil,
+                host: host,
+                scope: exists ? .local : .unavailable,
+                isRecent: recent
+            )
+            if exists { availableLocal.append(target) } else { unavailable.append(target) }
+        }
+
+        for project in projects {
+            appendLocal(name: project.name, path: project.path, recent: false)
+        }
+        for recentPath in recentPaths {
+            appendLocal(
+                name: URL(fileURLWithPath: recentPath, isDirectory: true).lastPathComponent,
+                path: recentPath,
+                recent: true
+            )
+        }
+        for worktree in worktrees {
+            let path = normalized(worktree.path)
+            guard seen.insert(path).inserted else { continue }
+            let exists = isDirectory(path)
+            let target = RunOnTarget(
+                name: worktree.name,
+                path: path,
+                branch: worktree.branch,
+                host: host,
+                scope: exists ? .worktree : .unavailable,
+                isRecent: false
+            )
+            if exists { availableWorktrees.append(target) } else { unavailable.append(target) }
+        }
+        return availableLocal + availableWorktrees + unavailable
+    }
+}
+
+/// AppKit coordinator for the launch sheet. The four controls are ordered to
+/// match the authority decision: location, scoped search, exact target, then
+/// provider account. The summary is the final confirmation, not placeholder
+/// prose.
+@MainActor
+final class RunOnPickerController: NSObject {
+    private var model: RunOnPickerModel
+    private let profiles: [UsageAccountProfile]
+    private let removeRecent: (String) -> Void
+
+    let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 520, height: 220))
+    let scopePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let searchField = NSSearchField(frame: .zero)
+    private let targetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let accountPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let removeRecentButton = NSButton(title: "Remove from Recents", target: nil, action: nil)
+    private let confirmationLabel = NSTextField(wrappingLabelWithString: "")
+    weak var startButton: NSButton?
+
+    init(
+        model: RunOnPickerModel,
+        profiles: [UsageAccountProfile],
+        provider: UsageAccountProfile.Provider?,
+        preferNamedAccount: Bool,
+        removeRecent: @escaping (String) -> Void
+    ) {
+        self.model = model
+        self.profiles = profiles
+        self.removeRecent = removeRecent
+        super.init()
+
+        scopePopup.setAccessibilityLabel("Execution location")
+        scopePopup.target = self
+        scopePopup.action = #selector(scopeChanged)
+        for scope in RunOnScope.allCases {
+            let count = model.targets.filter { $0.scope == scope }.count
+            scopePopup.addItem(withTitle: "\(scope.sectionTitle) (\(count))")
+            if let item = scopePopup.lastItem {
+                item.image = NSImage(systemSymbolName: scope.systemImage, accessibilityDescription: scope.sectionTitle)
+                item.representedObject = scope.rawValue
+            }
+        }
+
+        searchField.placeholderString = "Search this location"
+        searchField.setAccessibilityLabel("Search selected execution location")
+        searchField.sendsSearchStringImmediately = true
+        searchField.target = self
+        searchField.action = #selector(searchChanged)
+
+        targetPopup.setAccessibilityLabel("Project, root, or branch")
+        targetPopup.target = self
+        targetPopup.action = #selector(targetChanged)
+
+        accountPopup.setAccessibilityLabel("Account")
+        accountPopup.addItem(withTitle: "Project/default")
+        accountPopup.item(at: 0)?.toolTip = provider.map {
+            "Use this project's effective \($0.environmentKey)"
+        } ?? "Use the project's default environment"
+        for profile in profiles {
+            accountPopup.addItem(withTitle: profile.label)
+            accountPopup.lastItem?.toolTip = profile.expandedDirectory
+        }
+        if preferNamedAccount, !profiles.isEmpty { accountPopup.selectItem(at: 1) }
+        accountPopup.target = self
+        accountPopup.action = #selector(accountChanged)
+
+        removeRecentButton.setAccessibilityLabel("Remove selected target from recents")
+        removeRecentButton.bezelStyle = .inline
+        removeRecentButton.target = self
+        removeRecentButton.action = #selector(removeSelectedRecent)
+
+        confirmationLabel.maximumNumberOfLines = 4
+        confirmationLabel.lineBreakMode = .byTruncatingMiddle
+        confirmationLabel.font = .monospacedSystemFont(ofSize: NSFont.smallSystemFontSize, weight: .regular)
+        confirmationLabel.setAccessibilityLabel("Execution confirmation")
+
+        let labels = ["Location", "Search", "Project / root / branch", "Account"].map {
+            NSTextField(labelWithString: $0)
+        }
+        let grid = NSGridView(views: [
+            [labels[0], scopePopup],
+            [labels[1], searchField],
+            [labels[2], targetPopup],
+            [labels[3], accountPopup],
+        ])
+        grid.rowSpacing = 7
+        grid.columnSpacing = 12
+        grid.column(at: 0).xPlacement = .trailing
+        grid.column(at: 1).width = 350
+        scopePopup.widthAnchor.constraint(equalToConstant: 350).isActive = true
+        searchField.widthAnchor.constraint(equalToConstant: 350).isActive = true
+        targetPopup.widthAnchor.constraint(equalToConstant: 350).isActive = true
+        accountPopup.widthAnchor.constraint(equalToConstant: 350).isActive = true
+
+        let actions = NSStackView(views: [NSView(), removeRecentButton])
+        actions.orientation = .horizontal
+        let stack = NSStackView(views: [grid, actions, confirmationLabel])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 10
+        accessoryView.addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: accessoryView.leadingAnchor),
+            stack.trailingAnchor.constraint(equalTo: accessoryView.trailingAnchor),
+            stack.topAnchor.constraint(equalTo: accessoryView.topAnchor),
+            confirmationLabel.widthAnchor.constraint(equalTo: accessoryView.widthAnchor),
+        ])
+    }
+
+    var selectedTarget: RunOnTarget? { model.selectedTarget }
+
+    var selectedProfile: UsageAccountProfile? {
+        let index = accountPopup.indexOfSelectedItem
+        guard index > 0, profiles.indices.contains(index - 1) else { return nil }
+        return profiles[index - 1]
+    }
+
+    func refresh() {
+        for (index, scope) in RunOnScope.allCases.enumerated() {
+            let count = model.targets.filter { $0.scope == scope }.count
+            scopePopup.item(at: index)?.title = "\(scope.sectionTitle) (\(count))"
+        }
+        if let index = RunOnScope.allCases.firstIndex(of: model.selectedScope) {
+            scopePopup.selectItem(at: index)
+        }
+        let selectedID = model.selectedTarget?.id
+        targetPopup.removeAllItems()
+        for target in model.filteredTargets {
+            targetPopup.addItem(withTitle: target.name)
+            guard let item = targetPopup.lastItem else { continue }
+            item.image = NSImage(
+                systemSymbolName: target.scope.systemImage,
+                accessibilityDescription: target.scope.sectionTitle
+            )
+            item.representedObject = target.id
+            item.toolTip = [target.path, target.branch].compactMap { $0 }.joined(separator: " — ")
+        }
+        if targetPopup.numberOfItems == 0 {
+            targetPopup.addItem(withTitle: "No matching targets")
+            targetPopup.lastItem?.isEnabled = false
+        } else if let selectedID,
+                  let item = targetPopup.itemArray.first(where: {
+                      ($0.representedObject as? String) == selectedID
+                  }) {
+            targetPopup.select(item)
+        }
+        refreshConfirmation()
+    }
+
+    @objc private func scopeChanged() {
+        guard scopePopup.indexOfSelectedItem >= 0,
+              let rawValue = scopePopup.selectedItem?.representedObject as? String,
+              let scope = RunOnScope(rawValue: rawValue) else { return }
+        model.selectScope(scope)
+        searchField.stringValue = ""
+        refresh()
+    }
+
+    @objc private func searchChanged() {
+        model.updateQuery(searchField.stringValue)
+        refresh()
+    }
+
+    @objc private func targetChanged() {
+        model.selectTarget(targetPopup.selectedItem?.representedObject as? String)
+        refreshConfirmation()
+    }
+
+    @objc private func accountChanged() {
+        refreshConfirmation()
+    }
+
+    @objc private func removeSelectedRecent() {
+        guard let target = model.selectedTarget,
+              let path = model.removeRecent(targetID: target.id) else { return }
+        removeRecent(path)
+        refresh()
+    }
+
+    private func refreshConfirmation() {
+        let target = model.selectedTarget
+        removeRecentButton.isEnabled = target?.isRecent == true
+        startButton?.isEnabled = target?.canStart == true
+        confirmationLabel.stringValue = target?.confirmation(accountName: accountName)
+            ?? "No target in this execution location matches the search."
+    }
+
+    private var accountName: String {
+        selectedProfile?.label ?? "Project/default"
     }
 }
 

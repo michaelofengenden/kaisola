@@ -82,7 +82,7 @@ test('terminal spawn seeds only the escaped missing cwd into its warning snapsho
   const id = 'escaped-missing-cwd-warning'
   const cwd = path.join(storage, 'gone\x1b[2J\x07\rforged\nreport\u202eexe')
   const safeCwd = escapeTerminalText(cwd)
-  manager.configureStorage(storage)
+  manager.configureStorage(storage, { asyncWrites: false })
   t.after(() => {
     manager.release(id)
     fs.rmSync(storage, { recursive: true, force: true })

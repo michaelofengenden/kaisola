@@ -68,7 +68,7 @@ struct AcpComposerCard: View {
     private var sendEnabled: Bool {
         AcpComposerSendPolicy.isEnabled(
             draft: draft,
-            isConnected: conversation.isConnected,
+            isConnected: conversation.allowsInference,
             isRunning: conversation.isRunning,
             hasAttachments: !conversation.pendingAttachments.isEmpty
         )
@@ -83,6 +83,8 @@ struct AcpComposerCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            providerLaunchNotice
+
             TextField(placeholder, text: $draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(.callout)
@@ -112,6 +114,65 @@ struct AcpComposerCard: View {
         .accessibilityIdentifier("acp.composer")
         .task(id: agentName) {
             favorites = favoritesStore.favorites(agentKey: agentName)
+        }
+    }
+
+    @ViewBuilder
+    private var providerLaunchNotice: some View {
+        if let fallback = conversation.pendingModelFallback {
+            VStack(alignment: .leading, spacing: 7) {
+                Label("Confirm model fallback", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Text("Requested \(fallback.requestedLabel); \(fallback.providerName) account “\(fallback.accountLabel)” selected \(fallback.actualLabel). No prompt will run until you choose.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button("Use \(fallback.actualLabel)") {
+                        conversation.acceptModelFallback()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("acp.model-fallback.accept")
+                    Button("Cancel") {
+                        Task { await conversation.cancelModelFallback() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("acp.model-fallback.cancel")
+                }
+            }
+            .padding(12)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("acp.model-fallback")
+            Divider()
+        } else if let failure = conversation.providerStartupFailure {
+            VStack(alignment: .leading, spacing: 7) {
+                Label("\(failure.providerName) could not start", systemImage: "exclamationmark.octagon.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.red)
+                Text("Account: \(failure.accountLabel)")
+                    .font(.caption.weight(.medium))
+                Text(failure.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Open \(failure.settingsTitle)") {
+                    NotificationCenter.default.post(
+                        name: .kaisolaOpenProviderSettings,
+                        object: model,
+                        userInfo: [AcpProviderSettingsNotificationKey.sectionID: failure.settingsSectionID]
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("acp.provider-failure.settings")
+            }
+            .padding(12)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("acp.provider-failure")
+            Divider()
         }
     }
 
@@ -145,6 +206,7 @@ struct AcpComposerCard: View {
 
             Spacer(minLength: 8)
 
+            runProfileChip
             settingsPill
                 .layoutPriority(1)
             trailingControls
@@ -158,6 +220,56 @@ struct AcpComposerCard: View {
             .frame(width: KaisolaVisualSystem.focusStroke, height: 15)
             .padding(.horizontal, 2)
             .accessibilityHidden(true)
+    }
+
+    /// Visible before the first prompt because capability advertisement has
+    /// already been fixed for this adapter process. Selecting another profile
+    /// asks AppModel to rebuild the process rather than mutating its policy.
+    private var runProfileChip: some View {
+        let profile = conversation.runProfile
+        let knownServers = McpConfigStore(workspace: conversation.workspaceURL).servers().map(\.name)
+        let warnings = profile.availabilityWarnings(knownMCPServerNames: knownServers)
+        return Menu {
+            ForEach(AcpRunProfileStore().all()) { candidate in
+                Button {
+                    guard let chatID = model.chats.first(where: {
+                        $0.conversation === conversation
+                    })?.id else { return }
+                    Task { await model.switchChatRunProfile(chatID, to: candidate.id) }
+                } label: {
+                    if candidate.id == profile.id {
+                        Label(candidate.name, systemImage: "checkmark")
+                    } else {
+                        Text(candidate.name)
+                    }
+                }
+            }
+            if !warnings.isEmpty {
+                Divider()
+                ForEach(warnings, id: \.self) { warning in
+                    Text(warning)
+                }
+            }
+            Divider()
+            Button("Manage Profiles…") {
+                NSApp.sendAction(
+                    #selector(KaisolaMacAppDelegate.openAgentSettings(_:)),
+                    to: nil,
+                    from: nil
+                )
+            }
+        } label: {
+            AcpComposerChipLabel(label: profile.name, tint: warnings.isEmpty ? nil : .orange) {
+                Image(systemName: warnings.isEmpty ? "checkmark.shield" : "exclamationmark.triangle")
+                    .font(.system(size: 10, weight: .medium))
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help(warnings.first ?? "Run profile: model, host tools, and MCP availability")
+        .accessibilityLabel("Run profile: \(profile.name)" + (warnings.isEmpty ? "" : ", \(warnings.joined(separator: " "))"))
+        .accessibilityIdentifier("acp.composer.run-profile")
     }
 
     // MARK: - Attachment menu
@@ -178,7 +290,7 @@ struct AcpComposerCard: View {
         }
         .buttonStyle(.plain)
         .fixedSize()
-        .disabled(!conversation.isConnected)
+        .disabled(!conversation.allowsInference)
         .help("Attach files or photos, or insert a slash command")
         .accessibilityLabel("Add attachments")
         .accessibilityIdentifier("acp.composer.attach")
@@ -287,7 +399,7 @@ struct AcpComposerCard: View {
             }
         }
         .buttonStyle(AcpComposerChipButtonStyle(shape: AnyShape(Capsule()), restingOpacity: 0.32))
-        .disabled(conversation.pendingConfigOptionID != nil)
+        .disabled(conversation.pendingConfigOptionID != nil || conversation.pendingModelFallback != nil)
         .help(conversation.pendingConfigOptionID == nil
             ? "Agent, model, and the settings this chat runs on"
             : "Waiting for the agent to confirm this setting")

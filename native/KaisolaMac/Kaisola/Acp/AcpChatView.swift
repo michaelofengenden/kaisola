@@ -1000,6 +1000,17 @@ struct TranscriptRowView: View {
 
     var body: some View {
         switch row {
+        case let .runProfileAudit(_, profile):
+            HStack(spacing: 6) {
+                Image(systemName: "checkmark.shield")
+                    .accessibilityHidden(true)
+                Text("Run profile: \(profile.name)")
+                if let model = profile.modelID { Text("· \(model)") }
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("Run profile audit: \(profile.name)")
         case let .user(_, text, failed):
             HStack(spacing: 8) {
                 Spacer(minLength: 40)

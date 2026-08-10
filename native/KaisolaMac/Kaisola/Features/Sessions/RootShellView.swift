@@ -384,7 +384,10 @@ struct RootShellView: View {
                 }
                 .padding(12)
                 Divider()
-                GitPanelView(repoRoot: repo.url)
+                GitPanelView(repoRoot: repo.url) { agent, draft in
+                    model.openChat(agent, inDirectory: repo.url, initialDraft: draft)
+                    gitRepo = nil
+                }
                     .frame(width: 520, height: 460)
             }
         }

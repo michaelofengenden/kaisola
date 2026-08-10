@@ -43,6 +43,26 @@ struct ProjectAccountStore: Sendable {
         var projects: [String: ProjectAccountOverride]
     }
 
+    /// Serializes the read-modify-write in `set` per account file, process-wide.
+    /// The store is a value type and every Settings window builds its own, so
+    /// the lock has to live beside the file identity rather than beside an
+    /// instance — otherwise two windows saving different projects at the same
+    /// moment both read the old payload and the later write drops the earlier
+    /// project entirely. Keyed by resolved path; one entry per file, so the
+    /// registry stays a handful of locks (production has exactly one).
+    private static let lockRegistry = NSLock()
+    private nonisolated(unsafe) static var fileLocks: [String: NSLock] = [:]
+
+    private static func fileLock(for fileURL: URL) -> NSLock {
+        let key = fileURL.standardizedFileURL.path
+        lockRegistry.lock()
+        defer { lockRegistry.unlock() }
+        if let existing = fileLocks[key] { return existing }
+        let created = NSLock()
+        fileLocks[key] = created
+        return created
+    }
+
     let fileURL: URL
 
     init(fileURL: URL = NativePreviewPaths.applicationSupportDirectory
@@ -58,8 +78,13 @@ struct ProjectAccountStore: Sendable {
     /// Set (or clear) a project's override. Passing nil — or an override whose
     /// fields are all blank after trimming — removes the entry entirely. Stored
     /// values are normalized (trimmed, empty → nil). Idempotent: nothing is
-    /// written when the persisted value already matches.
+    /// written when the persisted value already matches. The read-modify-write
+    /// runs under the per-file lock, so concurrent saves from two Settings
+    /// windows land one after the other and both projects survive.
     func set(_ override: ProjectAccountOverride?, forProject projectID: String) {
+        let lock = ProjectAccountStore.fileLock(for: fileURL)
+        lock.lock()
+        defer { lock.unlock() }
         let normalized = override.flatMap { $0.isEmpty ? nil : $0.normalized() }
         var payload = read() ?? Payload(projects: [:])
         guard payload.projects[projectID] != normalized else { return }
@@ -103,7 +128,12 @@ struct ProjectAccountStore: Sendable {
             attributes: [.posixPermissions: 0o700]
         )
         guard let data = try? JSONEncoder().encode(payload) else { return }
-        let temporary = directory.appendingPathComponent(".\(fileURL.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier)")
+        // Unique per write, not just per process: a PID-derived name is the same
+        // string for every writer inside this app, so any two overlapping writes
+        // would stage into one file and publish a half-written payload.
+        let temporary = directory.appendingPathComponent(
+            ".\(fileURL.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier).\(UUID().uuidString)"
+        )
         do {
             try data.write(to: temporary, options: [])
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)

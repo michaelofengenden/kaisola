@@ -313,15 +313,33 @@ test('workflow pins the signed lane and uploads only the redacted receipt', () =
     path.join(root, '.github/workflows/native-keychain-boundaries.yml'),
     'utf8',
   )
+  const project = fs.readFileSync(
+    path.join(root, 'native/KaisolaMac/KaisolaMac.xcodeproj/project.pbxproj'),
+    'utf8',
+  )
 
   assert.match(workflow, /runs-on:\s*macos-15/u)
   assert.match(workflow, /DEVELOPER_DIR:\s*\/Applications\/Xcode_16\.4\.app/u)
   assert.match(workflow, /RUNNER_ENVIRONMENT:-.*github-hosted/u)
   assert.match(workflow, /RUNNER_ARCH:-.*ARM64/u)
   assert.doesNotMatch(workflow, /^\s*security default-keychain/mu)
-  assert.match(workflow, /CODE_SIGNING_ALLOWED=YES/u)
   assert.doesNotMatch(workflow, /codesign --force --deep --sign - --entitlements/u)
-  assert.match(workflow, /CODE_SIGN_IDENTITY="Developer ID Application"/u)
+  assert.doesNotMatch(
+    workflow,
+    /^\s*(?:CODE_SIGNING_ALLOWED|CODE_SIGN_STYLE|CODE_SIGN_IDENTITY|DEVELOPMENT_TEAM|CODE_SIGN_INJECT_BASE_ENTITLEMENTS|OTHER_CODE_SIGN_FLAGS)=/mu,
+  )
+  assert.equal(
+    (workflow.match(/^\s*KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_IDENTITY="Developer ID Application"/gmu) ?? []).length,
+    2,
+  )
+  assert.equal(
+    (workflow.match(/^\s*KAISOLA_KEYCHAIN_BOUNDARY_DEVELOPMENT_TEAM="\$APPLE_TEAM_ID"/gmu) ?? []).length,
+    2,
+  )
+  assert.equal(
+    (workflow.match(/^\s*KAISOLA_KEYCHAIN_BOUNDARY_OTHER_CODE_SIGN_FLAGS="--keychain \$KAISOLA_SIGNING_KEYCHAIN"/gmu) ?? []).length,
+    2,
+  )
   assert.match(workflow, /-allowProvisioningUpdates/u)
   assert.match(workflow, /-authenticationKeyPath/u)
   assert.match(workflow, /KAISOLA_KEYCHAIN_BOUNDARY_ENTITLEMENTS=/u)
@@ -334,6 +352,25 @@ test('workflow pins the signed lane and uploads only the redacted receipt', () =
   assert.match(workflow, /native-keychain-boundary-receipt\.cjs/u)
   assert.match(workflow, /path:\s*[^\n]*keychain-boundary-receipt\.json/u)
   assert.doesNotMatch(workflow, /path:\s*[^\n]*(?:\.xcresult|xcodebuild|tests\.json)/u)
+
+  for (const setting of [
+    'CODE_SIGN_IDENTITY = "\\$\\(KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_IDENTITY\\)";',
+    'DEVELOPMENT_TEAM = "\\$\\(KAISOLA_KEYCHAIN_BOUNDARY_DEVELOPMENT_TEAM\\)";',
+    'OTHER_CODE_SIGN_FLAGS = "\\$\\(inherited\\) \\$\\(KAISOLA_KEYCHAIN_BOUNDARY_OTHER_CODE_SIGN_FLAGS\\)";',
+  ]) {
+    assert.equal(
+      (project.match(new RegExp(setting, 'gu')) ?? []).length,
+      1,
+      `${setting} must be mapped only by the Kaisola Debug target`,
+    )
+  }
+  assert.equal(
+    (project.match(/CODE_SIGN_ENTITLEMENTS = "\$\(KAISOLA_KEYCHAIN_BOUNDARY_ENTITLEMENTS\)";/gu) ?? []).length,
+    1,
+  )
+  assert.match(project, /KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_IDENTITY = "-";/u)
+  assert.match(project, /KAISOLA_KEYCHAIN_BOUNDARY_DEVELOPMENT_TEAM = "";/u)
+  assert.match(project, /KAISOLA_KEYCHAIN_BOUNDARY_OTHER_CODE_SIGN_FLAGS = "";/u)
 
   const contractStart = workflow.indexOf('  contract:')
   const physicalStart = workflow.indexOf('  keychain-boundaries:')

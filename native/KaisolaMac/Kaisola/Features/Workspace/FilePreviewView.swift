@@ -1,7 +1,112 @@
 import AppKit
+import ImageIO
 import PDFKit
 import SwiftUI
 import UniformTypeIdentifiers
+
+/// Facts VoiceOver can report without trying to infer what an image depicts.
+/// Format and dimensions come from the decoded source, never its extension;
+/// description text is used only when the image stores an authored value.
+struct ImagePreviewAccessibilityMetadata: Equatable {
+    let filename: String
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let format: String
+    let authoredDescription: String?
+
+    init(
+        filename: String,
+        pixelWidth: Int,
+        pixelHeight: Int,
+        format: String,
+        authoredDescription: String?
+    ) {
+        self.filename = filename
+        self.pixelWidth = pixelWidth
+        self.pixelHeight = pixelHeight
+        self.format = format
+        self.authoredDescription = authoredDescription?.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        ).nilIfEmpty
+    }
+
+    var accessibilityDescription: String {
+        let facts = "Image preview: \(filename). \(format) format, "
+            + "\(pixelWidth) by \(pixelHeight) pixels."
+        if let authoredDescription {
+            return facts + " Authored description: \(authoredDescription)"
+        }
+        return facts + " No authored description is available."
+    }
+
+    static func load(from url: URL) -> ImagePreviewAccessibilityMetadata? {
+        guard let source = CGImageSourceCreateWithURL(
+            url as CFURL,
+            [kCGImageSourceShouldCache: false] as CFDictionary
+        ),
+        CGImageSourceGetCount(source) > 0,
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [CFString: Any],
+        let pixelWidth = positiveInteger(properties[kCGImagePropertyPixelWidth]),
+        let pixelHeight = positiveInteger(properties[kCGImagePropertyPixelHeight]) else {
+            return nil
+        }
+
+        return ImagePreviewAccessibilityMetadata(
+            filename: url.lastPathComponent,
+            pixelWidth: pixelWidth,
+            pixelHeight: pixelHeight,
+            format: formatName(for: CGImageSourceGetType(source)),
+            authoredDescription: authoredDescription(in: properties)
+        )
+    }
+
+    private static func positiveInteger(_ value: Any?) -> Int? {
+        guard let number = value as? NSNumber else { return nil }
+        let integer = number.intValue
+        return integer > 0 ? integer : nil
+    }
+
+    private static func formatName(for typeIdentifier: CFString?) -> String {
+        guard let identifier = typeIdentifier as String? else { return "Unknown image" }
+        switch identifier {
+        case "public.jpeg": return "JPEG"
+        case "public.png": return "PNG"
+        case "com.compuserve.gif": return "GIF"
+        case "public.tiff": return "TIFF"
+        case "com.microsoft.bmp": return "BMP"
+        case "com.apple.icns": return "ICNS"
+        case "com.microsoft.ico": return "ICO"
+        case "public.heic": return "HEIC"
+        case "public.heif": return "HEIF"
+        case "public.avif": return "AVIF"
+        case "org.webmproject.webp": return "WebP"
+        default:
+            return UTType(identifier)?.preferredFilenameExtension?.uppercased()
+                ?? "Unknown image"
+        }
+    }
+
+    private static func authoredDescription(in properties: [CFString: Any]) -> String? {
+        let candidates: [(CFString, CFString)] = [
+            (kCGImagePropertyIPTCDictionary, kCGImagePropertyIPTCCaptionAbstract),
+            (kCGImagePropertyTIFFDictionary, kCGImagePropertyTIFFImageDescription),
+            (kCGImagePropertyPNGDictionary, kCGImagePropertyPNGDescription),
+            (kCGImagePropertyExifDictionary, kCGImagePropertyExifUserComment),
+        ]
+        for (dictionaryKey, valueKey) in candidates {
+            guard let dictionary = properties[dictionaryKey] as? [CFString: Any],
+                  let value = dictionary[valueKey] as? String else { continue }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { return trimmed }
+        }
+        return nil
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
+}
 
 /// File preview/editor pane: UTF-8 text is editable with ⌘S save + revert,
 /// markdown renders styled (with a raw-source toggle), images display, and
@@ -1086,11 +1191,21 @@ struct FilePreviewView: View {
                 )
             }
         case .image:
-            if let image = NSImage(contentsOf: loadedURL ?? url) {
+            let imageURL = loadedURL ?? url
+            if let image = NSImage(contentsOf: imageURL) {
                 ScrollView([.horizontal, .vertical]) {
                     Image(nsImage: image).resizable().aspectRatio(contentMode: .fit)
                         .frame(maxWidth: 1200 * documentZoom)
                         .padding(16)
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityAddTraits(.isImage)
+                        .accessibilityLabel(
+                            ImagePreviewAccessibilityMetadata.load(from: imageURL)?
+                                .accessibilityDescription
+                                ?? "Image preview: \(imageURL.lastPathComponent). "
+                                    + "Image format, pixel dimensions, and any authored "
+                                    + "description are unavailable."
+                        )
                 }
                 .scrollBounceBehavior(.basedOnSize)
             } else {

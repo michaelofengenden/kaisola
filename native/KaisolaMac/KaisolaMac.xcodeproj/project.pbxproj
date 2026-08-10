@@ -77,6 +77,7 @@
 		2FB7A43822C41E01166489DE /* MarkdownTaskToggleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43DE8262D5D789B8D0AF17B1 /* MarkdownTaskToggleTests.swift */; };
 		30F274FD0EBF18BBC2120734 /* AcpPermissionRulesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 757C6A4EEAF0C23D949EF4A5 /* AcpPermissionRulesTests.swift */; };
 		317314707EEA686047D7DB42 /* DetailShowDoorsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EC8170548CE831438700C2F4 /* DetailShowDoorsTests.swift */; };
+		3350165D621827432149763A /* WorkspaceRowActions.swift in Sources */ = {isa = PBXBuildFile; fileRef = FFA5B7C000F2A2A8F444DBF2 /* WorkspaceRowActions.swift */; };
 		33692846E196A13311DD86C6 /* OnboardingView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 59057824C59D8B945BB9D032 /* OnboardingView.swift */; };
 		336BCD151BF7DF4E1FBDE151 /* QuietRollup.swift in Sources */ = {isa = PBXBuildFile; fileRef = E2C62AECA29EC2AB89B8C85A /* QuietRollup.swift */; };
 		3769FF88F6731888F7913E56 /* ProjectTint.swift in Sources */ = {isa = PBXBuildFile; fileRef = DD0520C7CA820BC9B9798C98 /* ProjectTint.swift */; };
@@ -258,6 +259,7 @@
 		BCEE7C4B2655BD5F02B14ABA /* AcpModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = F979524745D6648E34835DF3 /* AcpModels.swift */; };
 		BDE65F12928C19D4C1D19381 /* MarkdownPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9286E9EFA45E3FEE67AEB1E3 /* MarkdownPreview.swift */; };
 		BDE6C88324D3D561ADA7AF38 /* VerifiedUsageHelperCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83FF23C3F0FE8B751EF9300A /* VerifiedUsageHelperCache.swift */; };
+		BE113F1761DEA343B50CA7AA /* WorkspaceRowActionsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 78BA29D294ACDC5DD0830D81 /* WorkspaceRowActionsTests.swift */; };
 		BE1D1D8E6557320BB66B5CC6 /* TerminalMetaServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3722B2ED76D7E872E1CEEC39 /* TerminalMetaServiceTests.swift */; };
 		BE1FB7DB2A327E8E064C4CC6 /* SharedWebKitTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF9C958B00B75F3BA8F9930A /* SharedWebKitTests.swift */; };
 		BE218C17B3006B752A404163 /* TerminalFileLinkResolverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 841A2499E3D548FBC6398EAB /* TerminalFileLinkResolverTests.swift */; };
@@ -516,6 +518,7 @@
 		73DA2DC376948BFD21915726 /* MeshStagedTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshStagedTests.swift; sourceTree = "<group>"; };
 		757C6A4EEAF0C23D949EF4A5 /* AcpPermissionRulesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpPermissionRulesTests.swift; sourceTree = "<group>"; };
 		760FEDCDEC2F6023C11F7EE8 /* AuthModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthModelTests.swift; sourceTree = "<group>"; };
+		78BA29D294ACDC5DD0830D81 /* WorkspaceRowActionsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRowActionsTests.swift; sourceTree = "<group>"; };
 		7A120C6D9EED83504C701F99 /* ExtensionsSettingsHub.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExtensionsSettingsHub.swift; sourceTree = "<group>"; };
 		7B38F18265244392487F7BED /* index.html */ = {isa = PBXFileReference; lastKnownFileType = text.html; path = index.html; sourceTree = "<group>"; };
 		7D5753B3730D2AFC56ED20F9 /* AppModelTerminalRetentionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelTerminalRetentionTests.swift; sourceTree = "<group>"; };
@@ -690,6 +693,7 @@
 		FDC5D762925B519587B9EF95 /* AcpChatHandle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpChatHandle.swift; sourceTree = "<group>"; };
 		FDE152F4457B8AF7E5A92225 /* McpConfigStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = McpConfigStore.swift; sourceTree = "<group>"; };
 		FF9C958B00B75F3BA8F9930A /* SharedWebKitTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedWebKitTests.swift; sourceTree = "<group>"; };
+		FFA5B7C000F2A2A8F444DBF2 /* WorkspaceRowActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRowActions.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -801,6 +805,7 @@
 				3F83577979FF0B2A400B8F40 /* SourceOutline.swift */,
 				BA44B5608FF424D5A4173716 /* SyntaxHighlighter.swift */,
 				2709FF5202ACBC7BD9696C64 /* WorkspaceRailView.swift */,
+				FFA5B7C000F2A2A8F444DBF2 /* WorkspaceRowActions.swift */,
 				7FB737D5C0A6E0BA42FFC65E /* WorkspaceWatcher.swift */,
 			);
 			path = Workspace;
@@ -1159,6 +1164,7 @@
 				3E4B0A58CFF401C1C82E8239 /* WorkspaceFilesTests.swift */,
 				9E8A890E106780D1EBC76860 /* WorkspacePersistenceVisibilityTests.swift */,
 				ADDA11F70D5A2C27923186B5 /* WorkspaceRailNameFadeTests.swift */,
+				78BA29D294ACDC5DD0830D81 /* WorkspaceRowActionsTests.swift */,
 				2709C3EF1FBBB647E9258793 /* WorkspaceWatcherTests.swift */,
 			);
 			path = KaisolaTests;
@@ -1578,6 +1584,7 @@
 				A265252D179828EAC5598D96 /* WorkspaceRailView.swift in Sources */,
 				1763DAFD85AE9A3BC6ED6D8B /* WorkspaceRestorationNotice.swift in Sources */,
 				72E7D52DBB843CBD3BCDB8D9 /* WorkspaceRestorationNoticeView.swift in Sources */,
+				3350165D621827432149763A /* WorkspaceRowActions.swift in Sources */,
 				0D74F8F2D3065EDE13BEB326 /* WorkspaceWatcher.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -1735,6 +1742,7 @@
 				C0A9194905016828644B7D86 /* WorkspaceFilesTests.swift in Sources */,
 				1B90B06DA94C489692815A00 /* WorkspacePersistenceVisibilityTests.swift in Sources */,
 				0A96ED7B9E79E83CA2C8997F /* WorkspaceRailNameFadeTests.swift in Sources */,
+				BE113F1761DEA343B50CA7AA /* WorkspaceRowActionsTests.swift in Sources */,
 				7F9A5DAA9548D99E55198D7E /* WorkspaceWatcherTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

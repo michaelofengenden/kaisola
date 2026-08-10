@@ -1213,9 +1213,12 @@ private struct AgentRunProfilesSection: View {
     @State private var profiles: [AcpRunProfile] = []
     @State private var defaultProfileID = AcpRunProfile.write.id
 
+    private var knownMCPServerNames: [String]? {
+        workspace.map { McpConfigStore(workspace: $0).servers().map(\.name) }
+    }
+
     private var mcpServerNames: [String] {
-        guard let workspace else { return [] }
-        return McpConfigStore(workspace: workspace).servers().map(\.name)
+        knownMCPServerNames ?? []
     }
 
     var body: some View {
@@ -1270,10 +1273,25 @@ private struct AgentRunProfilesSection: View {
                             }
                         }
                     }
-                    ForEach(profile.availabilityWarnings(knownMCPServerNames: mcpServerNames), id: \.self) { warning in
+                    let warnings = profile.availabilityWarnings(knownMCPServerNames: mcpServerNames)
+                    ForEach(warnings, id: \.self) { warning in
                         Label(warning, systemImage: "exclamationmark.triangle")
                             .font(.caption)
                             .foregroundStyle(.orange)
+                    }
+                    let hasUnavailableClientTool = profile.enabledClientToolIDs.contains {
+                        AcpRunProfile.ClientTool(rawValue: $0) == nil
+                    }
+                    if !warnings.isEmpty,
+                       !profile.isBuiltIn,
+                       knownMCPServerNames != nil || hasUnavailableClientTool {
+                        Button("Remove unavailable references") {
+                            removeUnavailableReferences(from: profile.id)
+                        }
+                        .font(.caption)
+                        .buttonStyle(.borderless)
+                        .help("Remove only unavailable tool and MCP references; valid selections stay enabled.")
+                        .accessibilityIdentifier("settings.run-profile.\(profile.id).repair-availability")
                     }
                 }
                 .padding(.vertical, 3)
@@ -1360,6 +1378,14 @@ private struct AgentRunProfilesSection: View {
 
     private func delete(_ id: String) {
         _ = store.delete(id)
+        refresh()
+    }
+
+    private func removeUnavailableReferences(from id: String) {
+        _ = store.removeUnavailableReferences(
+            from: id,
+            knownMCPServerNames: knownMCPServerNames
+        )
         refresh()
     }
 

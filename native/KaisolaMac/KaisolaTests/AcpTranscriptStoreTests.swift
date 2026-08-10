@@ -1367,6 +1367,8 @@ final class AcpTranscriptStoreTests: XCTestCase {
         XCTAssertEqual(tombstoneState, .present)
         let restored = await reopened.rows(for: "chat-deleted")
         XCTAssertEqual(restored, saved)
+    }
+
     // MARK: - Typed read failures
 
     func testAbsentChatReadsAsMissingAndKeepsAcceptingWrites() async throws {

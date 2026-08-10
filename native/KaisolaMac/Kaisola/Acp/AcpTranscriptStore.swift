@@ -425,6 +425,7 @@ actor AcpTranscriptStore {
         var message: String {
             switch self {
             case let .database(detail): return detail
+            case let .corruptRecord(detail): return detail
             case .corruptLegacyArchive: return "the saved transcript archive could not be read"
             case let .legacyArchiveTooLarge(maxBytes):
                 return "the saved transcript archive is larger than \(maxBytes) bytes"

@@ -211,6 +211,34 @@ final class AcpRunProfileStore {
         return true
     }
 
+    /// Apply the warning's explicit repair action without broadening the
+    /// profile: valid selections remain enabled, while identifiers the current
+    /// client or workspace cannot provide are removed from this custom profile.
+    @discardableResult
+    func removeUnavailableReferences(
+        from id: String,
+        knownMCPServerNames: [String]?
+    ) -> Bool {
+        guard !AcpRunProfile.builtIns.contains(where: { $0.id == id }) else { return false }
+        var profiles = custom()
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return false }
+
+        let knownToolIDs = Set(AcpRunProfile.ClientTool.allCases.map(\.rawValue))
+        var repaired = profiles[index]
+        repaired.enabledClientToolIDs.removeAll { !knownToolIDs.contains($0) }
+        if let knownMCPServerNames {
+            let knownServerNames = Set(knownMCPServerNames)
+            repaired.enabledMCPServerNames.removeAll {
+                $0 != AcpRunProfile.allMCPServersID && !knownServerNames.contains($0)
+            }
+        }
+        guard repaired != profiles[index] else { return false }
+
+        profiles[index] = repaired
+        save(profiles)
+        return true
+    }
+
     @discardableResult
     func delete(_ id: String) -> Bool {
         guard !AcpRunProfile.builtIns.contains(where: { $0.id == id }) else { return false }

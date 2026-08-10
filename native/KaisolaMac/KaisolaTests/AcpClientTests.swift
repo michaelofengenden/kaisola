@@ -40,6 +40,58 @@ final class AcpClientTests: XCTestCase {
         )
     }
 
+    func testRunProfileStoreRemovesOnlyUnavailableReferencesWhenUserRepairsWarning() throws {
+        let suite = "AcpRunProfileStoreRepairTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defaults.removePersistentDomain(forName: suite)
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let store = AcpRunProfileStore(defaults: defaults, key: "profiles")
+
+        let created = store.create(
+            name: "Review",
+            enabledClientToolIDs: [AcpRunProfile.ClientTool.readTextFile.rawValue, "removed.tool"],
+            enabledMCPServerNames: ["docs", "removed-server"]
+        )
+
+        XCTAssertTrue(
+            store.removeUnavailableReferences(
+                from: created.id,
+                knownMCPServerNames: ["docs"]
+            )
+        )
+        let repaired = try XCTUnwrap(store.profile(id: created.id))
+        XCTAssertEqual(repaired.enabledClientToolIDs, [AcpRunProfile.ClientTool.readTextFile.rawValue])
+        XCTAssertEqual(repaired.enabledMCPServerNames, ["docs"])
+        XCTAssertEqual(repaired.availabilityWarnings(knownMCPServerNames: ["docs"]), [])
+        XCTAssertFalse(
+            store.removeUnavailableReferences(
+                from: created.id,
+                knownMCPServerNames: ["docs"]
+            )
+        )
+        XCTAssertFalse(
+            store.removeUnavailableReferences(
+                from: AcpRunProfile.write.id,
+                knownMCPServerNames: []
+            )
+        )
+
+        let noWorkspace = store.create(
+            name: "No workspace",
+            enabledClientToolIDs: ["removed.tool"],
+            enabledMCPServerNames: ["project-specific-server"]
+        )
+        XCTAssertTrue(
+            store.removeUnavailableReferences(
+                from: noWorkspace.id,
+                knownMCPServerNames: nil
+            )
+        )
+        let contextSafeRepair = try XCTUnwrap(store.profile(id: noWorkspace.id))
+        XCTAssertEqual(contextSafeRepair.enabledClientToolIDs, [])
+        XCTAssertEqual(contextSafeRepair.enabledMCPServerNames, ["project-specific-server"])
+    }
+
     func testRunProfileRestrictsAdvertisedAndEnforcedToolsAndMCPServers() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "kaisola-acp-profile-\(UUID().uuidString)", directoryHint: .isDirectory)

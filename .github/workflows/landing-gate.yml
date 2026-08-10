@@ -1,0 +1,41 @@
+name: landing gate
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  merge_group:
+
+concurrency:
+  group: kaisola-landing-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  landing:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Reject whitespace errors in the integrated tree
+        run: git diff --check HEAD^1 HEAD
+      - name: Install exact Node dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+        env:
+          KAISOLA_SKIP_NATIVE_REBUILD: '1'
+      - name: Run deterministic landing contracts
+        run: >-
+          node --test
+          tests/node/workflowSecurity.test.cjs
+          tests/node/nativeTestSelect.test.cjs
+          tests/node/brokerCompatibility.test.cjs
+          tests/node/companionProtocolTables.test.cjs

@@ -9,8 +9,8 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: kaisola-native-candidate-${{ github.sha }}
-  cancel-in-progress: false
+  group: kaisola-native-candidate-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

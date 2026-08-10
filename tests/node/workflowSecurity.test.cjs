@@ -62,6 +62,7 @@ function checkoutSteps(lines) {
 test('security-sensitive jobs do not persist checkout credentials', () => {
   const jobs = [
     ['swift-contracts.yml', 'verify'],
+    ['landing-gate.yml', 'landing'],
     ['release-candidate.yml', 'candidate'],
     ['release.yml', 'promote'],
   ]
@@ -83,4 +84,35 @@ test('the Swift contract workflow grants only read access to repository contents
   const permissions = /^permissions:\n((?:  [^\n]+\n)+)/m.exec(source)
   assert.ok(permissions, 'swift-contracts.yml must declare workflow permissions')
   assert.equal(permissions[1], '  contents: read\n')
+})
+
+test('superseded contract and candidate runs are cancelled by ref', () => {
+  const contracts = workflowSource('swift-contracts.yml')
+  const candidate = workflowSource('release-candidate.yml')
+
+  assert.match(
+    contracts,
+    /group: >-\n\s+swift-contracts-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/,
+  )
+  assert.match(contracts, /cancel-in-progress: true/)
+  assert.doesNotMatch(contracts, /concurrency:[\s\S]*?github\.sha/)
+
+  assert.match(candidate, /group: kaisola-native-candidate-\$\{\{ github\.ref \}\}/)
+  assert.match(candidate, /cancel-in-progress: true/)
+  assert.doesNotMatch(candidate, /concurrency:[\s\S]*?github\.sha/)
+})
+
+test('the landing gate covers every pull request and main integration', () => {
+  const source = workflowSource('landing-gate.yml')
+  const triggers = /^on:\n([\s\S]*?)\npermissions:/m.exec(source)
+  assert.ok(triggers, 'landing-gate.yml must declare triggers before permissions')
+  assert.match(triggers[1], /  pull_request:/)
+  assert.match(triggers[1], /  push:\n    branches: \[main\]/)
+  assert.match(triggers[1], /  merge_group:/)
+  assert.doesNotMatch(triggers[1], /paths:/)
+
+  assert.match(source, /group: kaisola-landing-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/)
+  assert.match(source, /cancel-in-progress: true/)
+  assert.match(source, /git diff --check HEAD\^1 HEAD/)
+  assert.match(source, /tests\/node\/workflowSecurity\.test\.cjs/)
 })

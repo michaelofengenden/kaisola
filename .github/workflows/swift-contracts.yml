@@ -43,6 +43,11 @@ on:
       - 'package.json'
       - 'package-lock.json'
 
+concurrency:
+  group: >-
+    swift-contracts-${{ github.event.pull_request.number || github.ref }}-${{ inputs.skip-ios }}-${{ inputs.skip-macos-release-build }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 

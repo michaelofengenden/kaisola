@@ -142,6 +142,60 @@ final class AcpStderrTail: @unchecked Sendable {
     }
 }
 
+/// Serializes every read from one adapter stderr pipe and provides a close
+/// barrier before its tail is inspected. `FileHandle` does not join an
+/// already-dispatched readability callback when its handler is cleared: that
+/// callback can consume bytes from the descriptor and append them after the
+/// actor has mistaken the tail for empty. Keeping both callback reads and the
+/// final drain on this queue makes consumed bytes visible before `finish()`
+/// returns; callbacks delivered after the barrier are harmless no-ops.
+final class AcpStderrDrain: @unchecked Sendable {
+    typealias ReadOperation = @Sendable () -> Data?
+
+    private let queue = DispatchQueue(label: "app.kaisola.acp.stderr-drain")
+    private let tail: AcpStderrTail
+    private let readOperation: ReadOperation
+    private var isFinished = false
+
+    convenience init(descriptor: Int32, tail: AcpStderrTail) {
+        self.init(tail: tail) {
+            var bytes = [UInt8](repeating: 0, count: 16 * 1_024)
+            while true {
+                let count = Darwin.read(descriptor, &bytes, bytes.count)
+                if count > 0 { return Data(bytes.prefix(count)) }
+                if count < 0, errno == EINTR { continue }
+                return nil
+            }
+        }
+    }
+
+    init(tail: AcpStderrTail, readOperation: @escaping ReadOperation) {
+        self.tail = tail
+        self.readOperation = readOperation
+    }
+
+    func consumeReadable() {
+        queue.sync { [self] in
+            drainAvailableBytes()
+        }
+    }
+
+    func finish() {
+        queue.sync { [self] in
+            guard !isFinished else { return }
+            drainAvailableBytes()
+            isFinished = true
+        }
+    }
+
+    private func drainAvailableBytes() {
+        guard !isFinished else { return }
+        while let data = readOperation(), !data.isEmpty {
+            tail.append(data)
+        }
+    }
+}
+
 /// A single ordered writer for the adapter's stdin. Calls to `send` enqueue
 /// complete JSON-RPC frames, but the potentially backpressured descriptor work
 /// happens in a separate task so it can never monopolize `AcpProcessTransport`.
@@ -419,6 +473,7 @@ actor AcpProcessTransport: AcpByteTransport {
     private var terminatingGeneration: UInt64?
     private var stdinWriter: AcpStdinWriteQueue?
     private var stderrTail: AcpStderrTail?
+    private var stderrDrain: AcpStderrDrain?
 
     private let stdinFrameDeadlineNanoseconds: UInt64
     private let maximumQueuedStdinFrames: Int
@@ -484,13 +539,14 @@ actor AcpProcessTransport: AcpByteTransport {
             byteLimit: stderrByteLimit,
             sensitiveValues: Self.sensitiveEnvironmentValues(environment)
         )
+        let drain = AcpStderrDrain(descriptor: spawned.stderrDescriptor, tail: tail)
         stderrHandle = stderr
         stderrTail = tail
+        stderrDrain = drain
         // Drain stderr so a chatty adapter never blocks on a full pipe. Its
         // contents are diagnostics only; the protocol is stdout.
-        stderr.readabilityHandler = { handle in
-            let data = handle.availableData
-            if !data.isEmpty { tail.append(data) }
+        stderr.readabilityHandler = { _ in
+            drain.consumeReadable()
         }
         waitTask = nil
     }
@@ -627,28 +683,14 @@ actor AcpProcessTransport: AcpByteTransport {
     private func closeHandles() {
         try? stdinHandle?.close()
         try? stdoutHandle?.close()
-        drainRemainingStderr()
+        stderrHandle?.readabilityHandler = nil
+        stderrDrain?.finish()
         try? stderrHandle?.close()
         stdinHandle = nil
         stdinWriter = nil
         stdoutHandle = nil
         stderrHandle = nil
-    }
-
-    private func drainRemainingStderr() {
-        guard let handle = stderrHandle else { return }
-        handle.readabilityHandler = nil
-        let descriptor = handle.fileDescriptor
-        var bytes = [UInt8](repeating: 0, count: 16 * 1_024)
-        while true {
-            let count = Darwin.read(descriptor, &bytes, bytes.count)
-            if count > 0 {
-                stderrTail?.append(Data(bytes.prefix(count)))
-                continue
-            }
-            if count < 0, errno == EINTR { continue }
-            return
-        }
+        stderrDrain = nil
     }
 
     private func signalOwnedGroup(_ signal: Int32, pid: pid_t, group: pid_t, generation: UInt64) -> Bool {

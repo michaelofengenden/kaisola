@@ -414,7 +414,16 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     cwd: startCwd,
     env: terminalEnv(env),
   })
-  const terminalSpool = new TerminalSpool(spoolOptions)
+  // The spool refuses a storage root it cannot prove is private, and that
+  // check lands after the pty already exists. Kill the shell rather than leave
+  // an unreferenced process behind on every rejected create.
+  let terminalSpool
+  try {
+    terminalSpool = new TerminalSpool(spoolOptions)
+  } catch (error) {
+    try { p.kill() } catch { /* already gone */ }
+    throw error
+  }
   const epochStartOffset = restoring ? terminalSpool.retainedByteCount() : 0
   terminalSpool.startEpoch(epochStartOffset)
   const streamEpoch = crypto.randomUUID()

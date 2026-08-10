@@ -94,6 +94,10 @@ test('superseded contract and candidate runs are cancelled by ref', () => {
     contracts,
     /group: >-\n\s+swift-contracts-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/,
   )
+  assert.match(
+    contracts,
+    /-\$\{\{ inputs\.skip-ios \}\}-\$\{\{ inputs\.skip-macos-release-build \}\}/,
+  )
   assert.match(contracts, /cancel-in-progress: true/)
   assert.doesNotMatch(contracts, /concurrency:[\s\S]*?github\.sha/)
 
@@ -113,6 +117,11 @@ test('the landing gate covers every pull request and main integration', () => {
 
   assert.match(source, /group: kaisola-landing-\$\{\{ github\.event\.pull_request\.number \|\| github\.ref \}\}/)
   assert.match(source, /cancel-in-progress: true/)
-  assert.match(source, /git diff --check HEAD\^1 HEAD/)
+  assert.match(
+    source,
+    /LANDING_BASE: \$\{\{ github\.event\.pull_request\.base\.sha \|\| github\.event\.merge_group\.base_sha \|\| github\.event\.before \}\}/,
+  )
+  assert.match(source, /git diff --check "\$LANDING_BASE"\.\.\.HEAD/)
+  assert.doesNotMatch(source, /HEAD\^1/)
   assert.match(source, /tests\/node\/workflowSecurity\.test\.cjs/)
 })

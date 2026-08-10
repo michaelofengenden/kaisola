@@ -19,8 +19,16 @@ import SwiftUI
 final class GitPanelModel: ObservableObject {
     @Published private(set) var status: GitService.Status?
     @Published private(set) var errorMessage: String?
+    /// True when the last failure was a command Kaisola *stopped* on its
+    /// deadline rather than one that failed. Git never reported anything about
+    /// the repository, so the banner offers Retry instead of only explaining.
+    @Published private(set) var errorIsRetryable = false
     @Published var commitMessage = ""
     @Published private(set) var isBusy = false
+
+    /// Re-runs exactly the operation the timeout interrupted. Nil unless the
+    /// last failure was retryable.
+    private var retryOperation: (() -> Void)?
 
     /// One-click PR state: the current branch's push/PR readiness, plus the
     /// result of the last Create-PR run (a PR or compare URL, and a status note).
@@ -406,6 +414,8 @@ final class GitPanelModel: ObservableObject {
             )
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            errorIsRetryable = false
+            retryOperation = nil
             return
         }
         prState = nil
@@ -484,6 +494,8 @@ final class GitPanelModel: ObservableObject {
         guard !isBusy else { return }
         isBusy = true
         errorMessage = nil
+        errorIsRetryable = false
+        retryOperation = nil
         // Every operation re-reads status, so any of them satisfies the refresh
         // policy's rate floor — a stage and an event-driven refresh must not run
         // git twice in the same window.
@@ -497,9 +509,29 @@ final class GitPanelModel: ObservableObject {
             } catch {
                 onError?(error)
                 errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                errorIsRetryable = Self.isRetryable(error)
+                // Hold the same closures, so Retry re-runs this operation
+                // rather than falling back to a generic refresh.
+                retryOperation = errorIsRetryable
+                    ? { [weak self] in self?.perform(work, apply: apply, onError: onError) }
+                    : nil
                 isBusy = false
             }
         }
+    }
+
+    /// Whether a failed operation is worth offering again. Pulled out as a pure
+    /// decision so the banner's Retry affordance is directly unit-testable.
+    nonisolated static func isRetryable(_ error: any Error) -> Bool {
+        (error as? GitService.GitError)?.isRetryable ?? false
+    }
+
+    /// Run the stopped operation again, from the banner's Retry button.
+    func retryLastOperation() {
+        guard !isBusy, let retry = retryOperation else { return }
+        retryOperation = nil
+        errorIsRetryable = false
+        retry()
     }
 
     private func closeDiff(_ path: String) {
@@ -553,12 +585,30 @@ struct GitPanelView: View {
             // (a transient op failure would otherwise blank the whole panel
             // until a manual refresh).
             if let error = model.errorMessage {
-                Label(error, systemImage: "exclamationmark.triangle")
+                // A stopped command reads differently from a failed one: amber
+                // rather than red, a clock rather than a warning triangle, and a
+                // Retry button, because nothing is actually known to be wrong.
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Label(
+                        error,
+                        systemImage: model.errorIsRetryable ? "clock.badge.exclamationmark" : "exclamationmark.triangle"
+                    )
                     .font(.caption)
-                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
-                    .padding(.horizontal, 12).padding(.vertical, 8)
+                    .foregroundStyle(
+                        (model.errorIsRetryable ? KaisolaStatusTone.needsYou : .failed).foregroundColor
+                    )
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(.red.opacity(0.08))
+                    if model.errorIsRetryable {
+                        Button("Retry", action: model.retryLastOperation)
+                            .buttonStyle(.borderless)
+                            .font(.caption)
+                            .disabled(model.isBusy)
+                            .accessibilityIdentifier("git.retry")
+                    }
+                }
+                .padding(.horizontal, 12).padding(.vertical, 8)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(model.errorIsRetryable ? Color.orange.opacity(0.10) : Color.red.opacity(0.08))
                 Divider()
             }
             if let status = model.status {
@@ -604,8 +654,8 @@ struct GitPanelView: View {
         HStack(spacing: 8) {
             Image(systemName: "arrow.triangle.branch")
             Text(model.status?.branch ?? "—").font(.subheadline.weight(.medium))
-            if let s = model.status, s.ahead > 0 { Text("↑\(s.ahead)").font(.caption).foregroundStyle(.secondary) }
-            if let s = model.status, s.behind > 0 { Text("↓\(s.behind)").font(.caption).foregroundStyle(.secondary) }
+            if let s = model.status, s.ahead > 0 { Text("↑\(s.ahead)").font(.caption).foregroundStyle(.kaisolaSecondary) }
+            if let s = model.status, s.behind > 0 { Text("↓\(s.behind)").font(.caption).foregroundStyle(.kaisolaSecondary) }
             Spacer()
             Button(action: model.pull) {
                 Label("Pull", systemImage: "arrow.down.circle")
@@ -637,9 +687,18 @@ struct GitPanelView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 4) {
                     bulkActions(status)
-                    fileSection("Staged", status.staged.map { ($0.path, $0.code) }, action: "Unstage", staged: true) { model.unstage($0) }
-                    fileSection("Changes", status.unstaged.map { ($0.path, $0.code) }, action: "Stage", staged: false, restorable: true) { model.stage($0) }
-                    fileSection("Untracked", status.untracked.map { ($0, "?") }, action: "Stage", staged: false) { model.stage($0) }
+                    fileSection(
+                        "Staged", status.staged.map { ($0.path, $0.code) }, stats: status.stagedStats,
+                        action: "Unstage", staged: true
+                    ) { model.unstage($0) }
+                    fileSection(
+                        "Changes", status.unstaged.map { ($0.path, $0.code) }, stats: status.unstagedStats,
+                        action: "Stage", staged: false, restorable: true
+                    ) { model.stage($0) }
+                    fileSection(
+                        "Untracked", status.untracked.map { ($0, "?") }, stats: nil,
+                        action: "Stage", staged: false
+                    ) { model.stage($0) }
                     logSection
                     prSection
                 }
@@ -679,6 +738,11 @@ struct GitPanelView: View {
                 .accessibilityIdentifier("git.stageAll")
             }
             Spacer()
+            if let summary = GitStatsRendering.summary(status.combinedStats) {
+                Text("Total \(summary)")
+                    .foregroundStyle(.kaisolaSecondary)
+                    .accessibilityIdentifier("git.stats.combined")
+            }
         }
         .font(.caption)
         .buttonStyle(.borderless)
@@ -692,7 +756,7 @@ struct GitPanelView: View {
             HStack {
                 Text("History")
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Spacer()
                 Button(model.log.isEmpty ? "Show" : "Refresh") { model.loadLog() }
                     .buttonStyle(.borderless).font(.caption)
@@ -700,7 +764,7 @@ struct GitPanelView: View {
             .padding(.top, 8)
             ForEach(model.log) { commit in
                 HStack(spacing: 8) {
-                    Text(commit.shortHash).font(.caption.monospaced()).foregroundStyle(.secondary)
+                    Text(commit.shortHash).font(.caption.monospaced()).foregroundStyle(.kaisolaSecondary)
                     Text(commit.subject).font(.caption).lineLimit(1)
                     Spacer()
                 }
@@ -719,7 +783,7 @@ struct GitPanelView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Pull Request")
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.top, 10)
 
@@ -738,11 +802,11 @@ struct GitPanelView: View {
                 }
             }
             if let note = model.prState {
-                Text(note).font(.caption2).foregroundStyle(.secondary)
+                Text(note).font(.caption2).foregroundStyle(.kaisolaSecondary)
             }
             if !model.ghAvailable {
                 Text("GitHub CLI (gh) not found — the confirm step opens a browser compare page instead.")
-                    .font(.caption2).foregroundStyle(.tertiary)
+                    .font(.caption2).foregroundStyle(.kaisolaTertiary)
             }
         }
         .padding(.horizontal, model.status?.isClean == true ? 12 : 0)
@@ -754,22 +818,22 @@ struct GitPanelView: View {
     private var prepareStage: some View {
         if let prep = model.prPrepInfo {
             HStack(spacing: 6) {
-                Image(systemName: "arrow.triangle.branch").font(.caption2).foregroundStyle(.secondary)
+                Image(systemName: "arrow.triangle.branch").font(.caption2).foregroundStyle(.kaisolaSecondary)
                 Text(prep.branch).font(.caption.monospaced())
                 if prep.aheadCount > 0 {
                     Text("· \(prep.aheadCount) PR \(prep.aheadCount == 1 ? "commit" : "commits")")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 } else {
                     Text("· no pull request commits")
                         .font(.caption)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.kaisolaTertiary)
                 }
                 Spacer()
             }
             if prep.isDefaultBranch, prep.aheadCount > 0 {
                 Text("On \(prep.branch) — the review proposes a new branch for the pull request.")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.caption2).foregroundStyle(.kaisolaSecondary)
             }
         }
 
@@ -796,9 +860,9 @@ struct GitPanelView: View {
             }
 
             HStack(spacing: 6) {
-                Image(systemName: "arrow.triangle.pull").font(.caption2).foregroundStyle(.secondary)
+                Image(systemName: "arrow.triangle.pull").font(.caption2).foregroundStyle(.kaisolaSecondary)
                 Text(plan.baseBranch).font(.caption.monospaced())
-                Image(systemName: "arrow.left").font(.caption2).foregroundStyle(.tertiary)
+                Image(systemName: "arrow.left").font(.caption2).foregroundStyle(.kaisolaTertiary)
                 Text(plan.headBranch).font(.caption.monospaced())
                 if plan.createsBranch {
                     Text("new branch")
@@ -812,12 +876,12 @@ struct GitPanelView: View {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("Remote")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Text(plan.destination.remoteName)
                     .font(.caption2.monospaced())
                 Text("·")
                     .font(.caption2)
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                 Text(plan.destination.remoteDisplayURL)
                     .font(.caption2.monospaced())
                     .lineLimit(1)
@@ -833,7 +897,7 @@ struct GitPanelView: View {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
                 Text("Destination")
                     .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 Text("\(plan.destination.webURL ?? plan.destination.remoteDisplayURL) · \(plan.baseBranch)")
                     .font(.caption2.monospaced())
                     .lineLimit(1)
@@ -856,14 +920,14 @@ struct GitPanelView: View {
             Text("\(plan.commitCount) \(plan.commitCount == 1 ? "commit" : "commits") · "
                  + "\(plan.changedFileCount) \(plan.changedFileCount == 1 ? "file" : "files") changed")
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
 
             ForEach(Array(plan.commitSubjects.prefix(6).enumerated()), id: \.offset) { _, subject in
-                Text("• \(subject)").font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                Text("• \(subject)").font(.caption2).foregroundStyle(.kaisolaSecondary).lineLimit(1)
             }
             if plan.commitSubjects.count > 6 {
                 Text("+ \(plan.commitSubjects.count - 6) more")
-                    .font(.caption2).foregroundStyle(.tertiary)
+                    .font(.caption2).foregroundStyle(.kaisolaTertiary)
             }
 
             if !plan.changedFiles.isEmpty {
@@ -915,7 +979,7 @@ struct GitPanelView: View {
                         + "\(plan.destination.remoteName) and open the pull request against \(plan.baseBranch)."
                 )
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
 
             HStack(spacing: 8) {
@@ -964,16 +1028,25 @@ struct GitPanelView: View {
     private func fileSection(
         _ title: String,
         _ files: [(String, String)],
+        stats: GitService.ChangeStats?,
         action: String,
         staged: Bool,
         restorable: Bool = false,
         perform: @escaping (String) -> Void
     ) -> some View {
         if !files.isEmpty {
-            Text("\(title) (\(files.count))")
-                .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.top, 4)
+            HStack(spacing: 6) {
+                Text("\(title) (\(files.count))")
+                    .fontWeight(.semibold)
+                if let stats, let summary = GitStatsRendering.summary(stats) {
+                    Text(summary)
+                        .foregroundStyle(.kaisolaTertiary)
+                        .accessibilityIdentifier("git.stats.\(staged ? "staged" : "unstaged")")
+                }
+            }
+            .font(.caption)
+            .foregroundStyle(.kaisolaSecondary)
+            .padding(.top, 4)
             ForEach(files, id: \.0) { path, code in
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 8) {
@@ -984,7 +1057,7 @@ struct GitPanelView: View {
                             HStack(spacing: 4) {
                                 Text((path as NSString).lastPathComponent).lineLimit(1)
                                 Text((path as NSString).deletingLastPathComponent)
-                                    .font(.caption2).foregroundStyle(.tertiary).lineLimit(1)
+                                    .font(.caption2).foregroundStyle(.kaisolaTertiary).lineLimit(1)
                             }
                             .contentShape(Rectangle())
                         }
@@ -1025,6 +1098,21 @@ struct GitPanelView: View {
         case "?": .secondary
         default: .primary
         }
+    }
+}
+
+enum GitStatsRendering {
+    /// Text and binary truth occupy separate parts of the summary. In
+    /// particular an all-binary diff renders only "1 binary", never +0/-0.
+    static func summary(_ stats: GitService.ChangeStats) -> String? {
+        var parts: [String] = []
+        if stats.textFiles > 0 {
+            parts.append("+\(stats.additions) −\(stats.deletions)")
+        }
+        if stats.binaryFiles > 0 {
+            parts.append("\(stats.binaryFiles) binary")
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: " · ")
     }
 }
 
@@ -1076,7 +1164,7 @@ private struct PatchText: View {
             if rendered.isTruncated {
                 Label("Large diff truncated in this view", systemImage: "ellipsis.rectangle")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.horizontal, 8)
                     .padding(.bottom, 5)
             }

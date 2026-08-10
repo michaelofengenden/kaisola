@@ -315,6 +315,15 @@ final class AppModel: ObservableObject {
     static let terminalInputDiscardAggregateNotice =
         "Unsent input was discarded after terminal control changed. Try again after input reconnects."
     private var terminalInputFailureNoticeAt: [String: Date] = [:]
+    /// Terminals whose open agent turn the broker acknowledged. Local activity
+    /// state only advances on a positive `terminal.agentTurn` reply, so the app
+    /// never claims a turn the broker did not record.
+    private var acknowledgedAgentTurnTerminalIDs: Set<String> = []
+    /// Terminals whose last agent-turn signal the broker refused (or never
+    /// answered). The broker counts these idle while a turn is really running,
+    /// so a rolling cutover could retire their generation underneath the agent.
+    @Published private(set) var agentTurnSignalFailureTerminalIDs: Set<String> = []
+    private var agentTurnSignalFailureNoticeAt: [String: Date] = [:]
     /// A request-level terminal.write failure has an ambiguous outcome: the
     /// PTY may have received the bytes before its reply timed out. Keep durable
     /// ownership intact, but fail closed for input on only that terminal until
@@ -423,6 +432,12 @@ final class AppModel: ObservableObject {
         persistedSessionAliases = navigation.sessionAliases
         persistedPinnedIDs = SessionPinStore().pins()
         sessionAdoptions = adoptionStore.adoptions()
+    }
+
+    /// Installed visual receipts assert this concrete no-launch route rather
+    /// than trusting the fixture environment flag that selected it.
+    var usesBrokerFreeFixturePreparer: Bool {
+        brokerPreparer is BrokerFreeFixturePreparer
     }
 
     /// Keeps each chat's usage observers alive only while that chat exists.
@@ -3155,6 +3170,7 @@ final class AppModel: ObservableObject {
             title: title,
             command: adapter.command,
             arguments: adapter.arguments,
+            containment: adapter.containment,
             environment: environment,
             cwd: directory.path,
             mcpServers: McpConfigStore.jsonValues(mcp),
@@ -4129,6 +4145,7 @@ final class AppModel: ObservableObject {
         if visualSurface != "terminal-transcript",
            visualSurface != "terminal-semantic",
            visualSurface != "terminal-scroll-output",
+           visualSurface != "terminal-continuous-scroll",
            let requestedResourceBytes,
            requestedResourceBytes > 0 {
             let targetBytes = min(requestedResourceBytes, TerminalDocument.maximumRetainedBytes)
@@ -4162,6 +4179,8 @@ final class AppModel: ObservableObject {
                 + "michael@kaisola Kaisola % " + mark("B")
         } else if visualSurface == "terminal-scroll-output" {
             output = VisualTerminalStreamingFixture.initialOutput
+        } else if visualSurface == "terminal-continuous-scroll" {
+            output = VisualTerminalContinuousScrollFixture.initialOutput
         } else if resourceScrollback != nil {
             output = ""
         } else {
@@ -4259,7 +4278,8 @@ final class AppModel: ObservableObject {
     func enqueueVisualTerminalStreamingPacket(_ index: Int) -> Bool {
         let environment = ProcessInfo.processInfo.environment
         guard environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
-              environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "terminal-scroll-output",
+              let visualSurface = environment["KAISOLA_NATIVE_VISUAL_SURFACE"],
+              ["terminal-scroll-output", "terminal-continuous-scroll"].contains(visualSurface),
               VisualTerminalStreamingFixture.packetIndices.contains(index),
               let terminal = sessions.first,
               terminal.id == terminalDocument.sessionID,
@@ -4280,9 +4300,12 @@ final class AppModel: ObservableObject {
     /// Finish a hosted burst synchronously before its evidence gate reads the
     /// document cursor. Ordinary live output still drains on the frame timer.
     func finishVisualTerminalStreamingBurst() {
-        guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
-              ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"]
-                == "terminal-scroll-output" else { return }
+        let environment = ProcessInfo.processInfo.environment
+        guard environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+              let visualSurface = environment["KAISOLA_NATIVE_VISUAL_SURFACE"],
+              ["terminal-scroll-output", "terminal-continuous-scroll"].contains(visualSurface) else {
+            return
+        }
         flushPendingTerminalOutputs()
     }
 
@@ -4301,9 +4324,14 @@ final class AppModel: ObservableObject {
         )
     }
 
-    func loadVisualMeshFixture(workspace: URL) {
+    /// `agentCount` drives the 2/3/4-column visual fixtures; the deck the Mesh
+    /// picks for that many columns is a function of the window width the
+    /// fixture declares.
+    func loadVisualMeshFixture(workspace: URL, agentCount: Int = 3) {
         let mesh = MeshSession(baseDirectory: workspace.standardizedFileURL)
-        mesh.loadVisualFixture()
+        mesh.loadVisualFixture(
+            agents: Array(AgentRegistry.builtIns.prefix(max(1, agentCount)))
+        )
         surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
@@ -5390,10 +5418,13 @@ final class AppModel: ObservableObject {
                       isOwned(terminalID) else { return }
                 trackTerminalDraftInput(packet.data, terminalID: terminalID)
                 if packet.opensAgentTurn {
-                    try? await controlClient.setAgentTurn(
+                    // Deliberately not part of the write's error path: a
+                    // refused turn signal is an activity-tracking failure, not
+                    // a broken connection, so it must not drop queued bytes.
+                    await signalAgentTurn(
+                        busy: true,
                         projectID: packet.projectID,
-                        terminalID: terminalID,
-                        busy: true
+                        terminalID: terminalID
                     )
                 }
             } catch {
@@ -5430,6 +5461,78 @@ final class AppModel: ObservableObject {
            terminalInputQueues[terminalID]?.isEmpty == true {
             terminalInputQueues.removeValue(forKey: terminalID)
         }
+    }
+
+    /// Tells the broker a turn opened or closed and only then moves local
+    /// activity state. The broker replies `{ok:false}` for a record it no
+    /// longer holds; treating that as success is what let the app protect a
+    /// turn the broker had already written off as idle.
+    private func signalAgentTurn(
+        busy: Bool,
+        projectID: String,
+        terminalID: String
+    ) async {
+        do {
+            try await controlClient.setAgentTurn(
+                projectID: projectID,
+                terminalID: terminalID,
+                busy: busy
+            )
+            if busy {
+                acknowledgedAgentTurnTerminalIDs.insert(terminalID)
+            } else {
+                acknowledgedAgentTurnTerminalIDs.remove(terminalID)
+            }
+            if agentTurnSignalFailureTerminalIDs.remove(terminalID) != nil {
+                agentTurnSignalFailureNoticeAt.removeValue(forKey: terminalID)
+            }
+        } catch {
+            acknowledgedAgentTurnTerminalIDs.remove(terminalID)
+            agentTurnSignalFailureTerminalIDs.insert(terminalID)
+            reportAgentTurnSignalFailure(terminalID)
+        }
+    }
+
+    /// Terminals whose open agent turn the broker confirmed and has not yet
+    /// reported finished. Only positive acknowledgements land here.
+    var openAgentTurnTerminalIDs: Set<String> {
+        guard !acknowledgedAgentTurnTerminalIDs.isEmpty else { return [] }
+        let live = Set(sessions.lazy.filter { !$0.exited }.map(\.id))
+        return acknowledgedAgentTurnTerminalIDs.intersection(live)
+    }
+
+    /// Terminals the app believes are mid-turn while the broker does not.
+    /// Rows that already left the live inventory clear themselves: a terminal
+    /// the broker no longer holds cannot be cut over underneath anything.
+    var unprotectedAgentTurnTerminalIDs: Set<String> {
+        guard !agentTurnSignalFailureTerminalIDs.isEmpty else { return [] }
+        let live = Set(sessions.lazy.filter { !$0.exited }.map(\.id))
+        return agentTurnSignalFailureTerminalIDs.intersection(live)
+    }
+
+    /// The native half of the terminal-continuity update gate. While a live
+    /// terminal's activity is unsignalled the broker would read it as idle and
+    /// accept a rolling cutover, so the app stops asking for one.
+    var brokerUpdateGateBlockedDetail: String? {
+        let blocked = unprotectedAgentTurnTerminalIDs
+        guard !blocked.isEmpty else { return nil }
+        let subject = blocked.count == 1
+            ? "1 terminal's agent activity"
+            : "\(blocked.count) terminals' agent activity"
+        return "Terminal-continuity updates are paused: \(subject) could not be reported to the "
+            + "background service, which would read those sessions as idle."
+    }
+
+    private func reportAgentTurnSignalFailure(_ terminalID: String) {
+        let now = Date()
+        if let last = agentTurnSignalFailureNoticeAt[terminalID],
+           now.timeIntervalSince(last) < 2 { return }
+        agentTurnSignalFailureNoticeAt[terminalID] = now
+        ToastCenter.shared.show(
+            "Agent activity could not be reported; terminal-continuity updates are paused",
+            style: .error,
+            duration: 6
+        )
     }
 
     /// Cancel and forget bytes accepted under the terminal's previous owner
@@ -5685,10 +5788,10 @@ final class AppModel: ObservableObject {
                 || detectedAgentNamesByTerminalID[current.id] != nil
         ) && data.contains("\r")
         if opensAgentTurn {
-            try? await controlClient.setAgentTurn(
+            await signalAgentTurn(
+                busy: true,
                 projectID: current.projectID,
-                terminalID: current.id,
-                busy: true
+                terminalID: current.id
             )
         }
     }
@@ -5987,23 +6090,59 @@ final class AppModel: ObservableObject {
                 await controlClient.detachGenerations(emptyDrains)
                 brokerRollbackCandidates.removeAll { emptyDrains.contains($0.id) }
             }
+            var retirementDiagnostics: [BrokerRetirementDiagnostic] = []
             if let activeBrokerUpgradeMonitor {
-                let next = await activeBrokerUpgradeMonitor.attemptUpgradeIfNeeded()
-                if next != brokerUpgradeState { brokerUpgradeState = next }
-                if case let .current(contentDigest) = next,
-                   activeBrokerTopology?.current.id != contentDigest {
-                    // The coordinator atomically changed the registry. Reopen
-                    // both lanes against the new topology before allowing a
-                    // create; retained terminal IDs will then route to drains.
-                    connectionLost(BrokerClientError.identityChanged, generation: connectionGeneration)
+                let monitorGeneration = connectionGeneration
+                // A refused agent-turn signal leaves the broker reading a
+                // working terminal as idle. Hold the cutover gate shut until
+                // every active turn is protected, while still publishing the
+                // current generation's bounded retirement diagnostics below.
+                if unprotectedAgentTurnTerminalIDs.isEmpty {
+                    let next = await activeBrokerUpgradeMonitor.attemptUpgradeIfNeeded()
+                    guard monitorGeneration == connectionGeneration,
+                          connectionState.isConnected else { return }
+                    if next != brokerUpgradeState { brokerUpgradeState = next }
+                    if case let .current(contentDigest) = next,
+                       activeBrokerTopology?.current.id != contentDigest {
+                        // The coordinator atomically changed the registry.
+                        // Reopen both lanes against the new topology before
+                        // allowing a create; retained IDs route to drains.
+                        connectionLost(
+                            BrokerClientError.identityChanged,
+                            generation: connectionGeneration
+                        )
+                        return
+                    }
+                }
+                retirementDiagnostics = await activeBrokerUpgradeMonitor
+                    .retirementDiagnostics()
+                guard monitorGeneration == connectionGeneration,
+                      connectionState.isConnected else { return }
+            }
+            let topologyGeneration = connectionGeneration
+            if let provider = activeBrokerTopologyProvider {
+                let latest = await provider.generationTopology()
+                guard topologyGeneration == connectionGeneration,
+                      connectionState.isConnected else { return }
+                if let latest, latest != activeBrokerTopology {
+                    connectionLost(
+                        BrokerClientError.identityChanged,
+                        generation: connectionGeneration
+                    )
                     return
                 }
             }
-            if let provider = activeBrokerTopologyProvider,
-               let latest = await provider.generationTopology(),
-               latest != activeBrokerTopology {
-                connectionLost(BrokerClientError.identityChanged, generation: connectionGeneration)
-                return
+            if let activeBrokerTopology {
+                let nextDetail = BrokerGenerationDiagnostics.detail(
+                    appVersion: Bundle.main.object(
+                        forInfoDictionaryKey: "CFBundleShortVersionString"
+                    ) as? String ?? "Dev",
+                    topology: activeBrokerTopology,
+                    retirementDiagnostics: retirementDiagnostics
+                )
+                if nextDetail != brokerGenerationDetail {
+                    brokerGenerationDetail = nextDetail
+                }
             }
         } catch {
             consecutiveInventoryFailures += 1
@@ -6551,12 +6690,18 @@ final class AppModel: ObservableObject {
             notifyInventoryCompletions(previous: sessions, next: visibleTerminals)
             sessions = visibleTerminals
             connectedBrokerFeatures = hello.features
-            brokerUpgradeState = await activeBrokerUpgradeMonitor?.upgradeState() ?? .unknown
+            let connectedUpgradeState = await activeBrokerUpgradeMonitor?.upgradeState() ?? .unknown
+            guard generation == connectionGeneration, shouldReconnect else { return false }
+            let retirementDiagnostics = await activeBrokerUpgradeMonitor?
+                .retirementDiagnostics() ?? []
+            guard generation == connectionGeneration, shouldReconnect else { return false }
+            brokerUpgradeState = connectedUpgradeState
             brokerGenerationDetail = BrokerGenerationDiagnostics.detail(
                 appVersion: Bundle.main.object(
                     forInfoDictionaryKey: "CFBundleShortVersionString"
                 ) as? String ?? "Dev",
-                topology: topology
+                topology: topology,
+                retirementDiagnostics: retirementDiagnostics
             )
             brokerRollbackCandidates = await activeBrokerRollbackController?
                 .rollbackCandidates() ?? []
@@ -7122,6 +7267,9 @@ final class AppModel: ObservableObject {
     }
 
     private func applyActivity(busy: Bool, completedAt: Int64?, to terminalID: String) {
+        // The broker is authoritative for when a turn ends, so its idle edge
+        // retires the local acknowledgement the app opened the turn with.
+        if !busy { acknowledgedAgentTurnTerminalIDs.remove(terminalID) }
         guard let index = sessions.firstIndex(where: { $0.id == terminalID }) else { return }
         let wasWorking = { if case .working = sessions[index].agentActivity { return true }; return false }()
         if busy {
@@ -7388,6 +7536,24 @@ enum VisualTerminalStreamingFixture {
     static var finalMarker: String {
         String(format: "streaming-frame-%04d", packetIndices.upperBound)
     }
+}
+
+/// Broker-free retained history for the optimized continuous-scroll fixture.
+/// It carries real OSC 133 prompt marks and an OSC 8 link so the installed-app
+/// receipt can prove those parser-owned features survive the fractional host
+/// viewport while Claude-style repaints and Codex-style linefeeds interleave.
+enum VisualTerminalContinuousScrollFixture {
+    private static func mark(_ value: String) -> String { "\u{1B}]133;\(value)\u{7}" }
+
+    static let initialOutput = mark("A")
+        + "michael@kaisola Kaisola % " + mark("B")
+        + "codex --continue" + mark("C") + "\r\n"
+        + "Open \u{1B}]8;;https://kaisola.app\u{7}https://kaisola.app\u{1B}]8;;\u{7}\r\n"
+        + (0 ..< 640).map { index in
+            String(format: "continuous-anchor-%04d  retained output remains readable", index)
+        }.joined(separator: "\r\n")
+        + "\r\n" + mark("D;0") + mark("A")
+        + "michael@kaisola Kaisola % " + mark("B")
 }
 
 /// Resolves terminal launch state independently of the app/broker lifetime.

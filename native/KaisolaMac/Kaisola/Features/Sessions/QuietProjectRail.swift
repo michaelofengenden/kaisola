@@ -434,7 +434,7 @@ private struct QuietProjectMarkView: View {
     var body: some View {
         Image(systemName: "folder")
             .font(.system(size: QuietRailMetrics.projectMarkText, weight: .regular))
-            .foregroundStyle(tint ?? Color.secondary)
+            .foregroundStyle(tint ?? Color.kaisolaSecondary)
             .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
             .accessibilityHidden(true)
     }
@@ -629,7 +629,7 @@ private struct QuietProjectGroup: View {
                         if QuietProjectHeaderControls.showsDisclosureChevron(hovering: hovering) {
                             Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                                 .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(.kaisolaTertiary)
                                 .accessibilityHidden(true)
                         }
                     }
@@ -675,7 +675,7 @@ private struct QuietProjectGroup: View {
                             // `.secondary` at rest, not `.primary`: present
                             // enough to find without competing with the project
                             // name beside it, which is the row's actual subject.
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                     }
                     .menuStyle(.borderlessButton)
                     .menuIndicator(.hidden)
@@ -738,7 +738,7 @@ private struct QuietProjectGroup: View {
             } label: {
                 Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
                     .font(.system(size: QuietRailMetrics.chevronText, weight: .semibold))
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .frame(width: 14, height: QuietRailMetrics.rowHeight)
                     .contentShape(Rectangle())
             }
@@ -790,7 +790,7 @@ private struct QuietProjectGroup: View {
     private var emptyRow: some View {
         Text("No activity yet")
             .font(.system(size: QuietRailMetrics.secondaryText))
-            .foregroundStyle(.tertiary)
+            .foregroundStyle(.kaisolaTertiary)
             .padding(.leading, QuietRailMetrics.sessionIndent)
             .frame(height: QuietRailMetrics.rowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -819,14 +819,14 @@ private struct QuietProjectGroup: View {
             HStack(spacing: QuietRailMetrics.markGap) {
                 Image(systemName: "clock.arrow.circlepath")
                     .font(.system(size: QuietRailMetrics.projectMarkText))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .frame(width: QuietRailMetrics.mark)
                 Text("Recently Closed")
                     .lineLimit(1)
                 Spacer(minLength: QuietRailMetrics.laneGap)
                 Text("\(surfaces.count)")
                     .font(.system(size: QuietRailMetrics.secondaryText).monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             .font(.system(size: QuietRailMetrics.secondaryText, weight: .medium))
             .padding(.leading, QuietRailMetrics.sessionIndent)
@@ -1159,7 +1159,7 @@ private struct QuietRollupView: View {
             if rollup.total > 0 {
                 Text("\(rollup.total)")
                     .font(.system(size: QuietRailMetrics.secondaryText).monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
             ForEach(Array(rollup.dots.enumerated()), id: \.offset) { _, state in
                 QuietStatusMark(status: state, size: QuietRailMetrics.dot)
@@ -1359,7 +1359,7 @@ private struct QuietRowBody: View {
         // the primary ink rather than the accent, which stays the mark of the
         // one row you are typing in.
         if isOnScreen { return AnyShapeStyle(HierarchicalShapeStyle.primary) }
-        if status.isDimmed { return AnyShapeStyle(HierarchicalShapeStyle.tertiary) }
+        if status.isDimmed { return AnyShapeStyle(Color.kaisolaTertiary) }
         return AnyShapeStyle(HierarchicalShapeStyle.secondary)
     }
 
@@ -1383,7 +1383,7 @@ private struct QuietRowBody: View {
                 // pointer-only affordance cannot serve.
                 Image(systemName: "square.split.2x1")
                     .font(.system(size: QuietRailMetrics.revealText, weight: .medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .frame(width: QuietRailMetrics.revealSlot, height: QuietRailMetrics.revealSlot)
                     .contentShape(Rectangle())
                     .highPriorityGesture(TapGesture().onEnded { reveal() })
@@ -1395,7 +1395,7 @@ private struct QuietRowBody: View {
             if !timeLabel.isEmpty {
                 Text(timeLabel)
                     .font(.system(size: QuietRailMetrics.secondaryText).monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.kaisolaTertiary)
                     .lineLimit(1)
             }
             QuietStatusDot(status: status)

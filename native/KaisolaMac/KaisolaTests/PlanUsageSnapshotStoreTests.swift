@@ -45,6 +45,38 @@ final class PlanUsageSnapshotStoreTests: XCTestCase {
         XCTAssertEqual(reloaded["ctx-a"]?.fetchedAt, fetchedAt)
     }
 
+    func testSaveQueueCompletesSnapshotsInEnqueueOrder() async {
+        let probe = PlanUsageSnapshotSaveProbe(contextKey: "ctx")
+        let queue = PlanUsageSnapshotSaveQueue { snapshot in
+            probe.save(snapshot)
+        }
+        let older: PlanUsageSnapshotSaveQueue.Snapshot = [
+            "ctx": .init(
+                providers: [usage(plan: "older", percent: 10)],
+                fetchedAt: Date(timeIntervalSince1970: 1)
+            ),
+        ]
+        let newer: PlanUsageSnapshotSaveQueue.Snapshot = [
+            "ctx": .init(
+                providers: [usage(plan: "newer", percent: 20)],
+                fetchedAt: Date(timeIntervalSince1970: 2)
+            ),
+        ]
+
+        queue.enqueue(older)
+        XCTAssertEqual(probe.firstStarted.wait(timeout: .now() + 5), .success)
+        queue.enqueue(newer)
+        XCTAssertEqual(
+            probe.secondStarted.wait(timeout: .now() + 1),
+            .timedOut,
+            "a newer snapshot must wait behind the older in-flight save"
+        )
+
+        probe.releaseFirst.signal()
+        await queue.flush()
+        XCTAssertEqual(probe.completedPlans, ["older", "newer"])
+    }
+
     func testMissingFileIsEmptyRatherThanAnError() {
         XCTAssertTrue(makeStore().entries().isEmpty)
     }
@@ -85,5 +117,39 @@ final class PlanUsageSnapshotStoreTests: XCTestCase {
         store.save(["ctx": .init(providers: [usage(plan: "pro", percent: 1)], fetchedAt: Date())])
         let attributes = try FileManager.default.attributesOfItem(atPath: store.fileURL.path)
         XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.int16Value, 0o600)
+    }
+}
+
+private final class PlanUsageSnapshotSaveProbe: @unchecked Sendable {
+    let firstStarted = DispatchSemaphore(value: 0)
+    let secondStarted = DispatchSemaphore(value: 0)
+    let releaseFirst = DispatchSemaphore(value: 0)
+
+    private let lock = NSLock()
+    private let contextKey: String
+    private var startCount = 0
+    private var completed: [String] = []
+
+    init(contextKey: String) {
+        self.contextKey = contextKey
+    }
+
+    var completedPlans: [String] {
+        lock.withLock { completed }
+    }
+
+    func save(_ snapshot: PlanUsageSnapshotSaveQueue.Snapshot) {
+        let ordinal = lock.withLock {
+            startCount += 1
+            return startCount
+        }
+        if ordinal == 1 {
+            firstStarted.signal()
+            _ = releaseFirst.wait(timeout: .now() + 10)
+        } else if ordinal == 2 {
+            secondStarted.signal()
+        }
+        let plan = snapshot[contextKey]?.providers.first?.plan ?? "missing"
+        lock.withLock { completed.append(plan) }
     }
 }

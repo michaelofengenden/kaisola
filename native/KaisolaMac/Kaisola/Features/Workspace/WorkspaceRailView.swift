@@ -154,7 +154,7 @@ struct WorkspaceRailView: View {
             HStack(spacing: 6) {
                 Image(systemName: "magnifyingglass")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                 TextField("Search files", text: $searchText)
                     .textFieldStyle(.plain)
                 Menu {
@@ -173,7 +173,7 @@ struct WorkspaceRailView: View {
                 } label: {
                     Image(systemName: "scope")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(followsAgentFiles ? Color.accentColor : Color.secondary)
+                        .foregroundStyle(followsAgentFiles ? Color.accentColor : Color.kaisolaSecondary)
                 }
                 .buttonStyle(.borderless)
                 .disabled(!canFollowAgentFiles)
@@ -195,7 +195,7 @@ struct WorkspaceRailView: View {
                 Button(action: close) {
                     Image(systemName: "minus")
                         .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .frame(width: 20, height: 20)
                 }
                 .buttonStyle(.borderless)
@@ -229,7 +229,7 @@ struct WorkspaceRailView: View {
             } else if tree.isSearching {
                 VStack(spacing: 10) {
                     ProgressView().controlSize(.small)
-                    Text("Indexing files…").font(.caption).foregroundStyle(.secondary)
+                    Text("Indexing files…").font(.caption).foregroundStyle(.kaisolaSecondary)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if tree.searchResults.isEmpty {
@@ -244,7 +244,7 @@ struct WorkspaceRailView: View {
                                 HStack(spacing: 7) {
                                     Image(systemName: "doc.text")
                                         .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                        .foregroundStyle(.kaisolaSecondary)
                                     FadingFileName(text: path)
                                     Spacer(minLength: 0)
                                 }
@@ -706,7 +706,7 @@ struct WorkspaceRailView: View {
         } else {
             HStack(spacing: 7) {
                 ProgressView().controlSize(.mini)
-                Text("Loading…").font(.caption).foregroundStyle(.tertiary)
+                Text("Loading…").font(.caption).foregroundStyle(.kaisolaTertiary)
             }
             .padding(.leading, CGFloat(depth) * 14 + 12)
             .padding(.vertical, 6)
@@ -805,7 +805,7 @@ struct WorkspaceRailView: View {
                 }
                 Image(systemName: node.isDirectory ? "folder" : "doc.text")
                     .font(.caption)
-                    .foregroundStyle(node.isDirectory ? Color.accentColor : .secondary)
+                    .foregroundStyle(node.isDirectory ? Color.accentColor : .kaisolaSecondary)
                 fileName(node.name)
                 Spacer(minLength: 0)
             }
@@ -1071,7 +1071,7 @@ private struct WorkspaceMoveSheet: View {
                     .font(.title3.weight(.semibold))
                 Text("Choose a folder inside \(root.lastPathComponent). The item will keep its name.")
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
 
             TextField("Search folders", text: $searchText)
@@ -1083,7 +1083,7 @@ private struct WorkspaceMoveSheet: View {
                         ProgressView().controlSize(.small)
                         Text("Finding project folders…")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if visibleDirectories.isEmpty {
@@ -1108,7 +1108,7 @@ private struct WorkspaceMoveSheet: View {
                                         Image(systemName: directory.path == root.standardizedFileURL.path
                                             ? "shippingbox"
                                             : "folder")
-                                            .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                                            .foregroundStyle(isSelected ? Color.accentColor : .kaisolaSecondary)
                                             .frame(width: 18)
                                         Text(destinationLabel(directory))
                                             .font(.callout)

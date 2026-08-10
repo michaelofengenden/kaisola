@@ -294,9 +294,17 @@ final class BrokerGenerationRoutingTests: XCTestCase {
 
     func testDiagnosticsNameAppCurrentAndEveryDrainingBrokerVersion() {
         let topology = makeTopology()
+        let retirement = BrokerRetirementDiagnostic(
+            generationID: topology.draining[0].id,
+            pid: topology.draining[0].info.pid,
+            failureCount: 2,
+            reason: .shutdownTimedOut,
+            nextAttemptInSweeps: 4
+        )
         let detail = BrokerGenerationDiagnostics.detail(
             appVersion: "1.1.8",
-            topology: topology
+            topology: topology,
+            retirementDiagnostics: [retirement]
         )
 
         XCTAssertTrue(detail.contains("App 1.1.8"))
@@ -304,6 +312,17 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         XCTAssertTrue(detail.contains("Draining brokers: routing-test"))
         XCTAssertEqual(detail.components(separatedBy: "package routing-test").count - 1, 2)
         XCTAssertEqual(detail.components(separatedBy: "implementation 2").count - 1, 2)
+        XCTAssertTrue(detail.contains("Retirement skipped"))
+        XCTAssertTrue(detail.contains("safe handoff timed out"))
+        XCTAssertTrue(detail.contains("failure count 2"))
+        XCTAssertTrue(detail.contains("retry in 4 heartbeats"))
+
+        let staleDetail = BrokerGenerationDiagnostics.detail(
+            appVersion: "1.1.8",
+            topology: .single(topology.current.info),
+            retirementDiagnostics: [retirement]
+        )
+        XCTAssertFalse(staleDetail.contains("Retirement skipped"))
     }
 
     private func makeTopology() -> BrokerGenerationTopology {

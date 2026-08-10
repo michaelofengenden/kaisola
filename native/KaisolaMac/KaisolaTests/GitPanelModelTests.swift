@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -493,6 +494,96 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertEqual(model.status?.staged.map(\.path), ["b.txt"])
     }
 
+    @MainActor
+    func testExternalStagePublishesFileStateAndAllCountersAtomically() throws {
+        try write("tracked.txt", "one\ntwo\n")
+        try git(["add", "tracked.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("tracked.txt", "ONE\ntwo\n")
+        try git(["add", "tracked.txt"])
+        try write("tracked.txt", "ONE\nTWO\n")
+
+        let model = GitPanelModel(repoRoot: repo)
+        var published: [GitService.Status] = []
+        let observation = model.$status.compactMap { $0 }.sink { published.append($0) }
+        defer { observation.cancel() }
+        model.startWatching()
+        defer { model.stopWatching() }
+        XCTAssertTrue(pump(until: { model.status != nil }, timeout: 10))
+        let before = try XCTUnwrap(model.status)
+        XCTAssertEqual(before.stagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(before.unstagedStats, .init(additions: 1, deletions: 1, textFiles: 1))
+        XCTAssertEqual(before.combinedStats, .init(additions: 2, deletions: 2, textFiles: 1))
+
+        try git(["add", "tracked.txt"])
+        XCTAssertTrue(
+            pump(until: {
+                model.status?.stagedStats == .init(additions: 2, deletions: 2, textFiles: 1)
+                    && model.status?.unstaged.isEmpty == true
+            }, timeout: 12),
+            "the Git-directory watcher should publish the externally staged snapshot"
+        )
+        let after = try XCTUnwrap(model.status)
+        XCTAssertEqual(after.staged.map(\.path), ["tracked.txt"])
+        XCTAssertTrue(after.unstaged.isEmpty)
+        XCTAssertEqual(after.unstagedStats, .empty)
+        XCTAssertEqual(after.combinedStats, .init(additions: 2, deletions: 2, textFiles: 1))
+        XCTAssertTrue(
+            published.allSatisfy { $0 == before || $0 == after },
+            "status lists and all counters must move as one published value"
+        )
+    }
+
+    func testBinaryStatsRenderingNeverInventsLineCounts() {
+        XCTAssertEqual(
+            GitStatsRendering.summary(.init(binaryFiles: 1)),
+            "1 binary"
+        )
+        XCTAssertEqual(
+            GitStatsRendering.summary(.init(additions: 3, deletions: 2, textFiles: 1, binaryFiles: 1)),
+            "+3 −2 · 1 binary"
+        )
+        XCTAssertNil(GitStatsRendering.summary(.empty))
+    }
+
+    @MainActor
+    func testRejectingCommitMessageHookKeepsDraftAndStagedIndexVisible() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let headBeforeCommit = try gitOutput(["rev-parse", "HEAD"])
+        try write("pending.txt", "keep staged\n")
+        try git(["add", "pending.txt"])
+        try installCommitMessageHook(
+            """
+            #!/bin/sh
+            printf '%s\n' 'panel hook stdout'
+            printf '%s\n' 'panel hook stderr' >&2
+            exit 41
+            """
+        )
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.refresh()
+        XCTAssertTrue(pump(until: { model.status?.staged.map(\.path) == ["pending.txt"] }, timeout: 10))
+        model.commitMessage = "keep my draft"
+        model.commit()
+        XCTAssertTrue(pump(until: { model.errorMessage != nil && !model.isBusy }, timeout: 10))
+
+        XCTAssertEqual(model.commitMessage, "keep my draft")
+        XCTAssertEqual(model.status?.staged.map(\.path), ["pending.txt"])
+        XCTAssertFalse(model.errorIsRetryable)
+        XCTAssertTrue(model.errorMessage?.contains("git commit exited with status 1") == true)
+        XCTAssertTrue(model.errorMessage?.contains("panel hook stdout") == true)
+        XCTAssertTrue(model.errorMessage?.contains("panel hook stderr") == true)
+        XCTAssertEqual(try gitOutput(["rev-parse", "HEAD"]), headBeforeCommit)
+        XCTAssertEqual(
+            try gitOutput(["diff", "--cached", "--name-only"])
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "pending.txt"
+        )
+    }
+
     /// The review card must self-invalidate: a background refresh (an external
     /// commit landing between the review and confirm clicks) marks the open
     /// plan stale so Confirm gets disabled instead of waiting for the user's
@@ -783,6 +874,12 @@ final class GitPanelModelTests: XCTestCase {
 
     private func write(_ name: String, _ contents: String) throws {
         try contents.write(to: repo.appendingPathComponent(name), atomically: true, encoding: .utf8)
+    }
+
+    private func installCommitMessageHook(_ script: String) throws {
+        let hook = repo.appendingPathComponent(".git/hooks/commit-msg")
+        try script.write(to: hook, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: hook.path)
     }
 
     @discardableResult

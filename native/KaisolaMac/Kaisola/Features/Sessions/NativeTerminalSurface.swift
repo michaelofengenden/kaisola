@@ -1045,6 +1045,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             let restoresMouseReporting = view.allowMouseReporting
             view.allowMouseReporting = false
             view.feed(text: text)
+            view.reconcileContinuousViewportAfterBufferChange()
             // Feeding and repinning both used to rebuild the semantic overlay.
             // Record cursor growth first, then paint exactly once after the
             // viewport reaches its final position for this output batch.
@@ -1082,6 +1083,7 @@ struct NativeTerminalSurface: NSViewRepresentable {
             let restoresMouseReporting = view.allowMouseReporting
             view.allowMouseReporting = false
             view.feed(byteArray: bytes)
+            view.reconcileContinuousViewportAfterBufferChange()
             view.observeSemanticPromptCursor(refreshDecorations: false)
             view.allowMouseReporting = restoresMouseReporting
             if scrollAfter, !userUnpinned {
@@ -1225,7 +1227,10 @@ struct NativeTerminalSurface: NSViewRepresentable {
             // the bottom; only a deliberate user scroll changes the pin state.
             guard !isFeeding else { return }
             guard let view = source as? ReadOnlyTerminalView else { return }
-            MainActor.assumeIsolated { view.updateSemanticDecorations() }
+            MainActor.assumeIsolated {
+                view.reconcileContinuousViewportAfterExternalScroll()
+                view.updateSemanticDecorations()
+            }
             // `isFeeding` alone is a whitelist of one safe window against an
             // emitter with several unsafe ones — resize, the synchronized-output
             // timeout, and reset all fire `scrolled` with no user involved.
@@ -1534,6 +1539,141 @@ enum TerminalJumpToBottomPolicy {
             ? max(bounds.minY, bounds.maxY - size.height - bottomInset)
             : bounds.minY + bottomInset
         return NSRect(origin: NSPoint(x: x, y: y), size: size)
+    }
+}
+
+/// Fractional macOS scroll state layered over SwiftTerm's integer `yDisp`.
+///
+/// SwiftTerm remains the only parser, buffer owner, and row renderer. Its AppKit
+/// renderer deliberately paints the first row just below the viewport, so the
+/// host can reveal that row continuously by moving the view's bounds origin
+/// while keeping `yDisp` on the integer row immediately above it. This state is
+/// point-based (rather than event-count-based), which preserves AppKit's native
+/// trackpad acceleration and momentum samples without reimplementing either.
+struct TerminalContinuousScrollProjection: Equatable, Sendable {
+    let rawPosition: CGFloat
+    let boundedPosition: CGFloat
+    let presentedPosition: CGFloat
+    let rowHeight: CGFloat
+    let maximumRow: Int
+    let anchorRow: Int
+    let offsetWithinAnchor: CGFloat
+    let scrollbarPosition: Double
+    let isRubberBanding: Bool
+}
+
+struct TerminalContinuousScrollState: Equatable, Sendable {
+    /// Matches AppKit's rubber-band curve: displacement remains responsive at
+    /// the edge, then asymptotically resists pulling farther than the viewport.
+    private static let rubberBandCoefficient: CGFloat = 0.55
+
+    private(set) var rawPosition: CGFloat
+    private(set) var rowHeight: CGFloat
+    private(set) var maximumRow: Int
+    private(set) var viewportExtent: CGFloat
+
+    init(
+        anchorRow: Int,
+        fractionalOffset: CGFloat,
+        rowHeight: CGFloat,
+        maximumRow: Int,
+        viewportExtent: CGFloat
+    ) {
+        self.rowHeight = max(1, rowHeight)
+        self.maximumRow = max(0, maximumRow)
+        self.viewportExtent = max(1, viewportExtent)
+        let row = max(0, min(anchorRow, self.maximumRow))
+        self.rawPosition = CGFloat(row) * self.rowHeight + fractionalOffset
+    }
+
+    var projection: TerminalContinuousScrollProjection {
+        let maximumPosition = CGFloat(maximumRow) * rowHeight
+        let boundedPosition = max(0, min(rawPosition, maximumPosition))
+        let presentedPosition: CGFloat
+        if rawPosition < 0 {
+            presentedPosition = -Self.rubberBandDistance(
+                -rawPosition,
+                dimension: viewportExtent
+            )
+        } else if rawPosition > maximumPosition {
+            presentedPosition = maximumPosition + Self.rubberBandDistance(
+                rawPosition - maximumPosition,
+                dimension: viewportExtent
+            )
+        } else {
+            presentedPosition = rawPosition
+        }
+
+        let anchorRow: Int
+        if boundedPosition >= maximumPosition {
+            anchorRow = maximumRow
+        } else {
+            anchorRow = max(0, min(maximumRow, Int(floor(boundedPosition / rowHeight))))
+        }
+        let offset = presentedPosition - CGFloat(anchorRow) * rowHeight
+        let scrollbarPosition = maximumPosition > 0
+            ? Double(boundedPosition / maximumPosition)
+            : 1
+        return TerminalContinuousScrollProjection(
+            rawPosition: rawPosition,
+            boundedPosition: boundedPosition,
+            presentedPosition: presentedPosition,
+            rowHeight: rowHeight,
+            maximumRow: maximumRow,
+            anchorRow: anchorRow,
+            offsetWithinAnchor: offset,
+            scrollbarPosition: scrollbarPosition,
+            isRubberBanding: rawPosition < 0 || rawPosition > maximumPosition
+        )
+    }
+
+    mutating func apply(scrollingDeltaY: CGFloat) {
+        // AppKit/SwiftTerm define positive delta Y as movement toward older
+        // output, while this coordinate grows toward the live bottom.
+        rawPosition -= scrollingDeltaY
+    }
+
+    /// Rebase after output trimming or geometry changes while retaining the
+    /// exact sub-row location. This never scans or materializes scrollback.
+    mutating func reconfigure(
+        anchorRow: Int,
+        rowHeight newRowHeight: CGFloat,
+        maximumRow newMaximumRow: Int,
+        viewportExtent newViewportExtent: CGFloat
+    ) {
+        let oldProjection = projection
+        let oldFraction = oldProjection.isRubberBanding
+            ? 0
+            : max(0, min(1, oldProjection.offsetWithinAnchor / rowHeight))
+        rowHeight = max(1, newRowHeight)
+        maximumRow = max(0, newMaximumRow)
+        viewportExtent = max(1, newViewportExtent)
+        let row = max(0, min(anchorRow, maximumRow))
+        rawPosition = CGFloat(row) * rowHeight + oldFraction * rowHeight
+    }
+
+    /// Advance a deterministic critically-damped-looking edge return. Returns
+    /// true while another frame is useful and false once the edge is exact.
+    @discardableResult
+    mutating func approachSettlement(retainingOvershoot: CGFloat = 0.68) -> Bool {
+        let maximumPosition = CGFloat(maximumRow) * rowHeight
+        let target = max(0, min(rawPosition, maximumPosition))
+        let remaining = rawPosition - target
+        guard abs(remaining) > 0.1 else {
+            rawPosition = target
+            return false
+        }
+        rawPosition = target + remaining * max(0, min(retainingOvershoot, 0.95))
+        return true
+    }
+
+    mutating func settle() {
+        rawPosition = max(0, min(rawPosition, CGFloat(maximumRow) * rowHeight))
+    }
+
+    private static func rubberBandDistance(_ distance: CGFloat, dimension: CGFloat) -> CGFloat {
+        let dimension = max(1, dimension)
+        return dimension * (1 - 1 / (distance * rubberBandCoefficient / dimension + 1))
     }
 }
 
@@ -2028,6 +2168,19 @@ class ReadOnlyTerminalView: TerminalView {
     var onKeyboardFocus: (() -> Void)?
     private var jumpToLiveBottomButton: NSButton?
     private var lastHistoryBoundaryRequestAt = -TimeInterval.greatestFiniteMagnitude
+    private var continuousScrollState: TerminalContinuousScrollState?
+    private var isApplyingContinuousScrollRow = false
+    private var continuousSettlementScheduled = false
+    private lazy var accessibilityPageUpAction = NSAccessibilityCustomAction(
+        name: "Scroll one page up",
+        target: self,
+        selector: #selector(performAccessibilityPageUp)
+    )
+    private lazy var accessibilityPageDownAction = NSAccessibilityCustomAction(
+        name: "Scroll one page down",
+        target: self,
+        selector: #selector(performAccessibilityPageDown)
+    )
     var hasUsableRenderGeometry: Bool {
         bounds.width > 1 && bounds.height > 1
     }
@@ -2182,6 +2335,7 @@ class ReadOnlyTerminalView: TerminalView {
         let first = terminal.buffer.totalLinesTrimmed
         semanticTracker.prune(before: first)
         guard let destination = semanticPromptDestination(backward: backward) else { return false }
+        prepareForDiscreteScrollInput()
         beforeScroll?()
         scrollTo(row: max(0, destination.row - first), notifyAccessibility: true)
         updateSemanticDecorations()
@@ -2255,6 +2409,258 @@ class ReadOnlyTerminalView: TerminalView {
         )
     }
 
+    /// Current continuous viewport state. Kept internal as an interaction/QA
+    /// seam; production rendering consumes the same projection below.
+    var continuousScrollSnapshot: TerminalContinuousScrollProjection? {
+        continuousScrollState?.projection
+    }
+
+    /// SwiftTerm's scroller is private, but it is an ordinary direct NSView
+    /// child. Updating its public value keeps thumb dragging, VoiceOver, and
+    /// fractional trackpad motion on one exact position.
+    private var nativeScroller: NSScroller? {
+        subviews.first { $0 is NSScroller } as? NSScroller
+    }
+
+    var nativeScrollerValue: Double {
+        nativeScroller?.doubleValue ?? scrollPosition
+    }
+
+    /// Window-space geometry is the installed-app truth for fixed chrome: a
+    /// fractional terminal transform must not translate or resize the native
+    /// scroll track under the pointer or VoiceOver focus ring.
+    var nativeScrollerWindowFrame: NSRect? {
+        guard window != nil, let scroller = nativeScroller else { return nil }
+        return scroller.convert(scroller.bounds, to: nil)
+    }
+
+    private var continuousScrollCellHeight: CGFloat? {
+        let rows = getTerminal().getDims().rows
+        guard rows > 0 else { return nil }
+        let height = getOptimalFrameSize().height / CGFloat(rows)
+        return height.isFinite && height > 0 ? height : nil
+    }
+
+    /// Count the normal buffer through SwiftTerm's public invariant-line API.
+    /// This bounded logarithmic lookup follows streamed growth without copying
+    /// row text or flattening the retained byte buffer on any gesture sample.
+    private func maximumContinuousScrollRow() -> Int {
+        let terminal = getTerminal()
+        let first = terminal.buffer.totalLinesTrimmed
+        var lower = first
+        var upper = first + terminal.options.scrollback + terminal.rows + 1
+        while lower < upper {
+            let middle = lower + (upper - lower) / 2
+            if terminal.getScrollInvariantLine(row: middle) == nil {
+                upper = middle
+            } else {
+                lower = middle + 1
+            }
+        }
+        return max(0, lower - first - terminal.rows)
+    }
+
+    /// Consume one precise AppKit wheel sample when, and only when, the normal
+    /// buffer owns scrolling. NSEvent has already applied the user's natural-
+    /// scrolling preference and acceleration; preserving every delta also
+    /// preserves native momentum without synthesizing velocity.
+    @discardableResult
+    func handleContinuousScroll(
+        scrollingDeltaY: CGFloat,
+        hasPreciseScrollingDeltas: Bool,
+        phase: NSEvent.Phase,
+        momentumPhase: NSEvent.Phase,
+        routesToNativeScrollback: Bool
+    ) -> Bool {
+        let terminal = getTerminal()
+        let ended = phase.contains(.ended)
+            || phase.contains(.cancelled)
+            || momentumPhase.contains(.ended)
+            || momentumPhase.contains(.cancelled)
+        let finishesRubberBand = ended
+            && continuousScrollState?.projection.isRubberBanding == true
+        guard routesToNativeScrollback,
+              hasPreciseScrollingDeltas,
+              scrollingDeltaY != 0 || finishesRubberBand,
+              canScroll,
+              !terminal.isCurrentBufferAlternate,
+              let rowHeight = continuousScrollCellHeight else { return false }
+
+        cancelContinuousSettlement()
+        let maximumRow = maximumContinuousScrollRow()
+        let currentRow = terminal.getTopVisibleRow()
+        if var state = continuousScrollState {
+            let projection = state.projection
+            if projection.anchorRow != currentRow
+                || abs(projection.rowHeight - rowHeight) > 0.001
+                || projection.maximumRow != maximumRow {
+                state.reconfigure(
+                    anchorRow: currentRow,
+                    rowHeight: rowHeight,
+                    maximumRow: maximumRow,
+                    viewportExtent: bounds.height
+                )
+            }
+            if scrollingDeltaY != 0 {
+                state.apply(scrollingDeltaY: scrollingDeltaY * scrollSensitivity)
+            }
+            continuousScrollState = state
+        } else {
+            var state = TerminalContinuousScrollState(
+                anchorRow: currentRow,
+                fractionalOffset: 0,
+                rowHeight: rowHeight,
+                maximumRow: maximumRow,
+                viewportExtent: bounds.height
+            )
+            state.apply(scrollingDeltaY: scrollingDeltaY * scrollSensitivity)
+            continuousScrollState = state
+        }
+
+        applyContinuousScrollProjection()
+        if continuousScrollState?.projection.isRubberBanding == true {
+            let phaseTracked = !phase.isEmpty || !momentumPhase.isEmpty
+            if ended || !phaseTracked {
+                // A real trackpad sends a zero-delta end/cancel sample. Keep
+                // the edge under the user's finger until that sample, while
+                // retaining a short fallback for phase-less precise devices.
+                scheduleContinuousSettlement(after: ended ? 0 : 0.08)
+            }
+        }
+        return true
+    }
+
+    /// Keyboard paging, semantic prompt jumps, and native scrollbar dragging
+    /// are row-addressed SwiftTerm operations. Reconcile to their integer row
+    /// in the same event turn so there is no stale fractional offset afterward.
+    func prepareForDiscreteScrollInput() {
+        cancelContinuousSettlement()
+        guard continuousScrollState != nil || bounds.origin.y != 0 else { return }
+        continuousScrollState = nil
+        setBoundsOrigin(NSPoint(x: bounds.origin.x, y: 0))
+        alignNativeScrollerToViewport()
+        nativeScroller?.doubleValue = scrollPosition
+        needsDisplay = true
+        semanticDecorationView?.needsDisplay = true
+        updateSemanticDecorations()
+        layoutJumpToLiveBottomAffordance()
+    }
+
+    /// Output can trim the bounded SwiftTerm buffer while a retained view is
+    /// fractionally parked in history. Rebase on the parser's new integer row,
+    /// retaining the sub-row fraction and the exact mounted NSView identity.
+    func reconcileContinuousViewportAfterBufferChange() {
+        guard var state = continuousScrollState else { return }
+        let terminal = getTerminal()
+        guard !terminal.isCurrentBufferAlternate else {
+            prepareForDiscreteScrollInput()
+            return
+        }
+        // Synchronized-output repaints and reflow briefly expose a normal
+        // buffer with no scrollable geometry while SwiftTerm applies the
+        // packet. That transient is not a discrete user scroll and must not
+        // discard the mounted view's sub-row position. The next stable feed or
+        // layout pass rebases the retained projection against real geometry.
+        guard canScroll, let rowHeight = continuousScrollCellHeight else { return }
+        state.reconfigure(
+            anchorRow: terminal.getTopVisibleRow(),
+            rowHeight: rowHeight,
+            maximumRow: maximumContinuousScrollRow(),
+            viewportExtent: bounds.height
+        )
+        continuousScrollState = state
+        applyContinuousScrollProjection(moveIntegerRow: false)
+    }
+
+    /// A delegate callback caused by a scrollbar/key/prompt row change may
+    /// arrive synchronously. Our own row crossing is marked so it keeps the
+    /// fractional projection; every other genuine gesture becomes authoritative.
+    func reconcileContinuousViewportAfterExternalScroll() {
+        guard !isApplyingContinuousScrollRow,
+              let projection = continuousScrollState?.projection,
+              projection.anchorRow != getTerminal().getTopVisibleRow() else { return }
+        prepareForDiscreteScrollInput()
+    }
+
+    private func applyContinuousScrollProjection(moveIntegerRow: Bool = true) {
+        guard let projection = continuousScrollState?.projection else { return }
+        let oldRow = getTerminal().getTopVisibleRow()
+        if moveIntegerRow, oldRow != projection.anchorRow {
+            isApplyingContinuousScrollRow = true
+            scrollTo(row: projection.anchorRow, notifyAccessibility: false)
+            isApplyingContinuousScrollRow = false
+        }
+        setBoundsOrigin(NSPoint(x: bounds.origin.x, y: -projection.offsetWithinAnchor))
+        alignNativeScrollerToViewport()
+        nativeScroller?.doubleValue = projection.scrollbarPosition
+        needsDisplay = true
+        semanticDecorationView?.needsDisplay = true
+        updateJumpToLiveBottomVisibility()
+        layoutJumpToLiveBottomAffordance()
+        if oldRow != projection.anchorRow {
+            NSAccessibility.post(element: self, notification: .valueChanged)
+        }
+    }
+
+    private func cancelContinuousSettlement() {
+        NSObject.cancelPreviousPerformRequests(
+            withTarget: self,
+            selector: #selector(advanceContinuousSettlement),
+            object: nil
+        )
+        continuousSettlementScheduled = false
+    }
+
+    /// `bounds.origin` deliberately moves the renderer and its interactive grid,
+    /// but SwiftTerm installs its `NSScroller` as a direct child of that same
+    /// view. Counter-position only that native chrome in bounds coordinates so
+    /// its window-space track remains fixed while terminal rows move beneath it.
+    private func alignNativeScrollerToViewport() {
+        guard let scroller = nativeScroller else { return }
+        var frame = scroller.frame
+        frame.origin.y = bounds.minY
+        frame.size.height = bounds.height
+        if scroller.frame != frame {
+            scroller.frame = frame
+        }
+    }
+
+    private func scheduleContinuousSettlement(after delay: TimeInterval) {
+        cancelContinuousSettlement()
+        continuousSettlementScheduled = true
+        perform(
+            #selector(advanceContinuousSettlement),
+            with: nil,
+            afterDelay: max(0, delay)
+        )
+    }
+
+    @objc private func advanceContinuousSettlement() {
+        continuousSettlementScheduled = false
+        guard var state = continuousScrollState,
+              state.projection.isRubberBanding else { return }
+        let continues = state.approachSettlement()
+        continuousScrollState = state
+        applyContinuousScrollProjection(moveIntegerRow: false)
+        if continues {
+            continuousSettlementScheduled = true
+            perform(
+                #selector(advanceContinuousSettlement),
+                with: nil,
+                afterDelay: 1 / 120
+            )
+        }
+    }
+
+    /// Deterministic fixture seam: production uses the 120 Hz edge return above.
+    func settleContinuousScrollImmediately() {
+        cancelContinuousSettlement()
+        guard var state = continuousScrollState else { return }
+        state.settle()
+        continuousScrollState = state
+        applyContinuousScrollProjection(moveIntegerRow: false)
+    }
+
     /// Screen-relative cell under `point`.
     ///
     /// Exact rather than approximate: SwiftTerm's optimal frame width is
@@ -2269,7 +2675,10 @@ class ReadOnlyTerminalView: TerminalView {
         let cellWidth = max(1, (optimal.width - scrollerWidth) / CGFloat(dimensions.cols))
         let cellHeight = max(1, optimal.height / CGFloat(dimensions.rows))
         let column = max(0, min(dimensions.cols - 1, Int(point.x / cellWidth)))
-        let row = max(0, min(dimensions.rows - 1, Int((bounds.height - point.y) / cellHeight)))
+        // `point` is in the shifted bounds coordinate space. SwiftTerm's own
+        // mouse hit testing intentionally measures from the fixed frame height;
+        // doing the same folds the fractional bounds origin into the row hit.
+        let row = max(0, min(dimensions.rows - 1, Int((frame.height - point.y) / cellHeight)))
         return (column, row)
     }
 
@@ -2277,7 +2686,11 @@ class ReadOnlyTerminalView: TerminalView {
     /// row the cursor reports. On the alternate screen SwiftTerm reports
     /// `canScroll == false`, which is exactly the full-screen-TUI case.
     var isViewportAtLiveBottom: Bool {
-        !canScroll || scrollPosition >= 1.0
+        guard canScroll else { return true }
+        guard scrollPosition >= 1.0 else { return false }
+        guard let projection = continuousScrollState?.projection else { return true }
+        return projection.boundedPosition
+            >= CGFloat(projection.maximumRow) * projection.rowHeight
     }
 
     private func updateLinkCursor(for event: NSEvent) {
@@ -2381,6 +2794,10 @@ class ReadOnlyTerminalView: TerminalView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         if window == nil {
+            cancelContinuousSettlement()
+            if continuousScrollState?.projection.isRubberBanding == true {
+                settleContinuousScrollImmediately()
+            }
             if let linkInteractionMonitor {
                 NSEvent.removeMonitor(linkInteractionMonitor)
                 self.linkInteractionMonitor = nil
@@ -2468,6 +2885,7 @@ class ReadOnlyTerminalView: TerminalView {
 
     override func layout() {
         super.layout()
+        alignNativeScrollerToViewport()
         layoutJumpToLiveBottomAffordance()
         updateSemanticDecorations()
         if hasUsableRenderGeometry {
@@ -2481,7 +2899,34 @@ class ReadOnlyTerminalView: TerminalView {
     /// until the user resizes the window. Frame assignment is the earliest
     /// reliable point at which SwiftTerm has real rows and columns.
     override func setFrameSize(_ newSize: NSSize) {
+        let retainedProjection = newSize != frame.size
+            ? continuousScrollState?.projection
+            : nil
+        if retainedProjection != nil {
+            // Let SwiftTerm reflow from an integer anchor, then express the same
+            // sub-row fraction in its new cell height below. Both happen inside
+            // this frame mutation, so AppKit never presents the intermediate.
+            cancelContinuousSettlement()
+            continuousScrollState = nil
+            setBoundsOrigin(NSPoint(x: bounds.origin.x, y: 0))
+        }
         super.setFrameSize(newSize)
+        if let retainedProjection,
+           canScroll,
+           !getTerminal().isCurrentBufferAlternate,
+           let newRowHeight = continuousScrollCellHeight {
+            let normalizedFraction = retainedProjection.isRubberBanding
+                ? 0
+                : max(0, min(1, retainedProjection.offsetWithinAnchor / retainedProjection.rowHeight))
+            continuousScrollState = TerminalContinuousScrollState(
+                anchorRow: getTerminal().getTopVisibleRow(),
+                fractionalOffset: normalizedFraction * newRowHeight,
+                rowHeight: newRowHeight,
+                maximumRow: maximumContinuousScrollRow(),
+                viewportExtent: bounds.height
+            )
+            applyContinuousScrollProjection(moveIntegerRow: false)
+        }
         reconcileSemanticPromptGrid()
         updateSemanticDecorations()
         if hasUsableRenderGeometry {
@@ -2624,6 +3069,7 @@ class ReadOnlyTerminalView: TerminalView {
     /// the live bottom — and is a harmless no-op when there is nothing to
     /// scroll, so callers can invoke it after every feed while pinned.
     func scrollToLiveBottom() {
+        prepareForDiscreteScrollInput()
         scroll(toPosition: 1)
         updateSemanticDecorations()
     }
@@ -2764,9 +3210,13 @@ class ReadOnlyTerminalView: TerminalView {
         scrollingDeltaY: CGFloat,
         now: TimeInterval = ProcessInfo.processInfo.systemUptime
     ) -> Bool {
+        let atContinuousTop = continuousScrollState.map {
+            $0.projection.boundedPosition <= 0
+        } ?? true
         guard scrollingDeltaY > 0,
               canScroll,
               getTerminal().getTopVisibleRow() == 0,
+              atContinuousTop,
               let onHistoryBoundary,
               now - lastHistoryBoundaryRequestAt >= Self.historyBoundaryRequestCooldown else {
             return false
@@ -2779,6 +3229,54 @@ class ReadOnlyTerminalView: TerminalView {
     override func isAccessibilityElement() -> Bool { true }
     override func accessibilityRole() -> NSAccessibility.Role? { .textArea }
     override func accessibilityValue() -> Any? { accessibilityTextSnapshot() }
+
+    override func accessibilityCustomActions() -> [NSAccessibilityCustomAction]? {
+        var actions = super.accessibilityCustomActions() ?? []
+        guard canScroll, !getTerminal().isCurrentBufferAlternate else { return actions }
+        actions.append(accessibilityPageUpAction)
+        actions.append(accessibilityPageDownAction)
+        return actions
+    }
+
+    /// VoiceOver's increment/decrement actions share the exact same discrete
+    /// page route as Page Down/Page Up and the native scroller. The scrollbar
+    /// remains a real NSScroller child, while the terminal keeps its text-area
+    /// role and bounded, parser-derived value.
+    override func accessibilityPerformDecrement() -> Bool {
+        guard canScroll, !getTerminal().isCurrentBufferAlternate else { return false }
+        let before = getTerminal().getTopVisibleRow()
+        prepareForDiscreteScrollInput()
+        TerminalScrollGestureMonitor.noteAccessibilityGesture(
+            view: self,
+            scrollingUpward: true
+        )
+        pageUp()
+        let moved = getTerminal().getTopVisibleRow() != before
+        if moved { NSAccessibility.post(element: self, notification: .valueChanged) }
+        return moved
+    }
+
+    override func accessibilityPerformIncrement() -> Bool {
+        guard canScroll, !getTerminal().isCurrentBufferAlternate else { return false }
+        let before = getTerminal().getTopVisibleRow()
+        prepareForDiscreteScrollInput()
+        TerminalScrollGestureMonitor.noteAccessibilityGesture(
+            view: self,
+            scrollingUpward: false
+        )
+        pageDown()
+        let moved = getTerminal().getTopVisibleRow() != before
+        if moved { NSAccessibility.post(element: self, notification: .valueChanged) }
+        return moved
+    }
+
+    @objc private func performAccessibilityPageUp() -> Bool {
+        accessibilityPerformDecrement()
+    }
+
+    @objc private func performAccessibilityPageDown() -> Bool {
+        accessibilityPerformIncrement()
+    }
 
     private func accessibilityTextSnapshot() -> String {
         let terminal = getTerminal()
@@ -2914,6 +3412,9 @@ enum TerminalScrollGestureMonitor {
                     view = activeScrollerGestureView
                 }
                 if let view, event.window === view.window {
+                    if event.type == .leftMouseDown {
+                        view.prepareForDiscreteScrollInput()
+                    }
                     recordGesture(view: view, at: event.timestamp, scrollingUpward: false)
                 }
                 if event.type == .leftMouseUp {
@@ -2945,13 +3446,38 @@ enum TerminalScrollGestureMonitor {
             if let view = terminalView(for: event),
                (event.type != .keyDown || scrollKeyCodes.contains(event.keyCode)) {
                 if event.type == .scrollWheel {
+                    let routesToNativeScrollback = view.wheelUsesNativeScrollback(event)
                     recordGesture(
                         view: view,
                         at: event.timestamp,
                         scrollingUpward: event.scrollingDeltaY > 0
-                            && view.wheelUsesNativeScrollback(event)
+                            && routesToNativeScrollback
                     )
+                    // SwiftTerm's macOS `scrollWheel(with:)` is non-open and
+                    // row-quantized. Consume only precise normal-buffer samples;
+                    // alternate screens and app mouse reporting continue into
+                    // SwiftTerm byte-for-byte unchanged.
+                    let handledContinuously = view.handleContinuousScroll(
+                        scrollingDeltaY: event.scrollingDeltaY,
+                        hasPreciseScrollingDeltas: event.hasPreciseScrollingDeltas,
+                        phase: event.phase,
+                        momentumPhase: event.momentumPhase,
+                        routesToNativeScrollback: routesToNativeScrollback
+                    )
+                    if !handledContinuously,
+                       !event.hasPreciseScrollingDeltas || !routesToNativeScrollback {
+                        view.prepareForDiscreteScrollInput()
+                    }
+                    // SwiftTerm uses positive `scrollingDeltaY` for upward
+                    // movement. The history seam is checked against the exact
+                    // fractional position, not merely integer row zero.
+                    _ = view.requestHistoryBeyondTop(
+                        scrollingDeltaY: event.scrollingDeltaY,
+                        now: event.timestamp
+                    )
+                    if handledContinuously { return nil }
                 } else if event.type == .keyDown {
+                    view.prepareForDiscreteScrollInput()
                     recordGesture(
                         view: view,
                         at: event.timestamp,
@@ -2964,17 +3490,7 @@ enum TerminalScrollGestureMonitor {
                         scrollingUpward: false
                     )
                 }
-                if event.type == .scrollWheel {
-                    // SwiftTerm uses positive `scrollingDeltaY` for upward
-                    // movement. The monitor runs before its non-open
-                    // `scrollWheel(with:)`, so a gesture that first reaches row
-                    // zero stays in the terminal; only the next upward event
-                    // crosses into the paged history surface.
-                    _ = view.requestHistoryBeyondTop(
-                        scrollingDeltaY: event.scrollingDeltaY,
-                        now: event.timestamp
-                    )
-                } else if event.type == .keyDown, event.keyCode == 116 {
+                if event.type == .keyDown, event.keyCode == 116 {
                     // Page Up is SwiftTerm's keyboard scrollback route.
                     // Repeating it at row zero should cross the same history
                     // seam as a continued trackpad gesture. Home/End are sent
@@ -3015,6 +3531,20 @@ enum TerminalScrollGestureMonitor {
         lastGestureTimestamp = timestamp ?? ProcessInfo.processInfo.systemUptime
         lastGestureView = view
         lastGestureWasUpward = scrollingUpward
+    }
+
+    /// Accessibility actions are genuine user navigation even though they do
+    /// not pass through NSEvent. Attribute them to the same sticky-scroll lane
+    /// so streamed output cannot immediately undo a VoiceOver page movement.
+    static func noteAccessibilityGesture(
+        view: ReadOnlyTerminalView,
+        scrollingUpward: Bool
+    ) {
+        recordGesture(
+            view: view,
+            at: ProcessInfo.processInfo.systemUptime,
+            scrollingUpward: scrollingUpward
+        )
     }
 
     static func resetForTesting() {

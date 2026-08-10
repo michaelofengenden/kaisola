@@ -148,7 +148,7 @@ struct AcpChatView: View {
             Text(conversation.title).font(.subheadline.weight(.medium))
             if conversation.isRunning {
                 ProgressView().controlSize(.small)
-                Text("Working…").font(.caption).foregroundStyle(.secondary)
+                Text("Working…").font(.caption).foregroundStyle(.kaisolaSecondary)
             }
             Spacer()
             sessionControls
@@ -210,7 +210,7 @@ struct AcpChatView: View {
                 isPresented: Binding(get: { restoreTarget != nil }, set: { if !$0 { restoreTarget = nil } })
             ) {
                 Button("Restore Files", role: .destructive) {
-                    if let restoreTarget { conversation.restoreCheckpoint(restoreTarget.id) }
+                    if let restoreTarget { conversation.restoreCheckpoint(restoreTarget) }
                     restoreTarget = nil
                 }
                 Button("Cancel", role: .cancel) { restoreTarget = nil }
@@ -221,12 +221,12 @@ struct AcpChatView: View {
         if let usage = conversation.usage {
             Text("\(usage.used / 1000)k / \(usage.max / 1000)k")
                 .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             if let amount = usage.costAmount,
                let cost = UsageCenter.costLabel(amount: amount, currency: usage.costCurrency) {
                 Text(cost)
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .help("Cumulative cost reported by this agent session")
                     .accessibilityLabel("Session cost \(cost)")
             }
@@ -243,7 +243,7 @@ struct AcpChatView: View {
                                 ProgressView().controlSize(.small)
                                 Text(loadingEarlierRows ? "Loading earlier messages…" : "Earlier messages")
                                     .font(.caption)
-                                    .foregroundStyle(.secondary)
+                                    .foregroundStyle(.kaisolaSecondary)
                             }
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 6)
@@ -272,7 +272,7 @@ struct AcpChatView: View {
                         } else if transcriptIsReady, !conversation.rows.isEmpty {
                             Label("Beginning of session", systemImage: "checkmark.circle")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .frame(maxWidth: .infinity)
                                 .padding(.vertical, 6)
                                 .accessibilityLabel("Beginning of session history")
@@ -280,7 +280,7 @@ struct AcpChatView: View {
                         if let status = conversation.statusMessage {
                             Label(status, systemImage: "exclamationmark.triangle")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                         }
                         ForEach(conversation.visibleRows) { row in
                             TranscriptRowView(
@@ -376,7 +376,7 @@ struct AcpChatView: View {
                 HStack(spacing: 8) {
                     Label("Agent disconnected — your draft and queued follow-ups are preserved.", systemImage: "bolt.slash")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     Spacer()
                     if conversation.canRestart {
                         Button(conversation.queued.isEmpty ? "Restart" : "Restart & Resume") {
@@ -404,7 +404,7 @@ struct AcpChatView: View {
                         } label: {
                             HStack(spacing: 8) {
                                 Text("/\(command.name)").font(.caption.monospaced().weight(.semibold))
-                                Text(command.description).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                                Text(command.description).font(.caption).foregroundStyle(.kaisolaSecondary).lineLimit(1)
                                 Spacer()
                             }
                             .contentShape(Rectangle())
@@ -483,17 +483,17 @@ struct AcpChatView: View {
                 ForEach(conversation.pendingAttachments) { attachment in
                     HStack(spacing: 6) {
                         Image(systemName: attachment.iconName)
-                            .font(.caption2).foregroundStyle(.secondary)
+                            .font(.caption2).foregroundStyle(.kaisolaSecondary)
                         Text(attachment.name).font(.caption).lineLimit(1)
                         Text(byteLabel(attachment.byteSize))
-                            .font(.caption2).foregroundStyle(.secondary)
+                            .font(.caption2).foregroundStyle(.kaisolaSecondary)
                         Button {
                             conversation.removeAttachment(attachment.id)
                         } label: {
                             Image(systemName: "xmark.circle.fill").font(.caption2)
                         }
                         .buttonStyle(.borderless)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .help("Remove this attachment")
                     }
                     .padding(.horizontal, 8).padding(.vertical, 4)
@@ -538,7 +538,7 @@ struct AcpChatView: View {
                 HStack(spacing: 8) {
                     Text("\(conversation.queued.count) preserved follow-up\(conversation.queued.count == 1 ? "" : "s")")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     Spacer()
                     Button("Resume All") {
                         conversation.resumeQueuedFollowUps()
@@ -552,7 +552,7 @@ struct AcpChatView: View {
             }
             ForEach(conversation.queued) { message in
                 HStack(spacing: 6) {
-                    Image(systemName: "clock").font(.caption2).foregroundStyle(.secondary)
+                    Image(systemName: "clock").font(.caption2).foregroundStyle(.kaisolaSecondary)
                     Text(message.text).font(.caption).lineLimit(1)
                     Spacer()
                     // Identified so the row's own contents, and whether it is
@@ -580,7 +580,7 @@ struct AcpChatView: View {
                         Image(systemName: "xmark.circle.fill").font(.caption2)
                     }
                     .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .disabled(conversation.injectingQueuedIDs.contains(message.id))
                     .help("Remove this queued follow-up")
                     .accessibilityIdentifier("acp.queued.\(message.id).remove")
@@ -705,17 +705,17 @@ struct TranscriptRowView: View {
                 )
                 Text(bounded.text)
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .textSelection(.enabled)
                 if bounded.isTruncated {
                     Text("Thinking output truncated in this view")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
             } label: {
                 Label("Thinking", systemImage: "brain")
                     .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
         case let .tool(call):
             ToolCallCard(
@@ -805,7 +805,7 @@ struct ToolCallCard: View {
                     call.locations.joined(separator: ", "),
                     workspaceURL: workspaceURL
                 ))
-                    .font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                    .font(.caption).foregroundStyle(.kaisolaSecondary).lineLimit(1)
             }
 
             if expanded {
@@ -836,9 +836,9 @@ struct ToolCallCard: View {
             Spacer()
             if hasArtifacts {
                 Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                    .font(.caption2).foregroundStyle(.secondary)
+                    .font(.caption2).foregroundStyle(.kaisolaSecondary)
             }
-            Text(call.kind).font(.caption).foregroundStyle(.secondary)
+            Text(call.kind).font(.caption).foregroundStyle(.kaisolaSecondary)
         }
         .contentShape(Rectangle())
     }
@@ -853,7 +853,7 @@ struct ToolCallCard: View {
 
     private var statusColor: Color {
         switch call.status {
-        case .pending, .inProgress: .secondary
+        case .pending, .inProgress: .kaisolaSecondary
         case .completed: .green
         case .failed: .red
         }
@@ -915,7 +915,7 @@ private struct ToolTextArtifact: View {
             if rendered.isTruncated {
                 Text("A bounded prefix is shown; the complete tool output remains available.")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.horizontal, 8)
                     .padding(.bottom, 6)
             }
@@ -926,29 +926,117 @@ private struct ToolTextArtifact: View {
 
 /// Live output of an agent-spawned terminal inside a tool card: polls the
 /// AcpTerminalHost snapshot until the process exits.
+@MainActor
+final class AcpTerminalContentModel: ObservableObject {
+    enum Status: Equatable {
+        case running
+        case exited(String)
+        case unavailable
+
+        var label: String {
+            switch self {
+            case .running: "Running…"
+            case let .exited(label): label
+            case .unavailable: "Terminal output unavailable"
+            }
+        }
+    }
+
+    @Published private(set) var output = ""
+    @Published private(set) var outputIsTruncated = false
+    @Published private(set) var status: Status = .running
+
+    private let pollIntervalNanoseconds: UInt64
+    private var activeTerminalID: String?
+    private var pollGeneration: UInt64 = 0
+
+    init(pollIntervalNanoseconds: UInt64 = 700_000_000) {
+        self.pollIntervalNanoseconds = pollIntervalNanoseconds
+    }
+
+    func poll(
+        terminalID: String,
+        snapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
+    ) async {
+        pollGeneration &+= 1
+        let generation = pollGeneration
+        if activeTerminalID != terminalID {
+            activeTerminalID = terminalID
+            output = ""
+            outputIsTruncated = false
+        }
+        status = .running
+
+        while !Task.isCancelled {
+            let next = await snapshot?(terminalID)
+            guard !Task.isCancelled, pollGeneration == generation else { return }
+            guard let next else {
+                status = .unavailable
+                return
+            }
+
+            let bounded = AcpChatRendering.bounded(
+                next.output,
+                characterLimit: AcpChatRendering.toolCharacterLimit,
+                lineLimit: AcpChatRendering.toolLineLimit
+            )
+            output = bounded.text
+            outputIsTruncated = next.truncated || bounded.isTruncated
+            if let exitStatus = next.exitStatus {
+                status = .exited(
+                    exitStatus.exitCode.map { "Exited (\($0))" }
+                        ?? exitStatus.signal.map { "Killed (\($0))" }
+                        ?? "Exited"
+                )
+                return
+            }
+
+            if pollIntervalNanoseconds == 0 {
+                await Task.yield()
+            } else {
+                do {
+                    try await Task.sleep(nanoseconds: pollIntervalNanoseconds)
+                } catch {
+                    return
+                }
+            }
+        }
+    }
+
+    /// Invalidates an in-flight provider call that may ignore task cancellation.
+    func invalidate() {
+        pollGeneration &+= 1
+    }
+}
+
 struct TerminalContentView: View {
     let terminalID: String
     var snapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
-    @State private var output = ""
-    @State private var outputIsTruncated = false
-    @State private var exitText: String?
+    @StateObject private var model = AcpTerminalContentModel()
+    @State private var retryGeneration: UInt64 = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 6) {
                 Image(systemName: "terminal").font(.caption2)
-                Text(exitText ?? "Running…").font(.caption2)
+                Text(model.status.label).font(.caption2)
                 Spacer()
+                if model.status == .unavailable {
+                    Button {
+                        retryGeneration &+= 1
+                    } label: {
+                        Label("Retry", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption2.weight(.semibold))
+                    .help("Try to load this terminal's output again")
+                }
             }
-            .foregroundStyle(
-                exitText == nil
-                    ? KaisolaStatusTone.working.foregroundColor
-                    : Color.secondary
-            )
+            .foregroundStyle(statusColor)
             .padding(.horizontal, 8).padding(.vertical, 5)
             .background(.quaternary.opacity(0.6))
             ScrollView {
-                Text(output.isEmpty ? " " : output)
+                Text(model.output.isEmpty ? " " : model.output)
                     .font(.system(.caption, design: .monospaced))
                     .textSelection(.enabled)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -956,35 +1044,43 @@ struct TerminalContentView: View {
             }
             .frame(maxHeight: 180)
             .background(.black.opacity(0.18))
-            if outputIsTruncated {
+            if model.status == .unavailable {
+                Text("No snapshot was returned for \(terminalID). The terminal may have been released or its output evicted.")
+                    .font(.caption2)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+            }
+            if model.outputIsTruncated {
                 Text("Earlier terminal output truncated in this view")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 4)
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 6))
         .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
-        .task(id: terminalID) {
-            while !Task.isCancelled {
-                guard let snap = await snapshot?(terminalID) else { break }
-                let bounded = AcpChatRendering.bounded(
-                    snap.output,
-                    characterLimit: AcpChatRendering.toolCharacterLimit,
-                    lineLimit: AcpChatRendering.toolLineLimit
-                )
-                output = bounded.text
-                outputIsTruncated = bounded.isTruncated
-                if let status = snap.exitStatus {
-                    exitText = status.exitCode.map { "Exited (\($0))" }
-                        ?? status.signal.map { "Killed (\($0))" }
-                        ?? "Exited"
-                    break
-                }
-                try? await Task.sleep(nanoseconds: 700_000_000)
-            }
+        .task(id: PollIdentity(terminalID: terminalID, retryGeneration: retryGeneration)) {
+            await model.poll(terminalID: terminalID, snapshot: snapshot)
         }
+        .onDisappear {
+            model.invalidate()
+        }
+    }
+
+    private var statusColor: Color {
+        switch model.status {
+        case .running: KaisolaStatusTone.working.foregroundColor
+        case .unavailable: KaisolaStatusTone.needsYou.foregroundColor
+        case .exited: .kaisolaSecondary
+        }
+    }
+
+    private struct PollIdentity: Hashable {
+        let terminalID: String
+        let retryGeneration: UInt64
     }
 }
 
@@ -1033,7 +1129,7 @@ struct DiffView: View {
                 }
                 .buttonStyle(.plain)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .help(sideBySide ? "Unified view" : "Side-by-side view")
             }
             .padding(.horizontal, 8).padding(.vertical, 5)
@@ -1052,7 +1148,7 @@ struct DiffView: View {
                             systemImage: "ellipsis.rectangle"
                         )
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     }
                     HStack(spacing: 10) {
                         if boundedOld.isTruncated || boundedNew.isTruncated {
@@ -1184,7 +1280,7 @@ struct PlanCard: View {
                         .foregroundStyle(
                             entry.status == "completed"
                                 ? KaisolaStatusTone.done.foregroundColor
-                                : Color.secondary
+                                : Color.kaisolaSecondary
                         )
                     Text(entry.content).strikethrough(entry.status == "completed")
                     Spacer()
@@ -1233,7 +1329,7 @@ struct AcpPermissionBar: View {
                 if pendingCount > 1 {
                     Text("\(pendingCount - 1) more permission request\(pendingCount == 2 ? "" : "s") queued")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .multilineTextAlignment(.trailing)
                 }
             }
@@ -1251,7 +1347,7 @@ struct AcpPermissionBar: View {
                 if review.rawInputIsTitleFallback {
                     Text("This adapter did not provide ACP rawInput; the exact title above is the only request payload available.")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 }
             }
 
@@ -1259,7 +1355,7 @@ struct AcpPermissionBar: View {
                 if review.paths.isEmpty {
                     Text("None declared by the adapter.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 } else {
                     ScrollView([.horizontal, .vertical]) {
                         VStack(alignment: .leading, spacing: 3) {
@@ -1284,7 +1380,7 @@ struct AcpPermissionBar: View {
                     ruleScopeRow("Resource", review.ruleScope.resource)
                     Text("Future requests must match all three fields.")
                         .font(.caption2)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                 } else {
                     Text(ruleUnavailableReason)
                         .font(.caption)
@@ -1296,7 +1392,7 @@ struct AcpPermissionBar: View {
                 let labels = review.omittedOptions.map { "\($0.name) [\($0.kind)]" }.joined(separator: ", ")
                 Text("Additional adapter choices not exposed: \(labels). Kaisola offers only scoped local persistence and one-time wire decisions.")
                     .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .textSelection(.enabled)
             }
 
@@ -1372,7 +1468,7 @@ struct AcpPermissionBar: View {
         VStack(alignment: .leading, spacing: 5) {
             Text(title)
                 .font(.caption.weight(.semibold))
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1382,7 +1478,7 @@ struct AcpPermissionBar: View {
         VStack(alignment: .leading, spacing: 1) {
             Text(label)
                 .font(.caption2)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
             Text(value)
                 .font(.caption.monospaced())
                 .textSelection(.enabled)

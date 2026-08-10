@@ -27,7 +27,8 @@ test('selection is deterministic regardless of changed-file order and duplicates
     'scripts/native-mcp-registry.cjs',
   ])
   assert.deepEqual(forward.native.selectors, [
-    'CodeEditorViewTests', 'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+    'CodeEditorViewTests', 'DataPreviewsTests', 'PDFPreviewBudgetTests',
+    'SyntaxHighlighterTests', 'WorkspaceFilesTests',
   ])
   assert.deepEqual(forward.node.files, ['tests/node/nativeMcpRegistry.test.cjs'])
   assert.equal(forward.fallback, false)
@@ -165,7 +166,7 @@ test('extracted preview units retain the complete preview contract lane', () => 
 
   assert.equal(plan.native.mode, 'focused')
   assert.deepEqual(plan.native.selectors, [
-    'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+    'DataPreviewsTests', 'PDFPreviewBudgetTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
   ])
   assert.equal(plan.node.mode, 'none')
   assert.equal(plan.fallback, false)
@@ -183,6 +184,46 @@ test('confined editor sources select bridge, bundle, and workspace contracts', (
   assert.deepEqual(plan.native.selectors, ['CodeEditorViewTests', 'WorkspaceFilesTests'])
   assert.deepEqual(plan.node.files, ['tests/node/codeEditorBundle.test.cjs'])
   assert.equal(plan.fallback, false)
+})
+
+test('custom ACP containment sources select launch and approval contracts', () => {
+  const plan = selector.planForChanges([
+    'native/KaisolaMac/Kaisola/Acp/AcpAdapterResolver.swift',
+    'native/KaisolaMac/Kaisola/Acp/AdapterInstallManager.swift',
+    'native/KaisolaMac/Kaisola/Acp/CustomAdapterContainment.swift',
+    'native/KaisolaMac/Kaisola/Broker/CustomAgentStore.swift',
+    'native/KaisolaMac/Kaisola/Features/Settings/CustomAgentsSection.swift',
+  ], inventory)
+
+  assert.equal(plan.native.mode, 'focused')
+  assert.deepEqual(plan.native.selectors, ['AcpClientTests', 'CustomAgentStoreTests'])
+  assert.equal(plan.node.mode, 'none')
+  assert.equal(plan.fallback, false)
+})
+
+test('terminal theme persistence and settings retain recovery contracts', () => {
+  const expectations = [
+    [
+      'native/KaisolaMac/Kaisola/Features/Sessions/CustomThemeStore.swift',
+      ['ExtensionsSettingsHubTests', 'TerminalThemeRegistryTests'],
+    ],
+    [
+      'native/KaisolaMac/Kaisola/Features/Settings/ExtensionsSettingsHub.swift',
+      ['ExtensionsSettingsHubTests'],
+    ],
+    [
+      'native/KaisolaMac/Kaisola/Features/Settings/ExtensionsSettingsModel.swift',
+      ['ExtensionsSettingsHubTests'],
+    ],
+  ]
+
+  for (const [file, selectors] of expectations) {
+    const plan = selector.planForChanges([file], inventory)
+    assert.equal(plan.native.mode, 'focused')
+    assert.deepEqual(plan.native.selectors, selectors)
+    assert.equal(plan.node.mode, 'none')
+    assert.equal(plan.fallback, false)
+  }
 })
 
 test('broker and shared wire changes expand to the reproducible contract lane', () => {
@@ -245,7 +286,8 @@ test('CLI accepts explicit files and emits the same machine-readable plan', () =
   assert.equal(result.status, 0, result.stderr)
   const plan = JSON.parse(result.stdout)
   assert.deepEqual(plan.native.selectors, [
-    'CodeEditorViewTests', 'DataPreviewsTests', 'SyntaxHighlighterTests', 'WorkspaceFilesTests',
+    'CodeEditorViewTests', 'DataPreviewsTests', 'PDFPreviewBudgetTests',
+    'SyntaxHighlighterTests', 'WorkspaceFilesTests',
   ])
   assert.equal(plan.node.mode, 'none')
 })
@@ -268,7 +310,7 @@ test('changed-file runner prints a plan without invoking xcodebuild in dry-run m
   ], { cwd: repoRoot, encoding: 'utf8' })
 
   assert.equal(result.status, 0, result.stderr)
-  assert.match(result.stdout, /Native tests \(focused\): CodeEditorViewTests, DataPreviewsTests, SyntaxHighlighterTests, WorkspaceFilesTests/u)
+  assert.match(result.stdout, /Native tests \(focused\): CodeEditorViewTests, DataPreviewsTests, PDFPreviewBudgetTests, SyntaxHighlighterTests, WorkspaceFilesTests/u)
   assert.match(result.stdout, /Dry run: no tests executed/u)
 })
 

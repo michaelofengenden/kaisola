@@ -300,7 +300,14 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.malformedResponse
         }
         params["busy"] = .bool(busy)
-        _ = try await request(.agentTurn, params: .object(params))
+        let result = try await request(.agentTurn, params: .object(params))
+        // The broker answers `{ok:false}` when the record is gone or predates
+        // activity tracking. Discarding that left the app believing a turn was
+        // protected while the broker still counted the terminal idle and
+        // eligible for rolling cutover, so the rejection has to travel.
+        guard result.objectValue?["ok"]?.boolValue == true else {
+            throw BrokerClientError.requestFailed("terminal.agentTurn")
+        }
     }
 
     func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {

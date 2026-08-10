@@ -1093,14 +1093,7 @@ final class WorkspaceMoveController: ObservableObject {
     @Published private(set) var isLoading = true
     @Published private(set) var phase: Phase = .choosing
     @Published private(set) var selectedPath: String?
-    @Published var searchText = "" {
-        didSet {
-            guard searchText != oldValue else { return }
-            // A narrowed list can hide the current pick; fall back to the
-            // first thing the user can actually see.
-            if selectedDirectory == nil { selectedPath = visibleDirectories.first?.path }
-        }
-    }
+    @Published var searchText = ""
 
     init(root: URL, item: FileNode) {
         self.root = root
@@ -1122,6 +1115,23 @@ final class WorkspaceMoveController: ObservableObject {
 
     var isMoving: Bool { phase == .moving }
 
+    /// Return and the Move button are inert until a row activation records an
+    /// explicit choice. Loading and filtering never manufacture that choice.
+    var canSubmit: Bool {
+        !isLoading && !isMoving && !isFinished && selectedDirectory != nil
+    }
+
+    /// The full project-relative choice spoken after pointer or keyboard row
+    /// activation. Read from the unfiltered directory set so changing search
+    /// text cannot silently change (or rename) the user's choice.
+    var selectionAnnouncement: String? {
+        guard let selectedPath,
+              let selected = directories.first(where: { $0.path == selectedPath }) else {
+            return nil
+        }
+        return "Selected move destination: \(destinationLabel(selected))"
+    }
+
     /// The one failure the user needs in front of them, shown in the sheet
     /// rather than in a toast behind it.
     var failureMessage: String? {
@@ -1133,8 +1143,9 @@ final class WorkspaceMoveController: ObservableObject {
     var isFinished: Bool { phase == .succeeded }
 
     func select(_ directory: URL) {
-        guard !isMoving else { return }
-        selectedPath = directory.path
+        let path = directory.standardizedFileURL.path
+        guard !isMoving, visibleDirectories.contains(where: { $0.path == path }) else { return }
+        selectedPath = path
         // The diagnostic described the previous destination.
         if case .failed = phase { phase = .choosing }
     }
@@ -1148,7 +1159,9 @@ final class WorkspaceMoveController: ObservableObject {
         }.value
         guard !Task.isCancelled else { return }
         directories = loaded
-        if selectedDirectory == nil { selectedPath = loaded.first?.path }
+        if let selectedPath, !loaded.contains(where: { $0.path == selectedPath }) {
+            self.selectedPath = nil
+        }
         isLoading = false
     }
 
@@ -1277,8 +1290,6 @@ private struct WorkspaceMoveSheet: View {
 
     private var visibleDirectories: [URL] { controller.visibleDirectories }
 
-    private var selectedDirectory: URL? { controller.selectedDirectory }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 4) {
@@ -1348,7 +1359,12 @@ private struct WorkspaceMoveSheet: View {
                                 .buttonStyle(.plain)
                                 .disabled(controller.isMoving)
                                 .accessibilityLabel("Move destination \(destinationLabel(directory))")
-                                .accessibilityValue(isSelected ? "Selected" : "Not selected")
+                                .accessibilityValue(
+                                    isSelected
+                                        ? "Selected. \(destinationLabel(directory))"
+                                        : "Not selected"
+                                )
+                                .accessibilityHint("Choose this folder as the move destination")
                             }
                         }
                         .padding(4)
@@ -1406,7 +1422,7 @@ private struct WorkspaceMoveSheet: View {
                     Task { await submit() }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(selectedDirectory == nil || controller.isLoading || controller.isMoving)
+                .disabled(!controller.canSubmit)
                 .accessibilityIdentifier("workspace.move.commit")
             }
         }
@@ -1415,6 +1431,9 @@ private struct WorkspaceMoveSheet: View {
         .interactiveDismissDisabled(controller.isMoving)
         .task(id: item.id) {
             await controller.loadDestinations()
+        }
+        .onChange(of: controller.selectedPath) { _, _ in
+            announceSelection()
         }
     }
 
@@ -1427,6 +1446,18 @@ private struct WorkspaceMoveSheet: View {
 
     private func destinationLabel(_ directory: URL) -> String {
         controller.destinationLabel(directory)
+    }
+
+    private func announceSelection() {
+        guard let announcement = controller.selectionAnnouncement else { return }
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: announcement,
+                .priority: NSAccessibilityPriorityLevel.medium.rawValue,
+            ]
+        )
     }
 }
 

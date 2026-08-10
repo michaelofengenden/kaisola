@@ -1652,6 +1652,8 @@ final class AcpConversation: ObservableObject {
         pendingDraftPersistence = nil
         draftPersistenceTask?.cancel()
         draftPersistenceTask = nil
+    }
+
     /// The latest visible assistant prose, deliberately excluding thought,
     /// tool, and plan rows that may follow it. The restored tail always contains
     /// the end of the conversation, so this remains bounded for paged chats.

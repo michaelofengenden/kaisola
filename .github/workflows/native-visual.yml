@@ -533,12 +533,14 @@ jobs:
             for shape in "$agents-min" "$agents-typical" "$agents-full" "$agents-typical-large-text"; do
               surface="mesh-$shape"
               capture="$output/$surface.png"
-              run_fixture "$surface" "$capture" \
+              log="$output/$surface.log"
+              run_fixture "$surface" "$capture" "$log" \
                 "$binary" -ApplePersistenceIgnoreState YES
               verify_capture "$capture" "$surface"
 
               capture="$output/dark-$surface.png"
-              run_fixture "$surface" "$capture" \
+              log="$output/dark-$surface.log"
+              run_fixture "$surface" "$capture" "$log" \
                 /usr/bin/env KAISOLA_NATIVE_VISUAL_APPEARANCE=dark "$binary"
               verify_capture "$capture" "$surface"
             done

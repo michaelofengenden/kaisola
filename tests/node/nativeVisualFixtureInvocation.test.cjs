@@ -23,3 +23,21 @@ test('non-Retina visual fixtures pass a writable log before the command', () => 
     /run_fixture "\$surface" "\$capture" "\$log" \\\n+\s+\/usr\/bin\/env KAISOLA_NATIVE_VISUAL_SCALE=1 "\$binary"/u,
   )
 })
+
+test('every visual fixture call passes a log argument before its command', () => {
+  const workflow = fs.readFileSync(
+    path.join(root, '.github/workflows/native-visual.yml'),
+    'utf8',
+  )
+  const invocations = workflow
+    .split(/\r?\n/u)
+    .filter((line) => line.trimStart().startsWith('run_fixture '))
+
+  assert.equal(invocations.length, 6)
+  for (const invocation of invocations) {
+    assert.match(
+      invocation,
+      /^\s*run_fixture\s+(?:"[^"]+"|\S+)\s+"?\$[A-Za-z_][A-Za-z0-9_]*"?\s+"?\$[A-Za-z_][A-Za-z0-9_]*"?(?:\s|$)/u,
+    )
+  }
+})

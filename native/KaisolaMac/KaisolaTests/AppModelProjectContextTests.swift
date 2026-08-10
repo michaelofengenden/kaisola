@@ -744,6 +744,46 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertFalse(persisted?.panes.contains(where: { $0.id == chat.id }) == true)
     }
 
+    /// A permanent delete may not announce itself while the transcript is
+    /// still on disk: an unwritable store has to come back as blocked.
+    @MainActor
+    func testPermanentChatDeleteReportsATranscriptItCouldNotErase() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let transcriptStore = AcpTranscriptStore(
+            fileURL: root.appendingPathComponent("transcripts.json")
+        )
+        // A directory standing where the database file belongs fails every
+        // open, so the DELETE can never commit.
+        try FileManager.default.createDirectory(
+            at: transcriptStore.databaseURL,
+            withIntermediateDirectories: true
+        )
+        let model = AppModel(
+            sessionStore: NativeSessionStore(fileURL: storeFile),
+            workspaceStateStore: NativeWorkspaceStateStore(
+                fileURL: root.appendingPathComponent("workspace-state-v1.json")
+            ),
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore)
+        )
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        let directory = root.appendingPathComponent("unerasable-chat-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        model.openChat(agent, inDirectory: directory)
+        let chat = try XCTUnwrap(model.chats.first)
+        XCTAssertTrue(model.closeChat(chat.id))
+
+        let deleteResult = await model.deleteRecentlyClosedSurface(
+            chat.id,
+            allowRecoverableWork: true
+        )
+        guard case let .blocked(message) = deleteResult else {
+            return XCTFail("expected a blocked delete, got \(deleteResult)")
+        }
+        XCTAssertTrue(message.contains("could not be erased"), message)
+    }
+
     @MainActor
     func testSwitchingProjectRestoresASurfaceInsideThatProject() async throws {
         let (model, _) = makeModel()

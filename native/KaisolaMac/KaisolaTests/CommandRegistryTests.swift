@@ -64,6 +64,112 @@ final class CommandRegistryTests: XCTestCase {
         )
     }
 
+    func testReadinessChecklistCommandIsPaletteOnlyAndMapsToPresentation() throws {
+        let definition = try XCTUnwrap(
+            AppCommandRegistry.definition(for: .readinessChecklist)
+        )
+
+        XCTAssertEqual(definition.title, "Readiness Checklist…")
+        XCTAssertEqual(definition.category, .help)
+        XCTAssertEqual(definition.systemImage, "checklist.checked")
+        XCTAssertEqual(definition.surfaces, [.palette])
+        XCTAssertNil(definition.defaultShortcut)
+        XCTAssertTrue(
+            AppCommandRegistry.paletteDefinitions.contains { $0.id == .readinessChecklist }
+        )
+        XCTAssertFalse(
+            AppCommandRegistry.keymapDefinitions.contains { $0.id == .readinessChecklist }
+        )
+        XCTAssertEqual(
+            RootShellLocalCommand(commandID: .readinessChecklist),
+            .presentReadinessChecklist
+        )
+    }
+
+    func testReadinessChecklistCommandTargetsExactWindowAndPreservesReadiness() throws {
+        let sessionStore = NativeSessionStore(
+            fileURL: temporaryDirectory.appendingPathComponent("native-sessions.json")
+        )
+        let model = AppModel(
+            brokerPreparer: BrokerFreeFixturePreparer(),
+            sessionStore: sessionStore,
+            workspaceStateStore: NativeWorkspaceStateStore(
+                fileURL: temporaryDirectory.appendingPathComponent("workspace-state.json")
+            )
+        )
+        let defaultsSuite = "kaisola-readiness-command-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: defaultsSuite))
+        defaults.removePersistentDomain(forName: defaultsSuite)
+        defer { defaults.removePersistentDomain(forName: defaultsSuite) }
+        OnboardingState.markSeen(defaults: defaults)
+        let projectStatusBefore = OnboardingReadiness.project(
+            directory: model.currentProjectDirectory
+        )
+        let terminalStatusBefore = OnboardingReadiness.terminalService(
+            connectionState: model.connectionState,
+            controlAvailable: model.controlAvailable
+        )
+        let routed = expectation(
+            forNotification: .kaisolaLocalCommand,
+            object: model
+        ) { note in
+            note.userInfo?[AppCommandNotificationKey.commandID] as? String
+                == AppCommandID.readinessChecklist.rawValue
+        }
+
+        XCTAssertTrue(
+            AppCommandRegistry.execute(
+                .readinessChecklist,
+                in: AppCommandContext(model: model)
+            )
+        )
+        wait(for: [routed], timeout: 1)
+
+        XCTAssertFalse(
+            OnboardingState.shouldShow(defaults: defaults),
+            "manual reopen must not reset the persisted first-run gate"
+        )
+        XCTAssertEqual(
+            OnboardingReadiness.project(directory: model.currentProjectDirectory),
+            projectStatusBefore
+        )
+        XCTAssertEqual(
+            OnboardingReadiness.terminalService(
+                connectionState: model.connectionState,
+                controlAvailable: model.controlAvailable
+            ),
+            terminalStatusBefore,
+            "presenting the checklist must not mutate the live readiness inputs"
+        )
+    }
+
+    func testPaletteSelectionIdentityFollowsFilteredItemInsteadOfReusedIndex() {
+        let original = PaletteItem(
+            id: "command.session.new-terminal",
+            title: "New Terminal Session",
+            subtitle: "Session",
+            systemImage: "terminal"
+        ) {}
+        let filtered = PaletteItem(
+            id: "command.app.readiness-checklist",
+            title: "Readiness Checklist…",
+            subtitle: "Help",
+            systemImage: "checklist.checked"
+        ) {}
+
+        XCTAssertEqual(
+            CommandPaletteResultIdentity.itemID(at: 0, in: [original]),
+            original.id
+        )
+        XCTAssertEqual(
+            CommandPaletteResultIdentity.itemID(at: 0, in: [filtered]),
+            filtered.id,
+            "result identity must change when filtering replaces index zero"
+        )
+        XCTAssertNotEqual(original.id, filtered.id)
+        XCTAssertNil(CommandPaletteResultIdentity.itemID(at: 1, in: [filtered]))
+    }
+
     func testDynamicIdentifiersRoundTripTheirTypedPayloads() {
         XCTAssertEqual(AppCommandID.newAgent("codex").agentID, "codex")
         XCTAssertEqual(AppCommandID.newChat("claude").chatAgentID, "claude")

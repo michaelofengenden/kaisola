@@ -106,16 +106,16 @@ enum OnboardingReadiness {
         checksAutomatically: Bool,
         pendingVersion: String?
     ) -> OnboardingReadinessStatus {
-        if let pendingVersion {
-            return .init(
-                kind: .needsAction,
-                detail: "Kaisola \(pendingVersion) is ready to install from Settings."
-            )
-        }
         guard canConfigure else {
             return .init(
                 kind: .information,
                 detail: "Update controls become available in a signed Kaisola build."
+            )
+        }
+        if let pendingVersion {
+            return .init(
+                kind: .needsAction,
+                detail: "Kaisola \(pendingVersion) is ready to install from Settings."
             )
         }
         return checksAutomatically
@@ -370,8 +370,15 @@ struct OnboardingView: View {
 
     private var controls: some View {
         HStack(spacing: 12) {
-            Button("Do This Later", action: dismiss)
-                .fixedSize()
+            HStack(spacing: 9) {
+                Button("Do This Later", action: dismiss)
+                    .fixedSize()
+                Text(OnboardingState.reopenInstruction)
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("onboarding.reopen-instruction")
+            }
             Spacer()
             Button(startButtonTitle, action: startFirstSession)
                 .keyboardShortcut(.defaultAction)
@@ -415,6 +422,8 @@ struct OnboardingView: View {
 /// setup flow once without disturbing the v1 record.
 enum OnboardingState {
     private static let seenKey = "onboardingSeen.v2"
+    static let reopenInstruction =
+        "Reopen anytime: press Command-K and choose Readiness Checklist…"
 
     static func shouldShow(defaults: UserDefaults = .standard) -> Bool {
         !defaults.bool(forKey: seenKey)

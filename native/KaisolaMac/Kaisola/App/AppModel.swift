@@ -270,6 +270,8 @@ final class AppModel: ObservableObject {
     private let transcriptStore: AcpTranscriptStore
     private let usageCenter: UsageCenter
     private let attentionCenter: AttentionCenter
+    private let chatDraftDefaults: UserDefaults
+    private let migratedChatDraftDefaults: UserDefaults?
     private let reconnectBackoff: BrokerReconnectBackoff
     private let sleep: @Sendable (UInt64) async throws -> Void
     private let jitter: @Sendable () -> Double
@@ -395,6 +397,10 @@ final class AppModel: ObservableObject {
         pinStore: SessionPinStore = SessionPinStore(),
         usageCenter: UsageCenter = .shared,
         attentionCenter: AttentionCenter = .shared,
+        chatDraftDefaults: UserDefaults = .standard,
+        migratedChatDraftDefaults: UserDefaults? = UserDefaults(
+            suiteName: KaisolaProductMigration.legacyBundleIdentifier
+        ),
         reconnectBackoff: BrokerReconnectBackoff = BrokerReconnectBackoff(),
         sleep: @escaping @Sendable (UInt64) async throws -> Void = {
             try await Task.sleep(nanoseconds: $0)
@@ -416,6 +422,8 @@ final class AppModel: ObservableObject {
         self.pinStore = pinStore
         self.usageCenter = usageCenter
         self.attentionCenter = attentionCenter
+        self.chatDraftDefaults = chatDraftDefaults
+        self.migratedChatDraftDefaults = migratedChatDraftDefaults
         self.reconnectBackoff = reconnectBackoff
         self.sleep = sleep
         self.jitter = jitter
@@ -2615,17 +2623,34 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func enqueueDraftRemoval(chatID: String) {
+    @discardableResult
+    private func enqueueDraftRemoval(chatID: String) -> Task<Void, Never> {
         enqueueDraftRemoval(stableKey: "chat|\(chatID)")
     }
 
-    private func enqueueDraftRemoval(stableKey: String) {
+    @discardableResult
+    private func enqueueDraftRemoval(stableKey: String) -> Task<Void, Never> {
         let previous = draftPersistenceTask
         let workspaceStateStore = workspaceStateStore
-        draftPersistenceTask = Task {
+        let removalTask = Task {
             await previous?.value
             try? await workspaceStateStore.removeDraft(stableKey: stableKey)
         }
+        draftPersistenceTask = removalTask
+        return removalTask
+    }
+
+    /// The durable deletion intent has already committed before this runs.
+    /// Serialize the workspace removal behind older saves, and synchronously
+    /// clear AcpConversation's current and migrated UserDefaults copies so no
+    /// superseded location can restore plaintext on relaunch.
+    private func removeChatDraftsAfterDeletionCommit(chatID: String) async {
+        AcpConversation.removePersistedDraft(
+            for: chatID,
+            currentDefaults: chatDraftDefaults,
+            migratedDefaults: migratedChatDraftDefaults
+        )
+        await enqueueDraftRemoval(chatID: chatID).value
     }
 
     private static func terminalDraftStableKey(_ terminalID: String) -> String {
@@ -3450,8 +3475,8 @@ final class AppModel: ObservableObject {
         // goes — the old forgetDurableChat gate could leave tombstoned
         // content on disk forever when usage bookkeeping said "shared".
         _ = forgetDurableChat
-        let removal = enqueueTranscriptRemoval(chatID: chatID)
-        enqueueDraftRemoval(chatID: chatID)
+        let removalResult = await enqueueTranscriptRemoval(chatID: chatID).value
+        await removeChatDraftsAfterDeletionCommit(chatID: chatID)
         // The workspace archive must reflect the deletion durably NOW, not
         // after a 220 ms debounce a crash can beat (§4e).
         if let projectID = closingChat?.projectID {
@@ -3460,7 +3485,6 @@ final class AppModel: ObservableObject {
         // The tombstone already keeps the chat closed, but a DELETE that never
         // committed left its bytes on disk. Say that instead of letting the
         // silent close read as a finished permanent delete.
-        let removalResult = await removal.value
         if let failure = removalResult.failureMessage {
             ToastCenter.shared.show(
                 "The chat is closed, but its transcript could not be erased from disk: \(failure)",
@@ -3920,11 +3944,11 @@ final class AppModel: ObservableObject {
             _ = removeRecentlyClosedPane(id: surfaceID)
             explicitlyClosedChatIDs.insert(surfaceID)
             usageCenter.remove(chatID: surfaceID)
-            let removal = enqueueTranscriptRemoval(chatID: surfaceID)
-            enqueueDraftRemoval(chatID: surfaceID)
+            let removalResult = await enqueueTranscriptRemoval(chatID: surfaceID).value
+            await removeChatDraftsAfterDeletionCommit(chatID: surfaceID)
             await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
             // "Permanently deleted" is only true once the DELETE commits.
-            if let failure = await removal.value.failureMessage {
+            if let failure = removalResult.failureMessage {
                 return .blocked(
                     "The chat left Recently Closed, but its transcript could not be erased: \(failure)"
                 )

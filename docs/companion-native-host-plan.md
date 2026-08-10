@@ -219,11 +219,13 @@ the ticket POST and never appears in the WebSocket URL.
 
 The host stores LAN and relay adapters behind `CompanionHostConnection`; both
 terminate in `CompanionConnectionSession`. There is still only one Noise XX
-handshake, device roster, capability gate, event log, command router, terminal
-stream hub, and control-lease manager. A virtual socket bounds bytes that race
-ahead of host installation and closes on overflow. Account sign-out and host
-disable stop Link and close every channel through the normal disconnect cleanup.
-The Settings surface reports nearby and Link state separately.
+handshake, account-partitioned device roster, capability gate, event log,
+command router, terminal stream hub, and control-lease manager. The active
+immutable account scope is authenticated in pairing and resume transcripts;
+sign-out or account change rotates every authority surface before a replacement
+host starts. A virtual socket bounds bytes that race ahead of host installation
+and closes on overflow. The Settings surface reports nearby and Link state
+separately.
 
 The combined authority suite is **75 passed, 1 explicit unsigned-Keychain skip,
 0 failed** across 76 tests
@@ -321,14 +323,17 @@ or the lease. All three are load-bearing on the shipped phone.
 - **Local-network TCC.** Deployment target is macOS 14 but 15+ enforces it, and
   a denied grant is not re-promptable in-session. Budget a "local network
   blocked" diagnostic state.
-- **Protocol is frozen at v1.** `CompanionEnvelope` rejects unknown fields, so
-  no envelope key can be added without breaking the shipped 0.3.9 client. Any
-  responder change must be additive.
-- **App Store.** LAN remains usable without an account, but optional Link uses
-  Firebase/Google sign-in and therefore needs the complete platform-login and
-  account-deletion review path before App Store submission. Expect review
-  friction on "remote terminal control"—have the capability model, live
-  indicator, sign-out teardown, and one-tap revoke flow demoable.
+- **Application envelopes remain frozen at v1.** `CompanionEnvelope` rejects
+  unknown fields. The pairing bootstrap now deliberately requires an opaque
+  account scope in QR offers, resume starts, and Noise prologues; unscoped legacy
+  rosters and phone tickets are not migrated and require a fresh pairing after
+  both apps upgrade.
+- **App Store.** Both LAN and Link pairing require the same restored
+  Firebase/Google account so local transport cannot outlive the app's account
+  authority. The complete platform-login and account-deletion review path is
+  therefore required before App Store submission. Expect review friction on
+  "remote terminal control"—have the capability model, live indicator, sign-out
+  teardown, account-switch isolation, and one-tap revoke flow demoable.
 
 ## Parallel account continuity, then Kaisola on the web
 

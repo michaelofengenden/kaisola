@@ -279,7 +279,8 @@ final class CompanionLinkClientTests: XCTestCase {
             displayName: "Relay iPhone"
         )
         let roster = try CompanionDeviceRosterStore(
-            fileURL: directory.appendingPathComponent("devices-v1.json")
+            fileURL: directory.appendingPathComponent("devices-v3.json"),
+            accountScope: try CompanionAccountScope(accountID: "link-client-test-account")
         )
         _ = try await roster.pair(
             peer: CompanionIdentityPin(
@@ -321,6 +322,7 @@ final class CompanionLinkClientTests: XCTestCase {
             "desktopId": .string(desktop.id),
             "deviceId": .string(device.id),
             "connectionId": .string(connectionID),
+            "accountScope": .string(roster.accountScope.rawValue),
         ])
         let initiator = try NoiseXXInitiator(
             identity: device,
@@ -336,6 +338,7 @@ final class CompanionLinkClientTests: XCTestCase {
             "type": .string("resume.start"),
             "deviceId": .string(device.id),
             "connectionId": .string(connectionID),
+            "accountScope": .string(roster.accountScope.rawValue),
             "message1": .string(try initiator.writeMessage1().base64URLEncodedString()),
         ]))
         await socket.receive(Data(start.prefix(5)))

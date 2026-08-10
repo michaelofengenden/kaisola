@@ -725,6 +725,19 @@ struct TranscriptRowView: View {
             )
         case let .plan(_, entries):
             PlanCard(entries: entries)
+        case let .permissionDecision(_, text):
+            Label {
+                Text(text)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            } icon: {
+                Image(systemName: "shield.slash")
+                    .foregroundStyle(.orange)
+            }
+            .padding(.vertical, 4)
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("acp.transcript.\(row.id)")
         }
     }
 }
@@ -1302,6 +1315,13 @@ struct AcpPermissionBar: View {
     let createRule: () -> Void
     var enablesKeyboardShortcuts = true
 
+    /// The exact payload stays one click away rather than in front of the
+    /// decision. Collapsed by default; the summary above already carries the
+    /// fields a reviewer needs.
+    @State private var showsRawPayload = false
+
+    private var summary: AcpPermissionSummary { review.summary }
+
     private var ruleUnavailableReason: String {
         review.allowOnceOptionID == nil
             ? "The adapter did not offer an exact one-time allow, so Kaisola cannot create a safe local rule."
@@ -1334,67 +1354,51 @@ struct AcpPermissionBar: View {
                 }
             }
 
-            inspectorSection(review.rawInputIsTitleFallback ? "Agent-provided request" : "Raw input") {
-                ScrollView([.horizontal, .vertical]) {
-                    Text(review.rawInput)
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                        .fixedSize(horizontal: true, vertical: true)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(minHeight: 34, maxHeight: 96, alignment: .topLeading)
-                .inspectorSurface()
-                if review.rawInputIsTitleFallback {
-                    Text("This adapter did not provide ACP rawInput; the exact title above is the only request payload available.")
-                        .font(.caption2)
-                        .foregroundStyle(.kaisolaSecondary)
-                }
-            }
+            // One vertical scroll for the whole reading, capped so a long ask
+            // can never push the decision buttons or the composer off-screen.
+            // `fixedSize` keeps a short card short instead of padding it to the
+            // cap; nothing inside scrolls, so there is no nested-scroll trap.
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 10) {
+                    summarySection
 
-            inspectorSection("Affected paths (\(review.paths.count))") {
-                if review.paths.isEmpty {
-                    Text("None declared by the adapter.")
-                        .font(.caption)
-                        .foregroundStyle(.kaisolaSecondary)
-                } else {
-                    ScrollView([.horizontal, .vertical]) {
-                        VStack(alignment: .leading, spacing: 3) {
-                            ForEach(Array(review.paths.enumerated()), id: \.offset) { _, path in
-                                Text(path)
-                                    .font(.caption.monospaced())
-                                    .textSelection(.enabled)
-                                    .fixedSize(horizontal: true, vertical: true)
-                            }
+                    pathsSection
+
+                    inspectorSection(allowsRule ? "Proposed standing rule" : "Standing rule unavailable") {
+                        if allowsRule {
+                            ruleScopeRow("Workspace", review.ruleScope.workspace)
+                            ruleScopeRow("Action", review.ruleScope.action)
+                            ruleScopeRow("Resource", review.ruleScope.resource)
+                            Text("Future requests must match all three fields.")
+                                .font(.caption2)
+                                .foregroundStyle(.kaisolaSecondary)
+                        } else {
+                            Text(ruleUnavailableReason)
+                                .font(.caption)
+                                .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
-                    .frame(minHeight: 24, maxHeight: 88, alignment: .topLeading)
-                    .inspectorSurface()
-                }
-            }
 
-            inspectorSection(allowsRule ? "Proposed standing rule" : "Standing rule unavailable") {
-                if allowsRule {
-                    ruleScopeRow("Workspace", review.ruleScope.workspace)
-                    ruleScopeRow("Action", review.ruleScope.action)
-                    ruleScopeRow("Resource", review.ruleScope.resource)
-                    Text("Future requests must match all three fields.")
-                        .font(.caption2)
-                        .foregroundStyle(.kaisolaSecondary)
-                } else {
-                    Text(ruleUnavailableReason)
-                        .font(.caption)
-                        .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
-                }
-            }
+                    if !review.omittedOptions.isEmpty {
+                        let labels = review.omittedOptions.map { "\($0.name) [\($0.kind)]" }.joined(separator: ", ")
+                        Text("Additional adapter choices not exposed: \(labels). Kaisola offers only scoped local persistence and one-time wire decisions.")
+                            .font(.caption2)
+                            .foregroundStyle(.kaisolaSecondary)
+                            .textSelection(.enabled)
+                            // Same wrapping rule as the summary: this sentence
+                            // names options the user is not being offered, so
+                            // it cannot end in an ellipsis.
+                            .fixedSize(horizontal: false, vertical: true)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
 
-            if !review.omittedOptions.isEmpty {
-                let labels = review.omittedOptions.map { "\($0.name) [\($0.kind)]" }.joined(separator: ", ")
-                Text("Additional adapter choices not exposed: \(labels). Kaisola offers only scoped local persistence and one-time wire decisions.")
-                    .font(.caption2)
-                    .foregroundStyle(.kaisolaSecondary)
-                    .textSelection(.enabled)
+                    rawPayloadInspector
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
+            .frame(maxHeight: 380)
+            .fixedSize(horizontal: false, vertical: true)
 
             HStack(spacing: 8) {
                 Spacer(minLength: 0)
@@ -1421,6 +1425,148 @@ struct AcpPermissionBar: View {
         .accessibilityHint(review.allowOnceOptionID == nil
             ? "Use Escape to deny this request"
             : "Use Return to allow once or Escape to deny")
+    }
+
+    /// The decision, in words, at the top of the card. Every row wraps, so a
+    /// narrow chat pane shows the whole command instead of a sideways fragment.
+    private var summarySection: some View {
+        inspectorSection("What this request does") {
+            Text(summary.headline)
+                .font(.callout.weight(.semibold))
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+            if !summary.concerns.isEmpty || !summary.escapingPaths.isEmpty {
+                alertRow(concernHeadline)
+            }
+
+            ForEach(summary.fields) { field in
+                summaryRow(field)
+            }
+
+            Text(summary.undeclaredLabels.isEmpty
+                ? AcpPermissionSummary.unflaggedIsNotSafeNote
+                : "The adapter did not declare: \(summary.undeclaredLabels.joined(separator: ", ")). \(AcpPermissionSummary.unflaggedIsNotSafeNote)")
+                .font(.caption2)
+                .foregroundStyle(.kaisolaSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private var concernHeadline: String {
+        let escaping = summary.escapingPaths.count
+        var parts = summary.concerns
+        if escaping > 0 {
+            parts.append("\(escaping) path\(escaping == 1 ? "" : "s") outside the workspace.")
+        }
+        return parts.joined(separator: " ")
+    }
+
+    private func summaryRow(_ field: AcpPermissionSummary.Field) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(field.label)
+                .font(.caption2)
+                .foregroundStyle(.kaisolaSecondary)
+            Text(field.text)
+                .font(field.isDeclared ? .caption.monospaced() : .caption)
+                .foregroundStyle(field.isDeclared ? Color.primary : Color.kaisolaSecondary)
+                .textSelection(.enabled)
+                // Wrapping, never sideways scrolling: a multiline command and a
+                // long Unicode path both stay readable at any pane width.
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            if let concern = field.concern {
+                alertRow(concern)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        // One element per field keeps VoiceOver reading label, value, then
+        // warning, in the order the card lays them out.
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            field.concern.map { "\(field.label): \(field.text). Warning: \($0)" }
+                ?? "\(field.label): \(field.text)"
+        )
+    }
+
+    private func alertRow(_ text: String) -> some View {
+        Label(text, systemImage: "exclamationmark.triangle.fill")
+            .font(.caption2)
+            .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityLabel("Warning: \(text)")
+    }
+
+    private var pathsSection: some View {
+        inspectorSection("Affected paths (\(summary.paths.count))") {
+            if summary.paths.isEmpty {
+                Text("None declared by the adapter. That is not a promise the request touches no files.")
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                // Every path in full. A clipped or half-cut path is exactly the
+                // misreading this card exists to prevent, so the list has no
+                // height of its own; the card's single scroll bounds it.
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(summary.paths.enumerated()), id: \.offset) { _, entry in
+                        pathRow(entry)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .inspectorSurface()
+            }
+        }
+    }
+
+    private func pathRow(_ entry: AcpPermissionSummary.PathEntry) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 5) {
+            if entry.leavesWorkspace {
+                Image(systemName: "arrow.up.forward.square.fill")
+                    .font(.caption2)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                    .accessibilityHidden(true)
+            }
+            Text(entry.path)
+                .font(.caption.monospaced())
+                .foregroundStyle(entry.leavesWorkspace ? KaisolaStatusTone.failed.foregroundColor : Color.primary)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(entry.leavesWorkspace ? "\(entry.path), outside the workspace" : entry.path)
+    }
+
+    /// The payload, byte for byte, still selectable — just no longer the first
+    /// thing a time-pressed reviewer has to decode.
+    private var rawPayloadInspector: some View {
+        DisclosureGroup(isExpanded: $showsRawPayload) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(review.rawInput)
+                    .font(.caption.monospaced())
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .inspectorSurface()
+                if review.rawInputIsTitleFallback {
+                    Text("This adapter did not provide ACP rawInput; the exact title above is the only request payload available.")
+                        .font(.caption2)
+                        .foregroundStyle(.kaisolaSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.top, 5)
+        } label: {
+            Text(review.rawInputIsTitleFallback
+                ? "Exact agent-provided request"
+                : "Exact raw input (unmodified JSON)")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.kaisolaSecondary)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     @ViewBuilder

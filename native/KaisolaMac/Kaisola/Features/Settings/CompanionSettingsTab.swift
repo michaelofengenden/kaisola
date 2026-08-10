@@ -3,12 +3,40 @@ import CoreImage.CIFilterBuiltins
 import KaisolaCore
 import SwiftUI
 
+struct CompanionPairingCodePresentation: Equatable, Sendable {
+    let code: String
+
+    var title: String { "Single-use pairing code" }
+    var displayValue: String { code }
+    var copyValue: String { code }
+    var accessibilityValue: String { code }
+
+    func qrFallbackMessage(qrCodeAvailable: Bool) -> String? {
+        qrCodeAvailable
+            ? nil
+            : "QR code unavailable. Copy or select the pairing code instead."
+    }
+}
+
+enum CompanionPairingOfferAccessibility {
+    static let group = "companion.pairing-offer"
+    static let code = group + ".code"
+    static let qrCode = group + ".qr-code"
+    static let qrFallback = group + ".qr-fallback"
+    static let copy = group + ".copy"
+    static let cancel = group + ".cancel"
+    static let allControlIdentifiers = [code, qrCode, copy, cancel]
+}
+
 struct CompanionSettingsTab: View {
     @ObservedObject private var host = CompanionHost.shared
     @StateObject private var offerActivation = CompanionPairingOfferActivation()
+    @StateObject private var confirmationActivation = CompanionPairingConfirmationActivation()
+    @State private var allowsAgentControl = false
     @State private var allowsTerminalControl = false
     @State private var operationError: String?
     @State private var pendingRevocation: CompanionPairedDeviceRecord?
+    @State private var capabilityUpdates: Set<String> = []
 
     var body: some View {
         ScrollView {
@@ -66,8 +94,19 @@ struct CompanionSettingsTab: View {
                 if case .ready = host.state {
                     SettingsCard(title: "Pair a Device", symbol: "qrcode") {
                         SettingsRow(
+                            title: "Allow agent control",
+                            detail: "Lets this phone message, stop, and approve agents",
+                            symbol: "bubble.left.and.bubble.right"
+                        ) {
+                            Toggle("", isOn: $allowsAgentControl)
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                                .accessibilityLabel("Allow agent control")
+                        }
+                        SettingsDivider()
+                        SettingsRow(
                             title: "Allow terminal control",
-                            detail: "Off gives this phone view-only access",
+                            detail: "Lets this phone type into shells running as you",
                             symbol: "keyboard"
                         ) {
                             Toggle("", isOn: $allowsTerminalControl)
@@ -76,63 +115,121 @@ struct CompanionSettingsTab: View {
                                 .accessibilityLabel("Allow terminal control")
                         }
                         SettingsDivider()
-                        HStack {
-                            VStack(alignment: .leading, spacing: 3) {
-                                Text(offerTitle)
-                                    .font(.callout.weight(.medium))
-                                Text("Scan on iPhone, or copy the code into kaisola.com/app.")
-                                    .font(.caption)
-                                    .foregroundStyle(.kaisolaSecondary)
-                            }
-                            Spacer()
-                            if host.pairingCode == nil {
-                                Button { createOffer() } label: {
-                                    if offerActivation.isCreating {
-                                        HStack(spacing: 5) {
-                                            ProgressView().controlSize(.mini)
-                                            Text("Creating…")
+                        VStack(spacing: 0) {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(offerTitle)
+                                        .font(.callout.weight(.medium))
+                                    Text("Scan on iPhone, or copy the code into kaisola.com/app.")
+                                        .font(.caption)
+                                        .foregroundStyle(.kaisolaSecondary)
+                                }
+                                Spacer()
+                                if host.pairingCode == nil {
+                                    Button { createOffer() } label: {
+                                        if offerActivation.isCreating {
+                                            HStack(spacing: 5) {
+                                                ProgressView().controlSize(.mini)
+                                                Text("Creating…")
+                                            }
+                                        } else {
+                                            Text("Pair New Device")
                                         }
-                                    } else {
-                                        Text("Pair New Device")
                                     }
-                                }
-                                .buttonStyle(.borderedProminent)
-                                .controlSize(.small)
-                                .disabled(offerActivation.isCreating)
-                                .accessibilityLabel(
-                                    offerActivation.isCreating
-                                        ? CompanionPairingOfferActivation.progressLabel
-                                        : "Pair New Device"
-                                )
-                            } else {
-                                Button("Cancel", action: cancelPairing)
-                                    .buttonStyle(.bordered)
+                                    .buttonStyle(.borderedProminent)
                                     .controlSize(.small)
-                            }
-                        }
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 11)
-
-                        if let code = host.pairingCode,
-                           let image = CompanionQRCode.image(for: code) {
-                            Divider().opacity(0.45)
-                            VStack(spacing: 10) {
-                                Image(nsImage: image)
-                                    .interpolation(.none)
-                                    .resizable()
-                                    .frame(width: 220, height: 220)
-                                    .accessibilityLabel("Companion pairing QR code")
-                                Button("Copy Pairing Code") {
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(code, forType: .string)
+                                    .disabled(offerActivation.isCreating)
+                                    .accessibilityLabel(
+                                        offerActivation.isCreating
+                                            ? CompanionPairingOfferActivation.progressLabel
+                                            : "Pair New Device"
+                                    )
+                                } else {
+                                    Button("Cancel", action: cancelPairing)
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .accessibilityIdentifier(
+                                            CompanionPairingOfferAccessibility.cancel
+                                        )
                                 }
-                                .buttonStyle(.plain)
-                                .font(.caption.weight(.medium))
-                                .foregroundStyle(Color.accentColor)
                             }
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 14)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 11)
+
+                            if let code = host.pairingCode {
+                                let presentation = CompanionPairingCodePresentation(code: code)
+                                let qrCodeImage = CompanionQRCode.image(for: code)
+                                Divider().opacity(0.45)
+                                VStack(spacing: 12) {
+                                    if let image = qrCodeImage {
+                                        Image(nsImage: image)
+                                            .interpolation(.none)
+                                            .resizable()
+                                            .frame(width: 220, height: 220)
+                                            .accessibilityLabel("Companion pairing QR code")
+                                            .accessibilityIdentifier(
+                                                CompanionPairingOfferAccessibility.qrCode
+                                            )
+                                    }
+
+                                    if let message = presentation.qrFallbackMessage(
+                                        qrCodeAvailable: qrCodeImage != nil
+                                    ) {
+                                        Text(message)
+                                            .font(.caption)
+                                            .multilineTextAlignment(.center)
+                                            .accessibilityIdentifier(
+                                                CompanionPairingOfferAccessibility.qrFallback
+                                            )
+                                    }
+
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        Text(presentation.title)
+                                            .font(.caption.weight(.semibold))
+                                        Text(presentation.displayValue)
+                                            .font(.caption.monospaced())
+                                            .foregroundStyle(.primary)
+                                            .textSelection(.enabled)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                            .padding(10)
+                                            .background(
+                                                Color(nsColor: .textBackgroundColor),
+                                                in: RoundedRectangle(cornerRadius: 8)
+                                            )
+                                            .overlay {
+                                                RoundedRectangle(cornerRadius: 8)
+                                                    .stroke(Color(nsColor: .separatorColor))
+                                            }
+                                            .accessibilityLabel(presentation.title)
+                                            .accessibilityValue(presentation.accessibilityValue)
+                                            .accessibilityIdentifier(
+                                                CompanionPairingOfferAccessibility.code
+                                            )
+                                    }
+                                    .frame(maxWidth: 360, alignment: .leading)
+
+                                    Button("Copy Pairing Code") {
+                                        NSPasteboard.general.clearContents()
+                                        NSPasteboard.general.setString(
+                                            presentation.copyValue,
+                                            forType: .string
+                                        )
+                                    }
+                                    .buttonStyle(.plain)
+                                    .font(.caption.weight(.medium))
+                                    .foregroundStyle(Color.accentColor)
+                                    .accessibilityIdentifier(
+                                        CompanionPairingOfferAccessibility.copy
+                                    )
+                                }
+                                .frame(maxWidth: .infinity)
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 14)
+                            }
                         }
+                        .accessibilityElement(children: .contain)
+                        .accessibilityIdentifier(CompanionPairingOfferAccessibility.group)
 
                         if let phrase = host.pairingPhrase {
                             Divider().opacity(0.45)
@@ -146,11 +243,27 @@ struct CompanionSettingsTab: View {
                                     .font(.body.monospaced().weight(.semibold))
                                     .textSelection(.enabled)
                                 HStack {
-                                    Button("They Differ") { host.cancelPairing() }
+                                    Button("They Differ", action: cancelPairing)
                                         .buttonStyle(.bordered)
+                                        .disabled(confirmationActivation.isConfirming)
                                     Spacer()
-                                    Button("They Match") { confirmPairing() }
-                                        .buttonStyle(.borderedProminent)
+                                    Button { confirmPairing() } label: {
+                                        if confirmationActivation.isConfirming {
+                                            HStack(spacing: 5) {
+                                                ProgressView().controlSize(.mini)
+                                                Text(CompanionPairingConfirmationActivation.progressLabel)
+                                            }
+                                        } else {
+                                            Text("They Match")
+                                        }
+                                    }
+                                    .buttonStyle(.borderedProminent)
+                                    .disabled(confirmationActivation.isConfirming)
+                                    .accessibilityLabel(
+                                        confirmationActivation.isConfirming
+                                            ? CompanionPairingConfirmationActivation.progressLabel
+                                            : "They Match"
+                                    )
                                 }
                             }
                             .padding(14)
@@ -168,16 +281,55 @@ struct CompanionSettingsTab: View {
                     } else {
                         ForEach(Array(host.pairedDevices.enumerated()), id: \.element.id) { index, device in
                             if index > 0 { SettingsDivider() }
+                            let connected = host.connectedDeviceIDs.contains(device.deviceId)
                             SettingsRow(
                                 title: device.displayName,
-                                detail: capabilityDetail(device.capabilities),
+                                detail: "\(capabilityDetail(device.capabilities)) · \(connected ? "Connected" : "Waiting to reconnect")",
                                 symbol: "laptopcomputer.and.iphone"
                             ) {
-                                Button("Revoke", role: .destructive) {
-                                    pendingRevocation = device
+                                HStack(spacing: 6) {
+                                    Menu("Access") {
+                                        Label("View status and output", systemImage: "checkmark")
+                                        Divider()
+                                        Button {
+                                            toggle(.agentControl, for: device)
+                                        } label: {
+                                            Label(
+                                                "Control agents",
+                                                systemImage: device.capabilities.contains(.agentControl)
+                                                    ? "checkmark" : "circle"
+                                            )
+                                        }
+                                        Button {
+                                            toggle(.terminalControl, for: device)
+                                        } label: {
+                                            Label(
+                                                "Control terminals",
+                                                systemImage: device.capabilities.contains(.terminalControl)
+                                                    ? "checkmark" : "circle"
+                                            )
+                                        }
+                                    }
+                                    .menuStyle(.borderlessButton)
+                                    .fixedSize()
+                                    .disabled(capabilityUpdates.contains(device.id))
+                                    .accessibilityLabel("Change access for \(device.displayName)")
+
+                                    if !connected {
+                                        Button("Refresh") {
+                                            host.refreshReconnectAvailability()
+                                        }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
+                                        .accessibilityLabel("Refresh reconnect routes for \(device.displayName)")
+                                        .accessibilityHint("Keeps this device paired and retries available Nearby and Link routes")
+                                    }
+                                    Button("Revoke", role: .destructive) {
+                                        pendingRevocation = device
+                                    }
+                                        .buttonStyle(.bordered)
+                                        .controlSize(.small)
                                 }
-                                    .buttonStyle(.bordered)
-                                    .controlSize(.small)
                             }
                         }
                     }
@@ -199,6 +351,10 @@ struct CompanionSettingsTab: View {
             // user can no longer press.
             if case .ready = state { return }
             offerActivation.discard()
+            confirmationActivation.discard()
+        }
+        .onChange(of: host.pairingPhrase?.pairingID) { _, pairingID in
+            confirmationActivation.reconcile(pairingID: pairingID)
         }
         .confirmationDialog(
             "Revoke \(pendingRevocation?.displayName ?? "Device")?",
@@ -266,7 +422,10 @@ struct CompanionSettingsTab: View {
         operationError = nil
         Task {
             do {
-                try await host.createPairingOffer(allowsTerminalControl: allowsTerminalControl)
+                try await host.createPairingOffer(
+                    allowsAgentControl: allowsAgentControl,
+                    allowsTerminalControl: allowsTerminalControl
+                )
                 offerActivation.finish(attempt)
             } catch {
                 guard offerActivation.finish(attempt) else { return }
@@ -277,14 +436,27 @@ struct CompanionSettingsTab: View {
 
     private func cancelPairing() {
         offerActivation.discard()
+        confirmationActivation.discard()
         host.cancelPairing()
     }
 
     private func confirmPairing() {
+        guard let phrase = host.pairingPhrase,
+              let attempt = confirmationActivation.begin(pairingID: phrase.pairingID)
+        else { return }
         operationError = nil
         Task {
-            do { try await host.confirmPairing() }
-            catch { operationError = error.localizedDescription }
+            do {
+                try await host.confirmPairing()
+                confirmationActivation.submitted(
+                    attempt,
+                    currentPairingID: host.pairingPhrase?.pairingID
+                )
+            } catch {
+                guard confirmationActivation.fail(attempt) else { return }
+                host.cancelPairing()
+                operationError = CompanionPairingConfirmationActivation.failureMessage(error)
+            }
         }
     }
 
@@ -296,8 +468,36 @@ struct CompanionSettingsTab: View {
         }
     }
 
+    private func toggle(
+        _ capability: CompanionCapability,
+        for device: CompanionPairedDeviceRecord
+    ) {
+        operationError = nil
+        capabilityUpdates.insert(device.id)
+        var capabilities = Set(device.capabilities)
+        if capabilities.contains(capability) { capabilities.remove(capability) }
+        else { capabilities.insert(capability) }
+        let ordered = CompanionCapability.allCases.filter(capabilities.contains)
+        Task {
+            defer { capabilityUpdates.remove(device.id) }
+            do {
+                try await host.updateCapabilities(
+                    deviceID: device.id,
+                    capabilities: ordered
+                )
+            } catch {
+                operationError = error.localizedDescription
+            }
+        }
+    }
+
     private func capabilityDetail(_ values: [CompanionCapability]) -> String {
-        values.contains(.terminalControl) ? "View and control terminals" : "View only"
+        switch (values.contains(.agentControl), values.contains(.terminalControl)) {
+        case (true, true): "View; control agents and terminals"
+        case (true, false): "View and control agents"
+        case (false, true): "View and control terminals"
+        case (false, false): "View only"
+        }
     }
 }
 
@@ -343,6 +543,98 @@ final class CompanionPairingOfferActivation: ObservableObject {
     func discard() {
         attempt = nil
         isCreating = false
+    }
+}
+
+/// Serializes the local SAS decision and keeps both phrase controls inert until
+/// that exact pairing either authenticates, disappears, or fails.
+///
+/// Sending the Mac's confirmation is not the same as completing the handshake:
+/// the phone may not have submitted its decision yet. The pairing identity is
+/// therefore part of the in-flight token, preventing a late task from clearing
+/// or cancelling a newer phrase.
+@MainActor
+final class CompanionPairingConfirmationActivation: ObservableObject {
+    static let progressLabel = "Confirming pairing"
+
+    struct Attempt: Equatable, Sendable {
+        let id: UUID
+        let pairingID: String
+    }
+
+    private enum Phase {
+        case idle
+        case submitting(Attempt)
+        case awaitingPeer(Attempt)
+    }
+
+    @Published private(set) var isConfirming = false
+
+    private var phase = Phase.idle
+
+    func begin(pairingID: String) -> Attempt? {
+        guard !isConfirming, !pairingID.isEmpty else { return nil }
+        let attempt = Attempt(id: UUID(), pairingID: pairingID)
+        phase = .submitting(attempt)
+        isConfirming = true
+        return attempt
+    }
+
+    /// Records that the local decision was sent. The controls stay gated while
+    /// the same phrase awaits its peer; an already-settled phrase releases them.
+    @discardableResult
+    func submitted(_ attempt: Attempt, currentPairingID: String?) -> Bool {
+        guard case let .submitting(current) = phase, current == attempt else { return false }
+        guard currentPairingID == attempt.pairingID else {
+            reset()
+            return false
+        }
+        phase = .awaitingPeer(attempt)
+        return true
+    }
+
+    /// Releases only the attempt that still owns the failure. A stale task can
+    /// never cancel a replacement pairing that has claimed a different token.
+    @discardableResult
+    func fail(_ attempt: Attempt) -> Bool {
+        guard activeAttempt == attempt else { return false }
+        reset()
+        return true
+    }
+
+    /// Pairing identity can disappear before an awaited task reports failure.
+    /// Keep a submitting attempt until that task settles, but release a
+    /// peer-waiting attempt as soon as its exact phrase completes or vanishes.
+    func reconcile(pairingID: String?) {
+        switch phase {
+        case .idle:
+            return
+        case let .submitting(attempt):
+            if let pairingID, pairingID != attempt.pairingID { reset() }
+        case let .awaitingPeer(attempt):
+            if pairingID != attempt.pairingID { reset() }
+        }
+    }
+
+    func discard() {
+        reset()
+    }
+
+    static func failureMessage(_ error: any Error) -> String {
+        "Pairing confirmation failed: \(error.localizedDescription) "
+            + "Create a new pairing code to try again."
+    }
+
+    private var activeAttempt: Attempt? {
+        switch phase {
+        case .idle: nil
+        case let .submitting(attempt), let .awaitingPeer(attempt): attempt
+        }
+    }
+
+    private func reset() {
+        phase = .idle
+        isConfirming = false
     }
 }
 

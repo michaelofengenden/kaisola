@@ -15,6 +15,9 @@ import XCTest
 final class CompanionControllerChipTests: XCTestCase {
     private static let ttl = CompanionTerminalControl.leaseTTLMilliseconds
     private static let longName = "Michael Ofengenden's Personal iPhone 17 Pro Max"
+    private static let accountScope = try! CompanionAccountScope(
+        accountID: "controller-chip-test-account"
+    )
 
     private func chip(
         name: String = "Michael's iPhone",
@@ -52,7 +55,8 @@ final class CompanionControllerChipTests: XCTestCase {
             x25519StaticPublic: Data(repeating: 0x22, count: 32).base64EncodedString(),
             capabilities: [.observe, .terminalControl],
             pairedAt: 1_785_216_000_000,
-            lastSeenAt: 1_785_216_060_000
+            lastSeenAt: 1_785_216_060_000,
+            accountScope: Self.accountScope
         )
     }
 

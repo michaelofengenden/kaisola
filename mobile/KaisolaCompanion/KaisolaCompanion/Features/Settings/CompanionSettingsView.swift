@@ -65,7 +65,7 @@ struct CompanionSettingsView: View {
             CompanionMacDetailView(
                 name: macName,
                 connected: store.connection == .live,
-                connectionTitle: store.connection.title,
+                connectionTitle: recoveryConnectionTitle,
                 route: coordinator.activeRoute,
                 onReconnect: { Task { await coordinator.reconnect() } },
                 onUnpair: { confirmUnpair = true }
@@ -109,7 +109,7 @@ struct CompanionSettingsView: View {
                 SettingsRow(icon: "laptopcomputer", label: macName, action: { showMacDetails = true }) {
                     HStack(spacing: 6) {
                         Circle().fill(connected ? KaisolaTheme.done : Color.secondary).frame(width: 7, height: 7)
-                        Text(connected ? coordinator.activeRoute.title : store.connection.title)
+                        Text(connected ? coordinator.activeRoute.title : recoveryConnectionTitle)
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -120,7 +120,11 @@ struct CompanionSettingsView: View {
                     Text(accessLabel).font(.caption).foregroundStyle(.secondary)
                 }
                 if !connected {
-                    SettingsRow(icon: "arrow.clockwise", label: "Reconnect", tint: KaisolaTheme.accent) {
+                    SettingsRow(
+                        icon: "arrow.clockwise",
+                        label: store.transportState == .reconnectRequired ? "Try reconnecting" : "Reconnect",
+                        tint: KaisolaTheme.accent
+                    ) {
                         Task { await coordinator.reconnect() }
                     }
                 }
@@ -140,6 +144,9 @@ struct CompanionSettingsView: View {
     // Neutral label until a real paired-device name arrives from the desktop
     // (pairing is wired in a later task). Never a hardcoded personal name.
     private let macName = "Your Mac"
+    private var recoveryConnectionTitle: String {
+        store.transportState == .reconnectRequired ? "Reconnect required" : store.connection.title
+    }
     private var accessLabel: String {
         if store.canControlTerminals { return "Full control" }
         if store.canControlAgents { return "Agent control" }

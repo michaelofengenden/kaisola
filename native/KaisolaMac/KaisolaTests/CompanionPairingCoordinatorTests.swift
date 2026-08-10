@@ -134,6 +134,64 @@ final class CompanionPairingCoordinatorTests: XCTestCase {
         XCTAssertNotNil(authenticatedConnection)
     }
 
+    func testAccountInvalidationDropsConsumedOfferAndHandshakeBeforeLateSASCanPersist() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let now: Int64 = 1_800_000_050_000
+        let offer = try await fixture.coordinator.createOffer(
+            listenerPort: 49_321,
+            nowMilliseconds: now,
+            nonce: Data(repeating: 0xA5, count: 32)
+        )
+        let connectionID = "connection-invalidated-account"
+        let initiator = try NoiseXXInitiator(
+            identity: fixture.device,
+            prologue: createNoisePrologue(try offer.handshakeContext(connectionId: connectionID)),
+            peerPin: offer.desktopPin
+        )
+        let started = try await fixture.coordinator.receive(
+            socketID: "socket-invalidated-account",
+            payload: try encode(JSONValue.object([
+                "v": .integer(Int64(CompanionCrypto.protocolVersion)),
+                "type": .string("pair.start"),
+                "qrPayload": try JSONValue.from(offer),
+                "connectionId": .string(connectionID),
+                "message1": .string(try initiator.writeMessage1().base64URLEncodedString()),
+            ])),
+            nowMilliseconds: now + 1
+        )
+        let message2Frame = try object(try XCTUnwrap(started.frames.first))
+        let sessionID = try XCTUnwrap(message2Frame["sessionId"]?.stringValue)
+        let message2 = try XCTUnwrap(
+            message2Frame["message2"]?.stringValue.flatMap(Data.init(base64URLString:))
+        )
+        _ = try initiator.readMessage2(message2)
+
+        await fixture.coordinator.invalidateAll()
+
+        do {
+            _ = try await fixture.coordinator.receive(
+                socketID: "socket-invalidated-account",
+                payload: try encode(JSONValue.object([
+                    "v": .integer(Int64(CompanionCrypto.protocolVersion)),
+                    "type": .string("pair.message3"),
+                    "sessionId": .string(sessionID),
+                    "message3": .string(try initiator.writeMessage3().base64URLEncodedString()),
+                ])),
+                nowMilliseconds: now + 2
+            )
+            XCTFail("A consumed Account A offer survived account invalidation")
+        } catch {
+            XCTAssertEqual(error as? CompanionPairingCoordinatorError, .invalidFrame)
+        }
+        let devices = await fixture.roster.list()
+        let authenticated = await fixture.coordinator.authenticatedConnection(
+            socketID: "socket-invalidated-account"
+        )
+        XCTAssertTrue(devices.isEmpty)
+        XCTAssertNil(authenticated)
+    }
+
     func testResumeAuthenticatesPinnedDeviceWithoutSASAndMarksItSeen() async throws {
         let fixture = try Fixture()
         defer { fixture.cleanUp() }
@@ -152,6 +210,7 @@ final class CompanionPairingCoordinatorTests: XCTestCase {
             "desktopId": .string(fixture.desktop.id),
             "deviceId": .string(fixture.device.id),
             "connectionId": .string(connectionID),
+            "accountScope": .string(fixture.roster.accountScope.rawValue),
         ])
         let initiator = try NoiseXXInitiator(
             identity: fixture.device,
@@ -165,6 +224,7 @@ final class CompanionPairingCoordinatorTests: XCTestCase {
                 "type": .string("resume.start"),
                 "deviceId": .string(fixture.device.id),
                 "connectionId": .string(connectionID),
+                "accountScope": .string(fixture.roster.accountScope.rawValue),
                 "message1": .string(try initiator.writeMessage1().base64URLEncodedString()),
             ])),
             nowMilliseconds: now + 10
@@ -219,6 +279,44 @@ final class CompanionPairingCoordinatorTests: XCTestCase {
         XCTAssertEqual(device.lastSeenAt, now + 12)
         let persistedLastSeenAt = await fixture.roster.device(fixture.device.id)?.lastSeenAt
         XCTAssertEqual(persistedLastSeenAt, now + 12)
+    }
+
+    func testResumeFromAnotherAccountFailsBeforeNoiseOrRosterMutation() async throws {
+        let fixture = try Fixture()
+        defer { fixture.cleanUp() }
+        let pairedAt: Int64 = 1_800_000_100_000
+        let original = try await fixture.roster.pair(
+            peer: fixture.devicePin,
+            displayName: fixture.device.displayName,
+            capabilities: [.observe],
+            now: pairedAt
+        )
+        let otherScope = try CompanionAccountScope(accountID: "another-account")
+
+        do {
+            _ = try await fixture.coordinator.receive(
+                socketID: "socket-cross-account-resume",
+                payload: try encode(JSONValue.object([
+                    "v": .integer(Int64(CompanionCrypto.protocolVersion)),
+                    "type": .string("resume.start"),
+                    "deviceId": .string(fixture.device.id),
+                    "connectionId": .string("connection-cross-account-resume"),
+                    "accountScope": .string(otherScope.rawValue),
+                    "message1": .string(Data(repeating: 7, count: 32).base64URLEncodedString()),
+                ])),
+                nowMilliseconds: pairedAt + 10
+            )
+            XCTFail("A resume ticket from another account crossed the roster boundary")
+        } catch {
+            XCTAssertEqual(error as? CompanionPairingCoordinatorError, .invalidFrame)
+        }
+
+        let persisted = await fixture.roster.device(fixture.device.id)
+        let authenticated = await fixture.coordinator.authenticatedConnection(
+            socketID: "socket-cross-account-resume"
+        )
+        XCTAssertEqual(persisted, original)
+        XCTAssertNil(authenticated)
     }
 
     func testOfferIsSingleUseEvenWhenPairStartIsMalformedAfterClaim() async throws {
@@ -293,7 +391,8 @@ final class CompanionPairingCoordinatorTests: XCTestCase {
                 displayName: "Test iPhone"
             )
             roster = try CompanionDeviceRosterStore(
-                fileURL: directory.appendingPathComponent("devices-v1.json")
+                fileURL: directory.appendingPathComponent("devices-v3.json"),
+                accountScope: try CompanionAccountScope(accountID: "pairing-coordinator-test-account")
             )
             coordinator = try CompanionPairingCoordinator(identity: desktop, roster: roster)
         }

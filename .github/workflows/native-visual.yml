@@ -179,7 +179,7 @@ jobs:
             # Keep a broken AppKit sheet or framework callback from hiding the
             # responsible surface until the job-wide 25-minute timeout. POSIX
             # preserves alarm(2) across exec, including env -> Kaisola.
-            if [[ "$surface" == settings-extensions || "$surface" == settings-extensions-narrow ]]; then
+            if [[ "$surface" == settings-extensions || "$surface" == settings-extensions-narrow || "$surface" == settings-terminal ]]; then
               local fixture_pid ax_pid fixture_exit ax_exit ax_log
               ax_log="${log%.log}.ax.log"
               /usr/bin/perl -e '
@@ -322,6 +322,38 @@ jobs:
             ' "$ax_receipt"
           }
 
+          verify_terminal_palette_ax_receipt() {
+            local surface="$1"
+            local log="$2"
+            local ax_log ax_receipt
+            ax_log="${log%.log}.ax.log"
+            ! grep -F 'KAISOLA_NATIVE_TERMINAL_PALETTE_AX=FAIL' "$ax_log"
+            grep -Fq "KAISOLA_NATIVE_TERMINAL_PALETTE_AX=PASS surface=$surface" "$ax_log"
+            ax_receipt="$(sed -n 's/^KAISOLA_NATIVE_TERMINAL_PALETTE_AX=\({.*}\)$/\1/p' "$ax_log" | tail -n 1)"
+            test -n "$ax_receipt"
+            node -e '
+              const receipt = JSON.parse(process.argv[1]);
+              const summary = receipt.terminalPaletteLabels.join(" ").toLocaleLowerCase();
+              const roles = [
+                "macos terminal theme",
+                "foreground text",
+                "background",
+                "cursor",
+                "ansi green",
+                "ansi blue",
+              ];
+              if (receipt.windowCount !== 1
+                  || receipt.elementCount < 20
+                  || receipt.terminalPaletteIdentifierCount !== 1
+                  || receipt.terminalPaletteChildCount !== 0
+                  || typeof receipt.terminalPaletteRole !== "string"
+                  || receipt.terminalPaletteRole.length === 0
+                  || !roles.every(role => summary.includes(role))) {
+                throw new Error(`invalid terminal palette AX receipt: ${process.argv[1]}`);
+              }
+            ' "$ax_receipt"
+          }
+
           optimized_source="$RUNNER_TEMP/kaisola-native-visual/Build/Products/LocalRelease/Kaisola.app"
           optimized_app="$RUNNER_TEMP/Kaisola Continuous Scroll QA.app"
           /usr/bin/ditto "$optimized_source" "$optimized_app"
@@ -412,6 +444,9 @@ jobs:
             if [[ "$surface" == settings-extensions || "$surface" == settings-extensions-narrow ]]; then
               verify_extensions_receipt "$surface" "$log"
             fi
+            if [[ "$surface" == settings-terminal ]]; then
+              verify_terminal_palette_ax_receipt "$surface" "$log"
+            fi
             if [[ "$surface" == settings-account-recovery ]]; then
               grep -Fq 'KAISOLA_NATIVE_ACCOUNT_RECOVERY_LAYOUT=PASS largeText=false verticalAction=true unclampedHeadline=true' "$log"
             fi
@@ -427,6 +462,9 @@ jobs:
             verify_capture "$capture" "$surface"
             if [[ "$surface" == settings-extensions ]]; then
               verify_extensions_receipt "$surface" "$log"
+            fi
+            if [[ "$surface" == settings-terminal ]]; then
+              verify_terminal_palette_ax_receipt "$surface" "$log"
             fi
             if [[ "$surface" == settings-account-recovery ]]; then
               grep -Fq 'KAISOLA_NATIVE_ACCOUNT_RECOVERY_LAYOUT=PASS largeText=false verticalAction=true unclampedHeadline=true' "$log"

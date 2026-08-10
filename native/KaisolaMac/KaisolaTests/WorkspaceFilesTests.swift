@@ -417,6 +417,92 @@ final class WorkspaceFilesTests: XCTestCase {
             )
         }
     }
+
+    func testCollapsingTheChangedOnDiskBannerKeepsACompactConflictIndicator() {
+        var state = FilePreviewConflictState()
+        XCTAssertFalse(state.showsBanner)
+        XCTAssertFalse(state.showsCompactIndicator)
+
+        state.apply(.detectedExternalChange(isDirty: true))
+        XCTAssertTrue(state.isActive)
+        XCTAssertTrue(state.showsBanner)
+        XCTAssertFalse(state.showsCompactIndicator)
+
+        // The close control collapses the banner. The conflict itself survives,
+        // so a compact indicator has to stay on screen.
+        state.apply(.collapseRequested)
+        XCTAssertTrue(state.isActive)
+        XCTAssertFalse(state.showsBanner)
+        XCTAssertTrue(state.showsCompactIndicator)
+
+        // Another agent write must not reopen a banner the user folded away.
+        state.apply(.detectedExternalChange(isDirty: true))
+        XCTAssertTrue(state.showsCompactIndicator)
+        XCTAssertFalse(state.showsBanner)
+
+        state.apply(.expandRequested)
+        XCTAssertTrue(state.showsBanner)
+        XCTAssertFalse(state.showsCompactIndicator)
+    }
+
+    func testOnlyReloadSaveOrDiscardClearsAnExternalFileConflict() {
+        for resolution in [
+            FilePreviewConflictState.Event.reloaded,
+            .savedThroughConflictDecision,
+            .draftDiscarded,
+            .documentLoaded
+        ] {
+            var state = FilePreviewConflictState()
+            state.apply(.detectedExternalChange(isDirty: true))
+            state.apply(.collapseRequested)
+            state.apply(resolution)
+            XCTAssertFalse(state.isActive, "\(resolution) should end the conflict")
+            XCTAssertFalse(state.showsBanner)
+            XCTAssertFalse(state.showsCompactIndicator)
+        }
+
+        // A clean preview follows the newer file on its own, so nothing is left
+        // to warn about.
+        var clean = FilePreviewConflictState()
+        clean.apply(.detectedExternalChange(isDirty: true))
+        clean.apply(.detectedExternalChange(isDirty: false))
+        XCTAssertFalse(clean.isActive)
+
+        // Collapse and expand are display-only: neither may resolve anything.
+        var collapsed = FilePreviewConflictState()
+        collapsed.apply(.detectedExternalChange(isDirty: true))
+        collapsed.apply(.collapseRequested)
+        collapsed.apply(.expandRequested)
+        collapsed.apply(.collapseRequested)
+        XCTAssertTrue(collapsed.isActive)
+        XCTAssertTrue(collapsed.showsCompactIndicator)
+
+        // Collapse cannot manufacture an indicator without a conflict.
+        var idle = FilePreviewConflictState()
+        idle.apply(.collapseRequested)
+        XCTAssertFalse(idle.showsCompactIndicator)
+        idle.apply(.expandRequested)
+        XCTAssertFalse(idle.showsBanner)
+    }
+
+    func testSaveControlAnnouncesAnUnresolvedDiskConflict() {
+        var state = FilePreviewConflictState()
+        XCTAssertEqual(state.saveHelpText, "Save")
+        XCTAssertEqual(state.saveAccessibilityLabel, "Save")
+
+        state.apply(.detectedExternalChange(isDirty: true))
+        XCTAssertEqual(state.saveHelpText, "Save — file changed on disk")
+        XCTAssertEqual(state.saveAccessibilityLabel, "Save, file changed on disk")
+
+        // Collapsing hides the banner, not the conflict-aware Save state.
+        state.apply(.collapseRequested)
+        XCTAssertEqual(state.saveAccessibilityLabel, "Save, file changed on disk")
+
+        state.apply(.reloaded)
+        XCTAssertEqual(state.saveHelpText, "Save")
+        XCTAssertEqual(state.saveAccessibilityLabel, "Save")
+    }
+
     private var root: URL!
 
     override func setUpWithError() throws {

@@ -270,6 +270,66 @@ enum FilePreviewNavigationPolicy {
     }
 }
 
+/// The changed-on-disk warning is collapsible but never dismissible: it is the
+/// only persistent sign that a later save can overwrite an agent's or another
+/// app's edit. Closing the banner folds it into a compact header indicator, and
+/// only a reload, a save that went through the conflict decision, or discarding
+/// the draft ends the conflict.
+struct FilePreviewConflictState: Equatable {
+    enum Event: Equatable {
+        /// The watcher saw the mounted file change under an open draft.
+        case detectedExternalChange(isDirty: Bool)
+        case collapseRequested
+        case expandRequested
+        case reloaded
+        case savedThroughConflictDecision
+        case draftDiscarded
+        /// Another document mounted; a conflict never survives a load.
+        case documentLoaded
+    }
+
+    private(set) var isActive = false
+    private(set) var isCollapsed = false
+
+    var showsBanner: Bool { isActive && !isCollapsed }
+    var showsCompactIndicator: Bool { isActive && isCollapsed }
+
+    /// Save stays reachable during a conflict — the write itself routes into
+    /// the reload/overwrite decision — but the control says so before it is
+    /// pressed rather than after.
+    var saveHelpText: String { isActive ? "Save — file changed on disk" : "Save" }
+
+    var saveAccessibilityLabel: String { isActive ? "Save, file changed on disk" : "Save" }
+
+    mutating func apply(_ event: Event) {
+        switch event {
+        case let .detectedExternalChange(isDirty):
+            // A clean preview follows the newer file automatically, so only a
+            // dirty draft can be in conflict with it.
+            guard isDirty else {
+                resolve()
+                return
+            }
+            // Collapse is sticky: a repeated agent write must not reopen a
+            // banner the user deliberately folded away.
+            isActive = true
+        case .collapseRequested:
+            guard isActive else { return }
+            isCollapsed = true
+        case .expandRequested:
+            guard isActive else { return }
+            isCollapsed = false
+        case .reloaded, .savedThroughConflictDecision, .draftDiscarded, .documentLoaded:
+            resolve()
+        }
+    }
+
+    private mutating func resolve() {
+        isActive = false
+        isCollapsed = false
+    }
+}
+
 /// User-facing preview feedback is deliberately typed so ordinary recovery is
 /// never presented as a save failure. The view supplies semantic color while
 /// this value owns stable icon and accessibility metadata for every channel.

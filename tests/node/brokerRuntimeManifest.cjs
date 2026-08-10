@@ -20,6 +20,7 @@ const brokerRuntimeTestFiles = Object.freeze([
   'tests/node/brokerUpgradeIntegration.test.cjs',
   'tests/node/brokerWire.test.cjs',
   'tests/node/companionProtocolTables.test.cjs',
+  'tests/node/companionTerminalCursor.test.cjs',
   'tests/node/sessionBrokerExitWaits.test.cjs',
   'tests/node/shellEnv.test.cjs',
   'tests/node/terminalAttachRoute.test.cjs',

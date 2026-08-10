@@ -15,6 +15,7 @@ const SCHEMA_VERSION = 2
 const MAX_CAPTURE_BYTES = 64 * 1024
 const LAUNCH_ARGUMENTS = ['-ApplePersistenceIgnoreState', 'YES']
 const PERSISTENCE_NOTICE = /^(?:\d{4}-\d{2}-\d{2} [^\r\n]+ )?ApplePersistenceIgnoreState: Existing state will not be touched\. New state will be written to [^\r\n]*\/[^\r\n]+\.savedState$/
+const CLEAN_GENERATION_EXIT_NOTICE = /^(?:\d{4}-\d{2}-\d{2} [^\r\n]+ )?NSQuitAlwaysKeepsWindows=NO$/
 const MALFORMED_PDF_NOTICE = 'CoreGraphics PDF has logged an error. Set environment variable "CG_PDF_VERBOSE" to learn more.'
 const MALFORMED_BYTES = Buffer.from('%PDF-1.7\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\n')
 
@@ -217,20 +218,24 @@ function validateDiagnostic(diagnostic, fixture) {
   return diagnostic
 }
 
-function validateAppStderr(stderr, fixture) {
+function validateAppStderr(stderr, fixture, phase = 'render') {
+  if (phase !== 'generate' && phase !== 'render') fail('PDF preview stderr phase is invalid')
   const lines = stderr.split(/\r?\n/u).filter(Boolean)
   let persistenceCount = 0
   let malformedCount = 0
+  let cleanGenerationExitCount = 0
   for (const line of lines) {
     if (PERSISTENCE_NOTICE.test(line)) {
       persistenceCount += 1
+    } else if (phase === 'generate' && CLEAN_GENERATION_EXIT_NOTICE.test(line)) {
+      cleanGenerationExitCount += 1
     } else if (fixture === 'malformed' && line === MALFORMED_PDF_NOTICE) {
       malformedCount += 1
     } else {
       fail(`app emitted stderr for ${fixture}: ${JSON.stringify(stderr)}`)
     }
   }
-  if (persistenceCount > 1 || malformedCount > 1) {
+  if (persistenceCount > 1 || malformedCount > 1 || cleanGenerationExitCount > 1) {
     fail(`app emitted duplicate stderr diagnostics for ${fixture}`)
   }
 }
@@ -543,7 +548,7 @@ async function runFixture(installed, fixture) {
       { requireCleanExit: true },
     )
     assertReceiptBundlePath(installed, fixture.id, generation.receipt.build.bundlePath)
-    validateAppStderr(generation.stderr, fixture.id)
+    validateAppStderr(generation.stderr, fixture.id, 'generate')
     const artifact = assertPreparedFixture(root, fixture, generation.receipt.artifact)
     assertInstalledAppUnchanged(installed)
 
@@ -554,7 +559,7 @@ async function runFixture(installed, fixture) {
     )
     const render = await waitForAppReceipt(renderChild, fixture.id, 'render')
     assertReceiptBundlePath(installed, fixture.id, render.receipt.build.bundlePath)
-    validateAppStderr(render.stderr, fixture.id)
+    validateAppStderr(render.stderr, fixture.id, 'render')
     assertPreparedFixture(root, fixture, artifact)
     const sample = takeSample([renderChild.pid], [])
     const memory = memoryFromSample(sample)

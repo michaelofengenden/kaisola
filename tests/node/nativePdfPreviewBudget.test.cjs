@@ -578,9 +578,23 @@ test('product and gate rely on PDFKit automatic layout without eager relayout', 
 test('stderr is fail-closed except for exact fixture-scoped framework notices', () => {
   const persistence = '2026-08-08 22:26:13.078 Kaisola[2862:7385610] ApplePersistenceIgnoreState: Existing state will not be touched. New state will be written to /tmp/com.kaisola.mac.savedState'
   const malformed = 'CoreGraphics PDF has logged an error. Set environment variable "CG_PDF_VERBOSE" to learn more.'
+  const cleanGenerationExit = '2026-08-10 10:30:43.981 Kaisola[13044:41063] NSQuitAlwaysKeepsWindows=NO'
   assert.doesNotThrow(() => validateAppStderr('', 'many-page'))
   assert.doesNotThrow(() => validateAppStderr(`${persistence}\n`, 'many-page'))
   assert.doesNotThrow(() => validateAppStderr(`${persistence}\n${malformed}\n`, 'malformed'))
+  assert.doesNotThrow(() => validateAppStderr(
+    `${persistence}\n${cleanGenerationExit}\n`,
+    'many-page',
+    'generate',
+  ))
+  assert.throws(
+    () => validateAppStderr(`${cleanGenerationExit}\n`, 'many-page', 'render'),
+    /app emitted stderr/u,
+  )
+  assert.throws(
+    () => validateAppStderr(`${cleanGenerationExit}\n${cleanGenerationExit}\n`, 'many-page', 'generate'),
+    /duplicate/u,
+  )
   assert.throws(() => validateAppStderr(`${malformed}\n`, 'many-page'), /app emitted stderr/u)
   assert.throws(() => validateAppStderr('unexpected warning\n', 'malformed'), /app emitted stderr/u)
   assert.throws(() => validateAppStderr(`${malformed}\n${malformed}\n`, 'malformed'), /duplicate/u)

@@ -92,6 +92,7 @@ class Client {
       socket.once('connect', () => socket.write(`${JSON.stringify({
         type: 'hello', protocol: 2, token, instanceId: this.instanceId,
         appVersion: this.appVersion, access: this.access,
+        features: this.access === 'administrator' ? ['broker-administration-v1'] : [],
       })}\n`))
       socket.on('data', (chunk) => {
         this.buffer += chunk.toString('utf8')
@@ -161,14 +162,21 @@ function closeActiveClients() {
   for (const client of [...activeClients]) client.close()
 }
 
-async function waitFor(predicate, timeoutMs = 8_000) {
+async function waitFor(predicate, timeoutMs = 8_000, label = 'probe condition') {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     const value = predicate()
     if (value) return value
     await wait(25)
   }
-  throw new Error('probe condition timed out')
+  throw new Error(`${label} timed out`)
+}
+
+function releaseSequence(number) {
+  fs.writeFileSync(path.join(root, `release-sequence-${number}`), '', {
+    flag: 'wx',
+    mode: 0o600,
+  })
 }
 
 function observerSlice(subscription, events) {
@@ -225,7 +233,7 @@ function assertSealedBrokerIdentity(frame, label) {
   if (!Number.isInteger(bootstrapPid) || bootstrapPid <= 1) throw new Error('bootstrap returned no broker PID')
   const info = await waitFor(() => {
     try { return JSON.parse(fs.readFileSync(infoFile, 'utf8')) } catch { return null }
-  })
+  }, CLIENT_DEADLINE_MS, 'broker metadata publication')
   if (info.pid !== bootstrapPid) throw new Error('published broker identity differs from bootstrap PID')
   if (info.contentDigest !== manifest.contentDigest) throw new Error('published broker digest differs from sealed manifest')
 
@@ -236,7 +244,10 @@ function assertSealedBrokerIdentity(frame, label) {
     projectId: 'nativehelperprobe',
     id: 'native-helper-probe',
     command: '/bin/sh',
-    args: ['-lc', 'for n in 1 2 3 4 5; do printf "sequence=%s\\n" "$n"; sleep 0.35; done'],
+    // Each line is released only after its replacement observer is subscribed.
+    // A timer-based producer can finish before a loaded CI runner connects,
+    // turning a continuity assertion into an unrelated scheduling race.
+    args: ['-lc', 'for n in 1 2 3 4 5; do while [ ! -f "release-sequence-$n" ]; do sleep 0.02; done; printf "sequence=%s\\n" "$n"; done'],
     cwd: root,
     cols: 80,
     rows: 24,
@@ -265,7 +276,18 @@ function assertSealedBrokerIdentity(frame, label) {
     id: 'native-helper-probe',
     maxQueueBytes: 256 * 1024,
   })
-  await waitFor(() => observerSlice(subscriptionN, observerN.events).output.includes('sequence=2'))
+  releaseSequence(1)
+  await waitFor(
+    () => observerSlice(subscriptionN, observerN.events).output.includes('sequence=1'),
+    CLIENT_DEADLINE_MS,
+    'initial observer sequence 1'
+  )
+  releaseSequence(2)
+  await waitFor(
+    () => observerSlice(subscriptionN, observerN.events).output.includes('sequence=2'),
+    CLIENT_DEADLINE_MS,
+    'initial observer sequence 2'
+  )
   const sliceN = observerSlice(subscriptionN, observerN.events)
   observerN.close()
 
@@ -282,7 +304,18 @@ function assertSealedBrokerIdentity(frame, label) {
     afterOffset: sliceN.cursor.offset,
     maxQueueBytes: 256 * 1024,
   })
-  await waitFor(() => observerSlice(subscriptionN1, observerN1.events).output.includes('sequence=4'))
+  releaseSequence(3)
+  await waitFor(
+    () => observerSlice(subscriptionN1, observerN1.events).output.includes('sequence=3'),
+    CLIENT_DEADLINE_MS,
+    'replacement observer sequence 3'
+  )
+  releaseSequence(4)
+  await waitFor(
+    () => observerSlice(subscriptionN1, observerN1.events).output.includes('sequence=4'),
+    CLIENT_DEADLINE_MS,
+    'replacement observer sequence 4'
+  )
   const sliceN1 = observerSlice(subscriptionN1, observerN1.events)
   observerN1.close()
 
@@ -299,7 +332,12 @@ function assertSealedBrokerIdentity(frame, label) {
     afterOffset: sliceN1.cursor.offset,
     maxQueueBytes: 256 * 1024,
   })
-  await waitFor(() => observerSlice(subscriptionRollback, observerRollback.events).output.includes('sequence=5'))
+  releaseSequence(5)
+  await waitFor(
+    () => observerSlice(subscriptionRollback, observerRollback.events).output.includes('sequence=5'),
+    CLIENT_DEADLINE_MS,
+    'rollback observer sequence 5'
+  )
   const sliceRollback = observerSlice(subscriptionRollback, observerRollback.events)
   observerRollback.close()
 
@@ -309,7 +347,7 @@ function assertSealedBrokerIdentity(frame, label) {
     throw new Error(`client replacement duplicated or lost output: ${JSON.stringify(numberedOutput)} output=${JSON.stringify(continuousOutput)}`)
   }
 
-  const cleanup = new Client('controller')
+  const cleanup = new Client('administrator')
   await cleanup.connect()
   await cleanup.request('terminal.release', {
     ownerId: '0', projectId: 'nativehelperprobe', id: 'native-helper-probe',
@@ -342,7 +380,7 @@ function assertSealedBrokerIdentity(frame, label) {
   closeActiveClients()
   try {
     if (fs.existsSync(infoFile)) {
-      const cleanup = new Client('controller')
+      const cleanup = new Client('administrator')
       try {
         await cleanup.connect()
         await cleanup.request('broker.shutdown', {})

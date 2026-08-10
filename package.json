@@ -30,6 +30,7 @@
     "native:helper:download": "node scripts/download-native-node-runtime.cjs all",
     "native:helper:probe": "node scripts/native-broker-helper-probe.cjs",
     "release:fast": "node scripts/release-fast.cjs",
+    "companion:device-acceptance": "node scripts/companion-device-acceptance.cjs",
     "companion:sim": "./scripts/companion-simulator.sh"
   },
   "dependencies": {

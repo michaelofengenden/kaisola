@@ -21,14 +21,21 @@ struct CustomAgentSymbolChoice: Equatable, Identifiable, Sendable {
 /// names. Keeping this outside the view makes it impossible for a new icon to
 /// silently ship without a human-readable VoiceOver name.
 enum CustomAgentSymbolAccessibility {
-    static let choices: [CustomAgentSymbolChoice] = [
-        CustomAgentSymbolChoice(symbolName: "terminal", name: "Terminal"),
-        CustomAgentSymbolChoice(symbolName: "cpu", name: "Processor"),
-        CustomAgentSymbolChoice(symbolName: "bolt", name: "Lightning bolt"),
-        CustomAgentSymbolChoice(symbolName: "ant", name: "Ant"),
-        CustomAgentSymbolChoice(symbolName: "bird", name: "Bird"),
-        CustomAgentSymbolChoice(symbolName: "cloud", name: "Cloud"),
-    ]
+    // Xcode 16.4 / Swift 6.1 crashes while lowering this constructor array as
+    // a lazy global once the integrated app module reaches its current size.
+    // These are immutable value choices with explicit identities, so a
+    // get-only computed catalog preserves the exact behavior without a global
+    // initializer or shared reference identity.
+    static var choices: [CustomAgentSymbolChoice] {
+        [
+            CustomAgentSymbolChoice(symbolName: "terminal", name: "Terminal"),
+            CustomAgentSymbolChoice(symbolName: "cpu", name: "Processor"),
+            CustomAgentSymbolChoice(symbolName: "bolt", name: "Lightning bolt"),
+            CustomAgentSymbolChoice(symbolName: "ant", name: "Ant"),
+            CustomAgentSymbolChoice(symbolName: "bird", name: "Bird"),
+            CustomAgentSymbolChoice(symbolName: "cloud", name: "Cloud"),
+        ]
+    }
 
     static func pickerLabel(agentName: String) -> String {
         "Icon for \(agentName)"

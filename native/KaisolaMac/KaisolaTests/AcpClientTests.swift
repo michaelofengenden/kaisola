@@ -1024,6 +1024,108 @@ final class AcpClientTests: XCTestCase {
         XCTAssertEqual(confirmed.first?.currentValue, "high")
     }
 
+    func testCancellingACallerFailsItsPendingRequestInsteadOfWaitingOnTheAdapter() async throws {
+        // Closing a chat view cancels the task awaiting `session/prompt`. That
+        // request must fail with its caller instead of sitting in `pending`
+        // until the adapter answers — prompts are sent with no timeout, so the
+        // wait is otherwise unbounded.
+        let transport = ScriptedAcpTransport(withholdFirstPromptReply: true)
+        let client = AcpClient(transport: transport)
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        let outcome = CallOutcome()
+        let abandoned = Task {
+            do {
+                try await client.prompt("abandoned")
+                await outcome.record(.success(()))
+            } catch {
+                await outcome.record(.failure(error))
+            }
+        }
+        try await Self.untilAsync("the prompt to reach the adapter") {
+            await transport.hasWithheldPrompt()
+        }
+
+        abandoned.cancel()
+
+        let returned = try await Self.untilAsync("the cancelled prompt to return") {
+            await outcome.isSettled()
+        }
+        guard returned else { return }
+        guard case let .failure(error)? = await outcome.settled() else {
+            return XCTFail("a cancelled prompt must fail, not report a finished turn")
+        }
+        XCTAssertTrue(error is CancellationError, "unexpected error: \(error)")
+    }
+
+    func testLateResponseCannotEndATurnTheCallerAlreadyAbandoned() async throws {
+        // The adapter answers on its own schedule, so a cancelled request's
+        // response still arrives. With nothing waiting on it, it must be
+        // dropped rather than ending a turn the surface has moved on from.
+        let transport = ScriptedAcpTransport(withholdFirstPromptReply: true)
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { event in collector.append(event) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        let outcome = CallOutcome()
+        let abandoned = Task {
+            do {
+                try await client.prompt("abandoned")
+                await outcome.record(.success(()))
+            } catch {
+                await outcome.record(.failure(error))
+            }
+        }
+        try await Self.untilAsync("the prompt to reach the adapter") {
+            await transport.hasWithheldPrompt()
+        }
+        abandoned.cancel()
+        let returned = try await Self.untilAsync("the cancelled prompt to return") {
+            await outcome.isSettled()
+        }
+        guard returned else { return }
+
+        await transport.deliverWithheldPromptReply()
+        try await client.prompt("the turn that counts")
+
+        let endings = collector.events.filter {
+            if case .turnEnded = $0 { return true } else { return false }
+        }
+        XCTAssertEqual(
+            endings.count, 1,
+            "the abandoned request's late response ended a turn of its own"
+        )
+        // The replacement request still gets its own answer: ids are never
+        // reused, so the stale response cannot resolve it.
+        let prompts = await transport.receivedPromptTexts()
+        XCTAssertEqual(prompts, ["abandoned", "the turn that counts"])
+    }
+
+    /// Poll an async condition until it holds, failing after `timeout` and
+    /// reporting whether it held so a caller can stop before asserting on state
+    /// that never arrived. A regression here must fail, never hang the suite.
+    @discardableResult
+    private static func untilAsync(
+        _ description: String,
+        timeout: TimeInterval = 5,
+        _ condition: () async -> Bool
+    ) async throws -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !(await condition()) {
+            if Date() > deadline {
+                XCTFail("timed out waiting for \(description)")
+                return false
+            }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return true
+    }
+
     @MainActor
     func testConversationAccumulatesStreamingChunks() async throws {
         let transport = ScriptedAcpTransport()
@@ -1423,6 +1525,15 @@ final class AcpClientTests: XCTestCase {
     }
 }
 
+/// Records how a call finished so a test can poll for it. Awaiting the task
+/// itself would hang forever on the very regression under test.
+private actor CallOutcome {
+    private var result: Result<Void, any Error>?
+    func record(_ result: Result<Void, any Error>) { self.result = result }
+    func settled() -> Result<Void, any Error>? { result }
+    func isSettled() -> Bool { result != nil }
+}
+
 private final class EventCollector: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [AcpEvent] = []
@@ -1538,6 +1649,11 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private let resumeCapability: Bool
     private let rejectRestoration: Bool
     private let crashOnFirstPrompt: Bool
+    /// Answers the first prompt only when the test says so, standing in for an
+    /// adapter that is still thinking while the caller walks away.
+    private let withholdFirstPromptReply: Bool
+    private var withheldPromptID: JSONValue?
+    private var didWithholdPrompt = false
     private let steeringSupported: Bool
     private let steerOutcome: String?
     private let steerErrorMessage: String?
@@ -1561,6 +1677,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         resumeCapability: Bool = false,
         rejectRestoration: Bool = false,
         crashOnFirstPrompt: Bool = false,
+        withholdFirstPromptReply: Bool = false,
         steeringSupported: Bool = true,
         steerOutcome: String? = "injected",
         steerErrorMessage: String? = nil,
@@ -1573,6 +1690,7 @@ private actor ScriptedAcpTransport: AcpByteTransport {
         self.resumeCapability = resumeCapability
         self.rejectRestoration = rejectRestoration
         self.crashOnFirstPrompt = crashOnFirstPrompt
+        self.withholdFirstPromptReply = withholdFirstPromptReply
         self.steeringSupported = steeringSupported
         self.steerOutcome = steerOutcome
         self.steerErrorMessage = steerErrorMessage
@@ -1603,6 +1721,16 @@ private actor ScriptedAcpTransport: AcpByteTransport {
             try await Task.sleep(for: .milliseconds(10))
         }
         throw AcpClientError.requestFailed("Timed out waiting for contained client response \(id)")
+    }
+
+    func hasWithheldPrompt() -> Bool { withheldPromptID != nil }
+
+    /// Answer the prompt this transport deliberately left open, as an adapter
+    /// does when it finishes long after the caller stopped listening.
+    func deliverWithheldPromptReply() {
+        guard let id = withheldPromptID else { return }
+        withheldPromptID = nil
+        reply(id: id, result: .object(["stopReason": .string("end_turn")]))
     }
 
     func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
@@ -1732,6 +1860,11 @@ private actor ScriptedAcpTransport: AcpByteTransport {
                 started = false
                 waiter?.resume(returning: nil)
                 waiter = nil
+                return
+            }
+            if withholdFirstPromptReply, !didWithholdPrompt {
+                didWithholdPrompt = true
+                withheldPromptID = id
                 return
             }
             streamTurn()

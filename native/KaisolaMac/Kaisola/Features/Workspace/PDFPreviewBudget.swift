@@ -762,14 +762,38 @@ struct PDFPreviewBudgetGenerationReceipt: Codable, Equatable, Sendable {
 
 @MainActor
 enum PDFPreviewViewConfiguration {
+    static var initialUpscaleCapPageCount: Int { 96 }
+
+    static func capsInitialUpscale(pageCount: Int) -> Bool {
+        pageCount >= initialUpscaleCapPageCount
+    }
+
     static func install(document: PDFDocument?, in view: PDFView) {
-        view.autoScales = true
+        guard view.document !== document else { return }
+        if view.document != nil {
+            view.setCurrentSelection(nil, animate: false)
+            view.document = nil
+        }
+
+        let capsInitialUpscale = capsInitialUpscale(pageCount: document?.pageCount ?? 0)
+        view.autoScales = !capsInitialUpscale
+        if capsInitialUpscale {
+            view.scaleFactor = 1
+        }
         view.displayMode = .singlePageContinuous
         view.displayDirection = .vertical
         view.displaysPageBreaks = true
         view.pageShadowsEnabled = true
         view.backgroundColor = .underPageBackgroundColor
         view.document = document
+        if capsInitialUpscale,
+           view.bounds.width > 0,
+           view.bounds.height > 0 {
+            let fitScale = view.scaleFactorForSizeToFit
+            if fitScale.isFinite, fitScale > 0, fitScale < 1 {
+                view.scaleFactor = fitScale
+            }
+        }
     }
 }
 

@@ -352,6 +352,105 @@ final class PDFPreviewBudgetTests: XCTestCase {
         XCTAssertNil(view.document)
     }
 
+    @MainActor
+    func testInitialUpscaleCapBeginsAtNinetySixPages() {
+        XCTAssertFalse(PDFPreviewViewConfiguration.capsInitialUpscale(pageCount: 95))
+        XCTAssertTrue(PDFPreviewViewConfiguration.capsInitialUpscale(pageCount: 96))
+    }
+
+    @MainActor
+    func testLongDocumentCapsInitialUpscaleAndPreservesNativeReaderState() throws {
+        let fixtureSpecification = try XCTUnwrap(
+            PDFPreviewBudgetFixtureCatalog.specification(id: "many-page")
+        )
+        let generatedFixture = try PDFPreviewBudgetFixtureWriter.write(fixtureSpecification, to: root)
+        let fixtureDocument = try XCTUnwrap(PDFDocumentIO.load(url: generatedFixture.url)?.value)
+        let longDocument = try makeSelectableDocument(
+            pageCount: 96,
+            pageSize: NSSize(width: 1_440, height: 1_440)
+        )
+        let shortDocument = try makeSelectableDocument(pageCount: 6)
+        let onePageDocument = try makeSelectableDocument(pageCount: 1)
+        let zeroFrameView = PDFView(frame: .zero)
+        PDFPreviewViewConfiguration.install(document: fixtureDocument, in: zeroFrameView)
+        XCTAssertEqual(fixtureDocument.pageCount, 96)
+        XCTAssertTrue(zeroFrameView.document === fixtureDocument)
+        XCTAssertFalse(zeroFrameView.autoScales)
+        XCTAssertEqual(zeroFrameView.scaleFactor, 1, accuracy: 0.001)
+        PDFFilePreview.dismantleNSView(zeroFrameView, coordinator: ())
+
+        let view = PDFView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 720))
+
+        PDFPreviewViewConfiguration.install(document: longDocument, in: view)
+
+        XCTAssertEqual(longDocument.pageCount, 96)
+        XCTAssertTrue(view.document === longDocument)
+        XCTAssertNotNil(view.documentView)
+        XCTAssertFalse(view.autoScales)
+        XCTAssertTrue(view.scaleFactor.isFinite)
+        XCTAssertGreaterThan(view.scaleFactor, 0)
+        XCTAssertLessThanOrEqual(view.scaleFactor, 1)
+        let fitScale = view.scaleFactorForSizeToFit
+        XCTAssertTrue(fitScale.isFinite)
+        XCTAssertGreaterThan(fitScale, 0)
+        XCTAssertLessThan(fitScale, 1)
+        XCTAssertEqual(view.scaleFactor, fitScale, accuracy: 0.001)
+        XCTAssertGreaterThan(view.maxScaleFactor, view.minScaleFactor)
+        XCTAssertEqual(view.displayMode, .singlePageContinuous)
+        XCTAssertEqual(view.displayDirection, .vertical)
+        XCTAssertTrue(view.displaysPageBreaks)
+        XCTAssertTrue(view.pageShadowsEnabled)
+
+        let longSelection = try XCTUnwrap(longDocument.findString(
+            "Native PDF preview 0",
+            withOptions: []
+        ).first)
+        view.setCurrentSelection(longSelection, animate: false)
+        XCTAssertEqual(view.currentSelection?.string, "Native PDF preview 0")
+
+        let cappedScale = view.scaleFactor
+        let zoomedScale = min(view.maxScaleFactor, cappedScale * 1.25)
+        XCTAssertGreaterThan(zoomedScale, cappedScale)
+        view.scaleFactor = zoomedScale
+        XCTAssertEqual(view.scaleFactor, zoomedScale, accuracy: 0.001)
+
+        PDFPreviewViewConfiguration.install(document: longDocument, in: view)
+
+        XCTAssertTrue(view.document === longDocument)
+        XCTAssertEqual(view.scaleFactor, zoomedScale, accuracy: 0.001)
+        XCTAssertEqual(view.currentSelection?.string, "Native PDF preview 0")
+
+        PDFPreviewViewConfiguration.install(document: shortDocument, in: view)
+
+        XCTAssertEqual(shortDocument.pageCount, 6)
+        XCTAssertTrue(view.document === shortDocument)
+        XCTAssertNotNil(view.documentView)
+        XCTAssertTrue(view.autoScales)
+        XCTAssertNil(view.currentSelection)
+        XCTAssertEqual(view.displayMode, .singlePageContinuous)
+        XCTAssertEqual(view.displayDirection, .vertical)
+        let shortSelection = try XCTUnwrap(shortDocument.findString(
+            "Native PDF preview 0",
+            withOptions: []
+        ).first)
+        view.setCurrentSelection(shortSelection, animate: false)
+        XCTAssertEqual(view.currentSelection?.string, "Native PDF preview 0")
+
+        PDFPreviewViewConfiguration.install(document: longDocument, in: view)
+
+        XCTAssertTrue(view.document === longDocument)
+        XCTAssertFalse(view.autoScales)
+        XCTAssertLessThanOrEqual(view.scaleFactor, 1)
+        XCTAssertNil(view.currentSelection)
+
+        PDFPreviewViewConfiguration.install(document: onePageDocument, in: view)
+
+        XCTAssertEqual(onePageDocument.pageCount, 1)
+        XCTAssertTrue(view.document === onePageDocument)
+        XCTAssertTrue(view.autoScales)
+        XCTAssertNil(view.currentSelection)
+    }
+
     func testInstalledProbeWaitsForTheInstrumentedPDFPageDrawCompletion() throws {
         let specification = try XCTUnwrap(
             PDFPreviewBudgetFixtureCatalog.specification(id: "large-page")
@@ -374,5 +473,23 @@ final class PDFPreviewBudgetTests: XCTestCase {
         page.draw(with: .mediaBox, to: context)
 
         XCTAssertEqual(page.completedDrawCount, baseline + 1)
+    }
+
+    @MainActor
+    private func makeSelectableDocument(
+        pageCount: Int,
+        pageSize: NSSize = NSSize(width: 612, height: 792)
+    ) throws -> PDFDocument {
+        let document = PDFDocument()
+        for pageIndex in 0..<pageCount {
+            let source = NSTextField(labelWithString: "Native PDF preview \(pageIndex)")
+            source.frame = NSRect(origin: .zero, size: pageSize)
+            let pageDocument = try XCTUnwrap(PDFDocument(
+                data: source.dataWithPDF(inside: source.bounds)
+            ))
+            let page = try XCTUnwrap(pageDocument.page(at: 0))
+            document.insert(page, at: document.pageCount)
+        }
+        return document
     }
 }

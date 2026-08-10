@@ -540,7 +540,7 @@ test('installed paging waits for PDFKit page draw completion instead of page sel
   )
 })
 
-test('product and gate rely on PDFKit automatic layout without eager relayout', () => {
+test('product and gate cap long-document initial upscale before mounting without eager relayout', () => {
   const budget = fs.readFileSync(path.resolve(
     __dirname,
     '../../native/KaisolaMac/Kaisola/Features/Workspace/PDFPreviewBudget.swift',
@@ -554,10 +554,46 @@ test('product and gate rely on PDFKit automatic layout without eager relayout', 
   const pageStart = budget.indexOf('final class PDFPreviewBudgetPage')
   assert.ok(configurationStart >= 0 && pageStart > configurationStart)
   const configuration = budget.slice(configurationStart, pageStart)
-  assert.match(configuration, /view\.autoScales = true/u)
+  assert.match(configuration, /static var initialUpscaleCapPageCount: Int \{ 96 \}/u)
+  assert.match(
+    configuration,
+    /static func capsInitialUpscale\(pageCount: Int\) -> Bool\s*\{\s*pageCount >= initialUpscaleCapPageCount\s*\}/u,
+  )
+  assert.match(configuration, /guard view\.document !== document else \{ return \}/u)
+  assert.match(
+    configuration,
+    /if view\.document != nil \{\s*view\.setCurrentSelection\(nil, animate: false\)\s*view\.document = nil\s*\}/u,
+  )
+  assert.match(
+    configuration,
+    /let capsInitialUpscale = capsInitialUpscale\(pageCount: document\?\.pageCount \?\? 0\)/u,
+  )
+  const identityGuard = configuration.indexOf('guard view.document !== document else { return }')
+  const clearSelection = configuration.indexOf('view.setCurrentSelection(nil, animate: false)')
+  const detach = configuration.indexOf('view.document = nil')
+  const capDecision = configuration.indexOf('let capsInitialUpscale =')
+  const autoScalePolicy = configuration.indexOf('view.autoScales = !capsInitialUpscale')
+  const unitScale = configuration.indexOf('view.scaleFactor = 1')
+  const documentAssignment = configuration.indexOf('view.document = document')
+  const fitScale = configuration.indexOf('let fitScale = view.scaleFactorForSizeToFit')
+  assert.ok(identityGuard >= 0)
+  assert.ok(clearSelection > identityGuard)
+  assert.ok(detach > clearSelection)
+  assert.ok(capDecision > detach)
+  assert.ok(autoScalePolicy > capDecision)
+  assert.ok(unitScale > autoScalePolicy)
+  assert.ok(documentAssignment > unitScale)
+  assert.ok(fitScale > documentAssignment)
+  assert.equal(configuration.match(/view\.document = document/gu)?.length, 1)
+  assert.match(
+    configuration,
+    /if capsInitialUpscale,\s*view\.bounds\.width > 0,\s*view\.bounds\.height > 0/u,
+  )
+  assert.match(configuration, /fitScale\.isFinite, fitScale > 0, fitScale < 1/u)
+  assert.match(configuration, /view\.scaleFactor = fitScale/u)
+  assert.doesNotMatch(configuration, /view\.(?:min|max)ScaleFactor\s*=/u)
   assert.match(configuration, /view\.displayMode = \.singlePageContinuous/u)
   assert.match(configuration, /view\.displayDirection = \.vertical/u)
-  assert.match(configuration, /view\.document = document/u)
   assert.doesNotMatch(configuration, /layoutDocumentView\(\)/u)
 
   const measureStart = budget.indexOf('private func measure(')
@@ -571,6 +607,7 @@ test('product and gate rely on PDFKit automatic layout without eager relayout', 
   )
   assert.doesNotMatch(measure, /layoutDocumentView\(\)/u)
 
+  assert.match(editors, /func makeNSView\(context: Context\) -> PDFView/u)
   assert.match(editors, /PDFPreviewViewConfiguration\.install\(document: document, in: view\)/u)
   assert.doesNotMatch(editors, /layoutDocumentView\(\)/u)
 })

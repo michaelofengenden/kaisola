@@ -52,6 +52,8 @@ jobs:
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 22
@@ -64,6 +66,8 @@ jobs:
         run: npm ci --prefer-offline --no-audit --no-fund
         env:
           KAISOLA_SKIP_NATIVE_REBUILD: '1'
+      - name: Lint security-sensitive workflow checkouts
+        run: node --test tests/node/workflowSecurity.test.cjs
       - name: Download checksum-pinned Node runtime
         run: node scripts/download-native-node-runtime.cjs arm64
       - name: Test native packaging, compatibility, and resource policies

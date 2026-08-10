@@ -1558,8 +1558,28 @@ final class AcpConversation: ObservableObject {
 
     // MARK: - Persistent draft
 
+    /// Preference keys written by the original composer persistence path.
+    /// Keep the list centralized so permanent deletion can clear every
+    /// source-backed alias without scanning or disturbing unrelated defaults.
+    static func persistedDraftDefaultsKeys(for draftStorageKey: String) -> [String] {
+        ["chatDraft.\(draftStorageKey)"]
+    }
+
+    static func removePersistedDraft(
+        for draftStorageKey: String,
+        currentDefaults: UserDefaults = .standard,
+        migratedDefaults: UserDefaults? = UserDefaults(
+            suiteName: KaisolaProductMigration.legacyBundleIdentifier
+        )
+    ) {
+        for key in persistedDraftDefaultsKeys(for: draftStorageKey) {
+            currentDefaults.removeObject(forKey: key)
+            migratedDefaults?.removeObject(forKey: key)
+        }
+    }
+
     private var draftDefaultsKey: String? {
-        draftStorageKey.map { "chatDraft.\($0)" }
+        draftStorageKey.flatMap { Self.persistedDraftDefaultsKeys(for: $0).first }
     }
 
     /// The composer draft persisted for this chat, or "" when none exists or the
@@ -1591,6 +1611,20 @@ final class AcpConversation: ObservableObject {
             self.pendingDraftPersistence = nil
             self.onDraftChanged?(pending)
         }
+    }
+
+    /// Drop the draft, its buffered write, and the key that names it. Called on
+    /// the permanent-delete boundary: clearing the stored text is not enough on
+    /// its own, because the composer tearing down one frame later can call
+    /// `saveDraft` and write the same plaintext straight back. Losing the key
+    /// makes every later save a no-op, exactly as for an unkeyed chat.
+    func forgetPersistentDraft() {
+        if let draftStorageKey { Self.removePersistedDraft(for: draftStorageKey) }
+        draftStorageKey = nil
+        restoredDraft = nil
+        pendingDraftPersistence = nil
+        draftPersistenceTask?.cancel()
+        draftPersistenceTask = nil
     }
 
     // MARK: - Test hooks

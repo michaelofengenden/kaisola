@@ -686,6 +686,12 @@ final class AppModelProjectContextTests: XCTestCase {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         model.openChat(agent, inDirectory: directory)
         let chat = try XCTUnwrap(model.chats.first)
+        let defaultsKeys = AcpConversation.persistedDraftDefaultsKeys(for: chat.id)
+        defer {
+            for key in defaultsKeys {
+                UserDefaults.standard.removeObject(forKey: key)
+            }
+        }
         let rows: [AcpTranscriptRow] = [
             .user(id: "user-1", text: "keep this question", failed: false),
             .message(id: "agent-1", text: "keep this answer"),
@@ -728,11 +734,17 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertTrue(model.recentlyClosedSurfaces(in: chat.projectID).isEmpty)
 
         XCTAssertTrue(model.closeChat(chat.id))
+        for key in defaultsKeys {
+            XCTAssertNotNil(UserDefaults.standard.string(forKey: key))
+        }
         let deleteResult = await model.deleteRecentlyClosedSurface(
             chat.id,
             allowRecoverableWork: true
         )
         XCTAssertEqual(deleteResult, .completed)
+        for key in defaultsKeys {
+            XCTAssertNil(UserDefaults.standard.object(forKey: key))
+        }
         XCTAssertTrue(model.recentlyClosedSurfaces(in: chat.projectID).isEmpty)
         let missingResult = await model.restoreRecentlyClosedSurface(chat.id)
         XCTAssertEqual(missingResult, .unavailable)
@@ -779,6 +791,61 @@ final class AppModelProjectContextTests: XCTestCase {
             return XCTFail("expected a blocked delete, got \(deleteResult)")
         }
         XCTAssertTrue(message.contains("could not be erased"), message)
+    }
+
+    /// A composer draft lives in two places: the workspace draft store, and the
+    /// legacy `chatDraft.<id>` defaults key that `loadDraft` still reads. A
+    /// permanent delete that clears only the first leaves the unsent text
+    /// readable in preferences for the life of the install.
+    @MainActor
+    func testPermanentDeleteErasesTheLegacyAndCurrentDraftStores() async throws {
+        let (model, _) = makeModel()
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        let directory = storeFile.deletingLastPathComponent()
+            .appendingPathComponent("deleted-draft-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        model.openChat(agent, inDirectory: directory)
+        let chat = try XCTUnwrap(model.chats.first)
+        let legacyKey = "chatDraft.\(chat.id)"
+        let stableKey = "chat|\(chat.id)"
+        defer { UserDefaults.standard.removeObject(forKey: legacyKey) }
+
+        // Seed both stores: `saveDraft` writes the defaults mirror inline, and
+        // the draft hook is what the composer's debounce eventually calls.
+        let secret = "unsent recovery phrase 8f21-tttp"
+        chat.conversation.saveDraft(secret)
+        chat.conversation.onDraftChanged?(secret)
+        await model.flushDraftPersistence()
+
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: storeFile.deletingLastPathComponent()
+                .appendingPathComponent("workspace-state-v1.json")
+        )
+        let seededDraft = try await workspaceStore.draft(for: stableKey)
+        XCTAssertEqual(UserDefaults.standard.string(forKey: legacyKey), secret)
+        XCTAssertEqual(seededDraft, secret)
+
+        await model.deleteChat(chat.id)
+        await model.flushDraftPersistence()
+        await model.teardown()
+
+        XCTAssertNil(
+            UserDefaults.standard.string(forKey: legacyKey),
+            "the legacy defaults draft survived a permanent delete"
+        )
+        await workspaceStore.invalidateCache()
+        let survivingDraft = try await workspaceStore.draft(for: stableKey)
+        XCTAssertNil(survivingDraft, "the workspace draft survived a permanent delete")
+
+        // Relaunch: a fresh conversation on the same key finds no plaintext.
+        let relaunched = AcpConversation(
+            title: "Relaunched",
+            command: "mock",
+            arguments: [],
+            cwd: directory.path,
+            draftKey: chat.id
+        )
+        XCTAssertEqual(relaunched.loadDraft(), "")
     }
 
     @MainActor

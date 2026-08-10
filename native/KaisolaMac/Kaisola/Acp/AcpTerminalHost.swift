@@ -15,16 +15,32 @@ actor AcpTerminalHost {
         let output: String
         let truncated: Bool
         let exitStatus: ExitStatus?
+        /// The child exited while a descendant still held the write end of the
+        /// output pipe, so the exit was reported without an EOF. The buffer is
+        /// sealed at that moment: whatever the descendant writes afterwards is
+        /// read and dropped, never appended behind the reported exit.
+        let outputDetached: Bool
     }
 
     static let defaultOutputByteLimit = 1_048_576
     /// Hard ceiling for adapter-requested output limits (mirrors Electron's
     /// 8 MiB clamp) — a hostile `outputByteLimit` cannot exhaust app memory.
     static let maxOutputByteLimit = 8 * 1_048_576
+    /// How long a lingering descendant may keep the pipe open after the child
+    /// exits before exit waiters are answered without an EOF.
+    private static let lingeringOutputGrace: TimeInterval = 2
     private static let signalNames: [Int32: String] = [
         SIGHUP: "SIGHUP", SIGINT: "SIGINT", SIGQUIT: "SIGQUIT", SIGKILL: "SIGKILL",
         SIGTERM: "SIGTERM", SIGPIPE: "SIGPIPE", SIGSEGV: "SIGSEGV", SIGABRT: "SIGABRT",
     ]
+
+    /// Ordered traffic from the output pipe. The grace-period tick rides the
+    /// same stream as the bytes, so it can never overtake a chunk that was
+    /// already read.
+    private enum OutputEvent: Sendable {
+        case chunk(Data)
+        case exitGraceExpired
+    }
 
     private final class Entry {
         let process: Process
@@ -35,7 +51,16 @@ actor AcpTerminalHost {
         /// Exit reported by the termination handler, held until the pipe drains
         /// so `wait_for_exit` can never resolve ahead of the final output.
         var pendingExit: ExitStatus?
+        /// The pipe itself reported EOF: the child and every descendant that
+        /// inherited the write end are done writing.
         var eofReached = false
+        /// A separate fact from EOF: the child exited and a descendant still
+        /// held the write end when the grace period ran out. Output ends here
+        /// because we stop trusting it, not because the writer finished.
+        var outputDetached = false
+        /// Closed at `finish`, so no byte can join the buffer behind an exit a
+        /// `wait_for_exit` caller has already seen.
+        var outputSealed = false
         var released = false
         var waiters: [CheckedContinuation<ExitStatus, Never>] = []
 
@@ -84,7 +109,7 @@ actor AcpTerminalHost {
         // lets the EOF task overtake the final append on a busy executor. Feed
         // one AsyncStream instead: its single consumer commits every chunk in
         // callback order, then marks EOF only after the buffer is fully drained.
-        let (outputStream, outputContinuation) = AsyncStream<Data>.makeStream()
+        let (outputStream, outputContinuation) = AsyncStream<OutputEvent>.makeStream()
         pipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             if data.isEmpty {
@@ -92,11 +117,16 @@ actor AcpTerminalHost {
                 outputContinuation.finish()
                 return
             }
-            outputContinuation.yield(data)
+            outputContinuation.yield(.chunk(data))
         }
         Task { [weak self] in
-            for await data in outputStream {
-                await self?.append(id: id, data: data)
+            for await event in outputStream {
+                switch event {
+                case .chunk(let data):
+                    await self?.append(id: id, data: data)
+                case .exitGraceExpired:
+                    await self?.markOutputDetached(id: id)
+                }
             }
             await self?.markEOF(id: id)
         }
@@ -106,10 +136,11 @@ actor AcpTerminalHost {
                 ? ExitStatus(exitCode: nil, signal: Self.signalNames[finished.terminationStatus] ?? "SIG\(finished.terminationStatus)")
                 : ExitStatus(exitCode: finished.terminationStatus, signal: nil)
             Task { await self.recordExit(id: id, status: status) }
-            // If a grandchild keeps the pipe open past exit, don't hold exit
-            // waiters hostage — force completion after a grace period.
-            DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-                Task { await self.forceEOF(id: id) }
+            // A grandchild that inherited the pipe can hold it open long past
+            // the child's exit. Don't hold exit waiters hostage — after a grace
+            // period the output is declared detached instead of complete.
+            DispatchQueue.global().asyncAfter(deadline: .now() + Self.lingeringOutputGrace) {
+                outputContinuation.yield(.exitGraceExpired)
             }
         }
 
@@ -129,7 +160,8 @@ actor AcpTerminalHost {
         return Snapshot(
             output: String(decoding: entry.buffer, as: UTF8.self),
             truncated: entry.truncated,
-            exitStatus: entry.exitStatus
+            exitStatus: entry.exitStatus,
+            outputDetached: entry.outputDetached
         )
     }
 
@@ -169,7 +201,9 @@ actor AcpTerminalHost {
     // MARK: - Internal
 
     private func append(id: String, data: Data) {
-        guard let entry = entries[id] else { return }
+        // A sealed buffer belongs to an exit that callers have already been
+        // told about; a lingering descendant's late bytes are dropped here.
+        guard let entry = entries[id], !entry.outputSealed else { return }
         entry.buffer.append(data)
         if entry.buffer.count > entry.byteLimit {
             // Keep the tail on a UTF-8 boundary so decoding stays clean.
@@ -183,12 +217,13 @@ actor AcpTerminalHost {
         }
     }
 
-    /// Exit lands here first; it only becomes visible once the pipe reached
-    /// EOF, so `terminal/output` after `wait_for_exit` always sees full output.
+    /// Exit lands here first; it only becomes visible once the output ended —
+    /// by EOF, or by detaching from a descendant that outlived the child — so
+    /// `terminal/output` after `wait_for_exit` never grows afterwards.
     private func recordExit(id: String, status: ExitStatus) {
         guard let entry = entries[id] else { return }
         entry.pendingExit = status
-        if entry.eofReached { finish(id: id, entry: entry) }
+        if entry.eofReached || entry.outputDetached { finish(id: id, entry: entry) }
     }
 
     private func markEOF(id: String) {
@@ -197,16 +232,22 @@ actor AcpTerminalHost {
         if entry.pendingExit != nil { finish(id: id, entry: entry) }
     }
 
-    /// The grace-period fallback for grandchildren that hold the pipe open.
-    private func forceEOF(id: String) {
-        guard let entry = entries[id], entry.exitStatus == nil, entry.pendingExit != nil else { return }
-        entry.eofReached = true
-        finish(id: id, entry: entry)
+    /// The grace period ran out with the pipe still open, so a descendant of
+    /// the exited child holds the write end. Its later bytes keep being read —
+    /// a writer blocked on a full pipe would wedge a background process the
+    /// agent meant to keep alive — but `append` drops them from here on.
+    private func markOutputDetached(id: String) {
+        guard let entry = entries[id], !entry.eofReached else { return }
+        entry.outputDetached = true
+        if entry.pendingExit != nil { finish(id: id, entry: entry) }
     }
 
     private func finish(id: String, entry: Entry) {
         guard entry.exitStatus == nil, let status = entry.pendingExit else { return }
         entry.exitStatus = status
+        // The snapshot a caller reads after `wait_for_exit` has to be the one
+        // the exit was reported against, so the buffer closes with it.
+        entry.outputSealed = true
         for waiter in entry.waiters { waiter.resume(returning: status) }
         entry.waiters.removeAll()
         if entry.released { entries[id] = nil }

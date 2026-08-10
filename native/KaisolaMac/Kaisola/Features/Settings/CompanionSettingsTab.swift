@@ -81,18 +81,101 @@ struct CompanionPairingOfferExpiryFence: Equatable, Sendable {
     }
 }
 
+enum CompanionSettingsFailureTarget: Hashable, Sendable {
+    case offer
+    case confirmation
+    case device(String)
+
+    var anchorID: String {
+        switch self {
+        case .offer: "companion.error.offer.anchor"
+        case .confirmation: "companion.error.confirmation.anchor"
+        case .device(let deviceID): "companion.error.device.\(deviceID).anchor"
+        }
+    }
+
+    var accessibilityIdentifier: String {
+        switch self {
+        case .offer: "companion.error.offer"
+        case .confirmation: "companion.error.confirmation"
+        case .device(let deviceID): "companion.error.device.\(deviceID)"
+        }
+    }
+}
+
+enum CompanionSettingsRetry: Equatable, Sendable {
+    case createOffer
+    case createReplacementOffer
+    case revoke(deviceID: String)
+    case updateCapabilities(deviceID: String, capabilities: [CompanionCapability])
+}
+
+struct CompanionSettingsFailure: Equatable, Sendable {
+    static let maximumMessageCharacters = 512
+
+    let message: String
+    let retryTitle: String
+    let retry: CompanionSettingsRetry
+
+    init(message: String, retryTitle: String, retry: CompanionSettingsRetry) {
+        self.message = String(message.prefix(Self.maximumMessageCharacters))
+        self.retryTitle = retryTitle
+        self.retry = retry
+    }
+}
+
+struct CompanionSettingsFailureStore: Equatable, Sendable {
+    private var offer: CompanionSettingsFailure?
+    private var confirmation: CompanionSettingsFailure?
+    private var devices: [String: CompanionSettingsFailure] = [:]
+
+    mutating func record(
+        _ failure: CompanionSettingsFailure,
+        for target: CompanionSettingsFailureTarget
+    ) {
+        switch target {
+        case .offer: offer = failure
+        case .confirmation: confirmation = failure
+        case .device(let deviceID): devices[deviceID] = failure
+        }
+    }
+
+    mutating func clear(_ target: CompanionSettingsFailureTarget) {
+        switch target {
+        case .offer: offer = nil
+        case .confirmation: confirmation = nil
+        case .device(let deviceID): devices.removeValue(forKey: deviceID)
+        }
+    }
+
+    mutating func retainDeviceFailures(for deviceIDs: Set<String>) {
+        devices = devices.filter { deviceIDs.contains($0.key) }
+    }
+
+    func failure(for target: CompanionSettingsFailureTarget) -> CompanionSettingsFailure? {
+        switch target {
+        case .offer: offer
+        case .confirmation: confirmation
+        case .device(let deviceID): devices[deviceID]
+        }
+    }
+}
+
 struct CompanionSettingsTab: View {
     @ObservedObject private var host = CompanionHost.shared
     @StateObject private var offerActivation = CompanionPairingOfferActivation()
     @StateObject private var confirmationActivation = CompanionPairingConfirmationActivation()
     @State private var pairingGrantDraft = CompanionPairingGrantDraft()
-    @State private var operationError: String?
+    @State private var failures = CompanionSettingsFailureStore()
+    @State private var failureFocusRequest: CompanionSettingsFailureTarget?
+    @FocusState private var focusedFailure: CompanionSettingsFailureTarget?
     @State private var pendingRevocation: CompanionPairedDeviceRecord?
     @State private var capabilityUpdates: Set<String> = []
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 16) {
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(spacing: 16) {
                 SettingsCard(title: "Nearby Access", symbol: "iphone.and.arrow.forward") {
                     SettingsRow(
                         title: "Kaisola Companion",
@@ -210,6 +293,8 @@ struct CompanionSettingsTab: View {
                             .padding(.horizontal, 14)
                             .padding(.vertical, 11)
 
+                            inlineFailure(for: .offer)
+
                             if let code = host.pairingCode {
                                 let presentation = CompanionPairingCodePresentation(code: code)
                                 let qrCodeImage = CompanionQRCode.image(for: code)
@@ -322,6 +407,7 @@ struct CompanionSettingsTab: View {
                             }
                             .padding(14)
                         }
+                        inlineFailure(for: .confirmation)
                     }
                 }
 
@@ -336,105 +422,166 @@ struct CompanionSettingsTab: View {
                         ForEach(Array(host.pairedDevices.enumerated()), id: \.element.id) { index, device in
                             if index > 0 { SettingsDivider() }
                             let connected = host.connectedDeviceIDs.contains(device.deviceId)
-                            SettingsRow(
-                                title: device.displayName,
-                                detail: "\(capabilityDetail(device.capabilities)) · \(connected ? "Connected" : "Waiting to reconnect")",
-                                symbol: "laptopcomputer.and.iphone"
-                            ) {
-                                HStack(spacing: 6) {
-                                    Menu("Access") {
-                                        Label("View status and output", systemImage: "checkmark")
-                                        Divider()
-                                        Button {
-                                            toggle(.agentControl, for: device)
-                                        } label: {
-                                            Label(
-                                                "Control agents",
-                                                systemImage: device.capabilities.contains(.agentControl)
-                                                    ? "checkmark" : "circle"
-                                            )
+                            VStack(spacing: 0) {
+                                SettingsRow(
+                                    title: device.displayName,
+                                    detail: "\(capabilityDetail(device.capabilities)) · \(connected ? "Connected" : "Waiting to reconnect")",
+                                    symbol: "laptopcomputer.and.iphone"
+                                ) {
+                                    HStack(spacing: 6) {
+                                        Menu("Access") {
+                                            Label("View status and output", systemImage: "checkmark")
+                                            Divider()
+                                            Button {
+                                                toggle(.agentControl, for: device)
+                                            } label: {
+                                                Label(
+                                                    "Control agents",
+                                                    systemImage: device.capabilities.contains(.agentControl)
+                                                        ? "checkmark" : "circle"
+                                                )
+                                            }
+                                            Button {
+                                                toggle(.terminalControl, for: device)
+                                            } label: {
+                                                Label(
+                                                    "Control terminals",
+                                                    systemImage: device.capabilities.contains(.terminalControl)
+                                                        ? "checkmark" : "circle"
+                                                )
+                                            }
                                         }
-                                        Button {
-                                            toggle(.terminalControl, for: device)
-                                        } label: {
-                                            Label(
-                                                "Control terminals",
-                                                systemImage: device.capabilities.contains(.terminalControl)
-                                                    ? "checkmark" : "circle"
-                                            )
-                                        }
-                                    }
-                                    .menuStyle(.borderlessButton)
-                                    .fixedSize()
-                                    .disabled(capabilityUpdates.contains(device.id))
-                                    .accessibilityLabel("Change access for \(device.displayName)")
+                                        .menuStyle(.borderlessButton)
+                                        .fixedSize()
+                                        .disabled(capabilityUpdates.contains(device.id))
+                                        .accessibilityLabel("Change access for \(device.displayName)")
 
-                                    if !connected {
-                                        Button("Refresh") {
-                                            host.refreshReconnectAvailability()
+                                        if !connected {
+                                            Button("Refresh") {
+                                                host.refreshReconnectAvailability()
+                                            }
+                                            .buttonStyle(.bordered)
+                                            .controlSize(.small)
+                                            .accessibilityLabel("Refresh reconnect routes for \(device.displayName)")
+                                            .accessibilityHint("Keeps this device paired and retries available Nearby and Link routes")
+                                        }
+                                        Button("Revoke", role: .destructive) {
+                                            pendingRevocation = device
                                         }
                                         .buttonStyle(.bordered)
                                         .controlSize(.small)
-                                        .accessibilityLabel("Refresh reconnect routes for \(device.displayName)")
-                                        .accessibilityHint("Keeps this device paired and retries available Nearby and Link routes")
                                     }
-                                    Button("Revoke", role: .destructive) {
-                                        pendingRevocation = device
-                                    }
-                                        .buttonStyle(.bordered)
-                                        .controlSize(.small)
                                 }
+                                inlineFailure(for: .device(device.id))
                             }
                         }
                     }
                 }
 
-                if let error = operationError {
-                    Label(error, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.horizontal, 4)
                 }
+                .padding(18)
             }
-            .padding(18)
-        }
-        .onChange(of: host.state) { _, state in
-            // Companion leaving ready tears this card down. An offer request
-            // that is still outstanding must not come back to a button the
-            // user can no longer press.
-            if case .ready = state { return }
-            offerActivation.discard()
-            confirmationActivation.discard()
-            pairingGrantDraft.reset(after: .cancelled)
-        }
-        .onChange(of: host.pairingPhrase?.pairingID) { _, pairingID in
-            confirmationActivation.reconcile(pairingID: pairingID)
-        }
-        .onChange(of: host.pairingPayload?.pairingNonce) { previous, current in
-            guard previous != nil, current == nil else { return }
-            pairingGrantDraft.reset(after: .confirmed)
-        }
-        .task(id: host.pairingPayload) {
-            guard let payload = host.pairingPayload else { return }
-            await resetPairingGrantDraft(atExpiryOf: payload)
-        }
-        .confirmationDialog(
-            "Revoke \(pendingRevocation?.displayName ?? "Device")?",
-            isPresented: Binding(
-                get: { pendingRevocation != nil },
-                set: { if !$0 { pendingRevocation = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button("Revoke Device", role: .destructive) {
-                guard let device = pendingRevocation else { return }
-                pendingRevocation = nil
-                revoke(device.id)
+            .onChange(of: failureFocusRequest) { _, target in
+                guard let target else { return }
+                withAnimation(.easeOut(duration: 0.16)) {
+                    proxy.scrollTo(target.anchorID, anchor: .center)
+                }
+                focusedFailure = target
+                failureFocusRequest = nil
             }
-            Button("Cancel", role: .cancel) { pendingRevocation = nil }
-        } message: {
-            Text("This device will immediately lose access. Pairing it again requires a new single-use code and confirmation on both devices.")
+            .onChange(of: host.state) { _, state in
+                // Companion leaving ready tears this card down. An offer request
+                // that is still outstanding must not come back to a button the
+                // user can no longer press.
+                if case .ready = state { return }
+                offerActivation.discard()
+                confirmationActivation.discard()
+                pairingGrantDraft.reset(after: .cancelled)
+            }
+            .onChange(of: host.pairingPhrase?.pairingID) { _, pairingID in
+                confirmationActivation.reconcile(pairingID: pairingID)
+            }
+            .onChange(of: host.pairingPayload?.pairingNonce) { previous, current in
+                guard previous != nil, current == nil else { return }
+                pairingGrantDraft.reset(after: .confirmed)
+            }
+            .onChange(of: host.pairedDevices.map(\.id)) { _, deviceIDs in
+                failures.retainDeviceFailures(for: Set(deviceIDs))
+            }
+            .task(id: host.pairingPayload) {
+                guard let payload = host.pairingPayload else { return }
+                await resetPairingGrantDraft(atExpiryOf: payload)
+            }
+            .confirmationDialog(
+                "Revoke \(pendingRevocation?.displayName ?? "Device")?",
+                isPresented: Binding(
+                    get: { pendingRevocation != nil },
+                    set: { if !$0 { pendingRevocation = nil } }
+                ),
+                titleVisibility: .visible
+            ) {
+                Button("Revoke Device", role: .destructive) {
+                    guard let device = pendingRevocation else { return }
+                    pendingRevocation = nil
+                    revoke(deviceID: device.id)
+                }
+                Button("Cancel", role: .cancel) { pendingRevocation = nil }
+            } message: {
+                Text("This device will immediately lose access. Pairing it again requires a new single-use code and confirmation on both devices.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func inlineFailure(for target: CompanionSettingsFailureTarget) -> some View {
+        if let failure = failures.failure(for: target) {
+            HStack(alignment: .firstTextBaseline, spacing: 10) {
+                Label(failure.message, systemImage: "exclamationmark.triangle.fill")
+                    .font(.caption)
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                Button(failure.retryTitle) {
+                    retry(failure.retry, at: target)
+                }
+                .controlSize(.small)
+                .focused($focusedFailure, equals: target)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(KaisolaStatusTone.failed.foregroundColor.opacity(0.08))
+            .id(target.anchorID)
+            .accessibilityIdentifier(target.accessibilityIdentifier)
+        }
+    }
+
+    private func beginAction(at target: CompanionSettingsFailureTarget) {
+        failures.clear(target)
+        if focusedFailure == target { focusedFailure = nil }
+        if failureFocusRequest == target { failureFocusRequest = nil }
+    }
+
+    private func recordFailure(
+        _ failure: CompanionSettingsFailure,
+        at target: CompanionSettingsFailureTarget
+    ) {
+        failures.record(failure, for: target)
+        failureFocusRequest = target
+    }
+
+    private func retry(
+        _ retry: CompanionSettingsRetry,
+        at target: CompanionSettingsFailureTarget
+    ) {
+        beginAction(at: target)
+        switch retry {
+        case .createOffer, .createReplacementOffer:
+            createOffer()
+        case .revoke(let deviceID):
+            revoke(deviceID: deviceID)
+        case let .updateCapabilities(deviceID, capabilities):
+            updateCapabilities(deviceID: deviceID, capabilities: capabilities)
         }
     }
 
@@ -486,8 +633,9 @@ struct CompanionSettingsTab: View {
 
     private func createOffer() {
         guard let attempt = offerActivation.begin() else { return }
+        beginAction(at: .offer)
+        beginAction(at: .confirmation)
         let selection = pairingGrantDraft.selection
-        operationError = nil
         Task {
             do {
                 try await host.createPairingOffer(
@@ -498,7 +646,14 @@ struct CompanionSettingsTab: View {
             } catch {
                 guard offerActivation.finish(attempt) else { return }
                 pairingGrantDraft.reset(after: .offerCreationFailed)
-                operationError = error.localizedDescription
+                recordFailure(
+                    CompanionSettingsFailure(
+                        message: "Pairing code creation failed: \(error.localizedDescription)",
+                        retryTitle: "Try Again",
+                        retry: .createOffer
+                    ),
+                    at: .offer
+                )
             }
         }
     }
@@ -507,6 +662,8 @@ struct CompanionSettingsTab: View {
         offerActivation.discard()
         confirmationActivation.discard()
         pairingGrantDraft.reset(after: .cancelled)
+        beginAction(at: .offer)
+        beginAction(at: .confirmation)
         host.cancelPairing()
     }
 
@@ -532,7 +689,7 @@ struct CompanionSettingsTab: View {
         guard let phrase = host.pairingPhrase,
               let attempt = confirmationActivation.begin(pairingID: phrase.pairingID)
         else { return }
-        operationError = nil
+        beginAction(at: .confirmation)
         Task {
             do {
                 try await host.confirmPairing()
@@ -543,17 +700,34 @@ struct CompanionSettingsTab: View {
             } catch {
                 guard confirmationActivation.fail(attempt) else { return }
                 host.cancelPairing()
-                operationError = CompanionPairingConfirmationActivation.failureMessage(error)
+                recordFailure(
+                    CompanionSettingsFailure(
+                        message: CompanionPairingConfirmationActivation.failureMessage(error),
+                        retryTitle: "Create New Code",
+                        retry: .createReplacementOffer
+                    ),
+                    at: .confirmation
+                )
                 pairingGrantDraft.reset(after: .cancelled)
             }
         }
     }
 
-    private func revoke(_ deviceID: String) {
-        operationError = nil
+    private func revoke(deviceID: String) {
+        let target = CompanionSettingsFailureTarget.device(deviceID)
+        beginAction(at: target)
         Task {
             do { try await host.revoke(deviceID: deviceID) }
-            catch { operationError = error.localizedDescription }
+            catch {
+                recordFailure(
+                    CompanionSettingsFailure(
+                        message: "Device revocation failed: \(error.localizedDescription)",
+                        retryTitle: "Retry Revoke",
+                        retry: .revoke(deviceID: deviceID)
+                    ),
+                    at: target
+                )
+            }
         }
     }
 
@@ -561,21 +735,39 @@ struct CompanionSettingsTab: View {
         _ capability: CompanionCapability,
         for device: CompanionPairedDeviceRecord
     ) {
-        operationError = nil
-        capabilityUpdates.insert(device.id)
         var capabilities = Set(device.capabilities)
         if capabilities.contains(capability) { capabilities.remove(capability) }
         else { capabilities.insert(capability) }
         let ordered = CompanionCapability.allCases.filter(capabilities.contains)
+        updateCapabilities(deviceID: device.id, capabilities: ordered)
+    }
+
+    private func updateCapabilities(
+        deviceID: String,
+        capabilities: [CompanionCapability]
+    ) {
+        let target = CompanionSettingsFailureTarget.device(deviceID)
+        beginAction(at: target)
+        capabilityUpdates.insert(deviceID)
         Task {
-            defer { capabilityUpdates.remove(device.id) }
+            defer { capabilityUpdates.remove(deviceID) }
             do {
                 try await host.updateCapabilities(
-                    deviceID: device.id,
-                    capabilities: ordered
+                    deviceID: deviceID,
+                    capabilities: capabilities
                 )
             } catch {
-                operationError = error.localizedDescription
+                recordFailure(
+                    CompanionSettingsFailure(
+                        message: "Device access update failed: \(error.localizedDescription)",
+                        retryTitle: "Retry Access Change",
+                        retry: .updateCapabilities(
+                            deviceID: deviceID,
+                            capabilities: capabilities
+                        )
+                    ),
+                    at: target
+                )
             }
         }
     }

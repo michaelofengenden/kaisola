@@ -11,9 +11,11 @@ const guardTestFile = 'tests/node/brokerRuntimeManifest.test.cjs'
 // adding a broker-prefixed suite or a test that directly loads the Node broker
 // runtime makes the guard fail until the new path is reviewed and listed here.
 const brokerRuntimeTestFiles = Object.freeze([
+  'tests/node/brokerAuthorization.test.cjs',
   'tests/node/brokerCompatibility.test.cjs',
   'tests/node/brokerExitStatus.test.cjs',
   'tests/node/brokerFrameLimits.test.cjs',
+  'tests/node/brokerInventorySnapshot.test.cjs',
   'tests/node/brokerRendezvous.test.cjs',
   'tests/node/brokerRequestGate.test.cjs',
   'tests/node/brokerTerminalIdLimit.test.cjs',
@@ -30,8 +32,10 @@ const brokerRuntimeTestFiles = Object.freeze([
   'tests/node/terminalKillRoute.test.cjs',
   'tests/node/terminalManager.test.cjs',
   'tests/node/terminalObservers.test.cjs',
+  'tests/node/terminalReleaseRoute.test.cjs',
   'tests/node/terminalResizeRoute.test.cjs',
   'tests/node/terminalSpool.test.cjs',
+  'tests/node/terminalSpoolAsync.test.cjs',
   'tests/node/terminalWarning.test.cjs',
 ])
 

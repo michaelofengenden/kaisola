@@ -5,9 +5,9 @@ import XCTest
 /// ProjectAccountStore persistence + the pure `mergedOverlay` precedence rules.
 /// Uses a throwaway file so it never touches the real per-project accounts:
 /// set/read round-trip, remove-on-both-blank, cross-project isolation,
-/// concurrent writers (two Settings windows), corrupt degradation, and the full
-/// app-vs-project merge matrix (project wins per key, blank falls back, tilde
-/// expands).
+/// concurrent writers (two Settings windows), fail-closed recovery, and the
+/// full app-vs-project merge matrix (project wins per key, blank falls back,
+/// tilde expands).
 final class ProjectAccountStoreTests: XCTestCase {
     private var fileURL: URL!
     private var store: ProjectAccountStore!
@@ -25,13 +25,13 @@ final class ProjectAccountStoreTests: XCTestCase {
 
     // MARK: - Persistence round-trip
 
-    func testSetReadRoundTripAcrossInstances() {
-        store.set(ProjectAccountOverride(claudeConfigDir: "~/claude-a", codexHome: "~/codex-a"),
-                  forProject: "nproj_a")
+    func testSetReadRoundTripAcrossInstances() throws {
+        try store.set(ProjectAccountOverride(claudeConfigDir: "~/claude-a", codexHome: "~/codex-a"),
+                      forProject: "nproj_a")
 
         let reopened = ProjectAccountStore(fileURL: fileURL)
         XCTAssertEqual(
-            reopened.override(forProject: "nproj_a"),
+            try reopened.override(forProject: "nproj_a"),
             ProjectAccountOverride(claudeConfigDir: "~/claude-a", codexHome: "~/codex-a")
         )
     }
@@ -39,56 +39,103 @@ final class ProjectAccountStoreTests: XCTestCase {
     /// Only one field set persists as a partial override (the other stays nil),
     /// and the stored value is trimmed but NOT tilde-expanded (so the settings
     /// field can show "~/…" back to the user).
-    func testPartialOverrideIsTrimmedNotExpanded() {
-        store.set(ProjectAccountOverride(claudeConfigDir: "  ~/claude  ", codexHome: nil),
-                  forProject: "nproj_a")
+    func testPartialOverrideIsTrimmedNotExpanded() throws {
+        try store.set(ProjectAccountOverride(claudeConfigDir: "  ~/claude  ", codexHome: nil),
+                      forProject: "nproj_a")
 
         XCTAssertEqual(
-            store.override(forProject: "nproj_a"),
+            try store.override(forProject: "nproj_a"),
             ProjectAccountOverride(claudeConfigDir: "~/claude", codexHome: nil)
         )
     }
 
     // MARK: - Removal
 
-    func testBothBlankRemovesEntry() {
-        store.set(ProjectAccountOverride(claudeConfigDir: "~/x", codexHome: "~/y"), forProject: "nproj_a")
-        XCTAssertNotNil(store.override(forProject: "nproj_a"))
+    func testBothBlankRemovesEntry() throws {
+        try store.set(ProjectAccountOverride(claudeConfigDir: "~/x", codexHome: "~/y"), forProject: "nproj_a")
+        XCTAssertNotNil(try store.override(forProject: "nproj_a"))
 
         // Both fields blank (nil / whitespace) collapse to "no override" → removed.
-        store.set(ProjectAccountOverride(claudeConfigDir: "   ", codexHome: nil), forProject: "nproj_a")
-        XCTAssertNil(store.override(forProject: "nproj_a"))
+        try store.set(ProjectAccountOverride(claudeConfigDir: "   ", codexHome: nil), forProject: "nproj_a")
+        XCTAssertNil(try store.override(forProject: "nproj_a"))
 
         // The removal is durable.
-        XCTAssertNil(ProjectAccountStore(fileURL: fileURL).override(forProject: "nproj_a"))
+        XCTAssertNil(try ProjectAccountStore(fileURL: fileURL).override(forProject: "nproj_a"))
     }
 
-    func testNilOverrideRemovesEntry() {
-        store.set(ProjectAccountOverride(claudeConfigDir: "~/x", codexHome: nil), forProject: "nproj_a")
-        store.set(nil, forProject: "nproj_a")
-        XCTAssertNil(store.override(forProject: "nproj_a"))
+    func testNilOverrideRemovesEntry() throws {
+        try store.set(ProjectAccountOverride(claudeConfigDir: "~/x", codexHome: nil), forProject: "nproj_a")
+        try store.set(nil, forProject: "nproj_a")
+        XCTAssertNil(try store.override(forProject: "nproj_a"))
     }
 
-    func testRemovingUnknownIsHarmless() {
-        store.set(nil, forProject: "never-set")
-        XCTAssertNil(store.override(forProject: "never-set"))
+    func testRemovingUnknownIsHarmless() throws {
+        try store.set(nil, forProject: "never-set")
+        XCTAssertNil(try store.override(forProject: "never-set"))
+    }
+
+    func testNamedAccountRemovalListsAndClearsOnlyMatchingProviderAssignments() throws {
+        let target = "/tmp/kaisola-account-work"
+        try store.set(
+            ProjectAccountOverride(claudeConfigDir: target, codexHome: target),
+            forProject: "nproj_current"
+        )
+        try store.set(
+            ProjectAccountOverride(claudeConfigDir: "/tmp/parent/../kaisola-account-work", codexHome: nil),
+            forProject: "nproj_alias"
+        )
+        try store.set(
+            ProjectAccountOverride(claudeConfigDir: "/tmp/other", codexHome: nil),
+            forProject: "nproj_other"
+        )
+
+        let before = try Data(contentsOf: fileURL)
+        XCTAssertEqual(
+            try store.projectIDs(
+                assignedTo: target,
+                provider: .claude
+            ),
+            ["nproj_alias", "nproj_current"]
+        )
+        XCTAssertEqual(
+            try Data(contentsOf: fileURL),
+            before,
+            "listing affected projects must not mutate either assignment or account"
+        )
+
+        XCTAssertEqual(
+            try store.clearAssignments(
+                to: target,
+                provider: .claude
+            ),
+            ["nproj_alias", "nproj_current"]
+        )
+        XCTAssertNil(try store.override(forProject: "nproj_alias"))
+        XCTAssertEqual(
+            try store.override(forProject: "nproj_current"),
+            ProjectAccountOverride(claudeConfigDir: nil, codexHome: target)
+        )
+        XCTAssertEqual(
+            try store.override(forProject: "nproj_other")?.claudeConfigDir,
+            "/tmp/other"
+        )
     }
 
     // MARK: - Cross-project isolation
 
-    func testOverridesAreScopedPerProjectAndIndependent() {
-        store.set(ProjectAccountOverride(claudeConfigDir: "~/a", codexHome: nil), forProject: "nproj_a")
-        store.set(ProjectAccountOverride(claudeConfigDir: nil, codexHome: "~/b"), forProject: "nproj_b")
+    func testOverridesAreScopedPerProjectAndIndependent() throws {
+        try store.set(ProjectAccountOverride(claudeConfigDir: "~/a", codexHome: nil), forProject: "nproj_a")
+        try store.set(ProjectAccountOverride(claudeConfigDir: nil, codexHome: "~/b"), forProject: "nproj_b")
 
-        XCTAssertEqual(store.override(forProject: "nproj_a")?.claudeConfigDir, "~/a")
-        XCTAssertNil(store.override(forProject: "nproj_a")?.codexHome)
-        XCTAssertEqual(store.override(forProject: "nproj_b")?.codexHome, "~/b")
-        XCTAssertNil(store.override(forProject: "nproj_b")?.claudeConfigDir)
+        XCTAssertEqual(try store.override(forProject: "nproj_a")?.claudeConfigDir, "~/a")
+        XCTAssertNil(try store.override(forProject: "nproj_a")?.codexHome)
+        XCTAssertEqual(try store.override(forProject: "nproj_b")?.codexHome, "~/b")
+        XCTAssertNil(try store.override(forProject: "nproj_b")?.claudeConfigDir)
 
         // Removing one leaves the other intact.
-        store.set(nil, forProject: "nproj_a")
-        XCTAssertNil(store.override(forProject: "nproj_a"))
-        XCTAssertEqual(store.override(forProject: "nproj_b")?.codexHome, "~/b")
+        try store.set(nil, forProject: "nproj_a")
+        XCTAssertNil(try store.override(forProject: "nproj_a"))
+        XCTAssertEqual(try store.override(forProject: "nproj_b")?.codexHome, "~/b")
     }
 
     // MARK: - Concurrent writers
@@ -107,7 +154,7 @@ final class ProjectAccountStoreTests: XCTestCase {
 
             runConcurrently(count: 2) { index in
                 let store = index == 0 ? first : second
-                store.set(
+                try! store.set(
                     ProjectAccountOverride(claudeConfigDir: "~/claude-\(index)", codexHome: nil),
                     forProject: "nproj_\(index)"
                 )
@@ -115,11 +162,11 @@ final class ProjectAccountStoreTests: XCTestCase {
 
             let reopened = ProjectAccountStore(fileURL: roundURL)
             XCTAssertEqual(
-                reopened.override(forProject: "nproj_0")?.claudeConfigDir, "~/claude-0",
+                try reopened.override(forProject: "nproj_0")?.claudeConfigDir, "~/claude-0",
                 "round \(round) lost the first writer's project"
             )
             XCTAssertEqual(
-                reopened.override(forProject: "nproj_1")?.claudeConfigDir, "~/claude-1",
+                try reopened.override(forProject: "nproj_1")?.claudeConfigDir, "~/claude-1",
                 "round \(round) lost the second writer's project"
             )
         }
@@ -133,7 +180,7 @@ final class ProjectAccountStoreTests: XCTestCase {
             let roundURL = try makeRoundFileURL(round)
 
             runConcurrently(count: writers) { index in
-                ProjectAccountStore(fileURL: roundURL).set(
+                try! ProjectAccountStore(fileURL: roundURL).set(
                     ProjectAccountOverride(claudeConfigDir: "~/claude-\(index)", codexHome: "~/codex-\(index)"),
                     forProject: "nproj_\(index)"
                 )
@@ -142,7 +189,7 @@ final class ProjectAccountStoreTests: XCTestCase {
             let reopened = ProjectAccountStore(fileURL: roundURL)
             for index in 0..<writers {
                 XCTAssertEqual(
-                    reopened.override(forProject: "nproj_\(index)"),
+                    try reopened.override(forProject: "nproj_\(index)"),
                     ProjectAccountOverride(claudeConfigDir: "~/claude-\(index)", codexHome: "~/codex-\(index)"),
                     "round \(round) lost or corrupted nproj_\(index)"
                 )
@@ -156,14 +203,14 @@ final class ProjectAccountStoreTests: XCTestCase {
         for round in 0..<40 {
             let roundURL = try makeRoundFileURL(round)
             let seed = ProjectAccountStore(fileURL: roundURL)
-            seed.set(ProjectAccountOverride(claudeConfigDir: "~/old", codexHome: nil), forProject: "nproj_0")
+            try seed.set(ProjectAccountOverride(claudeConfigDir: "~/old", codexHome: nil), forProject: "nproj_0")
 
             runConcurrently(count: 2) { index in
                 let store = ProjectAccountStore(fileURL: roundURL)
                 if index == 0 {
-                    store.set(nil, forProject: "nproj_0")
+                    try! store.set(nil, forProject: "nproj_0")
                 } else {
-                    store.set(
+                    try! store.set(
                         ProjectAccountOverride(claudeConfigDir: "~/claude-1", codexHome: nil),
                         forProject: "nproj_1"
                     )
@@ -172,11 +219,11 @@ final class ProjectAccountStoreTests: XCTestCase {
 
             let reopened = ProjectAccountStore(fileURL: roundURL)
             XCTAssertEqual(
-                reopened.override(forProject: "nproj_1")?.claudeConfigDir, "~/claude-1",
+                try reopened.override(forProject: "nproj_1")?.claudeConfigDir, "~/claude-1",
                 "round \(round) lost the writer that raced the removal"
             )
             XCTAssertNil(
-                reopened.override(forProject: "nproj_0"),
+                try reopened.override(forProject: "nproj_0"),
                 "round \(round) resurrected the removed project"
             )
         }
@@ -210,17 +257,181 @@ final class ProjectAccountStoreTests: XCTestCase {
         finished.wait()
     }
 
-    // MARK: - Corrupt file
+    // MARK: - Fail-closed recovery
 
-    func testCorruptFileDegradesToNoOverride() throws {
+    func testMissingFileIsDistinctAndAllowsAppDefaultLaunch() throws {
+        XCTAssertEqual(store.loadStatus(), .missing)
+        XCTAssertEqual(
+            try store.launchOverlay(
+                app: ["CLAUDE_CONFIG_DIR": "/app/claude"],
+                forProject: "nproj_a"
+            ).get(),
+            ["CLAUDE_CONFIG_DIR": "/app/claude"]
+        )
+    }
+
+    func testCorruptFileBlocksLaunchPreservesExactBytesAndRefusesOrdinarySet() throws {
         try FileManager.default.createDirectory(
             at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
         )
-        try Data("not json".utf8).write(to: fileURL)
-        XCTAssertNil(store.override(forProject: "anything"))
-        // A subsequent set still works (write replaces the garbage).
-        store.set(ProjectAccountOverride(claudeConfigDir: "~/ok", codexHome: nil), forProject: "nproj_a")
-        XCTAssertEqual(store.override(forProject: "nproj_a")?.claudeConfigDir, "~/ok")
+        let original = Data("not json\nkeep every byte".utf8)
+        try original.write(to: fileURL)
+
+        guard case .blocked(let issue) = store.loadStatus() else {
+            return XCTFail("Corrupt configured data must not become an empty store")
+        }
+        XCTAssertEqual(issue.kind, .corrupt)
+        let preserved = try XCTUnwrap(issue.preservedCopyURL)
+        XCTAssertEqual(try Data(contentsOf: preserved), original)
+        XCTAssertEqual(try Data(contentsOf: fileURL), original, "ordinary reads never alter the source")
+
+        guard case .failure(let launchIssue) = store.launchOverlay(
+            app: ["CLAUDE_CONFIG_DIR": "/wrong/app-wide"],
+            forProject: "nproj_a"
+        ) else { return XCTFail("Corruption must block the launch overlay") }
+        XCTAssertEqual(launchIssue.kind, .corrupt)
+
+        XCTAssertThrowsError(
+            try store.set(
+                ProjectAccountOverride(claudeConfigDir: "~/replacement", codexHome: nil),
+                forProject: "nproj_a"
+            )
+        )
+        XCTAssertThrowsError(
+            try store.projectIDs(assignedTo: "~/replacement", provider: .claude)
+        )
+        XCTAssertThrowsError(
+            try store.clearAssignments(to: "~/replacement", provider: .claude)
+        )
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+    }
+
+    func testUnsupportedVersionBlocksLaunchAndLeavesSourceUntouched() throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let original = Data(#"{"schemaVersion":999,"projects":{"nproj_a":{"claudeConfigDir":"/future"}}}"#.utf8)
+        try original.write(to: fileURL)
+
+        guard case .blocked(let issue) = store.loadStatus() else {
+            return XCTFail("A newer account schema must fail closed")
+        }
+        XCTAssertEqual(issue.kind, .unsupportedVersion(found: 999))
+        XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(issue.preservedCopyURL)), original)
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+        XCTAssertThrowsError(
+            try store.launchOverlay(app: ["CODEX_HOME": "/wrong/app-wide"], forProject: "nproj_a").get()
+        )
+    }
+
+    func testUnreadableFileIsDistinctFromMissingAndCorrupt() throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try Data("opaque".utf8).write(to: fileURL)
+        struct ExpectedReadFailure: Error {}
+        let unreadable = ProjectAccountStore(
+            fileURL: fileURL,
+            dataReader: { _ in throw ExpectedReadFailure() }
+        )
+
+        guard case .blocked(let issue) = unreadable.loadStatus() else {
+            return XCTFail("An existing unreadable file must not be reported missing")
+        }
+        guard case .unreadable = issue.kind else {
+            return XCTFail("Expected unreadable, got \(issue.kind)")
+        }
+        XCTAssertNil(issue.preservedCopyURL)
+        XCTAssertThrowsError(
+            try unreadable.launchOverlay(app: ["CODEX_HOME": "/wrong/app-wide"], forProject: "nproj_a").get()
+        )
+    }
+
+    func testPreservationDiskWriteFailureStillBlocksLaunchAndKeepsOriginal() throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let original = Data("damaged bytes".utf8)
+        try original.write(to: fileURL)
+        struct ExpectedDiskFailure: Error {}
+        let unwritableRecovery = ProjectAccountStore(
+            fileURL: fileURL,
+            preservationWriter: { _, _ in throw ExpectedDiskFailure() }
+        )
+
+        guard case .failure(let issue) = unwritableRecovery.launchOverlay(
+            app: ["CLAUDE_CONFIG_DIR": "/wrong/app-wide"],
+            forProject: "nproj_a"
+        ) else { return XCTFail("A failed recovery write must still fail closed") }
+        XCTAssertEqual(issue.kind, .corrupt)
+        XCTAssertNil(issue.preservedCopyURL)
+        XCTAssertNotNil(issue.preservationError)
+        XCTAssertEqual(try Data(contentsOf: fileURL), original)
+    }
+
+    func testExplicitResetMovesUnreadableSourceIntactBeforeClearingActivePath() throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let original = Data("bytes the injected reader cannot access".utf8)
+        try original.write(to: fileURL)
+        struct ExpectedReadFailure: Error {}
+        let unreadable = ProjectAccountStore(
+            fileURL: fileURL,
+            dataReader: { _ in throw ExpectedReadFailure() }
+        )
+        guard case .blocked(let issue) = unreadable.loadStatus() else {
+            return XCTFail("Expected unreadable recovery issue")
+        }
+        XCTAssertNil(issue.preservedCopyURL)
+
+        let preserved = try unreadable.resetAfterFailure(expectedIssue: issue)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        XCTAssertEqual(try Data(contentsOf: preserved), original)
+    }
+
+    func testExplicitResetKeepsPreservedCopyAndOnlyThenAllowsAppDefault() throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let original = Data("damaged bytes to retain".utf8)
+        try original.write(to: fileURL)
+        guard case .blocked(let issue) = store.loadStatus() else {
+            return XCTFail("Expected recovery issue")
+        }
+        let firstPreserved = try XCTUnwrap(issue.preservedCopyURL)
+
+        let resetCopy = try store.resetAfterFailure(expectedIssue: issue)
+
+        XCTAssertEqual(resetCopy, firstPreserved)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fileURL.path))
+        XCTAssertEqual(try Data(contentsOf: firstPreserved), original)
+        XCTAssertEqual(
+            try store.launchOverlay(app: ["CODEX_HOME": "/app/codex"], forProject: "nproj_a").get(),
+            ["CODEX_HOME": "/app/codex"]
+        )
+    }
+
+    func testResetAbortsWhenAnotherProcessReplacesSourceAfterPreservation() throws {
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        let original = Data("first corrupt bytes".utf8)
+        try original.write(to: fileURL)
+        guard case .blocked(let initialIssue) = store.loadStatus() else {
+            return XCTFail("Expected initial recovery issue")
+        }
+        let initialCopy = try XCTUnwrap(initialIssue.preservedCopyURL)
+        let replacement = Data("different corrupt bytes from another process".utf8)
+        try replacement.write(to: fileURL)
+
+        XCTAssertThrowsError(try store.resetAfterFailure(expectedIssue: initialIssue)) { error in
+            XCTAssertEqual(error as? ProjectAccountStore.StoreError, .recoveryChanged)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: fileURL), replacement)
+        XCTAssertEqual(try Data(contentsOf: initialCopy), original)
     }
 
     // MARK: - mergedOverlay precedence matrix

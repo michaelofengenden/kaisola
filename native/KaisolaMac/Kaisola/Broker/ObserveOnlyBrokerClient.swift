@@ -108,6 +108,7 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
         let continuation: CheckedContinuation<JSONValue, any Error>
     }
     private static let historyPageBytes = ObserverHistoryTailPolicy.maximumPageBytes
+    private static let maximumInventoryAttempts = 3
 
     private let transport: any BrokerByteTransport
     private let operationTimeoutNanoseconds: UInt64
@@ -240,17 +241,95 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
 
     func inventory() async throws -> BrokerStatus {
         guard let hello else { throw BrokerClientError.notConnected }
-        // These are typed read methods. The raw request encoder stays private,
-        // so application code cannot represent or emit an arbitrary method.
+        for _ in 0..<Self.maximumInventoryAttempts {
+            let stable: BrokerStatus?
+            if hello.features.contains(BrokerWire.brokerInventoryFeature) {
+                stable = try await atomicInventoryAttempt(expectedHello: hello)
+            } else {
+                stable = try await legacyInventoryAttempt(expectedHello: hello)
+            }
+            if let stable { return stable }
+        }
+        throw BrokerClientError.requestFailed(
+            "broker inventory kept changing while the snapshot was collected"
+        )
+    }
+
+    /// One upgraded broker request samples status, diagnostics, and live rows
+    /// without yielding the Node event loop. The result still carries a typed
+    /// rejection because an async mutation may already span the collection.
+    private func atomicInventoryAttempt(expectedHello: BrokerHello) async throws -> BrokerStatus? {
+        let value = try await request(
+            .inventory,
+            params: .object(["ownerId": .string("0")])
+        )
+        guard let object = value.objectValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        if object["ok"]?.boolValue == false {
+            guard object["state"]?.stringValue == "activity_changed" else {
+                throw BrokerClientError.malformedResponse
+            }
+            return nil
+        }
+        guard object["ok"]?.boolValue == true,
+              object["state"]?.stringValue == "stable",
+              let activityEpoch = object["activityEpoch"]?.intValue,
+              activityEpoch > 0,
+              let status = object["status"],
+              let diagnostics = object["diagnostics"],
+              let live = object["live"] else {
+            throw BrokerClientError.malformedResponse
+        }
+        let parsed = try BrokerStatus(
+            status: status,
+            diagnostics: diagnostics,
+            live: live,
+            expectedHello: expectedHello
+        )
+        guard parsed.activityEpoch == activityEpoch else {
+            throw BrokerClientError.malformedResponse
+        }
+        return parsed
+    }
+
+    /// Compatible protocol-2 brokers may predate `broker.inventory`. Fence the
+    /// old three-read surface with status reads on both sides and discard it if
+    /// a mutation is active or the activity epoch changes anywhere in between.
+    private func legacyInventoryAttempt(expectedHello: BrokerHello) async throws -> BrokerStatus? {
         let status = try await request(.status, params: .object(["ownerId": .string("0")]))
+        guard let startedEpoch = try stableActivityEpoch(
+            status: status,
+            expectedHello: expectedHello
+        ) else { return nil }
         let diagnostics = try await request(.diagnostics, params: .object(["ownerId": .string("0")]))
         let live = try await request(.list, params: .object(["ownerId": .string("0")]))
+        let finalStatus = try await request(.status, params: .object(["ownerId": .string("0")]))
+        guard try stableActivityEpoch(status: finalStatus, expectedHello: expectedHello) == startedEpoch else {
+            return nil
+        }
         return try BrokerStatus(
             status: status,
             diagnostics: diagnostics,
             live: live,
-            expectedHello: hello
+            expectedHello: expectedHello
         )
+    }
+
+    private func stableActivityEpoch(
+        status: JSONValue,
+        expectedHello: BrokerHello
+    ) throws -> Int64? {
+        guard let object = status.objectValue,
+              let inFlightMutations = object["inFlightMutations"]?.intValue,
+              inFlightMutations >= 0,
+              let activityEpoch = try BrokerStatus.validatedActivityEpoch(
+                  status: status,
+                  expectedHello: expectedHello
+              ) else {
+            throw BrokerClientError.malformedResponse
+        }
+        return inFlightMutations == 0 ? activityEpoch : nil
     }
 
     /// Cheap second phase for a multi-generation inventory. The router uses
@@ -367,7 +446,8 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             startOffset: snapshot.endOffset - retained,
             endOffset: snapshot.endOffset,
             truncated: true,
-            exited: snapshot.exited
+            exited: snapshot.exited,
+            readError: snapshot.readError
         )
     }
 
@@ -417,7 +497,11 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
             startOffset: page.startOffset,
             endOffset: snapshot.endOffset,
             truncated: page.hasMore || page.truncated || page.startOffset > 0,
-            exited: snapshot.exited
+            exited: snapshot.exited,
+            // A top-up page that could not read a segment leaves the combined
+            // tail incomplete, so the combined snapshot is not authoritative
+            // either.
+            readError: snapshot.readError ?? page.readError
         )
     }
 

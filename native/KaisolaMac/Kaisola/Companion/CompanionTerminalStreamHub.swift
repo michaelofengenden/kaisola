@@ -277,7 +277,8 @@ actor CompanionTerminalStreamHub {
                     startOffset: stream.snapshot.startOffset,
                     endOffset: stream.snapshot.endOffset,
                     truncated: stream.snapshot.truncated,
-                    exited: true
+                    exited: true,
+                    readError: stream.snapshot.readError
                 )
                 streams[key] = stream
                 let body = try CompanionBody(fields: [
@@ -349,7 +350,8 @@ actor CompanionTerminalStreamHub {
             startOffset: endOffset - Int64(tail.utf8.count),
             endOffset: endOffset,
             truncated: snapshot.truncated || start > 0,
-            exited: false
+            exited: false,
+            readError: snapshot.readError
         )
     }
 
@@ -372,7 +374,8 @@ actor CompanionTerminalStreamHub {
             startOffset: cursor.offset,
             endOffset: snapshot.endOffset,
             truncated: snapshot.truncated || cursor.offset > 0,
-            exited: snapshot.exited
+            exited: snapshot.exited,
+            readError: snapshot.readError
         )
     }
 

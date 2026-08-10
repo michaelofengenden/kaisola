@@ -9,9 +9,21 @@ const { execFileSync } = require('node:child_process')
 const {
   TerminalSpool,
   SPOOL_APPEND_DEBOUNCE_MS,
+  READ_ABSENT,
+  READ_EMPTY,
+  READ_FAILED,
+  META_RETRY_BASE_MS,
   readTail,
   readRange,
 } = require('../../runtime/node-broker/ipc/terminalSpool.cjs')
+
+/** Replace a spool segment with a non-regular path that every descriptor read
+ * refuses. This reproduces a transient permission or media
+ * failure without chmod, so the test behaves the same for a root runner. */
+function breakSegmentReads(file) {
+  fs.rmSync(file, { force: true })
+  fs.mkdirSync(file)
+}
 
 // Three UTF-8 bytes each, so a cap of 10 lands inside a scalar and the tail has
 // to move forward to the next character boundary.
@@ -31,6 +43,15 @@ function fixture(t, options = {}) {
     if (!options.dir) fs.rmSync(dir, { recursive: true, force: true })
   })
   return spool
+}
+
+/** atomicJson stages the meta through `${metaFile}.${pid}.tmp`; a directory
+ * parked on that path makes every write fail with EISDIR until it is removed,
+ * which is the closest thing to a disk-full window a test can hold open. */
+function blockMetaWrites(spool) {
+  const tmp = `${spool.metaFile}.${process.pid}.tmp`
+  fs.mkdirSync(tmp, { recursive: true })
+  return () => fs.rmSync(tmp, { recursive: true, force: true })
 }
 
 /** A file outside the spool that a local attacker would want the broker to
@@ -128,6 +149,117 @@ test('late pty output after close({remove}) cannot resurrect the deleted spool f
   assert.equal(fs.existsSync(spool.file), false)
 })
 
+test('close({remove}) reports every artifact and retries transient unlink failures', (t) => {
+  const spool = fixture(t, { id: 'terminal-spool-delete-retry' })
+  spool.push('previous secret')
+  spool.flush()
+  fs.renameSync(spool.file, spool.prevFile)
+  fs.writeFileSync(spool.file, 'current secret', { mode: 0o600 })
+  spool.markExited({ exitCode: 0, signal: null })
+
+  const targets = new Set([spool.file, spool.prevFile, spool.metaFile])
+  const attempts = new Map()
+  const unlinkSync = fs.unlinkSync
+  fs.unlinkSync = (file) => {
+    if (targets.has(file)) {
+      const attempt = (attempts.get(file) || 0) + 1
+      attempts.set(file, attempt)
+      if (attempt === 1) {
+        const error = new Error('injected transient deletion failure')
+        error.code = 'EBUSY'
+        throw error
+      }
+    }
+    return unlinkSync(file)
+  }
+
+  let deletion
+  try {
+    deletion = spool.close({ remove: true })
+  } finally {
+    fs.unlinkSync = unlinkSync
+  }
+
+  assert.deepEqual(deletion, {
+    complete: true,
+    retryable: false,
+    artifacts: [
+      { name: 'current', status: 'deleted', attempts: 2 },
+      { name: 'previous', status: 'deleted', attempts: 2 },
+      { name: 'metadata', status: 'deleted', attempts: 2 },
+    ],
+  })
+  for (const file of targets) assert.equal(fs.existsSync(file), false)
+})
+
+test('failed deletion is explicit and a closed spool can retry without resurrection', (t) => {
+  const spool = fixture(t, { id: 'terminal-spool-delete-cleanup' })
+  spool.push('sensitive terminal bytes')
+  spool.flush()
+  const unlinkSync = fs.unlinkSync
+  fs.unlinkSync = (file) => {
+    if (file === spool.file) {
+      const error = new Error('injected persistent deletion failure')
+      error.code = 'EACCES'
+      throw error
+    }
+    return unlinkSync(file)
+  }
+
+  let first
+  try {
+    first = spool.close({ remove: true })
+  } finally {
+    fs.unlinkSync = unlinkSync
+  }
+
+  assert.equal(first.complete, false)
+  assert.equal(first.retryable, true)
+  assert.deepEqual(first.artifacts, [
+    { name: 'current', status: 'failed', code: 'EACCES', attempts: 1 },
+    { name: 'previous', status: 'absent', attempts: 1 },
+    { name: 'metadata', status: 'deleted', attempts: 1 },
+  ])
+  assert.equal(fs.readFileSync(spool.file, 'utf8'), 'sensitive terminal bytes')
+  assert.equal(JSON.stringify(first).includes(path.dirname(spool.file)), false)
+
+  const retry = spool.close({ remove: true })
+  assert.equal(retry.complete, true)
+  assert.deepEqual(retry.artifacts.map(({ name, status }) => ({ name, status })), [
+    { name: 'current', status: 'deleted' },
+    { name: 'previous', status: 'absent' },
+    { name: 'metadata', status: 'absent' },
+  ])
+  spool.push('late bytes after cleanup')
+  spool.flush()
+  assert.equal(fs.existsSync(spool.file), false)
+})
+
+test('standalone cleanup refuses an unsafe spool root without following it', (t) => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-cleanup-root-'))
+  const bystanderDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-cleanup-bystander-'))
+  const spoolRoot = path.join(parent, 'spool')
+  const sentinel = path.join(bystanderDir, 'private.txt')
+  fs.writeFileSync(sentinel, 'must survive cleanup')
+  fs.symlinkSync(bystanderDir, spoolRoot)
+  t.after(() => {
+    fs.rmSync(parent, { recursive: true, force: true })
+    fs.rmSync(bystanderDir, { recursive: true, force: true })
+  })
+
+  const deletion = TerminalSpool.cleanup('unsafe-cleanup', spoolRoot)
+  assert.equal(deletion.complete, false)
+  assert.equal(deletion.retryable, true)
+  assert.deepEqual(deletion.artifacts, [
+    { name: 'current', status: 'failed', code: 'ERR_KAISOLA_UNSAFE_SPOOL_DIR', attempts: 0 },
+    { name: 'previous', status: 'failed', code: 'ERR_KAISOLA_UNSAFE_SPOOL_DIR', attempts: 0 },
+    { name: 'metadata', status: 'failed', code: 'ERR_KAISOLA_UNSAFE_SPOOL_DIR', attempts: 0 },
+  ])
+  assert.equal(fs.readFileSync(sentinel, 'utf8'), 'must survive cleanup')
+  assert.equal(fs.lstatSync(spoolRoot).isSymbolicLink(), true)
+  assert.equal(JSON.stringify(deletion).includes(parent), false)
+})
+
 test('exit evidence and the epoch boundary survive a fresh meta read', (t) => {
   const id = 'terminal-spool-exit-evidence'
   const spool = fixture(t, { id })
@@ -142,6 +274,71 @@ test('exit evidence and the epoch boundary survive a fresh meta read', (t) => {
     exitedAt: meta.exitedAt,
     exitStatus: { exitCode: 0, signal: null },
   })
+})
+
+test('a failed meta write stays dirty, reports the error, and retries onto disk', async (t) => {
+  const id = 'terminal-spool-meta-retry'
+  const spool = fixture(t, { id })
+  spool.push('output before the disk went away')
+  spool.flush()
+
+  const unblock = blockMetaWrites(spool)
+  spool.markExited({ exitCode: 3, signal: null })
+
+  assert.equal(TerminalSpool.readMeta(id, path.dirname(spool.metaFile)), null)
+  assert.equal(spool.metaDirty, true)
+  assert.equal(spool.stats().metaDirty, true)
+  assert.equal(spool.stats().metaError, 'EISDIR')
+
+  unblock()
+  await new Promise((resolve) => setTimeout(resolve, META_RETRY_BASE_MS + 400))
+
+  const meta = TerminalSpool.readMeta(id, path.dirname(spool.metaFile))
+  assert.ok(meta, 'the bounded retry must land the metadata once the disk recovers')
+  assert.deepEqual(meta.exitStatus, { exitCode: 3, signal: null })
+  assert.equal(spool.metaDirty, false)
+  assert.equal(spool.stats().metaError, null)
+})
+
+test('a terminal restarted after an injected meta write failure resurrects its state', async (t) => {
+  const id = 'terminal-spool-meta-retry-restart'
+  const spool = fixture(t, { id })
+  const dir = path.dirname(spool.metaFile)
+  spool.push('\x1b[?2004h\x1b[?1000h') // bracketed paste + mouse reporting
+  spool.setVisible(false, { scrollTop: 42 })
+
+  const unblock = blockMetaWrites(spool)
+  spool.markExited({ exitCode: 0, signal: null })
+  assert.equal(spool.metaDirty, true)
+
+  unblock()
+  await new Promise((resolve) => setTimeout(resolve, META_RETRY_BASE_MS + 400))
+
+  // Restart: a fresh spool over the same directory is what resurrection reads.
+  const restarted = new TerminalSpool({ dir, id })
+  t.after(() => restarted.close())
+  assert.deepEqual(restarted.exitEvidence(), {
+    exitedAt: spool.exitedAt,
+    exitStatus: { exitCode: 0, signal: null },
+  })
+  assert.deepEqual(restarted.viewState, { scrollTop: 42 })
+  assert.equal(restarted._modePrefix(), '\x1b[?1000h\x1b[?2004h')
+})
+
+test('close({remove}) cancels a pending meta retry instead of recreating the file', async (t) => {
+  const id = 'terminal-spool-meta-retry-close'
+  const spool = fixture(t, { id })
+  const unblock = blockMetaWrites(spool)
+  spool.markExited({ exitCode: 0, signal: null })
+  assert.equal(spool.metaDirty, true)
+
+  // The retry is still pending when the user wipes the session. Letting the
+  // disk recover afterwards must not put the meta file back.
+  spool.close({ remove: true })
+  unblock()
+  await new Promise((resolve) => setTimeout(resolve, META_RETRY_BASE_MS + 400))
+
+  assert.equal(fs.existsSync(spool.metaFile), false)
 })
 
 function spoolRoot(t) {
@@ -249,6 +446,104 @@ test('a spool without a natural-exit stamp has no exit evidence', (t) => {
   assert.equal(spool.exitEvidence(), null)
 })
 
+test('a segment read separates absent, empty and failed instead of one empty string', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-read-status-'))
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }))
+  const absent = path.join(dir, 'never-written.log')
+  const empty = path.join(dir, 'empty.log')
+  const unreadable = path.join(dir, 'unreadable.log')
+  fs.writeFileSync(empty, '', { mode: 0o600 })
+  breakSegmentReads(unreadable)
+
+  assert.deepEqual(readTail(absent, 64), { status: READ_ABSENT, text: '', error: null })
+  assert.deepEqual(readTail(empty, 64), { status: READ_EMPTY, text: '', error: null })
+  const failedTail = readTail(unreadable, 64)
+  assert.equal(failedTail.status, READ_FAILED)
+  assert.equal(failedTail.text, '')
+  assert.equal(failedTail.error, 'ESPOOLNOTFILE')
+
+  assert.equal(readRange(absent, 0, 64).status, READ_ABSENT)
+  assert.equal(readRange(empty, 0, 64).status, READ_EMPTY)
+  const failedRange = readRange(unreadable, 0, 64)
+  assert.equal(failedRange.status, READ_FAILED)
+  assert.equal(failedRange.buffer.length, 0)
+  assert.equal(failedRange.error, 'ESPOOLNOTFILE')
+})
+
+test('a failed spool read is reported, not answered as an empty transcript', (t) => {
+  const spool = fixture(t, { id: 'terminal-spool-read-failure' })
+  spool.push('retained-history')
+  spool.flush()
+  // Detaching drops the RAM read cache, so the disk spool is the only source
+  // left — the state a reattach or a cold selection reads from.
+  spool.setVisible(false)
+  const healthy = spool.snapshot(1024)
+  assert.equal(healthy.output, 'retained-history')
+  assert.equal(healthy.readError, undefined)
+
+  breakSegmentReads(spool.file)
+
+  const snapshot = spool.snapshot(1024)
+  assert.equal(snapshot.readError, 'ESPOOLNOTFILE')
+  assert.equal(snapshot.output, '')
+  assert.equal(snapshot.truncated, true)
+
+  const page = spool.historyPage(0, 1024)
+  assert.equal(page.readError, 'ESPOOLNOTFILE')
+  assert.equal(page.output, '')
+  assert.equal(page.truncated, true)
+})
+
+test('a terminal that produced nothing still reads as an authoritative empty spool', (t) => {
+  const spool = fixture(t, { id: 'terminal-spool-genuinely-empty' })
+  spool.push('')
+  spool.flush()
+  fs.writeFileSync(spool.file, '', { mode: 0o600 })
+  spool.setVisible(false)
+
+  const snapshot = spool.snapshot(1024)
+  assert.equal(snapshot.output, '')
+  assert.equal(snapshot.truncated, false)
+  assert.equal(snapshot.readError, undefined)
+})
+
+test('a failed read keeps the RAM tail the spool can still prove', (t) => {
+  const spool = fixture(t, { id: 'terminal-spool-read-failure-hot' })
+  spool.push('retained-history')
+  spool.flush()
+  breakSegmentReads(spool.file)
+
+  // The renderer is still attached, so the hot cache holds an exact suffix of
+  // the stream. It is the most history the spool can honestly return.
+  const snapshot = spool.snapshot(1024)
+  assert.equal(snapshot.output, 'retained-history')
+  assert.equal(snapshot.readError, 'ESPOOLNOTFILE')
+  assert.equal(snapshot.truncated, true)
+})
+
+test('coldTail separates a terminal with no spool from one it cannot read', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-terminal-cold-read-'))
+  const spool = new TerminalSpool({ dir, id: 'cold-read-failure' })
+  t.after(() => {
+    spool.close()
+    fs.rmSync(dir, { recursive: true, force: true })
+  })
+  assert.equal(TerminalSpool.coldTail('cold-read-failure', dir, 1024), null)
+
+  spool.push('cold-history')
+  spool.flush()
+  assert.deepEqual(TerminalSpool.coldTail('cold-read-failure', dir, 1024), {
+    text: 'cold-history',
+    truncated: false,
+  })
+
+  breakSegmentReads(spool.file)
+  const cold = TerminalSpool.coldTail('cold-read-failure', dir, 1024)
+  assert.equal(cold.readError, 'ESPOOLNOTFILE')
+  assert.equal(cold.text, '')
+  assert.equal(cold.truncated, true)
+})
+
 // Spool paths are a hash of the terminal id, so any local process can name
 // them before the terminal exists. A link planted at one of them must never
 // turn a spool read into "read that file" or a spool append into "overwrite
@@ -261,14 +556,26 @@ test('a symlinked current segment is never read back as terminal output', (t) =>
   const bystanderFile = bystander(t, 'ANTHROPIC_API_KEY=sk-do-not-exfiltrate\n')
   fs.symlinkSync(bystanderFile, spool.file)
 
-  assert.equal(spool.snapshot(4096).output, '')
-  assert.equal(spool.historyPage(0, 4096).output, '')
-  assert.equal(spool.historyPage(0, 4096).totalBytes, 0)
+  assert.deepEqual(spool.snapshot(4096), {
+    output: '',
+    truncated: true,
+    viewState: null,
+    modePrefix: '',
+    readError: 'ELOOP',
+  })
+  const page = spool.historyPage(0, 4096)
+  assert.equal(page.output, '')
+  assert.equal(page.totalBytes, 0)
+  assert.equal(page.readError, 'ELOOP')
   assert.equal(spool.stats().diskBytes, 0)
   assert.equal(spool.retainedByteCount(), 0)
-  assert.equal(TerminalSpool.coldTail(id, dir), null)
-  assert.equal(readTail(spool.file, 4096), '')
-  assert.equal(readRange(spool.file, 0, 4096).length, 0)
+  assert.deepEqual(TerminalSpool.coldTail(id, dir), {
+    text: '',
+    truncated: true,
+    readError: 'ELOOP',
+  })
+  assert.deepEqual(readTail(spool.file, 4096), { status: READ_FAILED, text: '', error: 'ELOOP' })
+  assert.equal(readRange(spool.file, 0, 4096).status, READ_FAILED)
 })
 
 test('a symlinked current segment refuses the append instead of writing through it', (t) => {
@@ -292,7 +599,11 @@ test('a fifo planted at the segment path is refused instead of parking the broke
   const spool = fixture(t, { id: 'terminal-spool-fifo' })
   execFileSync('/usr/bin/mkfifo', [spool.file])
 
-  assert.equal(readTail(spool.file, 4096), '')
+  assert.deepEqual(readTail(spool.file, 4096), {
+    status: READ_FAILED,
+    text: '',
+    error: 'ESPOOLNOTFILE',
+  })
   spool.push('output-with-nowhere-safe-to-go')
   spool.flush()
 
@@ -314,8 +625,14 @@ test('a segment owned by another uid is refused for both reads and appends', (t)
   t.after(() => { process.getuid = realGetuid })
 
   assert.equal(spool.stats().diskBytes, 0)
-  assert.equal(spool.snapshot(4096).output, '')
-  assert.equal(readTail(spool.file, 4096), '')
+  const snapshot = spool.snapshot(4096)
+  assert.equal(snapshot.output, 'bytes-written-while-we-owned-the-segment')
+  assert.equal(snapshot.readError, 'ESPOOLNOTOWNED')
+  assert.deepEqual(readTail(spool.file, 4096), {
+    status: READ_FAILED,
+    text: '',
+    error: 'ESPOOLNOTOWNED',
+  })
   spool.push('append-under-a-foreign-owner')
   spool.flush()
   assert.equal(spool.stats().diskError, 'ESPOOLNOTOWNED')

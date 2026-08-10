@@ -826,6 +826,11 @@ struct RootShellView: View {
             Label(model.isPinned(session.id) ? "Unpin" : "Pin",
                   systemImage: model.isPinned(session.id) ? "pin.slash" : "pin")
         }
+        if model.pinsUnreadable != nil {
+            // Pinning stays stuck until the unreadable file moves aside, and
+            // this is the only action allowed to give up on that file.
+            Button("Reset Pinned Sessions") { model.resetUnreadablePins() }
+        }
         if !visible {
             Button("Open in Split") {
                 model.revealSurfaceBeside(session.id)

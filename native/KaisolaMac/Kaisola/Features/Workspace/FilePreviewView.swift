@@ -108,6 +108,192 @@ private extension String {
     var nilIfEmpty: String? { isEmpty ? nil : self }
 }
 
+/// The complete destructive choice shown before Revert Changes replaces an
+/// editor draft. Keeping this value independent of the dialog makes the exact
+/// document and recovered-draft warning stable even if surrounding view state
+/// refreshes while the confirmation is open.
+struct FilePreviewRevertConfirmation: Equatable {
+    let fileURL: URL
+    let includesRecoveredDraft: Bool
+
+    private var filename: String {
+        fileURL.lastPathComponent.nilIfEmpty ?? "this file"
+    }
+
+    var title: String { "Revert changes in \(filename)?" }
+    var confirmLabel: String { "Revert \(filename)" }
+
+    var message: String {
+        if includesRecoveredDraft {
+            return "This permanently discards current edits and the recovered draft for "
+                + "\(filename). Recovery data is kept until you confirm."
+        }
+        return "This permanently discards current edits in \(filename). "
+            + "Recovery data is kept until you confirm."
+    }
+
+    func matchesCurrentDocument(_ url: URL) -> Bool {
+        fileURL.standardizedFileURL == url.standardizedFileURL
+    }
+}
+
+private struct FilePreviewRevertConfirmationModifier: ViewModifier {
+    @Binding var confirmation: FilePreviewRevertConfirmation?
+    let onConfirm: (FilePreviewRevertConfirmation) -> Void
+
+    func body(content: Content) -> some View {
+        content.confirmationDialog(
+            confirmation?.title ?? "Revert changes?",
+            isPresented: Binding(
+                get: { confirmation != nil },
+                set: { if !$0 { confirmation = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: confirmation
+        ) { value in
+            Button(value.confirmLabel, role: .destructive) { onConfirm(value) }
+            Button("Cancel", role: .cancel) {}
+        } message: { value in
+            Text(value.message)
+        }
+    }
+}
+
+struct FilePreviewTabOverflowPresentation {
+    struct Entry: Identifiable {
+        let tab: AppModel.FileWorkbenchTab
+        let title: String
+        let isSelected: Bool
+        let isModified: Bool
+
+        var id: URL { url }
+        var url: URL { tab.url.standardizedFileURL }
+
+        var accessibilityLabel: String {
+            var details = [title]
+            if isSelected { details.append("selected") }
+            details.append(tab.isPinned ? "kept open" : "preview")
+            if isModified { details.append("modified") }
+            return details.joined(separator: ", ")
+        }
+    }
+
+    static let accessibilityIdentifier = "preview.allDocuments"
+
+    let entries: [Entry]
+    let selectedScrollTarget: URL?
+
+    init(
+        tabs: [AppModel.FileWorkbenchTab],
+        selectedURL: URL,
+        workspaceRoot: URL?,
+        loadedURL: URL?,
+        isDirty: Bool
+    ) {
+        let normalizedSelection = selectedURL.standardizedFileURL
+        entries = tabs.map { tab in
+            let normalizedURL = tab.url.standardizedFileURL
+            return Entry(
+                tab: tab,
+                title: FilePreviewTabPolicy.displayTitle(
+                    for: tab,
+                    among: tabs,
+                    workspaceRoot: workspaceRoot
+                ),
+                isSelected: normalizedURL == normalizedSelection,
+                isModified: FilePreviewTabPolicy.isModified(
+                    tab,
+                    loadedURL: loadedURL,
+                    isDirty: isDirty
+                )
+            )
+        }
+        selectedScrollTarget = entries.contains { $0.url == normalizedSelection }
+            ? normalizedSelection
+            : nil
+    }
+
+    var label: String { "All Documents" }
+
+    var value: String {
+        guard let selected = entries.first(where: \.isSelected) else {
+            return "\(entries.count) open"
+        }
+        return "\(entries.count) open, \(selected.title) selected"
+    }
+
+    static func visibleTitle(openDocumentCount: Int) -> String {
+        "All \(openDocumentCount)"
+    }
+}
+
+struct FilePreviewEditorControlAccessibility: Equatable {
+    enum Kind: Equatable {
+        case markdown
+        case text
+        case html
+    }
+
+    let kind: Kind
+    let editorVisible: Bool
+
+    var label: String {
+        switch (kind, editorVisible) {
+        case (.markdown, false): "Edit Markdown source"
+        case (.markdown, true): "Show Markdown preview"
+        case (.text, false): "Edit text"
+        case (.text, true): "Show text preview"
+        case (.html, false): "Edit HTML source"
+        case (.html, true): "Show HTML preview"
+        }
+    }
+
+    var value: String {
+        switch (kind, editorVisible) {
+        case (.markdown, false): "Markdown preview shown"
+        case (.markdown, true): "Markdown source editor shown"
+        case (.text, false): "Text preview shown"
+        case (.text, true): "Text editor shown"
+        case (.html, false): "HTML preview shown"
+        case (.html, true): "HTML source editor shown"
+        }
+    }
+}
+
+struct FilePreviewSaveControlAccessibility: Equatable {
+    let fileURL: URL
+    let isDirty: Bool
+    let isLoading: Bool
+    let isSaving: Bool
+    let hasConflict: Bool
+
+    private var filename: String {
+        fileURL.lastPathComponent.nilIfEmpty ?? "this file"
+    }
+
+    var label: String { "Save \(filename)" }
+
+    var value: String {
+        let state: String
+        if isSaving { state = "Saving" }
+        else if isLoading { state = "Loading document" }
+        else if isDirty { state = "Changes pending" }
+        else { state = "Saved" }
+        return hasConflict ? "\(state), file changed on disk" : state
+    }
+
+    var isEnabled: Bool { isDirty && !isLoading && !isSaving }
+}
+
+enum FilePreviewControlAccessibility {
+    static let headerFocusOrder = [
+        "preview.editorMode",
+        "preview.save",
+        "preview.options",
+        "preview.hide",
+    ]
+}
+
 /// File preview/editor pane: UTF-8 text is editable with ⌘S save + revert,
 /// markdown renders styled (with a raw-source toggle), images display, and
 /// binary/oversized files degrade to a clear notice.
@@ -199,6 +385,7 @@ struct FilePreviewView: View {
     /// same line at the top of the viewport.
     @State private var textScrollMemory = FilePreviewTextScrollMemory()
     @State private var previewNotice: FilePreviewNotice?
+    @State private var revertConfirmation: FilePreviewRevertConfirmation?
     /// The URL that produced the currently rendered draft. It deliberately
     /// stays unchanged while another URL loads, so Save can never target the
     /// incoming file with the outgoing file's contents.
@@ -459,6 +646,12 @@ struct FilePreviewView: View {
         } message: {
             Text("The stored draft for \(loadedURL?.lastPathComponent ?? url.lastPathComponent) is deleted. Drafts for every other file are left alone.")
         }
+        .modifier(
+            FilePreviewRevertConfirmationModifier(
+                confirmation: $revertConfirmation,
+                onConfirm: performConfirmedRevert
+            )
+        )
     }
 
     private func completePendingAction() {
@@ -689,15 +882,22 @@ struct FilePreviewView: View {
                 outlineMenu
             }
             if case .markdown = content {
+                let accessibility = FilePreviewEditorControlAccessibility(
+                    kind: .markdown,
+                    editorVisible: showMarkdownSource
+                )
                 Button { showMarkdownSource.toggle() } label: {
                     Image(systemName: showMarkdownSource ? "doc.richtext.fill" : "pencil")
                 }
                 .buttonStyle(.borderless)
                 .help(showMarkdownSource ? "Show formatted Markdown" : "Edit Markdown")
+                .accessibilityLabel(accessibility.label)
+                .accessibilityValue(accessibility.value)
+                .accessibilityIdentifier("preview.editorMode")
             } else if case .text = content {
-                editModeButton(help: "Edit text")
+                editModeButton(kind: .text, help: "Edit text")
             } else if case .html = content {
-                editModeButton(help: "Edit HTML source")
+                editModeButton(kind: .html, help: "Edit HTML source")
             }
             if conflict.showsCompactIndicator {
                 Button {
@@ -712,6 +912,13 @@ struct FilePreviewView: View {
                 .accessibilityIdentifier("preview.conflictIndicator")
             }
             if isEditable {
+                let accessibility = FilePreviewSaveControlAccessibility(
+                    fileURL: loadedURL ?? url,
+                    isDirty: isDirty,
+                    isLoading: isLoading,
+                    isSaving: isSaving,
+                    hasConflict: conflict.isActive
+                )
                 Button { save() } label: {
                     Image(systemName: "square.and.arrow.down")
                         // Tinted only under a conflict; otherwise the control
@@ -724,9 +931,11 @@ struct FilePreviewView: View {
                 }
                 .buttonStyle(.borderless)
                 .keyboardShortcut("s", modifiers: .command)
-                .disabled(!isDirty || isLoading || isSaving)
+                .disabled(!accessibility.isEnabled)
                 .help(conflict.saveHelpText)
-                .accessibilityLabel(conflict.saveAccessibilityLabel)
+                .accessibilityLabel(accessibility.label)
+                .accessibilityValue(accessibility.value)
+                .accessibilityIdentifier("preview.save")
             }
             previewOptionsMenu
             Button {
@@ -755,6 +964,13 @@ struct FilePreviewView: View {
                 .truncationMode(.middle)
             Spacer()
         } else {
+            let presentation = FilePreviewTabOverflowPresentation(
+                tabs: tabs,
+                selectedURL: url,
+                workspaceRoot: workspaceRoot,
+                loadedURL: loadedURL,
+                isDirty: isDirty
+            )
             ScrollViewReader { tabScroll in
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 4) {
@@ -862,25 +1078,81 @@ struct FilePreviewView: View {
                     }
                 }
                 .onAppear {
-                    tabScroll.scrollTo(url.standardizedFileURL, anchor: .center)
-                }
-                .onChange(of: url.standardizedFileURL) { _, selectedURL in
-                    withAnimation(.easeOut(duration: 0.16)) {
+                    if let selectedURL = presentation.selectedScrollTarget {
                         tabScroll.scrollTo(selectedURL, anchor: .center)
+                    }
+                }
+                .onChange(of: presentation.selectedScrollTarget) { _, selectedURL in
+                    if let selectedURL {
+                        withAnimation(.easeOut(duration: 0.16)) {
+                            tabScroll.scrollTo(selectedURL, anchor: .center)
+                        }
                     }
                 }
                 .scrollBounceBehavior(.basedOnSize)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            allDocumentsMenu(presentation)
         }
     }
 
-    private func editModeButton(help: String) -> some View {
-        Button { isEditingText.toggle() } label: {
+    private func allDocumentsMenu(
+        _ presentation: FilePreviewTabOverflowPresentation
+    ) -> some View {
+        Menu {
+            ForEach(presentation.entries) { entry in
+                Button {
+                    selectTab(entry.url)
+                } label: {
+                    Label(
+                        entry.title,
+                        systemImage: entry.isSelected ? "checkmark" : "doc"
+                    )
+                }
+                .accessibilityLabel(entry.accessibilityLabel)
+            }
+            Divider()
+            Button("Reopen Closed Tab") {
+                reopenClosedTab()
+            }
+            .disabled(!canReopenClosedTab)
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "rectangle.stack")
+                Text(
+                    FilePreviewTabOverflowPresentation.visibleTitle(
+                        openDocumentCount: presentation.entries.count
+                    )
+                )
+                .font(.caption2.monospacedDigit())
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("All Documents")
+        .accessibilityLabel(presentation.label)
+        .accessibilityValue(presentation.value)
+        .accessibilityHint("Shows every open document")
+        .accessibilityIdentifier(FilePreviewTabOverflowPresentation.accessibilityIdentifier)
+    }
+
+    private func editModeButton(
+        kind: FilePreviewEditorControlAccessibility.Kind,
+        help: String
+    ) -> some View {
+        let accessibility = FilePreviewEditorControlAccessibility(
+            kind: kind,
+            editorVisible: isEditingText
+        )
+        return Button { isEditingText.toggle() } label: {
             Image(systemName: isEditingText ? "eye" : "pencil")
         }
         .buttonStyle(.borderless)
         .help(isEditingText ? "Show preview" : help)
+        .accessibilityLabel(accessibility.label)
+        .accessibilityValue(accessibility.value)
+        .accessibilityIdentifier("preview.editorMode")
     }
 
     private var outlineMenu: some View {
@@ -974,17 +1246,10 @@ struct FilePreviewView: View {
             if isEditable {
                 Divider()
                 Button("Revert Changes") {
-                    // Under an unresolved conflict the saved file is the newer
-                    // disk version, so reverting takes that rather than leaving
-                    // a stale buffer behind an indicator that just cleared.
-                    guard !conflict.isActive else {
-                        reloadExternalVersion()
-                        return
-                    }
-                    if let loadedURL, !clearRecoveryTokens(for: loadedURL) { return }
-                    if case .docx = content { richDraft = savedRichText }
-                    else { draft = savedText }
-                    recoveredDraftPending = false
+                    revertConfirmation = FilePreviewRevertConfirmation(
+                        fileURL: loadedURL ?? url,
+                        includesRecoveredDraft: recoveredDraftPending
+                    )
                 }
                 .disabled(!isDirty)
             }
@@ -995,6 +1260,7 @@ struct FilePreviewView: View {
         .menuIndicator(.hidden)
         .help("Document options")
         .accessibilityLabel("Document options")
+        .accessibilityIdentifier("preview.options")
     }
 
     private var copyableContents: String? {
@@ -1052,6 +1318,31 @@ struct FilePreviewView: View {
             accepted: NSWorkspace.shared.open(target),
             fileName: target.lastPathComponent
         ))
+    }
+
+    private func performConfirmedRevert(_ confirmation: FilePreviewRevertConfirmation) {
+        let target = loadedURL ?? url
+        guard confirmation.matchesCurrentDocument(target) else {
+            ToastCenter.shared.show(
+                "The selected document changed. No edits were reverted.",
+                style: .error
+            )
+            return
+        }
+        // Under an unresolved conflict the saved file is the newer disk
+        // version, so the confirmed revert reloads that rather than leaving a
+        // stale buffer behind an indicator that just cleared.
+        guard !conflict.isActive else {
+            reloadExternalVersion()
+            return
+        }
+        // This is deliberately the first recovery-store mutation in the
+        // Revert path. Opening or cancelling the dialog leaves every token and
+        // recovered draft byte intact.
+        if let loadedURL, !clearRecoveryTokens(for: loadedURL) { return }
+        if case .docx = content { richDraft = savedRichText }
+        else { draft = savedText }
+        recoveredDraftPending = false
     }
 
     /// The Choose Application recovery: launch the picked app against this file

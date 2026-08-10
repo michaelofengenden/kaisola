@@ -9,6 +9,156 @@ import XCTest
 /// ProjectFiles (tree listing + bounded enumeration) and FilePreviewContent
 /// (what a file renders as) — the workspace rail's foundations.
 final class WorkspaceFilesTests: XCTestCase {
+    func testAllDocumentsPresentationKeepsEveryTabReachableInSourceOrder() {
+        let project = URL(fileURLWithPath: "/tmp/Overflow project", isDirectory: true)
+        let first = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("README.md"),
+            isPinned: true,
+            line: nil
+        )
+        let selected = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("Sources/main.swift"),
+            isPinned: false,
+            line: nil
+        )
+        let last = AppModel.FileWorkbenchTab(
+            url: project.appendingPathComponent("Tests/main.swift"),
+            isPinned: true,
+            line: nil
+        )
+
+        let presentation = FilePreviewTabOverflowPresentation(
+            tabs: [first, selected, last],
+            selectedURL: selected.url,
+            workspaceRoot: project,
+            loadedURL: selected.url,
+            isDirty: true
+        )
+
+        XCTAssertEqual(presentation.label, "All Documents")
+        XCTAssertEqual(presentation.value, "3 open, main.swift — Sources selected")
+        XCTAssertEqual(presentation.selectedScrollTarget, selected.url.standardizedFileURL)
+        XCTAssertEqual(
+            presentation.entries.map(\.url),
+            [first.url, selected.url, last.url].map(\.standardizedFileURL)
+        )
+        XCTAssertEqual(
+            presentation.entries.map(\.accessibilityLabel),
+            [
+                "README.md, kept open",
+                "main.swift — Sources, selected, preview, modified",
+                "main.swift — Tests, kept open",
+            ]
+        )
+    }
+
+    func testAllDocumentsPresentationHasAStableKeyboardAndVoiceOverTarget() {
+        XCTAssertEqual(
+            FilePreviewTabOverflowPresentation.accessibilityIdentifier,
+            "preview.allDocuments"
+        )
+        XCTAssertEqual(
+            FilePreviewTabOverflowPresentation.visibleTitle(openDocumentCount: 12),
+            "All 12"
+        )
+    }
+
+    func testEditorModeControlsSpeakTheirActionAndCurrentToggleValue() {
+        let cases: [(FilePreviewEditorControlAccessibility.Kind, Bool, String, String)] = [
+            (.markdown, false, "Edit Markdown source", "Markdown preview shown"),
+            (.markdown, true, "Show Markdown preview", "Markdown source editor shown"),
+            (.text, false, "Edit text", "Text preview shown"),
+            (.text, true, "Show text preview", "Text editor shown"),
+            (.html, false, "Edit HTML source", "HTML preview shown"),
+            (.html, true, "Show HTML preview", "HTML source editor shown"),
+        ]
+
+        for (kind, editorVisible, label, value) in cases {
+            let accessibility = FilePreviewEditorControlAccessibility(
+                kind: kind,
+                editorVisible: editorVisible
+            )
+            XCTAssertEqual(accessibility.label, label)
+            XCTAssertEqual(accessibility.value, value)
+        }
+    }
+
+    func testSaveControlSpeaksCleanDirtySavingAndConflictStates() {
+        let file = URL(fileURLWithPath: "/tmp/main.swift")
+
+        let clean = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: false,
+            isLoading: false,
+            isSaving: false,
+            hasConflict: false
+        )
+        XCTAssertEqual(clean.label, "Save main.swift")
+        XCTAssertEqual(clean.value, "Saved")
+        XCTAssertFalse(clean.isEnabled)
+
+        let dirty = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: true,
+            isLoading: false,
+            isSaving: false,
+            hasConflict: true
+        )
+        XCTAssertEqual(dirty.value, "Changes pending, file changed on disk")
+        XCTAssertTrue(dirty.isEnabled)
+
+        let saving = FilePreviewSaveControlAccessibility(
+            fileURL: file,
+            isDirty: true,
+            isLoading: false,
+            isSaving: true,
+            hasConflict: false
+        )
+        XCTAssertEqual(saving.value, "Saving")
+        XCTAssertFalse(saving.isEnabled)
+    }
+
+    func testDocumentHeaderFocusOrderIsStable() {
+        XCTAssertEqual(
+            FilePreviewControlAccessibility.headerFocusOrder,
+            ["preview.editorMode", "preview.save", "preview.options", "preview.hide"]
+        )
+    }
+
+    func testRevertConfirmationNamesTheExactDocumentAndRecoveredDraft() {
+        let confirmation = FilePreviewRevertConfirmation(
+            fileURL: URL(fileURLWithPath: "/tmp/Incident notes.md"),
+            includesRecoveredDraft: true
+        )
+
+        XCTAssertEqual(confirmation.title, "Revert changes in Incident notes.md?")
+        XCTAssertEqual(confirmation.confirmLabel, "Revert Incident notes.md")
+        XCTAssertEqual(
+            confirmation.message,
+            "This permanently discards current edits and the recovered draft for Incident notes.md. Recovery data is kept until you confirm."
+        )
+        XCTAssertTrue(confirmation.matchesCurrentDocument(
+            URL(fileURLWithPath: "/tmp/Incident notes.md")
+        ))
+        XCTAssertFalse(confirmation.matchesCurrentDocument(
+            URL(fileURLWithPath: "/tmp/another.md")
+        ))
+    }
+
+    func testOrdinaryRevertConfirmationDoesNotClaimARecoveredDraft() {
+        let confirmation = FilePreviewRevertConfirmation(
+            fileURL: URL(fileURLWithPath: "/tmp/main.swift"),
+            includesRecoveredDraft: false
+        )
+
+        XCTAssertEqual(confirmation.title, "Revert changes in main.swift?")
+        XCTAssertEqual(
+            confirmation.message,
+            "This permanently discards current edits in main.swift. Recovery data is kept until you confirm."
+        )
+        XCTAssertFalse(confirmation.message.contains("recovered draft"))
+    }
+
     func testMarkdownListContinuationHandlesBulletsTasksAndOrderedLists() {
         XCTAssertEqual(MarkdownListContinuation.action(for: "- first"), .continueWith("- "))
         XCTAssertEqual(MarkdownListContinuation.action(for: "  * nested"), .continueWith("  * "))

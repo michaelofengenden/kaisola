@@ -3,6 +3,26 @@ import Combine
 import SwiftUI
 import UniformTypeIdentifiers
 
+/// Window-local presentation effects carried by registered commands. Keeping
+/// this mapping value-based lets tests prove that a global command targets the
+/// intended window without mounting the full workspace or touching a broker.
+enum RootShellLocalCommand: Equatable, Sendable {
+    case toggleCommandPalette
+    case toggleOmniBar
+    case toggleDocumentPreview
+    case presentReadinessChecklist
+
+    init?(commandID: AppCommandID) {
+        switch commandID {
+        case .commandPalette: self = .toggleCommandPalette
+        case .messageCurrentAgent: self = .toggleOmniBar
+        case .toggleDocumentPreview: self = .toggleDocumentPreview
+        case .readinessChecklist: self = .presentReadinessChecklist
+        default: return nil
+        }
+    }
+}
+
 struct RootShellView: View {
     nonisolated static func shouldAutomaticallyRefreshPlanUsage(
         environment: [String: String]
@@ -16,6 +36,16 @@ struct RootShellView: View {
     ) -> Bool {
         !NativePreviewSettings.isIsolatedFixture(environment: environment)
             && OnboardingState.shouldShow(defaults: defaults)
+    }
+
+    /// Drives the isolated optimized interaction gate through the same sheet,
+    /// dismissal, command palette, and local-command route as production. The
+    /// app delegate still supplies a broker-free fixture model.
+    nonisolated static func shouldPresentReadinessReopenFixture(
+        environment: [String: String]
+    ) -> Bool {
+        environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+            && environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "onboarding-reopen"
     }
 
     @EnvironmentObject private var model: AppModel
@@ -248,7 +278,9 @@ struct RootShellView: View {
             }
             .onAppear {
                 let environment = ProcessInfo.processInfo.environment
-                if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+                if Self.shouldPresentReadinessReopenFixture(environment: environment) {
+                    showOnboarding = true
+                } else if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
                    environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "palette" {
                     showPalette = true
                 } else if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
@@ -472,11 +504,18 @@ struct RootShellView: View {
     }
 
     private func performLocalCommand(_ id: AppCommandID) {
-        switch id {
-        case .commandPalette: toggleCommandPalette()
-        case .messageCurrentAgent: toggleOmniBar()
-        case .toggleDocumentPreview: toggleFilePreviewColumn()
-        default: break
+        guard let command = RootShellLocalCommand(commandID: id) else { return }
+        switch command {
+        case .toggleCommandPalette:
+            toggleCommandPalette()
+        case .toggleOmniBar:
+            toggleOmniBar()
+        case .toggleDocumentPreview:
+            toggleFilePreviewColumn()
+        case .presentReadinessChecklist:
+            showPalette = false
+            showOmniBar = false
+            showOnboarding = true
         }
     }
 

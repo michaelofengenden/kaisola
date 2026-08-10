@@ -1523,6 +1523,167 @@ final class AcpClientTests: XCTestCase {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
     }
+
+    // MARK: - Request timeout bookkeeping
+
+    /// The synchronous `until` above cannot await the client actor, so the
+    /// in-flight timer count needs its own poll.
+    private static func untilClient(
+        _ description: String,
+        timeout: TimeInterval = 5,
+        _ condition: @Sendable () async -> Bool
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while await !condition() {
+            if Date() > deadline { return XCTFail("timed out waiting for \(description)") }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private static func connectedClient() async throws -> (AcpClient, ControllableAcpTransport) {
+        let transport = ControllableAcpTransport()
+        let client = AcpClient(transport: transport)
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+        return (client, transport)
+    }
+
+    func testAnsweredRequestLeavesNoTimeoutTaskBehind() async throws {
+        let (client, transport) = try await Self.connectedClient()
+
+        // The handshake's own two requests (initialize, session/new) already
+        // settled, so nothing may still be sleeping on them.
+        var outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "the handshake left timeout tasks running")
+
+        let response = Task {
+            try await client.requestForTesting("session/set_model", timeoutNanoseconds: 30_000_000_000)
+        }
+        try await Self.untilClient("the request to go in flight") {
+            await client.outstandingRequestTimeoutCountForTesting() == 1
+        }
+        let inFlight = await transport.unansweredRequestIDs()
+        await transport.answer(id: try XCTUnwrap(inFlight.first))
+        _ = try await response.value
+
+        outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "a successful response left its timeout task running")
+        await client.stop()
+    }
+
+    func testSendFailureCancelsThatRequestsTimeout() async throws {
+        let (client, transport) = try await Self.connectedClient()
+        await transport.failSends(true)
+
+        do {
+            _ = try await client.requestForTesting("session/set_mode", timeoutNanoseconds: 30_000_000_000)
+            XCTFail("a failed send must surface to the caller")
+        } catch {
+            XCTAssertEqual(error as? AcpClientError, .notRunning)
+        }
+
+        let outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "a failed send left its timeout task running")
+        await client.stop()
+    }
+
+    func testAdapterExitCancelsEveryInFlightTimeout() async throws {
+        let (client, transport) = try await Self.connectedClient()
+
+        let first = Task { () -> (any Error)? in
+            do {
+                _ = try await client.requestForTesting("session/set_model", timeoutNanoseconds: 30_000_000_000)
+                return nil
+            } catch { return error }
+        }
+        let second = Task { () -> (any Error)? in
+            do {
+                _ = try await client.requestForTesting("session/set_mode", timeoutNanoseconds: 30_000_000_000)
+                return nil
+            } catch { return error }
+        }
+        try await Self.untilClient("both requests to go in flight") {
+            await client.outstandingRequestTimeoutCountForTesting() == 2
+        }
+
+        await transport.closeOutput(exitCode: 9)
+        let firstError = await first.value
+        let secondError = await second.value
+        XCTAssertEqual(firstError as? AcpClientError, .adapterExited(code: 9))
+        XCTAssertEqual(secondError as? AcpClientError, .adapterExited(code: 9))
+
+        let outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "an adapter exit left timeout tasks running")
+        await client.stop()
+    }
+
+    func testFiredTimeoutClearsItsOwnTask() async throws {
+        let (client, _) = try await Self.connectedClient()
+
+        do {
+            _ = try await client.requestForTesting("session/set_model", timeoutNanoseconds: 40_000_000)
+            XCTFail("an unanswered request must time out")
+        } catch let AcpClientError.requestFailed(message) {
+            XCTAssertTrue(message.contains("timed out"), message)
+        }
+
+        let outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "a fired timeout left its own task in the table")
+        await client.stop()
+    }
+
+    func testCancellingTheCallerSettlesTheRequestAndItsTimeout() async throws {
+        let (client, _) = try await Self.connectedClient()
+
+        let response = Task { () -> (any Error)? in
+            do {
+                _ = try await client.requestForTesting("session/set_model", timeoutNanoseconds: 30_000_000_000)
+                return nil
+            } catch { return error }
+        }
+        try await Self.untilClient("the request to go in flight") {
+            await client.outstandingRequestTimeoutCountForTesting() == 1
+        }
+
+        // A cancelled caller settles now; before, it (and its sleeper) waited
+        // out the whole 30s window against an adapter that never answers.
+        let cancelledAt = Date()
+        response.cancel()
+        let error = await response.value
+        XCTAssertTrue(error is CancellationError, String(describing: error))
+        XCTAssertLessThan(
+            Date().timeIntervalSince(cancelledAt), 5,
+            "a cancelled caller waited out the request timeout"
+        )
+
+        let outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "a cancelled caller left its timeout task running")
+        await client.stop()
+    }
+
+    func testStopCancelsTimeoutsForRequestsItAborts() async throws {
+        let (client, _) = try await Self.connectedClient()
+
+        let response = Task { () -> (any Error)? in
+            do {
+                _ = try await client.requestForTesting("session/set_model", timeoutNanoseconds: 30_000_000_000)
+                return nil
+            } catch { return error }
+        }
+        try await Self.untilClient("the request to go in flight") {
+            await client.outstandingRequestTimeoutCountForTesting() == 1
+        }
+
+        await client.stop()
+        // Stop terminates the transport before it drains its own table, so the
+        // read loop usually reports the abort as an adapter exit. Either way the
+        // caller settles and its timer goes with it.
+        let stopError = await response.value
+        XCTAssertNotNil(stopError as? AcpClientError, String(describing: stopError))
+        let outstanding = await client.outstandingRequestTimeoutCountForTesting()
+        XCTAssertEqual(outstanding, 0, "stop left timeout tasks running")
+    }
 }
 
 /// Records how a call finished so a test can poll for it. Awaiting the task
@@ -1948,6 +2109,90 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     }
 
     func exitCode() async -> Int32? { recordedExitCode }
+
+    private func trimmed(_ data: Data) -> Data {
+        data.last == 0x0A ? data.dropLast() : data
+    }
+}
+
+/// A transport that answers only the handshake. Every later request is recorded
+/// and left unanswered, so a test settles it deliberately — a reply, a send
+/// failure, or the adapter closing its output — and inspects what that leaves
+/// behind on the client.
+private actor ControllableAcpTransport: AcpByteTransport {
+    private var outbound: [Data] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+    private var unanswered: [Int64] = []
+    private var sendFails = false
+    private var closed = false
+    private var recordedExitCode: Int32 = 0
+
+    func failSends(_ failing: Bool) { sendFails = failing }
+    func unansweredRequestIDs() -> [Int64] { unanswered }
+
+    func start(command: String, arguments: [String], environment: [String: String], cwd: String) async throws {
+        closed = false
+    }
+
+    func send(_ data: Data) async throws {
+        if sendFails { throw AcpClientError.notRunning }
+        guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue,
+              let id = object["id"]?.intValue else { return }
+        switch object["method"]?.stringValue {
+        case "initialize":
+            reply(id: id, result: .object([
+                "protocolVersion": .integer(Int64(AcpWire.protocolVersion)),
+            ]))
+        case "session/new":
+            reply(id: id, result: .object(["sessionId": .string("sess-1")]))
+        default:
+            unanswered.append(id)
+        }
+    }
+
+    /// Answer a request the client is still waiting on.
+    func answer(id: Int64) {
+        unanswered.removeAll { $0 == id }
+        reply(id: id, result: .object(["ok": .bool(true)]))
+    }
+
+    /// Close the adapter's stdout, which is how a dead agent reaches the read
+    /// loop.
+    func closeOutput(exitCode: Int32) {
+        recordedExitCode = exitCode
+        closed = true
+        waiter?.resume(returning: nil)
+        waiter = nil
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !outbound.isEmpty { return outbound.removeFirst() }
+        if closed { return nil }
+        return await withCheckedContinuation { continuation in waiter = continuation }
+    }
+
+    func terminate() async {
+        closed = true
+        waiter?.resume(returning: nil)
+        waiter = nil
+    }
+
+    func exitCode() async -> Int32? { recordedExitCode }
+
+    private func reply(id: Int64, result: JSONValue) {
+        guard var data = try? JSONEncoder().encode(JSONValue.object([
+            "jsonrpc": .string("2.0"),
+            "id": .integer(id),
+            "result": result,
+        ])) else { return }
+        data.append(0x0A)
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            outbound.append(data)
+        }
+    }
 
     private func trimmed(_ data: Data) -> Data {
         data.last == 0x0A ? data.dropLast() : data

@@ -55,6 +55,11 @@ actor AcpClient {
     private var decoder = BrokerLineFrameDecoder(maximumFrameBytes: 64 * 1_024 * 1_024)
     private var eventHandler: EventHandler?
     private var pending: [Int: CheckedContinuation<JSONValue, any Error>] = [:]
+    /// One retained sleeper per in-flight request, cancelled the moment that
+    /// request settles. An unretained timer outlives the answer it was guarding
+    /// and keeps waking the actor for the rest of its window, so a busy session
+    /// accumulates tasks that can only report on requests already finished.
+    private var requestTimeouts: [Int: Task<Void, Never>] = [:]
     private var nextRequestID = 0
     private var readerTask: Task<Void, Never>?
     /// Invalidates callbacks that were awaiting a user decision when an adapter
@@ -418,8 +423,7 @@ actor AcpClient {
         await transport.terminate()
         await reader?.value
         await terminalHost.releaseAll()
-        for continuation in pending.values { continuation.resume(throwing: AcpClientError.notRunning) }
-        pending.removeAll()
+        failAllPending(with: AcpClientError.notRunning)
         sessionID = nil
         workspaceRoot = nil
         capabilities = AcpAgentCapabilities()
@@ -485,8 +489,9 @@ actor AcpClient {
                 }
                 pending[id] = continuation
                 if timeoutNanoseconds > 0 {
-                    Task {
+                    requestTimeouts[id] = Task {
                         try? await Task.sleep(nanoseconds: timeoutNanoseconds)
+                        guard !Task.isCancelled else { return }
                         failRequest(id, error: AcpClientError.requestFailed("\(method) timed out"))
                     }
                 }
@@ -499,7 +504,8 @@ actor AcpClient {
             // A caller that walked away — a closed chat view cancels its
             // `.task`, a restart abandons startup — must not leave its entry in
             // `pending` until the adapter answers. `session/prompt` in
-            // particular has no timeout, so that wait is unbounded.
+            // particular has no timeout, so that wait is unbounded. For timed
+            // requests this also cancels the retained sleeper immediately.
             Task { await self.failRequest(id, error: CancellationError()) }
         }
     }
@@ -541,7 +547,41 @@ actor AcpClient {
     /// gone, so a timeout firing after a cancellation (or an adapter exit after
     /// either) can never resume the same continuation twice.
     private func failRequest(_ id: Int, error: any Error) {
-        pending.removeValue(forKey: id)?.resume(throwing: error)
+        takePending(id)?.resume(throwing: error)
+    }
+
+    /// Take one request off the in-flight table and stop its timeout task.
+    /// Every single-request settlement — a response, a send failure, a fired
+    /// timeout, a cancelled caller — goes through here.
+    private func takePending(_ id: Int) -> CheckedContinuation<JSONValue, any Error>? {
+        requestTimeouts.removeValue(forKey: id)?.cancel()
+        return pending.removeValue(forKey: id)
+    }
+
+    /// Settle every in-flight request at once (stop, adapter exit, read
+    /// failure), cancelling the timers along with the continuations.
+    private func failAllPending(with error: any Error) {
+        for timeout in requestTimeouts.values { timeout.cancel() }
+        requestTimeouts.removeAll()
+        let waiters = pending
+        pending.removeAll()
+        for continuation in waiters.values { continuation.resume(throwing: error) }
+    }
+
+    // MARK: - Request testing hooks
+
+    /// In-flight request timers, so tests can prove a settled request leaves
+    /// none behind.
+    func outstandingRequestTimeoutCountForTesting() -> Int { requestTimeouts.count }
+
+    /// Drive one raw JSON-RPC request with a caller-chosen timeout. Tests need
+    /// a window far shorter than the 30s default to exercise the timeout path.
+    func requestForTesting(
+        _ method: String,
+        params: JSONValue = .object([:]),
+        timeoutNanoseconds: UInt64
+    ) async throws -> JSONValue {
+        try await request(method, params: params, timeoutNanoseconds: timeoutNanoseconds)
     }
 
     // MARK: - Read loop
@@ -556,8 +596,7 @@ actor AcpClient {
                     sessionID = nil
                     workspaceRoot = nil
                     eventHandler?(.exited(code: code))
-                    for continuation in pending.values { continuation.resume(throwing: AcpClientError.adapterExited(code: code)) }
-                    pending.removeAll()
+                    failAllPending(with: AcpClientError.adapterExited(code: code))
                     return
                 }
                 if data.isEmpty { continue }
@@ -575,8 +614,7 @@ actor AcpClient {
             cancelPermissionRequests()
             sessionID = nil
             workspaceRoot = nil
-            for continuation in pending.values { continuation.resume(throwing: error) }
-            pending.removeAll()
+            failAllPending(with: error)
             eventHandler?(.error(error.localizedDescription))
         }
     }
@@ -588,7 +626,7 @@ actor AcpClient {
         // dropped: nothing waits on it, and because ids never repeat it cannot
         // belong to whatever replaced that flow.
         if let id = object["id"]?.intValue.flatMap(Int.init(exactly:)), object["method"] == nil {
-            let continuation = pending.removeValue(forKey: id)
+            let continuation = takePending(id)
             if let error = object["error"]?.objectValue {
                 continuation?.resume(throwing: AcpClientError.requestFailed(error["message"]?.stringValue ?? "request failed"))
             } else {

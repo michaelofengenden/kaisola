@@ -922,6 +922,129 @@ final class WorkspaceFilesTests: XCTestCase {
         }
     }
 
+    func testNewInstructionFileWritesTheTemplateThenReportsTheExistingFile() throws {
+        let target = root.appendingPathComponent(WorkspaceInstructionFile.fileName).standardizedFileURL
+
+        let created = try WorkspaceInstructionFile.create(in: root).get()
+        XCTAssertEqual(created, .created(target))
+        XCTAssertTrue(created.didWrite)
+        XCTAssertEqual(created.url, target)
+        XCTAssertEqual(
+            try String(contentsOf: target, encoding: .utf8),
+            WorkspaceInstructionFile.template
+        )
+
+        let second = try WorkspaceInstructionFile.create(in: root).get()
+        XCTAssertEqual(second, .alreadyExisted(target))
+        XCTAssertFalse(second.didWrite)
+        XCTAssertEqual(
+            try String(contentsOf: target, encoding: .utf8),
+            WorkspaceInstructionFile.template,
+            "a second action must never overwrite the project's instructions"
+        )
+    }
+
+    func testFailedInstructionFileWriteOpensNothingAndSucceedsOnRetry() throws {
+        try XCTSkipIf(getuid() == 0, "a root test process can write into a read-only folder")
+        let project = root.appendingPathComponent("read-only-project", isDirectory: true)
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o500],
+            ofItemAtPath: project.path
+        )
+        defer {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: project.path
+            )
+        }
+        let target = project.appendingPathComponent(WorkspaceInstructionFile.fileName)
+
+        let result = WorkspaceInstructionFile.create(in: project)
+        guard case let .failure(failure) = result else {
+            return XCTFail("a folder that refuses the write must not report a created file")
+        }
+        XCTAssertEqual(failure.reason, .permission)
+        XCTAssertTrue(failure.message.contains(WorkspaceInstructionFile.fileName))
+        XCTAssertNil(
+            try? result.get(),
+            "a failed write must not hand the rail a file to open"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: target.path))
+
+        // The retry offered beside the failure is the point of surfacing it:
+        // once the cause clears, the same action writes the file.
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o700],
+            ofItemAtPath: project.path
+        )
+        let retried = try WorkspaceInstructionFile.create(in: project).get()
+        XCTAssertEqual(retried, .created(target.standardizedFileURL))
+        XCTAssertEqual(
+            try String(contentsOf: target, encoding: .utf8),
+            WorkspaceInstructionFile.template
+        )
+    }
+
+    func testInstructionFileRefusesAFolderOrLinkOccupyingItsName() throws {
+        let occupied = root.appendingPathComponent(WorkspaceInstructionFile.fileName)
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent(WorkspaceInstructionFile.fileName, isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        guard case let .failure(folderFailure) = WorkspaceInstructionFile.create(in: root) else {
+            return XCTFail("a folder under that name is a collision, not an instruction file")
+        }
+        XCTAssertEqual(folderFailure.reason, .collision)
+
+        try FileManager.default.removeItem(at: occupied)
+        try FileManager.default.createSymbolicLink(
+            at: occupied,
+            withDestinationURL: root.appendingPathComponent("README.md")
+        )
+        guard case let .failure(linkFailure) = WorkspaceInstructionFile.create(in: root) else {
+            return XCTFail("a symbolic link under that name is a collision")
+        }
+        XCTAssertEqual(linkFailure.reason, .collision)
+
+        let missingProject = root.appendingPathComponent("gone", isDirectory: true)
+        guard case let .failure(missingFailure) = WorkspaceInstructionFile.create(in: missingProject) else {
+            return XCTFail("a project folder that is not there cannot hold an instruction file")
+        }
+        XCTAssertEqual(missingFailure.reason, .workspaceUnavailable)
+    }
+
+    func testInstructionFileFailuresSeparateCollisionPermissionAndDiskFull() {
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EEXIST).reason, .collision)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EACCES).reason, .permission)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EPERM).reason, .permission)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EROFS).reason, .permission)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: ENOSPC).reason, .diskFull)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EDQUOT).reason, .diskFull)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: ENOENT).reason, .workspaceUnavailable)
+        XCTAssertEqual(WorkspaceInstructionFile.failure(forErrno: EIO).reason, .unknown)
+
+        XCTAssertTrue(
+            WorkspaceInstructionFile.Failure(reason: .diskFull).message.contains("disk is full")
+        )
+        XCTAssertTrue(
+            WorkspaceInstructionFile.Failure(reason: .permission).message.contains("permission")
+        )
+        for reason in [
+            WorkspaceInstructionFile.Failure.Reason.collision,
+            .permission,
+            .diskFull,
+            .workspaceUnavailable,
+            .unknown,
+        ] {
+            XCTAssertTrue(
+                WorkspaceInstructionFile.Failure(reason: reason).message
+                    .contains(WorkspaceInstructionFile.fileName),
+                "every failure should name the file it did not write"
+            )
+        }
+    }
+
     func testWorkspaceTrashRestoreRefusesDestinationCollision() throws {
         let original = root.appendingPathComponent("restored.md")
         let stagedTrash = root.deletingLastPathComponent()

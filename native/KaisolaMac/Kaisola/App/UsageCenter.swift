@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import CryptoKit
+import Darwin
 import Foundation
 
 /// Serializes the competing process-exit and timeout callbacks without tying
@@ -470,10 +471,21 @@ struct UsageAccountStore: Sendable {
 
     static let schemaVersion = 1
     let fileURL: URL
+    private let installTemporary: @Sendable (URL, URL) throws -> Void
 
-    init(fileURL: URL = NativePreviewPaths.applicationSupportDirectory
-        .appendingPathComponent("usage-accounts.json", isDirectory: false)) {
+    init(
+        fileURL: URL = NativePreviewPaths.applicationSupportDirectory
+            .appendingPathComponent("usage-accounts.json", isDirectory: false),
+        installTemporary: @escaping @Sendable (URL, URL) throws -> Void = { temporary, destination in
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+        }
+    ) {
         self.fileURL = fileURL
+        self.installTemporary = installTemporary
     }
 
     func profiles() -> [UsageAccountProfile] {
@@ -517,23 +529,74 @@ struct UsageAccountStore: Sendable {
             label: label,
             directory: directory
         ).normalized else { return nil }
-        var current = profiles()
-        guard Self.existingProfile(
-            in: current,
-            provider: profile.provider,
-            directory: profile.directory
-        ) == nil else { return nil }
-        current.append(profile)
-        guard write(current) else { return nil }
-        return profile
+        return withRegistryLock { current -> UsageAccountProfile? in
+            guard Self.existingProfile(
+                in: current,
+                provider: profile.provider,
+                directory: profile.directory
+            ) == nil else { return nil }
+            guard write(current + [profile]) else { return nil }
+            return profile
+        }
     }
 
     @discardableResult
     func remove(id: String) -> Bool {
-        let current = profiles()
-        let remaining = current.filter { $0.id != id }
-        guard remaining.count != current.count else { return false }
-        return write(remaining)
+        withRegistryLock { current -> Bool? in
+            let remaining = current.filter { $0.id != id }
+            guard remaining.count != current.count else { return false }
+            return write(remaining)
+        } ?? false
+    }
+
+    /// Advisory lock guarding a mutation's read-modify-write. It is a sidecar
+    /// file rather than the registry itself because every write replaces the
+    /// registry inode, and a lock held on a replaced inode guards nothing.
+    var lockURL: URL {
+        fileURL.deletingLastPathComponent().appendingPathComponent(
+            ".\(fileURL.lastPathComponent).lock",
+            isDirectory: false
+        )
+    }
+
+    /// How long a mutation waits for another writer. The critical section is
+    /// one small decode plus an atomic replace, so genuine contention clears in
+    /// well under a millisecond; the deadline exists only so a wedged holder
+    /// cannot freeze the Settings window indefinitely.
+    private static let lockTimeout: TimeInterval = 2
+    private static let lockRetryInterval: TimeInterval = 0.005
+
+    /// Run one mutation with the registry serialized against every other
+    /// writer, `body` receiving the profiles as they are *inside* the lock.
+    ///
+    /// add() and remove() used to load the whole registry, edit their own copy
+    /// and write it back with no interlock, so two Settings windows saving at
+    /// once each erased the other's account. `flock` is held per open file
+    /// description, which means two `UsageAccountStore` values in one process
+    /// contend exactly the way two app instances do.
+    ///
+    /// Reads stay lock-free: a write only ever swaps the file whole, so
+    /// `profiles()` sees one complete generation or the other, never a tear.
+    private func withRegistryLock<T>(_ body: ([UsageAccountProfile]) -> T?) -> T? {
+        let directory = fileURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let descriptor = open(lockURL.path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
+        guard descriptor >= 0 else { return nil }
+        defer { Darwin.close(descriptor) }
+
+        let deadline = Date().addingTimeInterval(Self.lockTimeout)
+        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            let failure = errno
+            guard failure == EWOULDBLOCK || failure == EINTR, Date() < deadline else { return nil }
+            Thread.sleep(forTimeInterval: Self.lockRetryInterval)
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+
+        return body(profiles())
     }
 
     static func suggestedDirectory(provider: UsageAccountProfile.Provider, label: String) -> String? {
@@ -557,7 +620,7 @@ struct UsageAccountStore: Sendable {
 
     private func write(_ profiles: [UsageAccountProfile]) -> Bool {
         let directory = fileURL.deletingLastPathComponent()
-        // Named ahead of the `do` so the catch can delete this exact fragment.
+        // Named ahead of the `do` so the defer can delete this exact fragment.
         // A locked destination fails `replaceItemAt` and a dangling symlink
         // fails `moveItem` *after* the temporary already exists, so a catch
         // that only returned false silted up the credential directory with
@@ -566,6 +629,9 @@ struct UsageAccountStore: Sendable {
             ".\(fileURL.lastPathComponent).\(UUID().uuidString)",
             isDirectory: false
         )
+        defer {
+            try? FileManager.default.removeItem(at: temporary)
+        }
         do {
             try FileManager.default.createDirectory(
                 at: directory,
@@ -576,14 +642,9 @@ struct UsageAccountStore: Sendable {
             let data = try JSONEncoder().encode(payload)
             try data.write(to: temporary, options: [.atomic])
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
-            } else {
-                try FileManager.default.moveItem(at: temporary, to: fileURL)
-            }
+            try installTemporary(temporary, fileURL)
             return true
         } catch {
-            try? FileManager.default.removeItem(at: temporary)
             return false
         }
     }

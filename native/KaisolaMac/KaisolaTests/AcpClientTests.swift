@@ -3751,7 +3751,6 @@ final class AcpClientTests: XCTestCase {
         let outstanding = await client.outstandingRequestTimeoutCountForTesting()
         XCTAssertEqual(outstanding, 0, "stop left timeout tasks running")
     }
-
     // MARK: - Malformed frames
 
     func testMalformedJsonBetweenValidFramesFailsTheConnection() async throws {

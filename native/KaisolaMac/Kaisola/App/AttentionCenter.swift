@@ -197,14 +197,16 @@ final class AttentionCenter: ObservableObject {
         detail: String,
         completedAt: Int64
     ) -> Bool {
+        guard completedAt >= 0 else { return false }
         guard acknowledgedSessionCompletions[targetID, default: .min] < completedAt else {
             return false
         }
         let at = Date(timeIntervalSince1970: Double(completedAt) / 1_000)
-        guard at.timeIntervalSince1970.isFinite else { return false }
+        guard Self.acknowledgementTimestamp(for: at) != nil else { return false }
         if let existing = entries.first(where: {
             $0.targetID == targetID && $0.kind == .sessionResponded
-        }), Int64(existing.at.timeIntervalSince1970 * 1_000) >= completedAt {
+        }), let existingCompletedAt = Self.acknowledgementTimestamp(for: existing.at),
+           existingCompletedAt >= completedAt {
             return false
         }
         addEntry(
@@ -224,6 +226,7 @@ final class AttentionCenter: ObservableObject {
     /// Mark a broker completion visited even when this process did not already
     /// have an inbox entry (the important cold-launch/replacement case).
     func acknowledgeSessionResponse(targetID: String, completedAt: Int64) {
+        guard completedAt >= 0 else { return }
         var updated = acknowledgedSessionCompletions
         updated[targetID] = max(updated[targetID, default: .min], completedAt)
         commit(
@@ -329,10 +332,22 @@ final class AttentionCenter: ObservableObject {
     private func acknowledgements(visiting candidates: [Entry]) -> [String: Int64] {
         var updated = acknowledgedSessionCompletions
         for entry in candidates where entry.kind == .sessionResponded {
-            let completedAt = Int64(entry.at.timeIntervalSince1970 * 1_000)
+            guard let completedAt = Self.acknowledgementTimestamp(for: entry.at) else { continue }
             updated[entry.targetID] = max(updated[entry.targetID, default: .min], completedAt)
         }
         return Self.trimmed(updated)
+    }
+
+    /// User-writable persisted dates must be range-checked before conversion:
+    /// converting a finite Double outside Int64's range traps instead of
+    /// returning an error. The strict upper bound also handles Int64.max being
+    /// rounded up when represented as a Double.
+    private static func acknowledgementTimestamp(for date: Date) -> Int64? {
+        let milliseconds = date.timeIntervalSince1970 * 1_000
+        guard milliseconds.isFinite,
+              milliseconds >= 0,
+              milliseconds < Double(Int64.max) else { return nil }
+        return Int64(milliseconds)
     }
 
     private static func trimmed(_ acknowledgements: [String: Int64]) -> [String: Int64] {
@@ -542,6 +557,8 @@ final class AttentionCenter: ObservableObject {
                 && entry.title.utf8.count <= 512
                 && entry.detail.utf8.count <= 2_048
                 && entry.at.timeIntervalSince1970.isFinite
+                && (entry.kind != .sessionResponded
+                    || acknowledgementTimestamp(for: entry.at) != nil)
         }
         var seen: Set<String> = []
         let newestUnique = valid.reversed().filter { entry in

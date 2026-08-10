@@ -1465,9 +1465,9 @@ actor AcpClient {
         } onCancel: {
             // A caller that walked away — a closed chat view cancels its
             // `.task`, a restart abandons startup — must not leave its entry in
-            // `pending` or its retained timeout task until the adapter answers.
-            // `session/prompt` in particular has no timeout, so that wait is
-            // otherwise unbounded.
+            // `pending` until the adapter answers. `session/prompt` in
+            // particular has no timeout, so that wait is unbounded. For timed
+            // requests this also cancels the retained sleeper immediately.
             Task { await self.failRequest(id, error: CancellationError()) }
         }
     }

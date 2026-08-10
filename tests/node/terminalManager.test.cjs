@@ -105,7 +105,7 @@ function spawnKillTestRecord(t, id) {
   return { record, pty }
 }
 
-test('terminal kill reports node-pty refusal and leaves the registered terminal live', (t) => {
+test('terminal kill reports node-pty refusal and leaves the registered terminal live', async (t) => {
   const id = 'kill-refusal-stays-live'
   const { record, pty } = spawnKillTestRecord(t, id)
 
@@ -128,6 +128,18 @@ test('terminal kill reports node-pty refusal and leaves the registered terminal 
   })
   assert.equal(manager.has(id), true)
   assert.equal(manager.isLive(id), true)
+
+  // A retained record is only bookkeeping evidence. Prove the process itself
+  // survived the refused signal by writing through the PTY and observing cat's
+  // echo in the captured output.
+  const livenessToken = 'kill-refusal-process-still-running'
+  assert.deepEqual(manager.write(id, `${livenessToken}\n`), { ok: true })
+  let output = ''
+  for (let attempt = 0; attempt < 40 && !output.includes(livenessToken); attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    output = manager.snapshot(id).output
+  }
+  assert.match(output, new RegExp(livenessToken))
 })
 
 test('terminal kill distinguishes a missing record from signaling refusal', () => {

@@ -8,6 +8,343 @@ import XCTest
 /// any agents.
 final class MeshStagedTests: XCTestCase {
 
+    // MARK: - Versioned lifecycle hooks (issue #279)
+
+    func testLifecycleHookPreviewIsStableRedactedAndNeverExecutes() async throws {
+        let calls = HookCallRecorder()
+        let hook = MeshLifecycleHookConfiguration(
+            id: "audit",
+            executable: "/usr/bin/true",
+            events: [.beforeSubmit],
+            scope: .mesh,
+            sideEffects: [.none],
+            timeoutMilliseconds: 250,
+            failurePolicy: .continue
+        )
+        let host = MeshLifecycleHookHost(configurations: [hook]) { configuration, payload in
+            await calls.record(configuration.id, payload: payload)
+            return .init(exitStatus: 0, standardOutput: "should not run", standardError: "")
+        }
+        let payload = MeshLifecycleHookPayload(
+            event: .beforeSubmit,
+            meshID: "mesh-1",
+            projectID: "project-1",
+            fields: [
+                "prompt": "ship it sk-secret-token",
+                "authorization": "Bearer private-value",
+                "normal": "visible",
+            ]
+        )
+
+        let first = await host.preview(configurationID: "audit", payload: payload)
+        let second = await host.preview(configurationID: "audit", payload: payload)
+
+        XCTAssertEqual(first, second, "preview JSON must be stable for audit and approval")
+        XCTAssertEqual(first.apiVersion, 1)
+        XCTAssertEqual(first.timeoutMilliseconds, 250)
+        XCTAssertEqual(first.scope, .mesh)
+        XCTAssertEqual(first.sideEffects, [.none])
+        XCTAssertTrue(first.validationErrors.isEmpty)
+        XCTAssertTrue(first.encodedPayload.contains("[redacted]"))
+        XCTAssertTrue(first.encodedPayload.contains("visible"))
+        XCTAssertFalse(first.encodedPayload.contains("secret-token"))
+        XCTAssertFalse(first.encodedPayload.contains("private-value"))
+        let previewCallCount = await calls.count
+        XCTAssertEqual(previewCallCount, 0, "preview must not execute the hook")
+    }
+
+    func testLifecycleHookFailClosedOnlyBlocksConfiguredBeforeSubmit() async {
+        let failure = String(repeating: "sensitive failure ", count: 100)
+        let observer = MeshLifecycleHookConfiguration(
+            id: "observer",
+            executable: "/usr/bin/false",
+            events: [.beforeSubmit],
+            scope: .mesh,
+            sideEffects: [.notification],
+            timeoutMilliseconds: 250,
+            failurePolicy: .continue
+        )
+        let gate = MeshLifecycleHookConfiguration(
+            id: "gate",
+            executable: "/usr/bin/false",
+            events: [.beforeSubmit],
+            scope: .mesh,
+            sideEffects: [.none],
+            timeoutMilliseconds: 250,
+            failurePolicy: .failClosed
+        )
+        let host = MeshLifecycleHookHost(configurations: [observer, gate]) { _, _ in
+            .init(exitStatus: 7, standardOutput: "", standardError: failure)
+        }
+
+        let decision = await host.invoke(.init(
+            event: .beforeSubmit,
+            meshID: "mesh-1",
+            projectID: "project-1",
+            fields: ["prompt": "unchanged"]
+        ))
+
+        XCTAssertFalse(decision.allowed)
+        XCTAssertEqual(decision.receipts.map(\.hookID), ["gate", "observer"], "execution order is stable")
+        XCTAssertEqual(decision.receipts.first(where: { $0.hookID == "observer" })?.blocked, false)
+        XCTAssertEqual(decision.receipts.first(where: { $0.hookID == "gate" })?.blocked, true)
+        XCTAssertTrue(decision.receipts.allSatisfy { $0.message.utf8.count <= 512 })
+
+        let invalid = MeshLifecycleHookConfiguration(
+            id: "invalid-gate",
+            executable: "/usr/bin/true",
+            events: [.afterResponse],
+            scope: .column,
+            sideEffects: [.none],
+            timeoutMilliseconds: 250,
+            failurePolicy: .failClosed
+        )
+        XCTAssertTrue(invalid.validationErrors.contains { $0.contains("beforeSubmit") })
+    }
+
+    func testLifecycleHookTimeoutAndReentrancyAreBoundedAndVisible() async {
+        let timeoutHook = MeshLifecycleHookConfiguration(
+            id: "slow",
+            executable: "/usr/bin/true",
+            events: [.turnCompleted],
+            scope: .mesh,
+            sideEffects: [.metrics],
+            timeoutMilliseconds: 20,
+            failurePolicy: .continue
+        )
+        let slowHost = MeshLifecycleHookHost(configurations: [timeoutHook]) { _, _ in
+            try await Task.sleep(for: .seconds(5))
+            return .init(exitStatus: 0, standardOutput: "late", standardError: "")
+        }
+        let timedOut = await slowHost.invoke(.init(
+            event: .turnCompleted,
+            meshID: "mesh-1",
+            projectID: "project-1"
+        ))
+        XCTAssertTrue(timedOut.allowed)
+        XCTAssertEqual(timedOut.receipts.first?.outcome, .timedOut)
+
+        let reentrantHook = MeshLifecycleHookConfiguration(
+            id: "recursive",
+            executable: "/usr/bin/true",
+            events: [.afterResponse],
+            scope: .column,
+            sideEffects: [.none],
+            timeoutMilliseconds: 250,
+            failurePolicy: .continue
+        )
+        let hostBox = HookHostBox()
+        let reentrantHost = MeshLifecycleHookHost(configurations: [reentrantHook]) { _, _ in
+            guard let host = await hostBox.host else {
+                return .init(exitStatus: 1, standardOutput: "", standardError: "missing host")
+            }
+            let nested = await host.invoke(.init(
+                event: .afterResponse,
+                meshID: "mesh-1",
+                projectID: "project-1",
+                columnID: "column-1"
+            ))
+            XCTAssertEqual(nested.receipts.first?.outcome, .reentrant)
+            return .init(exitStatus: 0, standardOutput: "", standardError: "")
+        }
+        await hostBox.set(reentrantHost)
+        let outer = await reentrantHost.invoke(.init(
+            event: .afterResponse,
+            meshID: "mesh-1",
+            projectID: "project-1",
+            columnID: "column-1"
+        ))
+        XCTAssertEqual(outer.receipts.first?.outcome, .succeeded)
+    }
+
+    @MainActor
+    func testMeshHookedSubmissionPreservesPromptAndSurfacesBlockingFailure() async throws {
+        let recorder = HookCallRecorder()
+        let hook = MeshLifecycleHookConfiguration(
+            id: "policy",
+            executable: "/usr/bin/true",
+            events: [.beforeSubmit],
+            scope: .mesh,
+            sideEffects: [.none],
+            timeoutMilliseconds: 250,
+            failurePolicy: .failClosed
+        )
+        let host = MeshLifecycleHookHost(configurations: [hook]) { configuration, payload in
+            await recorder.record(configuration.id, payload: payload)
+            return .init(exitStatus: 0, standardOutput: #"{"prompt":"mutated"}"#, standardError: "")
+        }
+        let mesh = MeshSession(
+            id: "mesh-hook-test",
+            baseDirectory: FileManager.default.temporaryDirectory,
+            hookHost: host
+        )
+        mesh.loadVisualFixture(agents: [Self.agents[0]])
+
+        let accepted = await mesh.submit("original prompt")
+        XCTAssertTrue(accepted)
+        let userText = try XCTUnwrap(mesh.columns[0].conversation.rows.compactMap { row -> String? in
+            if case let .user(_, text, _) = row { return text }
+            return nil
+        }.last)
+        XCTAssertEqual(userText, "original prompt", "hook output is audit-only and cannot rewrite prompts")
+        let executionCount = await recorder.count
+        XCTAssertEqual(executionCount, 1)
+        XCTAssertEqual(mesh.hookReceipts.last?.outcome, .succeeded)
+
+        let blocker = MeshLifecycleHookHost(configurations: [hook]) { _, _ in
+            .init(exitStatus: 9, standardOutput: "", standardError: "policy rejected")
+        }
+        let blockedMesh = MeshSession(
+            id: "mesh-hook-blocked",
+            baseDirectory: FileManager.default.temporaryDirectory,
+            hookHost: blocker
+        )
+        blockedMesh.loadVisualFixture(agents: [Self.agents[0]])
+        let rowsBefore = blockedMesh.columns[0].conversation.rows
+        blockedMesh.draft = "keep my draft"
+
+        let blocked = await blockedMesh.submit("keep my draft")
+        XCTAssertFalse(blocked)
+        XCTAssertEqual(blockedMesh.columns[0].conversation.rows, rowsBefore)
+        XCTAssertEqual(blockedMesh.draft, "keep my draft")
+        XCTAssertEqual(blockedMesh.hookReceipts.last?.blocked, true)
+    }
+
+    func testLifecycleHookPayloadAndReceiptRetentionStayBounded() async {
+        let hook = MeshLifecycleHookConfiguration(
+            id: "audit",
+            executable: "/usr/bin/true",
+            events: [.compaction],
+            scope: .column,
+            sideEffects: [.metrics],
+            timeoutMilliseconds: 250,
+            failurePolicy: .continue
+        )
+        let host = MeshLifecycleHookHost(configurations: [hook]) { _, _ in
+            .init(exitStatus: 0, standardOutput: String(repeating: "x", count: 10_000), standardError: "")
+        }
+        let decision = await host.invoke(.init(
+            event: .compaction,
+            meshID: "mesh-1",
+            projectID: "project-1",
+            columnID: "column-1",
+            fields: ["response": String(repeating: "y", count: 100_000)]
+        ))
+
+        XCTAssertLessThanOrEqual(decision.receipts[0].message.utf8.count, 512)
+        let preview = await host.preview(configurationID: "audit", payload: .init(
+            event: .compaction,
+            meshID: "mesh-1",
+            projectID: "project-1",
+            columnID: "column-1",
+            fields: ["response": String(repeating: "y", count: 100_000)]
+        ))
+        XCTAssertLessThanOrEqual(preview.encodedPayload.utf8.count, 16_384)
+    }
+
+    func testLifecycleHookAPIInvokesEveryDeclaredEventWithScopeFiltering() async {
+        let recorder = HookCallRecorder()
+        let hook = MeshLifecycleHookConfiguration(
+            id: "lifecycle",
+            executable: "/usr/bin/true",
+            events: Set(MeshLifecycleHookEvent.allCases),
+            scope: .column,
+            sideEffects: [.metrics],
+            timeoutMilliseconds: 250
+        )
+        let host = MeshLifecycleHookHost(configurations: [hook]) { configuration, payload in
+            await recorder.record(configuration.id, payload: payload)
+            return .init(exitStatus: 0, standardOutput: "", standardError: "")
+        }
+
+        for event in MeshLifecycleHookEvent.allCases {
+            _ = await host.invoke(.init(
+                event: event,
+                meshID: "mesh-1",
+                projectID: "project-1",
+                columnID: "column-1"
+            ))
+        }
+        _ = await host.invoke(.init(
+            event: .afterResponse,
+            meshID: "mesh-1",
+            projectID: "project-1",
+            columnID: nil
+        ))
+
+        let eventCount = await recorder.count
+        XCTAssertEqual(eventCount, MeshLifecycleHookEvent.allCases.count)
+    }
+
+    func testDefaultHookExecutorReceivesRedactedJSONAndHonorsTimeout() async {
+        let echo = MeshLifecycleHookConfiguration(
+            id: "echo",
+            executable: "/bin/sh",
+            arguments: ["-c", "cat"],
+            events: [.beforeSubmit],
+            scope: .mesh,
+            sideEffects: [.none],
+            timeoutMilliseconds: 500
+        )
+        let echoHost = MeshLifecycleHookHost(configurations: [echo])
+        let echoed = await echoHost.invoke(.init(
+            event: .beforeSubmit,
+            meshID: "mesh-1",
+            projectID: "project-1",
+            fields: ["prompt": "token=private-token-value"]
+        ))
+        XCTAssertTrue(echoed.allowed)
+        XCTAssertEqual(echoed.receipts.first?.outcome, .succeeded)
+        XCTAssertTrue(echoed.receipts.first?.message.contains("[redacted]") == true)
+        XCTAssertFalse(echoed.receipts.first?.message.contains("private-token-value") == true)
+
+        let slow = MeshLifecycleHookConfiguration(
+            id: "sleep",
+            executable: "/bin/sleep",
+            arguments: ["5"],
+            events: [.turnCompleted],
+            scope: .mesh,
+            sideEffects: [.none],
+            timeoutMilliseconds: 20
+        )
+        let slowHost = MeshLifecycleHookHost(configurations: [slow])
+        let start = ContinuousClock.now
+        let timedOut = await slowHost.invoke(.init(
+            event: .turnCompleted,
+            meshID: "mesh-1",
+            projectID: "project-1"
+        ))
+        XCTAssertEqual(timedOut.receipts.first?.outcome, .timedOut)
+        XCTAssertLessThan(start.duration(to: .now), .seconds(1))
+    }
+
+    @MainActor
+    func testMeshRetainsOnlyNewestSixtyFourHookReceipts() async {
+        let hook = MeshLifecycleHookConfiguration(
+            id: "audit",
+            executable: "/usr/bin/true",
+            events: [.beforeSubmit],
+            scope: .mesh,
+            sideEffects: [.metrics],
+            timeoutMilliseconds: 250
+        )
+        let host = MeshLifecycleHookHost(configurations: [hook]) { _, _ in
+            .init(exitStatus: 0, standardOutput: "ok", standardError: "")
+        }
+        let mesh = MeshSession(
+            baseDirectory: FileManager.default.temporaryDirectory,
+            hookHost: host
+        )
+        mesh.loadVisualFixture(agents: [Self.agents[0]])
+
+        for index in 0..<70 {
+            _ = await mesh.submit("prompt \(index)")
+        }
+
+        XCTAssertEqual(mesh.hookReceipts.count, 64)
+        XCTAssertTrue(mesh.hookReceipts.allSatisfy { $0.hookID == "audit" })
+    }
+
     // MARK: - MeshDiffStats.stat
 
     func testDiffStatCountsTwoFilesFivePlusTwoMinus() {
@@ -499,5 +836,23 @@ final class MeshStagedTests: XCTestCase {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         process.waitUntilExit()
         return String(decoding: data, as: UTF8.self)
+    }
+}
+
+private actor HookCallRecorder {
+    private(set) var calls: [(id: String, payload: Data)] = []
+
+    var count: Int { calls.count }
+
+    func record(_ id: String, payload: Data) {
+        calls.append((id, payload))
+    }
+}
+
+private actor HookHostBox {
+    private(set) var host: MeshLifecycleHookHost?
+
+    func set(_ host: MeshLifecycleHookHost) {
+        self.host = host
     }
 }

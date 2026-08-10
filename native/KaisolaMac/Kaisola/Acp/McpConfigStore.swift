@@ -743,15 +743,17 @@ enum McpConfigDiscovery {
 
     private static let maximumFileBytes = 1_000_000
     private static let maximumEntriesPerSource = 24
-    private static let sources = [
-        Source("Cursor", ".cursor/mcp.json"),
-        Source("Claude Desktop", "Library/Application Support/Claude/claude_desktop_config.json"),
-        Source("Claude CLI", ".claude.json"),
-        Source("Codex CLI", ".codex/config.toml", isCodexTOML: true),
-        Source("Gemini CLI", ".gemini/settings.json"),
-        Source("VS Code", "Library/Application Support/Code/User/mcp.json", mapKeys: ["servers", "mcpServers"]),
-        Source("Windsurf", ".codeium/windsurf/mcp_config.json"),
-    ]
+    private static var sources: [Source] {
+        [
+            Source("Cursor", ".cursor/mcp.json"),
+            Source("Claude Desktop", "Library/Application Support/Claude/claude_desktop_config.json"),
+            Source("Claude CLI", ".claude.json"),
+            Source("Codex CLI", ".codex/config.toml", isCodexTOML: true),
+            Source("Gemini CLI", ".gemini/settings.json"),
+            Source("VS Code", "Library/Application Support/Code/User/mcp.json", mapKeys: ["servers", "mcpServers"]),
+            Source("Windsurf", ".codeium/windsurf/mcp_config.json"),
+        ]
+    }
 
     static func scan(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> [McpDiscoveredServer] {
         var result: [McpDiscoveredServer] = []
@@ -1143,18 +1145,25 @@ enum McpToolSchemaNormalizer {
         }
     }
 
-    private static let annotationKeys: Set<String> = [
-        "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly",
-    ]
-    private static let acceptedTypes: Set<String> = [
-        "array", "boolean", "integer", "null", "number", "object", "string",
-    ]
-    private static let acceptedDialects: Set<String> = [
-        "https://json-schema.org/draft/2020-12/schema",
-        "https://json-schema.org/draft/2019-09/schema",
-        "http://json-schema.org/draft-07/schema#",
-        "https://json-schema.org/draft-07/schema",
-    ]
+    // Keep these immutable value catalogs out of stored global initializers.
+    // Xcode 16.4 / Swift 6.1 crashes while lowering this module's complex lazy
+    // globals; computed catalogs preserve the exact values without state.
+    private static var annotationKeys: Set<String> {
+        ["title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly"]
+    }
+
+    private static var acceptedTypes: Set<String> {
+        ["array", "boolean", "integer", "null", "number", "object", "string"]
+    }
+
+    private static var acceptedDialects: Set<String> {
+        [
+            "https://json-schema.org/draft/2020-12/schema",
+            "https://json-schema.org/draft/2019-09/schema",
+            "http://json-schema.org/draft-07/schema#",
+            "https://json-schema.org/draft-07/schema",
+        ]
+    }
 
     static func normalizeTools(_ tools: [Any], limits: Limits = Limits()) -> Result {
         var usable: [[String: Any]] = []
@@ -1395,12 +1404,14 @@ struct McpProbeResult: Equatable, Sendable {
         self.disabledTools = disabledTools
     }
 
-    static let probing = McpProbeResult(
-        status: .configured,
-        verified: false,
-        message: "Checking MCP server",
-        authentication: .probing
-    )
+    static var probing: McpProbeResult {
+        McpProbeResult(
+            status: .configured,
+            verified: false,
+            message: "Checking MCP server",
+            authentication: .probing
+        )
+    }
 }
 
 /// Pure MCP `initialize` revision negotiation: given the server's reply,
@@ -1421,7 +1432,7 @@ enum McpProtocolRevision {
 
     /// Every revision this probe can correctly speak, most-preferred
     /// first. A reply outside this set is genuinely unsupported.
-    static let accepted: [String] = ["2025-11-25", "2025-06-18"]
+    static var accepted: [String] { ["2025-11-25", "2025-06-18"] }
 
     /// Whether `reply` (the server's `initialize` `result.protocolVersion`)
     /// is a revision this probe can speak.

@@ -108,7 +108,10 @@ struct FilePreviewView: View {
     @State private var autosavePendingAction = false
     @State private var showUnsavedPrompt = false
     @State private var showExternalChangePrompt = false
-    @State private var externalChangeDetected = false
+    /// Collapsible, never dismissible: the banner can fold into a header
+    /// indicator, but only reloading, saving through the conflict decision, or
+    /// discarding the draft clears the conflict.
+    @State private var conflict = FilePreviewConflictState()
     @State private var isLoading = false
     @State private var isSaving = false
     @State private var loadTask: Task<Void, Never>?
@@ -127,6 +130,11 @@ struct FilePreviewView: View {
     /// file is temporarily unreadable. Keep it dirty until an explicit save or
     /// discard even in that edge case.
     @State private var recoveredDraftPending = false
+    /// A claim the store refused. The draft is still journaled, so the banner
+    /// keeps it visible with retry, inspect, and discard instead of letting the
+    /// load pretend nothing was ever stored.
+    @State private var recoveryClaimFailure: FilePreviewRecoveryClaimFailure?
+    @State private var showRecoveryDiscardPrompt = false
     @State private var recoveryOwnerID = UUID().uuidString.lowercased()
     @State private var recoveryRevision: UInt64 = 0
     @State private var recoveryFencedRevision: UInt64 = 0
@@ -159,7 +167,11 @@ struct FilePreviewView: View {
                 noticeBanner(previewNotice)
                 Divider()
             }
-            if externalChangeDetected {
+            if let recoveryClaimFailure {
+                recoveryFailureBanner(recoveryClaimFailure)
+                Divider()
+            }
+            if conflict.showsBanner {
                 externalChangeBanner
                 Divider()
             }
@@ -197,7 +209,7 @@ struct FilePreviewView: View {
                 isDirty: isDirty,
                 isMarkdown: isMarkdownContent,
                 isSaving: isSaving,
-                hasExternalConflict: externalChangeDetected || showExternalChangePrompt
+                hasExternalConflict: conflict.isActive || showExternalChangePrompt
             ) {
             case .navigate:
                 beginLoad(newURL)
@@ -301,6 +313,7 @@ struct FilePreviewView: View {
                 draft = savedText
                 richDraft = savedRichText
                 recoveredDraftPending = false
+                conflict.apply(.draftDiscarded)
                 completePendingAction()
             }
             Button("Cancel", role: .cancel) {
@@ -331,6 +344,15 @@ struct FilePreviewView: View {
             }
         } message: {
             Text("An agent or another app edited this file after it was opened. Reload it or explicitly overwrite the newer version.")
+        }
+        .confirmationDialog(
+            "Discard the unrecovered draft?",
+            isPresented: $showRecoveryDiscardPrompt
+        ) {
+            Button("Discard Draft", role: .destructive) { discardUnrecoveredDrafts() }
+            Button("Keep Draft", role: .cancel) {}
+        } message: {
+            Text("The stored draft for \(loadedURL?.lastPathComponent ?? url.lastPathComponent) is deleted. Drafts for every other file are left alone.")
         }
     }
 
@@ -386,19 +408,110 @@ struct FilePreviewView: View {
             }
             .buttonStyle(.bordered)
             .controlSize(.small)
+            // Collapsing folds the banner into the header indicator. There is
+            // deliberately no dismissal: the conflict outlives the banner.
             Button {
-                externalChangeDetected = false
+                conflict.apply(.collapseRequested)
             } label: {
-                Image(systemName: "xmark")
+                Image(systemName: "chevron.up")
             }
             .buttonStyle(.borderless)
-            .help("Dismiss change notice")
-            .accessibilityLabel("Dismiss changed-on-disk notice")
+            .help("Collapse to a compact conflict indicator")
+            .accessibilityLabel("Collapse changed-on-disk notice")
+            .accessibilityIdentifier("preview.conflictCollapse")
         }
         .padding(.horizontal, 11)
         .frame(minHeight: 32)
         .background(Color.orange.opacity(colorScheme == .dark ? 0.12 : 0.08))
         .accessibilityElement(children: .contain)
+    }
+
+    /// A claim the recovery store refused is presented as a choice, never as a
+    /// silent loss. Retry re-runs the load and inspect reveals the exact stored
+    /// record; only the explicit discard removes anything, so the banner never
+    /// writes over the journal it is reporting on.
+    private func recoveryFailureBanner(_ failure: FilePreviewRecoveryClaimFailure) -> some View {
+        let retryable = FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: isDirty,
+            isLoading: isLoading,
+            isSaving: isSaving
+        )
+        return HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: FilePreviewNotice.Severity.error.systemImageName)
+                .foregroundStyle(.red)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Could not check for an unsaved draft")
+                    .font(.caption.weight(.medium))
+                Text(failure.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            Spacer(minLength: 8)
+            Button("Retry") { retryRecoveryClaim() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(!retryable)
+                .help(retryable
+                    ? "Look for the stored draft again"
+                    : "Save or discard your current edits before retrying")
+            Button("Inspect") { inspectRecoveryJournal() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Reveal the stored recovery record in Finder")
+            Button("Discard", role: .destructive) { showRecoveryDiscardPrompt = true }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help("Delete the stored draft for this file")
+        }
+        .padding(.horizontal, 11)
+        .padding(.vertical, 7)
+        .frame(minHeight: 32)
+        .background(Color.red.opacity(colorScheme == .dark ? 0.13 : 0.08))
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("Error: \(failure.message)")
+    }
+
+    /// The failed attempt never modified the journal, so a retry is just the
+    /// ordinary load again, including its restore, notice, and dirty-state
+    /// bookkeeping.
+    private func retryRecoveryClaim() {
+        guard recoveryClaimFailure != nil, let loadedURL else { return }
+        guard FilePreviewRecoveryFailurePolicy.canRetry(
+            isDirty: isDirty,
+            isLoading: isLoading,
+            isSaving: isSaving
+        ) else { return }
+        recoveryClaimFailure = nil
+        beginLoad(loadedURL)
+    }
+
+    private func inspectRecoveryJournal() {
+        let target = loadedURL ?? url
+        let reveal = recoveryStore.newestOrphanRecordURL(
+            for: target,
+            workspaceRoot: workspaceRoot
+        ) ?? recoveryStore.directoryURL
+        guard FileManager.default.fileExists(atPath: reveal.path) else {
+            ToastCenter.shared.show(
+                "The recovery record is no longer on disk.",
+                style: .error
+            )
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([reveal])
+    }
+
+    private func discardUnrecoveredDrafts() {
+        let target = loadedURL ?? url
+        do {
+            try recoveryStore.discardOrphans(for: target, workspaceRoot: workspaceRoot)
+            recoveryClaimFailure = nil
+        } catch {
+            handleRecoveryFailure(error, richDocument: false)
+        }
     }
 
     private func noticeBanner(_ notice: FilePreviewNotice) -> some View {
@@ -447,18 +560,14 @@ struct FilePreviewView: View {
               FilePreviewDiskState.changed(onDisk: loadedURL, since: loadedModificationDate) else {
             return
         }
-        if isDirty {
-            externalChangeDetected = true
-        } else {
-            externalChangeDetected = false
-            beginLoad(loadedURL)
-        }
+        conflict.apply(.detectedExternalChange(isDirty: isDirty))
+        if !isDirty { beginLoad(loadedURL) }
     }
 
     private func reloadExternalVersion() {
         guard let loadedURL else { return }
         guard clearRecoveryTokens(for: loadedURL) else { return }
-        externalChangeDetected = false
+        conflict.apply(.reloaded)
         recoveredDraftPending = false
         beginLoad(loadedURL)
     }
@@ -485,14 +594,34 @@ struct FilePreviewView: View {
             } else if case .html = content {
                 editModeButton(help: "Edit HTML source")
             }
+            if conflict.showsCompactIndicator {
+                Button {
+                    conflict.apply(.expandRequested)
+                } label: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                }
+                .buttonStyle(.borderless)
+                .help("Changed on disk — show reload options")
+                .accessibilityLabel("Changed on disk, show reload options")
+                .accessibilityIdentifier("preview.conflictIndicator")
+            }
             if isEditable {
                 Button { save() } label: {
                     Image(systemName: "square.and.arrow.down")
+                        // Tinted only under a conflict; otherwise the control
+                        // keeps the header's ordinary borderless styling.
+                        .foregroundStyle(
+                            conflict.isActive
+                                ? AnyShapeStyle(KaisolaStatusTone.needsYou.foregroundColor)
+                                : AnyShapeStyle(.foreground)
+                        )
                 }
                 .buttonStyle(.borderless)
                 .keyboardShortcut("s", modifiers: .command)
                 .disabled(!isDirty || isLoading || isSaving)
-                .help("Save")
+                .help(conflict.saveHelpText)
+                .accessibilityLabel(conflict.saveAccessibilityLabel)
             }
             previewOptionsMenu
             Button {
@@ -740,6 +869,13 @@ struct FilePreviewView: View {
             if isEditable {
                 Divider()
                 Button("Revert Changes") {
+                    // Under an unresolved conflict the saved file is the newer
+                    // disk version, so reverting takes that rather than leaving
+                    // a stale buffer behind an indicator that just cleared.
+                    guard !conflict.isActive else {
+                        reloadExternalVersion()
+                        return
+                    }
                     if let loadedURL, !clearRecoveryTokens(for: loadedURL) { return }
                     if case .docx = content { richDraft = savedRichText }
                     else { draft = savedText }
@@ -1091,8 +1227,9 @@ struct FilePreviewView: View {
         outlineItems = []
         outlineTargetLine = nil
         outlineNavigationRevision &+= 1
-        externalChangeDetected = false
+        conflict.apply(.documentLoaded)
         recoveredDraftPending = false
+        recoveryClaimFailure = nil
         ownedRecoveryToken = nil
         claimedRecoverySourceTokens = []
         recoveryRevision = 0
@@ -1108,7 +1245,7 @@ struct FilePreviewView: View {
                 FilePreviewSnapshot(
                     content: FilePreviewContent.load(url: target),
                     modificationDate: FilePreviewDiskState.modificationDate(of: target),
-                    recoveryClaim: try? store.claimNewestOrphan(
+                    recoveryOutcome: store.claimOutcome(
                         for: target,
                         workspaceRoot: root,
                         claimantID: ownerID
@@ -1223,6 +1360,12 @@ struct FilePreviewView: View {
             loadedURL = target
             loadingURL = nil
             recoveredDraftPending = restoredRecovery
+            // A refused claim leaves the stored draft on disk. Carrying the
+            // typed failure onto the banner is the only thing that keeps it
+            // reachable from here.
+            recoveryClaimFailure = snapshot.recoveryFailure.flatMap {
+                FilePreviewRecoveryFailurePolicy.shouldSurface($0) ? $0 : nil
+            }
             if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
                ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "preview-dirty-tab",
                !restoredRecovery {
@@ -1449,6 +1592,10 @@ struct FilePreviewView: View {
             case let .saved(modificationDate):
                 loadedModificationDate = modificationDate
                 recoveredDraftPending = false
+                // The write either found the file untouched or came back
+                // through the reload/overwrite decision, so the draft and the
+                // file agree again.
+                conflict.apply(.savedThroughConflictDecision)
                 if savingRichDocument { savedRichText = richSnapshot.value }
                 else { savedText = textSnapshot }
                 guard clearRecoveryTokens(for: target) else {
@@ -1831,6 +1978,7 @@ struct FilePreviewView: View {
         switch result {
         case let .saved(modificationDate):
             recoveredDraftPending = false
+            conflict.apply(.savedThroughConflictDecision)
             if savingRichDocument { savedRichText = richSnapshot }
             else { savedText = textSnapshot }
             loadedModificationDate = modificationDate

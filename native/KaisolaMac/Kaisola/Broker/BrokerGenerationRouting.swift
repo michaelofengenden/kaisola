@@ -33,16 +33,28 @@ enum BrokerGenerationDiagnostics {
 /// controller lanes. The validated inventory is authoritative for existing
 /// terminals; only terminal.create can add an owner between inventory polls.
 actor BrokerGenerationRouteTable {
+    enum ReleaseRoute: Equatable, Sendable {
+        case generation(String)
+        case terminalAbsent
+        case generationAbsent
+    }
+
     private var topology: BrokerGenerationTopology?
     private var terminalOwners: [String: String] = [:]
+    private var hasAuthoritativeInventory = false
     /// A create reply is authoritative even if an inventory request that began
     /// just before it finishes afterward. Keep that acknowledged owner until a
     /// later inventory observes it (or release explicitly removes it), so the
     /// stale snapshot cannot make the terminal temporarily unroutable.
     private var createdAwaitingInventory: [String: String] = [:]
 
-    func configure(_ topology: BrokerGenerationTopology) {
+    func configure(
+        _ topology: BrokerGenerationTopology,
+        invalidateInventory: Bool = true
+    ) {
+        let topologyChanged = self.topology != topology
         self.topology = topology
+        if invalidateInventory || topologyChanged { hasAuthoritativeInventory = false }
         let liveGenerations = Set(topology.all.map(\.id))
         terminalOwners = terminalOwners.filter { liveGenerations.contains($0.value) }
         createdAwaitingInventory = createdAwaitingInventory.filter {
@@ -72,6 +84,7 @@ actor BrokerGenerationRouteTable {
             createdAwaitingInventory.removeValue(forKey: terminalID)
         }
         terminalOwners = reconciled
+        hasAuthoritativeInventory = true
     }
 
     func noteCreated(terminalID: String) throws {
@@ -109,6 +122,34 @@ actor BrokerGenerationRouteTable {
             throw BrokerClientError.requestFailed("terminal generation unavailable")
         }
         return owner
+    }
+
+    /// Release is the one terminal mutation allowed to target an absent row:
+    /// the broker operation is idempotent. A persisted generation hint routes
+    /// to that exact still-live broker even when its inventory no longer names
+    /// the terminal; a hint outside the validated topology is permanently
+    /// impossible and may drain without an RPC.
+    func releaseRoute(
+        for terminalID: String,
+        generationHint: String?
+    ) throws -> ReleaseRoute {
+        guard let topology else { throw BrokerClientError.notConnected }
+        if let generationHint {
+            if let owner = terminalOwners[terminalID], owner != generationHint {
+                throw BrokerClientError.identityChanged
+            }
+            guard topology.all.contains(where: { $0.id == generationHint }) else {
+                return .generationAbsent
+            }
+            return .generation(generationHint)
+        }
+        guard let owner = terminalOwners[terminalID] else {
+            guard hasAuthoritativeInventory else {
+                throw BrokerClientError.requestFailed("terminal generation unavailable")
+            }
+            return .terminalAbsent
+        }
+        return .generation(owner)
     }
 
     func currentGenerationID() throws -> String {
@@ -414,7 +455,7 @@ actor BrokerGenerationControlRouter: BrokerControlServing {
            clients[requestedTopology.current.id] != nil,
            !reportedDisconnect { return }
         await disconnect()
-        await routes.configure(requestedTopology)
+        await routes.configure(requestedTopology, invalidateInventory: false)
         topology = requestedTopology
         reportedDisconnect = false
         do {
@@ -481,8 +522,35 @@ actor BrokerGenerationControlRouter: BrokerControlServing {
     }
 
     func release(projectID: String, terminalID: String) async throws {
-        try await client(for: terminalID).release(projectID: projectID, terminalID: terminalID)
-        await routes.noteReleased(terminalID: terminalID)
+        _ = try await release(
+            projectID: projectID,
+            terminalID: terminalID,
+            brokerGenerationID: nil
+        )
+    }
+
+    func release(
+        projectID: String,
+        terminalID: String,
+        brokerGenerationID: String?
+    ) async throws -> BrokerTerminalReleaseDisposition {
+        switch try await routes.releaseRoute(
+            for: terminalID,
+            generationHint: brokerGenerationID
+        ) {
+        case .generation(let generationID):
+            guard let client = clients[generationID] else {
+                throw BrokerClientError.notConnected
+            }
+            try await client.release(projectID: projectID, terminalID: terminalID)
+            await routes.noteReleased(terminalID: terminalID)
+            return .released
+        case .terminalAbsent:
+            return .terminalAbsent
+        case .generationAbsent:
+            await routes.noteReleased(terminalID: terminalID)
+            return .generationAbsent
+        }
     }
 
     func detachOwner(projectID: String, terminalID: String) async throws {

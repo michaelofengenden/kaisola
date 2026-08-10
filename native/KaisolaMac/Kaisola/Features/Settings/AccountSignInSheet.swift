@@ -1,5 +1,39 @@
 import SwiftUI
 
+struct AccountSignInFormState: Equatable {
+    var code = ""
+    var showsTranscript = false
+
+    /// Clears every form-local value and returns the focus state the sheet
+    /// should apply before the replacement attempt begins.
+    mutating func prepareForRetry() -> Bool {
+        code = ""
+        showsTranscript = false
+        return false
+    }
+}
+
+enum AccountSignInFooterAction: Equatable {
+    case cancel
+    case retry
+    case done
+}
+
+enum AccountSignInFooterPolicy {
+    static func actions(
+        for phase: AccountSignInController.Phase
+    ) -> [AccountSignInFooterAction] {
+        switch phase {
+        case .failed:
+            [.cancel, .retry]
+        case .succeeded:
+            [.done]
+        default:
+            [.cancel]
+        }
+    }
+}
+
 /// Signing in to one account, without leaving Settings.
 ///
 /// The previous affordance posted `.kaisolaRunInTerminal`, which opened a
@@ -13,8 +47,7 @@ struct AccountSignInSheet: View {
     let dismiss: () -> Void
 
     @StateObject private var controller = AccountSignInController()
-    @State private var code = ""
-    @State private var showsTranscript = false
+    @State private var form = AccountSignInFormState()
     @FocusState private var codeFocused: Bool
 
     var body: some View {
@@ -39,20 +72,20 @@ struct AccountSignInSheet: View {
                         .font(.caption)
                         .foregroundStyle(.kaisolaSecondary)
                     HStack(spacing: 8) {
-                        TextField("Authorization code", text: $code)
+                        TextField("Authorization code", text: $form.code)
                             .textFieldStyle(.roundedBorder)
                             .focused($codeFocused)
-                            .onSubmit { controller.submit(code: code) }
+                            .onSubmit { controller.submit(code: form.code) }
                             .accessibilityLabel("Authorization code")
-                        Button("Submit") { controller.submit(code: code) }
+                        Button("Submit") { controller.submit(code: form.code) }
                             .buttonStyle(.borderedProminent)
-                            .disabled(code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            .disabled(form.code.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                                       || controller.phase == .submitting)
                     }
                 }
             }
 
-            DisclosureGroup("Details", isExpanded: $showsTranscript) {
+            DisclosureGroup("Details", isExpanded: $form.showsTranscript) {
                 ScrollView {
                     Text(controller.transcript.isEmpty ? "Starting…" : controller.transcript)
                         .font(.caption.monospaced())
@@ -70,11 +103,25 @@ struct AccountSignInSheet: View {
                         .help(url.absoluteString)
                 }
                 Spacer()
-                if controller.phase.isFinished {
+                switch AccountSignInFooterPolicy.actions(for: controller.phase) {
+                case [.done]:
                     Button("Done") { dismiss() }
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction)
-                } else {
+                case [.cancel, .retry]:
+                    Button("Cancel") {
+                        controller.cancel()
+                        dismiss()
+                    }
+                    .keyboardShortcut(.cancelAction)
+                    Button("Retry") {
+                        codeFocused = form.prepareForRetry()
+                        controller.retry(profile: profile)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.defaultAction)
+                    .accessibilityHint("Starts a new sign-in attempt without closing Settings")
+                default:
                     Button("Cancel") {
                         controller.cancel()
                         dismiss()
@@ -88,7 +135,11 @@ struct AccountSignInSheet: View {
         .onAppear { controller.start(profile: profile) }
         .onChange(of: controller.phase) { _, phase in
             // The code field is the only thing to do once it appears.
-            if phase.acceptsCode { codeFocused = true }
+            if phase.acceptsCode {
+                codeFocused = true
+            } else if phase.isFinished || phase == .launching {
+                codeFocused = false
+            }
         }
     }
 

@@ -64,22 +64,23 @@ struct ApiKeyStore {
         let upsert: @Sendable (_ service: String, _ account: String, _ data: Data) -> OSStatus
         let delete: @Sendable (_ service: String, _ account: String) -> OSStatus
 
-        static let live = KeychainAccess(
-            read: { service, account in
+        static var live: KeychainAccess {
+            KeychainAccess(
+                read: { service, account in
                 var query = ApiKeyStore.baseQuery(service: service, account: account)
                 query[kSecReturnData as String] = true
                 query[kSecMatchLimit as String] = kSecMatchLimitOne
                 var item: CFTypeRef?
                 let status = SecItemCopyMatching(query as CFDictionary, &item)
                 return (status, item as? Data)
-            },
-            insert: { service, account, data in
+                },
+                insert: { service, account, data in
                 var query = ApiKeyStore.baseQuery(service: service, account: account)
                 query[kSecValueData as String] = data
                 query[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
                 return SecItemAdd(query as CFDictionary, nil)
-            },
-            upsert: { service, account, data in
+                },
+                upsert: { service, account, data in
                 let query = ApiKeyStore.baseQuery(service: service, account: account)
                 let attributes: [String: Any] = [
                     kSecValueData as String: data,
@@ -98,11 +99,12 @@ struct ApiKeyStore {
                     }
                 }
                 return status
-            },
-            delete: { service, account in
+                },
+                delete: { service, account in
                 SecItemDelete(ApiKeyStore.baseQuery(service: service, account: account) as CFDictionary)
-            }
-        )
+                }
+            )
+        }
     }
 
     private let service: String

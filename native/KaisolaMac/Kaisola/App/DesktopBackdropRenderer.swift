@@ -871,7 +871,9 @@ enum DesktopBackdropRenderer {
     /// edges — irrelevant at radius 28 on a 176px still whose whole job is to
     /// stop being a picture, and the same trade every design tool makes by
     /// default.
-    static let bakeColorSpace = CGColorSpace(name: CGColorSpace.sRGB)
+    static var bakeColorSpace: CGColorSpace? {
+        CGColorSpace(name: CGColorSpace.sRGB)
+    }
 
     /// Structure first, then measure, then tone-map.
     ///
@@ -1039,16 +1041,16 @@ enum Oklab {
     /// error is under 2×10⁻⁸ — five orders of magnitude below anything the
     /// solve's tolerances care about, and the exact function is what every
     /// *assertion* still uses.
-    static let linearTable: [Double] = (0...4096).map {
-        linear(Double($0) / 4096)
+    static func makeLinearTable() -> [Double] {
+        (0...4096).map { linear(Double($0) / 4096) }
     }
 
-    static func tabulatedLinear(_ channel: Double) -> Double {
+    static func tabulatedLinear(_ channel: Double, table: [Double]) -> Double {
         let position = min(1, max(0, channel)) * 4096
         let index = Int(position)
-        guard index < 4096 else { return linearTable[4096] }
+        guard index < 4096 else { return table[4096] }
         let fraction = position - Double(index)
-        return linearTable[index] + (linearTable[index + 1] - linearTable[index]) * fraction
+        return table[index] + (table[index + 1] - table[index]) * fraction
     }
 
     static func encoded(_ channel: Double) -> Double {
@@ -1334,6 +1336,10 @@ extension DesktopBackdropRenderer {
         }
         var map = BakeToneMap(saturation: 1, gain: 1, offset: 0)
         guard !pixels.isEmpty else { return map }
+        // The table belongs to one rare off-main bake. Keeping it local avoids
+        // a Swift 6.1 lazy-global initializer while preserving the solve's
+        // quarter-million lookup fast path.
+        let linearTable = Oklab.makeLinearTable()
 
         let target = targetLightness(isDark: isDark)
         let headroom = tailHeadroomLightness(isDark: isDark)
@@ -1384,9 +1390,9 @@ extension DesktopBackdropRenderer {
                     min(1, max(0, (base + value * candidate.saturation) * candidate.gain
                         + candidate.offset))
                 }
-                let red = Oklab.tabulatedLinear(channel(delta.0))
-                let green = Oklab.tabulatedLinear(channel(delta.1))
-                let blue = Oklab.tabulatedLinear(channel(delta.2))
+                let red = Oklab.tabulatedLinear(channel(delta.0), table: linearTable)
+                let green = Oklab.tabulatedLinear(channel(delta.1), table: linearTable)
+                let blue = Oklab.tabulatedLinear(channel(delta.2), table: linearTable)
                 let long = cbrt(0.4122214708 * red + 0.5363325363 * green + 0.0514459929 * blue)
                 let medium = cbrt(0.2119034982 * red + 0.6806995451 * green + 0.1073969566 * blue)
                 let short = cbrt(0.0883024619 * red + 0.2817188376 * green + 0.6299787005 * blue)
@@ -1465,7 +1471,9 @@ enum DesktopTintSampler {
     /// It was 0.38/0.43/0.49 — a blue-grey — so the one case where Kaisola
     /// knows *nothing* about the wallpaper was also the case where it invented
     /// the most blue.
-    static let fallback = DesktopTintComponents(red: 0.42, green: 0.42, blue: 0.42)
+    static var fallback: DesktopTintComponents {
+        DesktopTintComponents(red: 0.42, green: 0.42, blue: 0.42)
+    }
 
     /// How much of the wallpaper's own chroma reaches the tint.
     ///

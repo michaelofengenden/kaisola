@@ -20,12 +20,12 @@ struct CompanionPairingCodePresentation: Equatable, Sendable {
 
 enum CompanionPairingOfferAccessibility {
     static let group = "companion.pairing-offer"
-    static let code = group + ".code"
-    static let qrCode = group + ".qr-code"
-    static let qrFallback = group + ".qr-fallback"
-    static let copy = group + ".copy"
-    static let cancel = group + ".cancel"
-    static let allControlIdentifiers = [code, qrCode, copy, cancel]
+    static var code: String { group + ".code" }
+    static var qrCode: String { group + ".qr-code" }
+    static var qrFallback: String { group + ".qr-fallback" }
+    static var copy: String { group + ".copy" }
+    static var cancel: String { group + ".cancel" }
+    static var allControlIdentifiers: [String] { [code, qrCode, copy, cancel] }
 }
 
 struct CompanionPairingGrantSelection: Equatable, Sendable {

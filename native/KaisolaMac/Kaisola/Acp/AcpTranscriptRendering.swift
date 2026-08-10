@@ -3,7 +3,9 @@ import Foundation
 import SwiftUI
 
 extension Notification.Name {
-    static let kaisolaTranscriptFindCommand = Notification.Name("kaisola.transcriptFindCommand")
+    static var kaisolaTranscriptFindCommand: Notification.Name {
+        Notification.Name("kaisola.transcriptFindCommand")
+    }
 }
 
 enum AcpTranscriptFindCommand: Int, Equatable {

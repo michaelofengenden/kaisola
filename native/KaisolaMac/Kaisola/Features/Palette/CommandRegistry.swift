@@ -44,7 +44,7 @@ struct AppCommandID: RawRepresentable, Codable, Hashable, Sendable {
     static let focusNextPane = Self(rawValue: "pane.focus-next")
     static let openSettings = Self(rawValue: "app.open-settings")
     static let checkForUpdates = Self(rawValue: "app.check-for-updates")
-    static let readinessChecklist = Self(rawValue: "app.readiness-checklist")
+    static var readinessChecklist: Self { Self(rawValue: "app.readiness-checklist") }
     static let openHelp = Self(rawValue: "app.open-help")
 
     static func newAgent(_ agentID: String) -> Self {

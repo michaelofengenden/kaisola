@@ -88,14 +88,16 @@ actor AcpTerminalHost {
         let droppedChunks: UInt64
         let droppedBytes: UInt64
 
-        static let empty = OutputBufferStats(
-            chunkByteLimit: AcpTerminalHost.outputStreamChunkByteLimit,
-            bufferedChunkLimit: AcpTerminalHost.outputStreamBufferedChunkLimit,
-            bufferedByteCeiling: AcpTerminalHost.outputStreamBufferedByteCeiling,
-            peakBufferedChunks: 0,
-            droppedChunks: 0,
-            droppedBytes: 0
-        )
+        static var empty: OutputBufferStats {
+            OutputBufferStats(
+                chunkByteLimit: AcpTerminalHost.outputStreamChunkByteLimit,
+                bufferedChunkLimit: AcpTerminalHost.outputStreamBufferedChunkLimit,
+                bufferedByteCeiling: AcpTerminalHost.outputStreamBufferedByteCeiling,
+                peakBufferedChunks: 0,
+                droppedChunks: 0,
+                droppedBytes: 0
+            )
+        }
     }
 
     static let defaultOutputByteLimit = 1_048_576
@@ -106,8 +108,9 @@ actor AcpTerminalHost {
     /// these bounds cap retained AsyncStream payloads at 4 MiB per terminal.
     static let outputStreamChunkByteLimit = 64 * 1024
     static let outputStreamBufferedChunkLimit = 64
-    static let outputStreamBufferedByteCeiling =
+    static var outputStreamBufferedByteCeiling: Int {
         outputStreamChunkByteLimit * outputStreamBufferedChunkLimit
+    }
     /// A descendant holding inherited stdout/stderr must not retain an ACP
     /// terminal forever. At the deadline the read end is closed for real;
     /// waiters resolve only after the bounded stream drains and reaches EOF.

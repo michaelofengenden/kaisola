@@ -365,7 +365,9 @@ final class DesktopBackdropProvider: ObservableObject {
     /// change, and changing the developer's desktop to find out is not a thing
     /// this code is allowed to do. So it is observed as a *fast path* and
     /// nothing depends on it. `desktopWatchInterval` below is the guarantee.
-    static let desktopChangedNotification = Notification.Name("com.apple.desktop")
+    static var desktopChangedNotification: Notification.Name {
+        Notification.Name("com.apple.desktop")
+    }
 
     /// How often the shallow watch tick runs while Kaisola is the active app.
     ///

@@ -426,10 +426,10 @@ actor AcpProcessTransport: AcpByteTransport {
     private let stdinWriteOperation: AcpStdinWriteQueue.WriteOperation
     private let stderrByteLimit: Int
 
-    private static let eofGrace: Duration = .milliseconds(100)
-    private static let terminateGrace: Duration = .milliseconds(1_500)
-    private static let killGrace: Duration = .milliseconds(500)
-    private static let exitStatusGrace: Duration = .milliseconds(500)
+    private static var eofGrace: Duration { .milliseconds(100) }
+    private static var terminateGrace: Duration { .milliseconds(1_500) }
+    private static var killGrace: Duration { .milliseconds(500) }
+    private static var exitStatusGrace: Duration { .milliseconds(500) }
 
     init(
         stdinFrameDeadlineNanoseconds: UInt64 =

@@ -36,11 +36,13 @@ struct AcpPlanPayloadLimits: Equatable, Sendable {
     let maximumEntryBytes: Int
     let maximumAggregateBytes: Int
 
-    static let production = AcpPlanPayloadLimits(
-        maximumEntries: 64,
-        maximumEntryBytes: 8 * 1_024,
-        maximumAggregateBytes: 128 * 1_024
-    )
+    static var production: AcpPlanPayloadLimits {
+        AcpPlanPayloadLimits(
+            maximumEntries: 64,
+            maximumEntryBytes: 8 * 1_024,
+            maximumAggregateBytes: 128 * 1_024
+        )
+    }
 }
 
 enum AcpPlanParser {
@@ -347,11 +349,13 @@ enum AcpToolCallReviewField: CaseIterable, Hashable, Sendable {
 }
 
 struct AcpToolCallReviewContextLimits: Equatable, Sendable {
-    static let production = AcpToolCallReviewContextLimits(
-        maximumContextBytes: 128 * 1_024,
-        maximumAggregateBytes: 2 * 1_024 * 1_024,
-        maximumCount: 512
-    )
+    static var production: AcpToolCallReviewContextLimits {
+        AcpToolCallReviewContextLimits(
+            maximumContextBytes: 128 * 1_024,
+            maximumAggregateBytes: 2 * 1_024 * 1_024,
+            maximumCount: 512
+        )
+    }
 
     let maximumContextBytes: Int
     let maximumAggregateBytes: Int
@@ -723,11 +727,13 @@ struct AcpOutboundFrameLimits: Equatable, Sendable {
     let promptMaximumBytes: Int
     let toolResponseMaximumBytes: Int
 
-    static let production = AcpOutboundFrameLimits(
-        globalMaximumBytes: 64 * 1_024 * 1_024,
-        promptMaximumBytes: 32 * 1_024 * 1_024,
-        toolResponseMaximumBytes: 12 * 1_024 * 1_024
-    )
+    static var production: AcpOutboundFrameLimits {
+        AcpOutboundFrameLimits(
+            globalMaximumBytes: 64 * 1_024 * 1_024,
+            promptMaximumBytes: 32 * 1_024 * 1_024,
+            toolResponseMaximumBytes: 12 * 1_024 * 1_024
+        )
+    }
 
     init(
         globalMaximumBytes: Int,

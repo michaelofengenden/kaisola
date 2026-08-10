@@ -329,15 +329,15 @@ struct GitPanelOperation: Equatable, Sendable {
         return "\(name) in progress. \(cancellationDescription)"
     }
 
-    static let refresh = readOnly("Refreshing Git status")
-    static let stageAll = mutating("Staging all changes")
-    static let unstageAll = mutating("Unstaging all changes")
-    static let pull = mutating("Pulling latest changes")
-    static let commit = mutating("Committing changes")
-    static let history = readOnly("Loading recent history")
-    static let agentReview = readOnly("Running local agent review")
-    static let preparePullRequest = readOnly("Preparing pull request review")
-    static let createPullRequest = mutating("Pushing and creating pull request")
+    static var refresh: Self { readOnly("Refreshing Git status") }
+    static var stageAll: Self { mutating("Staging all changes") }
+    static var unstageAll: Self { mutating("Unstaging all changes") }
+    static var pull: Self { mutating("Pulling latest changes") }
+    static var commit: Self { mutating("Committing changes") }
+    static var history: Self { readOnly("Loading recent history") }
+    static var agentReview: Self { readOnly("Running local agent review") }
+    static var preparePullRequest: Self { readOnly("Preparing pull request review") }
+    static var createPullRequest: Self { mutating("Pushing and creating pull request") }
 
     static func stage(_ path: String) -> Self { mutating("Staging \(path)") }
     static func unstage(_ path: String) -> Self { mutating("Unstaging \(path)") }
@@ -371,7 +371,9 @@ struct GitPRDraftValidation: Equatable, Sendable {
 
     var isValid: Bool { branchMessage == nil && titleMessage == nil }
 
-    static let valid = GitPRDraftValidation(branchMessage: nil, titleMessage: nil)
+    static var valid: GitPRDraftValidation {
+        GitPRDraftValidation(branchMessage: nil, titleMessage: nil)
+    }
 
     static func evaluate(plan: PRPlan, branch: String, title: String) -> Self {
         let branchMessage: String?

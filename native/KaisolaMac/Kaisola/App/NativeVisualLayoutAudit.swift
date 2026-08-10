@@ -125,12 +125,14 @@ struct NativeVisualLayoutSnapshot: Codable, Equatable, Sendable {
             self.samples = samples
         }
 
-        static let empty = InkSample(
-            coverage: 0,
-            minimumLuminance: 0,
-            maximumLuminance: 0,
-            samples: 0
-        )
+        static var empty: InkSample {
+            InkSample(
+                coverage: 0,
+                minimumLuminance: 0,
+                maximumLuminance: 0,
+                samples: 0
+            )
+        }
 
         var luminanceRange: Double {
             guard samples > 0, coverage > 0 else { return 0 }
@@ -273,12 +275,14 @@ enum NativeVisualLayoutRule {
     static let contentInkFloor = "content-ink-floor"
     static let missingWindowControls = "missing-window-controls"
 
-    static let all = [
-        controlOverlap, controlZoneInk, clipped, offscreen, elementCollision,
-        truncatedText, missingLabel, missingAction, missingFocus,
-        focusOutsideContent, typeFloor, inventoryUnavailable, contentInkFloor,
-        missingWindowControls,
-    ]
+    static var all: [String] {
+        [
+            controlOverlap, controlZoneInk, clipped, offscreen, elementCollision,
+            truncatedText, missingLabel, missingAction, missingFocus,
+            focusOutsideContent, typeFloor, inventoryUnavailable, contentInkFloor,
+            missingWindowControls,
+        ]
+    }
 }
 
 enum NativeVisualLayoutSeverity: String, Codable, Sendable {
@@ -318,11 +322,13 @@ struct NativeVisualLayoutExpectations: Codable, Equatable, Sendable {
         /// the strip densely, so this only rejects a degenerate measurement.
         var minimumSamples: Int
 
-        static let `default` = ControlZoneInkPolicy(
-            coverageThreshold: 0.04,
-            luminanceRangeThreshold: 0.18,
-            minimumSamples: 64
-        )
+        static var `default`: ControlZoneInkPolicy {
+            ControlZoneInkPolicy(
+                coverageThreshold: 0.04,
+                luminanceRangeThreshold: 0.18,
+                minimumSamples: 64
+            )
+        }
     }
 
     struct Surface: Codable, Equatable, Sendable {
@@ -336,7 +342,7 @@ struct NativeVisualLayoutExpectations: Codable, Equatable, Sendable {
         var allowsWindowControlsHidden: Bool?
         var severities: [String: NativeVisualLayoutSeverity]?
 
-        static let empty = Surface()
+        static var empty: Surface { Surface() }
 
         init(
             requiredLabels: [String]? = nil,

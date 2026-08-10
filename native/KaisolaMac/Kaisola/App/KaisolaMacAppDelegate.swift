@@ -67,11 +67,9 @@ enum WorkspaceFindSurfaceTarget: Equatable {
 
 @MainActor
 enum WorkspaceFindSurfaceResolver {
-    private static let fileAccessibilityLabels: Set<String> = [
-        "File contents",
-        "Markdown document",
-        "Source editor",
-    ]
+    private static var fileAccessibilityLabels: Set<String> {
+        ["File contents", "Markdown document", "Source editor"]
+    }
 
     static func resolve(
         focusedPaneID: String?,

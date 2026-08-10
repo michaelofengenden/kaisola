@@ -1018,7 +1018,7 @@ final class UsageCenter: ObservableObject {
         now: @escaping () -> Date = Date.init,
         persistenceStore: AcpTranscriptStore? = nil,
         usageAccountStore: UsageAccountStore = UsageAccountStore(),
-        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = ProjectAccountRecoveryCenter(),
+        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter? = nil,
         planUsageContextResolver: @escaping PlanUsageContextResolver = { workspace, environment in
             UsageCenter.planUsageContextKey(workspace: workspace, environment: environment)
         },
@@ -1037,6 +1037,7 @@ final class UsageCenter: ObservableObject {
         self.persistenceStore = persistenceStore
         self.usageAccountStore = usageAccountStore
         self.projectAccountRecoveryCenter = projectAccountRecoveryCenter
+            ?? ProjectAccountRecoveryCenter()
         self.planUsageContextResolver = planUsageContextResolver
         self.planUsageReader = planUsageReader
     }

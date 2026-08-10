@@ -125,6 +125,46 @@ final class CompanionHostFoundationTests: XCTestCase {
         XCTAssertNil(CompanionQRCode.image(for: ""))
     }
 
+    @MainActor
+    func testPairNewDeviceIgnoresRepeatActivationWhileAnOfferIsInFlight() throws {
+        let activation = CompanionPairingOfferActivation()
+        let first = try XCTUnwrap(activation.begin())
+        XCTAssertTrue(activation.isCreating)
+        XCTAssertNil(activation.begin())
+        XCTAssertNil(activation.begin())
+        XCTAssertTrue(activation.finish(first))
+        XCTAssertFalse(activation.isCreating)
+        let second = try XCTUnwrap(activation.begin())
+        XCTAssertNotEqual(second, first)
+    }
+
+    @MainActor
+    func testOnlyTheNewestOfferActivationMayApplyItsResult() throws {
+        let activation = CompanionPairingOfferActivation()
+        let abandoned = try XCTUnwrap(activation.begin())
+        activation.discard()
+        XCTAssertFalse(activation.isCreating)
+        let newest = try XCTUnwrap(activation.begin())
+        XCTAssertFalse(activation.finish(abandoned))
+        XCTAssertTrue(activation.isCreating)
+        XCTAssertTrue(activation.finish(newest))
+        XCTAssertFalse(activation.isCreating)
+        XCTAssertFalse(activation.finish(newest))
+    }
+
+    func testPairNewDeviceButtonRendersTheGatedProgressState() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Kaisola/Features/Settings/CompanionSettingsTab.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains(".disabled(offerActivation.isCreating)"))
+        XCTAssertTrue(source.contains("ProgressView().controlSize(.mini)"))
+        XCTAssertTrue(source.contains("CompanionPairingOfferActivation.progressLabel"))
+    }
+
     func testPairingCoordinatorCompletesMutualProofSASAndSecureResume() async throws {
         let fixture = try makePairingFixture()
         defer { try? FileManager.default.removeItem(at: fixture.directory) }

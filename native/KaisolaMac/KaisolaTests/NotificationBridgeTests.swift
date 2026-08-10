@@ -295,6 +295,51 @@ final class NotificationBridgeTests: XCTestCase {
         XCTAssertEqual(center.storageNotices.map(\.payload), [.entries])
     }
 
+    func testAttentionRestoreDropsSessionTimestampThatCannotBeAcknowledged() throws {
+        let defaults = makeDefaults()
+        let valid = AttentionCenter.Entry(
+            id: "terminal-valid-permission-1000",
+            kind: .permission,
+            targetID: "terminal-valid",
+            title: "Approval needed",
+            detail: "Review the command",
+            at: Date(timeIntervalSince1970: 1)
+        )
+        let outOfRange = AttentionCenter.Entry(
+            id: "terminal-extreme-session-responded",
+            kind: .sessionResponded,
+            targetID: "terminal-extreme",
+            title: "Agent responded",
+            detail: "Corrupt timestamp",
+            at: Date(timeIntervalSince1970: 1e20)
+        )
+        let raw = try JSONEncoder().encode([valid, outOfRange])
+        defaults.set(raw, forKey: Self.attentionEntriesKey)
+
+        let center = makeCenter(defaults: defaults)
+
+        XCTAssertEqual(center.entries, [valid])
+        XCTAssertEqual(
+            defaults.data(forKey: Self.attentionEntriesKey),
+            raw,
+            "dropping one unsafe record must not discard the recoverable source"
+        )
+        XCTAssertEqual(center.storageNotices.map(\.kind), [.recordsDropped(count: 1)])
+        XCTAssertEqual(center.storageNotices.map(\.payload), [.entries])
+        XCTAssertFalse(center.notifySessionResponded(
+            targetID: "terminal-negative",
+            title: "Agent responded",
+            detail: "Invalid timestamp",
+            completedAt: -1
+        ))
+        XCTAssertFalse(center.notifySessionResponded(
+            targetID: "terminal-overflow",
+            title: "Agent responded",
+            detail: "Invalid timestamp",
+            completedAt: .max
+        ))
+    }
+
     func testAnUnreadableAcknowledgementKeepsTheRest() {
         let completedAt: Int64 = 1_785_000_000_123
         let defaults = makeDefaults()

@@ -182,6 +182,82 @@ enum QuietRailOrder {
     }
 }
 
+// MARK: - Session drag persistence
+
+/// What a session drag is allowed to leave on screen, once the store has said
+/// whether the new order actually reached disk.
+///
+/// Pure, because the paths that matter here are the ones nobody sees. A drag
+/// whose write failed must not go on sitting there looking saved until a
+/// relaunch quietly undoes it, and a drag that would replace an order file
+/// Kaisola cannot read has to stop and ask rather than take the file with it.
+/// Both are decisions, not rendering, so they are tested as decisions.
+enum QuietSessionOrderCommit {
+    /// What the user is told, if anything.
+    enum Notice: Equatable {
+        /// The order was not saved. Carries the store's short reason.
+        case failed(String)
+        /// Saved, after setting a damaged order file aside at this URL.
+        case preserved(URL)
+        /// Nothing was written: the user decides whether the damaged catalog
+        /// may be replaced.
+        case confirmReplace(SessionOrderStore.Damage)
+    }
+
+    struct Resolution: Equatable {
+        /// The order the rail draws from here: the dragged one when it is
+        /// durable, the pre-drag one when it is not.
+        let order: [String]
+        let notice: Notice?
+    }
+
+    static func resolve(
+        previous: [String],
+        attempted: [String],
+        outcome: SessionOrderStore.SaveOutcome
+    ) -> Resolution {
+        switch outcome {
+        case let .saved(preservedCopy):
+            guard let preservedCopy else { return Resolution(order: attempted, notice: nil) }
+            return Resolution(order: attempted, notice: .preserved(preservedCopy))
+        case let .writeFailed(reason):
+            return Resolution(order: previous, notice: .failed(reason))
+        case let .needsConfirmation(damage):
+            return Resolution(order: previous, notice: .confirmReplace(damage))
+        }
+    }
+
+    /// Names the consequence as well as the cause. The rows sliding back to
+    /// where they were is otherwise the only signal the user gets, and on its
+    /// own that reads as the drag having been rejected at random.
+    static func failureMessage(_ reason: String) -> String {
+        "Session order not saved: \(reason). The list is back in its last saved order."
+    }
+
+    static func preservedMessage(_ url: URL) -> String {
+        "Session order saved. The unreadable order file was kept as \(url.lastPathComponent)."
+    }
+
+    static let confirmationTitle = "Replace the saved session order?"
+
+    /// Every branch says the same two things: what Kaisola cannot do with the
+    /// file, and that replacing it keeps a copy. The forward-version case adds
+    /// the one cost a copy does not cover — the newer install loses its order.
+    static func confirmationMessage(for damage: SessionOrderStore.Damage) -> String {
+        switch damage {
+        case .malformed:
+            return "Kaisola cannot read session-order.json, so it cannot save this drag "
+                + "without replacing it. Replacing keeps a copy of the unreadable file beside it."
+        case let .forwardVersion(version):
+            return "session-order.json was written by a newer version of Kaisola (format \(version)). "
+                + "Replacing it keeps a copy beside it, but that version will lose the ordering it stored."
+        case .unreadableFile:
+            return "Kaisola cannot open session-order.json. Replacing it keeps a copy of the "
+                + "existing file beside it."
+        }
+    }
+}
+
 // MARK: - Metrics
 
 /// Every size the rail uses. Text bottoms out at 10.5pt — no *label* in the
@@ -475,6 +551,18 @@ private struct QuietProjectGroup: View {
     /// never turns a re-render into file I/O.
     @State private var manualOrder: [String] = []
     @State private var loadedOrder = false
+    /// A drag waiting on the user's answer about replacing an order file
+    /// Kaisola cannot read. Nothing is written until they answer.
+    @State private var pendingReplacement: PendingOrderReplacement?
+
+    /// The drag held back by the replace-confirmation, with the order to put
+    /// back if the user declines.
+    private struct PendingOrderReplacement: Identifiable, Equatable {
+        let id = UUID()
+        let ids: [String]
+        let previous: [String]
+        let damage: SessionOrderStore.Damage
+    }
 
     private var isActive: Bool { placement == .active }
 
@@ -555,10 +643,10 @@ private struct QuietProjectGroup: View {
                     )
                 }
                 .onMove { indices, target in
-                    var ids = sessions.map(\.id)
+                    let previous = sessions.map(\.id)
+                    var ids = previous
                     ids.move(fromOffsets: indices, toOffset: target)
-                    manualOrder = ids
-                    orderStore.setOrder(projectID: project.id, ids: ids)
+                    commitOrder(ids, previous: previous)
                 }
                 if !recentlyClosed.isEmpty {
                     recentlyClosedRow(recentlyClosed)
@@ -583,6 +671,69 @@ private struct QuietProjectGroup: View {
         // whose surfaces are collapsed keeps accumulating time-in-state.
         .onAppear { noteAll(statuses) }
         .onChange(of: statuses) { _, updated in noteAll(updated) }
+        // Hung off the header because it is the one row of the group that is
+        // always drawn: attaching it to the session rows instead would give the
+        // group one alert per session.
+        .alert(
+            QuietSessionOrderCommit.confirmationTitle,
+            isPresented: Binding(
+                get: { pendingReplacement != nil },
+                set: { presented in if !presented { pendingReplacement = nil } }
+            ),
+            presenting: pendingReplacement
+        ) { pending in
+            Button("Replace", role: .destructive) {
+                pendingReplacement = nil
+                commitOrder(pending.ids, previous: pending.previous, replacingUnreadableCatalog: true)
+            }
+            Button("Cancel", role: .cancel) { pendingReplacement = nil }
+        } message: { pending in
+            Text(QuietSessionOrderCommit.confirmationMessage(for: pending.damage))
+        }
+    }
+
+    /// Applies a drag only as far as the store actually got.
+    ///
+    /// The rail used to set `manualOrder` first and write second with the
+    /// write's result discarded, so a save that never landed left the new order
+    /// sitting on screen until the next launch quietly restored the old one.
+    /// What the rail draws is now whatever is durable: the dragged list when
+    /// the file landed, the pre-drag list when it did not, and a toast saying
+    /// which happened.
+    private func commitOrder(
+        _ ids: [String],
+        previous: [String],
+        replacingUnreadableCatalog: Bool = false
+    ) {
+        let outcome = orderStore.setOrder(
+            projectID: project.id,
+            ids: ids,
+            replacingUnreadableCatalog: replacingUnreadableCatalog
+        )
+        let resolution = QuietSessionOrderCommit.resolve(
+            previous: previous,
+            attempted: ids,
+            outcome: outcome
+        )
+        manualOrder = resolution.order
+        switch resolution.notice {
+        case .none:
+            break
+        case let .failed(reason):
+            ToastCenter.shared.show(
+                QuietSessionOrderCommit.failureMessage(reason),
+                style: .error,
+                duration: 5
+            )
+        case let .preserved(url):
+            ToastCenter.shared.show(
+                QuietSessionOrderCommit.preservedMessage(url),
+                style: .info,
+                duration: 5
+            )
+        case let .confirmReplace(damage):
+            pendingReplacement = PendingOrderReplacement(ids: ids, previous: previous, damage: damage)
+        }
     }
 
     private func noteAll(_ statuses: [String: QuietSessionStatus]) {

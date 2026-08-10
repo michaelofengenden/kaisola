@@ -232,18 +232,22 @@ actor AcpTranscriptStore {
         /// The newest 2,000 rows are the first retention priority; older user
         /// prompts and tool cards are pinned evidence and outrank narration,
         /// thoughts, and superseded plans when the quota is tight.
-        static let production = RetentionPolicy(
-            maximumRowCount: 10_000,
-            maximumBytes: 32 * 1_048_576,
-            recentRowCount: 2_000
-        )
+        static var production: RetentionPolicy {
+            RetentionPolicy(
+                maximumRowCount: 10_000,
+                maximumBytes: 32 * 1_048_576,
+                recentRowCount: 2_000
+            )
+        }
     }
 
     struct RetentionStatus: Equatable, Sendable {
         var truncatedRowCount: Int64
         var truncatedByteCount: Int64
 
-        static let empty = RetentionStatus(truncatedRowCount: 0, truncatedByteCount: 0)
+        static var empty: RetentionStatus {
+            RetentionStatus(truncatedRowCount: 0, truncatedByteCount: 0)
+        }
         var isTruncated: Bool { truncatedRowCount > 0 || truncatedByteCount > 0 }
     }
 

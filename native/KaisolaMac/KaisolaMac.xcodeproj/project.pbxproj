@@ -244,6 +244,7 @@
 		BDE65F12928C19D4C1D19381 /* MarkdownPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9286E9EFA45E3FEE67AEB1E3 /* MarkdownPreview.swift */; };
 		BDE6C88324D3D561ADA7AF38 /* VerifiedUsageHelperCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83FF23C3F0FE8B751EF9300A /* VerifiedUsageHelperCache.swift */; };
 		BE1D1D8E6557320BB66B5CC6 /* TerminalMetaServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3722B2ED76D7E872E1CEEC39 /* TerminalMetaServiceTests.swift */; };
+		BE1FB7DB2A327E8E064C4CC6 /* SharedWebKitTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FF9C958B00B75F3BA8F9930A /* SharedWebKitTests.swift */; };
 		BE218C17B3006B752A404163 /* TerminalFileLinkResolverTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 841A2499E3D548FBC6398EAB /* TerminalFileLinkResolverTests.swift */; };
 		BE43B624BA0AF4B1D8CCB36E /* BrokerHelperPackage.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CE14B47B11FF8AEDD22CC1A /* BrokerHelperPackage.swift */; };
 		BFDE2C98C977243CF4E89074 /* AcpDiff.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA7E0A7AF7C58D8926909FDB /* AcpDiff.swift */; };
@@ -656,6 +657,7 @@
 		FD76B9C89A35C06E7942F6D6 /* FirebaseAuthBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirebaseAuthBackend.swift; sourceTree = "<group>"; };
 		FDC5D762925B519587B9EF95 /* AcpChatHandle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpChatHandle.swift; sourceTree = "<group>"; };
 		FDE152F4457B8AF7E5A92225 /* McpConfigStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = McpConfigStore.swift; sourceTree = "<group>"; };
+		FF9C958B00B75F3BA8F9930A /* SharedWebKitTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedWebKitTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -1083,6 +1085,7 @@
 				0441702AA1CD407632FB480D /* SessionPaneLayoutTests.swift */,
 				0B2E1FD28106BD28EB2758AE /* SessionPinStoreTests.swift */,
 				C49D972FACEF9F904974B8EB /* SessionTitleTrackerTests.swift */,
+				FF9C958B00B75F3BA8F9930A /* SharedWebKitTests.swift */,
 				1A071DDD3D444167CC8B36B0 /* ShuffledAerialDesktopTests.swift */,
 				ED0277730A353A218BAC1101 /* SidebarScrollPinTests.swift */,
 				4C1E742D2099046E14888F80 /* SwiftTermStressTests.swift */,
@@ -1642,6 +1645,7 @@
 				0F372789A67A0DE521EBBB92 /* SessionPaneLayoutTests.swift in Sources */,
 				41C16D5DE1E0A270FBCB9BBE /* SessionPinStoreTests.swift in Sources */,
 				A2B3CC2CAD3E9A1C41F873D9 /* SessionTitleTrackerTests.swift in Sources */,
+				BE1FB7DB2A327E8E064C4CC6 /* SharedWebKitTests.swift in Sources */,
 				91C5C935B8D30B2E2F1358FF /* ShuffledAerialDesktopTests.swift in Sources */,
 				897B77B765BE67C87E3258C5 /* SidebarScrollPinTests.swift in Sources */,
 				104445F9A7ECA376AB39CC53 /* SwiftTermStressTests.swift in Sources */,

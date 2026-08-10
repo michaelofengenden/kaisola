@@ -87,7 +87,8 @@ struct BrowserCardView: View {
 /// Anything else (an OAuth bounce, an external link, a `target=_blank`) is
 /// handed to the system browser for top-level navigations and silently dropped
 /// for off-origin subframes, so the card can never wander onto the open web.
-/// No JS message handlers are installed and the data store is non-persistent.
+/// No JS message handlers are installed, and the data store is non-persistent
+/// and not shared with the file preview.
 private struct ConfinedWebView: NSViewRepresentable {
     let url: URL
     let reloadToken: Int
@@ -97,10 +98,10 @@ private struct ConfinedWebView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        // Ephemeral, shared with the HTML preview (spec §2e) — nothing here
-        // touches on-disk cookies/cache.
-        configuration.websiteDataStore = SharedWebKit.ephemeralContentStore
+        // Ephemeral and isolated from the HTML preview (spec §2e, revised) —
+        // nothing here touches on-disk cookies/cache, and the dev server's
+        // session stays out of reach of project files.
+        let configuration = SharedWebKit.contentConfiguration(for: .browserCard)
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.navigationDelegate = context.coordinator
         webView.setValue(false, forKey: "drawsBackground")

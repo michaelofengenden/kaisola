@@ -205,12 +205,20 @@ final class CompanionHost: ObservableObject {
         }
     }
 
-    func controllingDeviceName(projectID: String, terminalID: String) -> String? {
-        guard let status = terminalControlStatuses.first(where: {
-            $0.projectID == projectID && $0.terminalID == terminalID
-        }) else { return nil }
-        return pairedDevices.first(where: { $0.deviceId == status.deviceID })?.displayName
-            ?? "paired device"
+    /// The header chip's identity and lease clock for one terminal. Nil the
+    /// moment the lease is gone: release, expiry, revocation, and a dropped
+    /// connection all clear the status, so the indicator cannot outlive the
+    /// authority it reports.
+    func controllerChipSource(
+        projectID: String,
+        terminalID: String
+    ) -> CompanionControllerChipSource? {
+        CompanionControllerChipSource.resolve(
+            status: terminalControlStatuses.first {
+                $0.projectID == projectID && $0.terminalID == terminalID
+            },
+            pairedDevices: pairedDevices
+        )
     }
 
     func startIfEnabled() {

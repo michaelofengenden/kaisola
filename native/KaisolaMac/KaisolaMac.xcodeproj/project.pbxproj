@@ -161,6 +161,7 @@
 		7E79252544D2552F7335E60C /* SyntaxHighlighter.swift in Sources */ = {isa = PBXBuildFile; fileRef = BA44B5608FF424D5A4173716 /* SyntaxHighlighter.swift */; };
 		7F366A320AFDDE5C0B008686 /* GitPanelView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9586CAAF5EE496B213F01998 /* GitPanelView.swift */; };
 		7F9A5DAA9548D99E55198D7E /* WorkspaceWatcherTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2709C3EF1FBBB647E9258793 /* WorkspaceWatcherTests.swift */; };
+		7F9CB5E55080CB21AA4D1BDF /* CompanionControllerChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28A17B28954EC3ADBA2F8411 /* CompanionControllerChip.swift */; };
 		7FC978B9CB1801B45BC82E36 /* KaisolaProductMigration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0AB04B1B3E725C0E0F09B57B /* KaisolaProductMigration.swift */; };
 		7FF3EA80ABF0D3AA00F5FA0B /* QuietStatusClock.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24F47DB42ECE72E7A870B5E7 /* QuietStatusClock.swift */; };
 		8073BF3B3D019ED2F8CA11EB /* CompanionPairingCoordinatorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A84A690D14C8F442F82CE86E /* CompanionPairingCoordinatorTests.swift */; };
@@ -241,6 +242,7 @@
 		BA06D02D0D784812DFE9BD1C /* NotificationBridgeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 37780782E5170FFD4996C1D8 /* NotificationBridgeTests.swift */; };
 		BA2BA718F195BAADA3415BA8 /* NativeUpdateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5245B06FDE5E37D212A59E72 /* NativeUpdateController.swift */; };
 		BA6D43828E4685E984297FCF /* GlassClarityTradeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E3D72AABAD7E8FBF9B665E43 /* GlassClarityTradeTests.swift */; };
+		BB660CB457F61B87C1D927D0 /* CompanionControllerChipTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AC839F30A579AC3FCE95DD2 /* CompanionControllerChipTests.swift */; };
 		BCEE7C4B2655BD5F02B14ABA /* AcpModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = F979524745D6648E34835DF3 /* AcpModels.swift */; };
 		BDE65F12928C19D4C1D19381 /* MarkdownPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9286E9EFA45E3FEE67AEB1E3 /* MarkdownPreview.swift */; };
 		BDE6C88324D3D561ADA7AF38 /* VerifiedUsageHelperCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 83FF23C3F0FE8B751EF9300A /* VerifiedUsageHelperCache.swift */; };
@@ -400,6 +402,7 @@
 		2709FF5202ACBC7BD9696C64 /* WorkspaceRailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceRailView.swift; sourceTree = "<group>"; };
 		27165DF5641D8A7739273769 /* SessionOrderStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionOrderStore.swift; sourceTree = "<group>"; };
 		2788B54E3ABEA6DC3BB724F1 /* KaisolaCore */ = {isa = PBXFileReference; lastKnownFileType = folder; name = KaisolaCore; path = ../KaisolaCore; sourceTree = SOURCE_ROOT; };
+		28A17B28954EC3ADBA2F8411 /* CompanionControllerChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionControllerChip.swift; sourceTree = "<group>"; };
 		28FFC42BA9783C68516FA31C /* AcpComposerModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpComposerModel.swift; sourceTree = "<group>"; };
 		2A0AA3187DEE4894928C6341 /* DataPreviewsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DataPreviewsTests.swift; sourceTree = "<group>"; };
 		2A6971FB4400D5FB64CC8D8C /* CompanionCommandRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionCommandRouter.swift; sourceTree = "<group>"; };
@@ -512,6 +515,7 @@
 		87E8CB81899E1EDA02B677F9 /* AcpClientTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpClientTests.swift; sourceTree = "<group>"; };
 		88248FB2EEAA9902A80D000D /* CompanionCommandRouterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionCommandRouterTests.swift; sourceTree = "<group>"; };
 		8A7A17FC91F373F5881DB97C /* BrokerReconnectBackoff.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerReconnectBackoff.swift; sourceTree = "<group>"; };
+		8AC839F30A579AC3FCE95DD2 /* CompanionControllerChipTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionControllerChipTests.swift; sourceTree = "<group>"; };
 		8B3E3C357D3C2EC2452B447B /* CompanionSettingsTab.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionSettingsTab.swift; sourceTree = "<group>"; };
 		8B86A2CF95725BC0B94C0DF1 /* InstructionFileStaleness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstructionFileStaleness.swift; sourceTree = "<group>"; };
 		8BC8C1434D04E2FD29D366DE /* MarkdownInlineFormattingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MarkdownInlineFormattingTests.swift; sourceTree = "<group>"; };
@@ -861,6 +865,7 @@
 			isa = PBXGroup;
 			children = (
 				A14E04EB9F13D5A9D6834430 /* AttentionInboxModel.swift */,
+				28A17B28954EC3ADBA2F8411 /* CompanionControllerChip.swift */,
 				0947C7DA82513DC2C0D20226 /* CustomThemeStore.swift */,
 				055F15AB1B998161AD252189 /* DetailShowDoors.swift */,
 				B31900000000000000000001 /* NativeTerminalCoordinator.swift */,
@@ -1021,6 +1026,7 @@
 				EEC8E541404472EF4F2F17A4 /* CommandRegistryTests.swift */,
 				88248FB2EEAA9902A80D000D /* CompanionCommandRouterTests.swift */,
 				D7B13A899955A8094A15E262 /* CompanionConnectionSessionTests.swift */,
+				8AC839F30A579AC3FCE95DD2 /* CompanionControllerChipTests.swift */,
 				1E90B4D2D24769D0CEB3DD2B /* CompanionEventLogTests.swift */,
 				54C430C9213147C88D3B98F9 /* CompanionHostFoundationTests.swift */,
 				1B38FA4E8BE113F582193C3D /* CompanionLinkClientTests.swift */,
@@ -1403,6 +1409,7 @@
 				405642754B45AED95E4283BA /* CommandRegistry.swift in Sources */,
 				EC2DA4A5EEE7309740A3F8FF /* CompanionCommandRouter.swift in Sources */,
 				7220383F52A27FECE4EA9D08 /* CompanionConnection.swift in Sources */,
+				7F9CB5E55080CB21AA4D1BDF /* CompanionControllerChip.swift in Sources */,
 				E7EC945D70A1071B42558C89 /* CompanionDeviceRosterStore.swift in Sources */,
 				DE3AC5C4180DE02722CB1470 /* CompanionEventLog.swift in Sources */,
 				3DF637B8B4F213C7FACFBF9E /* CompanionHost.swift in Sources */,
@@ -1582,6 +1589,7 @@
 				A56F42A67BA70F97CC9B7396 /* CommandRegistryTests.swift in Sources */,
 				1C675F4AF5327A3E83E5D7F8 /* CompanionCommandRouterTests.swift in Sources */,
 				D26B8D9E26E6AEE0BA0B50A6 /* CompanionConnectionSessionTests.swift in Sources */,
+				BB660CB457F61B87C1D927D0 /* CompanionControllerChipTests.swift in Sources */,
 				9C0F1C05560CAA34F45C43B8 /* CompanionEventLogTests.swift in Sources */,
 				3D5D2BB9AF69D483F5E7B602 /* CompanionHostFoundationTests.swift in Sources */,
 				FBB4B0FC354CDCDF1137BC9D /* CompanionLinkClientTests.swift in Sources */,

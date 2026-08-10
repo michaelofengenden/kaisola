@@ -1922,7 +1922,7 @@ struct RootShellView: View {
             let cardRadius = KaisolaVisualSystem.paneRadius
             let terminalChrome = terminalPaneChrome(for: id)
             VStack(spacing: 0) {
-                unifiedSessionHeader(id)
+                unifiedSessionHeader(id, paneWidth: geometry.size.width)
                 unifiedSessionContent(id)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1958,7 +1958,7 @@ struct RootShellView: View {
         .frame(minWidth: 220, minHeight: 150)
     }
 
-    private func unifiedSessionHeader(_ id: String) -> some View {
+    private func unifiedSessionHeader(_ id: String, paneWidth: CGFloat) -> some View {
         let terminalChrome = terminalPaneChrome(for: id)
         return HStack(spacing: 7) {
             Button {
@@ -1995,23 +1995,20 @@ struct RootShellView: View {
                             .accessibilityElement(children: .ignore)
                             .accessibilityLabel(surfaceStatusLabel(id))
                     }
-                    if let deviceName = companionControllerName(for: id) {
-                        Label(deviceName, systemImage: "iphone")
-                            .font(.system(size: 9, weight: .semibold))
-                            .foregroundStyle(Color.accentColor)
-                            .lineLimit(1)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(Color.accentColor.opacity(0.1), in: Capsule())
-                            .help("Controlled from \(deviceName)")
-                            .accessibilityLabel("Controlled from \(deviceName)")
-                    }
                     Spacer(minLength: 4)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .help("Focus \(surfaceTitle(id))")
+            // Outside the focus button on purpose: the chip is its own control,
+            // and the higher priority means it takes its width before the
+            // button's label does. A pane title that is usually the project
+            // name again truncates first; who holds control does not.
+            if let source = companionControllerChipSource(for: id) {
+                CompanionControllerChipView(source: source, paneWidth: paneWidth)
+                    .layoutPriority(1)
+            }
             if let mesh = model.meshes.first(where: { $0.id == id }) {
                 MeshStagedPromptQueueButton(mesh: mesh)
                 MeshConfigurationMenu(mesh: mesh)
@@ -2185,20 +2182,28 @@ struct RootShellView: View {
         }
     }
 
-    private func companionControllerName(for terminalID: String) -> String? {
+    private func companionControllerChipSource(
+        for terminalID: String
+    ) -> CompanionControllerChipSource? {
         guard let terminal = model.sessions.first(where: { $0.id == terminalID }) else { return nil }
-        if let deviceName = companionHost.controllingDeviceName(
+        if let source = companionHost.controllerChipSource(
             projectID: terminal.projectID,
             terminalID: terminal.id
         ) {
-            return deviceName
+            return source
         }
         // Deterministic visual fixtures exercise the chip without manufacturing
-        // a paired-device roster or network lease. Production sets both states
-        // together through CompanionHost's lease callback.
-        return model.companionControlledTerminalIDs.contains(terminalID)
-            ? "iPhone"
-            : nil
+        // a paired-device roster or network lease. Gated on the fixture flag:
+        // a production pane must never invent a controller name during the few
+        // milliseconds between a lease being fenced and its status publishing.
+        guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+              model.companionControlledTerminalIDs.contains(terminalID) else { return nil }
+        return CompanionControllerChipSource(
+            deviceName: "Michael's iPhone",
+            // Far enough out that a slow capture still photographs a live
+            // lease rather than the chip decaying to amber mid-run.
+            expiresAt: CompanionControllerChipSource.milliseconds(Date()) + 3_600_000
+        )
     }
 
     private func openTerminalTranscript(_ terminalID: String, fromLiveBoundary: Bool = false) {

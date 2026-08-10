@@ -3703,6 +3703,120 @@ final class WorkspaceFilesTests: XCTestCase {
         )
         XCTAssertEqual(effective, NSRange(location: 4, length: storage.length - 4))
     }
+
+    // MARK: - File rail click arbitration
+
+    @MainActor
+    func testFileRailSingleClickOpensExactlyOnePreviewWhenTheDoubleClickWindowCloses() {
+        let window = ManualDoubleClickWindow()
+        let clicks = WorkspaceRowClickArbiter(interval: { 0.5 }, schedule: window.schedule)
+        var opens: [RailOpen] = []
+
+        clicks.click(rowID: "/w/README.md") { opens.append(RailOpen(row: "/w/README.md", pinned: $0)) }
+        XCTAssertEqual(opens, [], "the preview must wait: a second click may still be coming")
+        XCTAssertEqual(
+            clicks.armedRowID,
+            "/w/README.md",
+            "the row highlights immediately so the wait is invisible"
+        )
+
+        window.elapse()
+        XCTAssertEqual(opens, [RailOpen(row: "/w/README.md", pinned: false)])
+        XCTAssertNil(clicks.armedRowID)
+
+        window.elapse()
+        XCTAssertEqual(opens.count, 1, "no timer may open the same document a second time")
+    }
+
+    @MainActor
+    func testFileRailDoubleClickOpensExactlyOnePinnedDocumentAndNoPreview() {
+        let window = ManualDoubleClickWindow()
+        let clicks = WorkspaceRowClickArbiter(interval: { 0.5 }, schedule: window.schedule)
+        var opens: [RailOpen] = []
+        let row = "/w/src/main.swift"
+        let open: (Bool) -> Void = { opens.append(RailOpen(row: row, pinned: $0)) }
+
+        // A double click reaches the rail as two button fires plus the two-tap
+        // gesture. All three used to open the file; exactly one may now.
+        clicks.click(rowID: row, open: open)
+        clicks.click(rowID: row, open: open)
+        clicks.doubleClick(rowID: row, open: open)
+        XCTAssertEqual(opens, [RailOpen(row: row, pinned: true)])
+        XCTAssertNil(clicks.armedRowID, "the pinned open cancels the armed preview")
+
+        window.elapse()
+        XCTAssertEqual(
+            opens,
+            [RailOpen(row: row, pinned: true)],
+            "the cancelled preview must never fire"
+        )
+    }
+
+    @MainActor
+    func testFileRailPinsOnceWhicheverOrderTheGestureAndTheSecondButtonFireArriveIn() {
+        let window = ManualDoubleClickWindow()
+        let clicks = WorkspaceRowClickArbiter(interval: { 0.5 }, schedule: window.schedule)
+        var opens: [RailOpen] = []
+        let row = "/w/src/main.swift"
+        let open: (Bool) -> Void = { opens.append(RailOpen(row: row, pinned: $0)) }
+
+        // SwiftUI does not order a simultaneous gesture against the button it
+        // rides on, and a third click is still the same gesture, not a new one.
+        clicks.click(rowID: row, open: open)
+        clicks.doubleClick(rowID: row, open: open)
+        clicks.click(rowID: row, open: open)
+        clicks.click(rowID: row, open: open)
+        XCTAssertEqual(opens, [RailOpen(row: row, pinned: true)])
+
+        window.elapse()
+        XCTAssertEqual(opens, [RailOpen(row: row, pinned: true)])
+
+        // Once the window has closed the row answers a fresh single click again.
+        clicks.click(rowID: row, open: open)
+        window.elapse()
+        XCTAssertEqual(
+            opens,
+            [RailOpen(row: row, pinned: true), RailOpen(row: row, pinned: false)]
+        )
+    }
+
+    @MainActor
+    func testFileRailFollowsTheLastRowClickedInsteadOfLoadingTwoPreviews() {
+        let window = ManualDoubleClickWindow()
+        let clicks = WorkspaceRowClickArbiter(interval: { 0.5 }, schedule: window.schedule)
+        var opens: [RailOpen] = []
+
+        clicks.click(rowID: "/w/README.md") { opens.append(RailOpen(row: "/w/README.md", pinned: $0)) }
+        clicks.click(rowID: "/w/CHANGELOG.md") { opens.append(RailOpen(row: "/w/CHANGELOG.md", pinned: $0)) }
+        XCTAssertEqual(clicks.armedRowID, "/w/CHANGELOG.md")
+
+        window.elapse()
+        XCTAssertEqual(opens, [RailOpen(row: "/w/CHANGELOG.md", pinned: false)])
+    }
+}
+
+/// The double-click window, opened and closed by hand in place of the
+/// arbiter's `Task.sleep`.
+@MainActor
+private final class ManualDoubleClickWindow {
+    private var waiting: [@MainActor () -> Void] = []
+
+    func schedule(_ delay: TimeInterval, _ work: @escaping @MainActor () -> Void) {
+        waiting.append(work)
+    }
+
+    /// Runs everything waiting on the window. Work scheduled while it drains
+    /// belongs to the next window, exactly as a later timer would.
+    func elapse() {
+        let due = waiting
+        waiting.removeAll()
+        for work in due { work() }
+    }
+}
+
+private struct RailOpen: Equatable {
+    let row: String
+    let pinned: Bool
 }
 
 private final class ProjectFileIndexProbe: @unchecked Sendable {

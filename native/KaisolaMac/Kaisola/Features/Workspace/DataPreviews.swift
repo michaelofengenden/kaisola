@@ -322,16 +322,20 @@ enum JsonTree {
     static let maxDepth = 12
     static let maxNodes = 2_000
 
-    /// The identity of the root value. Child paths extend it with `.key` for
-    /// object members and `[index]` for array elements.
-    static let rootPath = "$"
+    /// The identity of the root value. Paths are RFC 6901 JSON Pointers: the
+    /// whole document is the empty pointer, and each level appends `/` plus one
+    /// escaped token. Joining raw keys with `.` and `[index]` used to alias
+    /// distinct values — `{"a.b":1}` and `{"a":{"b":1}}` both landed on
+    /// `$.a.b` — which crossed disclosure state between unrelated rows and gave
+    /// SwiftUI two children with one identity.
+    static let rootPath = ""
 
     /// One node in the rendered JSON tree. A reference type so SwiftUI can hold
     /// stable identities across expand/collapse.
     final class Node: Identifiable, @unchecked Sendable {
         enum Kind: Equatable, Sendable { case object, array, string, number, bool, null, truncated }
 
-        /// The path to this value (`$.meta.items[3]`), not a fresh `UUID`.
+        /// The JSON Pointer to this value (`/meta/items/3`), not a fresh `UUID`.
         /// Disclosure state is keyed by node identity, so a rebuilt tree — a
         /// re-render, a reload, a returning tab — must reuse the same ids or
         /// every expanded object silently snaps shut.
@@ -378,12 +382,29 @@ enum JsonTree {
         return build(data, key: key, path: rootPath, depth: 0, count: &count)
     }
 
-    /// The identity of a container's truncation marker. Object children always
-    /// join with `.` and array children with `[`, so a suffix using neither can
-    /// never collide with a real member — including a key literally named
-    /// `truncated`.
+    /// The pointer for an object member. RFC 6901 escaping (`~` first, then
+    /// `/`) is what makes the join injective: an escaped token can never carry
+    /// the `/` that separates levels, so no key — however many dots, brackets,
+    /// pipes or slashes it holds — can imitate a deeper path.
+    nonisolated private static func childPath(_ path: String, key: String) -> String {
+        let escaped = key
+            .replacingOccurrences(of: "~", with: "~0")
+            .replacingOccurrences(of: "/", with: "~1")
+        return "\(path)/\(escaped)"
+    }
+
+    /// The pointer for an array element. Indices need no escaping, and an
+    /// object key that reads like an index cannot collide with one: a given
+    /// path is either an object or an array, never both.
+    nonisolated private static func childPath(_ path: String, index: Int) -> String {
+        "\(path)/\(index)"
+    }
+
+    /// The identity of a container's truncation marker. Escaping leaves `~`
+    /// only ever followed by `0` or `1`, so a `~t` token is one no real member
+    /// can spell — including a key literally named `truncated`.
     nonisolated private static func truncationPath(_ path: String) -> String {
-        path + "|truncated"
+        "\(path)/~truncated"
     }
 
     nonisolated private static func build(
@@ -416,7 +437,7 @@ enum JsonTree {
                 children.append(build(
                     dictionary[childKey] as Any,
                     key: childKey,
-                    path: "\(path).\(childKey)",
+                    path: childPath(path, key: childKey),
                     depth: depth + 1,
                     count: &count
                 ))
@@ -439,7 +460,7 @@ enum JsonTree {
                 children.append(build(
                     element,
                     key: "[\(index)]",
-                    path: "\(path)[\(index)]",
+                    path: childPath(path, index: index),
                     depth: depth + 1,
                     count: &count
                 ))

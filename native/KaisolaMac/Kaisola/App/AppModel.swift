@@ -2653,6 +2653,13 @@ final class AppModel: ObservableObject {
         await enqueueDraftRemoval(chatID: chatID).value
     }
 
+    /// Await the serialized draft queue so the durable store reflects every
+    /// save and removal already enqueued. `teardown` and the restore paths wait
+    /// on the task directly; this is the same wait for callers outside them.
+    func flushDraftPersistence() async {
+        await draftPersistenceTask?.value
+    }
+
     private static func terminalDraftStableKey(_ terminalID: String) -> String {
         "terminal|\(terminalID)"
     }
@@ -3451,6 +3458,10 @@ final class AppModel: ObservableObject {
             closingChat.conversation.onFileActivity = nil
             closingChat.conversation.onDraftChanged = nil
             closingChat.conversation.onQueueChanged = nil
+            // The composer outlives this call by a frame or two. Taking the
+            // draft key away with the text stops a late `saveDraft` from
+            // writing the deleted plaintext back into defaults.
+            closingChat.conversation.forgetPersistentDraft()
             chatShutdownTasks.start(chatID) {
                 _ = await closingChat.conversation.stop()
             }
@@ -3780,6 +3791,15 @@ final class AppModel: ObservableObject {
             layout.remove(meshID)
             paneLayouts[projectID] = layout
             let removals = enqueueTranscriptRemovals(chatIDs: columnIDs)
+            // Columns also have legacy composer-defaults copies. The Mesh's
+            // workspace draft removal never reaches those per-column keys.
+            for columnID in columnIDs {
+                AcpConversation.removePersistedDraft(
+                    for: columnID,
+                    currentDefaults: chatDraftDefaults,
+                    migratedDefaults: migratedChatDraftDefaults
+                )
+            }
             enqueueDraftRemoval(stableKey: "mesh|\(meshID)")
             await persistWorkspaceStateImmediately(projectID: projectID)
             if let failure = await firstTranscriptRemovalFailure(removals) {
@@ -3972,6 +3992,15 @@ final class AppModel: ObservableObject {
             // The user crossed the permanent-delete boundary. Remove column
             // data even if writing the final archive tombstone needs a retry.
             let removals = enqueueTranscriptRemovals(chatIDs: columnIDs)
+            // A permanent Mesh deletion also clears every per-column legacy
+            // composer-defaults copy after the destroy transaction is safe.
+            for columnID in columnIDs {
+                AcpConversation.removePersistedDraft(
+                    for: columnID,
+                    currentDefaults: chatDraftDefaults,
+                    migratedDefaults: migratedChatDraftDefaults
+                )
+            }
             enqueueDraftRemoval(stableKey: "mesh|\(surfaceID)")
             do {
                 try await workspaceStateStore.removeMeshState(

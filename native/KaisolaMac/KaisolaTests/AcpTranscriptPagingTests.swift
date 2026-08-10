@@ -633,6 +633,30 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertNil(UserDefaults.standard.string(forKey: defaultsKey), "clearing the draft deletes the key")
     }
 
+    func testForgettingTheDraftErasesItAndDisarmsLaterSaves() {
+        let key = "unit-\(UUID().uuidString)"
+        let defaultsKey = "chatDraft.\(key)"
+        defer { UserDefaults.standard.removeObject(forKey: defaultsKey) }
+
+        let conversation = makeConversation(draftKey: key)
+        conversation.saveDraft("unsent secret")
+        XCTAssertEqual(UserDefaults.standard.string(forKey: defaultsKey), "unsent secret")
+
+        conversation.forgetPersistentDraft()
+        XCTAssertNil(
+            UserDefaults.standard.string(forKey: defaultsKey),
+            "a permanent delete must erase the legacy defaults draft"
+        )
+
+        // The composer can still emit one last change as it tears down.
+        conversation.saveDraft("late write after delete")
+        XCTAssertNil(
+            UserDefaults.standard.string(forKey: defaultsKey),
+            "a save after the delete boundary must not resurrect the draft"
+        )
+        XCTAssertEqual(makeConversation(draftKey: key).loadDraft(), "")
+    }
+
     func testDraftIsNoOpWithoutAKey() {
         let conversation = makeConversation(draftKey: nil)
         conversation.saveDraft("orphan")   // no key ⇒ nothing persisted

@@ -1613,6 +1613,20 @@ final class AcpConversation: ObservableObject {
         }
     }
 
+    /// Drop the draft, its buffered write, and the key that names it. Called on
+    /// the permanent-delete boundary: clearing the stored text is not enough on
+    /// its own, because the composer tearing down one frame later can call
+    /// `saveDraft` and write the same plaintext straight back. Losing the key
+    /// makes every later save a no-op, exactly as for an unkeyed chat.
+    func forgetPersistentDraft() {
+        if let draftStorageKey { Self.removePersistedDraft(for: draftStorageKey) }
+        draftStorageKey = nil
+        restoredDraft = nil
+        pendingDraftPersistence = nil
+        draftPersistenceTask?.cancel()
+        draftPersistenceTask = nil
+    }
+
     // MARK: - Test hooks
 
     /// Test-only: replace the transcript wholesale so paging math can be

@@ -610,6 +610,8 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertNotNil(store.add(provider: .claude, label: "Work", directory: target.path))
         XCTAssertNil(store.add(provider: .claude, label: "Lowercase", directory: lowercased.path))
         XCTAssertEqual(store.profiles().map(\.label), ["Work"])
+    }
+
     /// Fault injection: a locked (`uchg`) destination makes `replaceItemAt`
     /// fail with EPERM long after the temporary file has landed on disk. The
     /// write must report failure *and* take its fragment with it, or the

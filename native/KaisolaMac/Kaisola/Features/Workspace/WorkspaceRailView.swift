@@ -1,6 +1,84 @@
 import AppKit
 import SwiftUI
 
+/// One source of truth for what a file-tree row says and does through either
+/// Full Keyboard Access or VoiceOver. The visible indentation and glyphs are
+/// presentation only; role, hierarchy, disclosure, and selection live here.
+struct WorkspaceFileTreeRowAccessibility: Equatable, Sendable {
+    enum Activation: Equatable, Sendable {
+        case openFile
+        case expandFolder
+        case collapseFolder
+    }
+
+    let label: String
+    let value: String
+    let hint: String
+    let activation: Activation
+    let disclosureActionLabel: String?
+    let isSelected: Bool
+
+    init(
+        name: String,
+        isDirectory: Bool,
+        depth: Int,
+        isExpanded: Bool,
+        isSelected: Bool
+    ) {
+        let level = max(0, depth) + 1
+        self.label = name
+        self.isSelected = isSelected
+        if isDirectory {
+            let expansion = isExpanded ? "expanded" : "collapsed"
+            self.value = "Folder, level \(level), \(expansion), \(isSelected ? "selected" : "not selected")"
+            self.hint = isExpanded
+                ? "Activate to collapse this folder"
+                : "Activate to expand this folder"
+            self.activation = isExpanded ? .collapseFolder : .expandFolder
+            self.disclosureActionLabel = isExpanded ? "Collapse" : "Expand"
+        } else {
+            self.value = "File, level \(level), \(isSelected ? "selected" : "not selected")"
+            self.hint = "Activate to open this file"
+            self.activation = .openFile
+            self.disclosureActionLabel = nil
+        }
+    }
+
+    /// A focused Button and VoiceOver's default Activate gesture take the same
+    /// route; this name makes the keyboard contract explicit in tests.
+    var keyboardActivation: Activation { activation }
+
+    /// Folders additionally advertise a named Expand/Collapse action. Files
+    /// use the Button's ordinary Activate action and expose no fake disclosure.
+    var voiceOverDisclosureAction: Activation? {
+        disclosureActionLabel == nil ? nil : activation
+    }
+}
+
+private struct WorkspaceFileTreeAccessibilityModifier: ViewModifier {
+    let descriptor: WorkspaceFileTreeRowAccessibility
+    let performDisclosure: () -> Void
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        let described = content
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(descriptor.label)
+            .accessibilityValue(descriptor.value)
+            .accessibilityHint(descriptor.hint)
+            .accessibilityAddTraits(
+                descriptor.isSelected ? [.isButton, .isSelected] : .isButton
+            )
+        if let actionLabel = descriptor.disclosureActionLabel {
+            described.accessibilityAction(named: Text(actionLabel)) {
+                performDisclosure()
+            }
+        } else {
+            described
+        }
+    }
+}
+
 /// The workspace rail: a lazy file tree for the active project (⌘B). Clicking a
 /// file opens it in the preview pane.
 struct WorkspaceRailView: View {
@@ -27,7 +105,13 @@ struct WorkspaceRailView: View {
     let close: () -> Void
 
     @State private var expanded: Set<String> = []
-    @State private var searchText = ""
+    @State private var searchText = {
+        let environment = ProcessInfo.processInfo.environment
+        return environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+            && environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "workspace-search-partial"
+            ? "indexed-fixture"
+            : ""
+    }()
     @State private var renameTarget: FileNode?
     @State private var renameDraft = ""
     @State private var moveTarget: FileNode?
@@ -123,14 +207,23 @@ struct WorkspaceRailView: View {
             .padding(.horizontal, 6)
             .padding(.vertical, 6)
 
+            if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               !tree.isSearching {
+                partialSearchNotice
+            }
+
             if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 0) {
-                        nodeRows(for: root, depth: 0)
+                if let emptyState = tree.emptyState(for: root) {
+                    projectEmptyState(emptyState)
+                } else {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 0) {
+                            nodeRows(for: root, depth: 0)
+                        }
+                        .padding(.vertical, 6)
                     }
-                    .padding(.vertical, 6)
+                    .scrollBounceBehavior(.basedOnSize)
                 }
-                .scrollBounceBehavior(.basedOnSize)
             } else if tree.isSearching {
                 VStack(spacing: 10) {
                     ProgressView().controlSize(.small)
@@ -201,6 +294,7 @@ struct WorkspaceRailView: View {
         .padding(4)
         .task {
             tree.load(root)
+            tree.search(searchText)
             revealSelection()
             // Deterministic broker-free visual QA: present a real file-action
             // sheet over the real lazy tree without mutating any fixture file.
@@ -289,7 +383,33 @@ struct WorkspaceRailView: View {
         } message: {
             Text("This is recoverable from the macOS Trash.")
         }
-        .accessibilityLabel("Project files")
+    }
+
+    /// The index is deliberately bounded; when one of those bounds wins, do
+    /// not let a partial match list masquerade as proof that another file does
+    /// not exist. Folder browsing is the uncached scope escape hatch.
+    @ViewBuilder
+    private var partialSearchNotice: some View {
+        if let notice = ProjectFileSearchPresentation.notice(for: tree.searchCompletion) {
+            VStack(alignment: .leading, spacing: 5) {
+                Label(notice.title, systemImage: "exclamationmark.magnifyingglass")
+                    .font(.caption.weight(.semibold))
+                Text(notice.detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button(notice.actionTitle) { searchText = "" }
+                    .buttonStyle(.link)
+                    .font(.caption)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(Color.orange.opacity(0.09))
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel("\(notice.title). \(notice.detail)")
+            .accessibilityIdentifier("files.search-partial")
+        }
     }
 
     private var renamePresented: Binding<Bool> {
@@ -575,6 +695,12 @@ struct WorkspaceRailView: View {
                     AnyView(nodeRows(for: node.url, depth: depth + 1))
                 }
             }
+            // A folder that is simply empty stays quiet. A folder Kaisola could
+            // not read looks identical from here unless it says so, which is
+            // how permission and I/O problems used to pass for empty ones.
+            if let failure = tree.loadFailure(for: directory) {
+                failureRow(failure, directory: directory, depth: depth)
+            }
         } else {
             HStack(spacing: 7) {
                 ProgressView().controlSize(.mini)
@@ -584,6 +710,74 @@ struct WorkspaceRailView: View {
             .padding(.vertical, 6)
             .task { tree.load(directory) }
         }
+    }
+
+    private func projectEmptyState(_ state: WorkspaceFilesEmptyState) -> some View {
+        VStack(spacing: 12) {
+            Spacer(minLength: 12)
+            VStack(spacing: 8) {
+                Image(systemName: state.systemImageName)
+                    .font(.system(size: 34, weight: .light))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                Text(state.title)
+                    .font(.title3.weight(.semibold))
+                    .multilineTextAlignment(.center)
+                Text(state.message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(state.title)
+            .accessibilityValue(state.message)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier(state.accessibilityIdentifier)
+            VStack(spacing: 8) {
+                Button(WorkspaceFilesEmptyState.newFileLabel) {
+                    beginCreate(.file, in: root)
+                }
+                .accessibilityLabel("New File in project")
+                .accessibilityIdentifier("files.empty.new-file")
+                Button(WorkspaceFilesEmptyState.newFolderLabel) {
+                    beginCreate(.folder, in: root)
+                }
+                .accessibilityLabel("New Folder in project")
+                .accessibilityIdentifier("files.empty.new-folder")
+            }
+            Spacer(minLength: 12)
+        }
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    /// The one row a failed directory gets: what went wrong, and a way back.
+    private func failureRow(
+        _ failure: ProjectFiles.DirectoryLoadFailure,
+        directory: URL,
+        depth: Int
+    ) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.orange)
+            Text(failure.summary)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+            Spacer(minLength: 0)
+            Button("Retry") { tree.load(directory, force: true) }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .accessibilityIdentifier("files.retry")
+        }
+        .padding(.leading, CGFloat(depth) * 14 + 12)
+        .padding(.trailing, Self.optionsClearance - 10)
+        .padding(.vertical, 4)
+        .help(failure.diagnostic)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(failure.summary). \(failure.diagnostic)")
     }
 
     private func nodeRow(_ node: FileNode, depth: Int) -> some View {
@@ -630,6 +824,25 @@ struct WorkspaceRailView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .modifier(WorkspaceFileTreeAccessibilityModifier(
+            descriptor: WorkspaceFileTreeRowAccessibility(
+                name: node.name,
+                isDirectory: node.isDirectory,
+                depth: depth,
+                isExpanded: expanded.contains(node.id),
+                isSelected: !node.isDirectory
+                    && selectedFile?.standardizedFileURL.path == node.url.standardizedFileURL.path
+            ),
+            performDisclosure: {
+                guard node.isDirectory else { return }
+                if expanded.contains(node.id) {
+                    expanded.remove(node.id)
+                } else {
+                    expanded.insert(node.id)
+                    tree.load(node.url)
+                }
+            }
+        ))
         .accessibilityLabel(node.name)
         .id(node.id)
         .simultaneousGesture(

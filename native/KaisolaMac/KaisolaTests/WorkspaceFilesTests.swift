@@ -1,4 +1,5 @@
 import AppKit
+import Darwin
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -724,13 +725,127 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertEqual(ProjectFiles.enumerate(root: root, limit: 5).count, 5)
     }
 
+    func testEnumerateReportsFileLimitWithoutFalsePositiveAtExactBoundary() throws {
+        let zero = ProjectFiles.enumerate(root: root, limit: 0)
+        XCTAssertEqual(zero.paths, [])
+        XCTAssertEqual(zero.completion.limits, [.init(kind: .files, maximum: 0)])
+
+        let exact = ProjectFiles.enumerate(root: root, limit: 2)
+        XCTAssertEqual(Set(exact.paths), ["README.md", "src/main.swift"])
+        XCTAssertTrue(exact.completion.isComplete)
+        XCTAssertEqual(exact.completion.limits, [])
+
+        try "third".write(
+            to: root.appendingPathComponent("third.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+        let limited = ProjectFiles.enumerate(root: root, limit: 2)
+        XCTAssertEqual(limited.paths.count, 2)
+        XCTAssertFalse(limited.completion.isComplete)
+        XCTAssertEqual(
+            limited.completion.limits,
+            [.init(kind: .files, maximum: 2)]
+        )
+    }
+
+    func testEnumerateReportsDirectoryVisitAndCancellationStops() {
+        let exactDirectoryBoundary = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 2,
+            visitLimit: 100
+        )
+        XCTAssertTrue(exactDirectoryBoundary.completion.isComplete)
+
+        let directoryLimited = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 1,
+            visitLimit: 100
+        )
+        XCTAssertEqual(
+            directoryLimited.completion.limits,
+            [.init(kind: .directories, maximum: 1)]
+        )
+        XCTAssertFalse(directoryLimited.completion.wasCancelled)
+
+        let visitLimited = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 100,
+            visitLimit: 1
+        )
+        XCTAssertEqual(
+            visitLimited.completion.limits,
+            [.init(kind: .visitedEntries, maximum: 1)]
+        )
+
+        let exactVisitBoundary = ProjectFiles.enumerate(
+            root: root,
+            directoryLimit: 100,
+            visitLimit: 4
+        )
+        XCTAssertTrue(exactVisitBoundary.completion.isComplete)
+
+        var checks = 0
+        let cancelled = ProjectFiles.enumerate(root: root, isCancelled: {
+            checks += 1
+            return checks >= 2
+        })
+        XCTAssertTrue(cancelled.completion.wasCancelled)
+        XCTAssertFalse(cancelled.completion.isComplete)
+    }
+
+    @MainActor
+    func testProjectFileIndexPreservesTraversalMetadataAndPartialPresentationIsActionable() async {
+        let enumeration = ProjectFiles.Enumeration(
+            paths: ["README.md"],
+            completion: .init(
+                limits: [
+                    .init(kind: .directories, maximum: 2_000),
+                    .init(kind: .visitedEntries, maximum: 20_000),
+                ],
+                wasCancelled: false
+            )
+        )
+        let index = ProjectFileIndex(enumerateResult: { _ in enumeration })
+
+        let snapshot = await index.snapshot(for: root)
+        let files = await index.files(for: root)
+        XCTAssertEqual(snapshot, enumeration)
+        XCTAssertEqual(files, enumeration.paths)
+
+        let notice = try? XCTUnwrap(
+            ProjectFileSearchPresentation.notice(for: enumeration.completion)
+        )
+        XCTAssertEqual(notice?.title, "Partial results")
+        XCTAssertEqual(notice?.actionTitle, "Browse folders")
+        XCTAssertTrue(notice?.detail.contains("2,000 folders") == true)
+        XCTAssertTrue(notice?.detail.contains("20,000 items") == true)
+    }
+
+    func testDetailedIndexUpdatePreservesPriorPartialReceipt() throws {
+        let partial = ProjectFiles.Enumeration(
+            paths: ProjectFiles.enumerate(root: root).paths,
+            completion: .init(limits: [.init(kind: .directories, maximum: 2_000)])
+        )
+        let added = root.appendingPathComponent("src/added.swift")
+        try "added".write(to: added, atomically: true, encoding: .utf8)
+
+        let updated = try XCTUnwrap(ProjectFiles.updatingEnumeration(
+            partial,
+            root: root,
+            changedPaths: [added]
+        ))
+        XCTAssertTrue(updated.paths.contains("src/added.swift"))
+        XCTAssertEqual(updated.completion, partial.completion)
+    }
+
     func testEnumerateHonorsDirectoryAndVisitBounds() {
         let rootOnly = ProjectFiles.enumerate(
             root: root,
             directoryLimit: 1,
             visitLimit: 100
         )
-        XCTAssertEqual(rootOnly, ["README.md"])
+        XCTAssertEqual(rootOnly.paths, ["README.md"])
 
         let oneVisit = ProjectFiles.enumerate(
             root: root,
@@ -789,7 +904,7 @@ final class WorkspaceFilesTests: XCTestCase {
 
     @MainActor
     func testDetailedIndexInvalidationAvoidsASecondRepositoryWalk() async throws {
-        let probe = ProjectFileIndexStaticProbe(files: ProjectFiles.enumerate(root: root))
+        let probe = ProjectFileIndexStaticProbe(files: ProjectFiles.enumerate(root: root).paths)
         let index = ProjectFileIndex(enumerateFiles: probe.enumerate)
         _ = await index.files(for: root)
         XCTAssertEqual(probe.startedCount, 1)
@@ -3282,6 +3397,280 @@ final class WorkspaceFilesTests: XCTestCase {
         try FileManager.default.createSymbolicLink(at: loop, withDestinationURL: root)
         XCTAssertFalse(ProjectFiles.children(of: root).contains { $0.name == "loop" })
         XCTAssertEqual(Set(ProjectFiles.enumerate(root: root)), ["README.md", "src/main.swift"])
+    }
+
+    /// Make a folder Kaisola can't read, and put it back afterwards even if
+    /// the test bails out early.
+    private func makeUnreadableFolder(named name: String) throws -> URL {
+        let locked = root.appendingPathComponent(name, isDirectory: true)
+        try FileManager.default.createDirectory(at: locked, withIntermediateDirectories: true)
+        try "secret".write(
+            to: locked.appendingPathComponent("notes.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: locked.path)
+        addTeardownBlock {
+            try? FileManager.default.setAttributes(
+                [.posixPermissions: 0o700],
+                ofItemAtPath: locked.path
+            )
+        }
+        try XCTSkipUnless(
+            access(locked.path, R_OK) != 0,
+            "This test user can read a 000 folder, so permission denied is unreachable."
+        )
+        return locked
+    }
+
+    func testDirectoryListingDistinguishesAnUnreadableFolderFromAnEmptyOne() throws {
+        let empty = root.appendingPathComponent("empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        let locked = try makeUnreadableFolder(named: "locked")
+
+        // Both folders list exactly nothing. Only the typed result tells the
+        // rail which of them is a real, quiet, empty folder.
+        let emptyListing = ProjectFiles.listing(of: empty)
+        XCTAssertEqual(emptyListing.nodes, [])
+        XCTAssertNil(emptyListing.failure)
+        XCTAssertTrue(emptyListing.isEmptyAndReadable)
+
+        let lockedListing = ProjectFiles.listing(of: locked)
+        XCTAssertEqual(lockedListing.nodes, [])
+        XCTAssertEqual(lockedListing.failure, .permissionDenied)
+        XCTAssertFalse(lockedListing.isEmptyAndReadable)
+        XCTAssertNil(lockedListing.emptyState)
+
+        // The legacy accessor keeps its old shape for the fuzzy index.
+        XCTAssertEqual(ProjectFiles.children(of: locked), [])
+    }
+
+    func testDirectoryListingDistinguishesEmptyFromOnlyHiddenOrIgnoredContent() throws {
+        let empty = root.appendingPathComponent("empty-project", isDirectory: true)
+        let ignored = root.appendingPathComponent("ignored-project", isDirectory: true)
+        let visible = root.appendingPathComponent("visible-project", isDirectory: true)
+        for directory in [empty, ignored, visible] {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        }
+        try FileManager.default.createDirectory(
+            at: ignored.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: ignored.appendingPathComponent("node_modules", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try "secret".write(
+            to: ignored.appendingPathComponent(".env"),
+            atomically: true,
+            encoding: .utf8
+        )
+        try "visible".write(
+            to: visible.appendingPathComponent("README.md"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        XCTAssertEqual(ProjectFiles.listing(of: empty).emptyState, .emptyProject)
+        let ignoredListing = ProjectFiles.listing(of: ignored)
+        XCTAssertEqual(ignoredListing.nodes, [])
+        XCTAssertNil(ignoredListing.failure)
+        XCTAssertEqual(ignoredListing.emptyState, .hiddenOrIgnoredContent)
+        XCTAssertNil(ProjectFiles.listing(of: visible).emptyState)
+        XCTAssertNil(ProjectFiles.listing(of: root, limit: 0).emptyState)
+    }
+
+    func testWorkspaceFilesEmptyStatesNameCauseAndCreationActions() {
+        XCTAssertEqual(WorkspaceFilesEmptyState.emptyProject.title, "Empty project")
+        XCTAssertEqual(
+            WorkspaceFilesEmptyState.emptyProject.message,
+            "Create a new file or folder to get started."
+        )
+        XCTAssertEqual(
+            WorkspaceFilesEmptyState.hiddenOrIgnoredContent.title,
+            "No visible files"
+        )
+        XCTAssertEqual(
+            WorkspaceFilesEmptyState.hiddenOrIgnoredContent.message,
+            "This project contains only hidden or ignored items."
+        )
+        XCTAssertEqual(WorkspaceFilesEmptyState.newFileLabel, "New File…")
+        XCTAssertEqual(WorkspaceFilesEmptyState.newFolderLabel, "New Folder…")
+        XCTAssertNotEqual(
+            WorkspaceFilesEmptyState.emptyProject.accessibilityIdentifier,
+            WorkspaceFilesEmptyState.hiddenOrIgnoredContent.accessibilityIdentifier
+        )
+    }
+
+    func testFileTreeAccessibilityNamesRoleDepthExpansionAndSelection() {
+        let collapsedFolder = WorkspaceFileTreeRowAccessibility(
+            name: "Sources",
+            isDirectory: true,
+            depth: 0,
+            isExpanded: false,
+            isSelected: false
+        )
+        XCTAssertEqual(collapsedFolder.label, "Sources")
+        XCTAssertEqual(collapsedFolder.value, "Folder, level 1, collapsed, not selected")
+        XCTAssertEqual(collapsedFolder.hint, "Activate to expand this folder")
+        XCTAssertEqual(collapsedFolder.activation, .expandFolder)
+        XCTAssertEqual(collapsedFolder.disclosureActionLabel, "Expand")
+
+        let expandedFolder = WorkspaceFileTreeRowAccessibility(
+            name: "Features",
+            isDirectory: true,
+            depth: 1,
+            isExpanded: true,
+            isSelected: false
+        )
+        XCTAssertEqual(expandedFolder.value, "Folder, level 2, expanded, not selected")
+        XCTAssertEqual(expandedFolder.hint, "Activate to collapse this folder")
+        XCTAssertEqual(expandedFolder.activation, .collapseFolder)
+        XCTAssertEqual(expandedFolder.disclosureActionLabel, "Collapse")
+
+        let selectedFile = WorkspaceFileTreeRowAccessibility(
+            name: "Editor.swift",
+            isDirectory: false,
+            depth: 2,
+            isExpanded: false,
+            isSelected: true
+        )
+        XCTAssertEqual(selectedFile.value, "File, level 3, selected")
+        XCTAssertEqual(selectedFile.hint, "Activate to open this file")
+        XCTAssertEqual(selectedFile.activation, .openFile)
+        XCTAssertNil(selectedFile.disclosureActionLabel)
+    }
+
+    func testFileTreeKeyboardAndVoiceOverActionsFollowTheSameNestedDisclosureState() {
+        let collapsed = WorkspaceFileTreeRowAccessibility(
+            name: "Sources",
+            isDirectory: true,
+            depth: 0,
+            isExpanded: false,
+            isSelected: false
+        )
+        XCTAssertEqual(collapsed.keyboardActivation, .expandFolder)
+        XCTAssertEqual(collapsed.voiceOverDisclosureAction, .expandFolder)
+
+        let expanded = WorkspaceFileTreeRowAccessibility(
+            name: "Sources",
+            isDirectory: true,
+            depth: 0,
+            isExpanded: true,
+            isSelected: false
+        )
+        XCTAssertEqual(expanded.keyboardActivation, .collapseFolder)
+        XCTAssertEqual(expanded.voiceOverDisclosureAction, .collapseFolder)
+
+        let nestedFile = WorkspaceFileTreeRowAccessibility(
+            name: "Editor.swift",
+            isDirectory: false,
+            depth: 2,
+            isExpanded: false,
+            isSelected: false
+        )
+        XCTAssertEqual(nestedFile.keyboardActivation, .openFile)
+        XCTAssertNil(nestedFile.voiceOverDisclosureAction)
+    }
+
+    func testDirectoryListingNamesMissingReplacedCancelledAndBoundedFolders() throws {
+        XCTAssertEqual(
+            ProjectFiles.listing(of: root.appendingPathComponent("gone", isDirectory: true)).failure,
+            .missing
+        )
+        XCTAssertEqual(
+            ProjectFiles.listing(of: root.appendingPathComponent("README.md")).failure,
+            .notDirectory
+        )
+
+        // Cancelled before the first entry, and cancelled part-way through:
+        // neither may look like a folder that simply had nothing in it.
+        XCTAssertEqual(ProjectFiles.listing(of: root, isCancelled: { true }).failure, .cancelled)
+        var checks = 0
+        let interrupted = ProjectFiles.listing(of: root, isCancelled: {
+            checks += 1
+            return checks > 1
+        })
+        XCTAssertEqual(interrupted.failure, .cancelled)
+
+        // A caller's own limit is deliberate bounding, not a failure.
+        let bulk = root.appendingPathComponent("bulk", isDirectory: true)
+        try FileManager.default.createDirectory(at: bulk, withIntermediateDirectories: true)
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            try "x".write(to: bulk.appendingPathComponent(name), atomically: true, encoding: .utf8)
+        }
+        let bounded = ProjectFiles.listing(of: bulk, limit: 2)
+        XCTAssertEqual(bounded.nodes.count, 2)
+        XCTAssertNil(bounded.failure)
+    }
+
+    func testDirectoryLoadFailuresCarryTheirOwnDiagnostic() throws {
+        let failures: [ProjectFiles.DirectoryLoadFailure] = [
+            .permissionDenied, .missing, .notDirectory, .cancelled, .ioFailure(code: EIO),
+        ]
+        for failure in failures {
+            XCTAssertFalse(failure.summary.isEmpty)
+            XCTAssertFalse(failure.diagnostic.isEmpty)
+        }
+        XCTAssertEqual(Set(failures.map(\.summary)).count, failures.count)
+
+        let reason = String(cString: try XCTUnwrap(strerror(EIO)))
+        XCTAssertTrue(
+            ProjectFiles.DirectoryLoadFailure.ioFailure(code: EIO).diagnostic.contains(reason)
+        )
+        XCTAssertFalse(
+            ProjectFiles.DirectoryLoadFailure.ioFailure(code: 0).diagnostic.contains(reason)
+        )
+    }
+
+    @MainActor
+    func testWorkspaceTreeModelPublishesUnreadableFoldersAndRetryClearsThem() async throws {
+        let locked = try makeUnreadableFolder(named: "locked")
+        let tree = WorkspaceTreeModel(root: root)
+
+        tree.load(locked)
+        let published = await settledListing(from: tree, of: locked)
+        let failed = try XCTUnwrap(published)
+        XCTAssertEqual(failed.failure, .permissionDenied)
+        XCTAssertEqual(tree.children(of: locked), [])
+        XCTAssertEqual(tree.loadFailure(for: locked), .permissionDenied)
+
+        // Retry is the inline affordance the row offers: fix the folder, load
+        // it again, and the rail goes back to an ordinary quiet listing.
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: locked.path)
+        tree.load(locked, force: true)
+        let retried = await settledListing(from: tree, of: locked, matching: { $0.failure == nil })
+        let recovered = try XCTUnwrap(retried)
+        XCTAssertEqual(recovered.nodes.map(\.name), ["notes.md"])
+        XCTAssertNil(tree.loadFailure(for: locked))
+
+        // A genuinely empty folder still publishes nothing to complain about.
+        let empty = root.appendingPathComponent("empty", isDirectory: true)
+        try FileManager.default.createDirectory(at: empty, withIntermediateDirectories: true)
+        tree.load(empty)
+        let publishedEmpty = await settledListing(from: tree, of: empty)
+        let emptyListing = try XCTUnwrap(publishedEmpty)
+        XCTAssertTrue(emptyListing.isEmptyAndReadable)
+        XCTAssertNil(tree.loadFailure(for: empty))
+    }
+
+    /// Poll the model's published snapshot until its background load lands.
+    @MainActor
+    private func settledListing(
+        from tree: WorkspaceTreeModel,
+        of directory: URL,
+        timeout: TimeInterval = 5,
+        matching isSettled: (ProjectFiles.DirectoryListing) -> Bool = { _ in true }
+    ) async -> ProjectFiles.DirectoryListing? {
+        let key = directory.standardizedFileURL.path
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            if let listing = tree.listingsByDirectory[key], isSettled(listing) {
+                return listing
+            }
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        return nil
     }
 
     func testSyntaxHighlighterAppKitPathClampsOutOfRangeSpanInsteadOfThrowing() {

@@ -648,9 +648,6 @@ enum PDFPreviewViewConfiguration {
         view.pageShadowsEnabled = true
         view.backgroundColor = .underPageBackgroundColor
         view.document = document
-        if document != nil {
-            view.layoutDocumentView()
-        }
     }
 }
 
@@ -872,7 +869,6 @@ final class PDFPreviewBudgetRunner {
         let scroll: PDFPreviewScrollMetrics?
         if specification.measuresSustainedScroll {
             view.go(to: firstPage)
-            view.layoutDocumentView()
             try? await Task.sleep(for: .milliseconds(250))
             scroll = await PDFPreviewScrollProbe(
                 view: view,

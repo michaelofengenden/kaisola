@@ -242,16 +242,28 @@ final class PDFPreviewBudgetTests: XCTestCase {
         )
         let generated = try PDFPreviewBudgetFixtureWriter.write(specification, to: root)
         let document = try XCTUnwrap(PDFDocumentIO.load(url: generated.url)?.value)
+        let replacement = try XCTUnwrap(PDFDocumentIO.load(url: generated.url)?.value)
         let view = PDFView(frame: NSRect(x: 0, y: 0, width: 1_000, height: 720))
 
         PDFPreviewViewConfiguration.install(document: document, in: view)
 
         XCTAssertTrue(view.document === document)
+        XCTAssertNotNil(view.documentView)
         XCTAssertTrue(view.autoScales)
         XCTAssertEqual(view.displayMode, .singlePageContinuous)
         XCTAssertEqual(view.displayDirection, .vertical)
         XCTAssertTrue(view.displaysPageBreaks)
         XCTAssertTrue(view.pageShadowsEnabled)
+        XCTAssertGreaterThan(view.maxScaleFactor, view.minScaleFactor)
+
+        PDFPreviewViewConfiguration.install(document: replacement, in: view)
+
+        XCTAssertFalse(replacement === document)
+        XCTAssertTrue(view.document === replacement)
+        XCTAssertNotNil(view.documentView)
+        XCTAssertTrue(view.autoScales)
+        XCTAssertEqual(view.displayMode, .singlePageContinuous)
+        XCTAssertEqual(view.displayDirection, .vertical)
 
         PDFFilePreview.dismantleNSView(view, coordinator: ())
         XCTAssertNil(view.document)

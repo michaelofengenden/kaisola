@@ -335,6 +335,41 @@ test('installed paging waits for PDFKit page draw completion instead of page sel
   )
 })
 
+test('product and gate rely on PDFKit automatic layout without eager relayout', () => {
+  const budget = fs.readFileSync(path.resolve(
+    __dirname,
+    '../../native/KaisolaMac/Kaisola/Features/Workspace/PDFPreviewBudget.swift',
+  ), 'utf8')
+  const editors = fs.readFileSync(path.resolve(
+    __dirname,
+    '../../native/KaisolaMac/Kaisola/Features/Workspace/FilePreviewEditors.swift',
+  ), 'utf8')
+
+  const configurationStart = budget.indexOf('enum PDFPreviewViewConfiguration')
+  const pageStart = budget.indexOf('final class PDFPreviewBudgetPage')
+  assert.ok(configurationStart >= 0 && pageStart > configurationStart)
+  const configuration = budget.slice(configurationStart, pageStart)
+  assert.match(configuration, /view\.autoScales = true/u)
+  assert.match(configuration, /view\.displayMode = \.singlePageContinuous/u)
+  assert.match(configuration, /view\.displayDirection = \.vertical/u)
+  assert.match(configuration, /view\.document = document/u)
+  assert.doesNotMatch(configuration, /layoutDocumentView\(\)/u)
+
+  const measureStart = budget.indexOf('private func measure(')
+  const windowStart = budget.indexOf('private func makeWindowIfNeeded', measureStart)
+  assert.ok(measureStart >= 0 && windowStart > measureStart)
+  const measure = budget.slice(measureStart, windowStart)
+  assert.match(measure, /PDFPreviewViewConfiguration\.install\(document: document, in: view\)/u)
+  assert.match(
+    measure,
+    /view\.go\(to: firstPage\)\s+try\? await Task\.sleep\(for: \.milliseconds\(250\)\)/u,
+  )
+  assert.doesNotMatch(measure, /layoutDocumentView\(\)/u)
+
+  assert.match(editors, /PDFPreviewViewConfiguration\.install\(document: document, in: view\)/u)
+  assert.doesNotMatch(editors, /layoutDocumentView\(\)/u)
+})
+
 test('stderr is fail-closed except for exact fixture-scoped framework notices', () => {
   const persistence = '2026-08-08 22:26:13.078 Kaisola[2862:7385610] ApplePersistenceIgnoreState: Existing state will not be touched. New state will be written to /tmp/com.kaisola.mac.savedState'
   const malformed = 'CoreGraphics PDF has logged an error. Set environment variable "CG_PDF_VERBOSE" to learn more.'

@@ -411,6 +411,51 @@ struct ExtensionSettingsItem: Equatable, Sendable {
         )
     }
 
+    static func languageGrammarRegistryIssue(_ state: CustomGrammarStore.LoadState) -> Self {
+        let integrity: String
+        let updates: String
+        let message: String
+        switch state {
+        case let .corrupt(.preserved(url)):
+            integrity = "Unreadable registry preserved"
+            updates = "Reset explicitly to repair"
+            message = "Kaisola preserved the unreadable registry as \(url.lastPathComponent). Last-known-good grammars remain active for this run; review the recovery copy, then reset explicitly to change grammars."
+        case .corrupt(.failed):
+            integrity = "Unreadable registry not preserved"
+            updates = "Resolve storage access before reset"
+            message = "Kaisola could not preserve the unreadable grammar registry. Last-known-good grammars remain active for this run; resolve storage access before recovery."
+        case let .newerVersion(version, .preserved(url)):
+            integrity = "Newer registry v\(version) preserved"
+            updates = "Reset explicitly to replace"
+            message = "This grammar registry uses schema v\(version), which is newer than Kaisola supports. It was preserved as \(url.lastPathComponent), and last-known-good grammars remain active for this run."
+        case let .newerVersion(version, .failed):
+            integrity = "Newer registry v\(version) not preserved"
+            updates = "Resolve storage access before reset"
+            message = "This grammar registry uses unsupported schema v\(version), and Kaisola could not create a recovery copy. Last-known-good grammars remain active for this run."
+        case .ioFailure:
+            integrity = "Registry unavailable"
+            updates = "Resolve storage access to continue"
+            message = "Kaisola could not read the language-grammar registry. The file was not changed, and last-known-good grammars remain active for this run."
+        case .missing, .ready:
+            integrity = "Registry ready"
+            updates = "Local · no remote updates"
+            message = "The language-grammar registry is ready."
+        }
+
+        return Self(
+            id: CustomGrammarStore.registryIssueID,
+            category: .languageGrammars,
+            name: "Language grammar registry",
+            detail: "Recovery required before custom grammars can change",
+            status: .disabled("Needs attention"),
+            source: .user,
+            versionIntegrity: integrity,
+            scope: .appWide,
+            updateState: .manual(updates),
+            validationMessage: message
+        )
+    }
+
     static func previewMapping(_ spec: PreviewMappingSpec) -> Self {
         let validation = spec.validationError
         return Self(
@@ -501,7 +546,11 @@ enum ExtensionsSettingsCatalog {
         if !themeSnapshot.state.allowsMutations {
             customThemes.append(.customThemeRegistryIssue(themeSnapshot.state))
         }
-        let grammars = CustomGrammarStore().specs().map(ExtensionSettingsItem.languageGrammar)
+        let grammarSnapshot = CustomGrammarStore().load()
+        var grammars = grammarSnapshot.specs.map(ExtensionSettingsItem.languageGrammar)
+        if !grammarSnapshot.state.allowsMutations {
+            grammars.append(.languageGrammarRegistryIssue(grammarSnapshot.state))
+        }
         let mappingSnapshot = PreviewMappingStore().load()
         var mappings = mappingSnapshot.specs.map(ExtensionSettingsItem.previewMapping)
         if !mappingSnapshot.state.allowsMutations {

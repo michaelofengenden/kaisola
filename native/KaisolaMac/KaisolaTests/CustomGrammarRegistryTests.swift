@@ -47,7 +47,7 @@ final class CustomGrammarRegistryTests: XCTestCase {
 
     func testACustomGrammarHighlightsItsOwnExtensionAndFence() throws {
         let store = try temporaryStore()
-        XCTAssertNil(store.upsert(tomlGrammar()))
+        XCTAssertNil(try store.upsert(tomlGrammar()))
 
         let byExtension = SyntaxHighlighter.grammar(forExtension: "TOML", store: store)
         XCTAssertEqual(byExtension, .custom(id: "toml", rules: []))
@@ -74,7 +74,7 @@ final class CustomGrammarRegistryTests: XCTestCase {
         let store = try temporaryStore()
         var greedy = tomlGrammar()
         greedy.extensions = ["swift"]
-        let reason = store.upsert(greedy)
+        let reason = try store.upsert(greedy)
         XCTAssertTrue(reason?.contains("built-in") == true, String(describing: reason))
         XCTAssertEqual(SyntaxHighlighter.grammar(forExtension: "swift", store: store), .shipped(.swift))
     }
@@ -106,7 +106,7 @@ final class CustomGrammarRegistryTests: XCTestCase {
         let store = try temporaryStore()
         var broken = tomlGrammar()
         broken.rules[0].pattern = "([unclosed"
-        XCTAssertNotNil(store.upsert(broken))
+        XCTAssertNotNil(try store.upsert(broken))
         XCTAssertEqual(store.specs().count, 1)
         XCTAssertNil(SyntaxHighlighter.grammar(forExtension: "toml", store: store))
     }
@@ -116,10 +116,188 @@ final class CustomGrammarRegistryTests: XCTestCase {
     func testTheCacheFollowsStoreChanges() throws {
         let store = try temporaryStore()
         XCTAssertNil(SyntaxHighlighter.grammar(forExtension: "toml", store: store))
-        store.upsert(tomlGrammar())
+        try store.upsert(tomlGrammar())
         XCTAssertNotNil(SyntaxHighlighter.grammar(forExtension: "toml", store: store))
-        store.remove(id: "toml")
+        try store.remove(id: "toml")
         XCTAssertNil(SyntaxHighlighter.grammar(forExtension: "toml", store: store))
+    }
+
+    func testMissingVersionedAndLegacyStatesAreDistinctAndMigrateOnSave() throws {
+        let store = try temporaryStore()
+        XCTAssertEqual(store.load(), .init(specs: [], state: .missing))
+
+        let legacySpec = tomlGrammar()
+        let legacy = try JSONEncoder().encode(["grammars": [legacySpec]])
+        try legacy.write(to: store.fileURL)
+        XCTAssertEqual(
+            store.load(),
+            .init(specs: [legacySpec], state: .ready(schemaVersion: 0))
+        )
+
+        var second = tomlGrammar()
+        second.id = "hcl"
+        second.title = "HCL"
+        second.extensions = ["hcl"]
+        second.fences = ["hcl"]
+        try store.upsert(second)
+        let object = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(contentsOf: store.fileURL)) as? [String: Any]
+        )
+        XCTAssertEqual(object["version"] as? Int, CustomGrammarStore.schemaVersion)
+        XCTAssertEqual((object["grammars"] as? [[String: Any]])?.count, 2)
+    }
+
+    func testMalformedPartialRegistryIsPreservedAndLastKnownGoodGrammarStaysLive() throws {
+        let store = try temporaryStore()
+        let baseline = tomlGrammar()
+        try store.upsert(baseline)
+        XCTAssertEqual(store.load().specs, [baseline])
+
+        let encoded = try JSONEncoder().encode(baseline)
+        let validObject = try XCTUnwrap(try JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        let malformedObject: [String: Any] = [
+            "version": CustomGrammarStore.schemaVersion,
+            "grammars": [validObject, ["id": "structurally-broken"]],
+        ]
+        let malformed = try JSONSerialization.data(withJSONObject: malformedObject, options: [.sortedKeys])
+        try malformed.write(to: store.fileURL)
+
+        let snapshot = store.load()
+        guard case let .corrupt(.preserved(copyURL)) = snapshot.state else {
+            return XCTFail("One undecodable grammar must quarantine the complete registry")
+        }
+        XCTAssertEqual(snapshot.specs, [baseline])
+        XCTAssertEqual(try Data(contentsOf: copyURL), malformed)
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), malformed)
+        XCTAssertNotNil(SyntaxHighlighter.grammar(forExtension: "toml", store: store))
+        XCTAssertThrowsError(try store.upsert(tomlGrammar()))
+        XCTAssertThrowsError(try store.remove(id: baseline.id))
+
+        let reset = try store.resetUnreadableRegistry()
+        XCTAssertEqual(
+            reset,
+            .init(specs: [], state: .ready(schemaVersion: CustomGrammarStore.schemaVersion))
+        )
+        XCTAssertEqual(try Data(contentsOf: copyURL), malformed)
+    }
+
+    func testRepeatedMalformedReadsReuseOnePrivateRecoveryCopy() throws {
+        let store = try temporaryStore()
+        let malformed = Data("not json at all".utf8)
+        try malformed.write(to: store.fileURL)
+
+        let first = try XCTUnwrap(store.load().state.preservedCopyURL)
+        let second = try XCTUnwrap(store.load().state.preservedCopyURL)
+        XCTAssertEqual(first, second)
+        XCTAssertEqual(try Data(contentsOf: first), malformed)
+
+        let siblings = try FileManager.default.contentsOfDirectory(
+            atPath: store.fileURL.deletingLastPathComponent().path
+        )
+        XCTAssertEqual(siblings.count, 2, "Expected the registry and exactly one recovery copy")
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: first.path)
+        let permissions = try XCTUnwrap(attributes[.posixPermissions] as? NSNumber)
+        XCTAssertEqual(permissions.intValue & 0o777, 0o600)
+    }
+
+    func testDamagedRecoveryCopyFailsClosedAndCannotAuthorizeReset() throws {
+        let store = try temporaryStore()
+        let baseline = tomlGrammar()
+        try store.upsert(baseline)
+        _ = store.load()
+        let malformed = Data("not-json".utf8)
+        try malformed.write(to: store.fileURL)
+        let first = store.load()
+        let copyURL = try XCTUnwrap(first.state.preservedCopyURL)
+        try Data("different".utf8).write(to: copyURL)
+
+        let second = store.load()
+        guard case .corrupt(.failed) = second.state else {
+            return XCTFail("A mismatched recovery copy must fail closed, got \(second.state)")
+        }
+        XCTAssertEqual(second.specs, [baseline])
+        XCTAssertFalse(second.state.canReset)
+        XCTAssertThrowsError(try store.resetUnreadableRegistry())
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), malformed)
+    }
+
+    func testFutureSchemaIsPreservedWithoutDowngradingRuntimeGrammar() throws {
+        let store = try temporaryStore()
+        let baseline = tomlGrammar()
+        try store.upsert(baseline)
+        _ = store.load()
+
+        let future = Data(#"{"version":42,"grammars":[],"futurePolicy":{"mode":"sealed"}}"#.utf8)
+        try future.write(to: store.fileURL)
+        let snapshot = store.load()
+        guard case let .newerVersion(version, .preserved(copyURL)) = snapshot.state else {
+            return XCTFail("Expected preserved future schema, got \(snapshot.state)")
+        }
+        XCTAssertEqual(version, 42)
+        XCTAssertEqual(snapshot.specs, [baseline])
+        XCTAssertEqual(try Data(contentsOf: copyURL), future)
+        XCTAssertThrowsError(try store.save([]))
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), future)
+    }
+
+    func testIOReadFailureKeepsRuntimeGrammarButCannotOfferDestructiveReset() throws {
+        let store = try temporaryStore()
+        let baseline = tomlGrammar()
+        try store.upsert(baseline)
+        _ = store.load()
+        try FileManager.default.removeItem(at: store.fileURL)
+        try FileManager.default.createDirectory(at: store.fileURL, withIntermediateDirectories: false)
+
+        let snapshot = store.load()
+        guard case .ioFailure = snapshot.state else {
+            return XCTFail("A directory at the registry path must be an I/O failure")
+        }
+        XCTAssertEqual(snapshot.specs, [baseline])
+        XCTAssertFalse(snapshot.state.canReset)
+        XCTAssertThrowsError(try store.resetUnreadableRegistry())
+        XCTAssertThrowsError(try store.upsert(baseline))
+    }
+
+    func testDurableWriteFailureIsVisibleAndLeavesRegistryUntouched() throws {
+        let store = try temporaryStore()
+        let baseline = tomlGrammar()
+        try store.upsert(baseline)
+        let before = try Data(contentsOf: store.fileURL)
+        let directory = store.fileURL.deletingLastPathComponent()
+
+        XCTAssertEqual(chmod(directory.path, 0o500), 0)
+        defer { _ = chmod(directory.path, 0o700) }
+        var lost = baseline
+        lost.id = "lost"
+        lost.title = "Lost"
+        lost.extensions = ["lost"]
+        XCTAssertThrowsError(try store.upsert(lost)) { error in
+            XCTAssertEqual(
+                error.localizedDescription,
+                "Kaisola could not save language grammars. The existing registry was left unchanged."
+            )
+        }
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), before)
+        XCTAssertEqual(store.specs(), [baseline])
+    }
+
+    func testOversizedBulkSaveIsRejectedWithoutTruncatingOrReplacingTheRegistry() throws {
+        let store = try temporaryStore()
+        let baseline = tomlGrammar()
+        try store.save([baseline])
+        let before = try Data(contentsOf: store.fileURL)
+        let oversized = (0..<17).map { index -> CustomGrammarSpec in
+            var spec = baseline
+            spec.id = "grammar-\(index)"
+            spec.title = "Grammar \(index)"
+            spec.extensions = ["g\(index)"]
+            return spec
+        }
+
+        XCTAssertThrowsError(try store.save(oversized))
+        XCTAssertEqual(store.specs(), [baseline])
+        XCTAssertEqual(try Data(contentsOf: store.fileURL), before)
     }
 }
 

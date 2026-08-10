@@ -408,6 +408,98 @@ final class CompanionHostFoundationTests: XCTestCase {
         XCTAssertTrue(source.contains("CompanionPairingOfferActivation.progressLabel"))
     }
 
+    func testPairingGrantDraftIsResetAtEveryOfferBoundary() throws {
+        let source = try String(
+            contentsOf: URL(fileURLWithPath: #filePath)
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("Kaisola/Features/Settings/CompanionSettingsTab.swift"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(source.contains(
+            "@State private var pairingGrantDraft = CompanionPairingGrantDraft()"
+        ))
+        XCTAssertTrue(source.contains("let selection = pairingGrantDraft.selection"))
+        XCTAssertTrue(source.contains(
+            "allowsTerminalControl: selection.allowsTerminalControl"
+        ))
+        XCTAssertEqual(
+            source.components(separatedBy: ".disabled(pairingGrantControlsDisabled)").count - 1,
+            2,
+            "an active or in-flight offer must freeze both exact grant choices"
+        )
+        XCTAssertTrue(source.contains("pairingGrantDraft.reset(after: .offerCreationFailed)"))
+        XCTAssertGreaterThanOrEqual(
+            source.components(separatedBy: "pairingGrantDraft.reset(after: .cancelled)").count - 1,
+            3,
+            "cancel, host loss, and owned confirmation failure must all clear grants"
+        )
+        XCTAssertTrue(source.contains("pairingGrantDraft.reset(after: .confirmed)"))
+        XCTAssertTrue(source.contains("pairingGrantDraft.reset(after: .expired)"))
+        XCTAssertTrue(source.contains(".onChange(of: host.pairingPayload?.pairingNonce)"))
+        XCTAssertTrue(source.contains(".task(id: host.pairingPayload)"))
+        XCTAssertTrue(source.contains("CompanionPairingOfferExpiryFence(payload: payload)"))
+    }
+
+    func testPairingGrantDraftDefaultsToViewOnlyAndSnapshotsExactOptIn() {
+        var draft = CompanionPairingGrantDraft()
+        XCTAssertEqual(
+            draft.selection,
+            CompanionPairingGrantSelection(
+                allowsAgentControl: false,
+                allowsTerminalControl: false
+            )
+        )
+
+        draft.allowsAgentControl = true
+        draft.allowsTerminalControl = true
+        let optedIn = draft.selection
+        draft.allowsAgentControl = false
+        draft.allowsTerminalControl = false
+
+        XCTAssertEqual(
+            optedIn,
+            CompanionPairingGrantSelection(
+                allowsAgentControl: true,
+                allowsTerminalControl: true
+            ),
+            "offer creation must use the synchronous selection, not later toggle mutations"
+        )
+    }
+
+    func testPairingGrantDraftResetsAfterEveryTerminalTransition() {
+        XCTAssertEqual(
+            Set(CompanionPairingGrantDraft.ResetReason.allCases),
+            [.offerCreationFailed, .cancelled, .confirmed, .expired]
+        )
+        for reason in CompanionPairingGrantDraft.ResetReason.allCases {
+            var draft = CompanionPairingGrantDraft(
+                allowsAgentControl: true,
+                allowsTerminalControl: true
+            )
+            draft.reset(after: reason)
+            XCTAssertEqual(
+                draft.selection,
+                CompanionPairingGrantSelection(
+                    allowsAgentControl: false,
+                    allowsTerminalControl: false
+                ),
+                "\(reason) must return the next offer to view-only"
+            )
+        }
+    }
+
+    func testPairingGrantExpiryIsExactOfferAndGenerationFenced() {
+        let expiry = CompanionPairingOfferExpiryFence(
+            pairingNonce: "pairing-old",
+            expiresAt: 12_000
+        )
+        XCTAssertTrue(expiry.matches(pairingNonce: "pairing-old", expiresAt: 12_000))
+        XCTAssertFalse(expiry.matches(pairingNonce: nil, expiresAt: nil))
+        XCTAssertFalse(expiry.matches(pairingNonce: "pairing-new", expiresAt: 12_000))
+        XCTAssertFalse(expiry.matches(pairingNonce: "pairing-old", expiresAt: 13_000))
+    }
+
     func testPairingConfirmationRendersOneGatedProgressAndFailureRestartState() throws {
         let source = try String(
             contentsOf: URL(fileURLWithPath: #filePath)

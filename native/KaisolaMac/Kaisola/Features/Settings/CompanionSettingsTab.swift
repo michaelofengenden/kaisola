@@ -28,12 +28,64 @@ enum CompanionPairingOfferAccessibility {
     static let allControlIdentifiers = [code, qrCode, copy, cancel]
 }
 
+struct CompanionPairingGrantSelection: Equatable, Sendable {
+    let allowsAgentControl: Bool
+    let allowsTerminalControl: Bool
+}
+
+/// Holds only the explicit grants for the next single-use offer. Every way an
+/// offer can end erases both elevated capabilities, so a later phone always
+/// starts from view-only rather than inheriting a previous decision.
+struct CompanionPairingGrantDraft: Equatable, Sendable {
+    enum ResetReason: CaseIterable, Hashable, Sendable {
+        case offerCreationFailed
+        case cancelled
+        case confirmed
+        case expired
+    }
+
+    var allowsAgentControl = false
+    var allowsTerminalControl = false
+
+    var selection: CompanionPairingGrantSelection {
+        CompanionPairingGrantSelection(
+            allowsAgentControl: allowsAgentControl,
+            allowsTerminalControl: allowsTerminalControl
+        )
+    }
+
+    mutating func reset(after _: ResetReason) {
+        allowsAgentControl = false
+        allowsTerminalControl = false
+    }
+}
+
+/// Fences the delayed expiry reset to the exact offer and expiry generation.
+/// A cancelled sleep or a late wake-up cannot erase choices made for a newer
+/// offer, even if stale work survives a SwiftUI task replacement.
+struct CompanionPairingOfferExpiryFence: Equatable, Sendable {
+    let pairingNonce: String
+    let expiresAt: Int64
+
+    init(pairingNonce: String, expiresAt: Int64) {
+        self.pairingNonce = pairingNonce
+        self.expiresAt = expiresAt
+    }
+
+    init(payload: CompanionPairingPayload) {
+        self.init(pairingNonce: payload.pairingNonce, expiresAt: payload.expiresAt)
+    }
+
+    func matches(pairingNonce: String?, expiresAt: Int64?) -> Bool {
+        pairingNonce == self.pairingNonce && expiresAt == self.expiresAt
+    }
+}
+
 struct CompanionSettingsTab: View {
     @ObservedObject private var host = CompanionHost.shared
     @StateObject private var offerActivation = CompanionPairingOfferActivation()
     @StateObject private var confirmationActivation = CompanionPairingConfirmationActivation()
-    @State private var allowsAgentControl = false
-    @State private var allowsTerminalControl = false
+    @State private var pairingGrantDraft = CompanionPairingGrantDraft()
     @State private var operationError: String?
     @State private var pendingRevocation: CompanionPairedDeviceRecord?
     @State private var capabilityUpdates: Set<String> = []
@@ -98,10 +150,11 @@ struct CompanionSettingsTab: View {
                             detail: "Lets this phone message, stop, and approve agents",
                             symbol: "bubble.left.and.bubble.right"
                         ) {
-                            Toggle("", isOn: $allowsAgentControl)
+                            Toggle("", isOn: $pairingGrantDraft.allowsAgentControl)
                                 .labelsHidden()
                                 .toggleStyle(.switch)
                                 .accessibilityLabel("Allow agent control")
+                                .disabled(pairingGrantControlsDisabled)
                         }
                         SettingsDivider()
                         SettingsRow(
@@ -109,10 +162,11 @@ struct CompanionSettingsTab: View {
                             detail: "Lets this phone type into shells running as you",
                             symbol: "keyboard"
                         ) {
-                            Toggle("", isOn: $allowsTerminalControl)
+                            Toggle("", isOn: $pairingGrantDraft.allowsTerminalControl)
                                 .labelsHidden()
                                 .toggleStyle(.switch)
                                 .accessibilityLabel("Allow terminal control")
+                                .disabled(pairingGrantControlsDisabled)
                         }
                         SettingsDivider()
                         VStack(spacing: 0) {
@@ -352,9 +406,18 @@ struct CompanionSettingsTab: View {
             if case .ready = state { return }
             offerActivation.discard()
             confirmationActivation.discard()
+            pairingGrantDraft.reset(after: .cancelled)
         }
         .onChange(of: host.pairingPhrase?.pairingID) { _, pairingID in
             confirmationActivation.reconcile(pairingID: pairingID)
+        }
+        .onChange(of: host.pairingPayload?.pairingNonce) { previous, current in
+            guard previous != nil, current == nil else { return }
+            pairingGrantDraft.reset(after: .confirmed)
+        }
+        .task(id: host.pairingPayload) {
+            guard let payload = host.pairingPayload else { return }
+            await resetPairingGrantDraft(atExpiryOf: payload)
         }
         .confirmationDialog(
             "Revoke \(pendingRevocation?.displayName ?? "Device")?",
@@ -417,18 +480,24 @@ struct CompanionSettingsTab: View {
             : "Create a single-use code"
     }
 
+    private var pairingGrantControlsDisabled: Bool {
+        offerActivation.isCreating || host.pairingCode != nil
+    }
+
     private func createOffer() {
         guard let attempt = offerActivation.begin() else { return }
+        let selection = pairingGrantDraft.selection
         operationError = nil
         Task {
             do {
                 try await host.createPairingOffer(
-                    allowsAgentControl: allowsAgentControl,
-                    allowsTerminalControl: allowsTerminalControl
+                    allowsAgentControl: selection.allowsAgentControl,
+                    allowsTerminalControl: selection.allowsTerminalControl
                 )
                 offerActivation.finish(attempt)
             } catch {
                 guard offerActivation.finish(attempt) else { return }
+                pairingGrantDraft.reset(after: .offerCreationFailed)
                 operationError = error.localizedDescription
             }
         }
@@ -437,7 +506,26 @@ struct CompanionSettingsTab: View {
     private func cancelPairing() {
         offerActivation.discard()
         confirmationActivation.discard()
+        pairingGrantDraft.reset(after: .cancelled)
         host.cancelPairing()
+    }
+
+    private func resetPairingGrantDraft(
+        atExpiryOf payload: CompanionPairingPayload
+    ) async {
+        let fence = CompanionPairingOfferExpiryFence(payload: payload)
+        let expiry = Date(timeIntervalSince1970: Double(fence.expiresAt) / 1_000)
+        let delay = max(0, expiry.timeIntervalSinceNow)
+        if delay > 0 {
+            do { try await Task.sleep(for: .seconds(delay)) }
+            catch { return }
+        }
+        guard !Task.isCancelled,
+              fence.matches(
+                  pairingNonce: host.pairingPayload?.pairingNonce,
+                  expiresAt: host.pairingPayload?.expiresAt
+              ) else { return }
+        pairingGrantDraft.reset(after: .expired)
     }
 
     private func confirmPairing() {
@@ -456,6 +544,7 @@ struct CompanionSettingsTab: View {
                 guard confirmationActivation.fail(attempt) else { return }
                 host.cancelPairing()
                 operationError = CompanionPairingConfirmationActivation.failureMessage(error)
+                pairingGrantDraft.reset(after: .cancelled)
             }
         }
     }

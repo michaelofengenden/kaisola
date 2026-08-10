@@ -329,7 +329,9 @@ final class AppModel: ObservableObject {
     /// Keep individual broker writes below the documented node-pty boundary.
     /// Ordinary keystrokes stay one packet; an intentional large paste is
     /// streamed in UTF-8-safe chunks and exposes acknowledged progress.
-    nonisolated static let terminalWritePayloadByteLimit = BrokerWire.terminalWritePayloadBytes
+    nonisolated static var terminalWritePayloadByteLimit: Int {
+        BrokerWire.terminalWritePayloadBytes
+    }
     private var nextTerminalPasteGeneration: UInt64 = 0
     private var terminalPasteGenerationByTerminalID: [String: UInt64] = [:]
     @Published private(set) var terminalPasteProgressByTerminalID: [String: TerminalPasteProgress] = [:]

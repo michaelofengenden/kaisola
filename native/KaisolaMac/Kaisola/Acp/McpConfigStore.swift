@@ -71,11 +71,13 @@ struct McpSecretVault: Sendable {
     let write: @Sendable (String, String) throws -> Void
     let delete: @Sendable (String) throws -> Void
 
-    static let keychain = McpSecretVault(
-        read: McpOAuthKeychain.read,
-        write: McpOAuthKeychain.write,
-        delete: McpOAuthKeychain.delete
-    )
+    static var keychain: McpSecretVault {
+        McpSecretVault(
+            read: McpOAuthKeychain.read,
+            write: McpOAuthKeychain.write,
+            delete: McpOAuthKeychain.delete
+        )
+    }
 }
 
 private enum McpOAuthKeychain {

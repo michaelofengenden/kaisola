@@ -5,8 +5,8 @@ import KaisolaBrokerProtocol
 
 struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
     static let generationMetadataDirectoryName = "generations"
-    static let defaultMaximumLiveTerminals = BrokerWire.defaultMaximumLiveTerminals
-    static let maximumConfigurableLiveTerminals = BrokerWire.maximumConfigurableLiveTerminals
+    static var defaultMaximumLiveTerminals: Int { BrokerWire.defaultMaximumLiveTerminals }
+    static var maximumConfigurableLiveTerminals: Int { BrokerWire.maximumConfigurableLiveTerminals }
 
     let protocolVersion: Int
     let securityEpoch: Int

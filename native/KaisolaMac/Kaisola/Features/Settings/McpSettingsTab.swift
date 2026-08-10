@@ -39,7 +39,7 @@ struct McpSettingsTab: View {
 /// catalog cap here prevents UI state from ever getting ahead of what the
 /// bounded store can persist.
 enum McpSettingsPolicy {
-    private static let nameComparisonLocale = Locale(identifier: "en_US_POSIX")
+    private static var nameComparisonLocale: Locale { Locale(identifier: "en_US_POSIX") }
 
     static let changeScopeTitle = "New chats only"
     static let storedSecretMarker = "<stored in Keychain>"

@@ -26,28 +26,40 @@ struct AcpRunProfile: Codable, Equatable, Hashable, Identifiable, Sendable {
     }
 
     static let allMCPServersID = "*"
-    static let write = AcpRunProfile(
-        id: "write",
-        name: "Write",
-        modelID: nil,
-        enabledClientToolIDs: ClientTool.allCases.map(\.rawValue),
-        enabledMCPServerNames: [allMCPServersID]
-    )
-    static let ask = AcpRunProfile(
-        id: "ask",
-        name: "Ask",
-        modelID: nil,
-        enabledClientToolIDs: [ClientTool.readTextFile.rawValue],
-        enabledMCPServerNames: [allMCPServersID]
-    )
-    static let minimal = AcpRunProfile(
-        id: "minimal",
-        name: "Minimal",
-        modelID: nil,
-        enabledClientToolIDs: [],
-        enabledMCPServerNames: []
-    )
-    static let builtIns = [write, ask, minimal]
+    // Xcode 16.4 / Swift 6.1 can crash while lowering these value-only lazy
+    // globals under whole-module compilation. Computed values are equivalent
+    // here: profiles are immutable value snapshots with stable explicit IDs.
+    static var write: AcpRunProfile {
+        AcpRunProfile(
+            id: "write",
+            name: "Write",
+            modelID: nil,
+            enabledClientToolIDs: ClientTool.allCases.map(\.rawValue),
+            enabledMCPServerNames: [allMCPServersID]
+        )
+    }
+
+    static var ask: AcpRunProfile {
+        AcpRunProfile(
+            id: "ask",
+            name: "Ask",
+            modelID: nil,
+            enabledClientToolIDs: [ClientTool.readTextFile.rawValue],
+            enabledMCPServerNames: [allMCPServersID]
+        )
+    }
+
+    static var minimal: AcpRunProfile {
+        AcpRunProfile(
+            id: "minimal",
+            name: "Minimal",
+            modelID: nil,
+            enabledClientToolIDs: [],
+            enabledMCPServerNames: []
+        )
+    }
+
+    static var builtIns: [AcpRunProfile] { [write, ask, minimal] }
 
     let id: String
     var name: String
@@ -530,7 +542,9 @@ struct AcpModelFallback: Equatable, Sendable {
 extension Notification.Name {
     /// Window-scoped through `object: AppModel`; another window must not open
     /// Settings when this conversation requests provider recovery.
-    static let kaisolaOpenProviderSettings = Notification.Name("kaisola.openProviderSettings")
+    static var kaisolaOpenProviderSettings: Notification.Name {
+        Notification.Name("kaisola.openProviderSettings")
+    }
 }
 
 enum AcpProviderSettingsNotificationKey {

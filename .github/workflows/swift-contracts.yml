@@ -20,6 +20,8 @@ on:
   push:
     branches: [main]
     paths:
+      - '.github/workflows/release-candidate.yml'
+      - '.github/workflows/release.yml'
       - '.github/workflows/swift-contracts.yml'
       - 'native/**'
       - 'mobile/KaisolaCompanion/**'
@@ -28,10 +30,13 @@ on:
       - 'tests/**'
       - 'scripts/download-native-node-runtime.cjs'
       - 'scripts/native-*.cjs'
+      - 'scripts/release-fast.cjs'
       - 'package.json'
       - 'package-lock.json'
   pull_request:
     paths:
+      - '.github/workflows/release-candidate.yml'
+      - '.github/workflows/release.yml'
       - '.github/workflows/swift-contracts.yml'
       - 'native/**'
       - 'mobile/KaisolaCompanion/**'
@@ -40,6 +45,7 @@ on:
       - 'tests/**'
       - 'scripts/download-native-node-runtime.cjs'
       - 'scripts/native-*.cjs'
+      - 'scripts/release-fast.cjs'
       - 'package.json'
       - 'package-lock.json'
 
@@ -80,6 +86,7 @@ jobs:
       - name: Test native packaging, compatibility, and resource policies
         run: >-
           node --test
+          tests/node/swiftContractsPaths.test.cjs
           tests/node/brokerCompatibility.test.cjs
           tests/node/companionProtocolTables.test.cjs
           tests/node/nativeAppcast.test.cjs

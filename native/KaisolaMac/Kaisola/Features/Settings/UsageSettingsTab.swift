@@ -102,6 +102,22 @@ struct UsageSettingsTab: View {
                             .accessibilityLabel("Refresh account limits")
                         }
 
+                        if let staleness = usage.planUsageStaleness {
+                            let timestamp = staleness.lastSuccessfulRefresh.formatted(
+                                date: .abbreviated,
+                                time: .shortened
+                            )
+                            Label(
+                                staleness.notice(lastUpdatedDescription: timestamp),
+                                systemImage: "exclamationmark.triangle"
+                            )
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityIdentifier("usage.plan.stale-snapshot")
+                        }
+
                         // A configured account gets a card even before its
                         // first probe returns — an account you set up should
                         // never simply be absent from this list.

@@ -343,6 +343,101 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertNil(center.planUsageError)
     }
 
+    func testTransientProviderRefreshFailureRetainsLastKnownSnapshotAndMarksItStale() async throws {
+        let lastSuccess = Date(timeIntervalSince1970: 4_000)
+        var currentTime = lastSuccess.addingTimeInterval(120)
+        let oldProviders = try UsageCenter.decodeProviderPlanUsage(Data(#"""
+        {"providers":[{
+          "provider":"codex","displayName":"Codex","ok":true,
+          "sourceLabel":"Codex CLI app-server","windows":[
+            {"label":"Weekly","usedPercent":31,"resetsAt":null}
+          ]
+        }]}
+        """#.utf8))
+        let recoveredProviders = try UsageCenter.decodeProviderPlanUsage(Data(#"""
+        {"providers":[{
+          "provider":"codex","displayName":"Codex","ok":true,
+          "sourceLabel":"Codex CLI app-server","windows":[
+            {"label":"Weekly","usedPercent":32,"resetsAt":null}
+          ]
+        }]}
+        """#.utf8))
+        let reader = UsagePlanReaderProbe(results: [
+            .failure("Provider usage is temporarily unavailable."),
+            .success(recoveredProviders),
+        ])
+        let center = UsageCenter(
+            now: { currentTime },
+            planUsageContextResolver: { _, _ in "issue-328-retained-snapshot" },
+            planUsageReader: { helperRoot, currentDirectory, environment, requests in
+                await reader.read(
+                    helperRoot: helperRoot,
+                    currentDirectory: currentDirectory,
+                    environment: environment,
+                    requests: requests
+                )
+            }
+        )
+        let workspace = URL(fileURLWithPath: "/tmp/kaisola-usage-stale", isDirectory: true)
+        await center.cachePlanUsage(
+            oldProviders,
+            workspace: workspace,
+            accountEnvironment: [:],
+            fetchedAt: lastSuccess
+        )
+
+        center.refreshPlanUsage(workspace: workspace, force: true)
+        await center.waitForPlanUsageRefresh()
+
+        XCTAssertEqual(center.planUsage, oldProviders, "a transient failure must not erase the last good reading")
+        XCTAssertEqual(center.planUsageError, "Provider usage is temporarily unavailable.")
+        XCTAssertEqual(
+            center.planUsageStaleness,
+            UsageCenter.PlanUsageStaleness(
+                error: "Provider usage is temporarily unavailable.",
+                lastSuccessfulRefresh: lastSuccess
+            )
+        )
+        XCTAssertEqual(
+            center.planUsageStaleness?.notice(lastUpdatedDescription: "Jan 1, 1970 at 1:06 AM"),
+            "Provider usage is temporarily unavailable. Showing account limits last updated Jan 1, 1970 at 1:06 AM."
+        )
+
+        center.refreshPlanUsage(workspace: workspace, force: false)
+        await center.waitForPlanUsageRefresh()
+
+        XCTAssertEqual(reader.readCount, 1, "a fresh cache lookup must not hide the prior provider failure")
+        XCTAssertEqual(center.planUsage, oldProviders)
+        XCTAssertEqual(center.planUsageStaleness?.lastSuccessfulRefresh, lastSuccess)
+
+        currentTime = lastSuccess.addingTimeInterval(240)
+        center.refreshPlanUsage(workspace: workspace, force: true)
+        await center.waitForPlanUsageRefresh()
+
+        XCTAssertEqual(center.planUsage, recoveredProviders)
+        XCTAssertNil(center.planUsageError)
+        XCTAssertNil(center.planUsageStaleness, "a successful retry must clear stale/error metadata")
+        XCTAssertEqual(reader.readCount, 2)
+    }
+
+    func testProviderRefreshFailureWithoutSnapshotDoesNotInventStaleMetadata() async {
+        let center = UsageCenter(
+            now: { Date(timeIntervalSince1970: 5_000) },
+            planUsageContextResolver: { _, _ in "issue-328-empty-context" },
+            planUsageReader: { _, _, _, _ in .failure("No provider response.") }
+        )
+
+        center.refreshPlanUsage(
+            workspace: URL(fileURLWithPath: "/tmp/kaisola-usage-empty", isDirectory: true),
+            force: true
+        )
+        await center.waitForPlanUsageRefresh()
+
+        XCTAssertTrue(center.planUsage.isEmpty)
+        XCTAssertEqual(center.planUsageError, "No provider response.")
+        XCTAssertNil(center.planUsageStaleness, "there is no last-success timestamp without a retained snapshot")
+    }
+
     func testProviderRefreshResolvesCredentialContextOffMainActorOncePerPath() async throws {
         let clock = Date(timeIntervalSince1970: 3_000)
         let probe = UsageContextResolverProbe(delay: 0.2, key: "opaque-test-context")
@@ -1217,6 +1312,36 @@ private final class UsageContextResolverProbe: @unchecked Sendable {
         lock.withLock { resolutionCount += 1 }
         Thread.sleep(forTimeInterval: delay)
         return key
+    }
+}
+
+private final class UsagePlanReaderProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var results: [ProviderPlanReadResult]
+    private var recordedReadCount = 0
+
+    init(results: [ProviderPlanReadResult]) {
+        self.results = results
+    }
+
+    var readCount: Int {
+        lock.withLock { recordedReadCount }
+    }
+
+    func read(
+        helperRoot: URL?,
+        currentDirectory: URL?,
+        environment: [String: String],
+        requests: [UsageCenter.PlanUsageRequest]
+    ) async -> ProviderPlanReadResult {
+        _ = (helperRoot, currentDirectory, environment, requests)
+        return lock.withLock {
+            recordedReadCount += 1
+            guard !results.isEmpty else {
+                return .failure("Unexpected provider usage read.")
+            }
+            return results.removeFirst()
+        }
     }
 }
 

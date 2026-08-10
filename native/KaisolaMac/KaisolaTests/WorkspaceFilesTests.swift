@@ -1131,7 +1131,14 @@ final class WorkspaceFilesTests: XCTestCase {
         await controller.loadDestinations()
         XCTAssertEqual(controller.phase, .choosing)
         XCTAssertFalse(controller.isMoving)
-        XCTAssertNotNil(controller.selectedDirectory)
+        XCTAssertNil(controller.selectedDirectory)
+        XCTAssertFalse(controller.canSubmit)
+
+        let destination = try XCTUnwrap(
+            controller.visibleDirectories.first { $0.lastPathComponent == "src" }
+        )
+        controller.select(destination)
+        XCTAssertTrue(controller.canSubmit)
 
         await controller.submit { _ in
             // While the filesystem work runs the sheet is still up, and says so.
@@ -1148,7 +1155,44 @@ final class WorkspaceFilesTests: XCTestCase {
     }
 
     @MainActor
-    func testMoveSheetSearchAndReselectionKeepAVisibleDestinationPicked() async throws {
+    func testMoveSheetRequiresAnExplicitDestinationAndAnnouncesItsRelativePath() async throws {
+        try FileManager.default.createDirectory(
+            at: root.appendingPathComponent("src/generated", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        let item = FileNode(
+            url: root.appendingPathComponent("README.md").standardizedFileURL,
+            isDirectory: false
+        )
+        let controller = WorkspaceMoveController(root: root, item: item)
+        await controller.loadDestinations()
+
+        XCTAssertNil(controller.selectedDirectory)
+        XCTAssertNil(controller.selectionAnnouncement)
+        XCTAssertFalse(controller.canSubmit)
+
+        var submitted = false
+        await controller.submit { _ in
+            submitted = true
+            return .succeeded
+        }
+        XCTAssertFalse(submitted, "Return must not move to a folder the user never chose")
+        XCTAssertFalse(controller.isFinished)
+
+        let generated = try XCTUnwrap(
+            controller.visibleDirectories.first { $0.lastPathComponent == "generated" }
+        )
+        controller.select(generated)
+        XCTAssertEqual(controller.selectedDirectory, generated)
+        XCTAssertTrue(controller.canSubmit)
+        XCTAssertEqual(
+            controller.selectionAnnouncement,
+            "Selected move destination: src/generated"
+        )
+    }
+
+    @MainActor
+    func testMoveSheetSearchNeverChangesTheExplicitDestination() async throws {
         try FileManager.default.createDirectory(
             at: root.appendingPathComponent("docs", isDirectory: true),
             withIntermediateDirectories: true
@@ -1159,12 +1203,28 @@ final class WorkspaceFilesTests: XCTestCase {
         )
         let controller = WorkspaceMoveController(root: root, item: item)
         await controller.loadDestinations()
-        XCTAssertEqual(controller.selectedDirectory?.lastPathComponent, "docs")
 
         controller.searchText = "src"
+        XCTAssertNil(controller.selectedDirectory)
+        XCTAssertNil(controller.selectedPath)
+
+        let src = try XCTUnwrap(controller.visibleDirectories.first)
+        controller.select(src)
         XCTAssertEqual(controller.selectedDirectory?.lastPathComponent, "src")
+        XCTAssertEqual(controller.selectedPath, src.path)
+
+        controller.searchText = "docs"
+        XCTAssertEqual(
+            controller.selectedPath,
+            src.path,
+            "filtering must not silently retarget the user's explicit destination"
+        )
+        XCTAssertNil(controller.selectedDirectory)
+        XCTAssertFalse(controller.canSubmit)
+
         controller.searchText = ""
-        XCTAssertEqual(controller.selectedDirectory?.lastPathComponent, "src")
+        XCTAssertEqual(controller.selectedDirectory, src)
+        XCTAssertTrue(controller.canSubmit)
 
         await controller.submit { _ in .failed("Could not move README.md.") }
         XCTAssertNotNil(controller.failureMessage)

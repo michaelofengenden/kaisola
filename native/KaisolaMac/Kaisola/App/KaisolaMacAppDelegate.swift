@@ -5132,7 +5132,7 @@ enum NativeVisualAccessibilitySnapshot {
                 label: element.accessibilityLabel(),
                 in: &snapshot
             )
-            let childGroups = [
+            let childGroups: [[Any]] = [
                 element.accessibilityChildren() ?? [],
                 element.accessibilityChildrenInNavigationOrder() ?? [],
                 element.accessibilityContents() ?? [],

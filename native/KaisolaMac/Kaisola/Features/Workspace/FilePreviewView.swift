@@ -302,7 +302,6 @@ enum FilePreviewControlAccessibility {
         ]
     }
 }
-
 /// File preview/editor pane: UTF-8 text is editable with ⌘S save + revert,
 /// markdown renders styled (with a raw-source toggle), images display, and
 /// binary/oversized files degrade to a clear notice.
@@ -379,6 +378,10 @@ struct FilePreviewView: View {
     @State private var content: FilePreviewContent = .unreadable
     @State private var draft = ""
     @State private var savedText = ""
+    /// The exact on-disk Markdown loaded for this mounted document. Autosave
+    /// advances `savedText`, but not this review baseline: the gutter remains a
+    /// useful summary of the editing session until an explicit reload.
+    @State private var markdownDiffBaseline = ""
     @State private var richDraft = NSAttributedString(string: "")
     @State private var savedRichText = NSAttributedString(string: "")
     @State private var pdfDocument: PDFDocument?
@@ -1474,6 +1477,7 @@ struct FilePreviewView: View {
                 // task list, or relative image through a lossy serializer.
                 MarkdownDocumentView(
                     source: $draft,
+                    baseline: markdownDiffBaseline,
                     documentURL: loadedURL ?? url,
                     workspaceRoot: workspaceRoot,
                     imageRevision: workspaceWatcher.changeToken,
@@ -1652,6 +1656,7 @@ struct FilePreviewView: View {
         recoveryFencedSourceTokens = []
         recoveryFenceToken = nil
         pendingEditedPreviewPromotion = nil
+        markdownDiffBaseline = ""
         let root = workspaceRoot
         let store = recoveryStore
         let ownerID = recoveryOwnerID
@@ -1694,6 +1699,11 @@ struct FilePreviewView: View {
             var restoredRecovery = false
             var recoveryMatchesDisk = false
             pdfDocument = nil
+            if case let .markdown(diskText) = snapshot.content {
+                markdownDiffBaseline = diskText
+            } else {
+                markdownDiffBaseline = ""
+            }
             switch snapshot.content {
             case let .text(text), let .markdown(text), let .html(text):
                 content = snapshot.content

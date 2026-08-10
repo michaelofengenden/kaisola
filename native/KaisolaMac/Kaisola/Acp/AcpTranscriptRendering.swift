@@ -2,6 +2,457 @@ import AppKit
 import Foundation
 import SwiftUI
 
+extension Notification.Name {
+    static let kaisolaTranscriptFindCommand = Notification.Name("kaisola.transcriptFindCommand")
+}
+
+enum AcpTranscriptFindCommand: Int, Equatable {
+    static let notificationActionKey = "action"
+
+    case show = 1
+    case next = 2
+    case previous = 3
+    case useSelection = 7
+}
+
+enum AcpTranscriptSearchDirection: Equatable {
+    case next
+    case previous
+}
+
+struct AcpTranscriptSearchMatch: Equatable, Sendable {
+    let rowID: String
+    let occurrence: Int
+}
+
+/// Builds a bounded index over exactly the transcript content the chat can
+/// render. The durable store remains complete; this view-local index never
+/// retains unbounded tool output or scans unloaded pages until asked.
+enum AcpTranscriptSearchIndex {
+    static let maximumMatches = 500
+    static let maximumSearchCharacters = 512_000
+    static let maximumQueryCharacters = 512
+
+    struct Result: Equatable, Sendable {
+        let matches: [AcpTranscriptSearchMatch]
+        let hasAdditionalMatches: Bool
+    }
+
+    static func build(query: String, rows: [AcpTranscriptRow]) -> Result {
+        let query = String(query.prefix(maximumQueryCharacters))
+        guard !query.isEmpty else { return Result(matches: [], hasAdditionalMatches: false) }
+
+        var matches: [AcpTranscriptSearchMatch] = []
+        var remainingCharacters = maximumSearchCharacters
+        var hasAdditionalMatches = false
+        for (rowIndex, row) in rows.enumerated() where remainingCharacters > 0 {
+            let source = searchableText(for: row)
+            let bounded = String(source.prefix(remainingCharacters))
+            remainingCharacters -= bounded.count
+            var occurrence = 0
+            var cursor = bounded.startIndex
+            while cursor < bounded.endIndex,
+                  let range = bounded.range(
+                      of: query,
+                      options: [.caseInsensitive, .diacriticInsensitive],
+                      range: cursor..<bounded.endIndex
+                  ) {
+                if matches.count == maximumMatches {
+                    hasAdditionalMatches = true
+                    return Result(matches: matches, hasAdditionalMatches: true)
+                }
+                matches.append(AcpTranscriptSearchMatch(rowID: row.id, occurrence: occurrence))
+                occurrence += 1
+                cursor = range.upperBound
+            }
+            if bounded.count < source.count || (remainingCharacters == 0 && rowIndex < rows.count - 1) {
+                hasAdditionalMatches = true
+            }
+        }
+        return Result(matches: matches, hasAdditionalMatches: hasAdditionalMatches)
+    }
+
+    private static func searchableText(for row: AcpTranscriptRow) -> String {
+        switch row {
+        case let .user(_, text, _),
+             let .message(_, text),
+             let .thought(_, text),
+             let .permissionDecision(_, text):
+            return AcpChatRendering.bounded(
+                text,
+                characterLimit: AcpChatRendering.assistantCharacterLimit,
+                lineLimit: AcpChatRendering.assistantLineLimit
+            ).text
+        case let .tool(call):
+            var fields = [call.title, call.kind, call.status.rawValue]
+            fields.append(contentsOf: call.declaredFilePaths)
+            for artifact in call.content {
+                switch artifact {
+                case let .text(text):
+                    fields.append(AcpChatRendering.bounded(
+                        text,
+                        characterLimit: AcpChatRendering.toolCharacterLimit,
+                        lineLimit: AcpChatRendering.toolLineLimit
+                    ).text)
+                case let .diff(path, oldText, newText):
+                    fields.append(path)
+                    if let oldText {
+                        fields.append(AcpChatRendering.bounded(
+                            oldText,
+                            characterLimit: AcpChatRendering.diffCharacterLimit,
+                            lineLimit: AcpChatRendering.diffLineLimit
+                        ).text)
+                    }
+                    fields.append(AcpChatRendering.bounded(
+                        newText,
+                        characterLimit: AcpChatRendering.diffCharacterLimit,
+                        lineLimit: AcpChatRendering.diffLineLimit
+                    ).text)
+                case let .terminal(id):
+                    fields.append(id)
+                }
+            }
+            return fields.joined(separator: "\n")
+        case let .plan(_, entries):
+            return entries.flatMap { [$0.content, $0.priority, $0.status] }.joined(separator: "\n")
+        case let .runProfileAudit(_, profile):
+            return [profile.name, profile.modelID]
+                .compactMap { $0 }
+                .joined(separator: "\n")
+        }
+    }
+}
+
+struct AcpTranscriptSearchState: Equatable, Sendable {
+    private(set) var isPresented = false
+    private(set) var query = ""
+    private(set) var matches: [AcpTranscriptSearchMatch] = []
+    private(set) var hasAdditionalMatches = false
+    private var selectedIndex: Int?
+
+    var matchCount: Int { matches.count }
+    var currentRowID: String? {
+        guard let selectedIndex, matches.indices.contains(selectedIndex) else { return nil }
+        return matches[selectedIndex].rowID
+    }
+
+    mutating func present() { isPresented = true }
+
+    mutating func dismiss() {
+        isPresented = false
+        selectedIndex = nil
+    }
+
+    mutating func updateQuery(_ value: String, rows: [AcpTranscriptRow]) {
+        query = String(value.prefix(AcpTranscriptSearchIndex.maximumQueryCharacters))
+        selectedIndex = nil
+        rebuild(rows: rows, preserving: nil)
+    }
+
+    mutating func refresh(rows: [AcpTranscriptRow]) {
+        let selected = selectedIndex.flatMap { matches.indices.contains($0) ? matches[$0] : nil }
+        rebuild(rows: rows, preserving: selected)
+    }
+
+    mutating func move(_ direction: AcpTranscriptSearchDirection) -> String? {
+        guard !matches.isEmpty else {
+            selectedIndex = nil
+            return nil
+        }
+        switch (direction, selectedIndex) {
+        case (.next, nil): selectedIndex = 0
+        case (.previous, nil): selectedIndex = matches.count - 1
+        case let (.next, index?): selectedIndex = (index + 1) % matches.count
+        case let (.previous, index?): selectedIndex = (index - 1 + matches.count) % matches.count
+        }
+        return currentRowID
+    }
+
+    func statusText(hasHiddenEarlierRows: Bool) -> String {
+        guard !query.isEmpty else { return "Type to search" }
+        guard !matches.isEmpty else {
+            return hasHiddenEarlierRows ? "No matches loaded" : "No matches"
+        }
+        if let selectedIndex {
+            return "\(selectedIndex + 1) of \(matches.count)"
+        }
+        if hasAdditionalMatches { return "\(matches.count)+ matches" }
+        return "\(matches.count) \(matches.count == 1 ? "match" : "matches")"
+    }
+
+    private mutating func rebuild(
+        rows: [AcpTranscriptRow],
+        preserving selected: AcpTranscriptSearchMatch?
+    ) {
+        let result = AcpTranscriptSearchIndex.build(query: query, rows: rows)
+        matches = result.matches
+        hasAdditionalMatches = result.hasAdditionalMatches
+        selectedIndex = selected.flatMap { matches.firstIndex(of: $0) }
+    }
+}
+
+struct AcpTranscriptSearchNavigationRequest: Equatable {
+    let generation: UInt64
+    let direction: AcpTranscriptSearchDirection
+}
+
+/// Captures the actual row mounted at the top of the AppKit scroll viewport,
+/// including a partially clipped row's sub-point offset, then restores that
+/// same reading position after older transcript rows are prepended.
+///
+/// A data-window anchor such as `visibleRows.first` is not a viewport anchor:
+/// it can sit hundreds of points above what the reader is looking at. Marker
+/// views bridge the laid-out SwiftUI rows to the owning `NSScrollView`, so the
+/// restore is based on document geometry rather than row addressability.
+@MainActor
+final class AcpTranscriptViewportAnchor: ObservableObject {
+    struct Snapshot: Equatable {
+        let rowID: String
+        let offsetFromViewportTop: CGFloat
+    }
+
+    struct Restoration: Equatable {
+        let rowID: String
+        let requestedOffset: CGFloat
+        let restoredOffset: CGFloat
+
+        var error: CGFloat { abs(restoredOffset - requestedOffset) }
+    }
+
+    final class MarkerView: NSView {
+        weak var owner: AcpTranscriptViewportAnchor?
+        var rowID = ""
+
+        override var isFlipped: Bool { true }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            owner?.register(self)
+        }
+
+        override func viewDidMoveToSuperview() {
+            super.viewDidMoveToSuperview()
+            // LazyVStack may temporarily reparent a representable without
+            // recreating or updating it. Re-register the same weak marker when
+            // it rejoins the mounted hierarchy; otherwise a later prepend can
+            // have visible AX rows but no addressable AppKit anchor.
+            if superview != nil { owner?.register(self) }
+        }
+
+        override func viewWillMove(toSuperview newSuperview: NSView?) {
+            if newSuperview == nil { owner?.unregister(self) }
+            super.viewWillMove(toSuperview: newSuperview)
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    }
+
+    private final class WeakMarker {
+        weak var value: MarkerView?
+        init(_ value: MarkerView) { self.value = value }
+    }
+
+    @MainActor
+    private final class CapturedViewport {
+        let rowID: String
+        weak var scrollView: NSScrollView?
+        let documentBounds: NSRect
+        let viewport: NSRect
+        let documentWasFlipped: Bool
+
+        init(rowID: String, geometry: Geometry) {
+            self.rowID = rowID
+            scrollView = geometry.scrollView
+            documentBounds = geometry.documentView.bounds
+            viewport = geometry.viewport
+            documentWasFlipped = geometry.documentView.isFlipped
+        }
+    }
+
+    @MainActor
+    private struct Geometry {
+        let marker: MarkerView
+        let scrollView: NSScrollView
+        let documentView: NSView
+        let rowRect: NSRect
+        let viewport: NSRect
+
+        var offsetFromViewportTop: CGFloat {
+            documentView.isFlipped
+                ? rowRect.minY - viewport.minY
+                : viewport.maxY - rowRect.maxY
+        }
+    }
+
+    private var markers: [String: WeakMarker] = [:]
+    private var capturedViewport: CapturedViewport?
+
+    fileprivate func register(_ marker: MarkerView) {
+        guard !marker.rowID.isEmpty else { return }
+        markers[marker.rowID] = WeakMarker(marker)
+    }
+
+    fileprivate func unregister(_ marker: MarkerView) {
+        guard markers[marker.rowID]?.value === marker else { return }
+        markers.removeValue(forKey: marker.rowID)
+    }
+
+    /// The uppermost row intersecting the real clip view. LazyVStack may keep
+    /// nearby rows mounted as prefetch, so mounted alone is insufficient.
+    func capture() -> Snapshot? {
+        purgeReleasedMarkers()
+        let candidate = markers.compactMap { rowID, marker -> (Snapshot, Geometry)? in
+            guard let view = marker.value,
+                  let geometry = geometry(for: view),
+                  geometry.rowRect.intersects(geometry.viewport) else { return nil }
+            return (
+                Snapshot(
+                    rowID: rowID,
+                    offsetFromViewportTop: geometry.offsetFromViewportTop
+                ),
+                geometry
+            )
+        }
+        .min { lhs, rhs in
+            lhs.0.offsetFromViewportTop < rhs.0.offsetFromViewportTop
+        }
+        guard let candidate else { return nil }
+        capturedViewport = CapturedViewport(rowID: candidate.0.rowID, geometry: candidate.1)
+        return candidate.0
+    }
+
+    /// Repositions the AppKit clip view to the exact captured intra-row offset.
+    /// The caller may first use `ScrollViewProxy.scrollTo` when LazyVStack has
+    /// unmounted the captured row; once its marker remounts this method applies
+    /// the precise correction that a SwiftUI anchor cannot represent.
+    @discardableResult
+    func restore(_ snapshot: Snapshot) -> Restoration? {
+        purgeReleasedMarkers()
+        guard let marker = markers[snapshot.rowID]?.value,
+              let initialGeometry = geometry(for: marker) else {
+            // A large prepend can make LazyVStack evict the captured marker
+            // before its exact row restoration runs. Preserve the underlying
+            // clip position from the measured document growth so SwiftUI
+            // remounts the same row, then let the caller retry and validate
+            // the real marker offset rather than manufacturing a PASS.
+            _ = restoreCapturedViewportGeometry(snapshot)
+            return nil
+        }
+
+        let clipView = initialGeometry.scrollView.contentView
+        var targetBounds = clipView.bounds
+        if initialGeometry.documentView.isFlipped {
+            targetBounds.origin.y = initialGeometry.rowRect.minY - snapshot.offsetFromViewportTop
+        } else {
+            targetBounds.origin.y = initialGeometry.rowRect.maxY
+                + snapshot.offsetFromViewportTop
+                - targetBounds.height
+        }
+        targetBounds = clipView.constrainBoundsRect(targetBounds)
+        clipView.scroll(to: targetBounds.origin)
+        initialGeometry.scrollView.reflectScrolledClipView(clipView)
+        initialGeometry.scrollView.layoutSubtreeIfNeeded()
+
+        guard let restored = geometry(for: marker) else { return nil }
+        return Restoration(
+            rowID: snapshot.rowID,
+            requestedOffset: snapshot.offsetFromViewportTop,
+            restoredOffset: restored.offsetFromViewportTop
+        )
+    }
+
+    private func geometry(for marker: MarkerView) -> Geometry? {
+        guard marker.window != nil,
+              let scrollView = marker.enclosingScrollView,
+              let documentView = scrollView.documentView else { return nil }
+        scrollView.layoutSubtreeIfNeeded()
+        return Geometry(
+            marker: marker,
+            scrollView: scrollView,
+            documentView: documentView,
+            rowRect: marker.convert(marker.bounds, to: documentView),
+            viewport: scrollView.documentVisibleRect
+        )
+    }
+
+    @discardableResult
+    private func restoreCapturedViewportGeometry(_ snapshot: Snapshot) -> Bool {
+        guard let capturedViewport,
+              capturedViewport.rowID == snapshot.rowID,
+              let scrollView = capturedViewport.scrollView,
+              let documentView = scrollView.documentView,
+              documentView.window != nil,
+              documentView.isFlipped == capturedViewport.documentWasFlipped else { return false }
+        scrollView.layoutSubtreeIfNeeded()
+        documentView.layoutSubtreeIfNeeded()
+        guard documentView.bounds.height + 0.5 >= capturedViewport.documentBounds.height else {
+            return false
+        }
+
+        let clipView = scrollView.contentView
+        var targetBounds = clipView.bounds
+        if documentView.isFlipped {
+            let trailingDistance = capturedViewport.documentBounds.maxY
+                - capturedViewport.viewport.maxY
+            targetBounds.origin.y = documentView.bounds.maxY
+                - trailingDistance
+                - targetBounds.height
+        } else {
+            // AppKit's non-flipped document coordinates grow upward. Content
+            // prepended at the visual top does not move the existing row's Y.
+            targetBounds.origin.y = capturedViewport.viewport.minY
+        }
+        targetBounds = clipView.constrainBoundsRect(targetBounds)
+        clipView.scroll(to: targetBounds.origin)
+        scrollView.reflectScrolledClipView(clipView)
+        scrollView.layoutSubtreeIfNeeded()
+        return true
+    }
+
+    private func purgeReleasedMarkers() {
+        markers = markers.filter { $0.value.value != nil }
+    }
+}
+
+/// Zero-hit-area AppKit marker mounted behind one rendered transcript row.
+/// It deliberately exposes no accessibility element of its own; the row keeps
+/// its existing combined label and stable `acp.transcript.*` identifier.
+@MainActor
+struct AcpTranscriptViewportMarker: NSViewRepresentable {
+    let rowID: String
+    let anchor: AcpTranscriptViewportAnchor
+
+    func makeNSView(context: Context) -> AcpTranscriptViewportAnchor.MarkerView {
+        let view = AcpTranscriptViewportAnchor.MarkerView()
+        view.setAccessibilityElement(false)
+        update(view)
+        return view
+    }
+
+    func updateNSView(
+        _ nsView: AcpTranscriptViewportAnchor.MarkerView,
+        context: Context
+    ) {
+        update(nsView)
+    }
+
+    static func dismantleNSView(
+        _ nsView: AcpTranscriptViewportAnchor.MarkerView,
+        coordinator: Void
+    ) {
+        nsView.owner?.unregister(nsView)
+    }
+
+    private func update(_ view: AcpTranscriptViewportAnchor.MarkerView) {
+        if view.owner !== anchor || view.rowID != rowID {
+            view.owner?.unregister(view)
+            view.owner = anchor
+            view.rowID = rowID
+        }
+        anchor.register(view)
+    }
+}
+
 /// Incremental structural cache for one assistant row. ACP message chunks are
 /// append-only, so an update reparses the final (potentially still-open) block
 /// rather than every stable block above it. Two short sentinels validate that

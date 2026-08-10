@@ -1947,6 +1947,42 @@ final class AcpConversation: ObservableObject {
                 content: [.text("Build and focused tests passed.")]
             )),
         ]
+        if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "mixed-search" {
+            // Enough mounted tail rows to keep the automatic top-boundary
+            // loader off screen. Visual QA can then invoke the real Find menu,
+            // request one earlier page, and measure a visible row's AX frame
+            // before/after the production prepend path.
+            rows = (0..<500).map { index in
+                .user(
+                    id: "visual-search-\(index)",
+                    text: index == 0
+                        ? "buried-anchor appears only in the oldest retained page."
+                        : "Reading checkpoint \(index). The mounted viewport must stay on this exact paragraph after older messages load.",
+                    failed: false
+                )
+            }
+        } else if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "mixed-density" {
+            rows = (0..<90).map { index in
+                if index.isMultiple(of: 2) {
+                    return .tool(AcpToolCall(
+                        id: "visual-density-\(index)",
+                        title: "Review the mounted density checkpoint \(index)",
+                        kind: index.isMultiple(of: 4) ? "edit" : "read",
+                        status: index.isMultiple(of: 10) ? .failed : .completed,
+                        content: [.text("Bounded artifact evidence for density row \(index).")],
+                        locations: [
+                            "Sources/Feature\(index)/A-Long-Mounted-Reading-Anchor-Path.swift",
+                            "Tests/Feature\(index)/DensityViewportContractTests.swift",
+                        ]
+                    ))
+                }
+                return .user(
+                    id: "visual-density-\(index)",
+                    text: "Reading checkpoint \(index) stays fixed while surrounding tool cards reflow.",
+                    failed: false
+                )
+            }
+        }
         usage = AcpUsage(
             used: 18_400,
             max: 200_000,

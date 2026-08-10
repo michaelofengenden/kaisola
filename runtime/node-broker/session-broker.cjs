@@ -16,7 +16,13 @@ const {
   backgroundRejection,
   createBrokerRejectionSupervisor,
 } = require('./ipc/brokerRejectionPolicy.cjs')
-const { terminalAttachRoute, terminalCreateRoute, terminalKillRoute, terminalResizeRoute } = require('./ipc/terminalCreateRoute.cjs')
+const {
+  terminalAttachRoute,
+  terminalCreateRoute,
+  terminalIdLengthRejection,
+  terminalKillRoute,
+  terminalResizeRoute,
+} = require('./ipc/terminalCreateRoute.cjs')
 const { terminalDetachOwnerRoute } = require('./ipc/terminalDetachOwnerRoute.cjs')
 const { BrokerRequestGate, dispatchBrokerRequest } = require('./ipc/brokerRequestGate.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
@@ -245,8 +251,15 @@ async function dispatch(client, method, params = {}) {
   const admin = String(params.ownerId ?? '0') === '0'
   const requestProject = projectScope(params.projectId)
   const owner = ownerKey(client.instanceId, params.ownerId, requestProject)
-  const terminalId = () => String(params.id || '').slice(0, 240)
-  if (drainingTarget && method === 'terminal.create' && !mgr.has(terminalId())) {
+  const rawTerminalId = String(params.id || '')
+  const idRejection = terminalIdLengthRejection(rawTerminalId)
+  const terminalId = () => {
+    if (idRejection) throw new Error(idRejection.message)
+    return rawTerminalId
+  }
+  // Let terminal.create return its structured rejection without consulting a
+  // truncated/existing ownership key, even while this generation is draining.
+  if (drainingTarget && method === 'terminal.create' && !idRejection && !mgr.has(rawTerminalId)) {
     throw new Error('broker generation is draining; create on the current generation')
   }
   const allowed = (id, adopt = false) => {
@@ -482,6 +495,7 @@ async function dispatch(client, method, params = {}) {
       return { ok: mgr.detachRenderer(id, owner, params.viewState) }
     }
     case 'terminal.detachOwner': {
+      terminalId()
       return terminalDetachOwnerRoute({ manager: mgr, params, owner, requireAllowed })
     }
     case 'terminal.write': {

@@ -41,6 +41,19 @@ extension GitService {
         }
     }
 
+    /// What a successful `gh pr create` produced. Exit zero means the pull
+    /// request exists, but `gh`'s stdout is not a contract — warnings and upgrade
+    /// notices ride the same stream — so a run that opened a PR without naming it
+    /// is a partial success with somewhere to go, not a URL nobody validated.
+    enum PullRequestOutcome: Equatable, Sendable {
+        /// `gh` printed exactly one pull request URL on the reviewed repository.
+        case opened(url: String)
+        /// The pull request was created, but no trustworthy URL came back.
+        /// `recoveryURL` is the repository's pull request list, filtered to the
+        /// branch that was pushed, so the reviewer can still reach it.
+        case openedWithoutURL(recoveryURL: String)
+    }
+
     /// Inspect the current branch: its name, whether it is the repo's default
     /// branch (so the PR flow must fork a new branch first), whether it already
     /// tracks an upstream (so push knows whether to set one), and how many
@@ -126,18 +139,24 @@ extension GitService {
         _ = try runGit(["checkout", "-b", name])
     }
 
-    /// Open a pull request for the current branch via the GitHub CLI, returning
-    /// the PR URL. Runs `gh` as its own child process (resolved absolute path,
-    /// cwd = repoRoot, stderr surfaced on failure) exactly like GitService's
-    /// `git` runner.
+    /// Open a pull request for the current branch via the GitHub CLI. Runs `gh`
+    /// as its own child process (resolved absolute path, cwd = repoRoot, stderr
+    /// surfaced on failure) exactly like GitService's `git` runner. `ghPath`
+    /// names the executable to run; the default resolves the installed CLI and
+    /// tests substitute a stub.
+    ///
+    /// A zero exit means the pull request exists, so a URL we cannot pin to the
+    /// reviewed repository is reported as a partial success rather than thrown
+    /// away or handed to the UI unchecked.
     func createPullRequest(
         title: String,
         body: String,
         baseBranch: String,
         headBranch: String,
-        repositoryURL: String
-    ) throws -> String {
-        guard let gh = Self.resolvedGhPath() else {
+        repositoryURL: String,
+        ghPath: String? = nil
+    ) throws -> PullRequestOutcome {
+        guard let gh = ghPath ?? Self.resolvedGhPath() else {
             throw GitError.commandFailed("GitHub CLI (gh) is not installed.")
         }
         guard repositoryURL.hasPrefix("https://") else {
@@ -166,11 +185,63 @@ extension GitService {
             let message = capture.err.diagnosticText(byteLimit: GitProcessCapture.diagnosticByteLimit)
             throw GitError.commandFailed(message.trimmingCharacters(in: .whitespacesAndNewlines))
         }
-        // gh prints the PR URL on stdout; take the last http line to be safe.
         let stdout = String(data: capture.out.completeData ?? Data(), encoding: .utf8) ?? ""
-        let lines = stdout.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
-        return lines.last(where: { $0.hasPrefix("http") })
-            ?? stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let url = Self.pullRequestURL(inGhOutput: stdout, repositoryURL: repositoryURL) {
+            return .opened(url: url)
+        }
+        return .openedWithoutURL(
+            recoveryURL: Self.pullRequestListURL(repositoryURL: repositoryURL, headBranch: headBranch)
+        )
+    }
+
+    /// The one pull request URL in `gh pr create`'s stdout, or nil when that
+    /// output is silent, unparseable, or ambiguous. `gh` prints the PR URL there,
+    /// but upgrade notices and warnings share the stream, so a token only counts
+    /// as the destination when it is an `https` URL on the reviewed repository's
+    /// own host, port, and `<owner>/<repo>/pull/<number>` path. Two different
+    /// pull request numbers mean we cannot tell which one was opened, so neither
+    /// is used. The result is rebuilt from the reviewed repository URL, never
+    /// echoed from stdout. Pure and static so it is unit testable without `gh`.
+    static func pullRequestURL(inGhOutput output: String, repositoryURL: String) -> String? {
+        var base = repositoryURL
+        while base.hasSuffix("/") { base.removeLast() }
+        guard let repo = URLComponents(string: base),
+              repo.scheme?.lowercased() == "https",
+              let repoHost = repo.host?.lowercased() else { return nil }
+        let repoPath = repo.path.split(separator: "/").map(String.init)
+        guard repoPath.count == 2 else { return nil }
+
+        let noise = CharacterSet(charactersIn: "()[]{}<>\"'`.,;:!?")
+        var number: String?
+        for token in output.split(whereSeparator: { $0.isWhitespace }) {
+            let candidate = String(token).trimmingCharacters(in: noise)
+            guard let url = URLComponents(string: candidate),
+                  url.scheme?.lowercased() == "https",
+                  url.user == nil, url.password == nil,
+                  url.host?.lowercased() == repoHost,
+                  url.port == repo.port else { continue }
+            let path = url.path.split(separator: "/").map(String.init)
+            guard path.count == 4,
+                  path[0].caseInsensitiveCompare(repoPath[0]) == .orderedSame,
+                  path[1].caseInsensitiveCompare(repoPath[1]) == .orderedSame,
+                  path[2] == "pull",
+                  !path[3].isEmpty, path[3].allSatisfy({ $0.isASCII && $0.isNumber }) else { continue }
+            if let seen = number, seen != path[3] { return nil }
+            number = path[3]
+        }
+        return number.map { "\(base)/pull/\($0)" }
+    }
+
+    /// Where to look when `gh` opened a pull request but never named it: the
+    /// reviewed repository's pull request list, filtered to the branch that was
+    /// just pushed.
+    static func pullRequestListURL(repositoryURL: String, headBranch: String) -> String {
+        var base = repositoryURL
+        while base.hasSuffix("/") { base.removeLast() }
+        var query = URLComponents()
+        query.queryItems = [URLQueryItem(name: "q", value: "is:pr head:\(headBranch)")]
+        guard let encoded = query.percentEncodedQuery, !encoded.isEmpty else { return "\(base)/pulls" }
+        return "\(base)/pulls?\(encoded)"
     }
 
     static func pullRequestArguments(
@@ -203,6 +274,16 @@ extension GitService {
         guard destination.isReadyForPullRequest,
               let base = destination.webURL else { return nil }
         return "\(base)/compare/\(destination.baseBranch)...\(headBranch)"
+    }
+
+    /// The pushed branch's own page on the remote (`…/tree/<branch>`). A confirm
+    /// that pushed but could not open the pull request has this to show for
+    /// itself, so the branch it left behind is a link the user can follow rather
+    /// than an unmentioned side effect. Static and pure like `webURL`.
+    static func branchWebURL(destination: PRDestination, headBranch: String) -> String? {
+        guard let base = destination.webURL, !headBranch.isEmpty else { return nil }
+        let path = headBranch.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? headBranch
+        return "\(base)/tree/\(path)"
     }
 
     /// Turn a git remote URL into its web base (`https://host/owner/repo`, no

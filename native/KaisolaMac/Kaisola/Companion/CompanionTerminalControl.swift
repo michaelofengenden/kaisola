@@ -132,26 +132,54 @@ final class CompanionTerminalControl {
         command: CompanionCommandBody,
         deviceID: String,
         connectionID: String,
-        terminal: BrokerTerminalRecord?
+        terminal: BrokerTerminalRecord?,
+        isAuthorized: @escaping @MainActor () -> Bool = { true }
     ) async -> CompanionReceiptBody? {
+        guard isAuthorized() else { return revoked(command) }
         switch command.type {
         case "terminal.acquire-control":
             return await acquire(
                 command: command,
                 deviceID: deviceID,
                 connectionID: connectionID,
-                terminal: terminal
+                terminal: terminal,
+                isAuthorized: isAuthorized
             )
         case "terminal.renew-control":
-            return await renew(command: command, deviceID: deviceID, connectionID: connectionID)
+            return await renew(
+                command: command,
+                deviceID: deviceID,
+                connectionID: connectionID,
+                isAuthorized: isAuthorized
+            )
         case "terminal.write":
-            return await write(command: command, deviceID: deviceID, connectionID: connectionID)
+            return await write(
+                command: command,
+                deviceID: deviceID,
+                connectionID: connectionID,
+                isAuthorized: isAuthorized
+            )
         case "terminal.resize":
-            return await resize(command: command, deviceID: deviceID, connectionID: connectionID)
+            return await resize(
+                command: command,
+                deviceID: deviceID,
+                connectionID: connectionID,
+                isAuthorized: isAuthorized
+            )
         case "terminal.interrupt":
-            return await interrupt(command: command, deviceID: deviceID, connectionID: connectionID)
+            return await interrupt(
+                command: command,
+                deviceID: deviceID,
+                connectionID: connectionID,
+                isAuthorized: isAuthorized
+            )
         case "terminal.release-control":
-            return await release(command: command, deviceID: deviceID, connectionID: connectionID)
+            return await release(
+                command: command,
+                deviceID: deviceID,
+                connectionID: connectionID,
+                isAuthorized: isAuthorized
+            )
         default:
             return nil
         }
@@ -189,8 +217,10 @@ final class CompanionTerminalControl {
         command: CompanionCommandBody,
         deviceID: String,
         connectionID: String,
-        terminal: BrokerTerminalRecord?
+        terminal: BrokerTerminalRecord?,
+        isAuthorized: @escaping @MainActor () -> Bool
     ) async -> CompanionReceiptBody {
+        guard isAuthorized() else { return revoked(command) }
         guard !deviceID.isEmpty, !connectionID.isEmpty, let terminal,
               !terminal.exited else {
             return receipt(command, .rejected, "Terminal control request is invalid.")
@@ -198,6 +228,7 @@ final class CompanionTerminalControl {
         let key = Key(projectID: command.projectId, terminalID: command.targetId)
         await expireIfNeeded(key)
         await waitForRestoration(key)
+        guard isAuthorized() else { return revoked(command) }
         if let current = leases[key],
            !sameHolder(current, deviceID: deviceID, connectionID: connectionID) {
             return receipt(command, .rejected, "Terminal is already controlled from another device.")
@@ -217,11 +248,17 @@ final class CompanionTerminalControl {
             expiresAt: 0
         )
         if isNewLease {
+            guard isAuthorized() else { return revoked(command) }
             do { try await adapter.controlStateChanged(terminal, true) }
             catch {
                 return receipt(command, .unavailable, "Terminal control could not be fenced safely.")
             }
+            guard isAuthorized() else {
+                try? await adapter.controlStateChanged(terminal, false)
+                return revoked(command)
+            }
         }
+        guard isAuthorized() else { return revoked(command) }
         arm(&lease)
         return receipt(
             command,
@@ -234,15 +271,19 @@ final class CompanionTerminalControl {
     private func renew(
         command: CompanionCommandBody,
         deviceID: String,
-        connectionID: String
+        connectionID: String,
+        isAuthorized: @escaping @MainActor () -> Bool
     ) async -> CompanionReceiptBody {
+        guard isAuthorized() else { return revoked(command) }
         guard var lease = await requiredLease(
             command,
             deviceID: deviceID,
             connectionID: connectionID
         ) else { return stale(command) }
+        guard isAuthorized() else { return revoked(command) }
         do { try await adapter.controlStateChanged(lease.terminal, true) }
         catch { return receipt(command, .unavailable, "Terminal control could not be renewed safely.") }
+        guard isAuthorized() else { return revoked(command) }
         arm(&lease)
         return receipt(command, .applied, "Terminal control renewed.", payload: leasePayload(lease))
     }
@@ -250,8 +291,10 @@ final class CompanionTerminalControl {
     private func write(
         command: CompanionCommandBody,
         deviceID: String,
-        connectionID: String
+        connectionID: String,
+        isAuthorized: @escaping @MainActor () -> Bool
     ) async -> CompanionReceiptBody {
+        guard isAuthorized() else { return revoked(command) }
         guard let lease = await requiredLease(
             command,
             deviceID: deviceID,
@@ -272,8 +315,10 @@ final class CompanionTerminalControl {
                 "Terminal input must be between 1 and \(Self.maximumInputBytes) bytes."
             )
         }
+        guard isAuthorized() else { return revoked(command) }
         do {
             try await adapter.write(lease.terminal, data)
+            guard isAuthorized() else { return revoked(command) }
             return receipt(command, .applied, "Terminal input applied.")
         } catch {
             return receipt(command, .unavailable, "Terminal input was not applied.")
@@ -283,8 +328,10 @@ final class CompanionTerminalControl {
     private func resize(
         command: CompanionCommandBody,
         deviceID: String,
-        connectionID: String
+        connectionID: String,
+        isAuthorized: @escaping @MainActor () -> Bool
     ) async -> CompanionReceiptBody {
+        guard isAuthorized() else { return revoked(command) }
         guard let lease = await requiredLease(
             command,
             deviceID: deviceID,
@@ -306,8 +353,10 @@ final class CompanionTerminalControl {
               let geometry = CompanionTerminalGeometry(columns: columns, rows: rows) else {
             return receipt(command, .rejected, "Terminal size is outside the supported range.")
         }
+        guard isAuthorized() else { return revoked(command) }
         do {
             try await adapter.resize(lease.terminal, geometry)
+            guard isAuthorized() else { return revoked(command) }
             return receipt(command, .applied, "Terminal size applied.")
         } catch {
             return receipt(command, .unavailable, "Terminal resize was not applied.")
@@ -317,15 +366,19 @@ final class CompanionTerminalControl {
     private func interrupt(
         command: CompanionCommandBody,
         deviceID: String,
-        connectionID: String
+        connectionID: String,
+        isAuthorized: @escaping @MainActor () -> Bool
     ) async -> CompanionReceiptBody {
+        guard isAuthorized() else { return revoked(command) }
         guard let lease = await requiredLease(
             command,
             deviceID: deviceID,
             connectionID: connectionID
         ) else { return stale(command) }
+        guard isAuthorized() else { return revoked(command) }
         do {
             try await adapter.interrupt(lease.terminal)
+            guard isAuthorized() else { return revoked(command) }
             return receipt(command, .applied, "Interrupt sent.")
         } catch {
             return receipt(command, .unavailable, "Interrupt was not applied.")
@@ -335,13 +388,16 @@ final class CompanionTerminalControl {
     private func release(
         command: CompanionCommandBody,
         deviceID: String,
-        connectionID: String
+        connectionID: String,
+        isAuthorized: @escaping @MainActor () -> Bool
     ) async -> CompanionReceiptBody {
+        guard isAuthorized() else { return revoked(command) }
         guard let lease = await requiredLease(
             command,
             deviceID: deviceID,
             connectionID: connectionID
         ) else { return stale(command) }
+        guard isAuthorized() else { return revoked(command) }
         await drop(lease.key)
         return receipt(command, .applied, "Terminal control released.")
     }
@@ -441,6 +497,10 @@ final class CompanionTerminalControl {
 
     private func stale(_ command: CompanionCommandBody) -> CompanionReceiptBody {
         receipt(command, .stale, "Terminal control lease is missing or expired.")
+    }
+
+    private func revoked(_ command: CompanionCommandBody) -> CompanionReceiptBody {
+        receipt(command, .rejected, "This Companion device is no longer authorized.")
     }
 
     private func receipt(

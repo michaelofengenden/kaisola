@@ -52,10 +52,14 @@ struct KaisolaCompanionApp: App {
                         baseURL: relayURL,
                         tokenProvider: { try await auth.freshIDToken() }
                     )
+                    coordinator.activateAccount(accountID: auth.account?.uid)
                     await coordinator.connectIfPaired()
                     await Self.autoPairIfRequested(coordinator)
                 }
                 .task(id: auth.account?.uid) {
+                    if !Self.usePreviewStore {
+                        coordinator.activateAccount(accountID: auth.account?.uid)
+                    }
                     // A UID transition owns a fresh presentation scope even if
                     // the previous account still has a suspended network call.
                     // Deactivate before clearing so sign-out also advances the
@@ -64,6 +68,7 @@ struct KaisolaCompanionApp: App {
                     await rememberedSessionCatalog?.deactivate()
                     rememberedSessions.clear()
                     guard let accountID = auth.account?.uid else { return }
+                    await coordinator.connectIfPaired()
                     if let rememberedSessionCache,
                        let snapshot = try? await rememberedSessionCache.load(
                             accountID: accountID

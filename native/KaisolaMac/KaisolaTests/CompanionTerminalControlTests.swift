@@ -4,6 +4,11 @@ import XCTest
 @testable import Kaisola
 
 @MainActor
+private final class TerminalAuthorizationState {
+    var value = true
+}
+
+@MainActor
 final class CompanionTerminalControlTests: XCTestCase {
     private enum Call: Equatable {
         case available(String)
@@ -320,6 +325,58 @@ final class CompanionTerminalControlTests: XCTestCase {
         await harness.control.dispose()
     }
 
+    func testRevokedAuthorityCannotAcquireOrUseAnExistingLease() async throws {
+        let fake = FakeAdapter()
+        let harness = makeControl(fake: fake)
+        let authorization = TerminalAuthorizationState()
+        let acquired = try await route(
+            harness.control,
+            command("terminal.acquire-control"),
+            deviceID: "device-first",
+            connectionID: "connection-first",
+            terminal: terminal,
+            isAuthorized: { authorization.value }
+        )
+        let leaseID = try XCTUnwrap(acquired.payload?["leaseId"]?.stringValue)
+        let baseline = fake.calls
+
+        authorization.value = false
+        let revokedWrite = try await route(
+            harness.control,
+            command("terminal.write", [
+                "leaseId": .string(leaseID),
+                "data": .string("must-not-cross-revocation"),
+            ]),
+            deviceID: "device-first",
+            connectionID: "connection-first",
+            isAuthorized: { authorization.value }
+        )
+        XCTAssertEqual(revokedWrite.status, .rejected)
+        XCTAssertEqual(fake.calls, baseline)
+
+        let revokedRenewal = try await route(
+            harness.control,
+            command("terminal.renew-control", ["leaseId": .string(leaseID)]),
+            deviceID: "device-first",
+            connectionID: "connection-first",
+            isAuthorized: { authorization.value }
+        )
+        XCTAssertEqual(revokedRenewal.status, .rejected)
+        XCTAssertEqual(fake.calls, baseline)
+
+        let revokedAcquire = try await route(
+            harness.control,
+            command("terminal.acquire-control"),
+            deviceID: "device-second",
+            connectionID: "connection-second",
+            terminal: terminal,
+            isAuthorized: { false }
+        )
+        XCTAssertEqual(revokedAcquire.status, .rejected)
+        XCTAssertEqual(fake.calls, baseline)
+        await harness.control.dispose()
+    }
+
     private struct Harness {
         let control: CompanionTerminalControl
         let setNow: (Int64) -> Void
@@ -382,13 +439,15 @@ final class CompanionTerminalControlTests: XCTestCase {
         _ command: CompanionCommandBody,
         deviceID: String,
         connectionID: String,
-        terminal: BrokerTerminalRecord? = nil
+        terminal: BrokerTerminalRecord? = nil,
+        isAuthorized: @escaping @MainActor () -> Bool = { true }
     ) async throws -> CompanionReceiptBody {
         let result = await control.route(
             command: command,
             deviceID: deviceID,
             connectionID: connectionID,
-            terminal: terminal
+            terminal: terminal,
+            isAuthorized: isAuthorized
         )
         return try XCTUnwrap(result)
     }

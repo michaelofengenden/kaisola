@@ -340,6 +340,7 @@ struct WorkspaceRailView: View {
             Divider()
             Button("Refresh") { refresh() }
             Button("New AGENTS.md") { createInstructionFile() }
+                .disabled(isMutating)
         }
         .alert(
             "Rename \(renameTarget?.isDirectory == true ? "Folder" : "File")",
@@ -388,6 +389,8 @@ struct WorkspaceRailView: View {
             // so a synchronous retry's new failure would be cleared before it
             // could be shown. Retry on the next turn instead.
             Button("Try Again") { Task { @MainActor in createInstructionFile() } }
+                .keyboardShortcut(.defaultAction)
+                .accessibilityIdentifier("workspace-agents-create-retry")
             Button("Cancel", role: .cancel) { instructionFileFailure = nil }
         } message: { failure in
             Text(failure.message)
@@ -706,6 +709,11 @@ struct WorkspaceRailView: View {
             isMutating = false
         }
     }
+
+    /// Compatibility surface retained for the original exclusive-create
+    /// regression suite. The live action uses `WorkspaceInstructionFile`, whose
+    /// low-level writer also rejects racing files and incomplete writes.
+    static let agentsTemplate = WorkspaceInstructionFile.template
 
     @ViewBuilder
     private func nodeRows(for directory: URL, depth: Int) -> some View {
@@ -1167,6 +1175,83 @@ final class WorkspaceMoveController: ObservableObject {
         let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
         guard directory.path.hasPrefix(prefix) else { return directory.lastPathComponent }
         return String(directory.path.dropFirst(prefix.count))
+    }
+}
+
+enum WorkspaceAgentsFileCreation {
+    typealias Writer = (_ data: Data, _ target: URL) throws -> Void
+
+    enum Failure: Error, Equatable, Sendable {
+        case destinationExists
+        case permissionDenied
+        case diskFull
+        case other
+
+        var message: String {
+            switch self {
+            case .destinationExists:
+                "AGENTS.md already exists. Rename or remove it, then try again."
+            case .permissionDenied:
+                "Kaisola doesn't have permission to create AGENTS.md in this project."
+            case .diskFull:
+                "There isn't enough disk space to create AGENTS.md."
+            case .other:
+                "Kaisola couldn't create AGENTS.md. Check the project and try again."
+            }
+        }
+    }
+
+    static func attempt(in root: URL, template: String) -> Result<URL, Failure> {
+        attempt(in: root, template: template) { data, target in
+            // Foundation rejects combining `.atomic` with
+            // `.withoutOverwriting`. Exclusive creation is the required
+            // boundary here: a racing AGENTS.md must never be replaced.
+            try data.write(to: target, options: .withoutOverwriting)
+        }
+    }
+
+    static func attempt(
+        in root: URL,
+        template: String,
+        writer: Writer
+    ) -> Result<URL, Failure> {
+        let target = root.standardizedFileURL.appendingPathComponent("AGENTS.md")
+        do {
+            try writer(Data(template.utf8), target)
+            return .success(target)
+        } catch {
+            return .failure(classify(error))
+        }
+    }
+
+    private static func classify(_ error: any Error) -> Failure {
+        if let cocoaError = error as? CocoaError {
+            switch cocoaError.code {
+            case .fileWriteFileExists:
+                return .destinationExists
+            case .fileReadNoPermission, .fileWriteNoPermission, .fileWriteVolumeReadOnly:
+                return .permissionDenied
+            case .fileWriteOutOfSpace:
+                return .diskFull
+            default:
+                break
+            }
+        }
+
+        let nsError = error as NSError
+        if nsError.domain == NSPOSIXErrorDomain {
+            switch nsError.code {
+            case Int(EEXIST):
+                return .destinationExists
+            case Int(EACCES), Int(EPERM), Int(EROFS):
+                return .permissionDenied
+            case Int(ENOSPC):
+                return .diskFull
+            default:
+                break
+            }
+        }
+        return .other
     }
 }
 

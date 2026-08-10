@@ -434,6 +434,165 @@ final class GitPanelModelTests: XCTestCase {
         ))
     }
 
+    // MARK: - Recovering from a confirm that stopped part way
+
+    /// Confirming is three side effects in a row and only the last can simply be
+    /// run again. Each completed phase is recorded and named, so a run that
+    /// forked a branch or pushed it before failing says so instead of collapsing
+    /// into one generic operation error.
+    func testCompletedPhasesNameEverySideEffectTheRunLeftBehind() {
+        let nothing = PRExecutionProgress()
+        XCTAssertFalse(nothing.hasSideEffects)
+        XCTAssertEqual(nothing.completedPhases, [])
+        XCTAssertNil(nothing.recoveryNote)
+
+        var forked = PRExecutionProgress()
+        forked.createdBranch = "kaisola/pr-branch"
+        XCTAssertTrue(forked.hasSideEffects)
+        XCTAssertEqual(forked.completedPhases, ["Created branch kaisola/pr-branch"])
+        XCTAssertEqual(
+            forked.recoveryNote,
+            "Created branch kaisola/pr-branch. The pull request was not opened."
+        )
+
+        var pushed = forked
+        pushed.pushedBranch = "kaisola/pr-branch"
+        pushed.pushedHeadOID = String(repeating: "a", count: 40)
+        pushed.remoteBranchURL = "https://github.com/acme/widget/tree/kaisola/pr-branch"
+        XCTAssertEqual(pushed.completedPhases, [
+            "Created branch kaisola/pr-branch",
+            "Pushed kaisola/pr-branch to the remote",
+        ])
+        XCTAssertEqual(
+            pushed.recoveryNote,
+            "Created branch kaisola/pr-branch. Pushed kaisola/pr-branch to the remote. "
+                + "The pull request was not opened."
+        )
+    }
+
+    /// Retry resumes rather than restarts: a phase that already landed is
+    /// skipped (a second `checkout -b` only fails), but a push is skipped only
+    /// while the remote already has that branch at this exact commit.
+    func testRetrySkipsCompletedPhasesButNeverASupersededPush() throws {
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "a", count: 40),
+            requestedBranchName: "kaisola/pr-branch", commitSubjects: ["work"], changedFileCount: 1
+        )
+
+        var progress = PRExecutionProgress()
+        XCTAssertTrue(progress.needsBranchCreation(for: plan))
+        XCTAssertTrue(progress.needsPush(for: plan))
+        XCTAssertEqual(
+            progress.remainingWork(for: plan),
+            "create branch kaisola/pr-branch, then push kaisola/pr-branch to origin, "
+                + "then open the pull request against main"
+        )
+
+        progress.createdBranch = "kaisola/pr-branch"
+        XCTAssertFalse(progress.needsBranchCreation(for: plan))
+        XCTAssertTrue(progress.needsPush(for: plan))
+        XCTAssertEqual(
+            progress.remainingWork(for: plan),
+            "push kaisola/pr-branch to origin, then open the pull request against main"
+        )
+
+        progress.pushedBranch = "kaisola/pr-branch"
+        progress.pushedHeadOID = plan.headOID
+        XCTAssertFalse(progress.needsPush(for: plan))
+        XCTAssertEqual(progress.remainingWork(for: plan), "open the pull request against main")
+
+        // The same branch name at a newer commit is not the branch that was
+        // pushed: skipping the push there would open a pull request missing the
+        // work the review promised.
+        var moved = plan
+        moved.headOID = String(repeating: "b", count: 40)
+        XCTAssertTrue(progress.needsPush(for: moved))
+    }
+
+    /// "Review Again" after a half-finished run keeps the completed phases the
+    /// fresh plan still stands on, and forgets the ones it does not.
+    func testProgressCarriedIntoAFreshPlanKeepsOnlyWhatStillHolds() throws {
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "kaisola/pr-branch", isDefault: false, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "c", count: 40),
+            requestedBranchName: "", commitSubjects: ["work"], changedFileCount: 1
+        )
+        var progress = PRExecutionProgress()
+        progress.createdBranch = "kaisola/pr-branch"
+        progress.pushedBranch = "kaisola/pr-branch"
+        progress.pushedHeadOID = plan.headOID
+        progress.remoteBranchURL = "https://github.com/acme/widget/tree/kaisola/pr-branch"
+
+        let sameCommit = progress.carriedForward(into: plan)
+        XCTAssertEqual(sameCommit, progress, "a re-review of the same commit still knows the branch is pushed")
+
+        // A commit landed and the user reviewed again: the branch is still
+        // theirs, but what sits on the remote no longer covers this plan.
+        var newer = plan
+        newer.headOID = String(repeating: "d", count: 40)
+        let carried = progress.carriedForward(into: newer)
+        XCTAssertEqual(carried.createdBranch, "kaisola/pr-branch")
+        XCTAssertNil(carried.pushedBranch)
+        XCTAssertNil(carried.pushedHeadOID)
+        XCTAssertNil(carried.remoteBranchURL)
+        XCTAssertTrue(carried.needsPush(for: newer))
+
+        // A plan for a different branch keeps none of it.
+        var other = plan
+        other.headBranch = "kaisola/other"
+        XCTAssertEqual(progress.carriedForward(into: other), PRExecutionProgress())
+    }
+
+    /// The fork a half-finished confirm made is the plan running, not the
+    /// repository drifting away from it. Reading it as staleness is exactly what
+    /// left the user on a new branch with no way to retry.
+    func testAForkThisPlanItselfMadeDoesNotCountAsStaleness() throws {
+        let plan = try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "8", count: 40),
+            requestedBranchName: "kaisola/pr-branch", commitSubjects: ["work"], changedFileCount: 1
+        )
+        let oid = String(repeating: "8", count: 40)
+        XCTAssertTrue(plan.createsBranch)
+
+        // Before the fork runs, standing on the head branch is somebody else's
+        // checkout and must still be refused.
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: oid, currentBranch: plan.headBranch
+        ))
+        XCTAssertTrue(GitPRPlanner.isStale(
+            plan: plan, currentHeadOID: oid, currentBranch: plan.headBranch
+        ))
+
+        // Once this plan's own fork landed, that branch IS where the retry must
+        // be standing.
+        XCTAssertNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: oid, currentBranch: plan.headBranch,
+            completedBranchCreation: true
+        ))
+        XCTAssertFalse(GitPRPlanner.isStale(
+            plan: plan, currentHeadOID: oid, currentBranch: plan.headBranch,
+            completedBranchCreation: true
+        ))
+
+        // It licenses that branch and nothing else: going back to the base, or
+        // off to a third branch, still refuses.
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: oid, currentBranch: plan.baseBranch,
+            completedBranchCreation: true
+        ))
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: oid, currentBranch: "someone/else",
+            completedBranchCreation: true
+        ))
+        // And a moved HEAD is still a moved HEAD.
+        XCTAssertNotNil(GitPRPlanner.stalenessMessage(
+            plan: plan, currentHeadOID: String(repeating: "9", count: 40),
+            currentBranch: plan.headBranch, completedBranchCreation: true
+        ))
+    }
+
     // MARK: - Live model behavior
 
     /// The first click must assemble a review and execute NOTHING: no fork, no
@@ -843,6 +1002,84 @@ final class GitPanelModelTests: XCTestCase {
         model.commitMessage = "real"
         XCTAssertTrue(model.canCommit)
         XCTAssertEqual(model.commitHelp, "Commit the staged files")
+    }
+
+    /// The half-finished confirm, end to end. On the default branch with a
+    /// remote nothing can reach, the fork lands and the push fails: the panel
+    /// must name the branch it created, keep the review card usable, and let a
+    /// retry resume at the push instead of being refused as stale or forking a
+    /// second branch.
+    @MainActor
+    func testAConfirmThatFailsMidwayReportsWhatItDidAndStaysRetryable() throws {
+        try write("a.txt", "one\n")
+        try git(["add", "a.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let baseOID = try gitOutput(["rev-parse", "HEAD"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        try write("b.txt", "two\n")
+        try git(["add", "b.txt"])
+        try git(["commit", "-q", "-m", "feature work"])
+        // A web destination whose push cannot connect: port 1 refuses instantly,
+        // so the confirm fails at the push and never leaves this machine.
+        try git(["remote", "add", "origin", "ssh://git@127.0.0.1:1/acme/widget.git"])
+        // `main` is the default branch and the PR base, so the plan forks first.
+        try git(["update-ref", "refs/remotes/origin/main", baseOID])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.preparePR()
+        XCTAssertTrue(pump(until: { model.prPlan != nil || model.errorMessage != nil }, timeout: 10))
+        let plan = try XCTUnwrap(model.prPlan, "expected a plan, error: \(model.errorMessage ?? "none")")
+        XCTAssertTrue(plan.createsBranch)
+        XCTAssertEqual(plan.headBranch, "kaisola/pr-branch")
+
+        model.confirmPR()
+        XCTAssertTrue(pump(until: { model.errorMessage != nil }, timeout: 30), "the push should fail")
+
+        // The fork happened, and the panel says so.
+        XCTAssertEqual(model.prProgress.createdBranch, "kaisola/pr-branch")
+        XCTAssertNil(model.prProgress.pushedBranch, "the push is what failed")
+        XCTAssertEqual(model.prProgress.completedPhases, ["Created branch kaisola/pr-branch"])
+        XCTAssertEqual(
+            model.prState,
+            "Created branch kaisola/pr-branch. The pull request was not opened."
+        )
+        XCTAssertNotNil(model.prPlan, "the review card stays so the run can be finished")
+        XCTAssertEqual(
+            try gitOutput(["rev-parse", "--abbrev-ref", "HEAD"])
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "kaisola/pr-branch"
+        )
+
+        // A background refresh must not read this plan's own fork as the
+        // repository moving past it — that would disable the retry.
+        model.refresh()
+        XCTAssertTrue(pump(until: { !model.isBusy && model.status != nil }, timeout: 10))
+        XCTAssertFalse(model.prPlanStale, "the fork this very plan made is not staleness")
+
+        // Retry resumes at the push: not refused as stale, and no second fork.
+        model.confirmPR()
+        XCTAssertTrue(pump(until: { model.errorMessage != nil }, timeout: 30))
+        let retryError = model.errorMessage ?? ""
+        XCTAssertFalse(
+            retryError.contains("Review it again"),
+            "a retry must not be refused as stale: \(retryError)"
+        )
+        XCTAssertFalse(
+            retryError.contains("already exists"),
+            "a retry must not fork the branch a second time: \(retryError)"
+        )
+        XCTAssertEqual(
+            try gitOutput(["branch", "--format=%(refname:short)"]).split(separator: "\n").sorted(),
+            ["kaisola/pr-branch", "main"]
+        )
+
+        // Dismissing the review must not take the record with it: the branch is
+        // still there, so the note that explains it stays too.
+        model.cancelPR()
+        XCTAssertNil(model.prPlan)
+        XCTAssertEqual(
+            model.prState,
+            "Created branch kaisola/pr-branch. The pull request was not opened."
+        )
     }
 
     // MARK: - helpers

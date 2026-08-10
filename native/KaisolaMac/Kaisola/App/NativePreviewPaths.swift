@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import KaisolaCore
 
 enum NativePreviewPaths {
     static let applicationSupportDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
@@ -24,6 +25,16 @@ enum NativePreviewPaths {
 
     static let companionDevices = companionDirectory
         .appendingPathComponent("devices-v1.json", isDirectory: false)
+
+    static func companionDevices(
+        accountScope: CompanionAccountScope,
+        directory: URL = companionDirectory
+    ) -> URL {
+        directory.appendingPathComponent(
+            "devices-v3-\(accountScope.rawValue).json",
+            isDirectory: false
+        )
+    }
 
     /// Durable, app-owned Git worktrees for Mesh editing columns. These must
     /// not live in `/tmp`: macOS may purge temporary files across a reboot,

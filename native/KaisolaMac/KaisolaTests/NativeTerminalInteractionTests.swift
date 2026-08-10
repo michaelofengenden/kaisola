@@ -947,6 +947,111 @@ final class NativeTerminalInteractionTests: XCTestCase {
         XCTAssertEqual(useSelection.tag, Int(NSFindPanelAction.setFindString.rawValue))
     }
 
+    func testEditMenuCanTargetWorkspaceFindRouterWithoutChangingFindTags() throws {
+        let target = NSObject()
+        let action = #selector(KaisolaMacAppDelegate.routeWorkspaceFind(_:))
+        let menu = KaisolaMacAppDelegate.makeMainMenu(
+            updateTarget: nil,
+            updateAction: nil,
+            updateEnabled: false,
+            updateDetail: nil,
+            findTarget: target,
+            findAction: action
+        )
+        let edit = try editMenu(in: menu)
+
+        for title in ["Find…", "Find Next", "Find Previous", "Use Selection for Find"] {
+            let item = try XCTUnwrap(edit.items.first { $0.title == title })
+            XCTAssertTrue(item.target === target)
+            XCTAssertEqual(item.action, action)
+        }
+        XCTAssertEqual(
+            edit.items.first { $0.title == "Find…" }?.tag,
+            Int(NSFindPanelAction.showFindPanel.rawValue)
+        )
+        XCTAssertEqual(
+            edit.items.first { $0.title == "Find Next" }?.tag,
+            Int(NSFindPanelAction.next.rawValue)
+        )
+        XCTAssertEqual(
+            edit.items.first { $0.title == "Find Previous" }?.tag,
+            Int(NSFindPanelAction.previous.rawValue)
+        )
+    }
+
+    func testWorkspaceFindRoutingPrefersVisibleFileThenExactFocusedSurface() {
+        let chats: Set<String> = ["chat"]
+        let terminals: Set<String> = ["terminal", "background-terminal"]
+
+        XCTAssertEqual(
+            WorkspaceFindSurfaceResolver.resolve(
+                focusedPaneID: "chat",
+                chatIDs: chats,
+                terminalIDs: terminals,
+                hasVisibleFileResponder: true
+            ),
+            .nativeFileResponder
+        )
+        XCTAssertEqual(
+            WorkspaceFindSurfaceResolver.resolve(
+                focusedPaneID: "chat",
+                chatIDs: chats,
+                terminalIDs: terminals,
+                hasVisibleFileResponder: false
+            ),
+            .chat("chat"),
+            "a hidden editor must not intercept Command-F from the focused chat"
+        )
+        XCTAssertEqual(
+            WorkspaceFindSurfaceResolver.resolve(
+                focusedPaneID: "terminal",
+                chatIDs: chats,
+                terminalIDs: terminals,
+                hasVisibleFileResponder: false
+            ),
+            .terminal("terminal")
+        )
+        XCTAssertEqual(
+            WorkspaceFindSurfaceResolver.resolve(
+                focusedPaneID: "stale",
+                chatIDs: chats,
+                terminalIDs: terminals,
+                hasVisibleFileResponder: false
+            ),
+            .responderChain
+        )
+    }
+
+    func testWorkspaceFindFileResponderMustBeVisibleInTheTargetWindow() {
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 480, height: 320),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        let container = NSView(frame: window.contentView?.bounds ?? .zero)
+        let editor = NSTextView(frame: container.bounds)
+        editor.setAccessibilityLabel("Markdown document")
+        container.addSubview(editor)
+        window.contentView?.addSubview(container)
+
+        XCTAssertTrue(WorkspaceFindSurfaceResolver.isVisibleFileResponder(editor, in: window))
+        container.isHidden = true
+        XCTAssertFalse(
+            WorkspaceFindSurfaceResolver.isVisibleFileResponder(editor, in: window),
+            "a retained hidden preview must not own Command-F"
+        )
+        container.isHidden = false
+
+        let otherWindow = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 200, height: 100),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        XCTAssertFalse(WorkspaceFindSurfaceResolver.isVisibleFileResponder(editor, in: otherWindow))
+    }
+
     func testEditMenuKeepsStandardUndoRedoCutCopyPasteAndSelectAll() throws {
         let menu = KaisolaMacAppDelegate.makeMainMenu(
             updateTarget: nil,

@@ -7,6 +7,7 @@ import XCTest
 /// clockwise, button" with no hint of which page it reloads. The card can also
 /// sit on a dev server that never came up, so every load state has to be
 /// reachable in the header's accessibility tree.
+@MainActor
 final class BrowserCardAccessibilityTests: XCTestCase {
     private func accessibility(
         _ string: String = "http://localhost:3000/dashboard?tab=logs",
@@ -151,6 +152,40 @@ final class BrowserCardAccessibilityTests: XCTestCase {
         address.commit(nil)
 
         XCTAssertEqual(address.currentURL, retargeted)
+    }
+
+    func testSameDocumentObserverAcceptsOnlyIdleExactOriginAddresses() throws {
+        let coordinator = ConfinedWebView.Coordinator()
+        coordinator.origin = try origin("http://localhost:3000/start")
+        var reported: [URL] = []
+        coordinator.reportCommittedURL = { url in
+            if let url { reported.append(url) }
+        }
+
+        let sameDocument = try url("http://localhost:3000/dashboard#activity")
+        coordinator.addressChangedOutsideNavigation(to: sameDocument, isLoading: true)
+        coordinator.addressChangedOutsideNavigation(
+            to: try url("http://localhost:3001/dashboard"),
+            isLoading: false
+        )
+        coordinator.addressChangedOutsideNavigation(to: nil, isLoading: false)
+        coordinator.addressChangedOutsideNavigation(to: sameDocument, isLoading: false)
+
+        XCTAssertEqual(reported, [sameDocument])
+    }
+
+    func testCoordinatorAnswersTheWebKitNavigationSelectors() {
+        let coordinator = ConfinedWebView.Coordinator()
+        XCTAssertTrue(
+            coordinator.responds(to: NSSelectorFromString("webView:didCommitNavigation:"))
+        )
+        XCTAssertTrue(
+            coordinator.responds(
+                to: NSSelectorFromString(
+                    "webView:decidePolicyForNavigationAction:decisionHandler:"
+                )
+            )
+        )
     }
 
     // MARK: - Origin confinement

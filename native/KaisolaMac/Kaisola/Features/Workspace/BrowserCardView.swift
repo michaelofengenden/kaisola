@@ -263,7 +263,7 @@ struct BrowserCardView: View {
 /// for off-origin subframes, so the card can never wander onto the open web.
 /// No JS message handlers are installed, and the data store is non-persistent
 /// and not shared with the file preview.
-private struct ConfinedWebView: NSViewRepresentable {
+struct ConfinedWebView: NSViewRepresentable {
     let url: URL
     let reloadToken: Int
     @Binding var loadState: BrowserCardLoadState
@@ -288,6 +288,7 @@ private struct ConfinedWebView: NSViewRepresentable {
         coordinator.reloadToken = reloadToken
         coordinator.report = report
         coordinator.reportCommittedURL = reportCommittedURL
+        coordinator.observeAddress(of: webView)
         webView.load(URLRequest(url: url))
         return webView
     }
@@ -331,6 +332,27 @@ private struct ConfinedWebView: NSViewRepresentable {
         var reloadToken = 0
         var report: (BrowserCardLoadState) -> Void = { _ in }
         var reportCommittedURL: (URL?) -> Void = { _ in }
+        private var urlObservation: NSKeyValueObservation?
+
+        /// `WKNavigationDelegate` does not report fragment changes or History
+        /// API routing. Observe the web view's address for those same-document
+        /// transitions while keeping provisional and off-origin URLs out of
+        /// the header until the confined navigation policy accepts them.
+        func observeAddress(of webView: WKWebView) {
+            urlObservation = webView.observe(\.url, options: [.new]) { [weak self] observed, change in
+                MainActor.assumeIsolated {
+                    self?.addressChangedOutsideNavigation(
+                        to: change.newValue ?? nil,
+                        isLoading: observed.isLoading
+                    )
+                }
+            }
+        }
+
+        func addressChangedOutsideNavigation(to url: URL?, isLoading: Bool) {
+            guard !isLoading, let url, origin?.allows(url) == true else { return }
+            reportCommittedURL(url)
+        }
 
         func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
             report(.loading)

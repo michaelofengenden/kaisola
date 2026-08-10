@@ -87,7 +87,10 @@ final class PDFPreviewBudgetTests: XCTestCase {
             temporaryDirectory: FileManager.default.temporaryDirectory
         )
         XCTAssertEqual(valid?.fixture.id, "image-heavy")
-        XCTAssertEqual(valid?.root.standardizedFileURL, privateRoot.standardizedFileURL)
+        XCTAssertEqual(
+            valid?.root.standardizedFileURL.resolvingSymlinksInPath().path,
+            privateRoot.standardizedFileURL.resolvingSymlinksInPath().path
+        )
 
         XCTAssertNil(PDFPreviewBudgetConfiguration.resolve(
             environment: [

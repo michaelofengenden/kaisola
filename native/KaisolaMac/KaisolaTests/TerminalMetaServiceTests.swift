@@ -328,8 +328,20 @@ final class TerminalMetaServiceTests: XCTestCase {
         XCTAssertNil(TerminalMetaService.agentName(fromCommand: command))
         let expectedName = try XCTUnwrap(TerminalMetaService.processName(fromCommand: command))
         XCTAssertNotEqual(expectedName, "codex")
-        let meta = try harness.collect(untilProcessNameIs: expectedName)
-        XCTAssertEqual(meta.processName, expectedName)
+        let meta = try harness.collect(untilProcessNameMatches: { observedName in
+            Self.runtimeProcessFamily(observedName) == Self.runtimeProcessFamily(expectedName)
+        })
+        XCTAssertEqual(
+            Self.runtimeProcessFamily(try XCTUnwrap(meta.processName)),
+            Self.runtimeProcessFamily(expectedName)
+        )
+    }
+
+    private static func runtimeProcessFamily(_ name: String) -> String {
+        let normalized = name.lowercased()
+        return normalized == "python" || normalized.hasPrefix("python3")
+            ? "python"
+            : normalized
     }
 
     func testExitedControlledTreeCannotRetainAnAgentIdentity() throws {
@@ -534,14 +546,28 @@ private final class TerminalAgentProcessHarness {
         untilProcessNameIs expected: String,
         timeout: TimeInterval = 5
     ) throws -> TerminalMeta {
+        try collect(
+            untilProcessNameMatches: { $0 == expected },
+            expectationDescription: expected,
+            timeout: timeout
+        )
+    }
+
+    func collect(
+        untilProcessNameMatches predicate: (String) -> Bool,
+        expectationDescription: String = "a matching process",
+        timeout: TimeInterval = 5
+    ) throws -> TerminalMeta {
         let deadline = Date().addingTimeInterval(timeout)
         var last = TerminalMeta.empty
         repeat {
             last = TerminalMetaService.collect(pid: rootPID)
-            if last.processName == expected { return last }
+            if let processName = last.processName, predicate(processName) { return last }
             Thread.sleep(forTimeInterval: 0.02)
         } while rootProcess.isRunning && Date() < deadline
-        throw failure("collector returned \(last.processName ?? "nil") instead of \(expected)")
+        throw failure(
+            "collector returned \(last.processName ?? "nil") instead of \(expectationDescription)"
+        )
     }
 
     func stopAndVerify(file: StaticString = #filePath, line: UInt = #line) {

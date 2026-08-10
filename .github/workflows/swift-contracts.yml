@@ -404,6 +404,52 @@ jobs:
           path: ${{ runner.temp }}/companion-contract/companion-contract.json
           if-no-files-found: error
           retention-days: 90
+      - name: Compile Kaisola macOS test bundle
+        run: >-
+          xcodebuild
+          -project native/KaisolaMac/KaisolaMac.xcodeproj
+          -scheme Kaisola
+          -configuration Debug
+          -destination 'platform=macOS'
+          -derivedDataPath "$RUNNER_TEMP/kaisola-mac-tests"
+          CODE_SIGNING_ALLOWED=NO
+          build-for-testing
+      - name: Run Kaisola macOS tests
+        run: >-
+          xcodebuild
+          -project native/KaisolaMac/KaisolaMac.xcodeproj
+          -scheme Kaisola
+          -configuration Debug
+          -destination 'platform=macOS'
+          -derivedDataPath "$RUNNER_TEMP/kaisola-mac-tests"
+          CODE_SIGNING_ALLOWED=NO
+          test-without-building
+
+  # The installed optimized-PDF receipt is a performance contract. Give it a
+  # fresh runner with no booted simulator, CoreSimulator services, or iPhone
+  # build/test residue so PDFKit cadence and process footprint measure only the
+  # packaged macOS app. Release-candidate callers already prove their signed
+  # candidate bytes and retain the existing skip behavior here.
+  optimized-macos-pdf:
+    if: ${{ !inputs.skip-macos-release-build }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install exact Node helper dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+        env:
+          KAISOLA_SKIP_NATIVE_REBUILD: '1'
+      - name: Download checksum-pinned Node runtime
+        run: node scripts/download-native-node-runtime.cjs arm64
       - name: Compile optimized Kaisola macOS app
         if: ${{ !inputs.skip-macos-release-build }}
         run: >-
@@ -439,23 +485,3 @@ jobs:
           npm run native:pdf-preview-budget -- \
             --app "$installed_app" \
             --output "$RUNNER_TEMP/native-pdf-preview-budget.json"
-      - name: Compile Kaisola macOS test bundle
-        run: >-
-          xcodebuild
-          -project native/KaisolaMac/KaisolaMac.xcodeproj
-          -scheme Kaisola
-          -configuration Debug
-          -destination 'platform=macOS'
-          -derivedDataPath "$RUNNER_TEMP/kaisola-mac-tests"
-          CODE_SIGNING_ALLOWED=NO
-          build-for-testing
-      - name: Run Kaisola macOS tests
-        run: >-
-          xcodebuild
-          -project native/KaisolaMac/KaisolaMac.xcodeproj
-          -scheme Kaisola
-          -configuration Debug
-          -destination 'platform=macOS'
-          -derivedDataPath "$RUNNER_TEMP/kaisola-mac-tests"
-          CODE_SIGNING_ALLOWED=NO
-          test-without-building

@@ -62,6 +62,7 @@ function checkoutSteps(lines) {
 test('security-sensitive jobs do not persist checkout credentials', () => {
   const jobs = [
     ['swift-contracts.yml', 'verify'],
+    ['swift-contracts.yml', 'optimized-macos-pdf'],
     ['landing-gate.yml', 'landing'],
     ['release-candidate.yml', 'candidate'],
     ['release.yml', 'promote'],

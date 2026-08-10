@@ -21,6 +21,21 @@ const {
   validateAppStderr,
 } = require('../../scripts/native-pdf-preview-budget.cjs')
 
+function workflowJobSource(source, job) {
+  const lines = source.split('\n')
+  const start = lines.findIndex((line) => line === `  ${job}:`)
+  assert.notEqual(start, -1, `swift-contracts must define the ${job} job`)
+
+  let end = lines.length
+  for (let index = start + 1; index < lines.length; index += 1) {
+    if (/^  [a-zA-Z0-9_-]+:\s*(?:#.*)?$/u.test(lines[index])) {
+      end = index
+      break
+    }
+  }
+  return lines.slice(start, end).join('\n')
+}
+
 function passingReceipt(fixture = FIXTURES[0]) {
   const pagingLatencies = fixture.pagingPageIndexes.map((_, index) => 50 + index)
   const scroll = fixture.measuresSustainedScroll ? {
@@ -81,6 +96,61 @@ test('fixture catalog and thresholds are exact, deterministic, and bounded', () 
     maximumPeakPhysicalFootprintBytes: 768 * 1024 * 1024,
   })
   assert.ok(FIXTURES.every((fixture) => fixture.maximumBytes <= 20 * 1024 * 1024))
+})
+
+test('optimized PDF qualification runs in a fresh simulator-free macOS job', () => {
+  const workflow = fs.readFileSync(path.resolve(
+    __dirname,
+    '../../.github/workflows/swift-contracts.yml',
+  ), 'utf8')
+  const verify = workflowJobSource(workflow, 'verify')
+  const qualification = workflowJobSource(workflow, 'optimized-macos-pdf')
+
+  assert.match(qualification, /runs-on: macos-15/u)
+  assert.match(qualification, /if: \$\{\{ !inputs\.skip-macos-release-build \}\}/u)
+  assert.match(qualification, /uses: actions\/checkout@[0-9a-f]{40}/u)
+  assert.match(qualification, /persist-credentials: false/u)
+  assert.match(qualification, /uses: actions\/setup-node@[0-9a-f]{40}/u)
+  assert.match(qualification, /node-version: 22/u)
+  assert.match(qualification, /npm ci --prefer-offline --no-audit --no-fund/u)
+  assert.match(qualification, /node scripts\/download-native-node-runtime\.cjs arm64/u)
+
+  const orderedPrerequisites = [
+    'uses: actions/checkout@',
+    'uses: actions/setup-node@',
+    'run: npm ci --prefer-offline --no-audit --no-fund',
+    '- name: Download checksum-pinned Node runtime',
+  ]
+  let previous = -1
+  for (const prerequisite of orderedPrerequisites) {
+    const position = qualification.indexOf(prerequisite)
+    assert.ok(position > previous, `${prerequisite} must precede optimized qualification`)
+    previous = position
+  }
+
+  const requiredSteps = [
+    'Compile optimized Kaisola macOS app',
+    'Verify sealed Kaisola package',
+    'Prove packaged broker and PTY continuity',
+    'Gate installed optimized PDF previews',
+  ]
+  for (const step of requiredSteps) {
+    const position = qualification.indexOf(`- name: ${step}`)
+    assert.ok(position > previous, `${step} must run in qualification order`)
+    previous = position
+    assert.equal(verify.includes(`- name: ${step}`), false, `${step} must leave the simulator job`)
+  }
+
+  assert.match(qualification, /-configuration LocalRelease/u)
+  assert.match(qualification, /npm run native:preflight --/u)
+  assert.match(qualification, /npm run native:helper:probe --/u)
+  assert.match(qualification, /--require-signed-host/u)
+  assert.match(qualification, /npm run native:pdf-preview-budget --/u)
+  assert.match(qualification, /--output "\$RUNNER_TEMP\/native-pdf-preview-budget\.json"/u)
+  assert.doesNotMatch(
+    qualification,
+    /simctl|CoreSimulator|KaisolaCompanion|KAISOLA_COMPANION|iPhone/u,
+  )
 })
 
 test('app receipts cannot claim green with missing metrics, threshold drift, or Debug bytes', () => {

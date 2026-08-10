@@ -1,5 +1,6 @@
 import AppKit
 import CoreGraphics
+import CryptoKit
 import Foundation
 import PDFKit
 import QuartzCore
@@ -88,6 +89,82 @@ struct PDFPreviewBudgetGeneratedFixture: Equatable, Sendable {
     let specification: PDFPreviewBudgetFixtureSpecification
     let url: URL
     let byteCount: Int
+}
+
+struct PDFPreviewBudgetFixtureArtifact: Codable, Equatable, Sendable {
+    let fileName: String
+    let byteCount: Int
+    let sha256: String
+
+    static func capture(
+        _ fixture: PDFPreviewBudgetGeneratedFixture
+    ) throws -> PDFPreviewBudgetFixtureArtifact {
+        PDFPreviewBudgetFixtureArtifact(
+            fileName: fixture.specification.fileName,
+            byteCount: fixture.byteCount,
+            sha256: try digest(of: fixture.url)
+        )
+    }
+
+    func isValid(for specification: PDFPreviewBudgetFixtureSpecification) -> Bool {
+        fileName == specification.fileName
+            && byteCount >= specification.minimumBytes
+            && byteCount <= specification.maximumBytes
+            && sha256.count == 64
+            && sha256.allSatisfy { character in
+                character.isNumber || ("a"..."f").contains(String(character))
+            }
+    }
+
+    private static func digest(of url: URL) throws -> String {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        var digest = SHA256()
+        while let data = try handle.read(upToCount: 64 * 1_024), !data.isEmpty {
+            digest.update(data: data)
+        }
+        return digest.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+enum PDFPreviewBudgetFixtureLoader {
+    static func load(
+        specification: PDFPreviewBudgetFixtureSpecification,
+        root: URL,
+        expectedArtifact: PDFPreviewBudgetFixtureArtifact
+    ) throws -> PDFPreviewBudgetGeneratedFixture {
+        guard expectedArtifact.isValid(for: specification) else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let canonicalRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        let candidate = canonicalRoot.appendingPathComponent(
+            specification.fileName,
+            isDirectory: false
+        ).standardizedFileURL
+        guard candidate.deletingLastPathComponent() == canonicalRoot else {
+            throw CocoaError(.fileReadNoPermission)
+        }
+        let values = try candidate.resourceValues(forKeys: [
+            .fileSizeKey,
+            .isRegularFileKey,
+            .isSymbolicLinkKey,
+        ])
+        guard values.isRegularFile == true,
+              values.isSymbolicLink != true,
+              candidate.resolvingSymlinksInPath() == candidate,
+              values.fileSize == expectedArtifact.byteCount else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        let fixture = PDFPreviewBudgetGeneratedFixture(
+            specification: specification,
+            url: candidate,
+            byteCount: expectedArtifact.byteCount
+        )
+        guard try PDFPreviewBudgetFixtureArtifact.capture(fixture) == expectedArtifact else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return fixture
+    }
 }
 
 enum PDFPreviewBudgetFixtureWriter {
@@ -345,9 +422,16 @@ enum PDFPreviewBudgetFixtureWriter {
     }
 }
 
+enum PDFPreviewBudgetPhase: String, Codable, Equatable, Sendable {
+    case generate
+    case render
+}
+
 struct PDFPreviewBudgetConfiguration: Equatable, Sendable {
     let fixture: PDFPreviewBudgetFixtureSpecification
     let root: URL
+    let phase: PDFPreviewBudgetPhase
+    let expectedArtifact: PDFPreviewBudgetFixtureArtifact?
 
     static func resolve(
         environment: [String: String] = ProcessInfo.processInfo.environment,
@@ -356,6 +440,8 @@ struct PDFPreviewBudgetConfiguration: Equatable, Sendable {
         guard environment["KAISOLA_NATIVE_PDF_PREVIEW_BUDGET"] == "1",
               let fixtureID = environment["KAISOLA_NATIVE_PDF_PREVIEW_FIXTURE"],
               let fixture = PDFPreviewBudgetFixtureCatalog.specification(id: fixtureID),
+              let rawPhase = environment["KAISOLA_NATIVE_PDF_PREVIEW_PHASE"],
+              let phase = PDFPreviewBudgetPhase(rawValue: rawPhase),
               let rawRoot = environment["KAISOLA_NATIVE_PDF_PREVIEW_ROOT"],
               rawRoot.hasPrefix("/") else { return nil }
         let root = URL(fileURLWithPath: rawRoot, isDirectory: true)
@@ -363,7 +449,31 @@ struct PDFPreviewBudgetConfiguration: Equatable, Sendable {
             .resolvingSymlinksInPath()
         let temporary = temporaryDirectory.standardizedFileURL.resolvingSymlinksInPath()
         guard root.path.hasPrefix(temporary.path + "/") else { return nil }
-        return PDFPreviewBudgetConfiguration(fixture: fixture, root: root)
+        let expectedBytes = environment["KAISOLA_NATIVE_PDF_PREVIEW_EXPECTED_BYTES"]
+        let expectedSHA256 = environment["KAISOLA_NATIVE_PDF_PREVIEW_EXPECTED_SHA256"]
+        let artifact: PDFPreviewBudgetFixtureArtifact?
+        switch phase {
+        case .generate:
+            guard expectedBytes == nil, expectedSHA256 == nil else { return nil }
+            artifact = nil
+        case .render:
+            guard let expectedBytes,
+                  let byteCount = Int(expectedBytes),
+                  let expectedSHA256 else { return nil }
+            let candidate = PDFPreviewBudgetFixtureArtifact(
+                fileName: fixture.fileName,
+                byteCount: byteCount,
+                sha256: expectedSHA256
+            )
+            guard candidate.isValid(for: fixture) else { return nil }
+            artifact = candidate
+        }
+        return PDFPreviewBudgetConfiguration(
+            fixture: fixture,
+            root: root,
+            phase: phase,
+            expectedArtifact: artifact
+        )
     }
 }
 
@@ -630,12 +740,24 @@ struct PDFPreviewBudgetBuildReceipt: Codable, Equatable, Sendable {
 struct PDFPreviewBudgetAppReceipt: Codable, Equatable, Sendable {
     let schemaVersion: Int
     let workload: String
+    let phase: PDFPreviewBudgetPhase
     let fixture: String
     let appPid: Int32
     let build: PDFPreviewBudgetBuildReceipt
     let thresholds: PDFPreviewBudgetThresholds
     let specification: PDFPreviewBudgetFixtureSpecification
     let result: PDFPreviewBudgetFixtureResult
+}
+
+struct PDFPreviewBudgetGenerationReceipt: Codable, Equatable, Sendable {
+    let schemaVersion: Int
+    let workload: String
+    let phase: PDFPreviewBudgetPhase
+    let fixture: String
+    let appPid: Int32
+    let build: PDFPreviewBudgetBuildReceipt
+    let specification: PDFPreviewBudgetFixtureSpecification
+    let artifact: PDFPreviewBudgetFixtureArtifact
 }
 
 @MainActor
@@ -771,6 +893,7 @@ private final class PDFPreviewScrollProbe: NSObject {
 @MainActor
 final class PDFPreviewBudgetRunner {
     static let receiptPrefix = "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET_RECEIPT="
+    static let workload = "bounded-pdf-preview-v2"
 
     private let configuration: PDFPreviewBudgetConfiguration
     private var window: NSWindow?
@@ -787,14 +910,53 @@ final class PDFPreviewBudgetRunner {
     }
 
     private func run() async {
-        let result: PDFPreviewBudgetFixtureResult
+        switch configuration.phase {
+        case .generate:
+            await generate()
+        case .render:
+            await render()
+        }
+    }
+
+    private func generate() async {
         do {
             let specification = configuration.fixture
             let root = configuration.root
             let generated = try await Task.detached(priority: .userInitiated) {
-                try PDFPreviewBudgetFixtureWriter.write(
-                    specification,
-                    to: root
+                try PDFPreviewBudgetFixtureWriter.write(specification, to: root)
+            }.value
+            let artifact = try await Task.detached(priority: .userInitiated) {
+                try PDFPreviewBudgetFixtureArtifact.capture(generated)
+            }.value
+            emit(PDFPreviewBudgetGenerationReceipt(
+                schemaVersion: 2,
+                workload: Self.workload,
+                phase: .generate,
+                fixture: specification.id,
+                appPid: ProcessInfo.processInfo.processIdentifier,
+                build: buildReceipt(),
+                specification: specification,
+                artifact: artifact
+            ))
+        } catch {
+            emitFailure("fixture-generation")
+        }
+        NSApp.terminate(nil)
+    }
+
+    private func render() async {
+        let result: PDFPreviewBudgetFixtureResult
+        do {
+            let specification = configuration.fixture
+            let root = configuration.root
+            guard let expectedArtifact = configuration.expectedArtifact else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let generated = try await Task.detached(priority: .userInitiated) {
+                try PDFPreviewBudgetFixtureLoader.load(
+                    specification: specification,
+                    root: root,
+                    expectedArtifact: expectedArtifact
                 )
             }.value
             result = try await measure(generated)
@@ -805,8 +967,9 @@ final class PDFPreviewBudgetRunner {
             )
         }
         emit(PDFPreviewBudgetAppReceipt(
-            schemaVersion: 1,
-            workload: "bounded-pdf-preview-v1",
+            schemaVersion: 2,
+            workload: Self.workload,
+            phase: .render,
             fixture: configuration.fixture.id,
             appPid: ProcessInfo.processInfo.processIdentifier,
             build: buildReceipt(),
@@ -944,7 +1107,7 @@ final class PDFPreviewBudgetRunner {
         )
     }
 
-    private func emit(_ receipt: PDFPreviewBudgetAppReceipt) {
+    private func emit<Receipt: Encodable>(_ receipt: Receipt) {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
         guard let data = try? encoder.encode(receipt) else {
@@ -955,6 +1118,11 @@ final class PDFPreviewBudgetRunner {
         FileHandle.standardOutput.write(Data(Self.receiptPrefix.utf8))
         FileHandle.standardOutput.write(data)
         FileHandle.standardOutput.write(Data("\n".utf8))
+        try? FileHandle.standardOutput.synchronize()
+    }
+
+    private func emitFailure(_ reason: String) {
+        print("\(Self.receiptPrefix)FAIL \(reason)")
         try? FileHandle.standardOutput.synchronize()
     }
 }

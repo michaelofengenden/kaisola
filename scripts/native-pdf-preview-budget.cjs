@@ -10,7 +10,8 @@ const { isDeepStrictEqual } = require('node:util')
 const { takeSample } = require('./native-resource-gate.cjs')
 
 const APP_RECEIPT_PREFIX = 'KAISOLA_NATIVE_PDF_PREVIEW_BUDGET_RECEIPT='
-const WORKLOAD = 'bounded-pdf-preview-v1'
+const WORKLOAD = 'bounded-pdf-preview-v2'
+const SCHEMA_VERSION = 2
 const MAX_CAPTURE_BYTES = 64 * 1024
 const LAUNCH_ARGUMENTS = ['-ApplePersistenceIgnoreState', 'YES']
 const PERSISTENCE_NOTICE = /^(?:\d{4}-\d{2}-\d{2} [^\r\n]+ )?ApplePersistenceIgnoreState: Existing state will not be touched\. New state will be written to [^\r\n]*\/[^\r\n]+\.savedState$/
@@ -159,23 +160,37 @@ function assertReceiptBundlePath(installed, fixture, observed) {
   }
 }
 
-function buildFixtureEnvironment(root, fixture) {
-  return {
+function buildFixtureEnvironment(root, fixture, phase, artifact = null) {
+  if (phase !== 'generate' && phase !== 'render') fail('PDF preview phase is invalid')
+  if (phase === 'render' && (!artifact
+      || artifact.fileName !== FIXTURES.find((candidate) => candidate.id === fixture)?.fileName
+      || !Number.isSafeInteger(artifact.byteCount) || artifact.byteCount <= 0
+      || !/^[0-9a-f]{64}$/u.test(artifact.sha256))) {
+    fail('render phase requires an exact prepared fixture artifact')
+  }
+  const home = path.join(root, `${phase}-home`)
+  const environment = {
     PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
     LANG: 'en_US.UTF-8',
     TMPDIR: process.env.TMPDIR || os.tmpdir(),
-    HOME: root,
-    CFFIXED_USER_HOME: root,
+    HOME: home,
+    CFFIXED_USER_HOME: home,
     KAISOLA_NATIVE_PDF_PREVIEW_BUDGET: '1',
     KAISOLA_NATIVE_PDF_PREVIEW_FIXTURE: fixture,
     KAISOLA_NATIVE_PDF_PREVIEW_ROOT: root,
+    KAISOLA_NATIVE_PDF_PREVIEW_PHASE: phase,
   }
+  if (phase === 'render') {
+    environment.KAISOLA_NATIVE_PDF_PREVIEW_EXPECTED_BYTES = String(artifact.byteCount)
+    environment.KAISOLA_NATIVE_PDF_PREVIEW_EXPECTED_SHA256 = artifact.sha256
+  }
+  return environment
 }
 
-function buildFixtureLaunchOptions(root, fixture) {
+function buildFixtureLaunchOptions(root, fixture, phase, artifact = null) {
   return {
-    cwd: root,
-    env: buildFixtureEnvironment(root, fixture),
+    cwd: path.join(root, `${phase}-home`),
+    env: buildFixtureEnvironment(root, fixture, phase, artifact),
     stdio: ['ignore', 'pipe', 'pipe'],
   }
 }
@@ -220,19 +235,40 @@ function validateAppStderr(stderr, fixture) {
   }
 }
 
-function validateAppReceipt(receipt, expectedFixture, expectedPID) {
+function validateReceiptEnvelope(receipt, expectedFixture, expectedPID, expectedPhase) {
   if (!receipt || typeof receipt !== 'object' || Array.isArray(receipt)) fail('app receipt must be an object')
-  if (receipt.schemaVersion !== 1 || receipt.workload !== WORKLOAD) fail('app receipt schema or workload drifted')
+  if (receipt.schemaVersion !== SCHEMA_VERSION || receipt.workload !== WORKLOAD) {
+    fail('app receipt schema or workload drifted')
+  }
+  if (receipt.phase !== expectedPhase) fail('app receipt phase drifted')
   if (receipt.fixture !== expectedFixture) fail('app receipt fixture drifted')
   if (receipt.appPid !== expectedPID) fail('app receipt pid does not match the launched process')
   if (receipt.build?.optimized !== true) fail('PDF preview budget requires optimized app bytes')
   for (const key of ['bundleIdentifier', 'bundlePath', 'version', 'build']) {
     if (typeof receipt.build?.[key] !== 'string' || !receipt.build[key]) fail(`app build ${key} is missing`)
   }
-  exactObject(receipt.thresholds, THRESHOLDS, 'PDF preview threshold')
   const fixture = FIXTURES.find((candidate) => candidate.id === expectedFixture)
   if (!fixture) fail(`unsupported fixture: ${expectedFixture}`)
   exactObject(receipt.specification, fixture, 'PDF fixture specification')
+  return fixture
+}
+
+function validateGenerationReceipt(receipt, expectedFixture, expectedPID) {
+  const fixture = validateReceiptEnvelope(receipt, expectedFixture, expectedPID, 'generate')
+  const artifact = receipt.artifact
+  if (!artifact || artifact.fileName !== fixture.fileName
+      || !Number.isSafeInteger(artifact.byteCount)
+      || artifact.byteCount < fixture.minimumBytes
+      || artifact.byteCount > fixture.maximumBytes
+      || !/^[0-9a-f]{64}$/u.test(artifact.sha256)) {
+    fail('generation receipt artifact is invalid')
+  }
+  return receipt
+}
+
+function validateAppReceipt(receipt, expectedFixture, expectedPID) {
+  const fixture = validateReceiptEnvelope(receipt, expectedFixture, expectedPID, 'render')
+  exactObject(receipt.thresholds, THRESHOLDS, 'PDF preview threshold')
 
   const result = receipt.result
   if (!result || result.fixture !== expectedFixture || !Array.isArray(result.diagnostics)) {
@@ -306,7 +342,7 @@ function validateAppReceipt(receipt, expectedFixture, expectedPID) {
   return receipt
 }
 
-function parseAppReceiptLine(line, expectedFixture, expectedPID) {
+function parseAppReceiptLine(line, expectedFixture, expectedPID, expectedPhase = 'render') {
   if (!String(line).startsWith(APP_RECEIPT_PREFIX)) fail('app receipt prefix is invalid')
   const raw = String(line).slice(APP_RECEIPT_PREFIX.length)
   if (raw.startsWith('FAIL ')) fail(raw)
@@ -316,15 +352,51 @@ function parseAppReceiptLine(line, expectedFixture, expectedPID) {
   } catch {
     fail('app receipt JSON is invalid')
   }
-  return validateAppReceipt(receipt, expectedFixture, expectedPID)
+  if (expectedPhase === 'generate') {
+    return validateGenerationReceipt(receipt, expectedFixture, expectedPID)
+  }
+  if (expectedPhase === 'render') return validateAppReceipt(receipt, expectedFixture, expectedPID)
+  fail('expected PDF preview phase is invalid')
+}
+
+function assertPreparedFixture(root, fixture, artifact) {
+  if (!artifact || artifact.fileName !== fixture.fileName
+      || !Number.isSafeInteger(artifact.byteCount)
+      || artifact.byteCount < fixture.minimumBytes
+      || artifact.byteCount > fixture.maximumBytes
+      || !/^[0-9a-f]{64}$/u.test(artifact.sha256)) {
+    fail(`prepared fixture metadata is invalid for ${fixture.id}`)
+  }
+  const canonicalRoot = fs.realpathSync(root)
+  const expected = path.join(canonicalRoot, fixture.fileName)
+  let metadata
+  try {
+    metadata = fs.lstatSync(expected)
+  } catch (error) {
+    fail(`prepared fixture is missing for ${fixture.id}: ${error.message}`)
+  }
+  if (!metadata.isFile() || metadata.isSymbolicLink()) {
+    fail(`prepared fixture must be a regular file for ${fixture.id}`)
+  }
+  if (fs.realpathSync(expected) !== expected) {
+    fail(`prepared fixture escaped its private root for ${fixture.id}`)
+  }
+  if (metadata.size !== artifact.byteCount) {
+    fail(`prepared fixture byte count drifted for ${fixture.id}`)
+  }
+  if (fileSHA256(expected) !== artifact.sha256) {
+    fail(`prepared fixture digest drifted for ${fixture.id}`)
+  }
+  return artifact
 }
 
 function mergeMemoryMeasurement(receipt, memory) {
   if (!Number.isSafeInteger(memory?.peakPhysicalFootprintBytes) || memory.peakPhysicalFootprintBytes <= 0
       || !Number.isSafeInteger(memory?.currentPhysicalFootprintBytes) || memory.currentPhysicalFootprintBytes <= 0
-      || !Number.isSafeInteger(memory?.measuredProcessCount) || memory.measuredProcessCount <= 0) {
+      || !Number.isSafeInteger(memory?.measuredPid) || memory.measuredPid <= 0) {
     fail('physical-footprint measurement is invalid')
   }
+  if (memory.measuredProcessCount !== 1) fail('physical footprint must measure exactly one render process')
   const diagnostics = [...receipt.result.diagnostics]
   if (memory.peakPhysicalFootprintBytes > THRESHOLDS.maximumPeakPhysicalFootprintBytes) {
     diagnostics.push({
@@ -339,7 +411,8 @@ function mergeMemoryMeasurement(receipt, memory) {
     memory: {
       metric: {
         family: 'macOS-footprint',
-        name: 'summed process-tree phys_footprint_peak',
+        name: 'single render-process phys_footprint_peak',
+        retainedName: 'single render-process phys_footprint',
         source: '/usr/bin/footprint JSON',
         unit: 'byte',
       },
@@ -356,18 +429,25 @@ function appendBounded(current, chunk, label) {
   return next
 }
 
-function waitForAppReceipt(child, fixture, timeoutMs = 60_000) {
+function waitForAppReceipt(
+  child,
+  fixture,
+  phase = 'render',
+  { timeoutMs = 60_000, requireCleanExit = false } = {},
+) {
   return new Promise((resolve, reject) => {
     let stdout = ''
     let stderr = ''
     let settled = false
+    let parsedReceipt = null
     const finish = (error, receipt) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
       child.stdout.off('data', onStdout)
       child.stderr.off('data', onStderr)
-      child.off('exit', onExit)
+      child.off('close', onClose)
+      child.off('error', onError)
       if (error) reject(error)
       else resolve({ receipt, stdout, stderr })
     }
@@ -380,7 +460,8 @@ function waitForAppReceipt(child, fixture, timeoutMs = 60_000) {
         if (receipts.length === 1 && stdout.endsWith('\n')) {
           const nonempty = lines.filter(Boolean)
           if (nonempty.length !== 1) fail('app emitted stdout outside its PDF receipt')
-          finish(null, parseAppReceiptLine(receipts[0], fixture, child.pid))
+          parsedReceipt = parseAppReceiptLine(receipts[0], fixture, child.pid, phase)
+          if (!requireCleanExit) finish(null, parsedReceipt)
         }
       } catch (error) {
         finish(error)
@@ -389,16 +470,24 @@ function waitForAppReceipt(child, fixture, timeoutMs = 60_000) {
     const onStderr = (chunk) => {
       try { stderr = appendBounded(stderr, chunk, 'app stderr') } catch (error) { finish(error) }
     }
-    const onExit = (code, signal) => finish(new Error(
-      `app exited before PDF receipt: code=${code} signal=${signal || 'none'} stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`,
-    ))
+    const onClose = (code, signal) => {
+      if (requireCleanExit && parsedReceipt && code === 0 && signal == null) {
+        finish(null, parsedReceipt)
+        return
+      }
+      finish(new Error(
+        `app exited before a complete PDF ${phase} receipt: code=${code} signal=${signal || 'none'} stdout=${JSON.stringify(stdout)} stderr=${JSON.stringify(stderr)}`,
+      ))
+    }
+    const onError = (error) => finish(new Error(`PDF ${phase} launch failed: ${error.message}`))
     const timer = setTimeout(
-      () => finish(new Error(`PDF receipt timed out for ${fixture}`)),
+      () => finish(new Error(`PDF ${phase} receipt timed out for ${fixture}`)),
       timeoutMs,
     )
     child.stdout.on('data', onStdout)
     child.stderr.on('data', onStderr)
-    child.on('exit', onExit)
+    child.on('close', onClose)
+    child.on('error', onError)
   })
 }
 
@@ -415,39 +504,80 @@ async function terminateExactChild(child) {
 }
 
 function memoryFromSample(sample) {
-  const peak = sample.processes.reduce(
-    (total, process) => total + Math.max(process.peakPhysicalFootprintBytes, process.physicalFootprintBytes),
-    0,
-  )
+  if (!Array.isArray(sample?.processes) || sample.processes.length !== 1) {
+    fail('physical footprint must measure exactly one render process')
+  }
+  const [process] = sample.processes
+  if (!Number.isSafeInteger(process.pid) || process.pid <= 0
+      || !Number.isSafeInteger(process.physicalFootprintBytes) || process.physicalFootprintBytes <= 0
+      || !Number.isSafeInteger(process.peakPhysicalFootprintBytes) || process.peakPhysicalFootprintBytes <= 0) {
+    fail('render-process physical footprint is invalid')
+  }
   return {
-    peakPhysicalFootprintBytes: Math.max(sample.totalBytes, peak),
-    currentPhysicalFootprintBytes: sample.totalBytes,
-    measuredProcessCount: sample.processes.length,
+    peakPhysicalFootprintBytes: Math.max(
+      process.peakPhysicalFootprintBytes,
+      process.physicalFootprintBytes,
+    ),
+    currentPhysicalFootprintBytes: process.physicalFootprintBytes,
+    measuredProcessCount: 1,
+    measuredPid: process.pid,
   }
 }
 
 async function runFixture(installed, fixture) {
   assertInstalledAppUnchanged(installed)
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `kaisola-pdf-preview-${fixture.id}-`))
-  const child = spawn(
+  fs.mkdirSync(path.join(root, 'generate-home'), { mode: 0o700 })
+  fs.mkdirSync(path.join(root, 'render-home'), { mode: 0o700 })
+  let generationChild = spawn(
     installed.executable,
     LAUNCH_ARGUMENTS,
-    buildFixtureLaunchOptions(root, fixture.id),
+    buildFixtureLaunchOptions(root, fixture.id, 'generate'),
   )
+  let renderChild = null
   try {
-    const readiness = await waitForAppReceipt(child, fixture.id)
-    assertReceiptBundlePath(installed, fixture.id, readiness.receipt.build.bundlePath)
-    validateAppStderr(readiness.stderr, fixture.id)
-    const sample = takeSample([child.pid], [])
-    const result = mergeMemoryMeasurement(readiness.receipt, memoryFromSample(sample))
+    const generation = await waitForAppReceipt(
+      generationChild,
+      fixture.id,
+      'generate',
+      { requireCleanExit: true },
+    )
+    assertReceiptBundlePath(installed, fixture.id, generation.receipt.build.bundlePath)
+    validateAppStderr(generation.stderr, fixture.id)
+    const artifact = assertPreparedFixture(root, fixture, generation.receipt.artifact)
+    assertInstalledAppUnchanged(installed)
+
+    renderChild = spawn(
+      installed.executable,
+      LAUNCH_ARGUMENTS,
+      buildFixtureLaunchOptions(root, fixture.id, 'render', artifact),
+    )
+    const render = await waitForAppReceipt(renderChild, fixture.id, 'render')
+    assertReceiptBundlePath(installed, fixture.id, render.receipt.build.bundlePath)
+    validateAppStderr(render.stderr, fixture.id)
+    assertPreparedFixture(root, fixture, artifact)
+    const sample = takeSample([renderChild.pid], [])
+    const memory = memoryFromSample(sample)
+    if (memory.measuredPid !== renderChild.pid) {
+      fail('footprint measured a process other than the exact render process')
+    }
+    const result = mergeMemoryMeasurement(render.receipt, memory)
     return {
       ...result,
+      processBoundary: {
+        generationPid: generationChild.pid,
+        generationExitedBeforeRender: true,
+        renderPid: renderChild.pid,
+        preparedArtifact: artifact,
+      },
       brokerFree: !fs.existsSync(path.join(root, 'broker-profile')),
     }
   } finally {
-    await terminateExactChild(child)
+    await terminateExactChild(renderChild)
+    await terminateExactChild(generationChild)
     assertInstalledAppUnchanged(installed)
-    if (child.exitCode != null || child.signalCode != null) {
+    if ((renderChild == null || renderChild.exitCode != null || renderChild.signalCode != null)
+        && (generationChild.exitCode != null || generationChild.signalCode != null)) {
       fs.rmSync(root, { recursive: true, force: true })
     }
   }
@@ -459,7 +589,7 @@ async function run(options) {
   for (const fixture of FIXTURES) results.push(await runFixture(installed, fixture))
   const diagnostics = results.flatMap((result) => result.diagnostics)
   const report = {
-    schemaVersion: 1,
+    schemaVersion: SCHEMA_VERSION,
     workload: WORKLOAD,
     installedApp: installed.app,
     optimized: results.every((result) => result.build.optimized),
@@ -497,7 +627,9 @@ module.exports = {
   APP_RECEIPT_PREFIX,
   FIXTURES,
   LAUNCH_ARGUMENTS,
+  WORKLOAD,
   THRESHOLDS,
+  assertPreparedFixture,
   assertInstalledAppUnchanged,
   assertReceiptBundlePath,
   buildFixtureEnvironment,
@@ -509,6 +641,7 @@ module.exports = {
   resolveInstalledExecutable,
   run,
   validateAppReceipt,
+  validateGenerationReceipt,
   validateAppStderr,
   waitForAppReceipt,
 }

@@ -33,11 +33,14 @@ npm run native:pdf-preview-budget -- \
   --output native/KaisolaMac/ResourceGates/results/pdf-preview.json
 ```
 
-The gate launches one private, broker-free process per fixture with its working
-directory, `HOME`, and `CFFIXED_USER_HOME` pinned to the fixture root. Fixture
-bytes are generated inside that process from fixed algorithms; no production
-file or profile is read. Generation is excluded from latency but conservatively
-remains inside the lifetime peak-memory observation.
+The gate uses two private, broker-free launches of the same installed executable
+per fixture, with each launch's working directory, `HOME`, and
+`CFFIXED_USER_HOME` pinned to separate `generate-home` and `render-home`
+directories under the private fixture root. The first launch only generates the
+deterministic bytes at the root, emits their exact size and SHA-256, and exits cleanly.
+The fresh second launch refuses a missing, changed, or symlinked artifact and
+only loads and renders those prepared bytes. No production file or profile is
+read.
 
 | Fixture | Deterministic bound | Surface exercised |
 | --- | --- | --- |
@@ -54,12 +57,15 @@ enough to catch a hung or eagerly decoded surface:
 - malformed rejection: at most 1,000 ms;
 - sustained PDFView scrolling: 3 seconds, p95 callback interval at most 50 ms,
   maximum interval at most 250 ms, and callback coverage at least 0.80;
-- per-fixture summed process-tree `phys_footprint_peak`: at most 768 MiB.
+- per-fixture render-process `phys_footprint_peak`: at most 768 MiB.
 
 Each failure is emitted in the final JSON receipt as `{fixture, threshold,
-observed, limit}`. The app receipt also proves optimized compilation, the exact
-installed bundle path, fixture page/byte shape, and that no broker profile was
-created.
+observed, limit}`. The receipt reports the render process's current
+`phys_footprint` separately from its lifetime peak, requires exactly that one
+render process in the sample, and records that the generation process exited
+before rendering began. It also proves optimized compilation, the exact
+installed bundle path, fixture page/byte shape and digest, and that no broker
+profile was created.
 
 ## Installed terminal-history qualification
 

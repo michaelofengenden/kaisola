@@ -78,25 +78,47 @@ final class PDFPreviewBudgetTests: XCTestCase {
 
     func testLaunchConfigurationRequiresAnExplicitFixtureAndPrivateTemporaryRoot() throws {
         let privateRoot = root.appendingPathComponent("run", isDirectory: true)
-        let valid = PDFPreviewBudgetConfiguration.resolve(
+        let generate = PDFPreviewBudgetConfiguration.resolve(
             environment: [
                 "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1",
                 "KAISOLA_NATIVE_PDF_PREVIEW_FIXTURE": "image-heavy",
                 "KAISOLA_NATIVE_PDF_PREVIEW_ROOT": privateRoot.path,
+                "KAISOLA_NATIVE_PDF_PREVIEW_PHASE": "generate",
             ],
             temporaryDirectory: FileManager.default.temporaryDirectory
         )
-        XCTAssertEqual(valid?.fixture.id, "image-heavy")
+        XCTAssertEqual(generate?.fixture.id, "image-heavy")
+        XCTAssertEqual(generate?.phase, .generate)
+        XCTAssertNil(generate?.expectedArtifact)
         XCTAssertEqual(
-            valid?.root.standardizedFileURL.resolvingSymlinksInPath().path,
+            generate?.root.standardizedFileURL.resolvingSymlinksInPath().path,
             privateRoot.standardizedFileURL.resolvingSymlinksInPath().path
         )
+
+        let render = PDFPreviewBudgetConfiguration.resolve(
+            environment: [
+                "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1",
+                "KAISOLA_NATIVE_PDF_PREVIEW_FIXTURE": "image-heavy",
+                "KAISOLA_NATIVE_PDF_PREVIEW_ROOT": privateRoot.path,
+                "KAISOLA_NATIVE_PDF_PREVIEW_PHASE": "render",
+                "KAISOLA_NATIVE_PDF_PREVIEW_EXPECTED_BYTES": "9000000",
+                "KAISOLA_NATIVE_PDF_PREVIEW_EXPECTED_SHA256": String(repeating: "a", count: 64),
+            ],
+            temporaryDirectory: FileManager.default.temporaryDirectory
+        )
+        XCTAssertEqual(render?.phase, .render)
+        XCTAssertEqual(render?.expectedArtifact, PDFPreviewBudgetFixtureArtifact(
+            fileName: "image-heavy.pdf",
+            byteCount: 9_000_000,
+            sha256: String(repeating: "a", count: 64)
+        ))
 
         XCTAssertNil(PDFPreviewBudgetConfiguration.resolve(
             environment: [
                 "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1",
                 "KAISOLA_NATIVE_PDF_PREVIEW_FIXTURE": "not-a-fixture",
                 "KAISOLA_NATIVE_PDF_PREVIEW_ROOT": privateRoot.path,
+                "KAISOLA_NATIVE_PDF_PREVIEW_PHASE": "generate",
             ],
             temporaryDirectory: FileManager.default.temporaryDirectory
         ))
@@ -105,6 +127,7 @@ final class PDFPreviewBudgetTests: XCTestCase {
                 "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1",
                 "KAISOLA_NATIVE_PDF_PREVIEW_FIXTURE": "many-page",
                 "KAISOLA_NATIVE_PDF_PREVIEW_ROOT": "/Applications/not-private",
+                "KAISOLA_NATIVE_PDF_PREVIEW_PHASE": "generate",
             ],
             temporaryDirectory: FileManager.default.temporaryDirectory
         ))
@@ -112,8 +135,65 @@ final class PDFPreviewBudgetTests: XCTestCase {
             environment: [
                 "KAISOLA_NATIVE_PDF_PREVIEW_FIXTURE": "many-page",
                 "KAISOLA_NATIVE_PDF_PREVIEW_ROOT": privateRoot.path,
+                "KAISOLA_NATIVE_PDF_PREVIEW_PHASE": "generate",
             ],
             temporaryDirectory: FileManager.default.temporaryDirectory
+        ))
+        XCTAssertNil(PDFPreviewBudgetConfiguration.resolve(
+            environment: [
+                "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1",
+                "KAISOLA_NATIVE_PDF_PREVIEW_FIXTURE": "many-page",
+                "KAISOLA_NATIVE_PDF_PREVIEW_ROOT": privateRoot.path,
+                "KAISOLA_NATIVE_PDF_PREVIEW_PHASE": "render",
+            ],
+            temporaryDirectory: FileManager.default.temporaryDirectory
+        ))
+        XCTAssertNil(PDFPreviewBudgetConfiguration.resolve(
+            environment: [
+                "KAISOLA_NATIVE_PDF_PREVIEW_BUDGET": "1",
+                "KAISOLA_NATIVE_PDF_PREVIEW_FIXTURE": "many-page",
+                "KAISOLA_NATIVE_PDF_PREVIEW_ROOT": privateRoot.path,
+                "KAISOLA_NATIVE_PDF_PREVIEW_PHASE": "generate",
+                "KAISOLA_NATIVE_PDF_PREVIEW_EXPECTED_BYTES": "8192",
+                "KAISOLA_NATIVE_PDF_PREVIEW_EXPECTED_SHA256": String(repeating: "a", count: 64),
+            ],
+            temporaryDirectory: FileManager.default.temporaryDirectory
+        ))
+    }
+
+    func testRenderPhaseLoadsOnlyTheExactRegularGeneratedArtifact() throws {
+        let specification = try XCTUnwrap(
+            PDFPreviewBudgetFixtureCatalog.specification(id: "many-page")
+        )
+        let generated = try PDFPreviewBudgetFixtureWriter.write(specification, to: root)
+        let artifact = try PDFPreviewBudgetFixtureArtifact.capture(generated)
+
+        XCTAssertEqual(
+            try PDFPreviewBudgetFixtureLoader.load(
+                specification: specification,
+                root: root,
+                expectedArtifact: artifact
+            ),
+            generated
+        )
+
+        var bytes = try Data(contentsOf: generated.url)
+        bytes[bytes.startIndex] ^= 0x01
+        try bytes.write(to: generated.url, options: .atomic)
+        XCTAssertThrowsError(try PDFPreviewBudgetFixtureLoader.load(
+            specification: specification,
+            root: root,
+            expectedArtifact: artifact
+        ))
+
+        let regenerated = try PDFPreviewBudgetFixtureWriter.write(specification, to: root)
+        let outside = root.appendingPathComponent("outside.pdf")
+        try FileManager.default.moveItem(at: regenerated.url, to: outside)
+        try FileManager.default.createSymbolicLink(at: regenerated.url, withDestinationURL: outside)
+        XCTAssertThrowsError(try PDFPreviewBudgetFixtureLoader.load(
+            specification: specification,
+            root: root,
+            expectedArtifact: artifact
         ))
     }
 

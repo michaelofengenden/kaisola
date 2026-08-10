@@ -4,21 +4,28 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { EventEmitter } = require('node:events')
+const { PassThrough } = require('node:stream')
 const test = require('node:test')
 const {
   APP_RECEIPT_PREFIX,
   FIXTURES,
+  WORKLOAD,
   THRESHOLDS,
+  assertPreparedFixture,
   assertInstalledAppUnchanged,
   assertReceiptBundlePath,
   buildFixtureEnvironment,
   buildFixtureLaunchOptions,
+  memoryFromSample,
   mergeMemoryMeasurement,
   parseArguments,
   parseAppReceiptLine,
   resolveInstalledExecutable,
   validateAppReceipt,
+  validateGenerationReceipt,
   validateAppStderr,
+  waitForAppReceipt,
 } = require('../../scripts/native-pdf-preview-budget.cjs')
 
 function workflowJobSource(source, job) {
@@ -47,8 +54,9 @@ function passingReceipt(fixture = FIXTURES[0]) {
     callbackCoverage: 0.96,
   } : null
   return {
-    schemaVersion: 1,
-    workload: 'bounded-pdf-preview-v1',
+    schemaVersion: 2,
+    workload: 'bounded-pdf-preview-v2',
+    phase: 'render',
     fixture: fixture.id,
     appPid: 123,
     build: {
@@ -78,7 +86,35 @@ function passingReceipt(fixture = FIXTURES[0]) {
   }
 }
 
+function passingGenerationReceipt(fixture, artifact, appPid = 122) {
+  return {
+    schemaVersion: 2,
+    workload: 'bounded-pdf-preview-v2',
+    phase: 'generate',
+    fixture: fixture.id,
+    appPid,
+    build: {
+      optimized: true,
+      bundleIdentifier: 'com.kaisola.mac.pdf-budget-tests',
+      bundlePath: '/tmp/Applications/Kaisola PDF Budget QA.app',
+      version: '0.1.114',
+      build: '1',
+    },
+    specification: fixture,
+    artifact,
+  }
+}
+
+function fakeChild(pid) {
+  const child = new EventEmitter()
+  child.pid = pid
+  child.stdout = new PassThrough()
+  child.stderr = new PassThrough()
+  return child
+}
+
 test('fixture catalog and thresholds are exact, deterministic, and bounded', () => {
+  assert.equal(WORKLOAD, 'bounded-pdf-preview-v2')
   assert.deepEqual(FIXTURES.map((fixture) => fixture.id), [
     'many-page', 'image-heavy', 'malformed', 'large-page',
   ])
@@ -205,6 +241,7 @@ test('memory gating appends a fixture-named physical-footprint diagnostic exactl
   const passing = mergeMemoryMeasurement(receipt, {
     peakPhysicalFootprintBytes: THRESHOLDS.maximumPeakPhysicalFootprintBytes,
     measuredProcessCount: 1,
+    measuredPid: 123,
     currentPhysicalFootprintBytes: 200 * 1024 * 1024,
   })
   assert.equal(passing.pass, true)
@@ -213,7 +250,8 @@ test('memory gating appends a fixture-named physical-footprint diagnostic exactl
   const observed = THRESHOLDS.maximumPeakPhysicalFootprintBytes + 1
   const failing = mergeMemoryMeasurement(receipt, {
     peakPhysicalFootprintBytes: observed,
-    measuredProcessCount: 2,
+    measuredProcessCount: 1,
+    measuredPid: 123,
     currentPhysicalFootprintBytes: 300 * 1024 * 1024,
   })
   assert.equal(failing.pass, false)
@@ -223,26 +261,193 @@ test('memory gating appends a fixture-named physical-footprint diagnostic exactl
     observed,
     limit: THRESHOLDS.maximumPeakPhysicalFootprintBytes,
   }])
+
+  assert.throws(() => mergeMemoryMeasurement(receipt, {
+    peakPhysicalFootprintBytes: 400 * 1024 * 1024,
+    measuredProcessCount: 2,
+    measuredPid: 123,
+    currentPhysicalFootprintBytes: 300 * 1024 * 1024,
+  }), /exactly one render process/u)
+
+  assert.throws(() => memoryFromSample({
+    totalBytes: 300 * 1024 * 1024,
+    processes: [
+      { pid: 1, physicalFootprintBytes: 100, peakPhysicalFootprintBytes: 200 },
+      { pid: 2, physicalFootprintBytes: 100, peakPhysicalFootprintBytes: 200 },
+    ],
+  }), /exactly one render process/u)
+
+  assert.deepEqual(memoryFromSample({
+    totalBytes: 300 * 1024 * 1024,
+    processes: [{
+      pid: 42,
+      physicalFootprintBytes: 280 * 1024 * 1024,
+      peakPhysicalFootprintBytes: 400 * 1024 * 1024,
+    }],
+  }), {
+    peakPhysicalFootprintBytes: 400 * 1024 * 1024,
+    currentPhysicalFootprintBytes: 280 * 1024 * 1024,
+    measuredProcessCount: 1,
+    measuredPid: 42,
+  })
 })
 
 test('launch environment is broker-free and rooted in the caller temporary directory', () => {
-  const environment = buildFixtureEnvironment('/tmp/kaisola-pdf-run', 'large-page')
+  const environment = buildFixtureEnvironment('/tmp/kaisola-pdf-run', 'large-page', 'generate')
   assert.deepEqual(environment, {
     PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
     LANG: 'en_US.UTF-8',
     TMPDIR: process.env.TMPDIR || require('node:os').tmpdir(),
-    HOME: '/tmp/kaisola-pdf-run',
-    CFFIXED_USER_HOME: '/tmp/kaisola-pdf-run',
+    HOME: '/tmp/kaisola-pdf-run/generate-home',
+    CFFIXED_USER_HOME: '/tmp/kaisola-pdf-run/generate-home',
     KAISOLA_NATIVE_PDF_PREVIEW_BUDGET: '1',
     KAISOLA_NATIVE_PDF_PREVIEW_FIXTURE: 'large-page',
     KAISOLA_NATIVE_PDF_PREVIEW_ROOT: '/tmp/kaisola-pdf-run',
+    KAISOLA_NATIVE_PDF_PREVIEW_PHASE: 'generate',
   })
   assert.equal(Object.keys(environment).some((key) => /broker/u.test(key)), false)
-  assert.deepEqual(buildFixtureLaunchOptions('/tmp/kaisola-pdf-run', 'large-page'), {
-    cwd: '/tmp/kaisola-pdf-run',
+  assert.deepEqual(buildFixtureLaunchOptions('/tmp/kaisola-pdf-run', 'large-page', 'generate'), {
+    cwd: '/tmp/kaisola-pdf-run/generate-home',
     env: environment,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
+
+  const artifact = {
+    fileName: 'large-page.pdf',
+    byteCount: 1_024,
+    sha256: 'a'.repeat(64),
+  }
+  assert.deepEqual(buildFixtureEnvironment(
+    '/tmp/kaisola-pdf-run',
+    'large-page',
+    'render',
+    artifact,
+  ), {
+    ...environment,
+    HOME: '/tmp/kaisola-pdf-run/render-home',
+    CFFIXED_USER_HOME: '/tmp/kaisola-pdf-run/render-home',
+    KAISOLA_NATIVE_PDF_PREVIEW_PHASE: 'render',
+    KAISOLA_NATIVE_PDF_PREVIEW_EXPECTED_BYTES: '1024',
+    KAISOLA_NATIVE_PDF_PREVIEW_EXPECTED_SHA256: 'a'.repeat(64),
+  })
+  assert.throws(
+    () => buildFixtureEnvironment('/tmp/kaisola-pdf-run', 'large-page', 'render'),
+    /render phase requires/u,
+  )
+})
+
+test('generation receipt and prepared fixture are independently integrity checked', (context) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-pdf-generated-'))
+  context.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  const fixture = FIXTURES[0]
+  const file = path.join(root, fixture.fileName)
+  const bytes = Buffer.alloc(fixture.minimumBytes, 0x41)
+  fs.writeFileSync(file, bytes)
+  const artifact = {
+    fileName: fixture.fileName,
+    byteCount: bytes.length,
+    sha256: require('node:crypto').createHash('sha256').update(bytes).digest('hex'),
+  }
+  const receipt = passingGenerationReceipt(fixture, artifact)
+
+  assert.deepEqual(validateGenerationReceipt(receipt, fixture.id, 122), receipt)
+  assert.deepEqual(assertPreparedFixture(root, fixture, artifact), artifact)
+  assert.throws(
+    () => validateGenerationReceipt({ ...receipt, phase: 'render' }, fixture.id, 122),
+    /phase/u,
+  )
+
+  fs.appendFileSync(file, 'tampered')
+  assert.throws(() => assertPreparedFixture(root, fixture, artifact), /byte count/u)
+  fs.writeFileSync(file, bytes)
+  assert.throws(
+    () => assertPreparedFixture(root, fixture, { ...artifact, sha256: 'b'.repeat(64) }),
+    /digest/u,
+  )
+
+  const outside = path.join(root, 'outside.pdf')
+  fs.writeFileSync(outside, bytes)
+  fs.rmSync(file)
+  fs.symlinkSync(outside, file)
+  assert.throws(() => assertPreparedFixture(root, fixture, artifact), /regular file/u)
+})
+
+test('generation receipt remains pending until clean exit and rejects late output or failure', async () => {
+  const fixture = FIXTURES[0]
+  const artifact = {
+    fileName: fixture.fileName,
+    byteCount: fixture.minimumBytes,
+    sha256: 'a'.repeat(64),
+  }
+
+  const clean = fakeChild(122)
+  let resolved = false
+  const cleanWait = waitForAppReceipt(
+    clean,
+    fixture.id,
+    'generate',
+    { requireCleanExit: true },
+  ).then((value) => {
+    resolved = true
+    return value
+  })
+  clean.stdout.write(`${APP_RECEIPT_PREFIX}${JSON.stringify(
+    passingGenerationReceipt(fixture, artifact),
+  )}\n`)
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(resolved, false)
+  clean.emit('close', 0, null)
+  assert.equal((await cleanWait).receipt.phase, 'generate')
+
+  const late = fakeChild(122)
+  const lateWait = waitForAppReceipt(
+    late,
+    fixture.id,
+    'generate',
+    { requireCleanExit: true },
+  )
+  late.stdout.write(`${APP_RECEIPT_PREFIX}${JSON.stringify(
+    passingGenerationReceipt(fixture, artifact),
+  )}\n`)
+  late.stdout.write('unexpected late output\n')
+  await assert.rejects(lateWait, /stdout outside/u)
+
+  const failed = fakeChild(122)
+  const failedWait = waitForAppReceipt(
+    failed,
+    fixture.id,
+    'generate',
+    { requireCleanExit: true },
+  )
+  failed.stdout.write(`${APP_RECEIPT_PREFIX}${JSON.stringify(
+    passingGenerationReceipt(fixture, artifact),
+  )}\n`)
+  failed.emit('close', 7, null)
+  await assert.rejects(failedWait, /code=7/u)
+})
+
+test('fixture orchestration exits generation before launching and measuring render', () => {
+  const source = fs.readFileSync(path.resolve(
+    __dirname,
+    '../../scripts/native-pdf-preview-budget.cjs',
+  ), 'utf8')
+  const start = source.indexOf('async function runFixture(')
+  const end = source.indexOf('\nasync function run(', start)
+  assert.ok(start >= 0 && end > start)
+  const runFixtureSource = source.slice(start, end)
+
+  const generationLaunch = runFixtureSource.indexOf("'generate'")
+  const generationExit = runFixtureSource.indexOf('waitForAppReceipt', generationLaunch)
+  const renderLaunch = runFixtureSource.indexOf("'render'", generationExit)
+  const sample = runFixtureSource.indexOf('takeSample', renderLaunch)
+  assert.ok(generationLaunch >= 0)
+  assert.ok(generationExit > generationLaunch)
+  assert.ok(renderLaunch > generationExit)
+  assert.ok(sample > renderLaunch)
+  assert.match(runFixtureSource, /requireCleanExit: true/u)
+  assert.match(runFixtureSource, /takeSample\(\[renderChild\.pid\], \[\]\)/u)
+  assert.match(runFixtureSource, /generate-home/u)
+  assert.match(runFixtureSource, /render-home/u)
 })
 
 test('CLI requires a copied installed app and refuses build-product paths', () => {

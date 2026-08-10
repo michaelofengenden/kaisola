@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -9,77 +10,318 @@ final class DataPreviewsTests: XCTestCase {
 
     // MARK: - CSV parsing
 
+    func testCsvHeaderModesResolveHeaderSemanticsAndDataRowNumbers() {
+        let labeled = [["name", "age"], ["Ada", "36"], ["Grace", "37"]]
+        let headerless = [["Ada", "36"], ["Grace", "37"]]
+
+        let automatic = CsvHeaderResolution(mode: .automatic, rows: labeled)
+        XCTAssertTrue(automatic.hasHeader)
+        XCTAssertTrue(automatic.isHeader(rowIndex: 0))
+        XCTAssertNil(automatic.dataRowNumber(rowIndex: 0))
+        XCTAssertEqual(automatic.dataRowNumber(rowIndex: 1), 1)
+        XCTAssertEqual(automatic.accessibilityLabel(rowIndex: 0, columnIndex: 1), "Header, column 2")
+        XCTAssertEqual(automatic.accessibilityLabel(rowIndex: 1, columnIndex: 1), "Row 1, column 2")
+
+        let conservativeAuto = CsvHeaderResolution(mode: .automatic, rows: headerless)
+        XCTAssertFalse(conservativeAuto.hasHeader)
+        XCTAssertEqual(conservativeAuto.dataRowNumber(rowIndex: 0), 1)
+
+        let forcedHeader = CsvHeaderResolution(mode: .firstRowIsHeader, rows: headerless)
+        XCTAssertTrue(forcedHeader.hasHeader)
+        XCTAssertEqual(forcedHeader.dataRowNumber(rowIndex: 1), 1)
+        XCTAssertEqual(
+            CsvCellInspection(
+                rowIndex: 0,
+                columnIndex: 1,
+                value: "36",
+                rowAccessibilityLabel: "Header"
+            ).accessibilityLabel,
+            "Header, column 2"
+        )
+
+        let forcedData = CsvHeaderResolution(mode: .noHeader, rows: labeled)
+        XCTAssertFalse(forcedData.hasHeader)
+        XCTAssertEqual(forcedData.dataRowNumber(rowIndex: 0), 1)
+        XCTAssertEqual(forcedData.accessibilityLabel(rowIndex: 0, columnIndex: 0), "Row 1, column 1")
+    }
+
+    func testCsvHeaderModeChoicesUseExactUserFacingNames() {
+        XCTAssertEqual(CsvHeaderMode.allCases.map(\.title), [
+            "Auto",
+            "First Row Is Header",
+            "No Header",
+        ])
+    }
+
+    func testCsvHeaderPreferencePersistsPerPreviewWithoutStoringThePath() {
+        let suite = "CsvHeaderPreferenceTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let firstPath = "/private/tmp/Customer exports/people.csv"
+        let secondPath = "/private/tmp/Customer exports/events.csv"
+
+        var store = CsvHeaderPreferenceStore(defaults: defaults)
+        XCTAssertEqual(store.mode(forPath: firstPath), .automatic)
+        store.set(.noHeader, forPath: firstPath)
+        store.set(.firstRowIsHeader, forPath: secondPath)
+
+        store = CsvHeaderPreferenceStore(defaults: defaults)
+        XCTAssertEqual(store.mode(forPath: firstPath), .noHeader)
+        XCTAssertEqual(
+            store.mode(forPath: "/private/tmp/Customer exports/archive/../people.csv"),
+            .noHeader,
+            "standardized aliases of the same preview must share one preference"
+        )
+        XCTAssertEqual(store.mode(forPath: secondPath), .firstRowIsHeader)
+        XCTAssertFalse(
+            defaults.dictionaryRepresentation().keys.contains { $0.contains(firstPath) },
+            "the persisted key must not expose an absolute preview path"
+        )
+
+        store.set(.automatic, forPath: firstPath)
+        XCTAssertEqual(CsvHeaderPreferenceStore(defaults: defaults).mode(forPath: firstPath), .automatic)
+    }
+
     func testParsesSimpleRows() {
-        let (rows, truncated) = CsvTable.parse("a,b,c\n1,2,3")
-        XCTAssertEqual(rows, [["a", "b", "c"], ["1", "2", "3"]])
-        XCTAssertFalse(truncated)
+        let result = CsvTable.parse("a,b,c\n1,2,3")
+        XCTAssertEqual(result.rows, [["a", "b", "c"], ["1", "2", "3"]])
+        XCTAssertFalse(result.truncated)
     }
 
     func testQuotedFieldWithEmbeddedCommaAndNewline() {
-        let (rows, _) = CsvTable.parse("name,note\n\"Doe, Jane\",\"line1\nline2\"")
-        XCTAssertEqual(rows, [["name", "note"], ["Doe, Jane", "line1\nline2"]])
+        let result = CsvTable.parse("name,note\n\"Doe, Jane\",\"line1\nline2\"")
+        XCTAssertEqual(result.rows, [["name", "note"], ["Doe, Jane", "line1\nline2"]])
     }
 
     func testEscapedQuotesInsideQuotedField() {
         // Source field: "He said ""hi"""  ->  He said "hi"
-        let (rows, _) = CsvTable.parse("q\n\"He said \"\"hi\"\"\"")
-        XCTAssertEqual(rows, [["q"], ["He said \"hi\""]])
+        let result = CsvTable.parse("q\n\"He said \"\"hi\"\"\"")
+        XCTAssertEqual(result.rows, [["q"], ["He said \"hi\""]])
     }
 
     func testMidFieldQuoteIsLiteralAndDoesNotSwallowRest() {
         // A stray quote NOT at field start (3"5) is a literal character; it must
         // not open a quoted field that eats every later delimiter/newline.
-        let (rows, _) = CsvTable.parse("a,b\n3\"5,tail\nx,y")
-        XCTAssertEqual(rows, [["a", "b"], ["3\"5", "tail"], ["x", "y"]])
+        let result = CsvTable.parse("a,b\n3\"5,tail\nx,y")
+        XCTAssertEqual(result.rows, [["a", "b"], ["3\"5", "tail"], ["x", "y"]])
     }
 
     func testCRLFLineEndings() {
-        let (rows, _) = CsvTable.parse("a,b\r\n1,2\r\n")
-        XCTAssertEqual(rows, [["a", "b"], ["1", "2"]])
+        let result = CsvTable.parse("a,b\r\n1,2\r\n")
+        XCTAssertEqual(result.rows, [["a", "b"], ["1", "2"]])
     }
 
     func testTrailingNewlineDoesNotAddEmptyRow() {
-        let (rows, _) = CsvTable.parse("a\nb\n")
-        XCTAssertEqual(rows, [["a"], ["b"]])
+        let result = CsvTable.parse("a\nb\n")
+        XCTAssertEqual(result.rows, [["a"], ["b"]])
     }
 
     func testTrailingEmptyFieldIsPreserved() {
-        let (rows, _) = CsvTable.parse("a,")
-        XCTAssertEqual(rows, [["a", ""]])
+        let result = CsvTable.parse("a,")
+        XCTAssertEqual(result.rows, [["a", ""]])
     }
 
     func testEmptyInputYieldsNoRows() {
-        let (rows, truncated) = CsvTable.parse("")
-        XCTAssertTrue(rows.isEmpty)
-        XCTAssertFalse(truncated)
+        let result = CsvTable.parse("")
+        XCTAssertTrue(result.rows.isEmpty)
+        XCTAssertFalse(result.truncated)
+        XCTAssertEqual(result.truncation, .empty)
     }
 
     func testSemicolonDelimiterParsing() {
-        let (rows, _) = CsvTable.parse("a;b;c", delimiter: ";")
-        XCTAssertEqual(rows, [["a", "b", "c"]])
+        let result = CsvTable.parse("a;b;c", delimiter: ";")
+        XCTAssertEqual(result.rows, [["a", "b", "c"]])
+    }
+
+    func testCsvUTF8CursorTraversesComposedUnicodeAndCRLFInSourceOrder() {
+        let source = "café 🍣 e\u{301}\r\n\"\"終"
+        var cursor = CsvTable.UTF8Cursor(source.utf8)
+        var traversed: [UInt8] = []
+
+        while let byte = cursor.take() {
+            traversed.append(byte)
+        }
+
+        XCTAssertEqual(String(decoding: traversed, as: UTF8.self), source)
+        XCTAssertNil(cursor.peek())
+        XCTAssertNil(cursor.take())
+    }
+
+    func testStreamingCsvParserPreservesQuotedUnicodeCorpus() {
+        let fixtures: [(text: String, delimiter: Character, rows: [[String]])] = [
+            (
+                "name,note\r\n藤井,\"café 🍣\"\r\nZoë,\"line one\r\nline two\"",
+                ",",
+                [["name", "note"], ["藤井", "café 🍣"], ["Zoë", "line one\r\nline two"]]
+            ),
+            (
+                "\"He said \"\"終\"\"\";\"данные;δοκιμή\";tail",
+                ";",
+                [["He said \"終\"", "данные;δοκιμή", "tail"]]
+            ),
+            (
+                "decomposed,emoji,empty\ne\u{301},🏳️‍🌈,",
+                ",",
+                [["decomposed", "emoji", "empty"], ["e\u{301}", "🏳️‍🌈", ""]]
+            ),
+            (
+                "literal\"quote\t\"embedded\tseparator\"\t終",
+                "\t",
+                [["literal\"quote", "embedded\tseparator", "終"]]
+            ),
+            (
+                "café💠\"данные💠δοκιμή\"💠終",
+                "💠",
+                [["café", "данные💠δοκιμή", "終"]]
+            ),
+        ]
+
+        for fixture in fixtures {
+            XCTAssertEqual(
+                CsvTable.parse(fixture.text, delimiter: fixture.delimiter).rows,
+                fixture.rows,
+                "fixture: \(fixture.text.debugDescription)"
+            )
+        }
     }
 
     // MARK: - CSV caps
 
     func testRowCapAndTruncatedFlag() {
         let text = (0..<(CsvTable.maxRows + 500)).map(String.init).joined(separator: "\n")
-        let (rows, truncated) = CsvTable.parse(text)
-        XCTAssertEqual(rows.count, CsvTable.maxRows)
-        XCTAssertTrue(truncated)
+        let result = CsvTable.parse(text)
+        XCTAssertEqual(result.rows.count, CsvTable.maxRows)
+        XCTAssertTrue(result.truncated)
     }
 
     func testColumnCapAndTruncatedFlag() {
         let wideRow = (0..<(CsvTable.maxCols + 30)).map { "c\($0)" }.joined(separator: ",")
-        let (rows, truncated) = CsvTable.parse(wideRow)
-        XCTAssertEqual(rows.first?.count, CsvTable.maxCols)
-        XCTAssertTrue(truncated)
+        let result = CsvTable.parse(wideRow)
+        XCTAssertEqual(result.rows.first?.count, CsvTable.maxCols)
+        XCTAssertTrue(result.truncated)
     }
 
     func testWithinCapsIsNotTruncated() {
         let text = (0..<10).map { "\($0),x,y" }.joined(separator: "\n")
-        let (rows, truncated) = CsvTable.parse(text)
-        XCTAssertEqual(rows.count, 10)
-        XCTAssertFalse(truncated)
+        let result = CsvTable.parse(text)
+        XCTAssertEqual(result.rows.count, 10)
+        XCTAssertFalse(result.truncated)
+    }
+
+    func testRowOnlyTruncationReportsActualAndDisplayedCounts() {
+        let text = (0...CsvTable.maxRows).map(String.init).joined(separator: "\n")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows + 1)
+        XCTAssertEqual(result.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.actualColumnCount, 1)
+        XCTAssertEqual(result.truncation.displayedColumnCount, 1)
+        XCTAssertTrue(result.truncation.rowsWereTruncated)
+        XCTAssertFalse(result.truncation.columnsWereTruncated)
+        XCTAssertEqual(result.truncation.notice, "Showing 2000 of 2001 rows.")
+    }
+
+    func testColumnOnlyTruncationReportsActualAndDisplayedCounts() {
+        let text = (0...CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, 1)
+        XCTAssertEqual(result.truncation.displayedRowCount, 1)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols + 1)
+        XCTAssertEqual(result.truncation.displayedColumnCount, CsvTable.maxCols)
+        XCTAssertFalse(result.truncation.rowsWereTruncated)
+        XCTAssertTrue(result.truncation.columnsWereTruncated)
+        XCTAssertEqual(result.truncation.notice, "Showing 64 of 65 columns.")
+    }
+
+    func testRowAndColumnTruncationReportsBothDimensions() {
+        let row = (0...CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let text = Array(repeating: row, count: CsvTable.maxRows + 1).joined(separator: "\n")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows + 1)
+        XCTAssertEqual(result.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols + 1)
+        XCTAssertEqual(result.truncation.displayedColumnCount, CsvTable.maxCols)
+        XCTAssertTrue(result.truncation.rowsWereTruncated)
+        XCTAssertTrue(result.truncation.columnsWereTruncated)
+        XCTAssertEqual(
+            result.truncation.notice,
+            "Showing 2000 of 2001 rows and 64 of 65 columns."
+        )
+    }
+
+    func testExactRowAndColumnBoundariesDoNotReportTruncation() {
+        let row = (0..<CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let text = Array(repeating: row, count: CsvTable.maxRows).joined(separator: "\n")
+        let result = CsvTable.parse(text)
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols)
+        XCTAssertEqual(result.truncation.displayedColumnCount, CsvTable.maxCols)
+        XCTAssertFalse(result.truncation.rowsWereTruncated)
+        XCTAssertFalse(result.truncation.columnsWereTruncated)
+        XCTAssertNil(result.truncation.notice)
+    }
+
+    func testDiscardedColumnBytesCannotChangeQuoteOrRecordBoundaries() {
+        let visible = (0..<CsvTable.maxCols).map { "c\($0)" }.joined(separator: ",")
+        let result = CsvTable.parse("\(visible),discarded\"literal,tail\nnext")
+
+        XCTAssertEqual(result.truncation.actualRowCount, 2)
+        XCTAssertEqual(result.truncation.actualColumnCount, CsvTable.maxCols + 2)
+        XCTAssertEqual(result.rows.count, 2)
+        XCTAssertEqual(result.rows[0].count, CsvTable.maxCols)
+        XCTAssertEqual(result.rows[1], ["next"])
+    }
+
+    func testDiscardedRowBytesCannotChangeQuoteOrRecordBoundaries() {
+        let visibleRows = Array(repeating: "visible", count: CsvTable.maxRows)
+            .joined(separator: "\n")
+        let result = CsvTable.parse("\(visibleRows)\ndiscarded\"literal,tail\nlast")
+
+        XCTAssertEqual(result.truncation.actualRowCount, CsvTable.maxRows + 2)
+        XCTAssertEqual(result.truncation.actualColumnCount, 2)
+        XCTAssertEqual(result.rows.count, CsvTable.maxRows)
+        XCTAssertEqual(result.rows.last, ["visible"])
+    }
+
+    // MARK: - CSV cell inspection
+
+    func testCsvCellInspectionPreservesTheCompleteAccessibleValue() {
+        let value = String(repeating: "long-value-", count: 100) + "終"
+        let inspection = CsvCellInspection(rowIndex: 7, columnIndex: 3, value: value)
+
+        XCTAssertEqual(inspection.value, value)
+        XCTAssertEqual(inspection.accessibilityLabel, "Row 8, column 4")
+        XCTAssertEqual(inspection.accessibilityValue, value)
+        XCTAssertEqual(
+            inspection.accessibilityHint,
+            "Press Return to inspect the complete value and copy it."
+        )
+        XCTAssertEqual(
+            CsvCellInspection(rowIndex: 8, columnIndex: 4, value: "").accessibilityValue,
+            "Empty cell"
+        )
+    }
+
+    func testCsvCellInspectionIdentityUsesCoordinatesRatherThanTruncatedText() {
+        let original = CsvCellInspection(rowIndex: 2, columnIndex: 5, value: "before")
+        let updated = CsvCellInspection(rowIndex: 2, columnIndex: 5, value: "after")
+        let neighbor = CsvCellInspection(rowIndex: 2, columnIndex: 6, value: "before")
+
+        XCTAssertEqual(original.id, updated.id)
+        XCTAssertNotEqual(original.id, neighbor.id)
+    }
+
+    func testCsvCellClipboardCopiesTheCompleteValueToAnIsolatedPasteboard() {
+        let pasteboard = NSPasteboard(name: .init("kaisola-csv-cell-inspection-tests"))
+        defer { pasteboard.clearContents() }
+        let value = "first line\nsecond\tcolumn\nUnicode: café 終"
+
+        XCTAssertTrue(CsvCellClipboard.copy(value, to: pasteboard))
+        XCTAssertEqual(pasteboard.string(forType: .string), value)
     }
 
     // MARK: - Delimiter detection
@@ -332,9 +574,14 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertEqual(model.columnWidths[1], CsvPreviewModel.maximumColumnWidth)
     }
 
-    func testCsvPreviewModelCarriesTheTruncationFlag() {
+    func testCsvPreviewModelCarriesTheTruncationSummary() {
         let text = (0..<(CsvTable.maxRows + 10)).map(String.init).joined(separator: "\n")
-        XCTAssertTrue(CsvPreviewModel.make(text).truncated)
+        let model = CsvPreviewModel.make(text)
+
+        XCTAssertTrue(model.truncated)
+        XCTAssertEqual(model.truncation.actualRowCount, CsvTable.maxRows + 10)
+        XCTAssertEqual(model.truncation.displayedRowCount, CsvTable.maxRows)
+        XCTAssertEqual(model.truncation.notice, "Showing 2000 of 2010 rows.")
     }
 
     func testJsonPreviewOutcomeIsBuiltOncePerContentIdentity() async {

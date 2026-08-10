@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import SwiftUI
 import WebKit
@@ -646,8 +647,12 @@ private struct JsonNodeRow: View {
 /// preview keeps project scripts off by default, but an empty app shell should
 /// explain that choice instead of presenting a mysterious blank pane.
 enum HTMLPreviewReadiness {
+    nonisolated static func containsJavaScript(_ source: String) -> Bool {
+        contains(source, pattern: #"<script\b"#)
+    }
+
     nonisolated static func requiresJavaScriptPrompt(_ source: String) -> Bool {
-        guard contains(source, pattern: #"<script\b"#) else { return false }
+        guard containsJavaScript(source) else { return false }
 
         let body = firstCapture(
             in: source,
@@ -705,6 +710,190 @@ enum HTMLPreviewReadiness {
     }
 }
 
+/// Tracks the exact document an HTML preview's JavaScript opt-in applies to.
+///
+/// The path alone is not a document. A preview pane keeps the same path while
+/// the bytes behind it are replaced — an agent rewrites the file, the built-in
+/// editor saves over it, the changed-on-disk banner reloads it — so a grant
+/// tied to the path lets replaced content inherit permission the user gave to
+/// something else. The grant therefore names the parse identity it was made
+/// for, which changes on retarget, disk snapshot, and revision alike, and
+/// carries a fingerprint of the approved source so a reload that produced
+/// byte-identical content does not re-prompt.
+struct HTMLScriptApproval: Equatable {
+    private var mountedFingerprint: String?
+    private var approvedIdentity: PreviewParseIdentity?
+    private var approvedFingerprint: String?
+
+    init() {}
+
+    /// Scripts run only for the identity the user opted in for. Every other
+    /// identity — including the same file one revision later — reads as false
+    /// in the same body evaluation that mounts the new content.
+    func allowsJavaScript(for identity: PreviewParseIdentity) -> Bool {
+        approvedIdentity == identity
+    }
+
+    /// The user allowed scripts for what is on screen right now.
+    mutating func allow(for identity: PreviewParseIdentity) {
+        approvedIdentity = identity
+        approvedFingerprint = mountedFingerprint
+    }
+
+    mutating func revoke() {
+        approvedIdentity = nil
+        approvedFingerprint = nil
+    }
+
+    /// The preview finished preparing a document's source. A grant carries
+    /// over only when the same file came back with the same bytes. Anything
+    /// else — replaced content, a save, another file that happens to match —
+    /// drops the grant outright rather than parking it, so no later identity
+    /// can collide back into it.
+    mutating func adopt(identity: PreviewParseIdentity, fingerprint: String) {
+        mountedFingerprint = fingerprint
+        guard let approvedIdentity else { return }
+        guard approvedIdentity.path == identity.path, approvedFingerprint == fingerprint else {
+            revoke()
+            return
+        }
+        self.approvedIdentity = identity
+    }
+
+    /// Stable fingerprint of preview source text.
+    nonisolated static func fingerprint(_ source: String) -> String {
+        SHA256.hash(data: Data(source.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
+
+/// Cached preparation of the HTML source: whether it contains scripts,
+/// whether its blank shell needs the automatic review, and the fingerprint
+/// that pins a grant to these exact bytes. All work stays off the main actor
+/// and is reused for identical content.
+struct HTMLPreviewPreparation: Equatable, Sendable {
+    let containsJavaScript: Bool
+    let requiresJavaScriptPrompt: Bool
+    let fingerprint: String
+
+    nonisolated static func make(_ source: String) -> HTMLPreviewPreparation {
+        HTMLPreviewPreparation(
+            containsJavaScript: HTMLPreviewReadiness.containsJavaScript(source),
+            requiresJavaScriptPrompt: HTMLPreviewReadiness.requiresJavaScriptPrompt(source),
+            fingerprint: HTMLScriptApproval.fingerprint(source)
+        )
+    }
+}
+
+/// Keeps JavaScript-disabled affordances exhaustive without conflating two
+/// different jobs: blank-shell detection may open the review automatically,
+/// while a page that already renders static content still keeps a persistent
+/// route into that same security review.
+struct HTMLJavaScriptDisabledPresentation: Equatable, Sendable {
+    let containsJavaScript: Bool
+    let requiresAutomaticReview: Bool
+
+    init(containsJavaScript: Bool, requiresAutomaticReview: Bool) {
+        self.containsJavaScript = containsJavaScript
+        self.requiresAutomaticReview = requiresAutomaticReview
+    }
+
+    init(preparation: HTMLPreviewPreparation) {
+        self.init(
+            containsJavaScript: preparation.containsJavaScript,
+            requiresAutomaticReview: preparation.requiresJavaScriptPrompt
+        )
+    }
+
+    var showsAutomaticReview: Bool {
+        containsJavaScript && requiresAutomaticReview
+    }
+
+    var showsCompactIndicator: Bool {
+        containsJavaScript && !requiresAutomaticReview
+    }
+
+    var indicatorTitle: String { "JavaScript is off" }
+    var reviewActionTitle: String { "Review and Allow…" }
+}
+
+/// User-facing disclosure derived from the same effective local-file boundary
+/// passed to WebKit. Keeping these together prevents the approval copy from
+/// claiming a narrower or broader scope than the page actually receives.
+struct HTMLJavaScriptSecurityScope: Equatable, Sendable {
+    struct Disclosure: Equatable, Sendable, Identifiable {
+        enum ID: String, Hashable, Sendable {
+            case localFiles
+            case network
+            case storage
+            case navigation
+        }
+
+        let id: ID
+        let title: String
+        let detail: String
+        let systemImage: String
+    }
+
+    static let revokeActionTitle = "Revoke JavaScript"
+
+    let fileURL: URL
+    let readAccessRoot: URL?
+
+    var effectiveReadAccessRoot: URL {
+        let fallback = fileURL.deletingLastPathComponent()
+        guard let candidate = readAccessRoot?.standardizedFileURL,
+              WorkspacePreviewLinkPolicy.isContained(fileURL, in: candidate) else {
+            return fallback
+        }
+        return candidate
+    }
+
+    var approvalSummary: String {
+        "Approval applies only to \(fileName) at its current contents."
+    }
+
+    var enabledNotice: String {
+        "JavaScript is enabled for \(fileName) only."
+    }
+
+    var disclosures: [Disclosure] {
+        [
+            Disclosure(
+                id: .localFiles,
+                title: "Local files",
+                detail: "Scripts can read this file and other files inside "
+                    + "\(effectiveReadAccessRoot.path).",
+                systemImage: "folder"
+            ),
+            Disclosure(
+                id: .network,
+                title: "Network",
+                detail: "Scripts can contact network hosts permitted by the page and WebKit.",
+                systemImage: "network"
+            ),
+            Disclosure(
+                id: .storage,
+                title: "Temporary storage",
+                detail: "Website data is temporary and is not persisted by this preview.",
+                systemImage: "internaldrive"
+            ),
+            Disclosure(
+                id: .navigation,
+                title: "External navigation",
+                detail: "Only clicked HTTP or HTTPS links open in your browser; off-project "
+                    + "redirects and custom schemes stay blocked.",
+                systemImage: "arrow.up.right.square"
+            ),
+        ]
+    }
+
+    private var fileName: String {
+        fileURL.lastPathComponent.isEmpty ? "this file" : fileURL.lastPathComponent
+    }
+}
+
 private enum HTMLPreviewLoadState: Equatable {
     case loading
     case ready
@@ -724,12 +913,32 @@ struct HtmlFilePreview: View {
     let zoom: CGFloat
     let contentRevision: Int
 
-    @State private var readinessCache = PreviewParseCache<Bool>()
+    @State private var preparationCache = PreviewParseCache<HTMLPreviewPreparation>()
+    @State private var containsJavaScript = false
     @State private var requiresJavaScriptPrompt = false
     @State private var preparedIdentity: PreviewParseIdentity?
     @State private var reloadToken = 0
-    @State private var allowsJavaScript = false
+    @State private var scriptApproval = HTMLScriptApproval()
     @State private var loadState: HTMLPreviewLoadState = .loading
+    @State private var showsJavaScriptReview = false
+
+    /// Derived rather than stored: the approval names one document, so content
+    /// swapped in behind the same path drops to false without waiting for an
+    /// effect to run.
+    private var allowsJavaScript: Bool {
+        scriptApproval.allowsJavaScript(for: identity)
+    }
+
+    private var javaScriptSecurityScope: HTMLJavaScriptSecurityScope {
+        HTMLJavaScriptSecurityScope(fileURL: fileURL, readAccessRoot: readAccessRoot)
+    }
+
+    private var javaScriptDisabledPresentation: HTMLJavaScriptDisabledPresentation {
+        HTMLJavaScriptDisabledPresentation(
+            containsJavaScript: containsJavaScript,
+            requiresAutomaticReview: requiresJavaScriptPrompt
+        )
+    }
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -769,21 +978,37 @@ struct HtmlFilePreview: View {
                 }
             }
 
-            if !allowsJavaScript, requiresJavaScriptPrompt {
+            if !allowsJavaScript,
+               javaScriptDisabledPresentation.showsAutomaticReview || showsJavaScriptReview {
                 VStack(spacing: 10) {
                     Image(systemName: "curlybraces.square")
                         .font(.system(size: 23, weight: .medium))
                         .foregroundStyle(Color.accentColor)
-                    Text("This page needs JavaScript")
+                        .accessibilityHidden(true)
+                    Text(javaScriptDisabledPresentation.showsAutomaticReview
+                        ? "This page needs JavaScript"
+                        : "Review JavaScript Access")
                         .font(.headline)
-                    Text("Project scripts stay off until you allow them for this preview.")
+                    Text("Review what project-controlled code can access before allowing it.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
-                        .frame(maxWidth: 260)
+                    Text(javaScriptSecurityScope.approvalSummary)
+                        .font(.caption.weight(.semibold))
+                    HTMLJavaScriptSecurityDisclosureView(scope: javaScriptSecurityScope)
                     HStack(spacing: 8) {
-                        Button("Allow JavaScript") { allowsJavaScript = true }
-                            .buttonStyle(.borderedProminent)
+                        Button("Allow JavaScript") {
+                            scriptApproval.allow(for: identity)
+                            showsJavaScriptReview = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                        if showsJavaScriptReview,
+                           !javaScriptDisabledPresentation.showsAutomaticReview {
+                            Button("Cancel") { showsJavaScriptReview = false }
+                                .buttonStyle(.bordered)
+                                .keyboardShortcut(.cancelAction)
+                        }
                         Button("Open in Browser") { NSWorkspace.shared.open(fileURL) }
                             .buttonStyle(.bordered)
                     }
@@ -794,8 +1019,28 @@ struct HtmlFilePreview: View {
                 .background(.regularMaterial)
             }
 
+            if !allowsJavaScript,
+               javaScriptDisabledPresentation.showsCompactIndicator,
+               !showsJavaScriptReview {
+                javaScriptDisabledBanner
+                    .padding(8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+            }
+
+            if allowsJavaScript {
+                javaScriptEnabledBanner
+                    .padding(8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+            }
+
             Menu {
-                Toggle("Allow project JavaScript", isOn: $allowsJavaScript)
+                if allowsJavaScript {
+                    Button(HTMLJavaScriptSecurityScope.revokeActionTitle, role: .destructive) {
+                        scriptApproval.revoke()
+                    }
+                } else {
+                    Button("Review JavaScript Access…") { showsJavaScriptReview = true }
+                }
                 Button("Reload") { reloadToken &+= 1 }
                 Divider()
                 Button("Open in Browser") { NSWorkspace.shared.open(fileURL) }
@@ -814,7 +1059,11 @@ struct HtmlFilePreview: View {
         .background(Color(nsColor: .windowBackgroundColor))
         // Approval is deliberately one-file-at-a-time. Navigating from a
         // trusted document must never silently grant scripts to the next file.
-        .onChange(of: fileURL) { _, _ in allowsJavaScript = false }
+        .onChange(of: fileURL) { _, _ in
+            showsJavaScriptReview = false
+            scriptApproval.revoke()
+        }
+        .onChange(of: identity) { _, _ in showsJavaScriptReview = false }
         .overlay {
             if preparedIdentity != identity {
                 ZStack {
@@ -826,14 +1075,89 @@ struct HtmlFilePreview: View {
         }
         .task(id: identity) {
             let html = source
-            let readiness = await readinessCache.value(
+            let preparation = await preparationCache.value(
                 for: html,
-                parse: HTMLPreviewReadiness.requiresJavaScriptPrompt
+                parse: HTMLPreviewPreparation.make
             )
             guard !Task.isCancelled else { return }
-            requiresJavaScriptPrompt = readiness
+            containsJavaScript = preparation.containsJavaScript
+            requiresJavaScriptPrompt = preparation.requiresJavaScriptPrompt
+            scriptApproval.adopt(identity: identity, fingerprint: preparation.fingerprint)
             preparedIdentity = identity
         }
+    }
+
+    private var javaScriptDisabledBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "curlybraces.square")
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            Text(javaScriptDisabledPresentation.indicatorTitle)
+                .font(.caption.weight(.medium))
+            Button(javaScriptDisabledPresentation.reviewActionTitle) {
+                showsJavaScriptReview = true
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityHint("Reviews the security scope before allowing project scripts")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.10)))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("html-preview.javascript-disabled")
+    }
+
+    private var javaScriptEnabledBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "curlybraces.square.fill")
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            Text(javaScriptSecurityScope.enabledNotice)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+            Button(HTMLJavaScriptSecurityScope.revokeActionTitle) {
+                scriptApproval.revoke()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityHint("Stops project scripts and reloads this preview")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.10)))
+    }
+}
+
+private struct HTMLJavaScriptSecurityDisclosureView: View {
+    let scope: HTMLJavaScriptSecurityScope
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 9) {
+                ForEach(scope.disclosures) { disclosure in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: disclosure.systemImage)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 16)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(disclosure.title)
+                                .font(.caption.weight(.medium))
+                            Text(disclosure.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: 460, maxHeight: 240)
     }
 }
 
@@ -903,10 +1227,10 @@ private struct ConfinedFileWebView: NSViewRepresentable {
     }
 
     private var effectiveReadAccessRoot: URL {
-        let fallback = fileURL.deletingLastPathComponent()
-        guard let candidate = readAccessRoot?.standardizedFileURL,
-              WorkspacePreviewLinkPolicy.isContained(fileURL, in: candidate) else { return fallback }
-        return candidate
+        HTMLJavaScriptSecurityScope(
+            fileURL: fileURL,
+            readAccessRoot: readAccessRoot
+        ).effectiveReadAccessRoot
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {

@@ -362,4 +362,245 @@ final class DataPreviewsTests: XCTestCase {
         XCTAssertEqual(jsonParseCount, 1)
         XCTAssertLessThan(jsonElapsed, .seconds(3.5))
     }
+
+    // MARK: - HTML JavaScript approval
+
+    private static let benignHTML = "<html><body><p>Weekly report</p></body></html>"
+    private static let scriptedHTML =
+        "<html><body><div id=\"root\"></div><script>exfiltrate()</script></body></html>"
+    private static let staticShellHTML = """
+        <html><body>
+          <p>Loading weekly report…</p>
+          <div id="root"></div>
+          <SCRIPT src="report.js"></SCRIPT>
+        </body></html>
+        """
+
+    private func htmlIdentity(
+        path: String = "/project/report.html",
+        modifiedAt seconds: TimeInterval = 10,
+        revision: Int = 1
+    ) -> PreviewParseIdentity {
+        PreviewParseIdentity(
+            path: path,
+            modificationDate: Date(timeIntervalSince1970: seconds),
+            revision: revision
+        )
+    }
+
+    /// Mounts a document the way the preview does — prepare, then approve.
+    private func approvedApproval(
+        for identity: PreviewParseIdentity,
+        source: String
+    ) -> HTMLScriptApproval {
+        var approval = HTMLScriptApproval()
+        approval.adopt(identity: identity, fingerprint: HTMLScriptApproval.fingerprint(source))
+        approval.allow(for: identity)
+        XCTAssertTrue(approval.allowsJavaScript(for: identity))
+        return approval
+    }
+
+    func testJavaScriptApprovalDoesNotSurviveExternalReplacementOfTheSameFile() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 1)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // An agent rewrites the file on disk: same path, later snapshot, and a
+        // revision bump from the reload the workspace watcher triggers.
+        let replaced = htmlIdentity(modifiedAt: 20, revision: 2)
+        XCTAssertFalse(approval.allowsJavaScript(for: replaced))
+
+        approval.adopt(
+            identity: replaced,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.scriptedHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: replaced))
+        XCTAssertFalse(approval.allowsJavaScript(for: approvedIdentity))
+    }
+
+    func testJavaScriptApprovalDoesNotSurviveAnInEditorSave() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 3)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // Saving from the built-in editor rewrites the file and bumps the
+        // preview revision, leaving the pane pointed at the same path.
+        let saved = htmlIdentity(modifiedAt: 40, revision: 4)
+        XCTAssertFalse(approval.allowsJavaScript(for: saved))
+
+        approval.adopt(
+            identity: saved,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.scriptedHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: saved))
+    }
+
+    func testJavaScriptApprovalDropsWhenContentChangesUnderOneModificationTimestamp() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 1)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // Filesystem timestamps are coarse enough that a fast rewrite can land
+        // on the same mtime. The revision still moves, and so do the bytes.
+        let rewritten = htmlIdentity(modifiedAt: 10, revision: 2)
+        XCTAssertFalse(approval.allowsJavaScript(for: rewritten))
+
+        approval.adopt(
+            identity: rewritten,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.scriptedHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: rewritten))
+    }
+
+    func testJavaScriptApprovalReturnsOnlyWhenAReloadProducedIdenticalBytes() {
+        let approvedIdentity = htmlIdentity(modifiedAt: 10, revision: 1)
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        // A reload of unchanged content should not ask again, but the grant
+        // stays off until those bytes have actually proved identical.
+        let reloaded = htmlIdentity(modifiedAt: 20, revision: 2)
+        XCTAssertFalse(approval.allowsJavaScript(for: reloaded))
+
+        approval.adopt(
+            identity: reloaded,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertTrue(approval.allowsJavaScript(for: reloaded))
+    }
+
+    func testJavaScriptApprovalDoesNotFollowIdenticalContentToAnotherFile() {
+        let approvedIdentity = htmlIdentity(path: "/project/trusted.html")
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        let otherFile = htmlIdentity(path: "/project/copy.html", modifiedAt: 20, revision: 2)
+        approval.adopt(
+            identity: otherFile,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: otherFile))
+    }
+
+    func testRevokingJavaScriptClearsTheGrantForIdenticalContentToo() {
+        let approvedIdentity = htmlIdentity()
+        var approval = approvedApproval(for: approvedIdentity, source: Self.benignHTML)
+
+        approval.revoke()
+        XCTAssertFalse(approval.allowsJavaScript(for: approvedIdentity))
+
+        let reloaded = htmlIdentity(modifiedAt: 20, revision: 2)
+        approval.adopt(
+            identity: reloaded,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: reloaded))
+    }
+
+    func testJavaScriptApprovalTakenBeforeFingerprintingCoversOnlyThatIdentity() {
+        // The preparing overlay normally blocks this, but a grant made without
+        // a known fingerprint must not outlive the document it was made for.
+        let approvedIdentity = htmlIdentity()
+        var approval = HTMLScriptApproval()
+        approval.allow(for: approvedIdentity)
+        XCTAssertTrue(approval.allowsJavaScript(for: approvedIdentity))
+
+        let reloaded = htmlIdentity(modifiedAt: 20, revision: 2)
+        approval.adopt(
+            identity: reloaded,
+            fingerprint: HTMLScriptApproval.fingerprint(Self.benignHTML)
+        )
+        XCTAssertFalse(approval.allowsJavaScript(for: reloaded))
+    }
+
+    func testHtmlPreviewPreparationCarriesScriptPresenceReadinessAndFingerprintFromOneCachedPreparation() async {
+        let cache = PreviewParseCache<HTMLPreviewPreparation>()
+        _ = await cache.value(for: Self.scriptedHTML, parse: HTMLPreviewPreparation.make)
+        let preparation = await cache.value(for: Self.scriptedHTML, parse: HTMLPreviewPreparation.make)
+        let parseCount = await cache.parseCount
+
+        XCTAssertEqual(parseCount, 1)
+        XCTAssertTrue(preparation.containsJavaScript)
+        XCTAssertTrue(preparation.requiresJavaScriptPrompt)
+        XCTAssertEqual(preparation.fingerprint, HTMLScriptApproval.fingerprint(Self.scriptedHTML))
+        XCTAssertNotEqual(preparation.fingerprint, HTMLScriptApproval.fingerprint(Self.benignHTML))
+        let benign = HTMLPreviewPreparation.make(Self.benignHTML)
+        XCTAssertFalse(benign.containsJavaScript)
+        XCTAssertFalse(benign.requiresJavaScriptPrompt)
+    }
+
+    func testStaticShellWithScriptsKeepsJavaScriptDisabledActionDiscoverable() {
+        let preparation = HTMLPreviewPreparation.make(Self.staticShellHTML)
+        let presentation = HTMLJavaScriptDisabledPresentation(preparation: preparation)
+
+        XCTAssertTrue(preparation.containsJavaScript)
+        XCTAssertFalse(preparation.requiresJavaScriptPrompt)
+        XCTAssertFalse(presentation.showsAutomaticReview)
+        XCTAssertTrue(presentation.showsCompactIndicator)
+        XCTAssertEqual(presentation.indicatorTitle, "JavaScript is off")
+        XCTAssertEqual(presentation.reviewActionTitle, "Review and Allow…")
+    }
+
+    func testEveryScriptBearingDocumentGetsAnAutomaticReviewOrCompactIndicator() {
+        let fixtures = [
+            Self.scriptedHTML,
+            Self.staticShellHTML,
+            "<html><body><svg></svg><script type=\"module\">boot()</script></body></html>",
+        ]
+
+        for source in fixtures {
+            let presentation = HTMLJavaScriptDisabledPresentation(
+                preparation: HTMLPreviewPreparation.make(source)
+            )
+            XCTAssertNotEqual(
+                presentation.showsAutomaticReview,
+                presentation.showsCompactIndicator,
+                "every script-bearing fixture must have exactly one discoverable route"
+            )
+        }
+
+        let benign = HTMLJavaScriptDisabledPresentation(
+            preparation: HTMLPreviewPreparation.make(Self.benignHTML)
+        )
+        XCTAssertFalse(benign.showsAutomaticReview)
+        XCTAssertFalse(benign.showsCompactIndicator)
+    }
+
+    func testHtmlJavaScriptSecurityScopeExplainsEveryCapabilityBeforeApproval() {
+        let project = URL(fileURLWithPath: "/tmp/kaisola-html-security/project", isDirectory: true)
+        let file = project.appendingPathComponent("reports/status.html")
+        let scope = HTMLJavaScriptSecurityScope(fileURL: file, readAccessRoot: project)
+        let disclosures = Dictionary(uniqueKeysWithValues: scope.disclosures.map { ($0.id, $0.detail) })
+
+        XCTAssertEqual(scope.effectiveReadAccessRoot, project.standardizedFileURL)
+        XCTAssertEqual(
+            disclosures[.localFiles],
+            "Scripts can read this file and other files inside \(project.path)."
+        )
+        XCTAssertEqual(
+            disclosures[.network],
+            "Scripts can contact network hosts permitted by the page and WebKit."
+        )
+        XCTAssertEqual(
+            disclosures[.storage],
+            "Website data is temporary and is not persisted by this preview."
+        )
+        XCTAssertEqual(
+            disclosures[.navigation],
+            "Only clicked HTTP or HTTPS links open in your browser; off-project redirects and custom schemes stay blocked."
+        )
+        XCTAssertEqual(
+            scope.approvalSummary,
+            "Approval applies only to status.html at its current contents."
+        )
+        XCTAssertEqual(scope.enabledNotice, "JavaScript is enabled for status.html only.")
+        XCTAssertEqual(HTMLJavaScriptSecurityScope.revokeActionTitle, "Revoke JavaScript")
+    }
+
+    func testHtmlJavaScriptSecurityScopeNeverOverclaimsAnUnrelatedReadRoot() {
+        let requestedRoot = URL(fileURLWithPath: "/tmp/kaisola-html-security/project")
+        let file = URL(fileURLWithPath: "/tmp/kaisola-html-security/project-copy/status.html")
+        let scope = HTMLJavaScriptSecurityScope(fileURL: file, readAccessRoot: requestedRoot)
+
+        XCTAssertEqual(scope.effectiveReadAccessRoot, file.deletingLastPathComponent())
+        XCTAssertEqual(
+            scope.disclosures.first(where: { $0.id == .localFiles })?.detail,
+            "Scripts can read this file and other files inside /tmp/kaisola-html-security/project-copy."
+        )
+    }
 }

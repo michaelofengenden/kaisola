@@ -234,6 +234,14 @@ final class AcpConversation: ObservableObject {
             }
         }
     }
+    /// Durable notice that older saved rows were pruned by the per-chat disk
+    /// quota. It survives relaunch and remains visible instead of making the
+    /// retained tail look like the complete transcript.
+    @Published private(set) var transcriptRetentionStatus: AcpTranscriptStore.RetentionStatus
+    /// Remains non-healthy while the newest visible snapshot has not reached
+    /// SQLite. Unlike a transient toast, the chat surface keeps this state in
+    /// view until persistence succeeds or the chat is explicitly removed.
+    @Published private(set) var transcriptPersistenceHealth: AcpTranscriptStore.PersistenceHealth = .healthy
     /// Advances for both appended rows and in-place streaming updates. Views
     /// must follow this rather than `rows.count`: an agent can stream thousands
     /// of chunks into one existing Markdown row without changing the count.
@@ -341,6 +349,14 @@ final class AcpConversation: ObservableObject {
     /// Persistence hooks are injected by AppModel so this reusable conversation
     /// stays independent of the concrete disk stores used by the native shell.
     var onTranscriptChanged: ((_ rows: [AcpTranscriptRow], _ startOrdinal: Int64) -> Void)?
+    var onRetryTranscriptPersistence: (() -> Void)?
+    /// The owner writes a complete retained Markdown export from its transcript
+    /// actor. Keeping the hook async means older pages never pass through this
+    /// MainActor presentation model merely to reach disk.
+    var onExportTranscriptMarkdown: ((
+        _ request: AcpTranscriptMarkdownExport.Request,
+        _ destination: URL
+    ) async throws -> AcpTranscriptMarkdownExport.Receipt)?
     /// Bounded page loader injected by AppModel (or MeshSession) so this
     /// presentation model remains independent of the concrete SQLite store.
     var loadEarlierRows: ((_ beforeOrdinal: Int64, _ limit: Int) async -> AcpTranscriptStore.Page?)?
@@ -398,6 +414,9 @@ final class AcpConversation: ObservableObject {
     private let containment: CustomAdapterContainment?
     private let environment: [String: String]
     private let cwd: String
+    private let transcriptAgentID: String
+    private let transcriptAgentName: String?
+    private let transcriptModelID: String?
     private let mcpServers: [JSONValue]
     private let ruleStore: PermissionRuleStore
     private let sensitiveGlobs: [String]
@@ -495,6 +514,9 @@ final class AcpConversation: ObservableObject {
         containment: CustomAdapterContainment? = nil,
         environment: [String: String] = ProcessInfo.processInfo.environment,
         cwd: String,
+        transcriptAgentID: String = "unknown-agent",
+        transcriptAgentName: String? = nil,
+        transcriptModelID: String? = nil,
         mcpServers: [JSONValue] = [],
         client: AcpClient? = nil,
         clientFactory: (@MainActor () -> AcpClient)? = nil,
@@ -507,6 +529,7 @@ final class AcpConversation: ObservableObject {
         initialRowStartOrdinal: Int64 = 0,
         initialEarlierRowCount: Int = 0,
         initialTotalRowCount: Int? = nil,
+        initialRetentionStatus: AcpTranscriptStore.RetentionStatus = .empty,
         initialDraft: String? = nil,
         initialAttachments: [AcpAttachment] = [],
         initialUsage: AcpUsage? = nil,
@@ -520,6 +543,9 @@ final class AcpConversation: ObservableObject {
         self.containment = containment
         self.environment = environment
         self.cwd = cwd
+        self.transcriptAgentID = transcriptAgentID
+        self.transcriptAgentName = transcriptAgentName
+        self.transcriptModelID = transcriptModelID
         self.mcpServers = mcpServers
         let factory = clientFactory ?? { AcpClient() }
         self.clientFactory = factory
@@ -544,6 +570,7 @@ final class AcpConversation: ObservableObject {
         self.userMessageLedger = AcpUserMessageLedger(rows: initialRows)
         self.loadedRowStartOrdinal = max(0, initialRowStartOrdinal)
         self.unloadedEarlierRowCount = max(0, initialEarlierRowCount)
+        self.transcriptRetentionStatus = initialRetentionStatus
         self.restoredDraft = initialDraft
         self.pendingAttachments = Self.restoredPendingAttachments(initialAttachments)
         self.attachmentCounter = self.pendingAttachments.count
@@ -1625,6 +1652,31 @@ final class AcpConversation: ObservableObject {
         pendingDraftPersistence = nil
         draftPersistenceTask?.cancel()
         draftPersistenceTask = nil
+    /// The latest visible assistant prose, deliberately excluding thought,
+    /// tool, and plan rows that may follow it. The restored tail always contains
+    /// the end of the conversation, so this remains bounded for paged chats.
+    var lastAssistantResponse: String? {
+        AcpTranscriptMarkdownExport.lastAssistantResponse(in: rows)
+    }
+
+    func exportTranscriptMarkdown(
+        to destination: URL,
+        exportedAt: Date = Date()
+    ) async throws -> AcpTranscriptMarkdownExport.Receipt {
+        guard let onExportTranscriptMarkdown else {
+            throw AcpTranscriptStore.StoreError.database("Transcript export is unavailable")
+        }
+        let modelID = currentModelID ?? transcriptModelID
+        return try await onExportTranscriptMarkdown(
+            AcpTranscriptMarkdownExport.Request(
+                title: title,
+                agentID: transcriptAgentID,
+                agentName: transcriptAgentName,
+                modelID: modelID,
+                exportedAt: exportedAt
+            ),
+            destination
+        )
     }
 
     // MARK: - Test hooks
@@ -1635,6 +1687,14 @@ final class AcpConversation: ObservableObject {
         loadedRowStartOrdinal = 0
         unloadedEarlierRowCount = 0
         rows = newRows
+    }
+
+    func applyTranscriptPersistenceHealth(_ health: AcpTranscriptStore.PersistenceHealth) {
+        transcriptPersistenceHealth = health
+    }
+
+    func retryTranscriptPersistence() {
+        onRetryTranscriptPersistence?()
     }
 
     /// Test-only: seed the never-dispatched recovery FIFO without spawning an

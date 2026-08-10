@@ -1,4 +1,5 @@
 import Darwin
+import Dispatch
 import Foundation
 import KaisolaCore
 import XCTest
@@ -3628,7 +3629,9 @@ final class AcpClientTests: XCTestCase {
             try await client.requestForTesting("session/set_model", timeoutNanoseconds: 30_000_000_000)
         }
         try await Self.untilClient("the request to go in flight") {
-            await client.outstandingRequestTimeoutCountForTesting() == 1
+            let timeoutCount = await client.outstandingRequestTimeoutCountForTesting()
+            let requestIDs = await transport.unansweredRequestIDs()
+            return timeoutCount == 1 && !requestIDs.isEmpty
         }
         let inFlight = await transport.unansweredRequestIDs()
         await transport.answer(id: try XCTUnwrap(inFlight.first))
@@ -3653,6 +3656,304 @@ final class AcpClientTests: XCTestCase {
         let outstanding = await client.outstandingRequestTimeoutCountForTesting()
         XCTAssertEqual(outstanding, 0, "a failed send left its timeout task running")
         await client.stop()
+    }
+
+    // MARK: - Filesystem callback worker
+
+    func testDelayedFilesystemReadDoesNotBlockSessionUpdates() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-acp-read-worker-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try "worker result".write(
+            to: workspace.appending(path: "input.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let gate = FilesystemOperationGate()
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(
+            transport: transport,
+            filesystemWorker: AcpFilesystemWorker(operationHook: gate.hook)
+        )
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: workspace.path, mcpServers: []
+        )
+        defer {
+            gate.release()
+            Task { await client.stop() }
+        }
+
+        await transport.sendAgentRequest(
+            id: 36_701,
+            method: "fs/read_text_file",
+            params: .object(["path": .string("input.txt")])
+        )
+        try await Self.untilAsync("the read to reach the filesystem worker") { gate.didEnter }
+        try await Self.untilClient("the blocked read to remain in flight") {
+            await client.filesystemCallbacksInFlightForTesting() == 1
+        }
+
+        await transport.emitSessionUpdate(.object([
+            "sessionUpdate": .string("agent_message_chunk"),
+            "content": .object([
+                "type": .string("text"),
+                "text": .string("message while read is blocked"),
+            ]),
+        ]))
+        try await Self.untilAsync("the client actor to handle output during the read") {
+            collector.events.contains { event in
+                if case let .turnItem(.message(_, text)) = event {
+                    return text == "message while read is blocked"
+                }
+                return false
+            }
+        }
+        let prematureResponse = await transport.clientResponse(for: 36_701)
+        XCTAssertNil(prematureResponse)
+
+        gate.release()
+        let response = try await transport.waitForClientResponse(id: 36_701)
+        XCTAssertEqual(
+            response.objectValue?["result"]?.objectValue?["content"],
+            .string("worker result")
+        )
+    }
+
+    func testDelayedFilesystemWriteDoesNotBlockSessionUpdates() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-acp-write-worker-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+
+        let gate = FilesystemOperationGate()
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(
+            transport: transport,
+            filesystemWorker: AcpFilesystemWorker(operationHook: gate.hook)
+        )
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: workspace.path, mcpServers: []
+        )
+        defer {
+            gate.release()
+            Task { await client.stop() }
+        }
+
+        await transport.sendAgentRequest(
+            id: 36_702,
+            method: "fs/write_text_file",
+            params: .object([
+                "path": .string("nested/output.txt"),
+                "content": .string("written off actor"),
+            ])
+        )
+        try await Self.untilAsync("the write to reach the filesystem worker") { gate.didEnter }
+        try await Self.untilClient("the blocked write to remain in flight") {
+            await client.filesystemCallbacksInFlightForTesting() == 1
+        }
+
+        await transport.emitSessionUpdate(.object([
+            "sessionUpdate": .string("agent_message_chunk"),
+            "content": .object([
+                "type": .string("text"),
+                "text": .string("message while write is blocked"),
+            ]),
+        ]))
+        try await Self.untilAsync("the client actor to handle output during the write") {
+            collector.events.contains { event in
+                if case let .turnItem(.message(_, text)) = event {
+                    return text == "message while write is blocked"
+                }
+                return false
+            }
+        }
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: workspace.appending(path: "nested/output.txt").path)
+        )
+        let prematureResponse = await transport.clientResponse(for: 36_702)
+        XCTAssertNil(prematureResponse)
+
+        gate.release()
+        let response = try await transport.waitForClientResponse(id: 36_702)
+        XCTAssertEqual(response.objectValue?["result"], .object([:]))
+        XCTAssertEqual(
+            try String(contentsOf: workspace.appending(path: "nested/output.txt"), encoding: .utf8),
+            "written off actor"
+        )
+    }
+
+    func testFilesystemCompletionFromRetiredGenerationCannotAnswerReplacementConnection() async throws {
+        let workspace = FileManager.default.temporaryDirectory
+            .appending(path: "kaisola-acp-worker-generation-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: workspace, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: workspace) }
+        try "stale result".write(
+            to: workspace.appending(path: "input.txt"),
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let gate = FilesystemOperationGate()
+        let transport = ScriptedAcpTransport(newSessionIDs: ["old-session", "replacement-session"])
+        let client = AcpClient(
+            transport: transport,
+            filesystemWorker: AcpFilesystemWorker(operationHook: gate.hook)
+        )
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: workspace.path, mcpServers: []
+        )
+        defer {
+            gate.release()
+            Task { await client.stop() }
+        }
+
+        await transport.sendAgentRequest(
+            id: 36_703,
+            method: "fs/read_text_file",
+            params: .object(["path": .string("input.txt")])
+        )
+        try await Self.untilAsync("the stale read to reach the filesystem worker") { gate.didEnter }
+        try await Self.untilClient("the stale read to remain in flight") {
+            await client.filesystemCallbacksInFlightForTesting() == 1
+        }
+
+        await client.stop()
+        let replacement = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: workspace.path, mcpServers: []
+        )
+        XCTAssertEqual(replacement.sessionID, "replacement-session")
+
+        gate.release()
+        try await Self.untilClient("the stale callback task to retire") {
+            await client.filesystemCallbacksInFlightForTesting() == 0
+        }
+        let staleResponse = await transport.clientResponse(for: 36_703)
+        XCTAssertNil(staleResponse, "a retired filesystem completion answered on the replacement connection")
+
+        let options = try await client.setConfigOption(id: "reasoning_effort", value: "high")
+        XCTAssertEqual(options.first(where: { $0.id == "reasoning_effort" })?.currentValue, "high")
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(terminationCount, 1, "the stale completion terminated the healthy replacement")
+    }
+
+    // MARK: - Callback delivery health
+
+    func testFailedNotificationSendClosesTheConnectionWithAVisibleReason() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.failClientNotifications(true)
+        await client.cancel()
+
+        try await Self.untilAsync("the failed notification to retire the connection") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        let errors = collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message }
+            return nil
+        }
+        XCTAssertEqual(
+            errors,
+            ["Kaisola could not send an ACP notification. The agent connection was closed."]
+        )
+        XCTAssertEqual(
+            collector.events.filter { if case .exited = $0 { return true } else { return false } }.count,
+            1
+        )
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(terminationCount, 1)
+    }
+
+    func testFailedCallbackResponsesShareOneConnectionHealthTransition() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(transport: transport)
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.failClientResponses(true)
+        await transport.sendAgentRequest(
+            id: 37_001,
+            method: "test/first_unhandled_callback",
+            params: .object([:])
+        )
+        await transport.sendAgentRequest(
+            id: 37_002,
+            method: "test/second_unhandled_callback",
+            params: .object([:])
+        )
+
+        try await Self.untilAsync("the failed responses to retire the connection once") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        let errors = collector.events.compactMap { event -> String? in
+            if case let .error(message) = event { return message }
+            return nil
+        }
+        XCTAssertEqual(
+            errors,
+            ["Kaisola could not send an ACP callback response. The agent connection was closed."]
+        )
+        XCTAssertEqual(
+            collector.events.filter { if case .exited = $0 { return true } else { return false } }.count,
+            1
+        )
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(terminationCount, 1)
+    }
+
+    func testUnencodableRequiredCallbackResponseClosesTheConnection() async throws {
+        let transport = ScriptedAcpTransport()
+        let client = AcpClient(
+            transport: transport,
+            outboundFrameLimits: AcpOutboundFrameLimits(
+                globalMaximumBytes: 4 * 1_024,
+                promptMaximumBytes: 4 * 1_024,
+                toolResponseMaximumBytes: 1
+            )
+        )
+        let collector = EventCollector()
+        await client.setEventHandler { collector.append($0) }
+        _ = try await client.start(
+            command: "mock", arguments: [], environment: [:], cwd: "/tmp", mcpServers: []
+        )
+
+        await transport.sendAgentRequest(
+            id: 37_003,
+            method: "fs/read_text_file",
+            params: .object(["path": .string("/var/empty/kaisola-callback-fixture")])
+        )
+
+        try await Self.untilAsync("the rejected callback encoding to retire the connection") {
+            await transport.terminationCount() == 1
+                && collector.events.contains { if case .error = $0 { return true } else { return false } }
+        }
+        XCTAssertTrue(collector.events.contains { event in
+            if case let .error(message) = event {
+                return message
+                    == "Kaisola could not send an ACP callback response. The agent connection was closed."
+            }
+            return false
+        })
+        let responseCount = await transport.receivedProtocolResponses().count
+        let terminationCount = await transport.terminationCount()
+        XCTAssertEqual(responseCount, 0)
+        XCTAssertEqual(terminationCount, 1)
     }
 
     func testAdapterExitCancelsEveryInFlightTimeout() async throws {
@@ -3978,6 +4279,30 @@ private final class EventCollector: @unchecked Sendable {
     }
 }
 
+private final class FilesystemOperationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var entered = false
+    private let released = DispatchSemaphore(value: 0)
+
+    lazy var hook: AcpFilesystemWorker.OperationHook = { [weak self] _ in
+        guard let self else { return }
+        lock.lock()
+        entered = true
+        lock.unlock()
+        released.wait()
+    }
+
+    var didEnter: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return entered
+    }
+
+    func release() {
+        released.signal()
+    }
+}
+
 /// A transport that answers the handshake and then hands the test direct
 /// control over `session/request_permission`, keeping every frame the client
 /// writes back so a malformed ask can be checked for the reply it still owes.
@@ -4115,6 +4440,8 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     private var didCrashPrompt = false
     private var recordedExitCode: Int32 = 0
     private var terminations = 0
+    private var failingClientNotifications = false
+    private var failingClientResponses = false
     private var clientCapabilities: JSONValue?
     private var clientResponses: [Int64: JSONValue] = [:]
 
@@ -4173,6 +4500,9 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func receivedProtocolResponses() -> [JSONValue] { protocolResponses }
     func terminationCount() -> Int { terminations }
     func receivedClientCapabilities() -> JSONValue? { clientCapabilities }
+    func clientResponse(for id: Int64) -> JSONValue? { clientResponses[id] }
+    func failClientNotifications(_ failing: Bool) { failingClientNotifications = failing }
+    func failClientResponses(_ failing: Bool) { failingClientResponses = failing }
 
     func sendAgentRequest(id: Int64, method: String, params: JSONValue) {
         enqueue(.object([
@@ -4301,6 +4631,12 @@ private actor ScriptedAcpTransport: AcpByteTransport {
     func send(_ data: Data) async throws {
         guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else { return }
         let id = object["id"]
+        if object["method"] == nil, failingClientResponses {
+            throw AcpClientError.notRunning
+        }
+        if id == nil, object["method"] != nil, failingClientNotifications {
+            throw AcpClientError.notRunning
+        }
         if object["method"] == nil {
             protocolResponses.append(.object(object))
             if let wireID = id?.intValue {

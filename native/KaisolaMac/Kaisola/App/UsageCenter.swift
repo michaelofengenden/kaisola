@@ -540,6 +540,28 @@ struct UsageAccountStore: Sendable {
         }
     }
 
+    /// Re-register an immutable account binding that a restored chat still
+    /// names. This is used only after the user explicitly chooses Sign In from
+    /// that chat's recovery card; keeping the original id lets the auth probe
+    /// and every persisted continuation continue to refer to the same account.
+    @discardableResult
+    func restore(_ requested: UsageAccountProfile) -> UsageAccountProfile? {
+        guard let profile = requested.normalized,
+              profile.id.count <= 128,
+              !profile.id.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else { return nil }
+        var current = profiles()
+        if let existing = current.first(where: { $0.id == profile.id }) {
+            return existing == profile ? existing : nil
+        }
+        guard !current.contains(where: {
+            $0.provider == profile.provider && $0.expandedDirectory == profile.expandedDirectory
+        }) else { return nil }
+        current.append(profile)
+        guard write(current) else { return nil }
+        return profile
+    }
+
     @discardableResult
     func remove(id: String) -> Bool {
         withRegistryLock { current -> Bool? in

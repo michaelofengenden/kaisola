@@ -33,6 +33,7 @@ struct RootShellView: View {
     /// Chat id awaiting a typed model id (the menu's "Custom Model…").
     @State private var customModelTarget: String?
     @State private var customModelText: String = ""
+    @State private var signingInChatAccount: UsageAccountProfile?
     @State private var renameProjectTarget: String?
     @State private var renameText: String = ""
     @State private var gitRepo: URL?
@@ -326,6 +327,11 @@ struct RootShellView: View {
                 Task { await model.switchChatModel(target.id, to: modelID) }
             } cancel: {
                 customModelTarget = nil
+            }
+        }
+        .sheet(item: $signingInChatAccount) { profile in
+            AccountSignInSheet(profile: profile) {
+                signingInChatAccount = nil
             }
         }
         .sheet(item: Binding(get: { gitRepo.map(GitRepoID.init) }, set: { gitRepo = $0?.url })) { repo in
@@ -2167,6 +2173,26 @@ struct RootShellView: View {
         .accessibilityLabel("Account and model: \(currentLabel), \(chat.modelOverride ?? "default model")")
     }
 
+    private func signInToRestoredChatAccount(_ chat: AcpChatHandle) {
+        guard let profile = model.accountSignInProfile(for: chat.id) else {
+            settingsSectionID = "accounts"
+            showSettings = true
+            ToastCenter.shared.show(
+                "Open Accounts to add or repair this provider account.",
+                style: .info
+            )
+            return
+        }
+        signingInChatAccount = profile
+    }
+
+    private func chooseRestoredChatAccount(_ chat: AcpChatHandle) {
+        guard let agent = AgentRegistry.profile(id: chat.agentID) else { return }
+        Self.chooseSessionAccount(for: agent) { profile in
+            Task { await model.switchChatAccount(chat.id, to: profile) }
+        }
+    }
+
     @ViewBuilder
     private func accountMenuRow(
         title: String,
@@ -2223,9 +2249,15 @@ struct RootShellView: View {
         } else if let chat = model.chats.first(where: { $0.id == id }) {
             AcpChatView(
                 conversation: chat.conversation,
+                accountAccess: chat.accountAccess,
                 presentation: .embedded,
                 focusRequestGeneration: keyboardFocusGeneration(for: id),
-                onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) }
+                onKeyboardFocus: { model.focusSurfaceFromKeyboard(id) },
+                onSignIn: { signInToRestoredChatAccount(chat) },
+                onChooseAccount: { chooseRestoredChatAccount(chat) },
+                onPreserveTranscript: {
+                    Task { await model.preserveBlockedChat(chat.id) }
+                }
             )
                 .id(chat.id)
         } else if let mesh = model.meshes.first(where: { $0.id == id }) {

@@ -93,6 +93,83 @@ final class AcpTranscriptPagingTests: XCTestCase {
         XCTAssertEqual(conversation.hiddenEarlierCount, 0)
     }
 
+    func testRestoredQuotaStatusRemainsAvailableForPersistentDisclosure() {
+        let status = AcpTranscriptStore.RetentionStatus(
+            truncatedRowCount: 42,
+            truncatedByteCount: 4_096
+        )
+        let conversation = AcpConversation(
+            title: "Test",
+            command: "mock",
+            arguments: [],
+            cwd: "/tmp",
+            initialRetentionStatus: status
+        )
+
+        XCTAssertEqual(conversation.transcriptRetentionStatus, status)
+        XCTAssertTrue(conversation.transcriptRetentionStatus.isTruncated)
+    }
+
+    func testPersistenceHealthAndRetryActionRemainAttachedToConversation() {
+        let conversation = makeConversation()
+        var retryCount = 0
+        conversation.onRetryTranscriptPersistence = { retryCount += 1 }
+        let failure = AcpTranscriptStore.PersistenceFailure(
+            attemptCount: 3,
+            maximumAttempts: 3
+        )
+
+        conversation.applyTranscriptPersistenceHealth(.failed(failure))
+        XCTAssertEqual(conversation.transcriptPersistenceHealth, .failed(failure))
+        conversation.retryTranscriptPersistence()
+        XCTAssertEqual(retryCount, 1)
+    }
+
+    func testConversationExportsProvenanceAndCopiesOnlyTheLastAssistantResponse() async throws {
+        let conversation = AcpConversation(
+            title: "Review thread",
+            command: "mock",
+            arguments: [],
+            cwd: "/tmp",
+            transcriptAgentID: "codex",
+            transcriptAgentName: "Codex",
+            transcriptModelID: "gpt-test"
+        )
+        conversation.seedRowsForTesting([
+            .message(id: "1", text: "first response"),
+            .message(id: "2", text: "last response\n```swift\nprint(1)\n```"),
+            .thought(id: "3", text: "private reasoning after response"),
+            .tool(.init(id: "tool", title: "Check", kind: "read", status: .completed)),
+        ])
+        var capturedRequest: AcpTranscriptMarkdownExport.Request?
+        let destination = URL(fileURLWithPath: "/tmp/thread.md")
+        conversation.onExportTranscriptMarkdown = { request, url in
+            capturedRequest = request
+            XCTAssertEqual(url, destination)
+            return .init(
+                rowCount: 4,
+                startOrdinal: 0,
+                byteCount: 200,
+                includedPendingChanges: false
+            )
+        }
+
+        XCTAssertEqual(
+            conversation.lastAssistantResponse,
+            "last response\n```swift\nprint(1)\n```"
+        )
+        let receipt = try await conversation.exportTranscriptMarkdown(
+            to: destination,
+            exportedAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        XCTAssertEqual(receipt.rowCount, 4)
+        XCTAssertEqual(capturedRequest?.title, "Review thread")
+        XCTAssertEqual(capturedRequest?.agentID, "codex")
+        XCTAssertEqual(capturedRequest?.agentName, "Codex")
+        XCTAssertEqual(capturedRequest?.modelID, "gpt-test")
+        XCTAssertEqual(capturedRequest?.exportedAt, Date(timeIntervalSince1970: 1_700_000_000))
+    }
+
     func testVisibleLimitIsSettableToDriveTheView() {
         let conversation = makeConversation()
         conversation.seedRowsForTesting(Self.messageRows(count: 500))

@@ -1188,6 +1188,17 @@ struct GitService: Sendable {
         let branch: String?
     }
 
+    enum WorktreeRemovalPhase: Equatable, Sendable {
+        /// Git still owns the exact path/branch pair, so removing the
+        /// registered worktree is the next destructive step.
+        case registered
+        /// The worktree is gone but its Mesh branch remains. A retry must
+        /// delete only the branch and never touch whatever now occupies path.
+        case branchCleanupPending
+        /// Neither the exact registration nor the Mesh branch remains.
+        case complete
+    }
+
     struct MeshDiscardInventory: Equatable, Sendable {
         let status: Status
         let commitsSinceBase: Int
@@ -1226,7 +1237,15 @@ struct GitService: Sendable {
     /// Registered worktree truth from Git itself. Persisted Mesh paths are
     /// adopted or removed only after their exact path/branch pair appears here.
     func registeredWorktrees() throws -> [RegisteredWorktree] {
-        let output = try run(["worktree", "list", "--porcelain"])
+        Self.parseRegisteredWorktrees(try run(["worktree", "list", "--porcelain", "-z"]))
+    }
+
+    /// Parse `git worktree list --porcelain -z`. Every attribute is its own
+    /// NUL-delimited record and an empty record ends one worktree, so legal
+    /// newlines and tabs in a path can never become structure. Unknown fields
+    /// such as `locked` and `prunable` remain attached to the current record
+    /// but do not affect the exact path/branch inventory Mesh consumes.
+    static func parseRegisteredWorktrees(_ output: String) -> [RegisteredWorktree] {
         var result: [RegisteredWorktree] = []
         var path: String?
         var branch: String?
@@ -1237,15 +1256,16 @@ struct GitService: Sendable {
             path = nil
             branch = nil
         }
-        for rawLine in output.split(separator: "\n", omittingEmptySubsequences: false) {
-            let line = String(rawLine)
-            if line.isEmpty {
+        for record in output.split(separator: "\0", omittingEmptySubsequences: false) {
+            if record.isEmpty {
                 flush()
-            } else if line.hasPrefix("worktree ") {
+            } else if record.hasPrefix("worktree ") {
                 flush()
-                path = String(line.dropFirst("worktree ".count))
-            } else if line.hasPrefix("branch refs/heads/") {
-                branch = String(line.dropFirst("branch refs/heads/".count))
+                let value = record.dropFirst("worktree ".count)
+                path = value.isEmpty ? nil : String(value)
+            } else if path != nil, record.hasPrefix("branch refs/heads/") {
+                let value = record.dropFirst("branch refs/heads/".count)
+                branch = value.isEmpty ? nil : String(value)
             }
         }
         flush()
@@ -1258,6 +1278,31 @@ struct GitService: Sendable {
             URL(fileURLWithPath: entry.path, isDirectory: true).standardizedFileURL.path == expectedPath
                 && entry.branch == branch
         }
+    }
+
+    /// Derive the durable phase from Git's own registration/ref inventory.
+    /// A mismatched registration fails closed: a caller cannot pair one Mesh
+    /// path with another Mesh branch and use retry cleanup to delete either.
+    func worktreeRemovalPhase(path: String, branch: String) throws -> WorktreeRemovalPhase {
+        guard branch.hasPrefix(Self.meshBranchPrefix) else {
+            throw GitError.commandFailed("Refusing to remove a non-Mesh worktree branch")
+        }
+        let expectedPath = URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.path
+        let worktrees = try registeredWorktrees()
+        let exactRegistration = worktrees.contains { entry in
+            URL(fileURLWithPath: entry.path, isDirectory: true).standardizedFileURL.path == expectedPath
+                && entry.branch == branch
+        }
+        if exactRegistration { return .registered }
+
+        let hasMismatchedRegistration = worktrees.contains { entry in
+            URL(fileURLWithPath: entry.path, isDirectory: true).standardizedFileURL.path == expectedPath
+                || entry.branch == branch
+        }
+        guard !hasMismatchedRegistration else {
+            throw GitError.commandFailed("Refusing to remove an unverified Mesh worktree")
+        }
+        return try branchExists(branch) ? .branchCleanupPending : .complete
     }
 
     /// Inventory every recoverable form of Mesh work. A clean worktree can
@@ -1299,16 +1344,23 @@ struct GitService: Sendable {
         _ = try run(["worktree", "add", "-b", branch, path, startPoint])
     }
 
-    /// Remove a Mesh worktree and its branch. Refuses non-Mesh branches.
-    func worktreeRemove(path: String, branch: String) throws {
-        guard branch.hasPrefix(Self.meshBranchPrefix) else {
-            throw GitError.commandFailed("Refusing to remove a non-Mesh worktree branch")
+    /// Remove a Mesh worktree and its branch as a resumable transaction. Git's
+    /// registration and branch ref are the durable phase record: after a
+    /// branch-delete failure, retry skips worktree removal entirely.
+    @discardableResult
+    func worktreeRemove(path: String, branch: String) throws -> WorktreeRemovalPhase {
+        switch try worktreeRemovalPhase(path: path, branch: branch) {
+        case .registered:
+            _ = try run(["worktree", "remove", "--force", path])
+        case .branchCleanupPending:
+            break
+        case .complete:
+            return .complete
         }
-        guard try isRegisteredWorktree(path: path, branch: branch) else {
-            throw GitError.commandFailed("Refusing to remove an unverified Mesh worktree")
+        if try branchExists(branch) {
+            _ = try run(["branch", "-D", branch])
         }
-        _ = try run(["worktree", "remove", "--force", path])
-        _ = try run(["branch", "-D", branch])
+        return .complete
     }
 
     /// The full working-tree diff against HEAD (Mesh column review).

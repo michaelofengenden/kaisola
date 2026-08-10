@@ -360,7 +360,7 @@ struct WorkspaceRailView: View {
         })
         .sheet(item: $moveTarget) { target in
             WorkspaceMoveSheet(root: root, item: target) { destinationDirectory in
-                performMove(target, to: destinationDirectory)
+                await performMove(target, to: destinationDirectory)
             }
         }
         .alert(
@@ -499,18 +499,24 @@ struct WorkspaceRailView: View {
         trashTarget = node
     }
 
+    /// Asks the open editors whether this item may be changed. Returns the
+    /// reason it may not, so a caller with a surface of its own — the Move
+    /// sheet — can say it in place instead of behind a toast.
     @MainActor
-    private func prepareMutation(_ node: FileNode) -> Bool {
+    private func mutationBarrierRefusal(_ node: FileNode) -> String? {
         let request = WorkspaceFileMutationBarrierRequest(item: node.url)
         NotificationCenter.default.post(name: .kaisolaPrepareWorkspaceFileMutation, object: request)
         guard request.mayProceed else {
-            ToastCenter.shared.show(
-                "Resolve the unsaved changes in \(node.name) before changing it.",
-                style: .error
-            )
-            return false
+            return "Resolve the unsaved changes in \(node.name) before changing it."
         }
-        return true
+        return nil
+    }
+
+    @MainActor
+    private func prepareMutation(_ node: FileNode) -> Bool {
+        guard let refusal = mutationBarrierRefusal(node) else { return true }
+        ToastCenter.shared.show(refusal, style: .error)
+        return false
     }
 
     private func performRename() {
@@ -549,47 +555,51 @@ struct WorkspaceRailView: View {
         }
     }
 
-    @discardableResult
-    private func performMove(_ target: FileNode, to destinationDirectory: URL) -> Bool {
-        guard prepareMutation(target) else { return false }
+    /// Runs the move and reports what actually happened. This used to return
+    /// `true` the moment it spawned its detached task, and the sheet read that
+    /// as "done" and dismissed — so a failure arrived as a toast long after the
+    /// destination the user picked had disappeared. The sheet now awaits this,
+    /// which means a failure message stays the sheet's to show.
+    @MainActor
+    private func performMove(
+        _ target: FileNode,
+        to destinationDirectory: URL
+    ) async -> WorkspaceMoveOutcome {
+        if let refusal = mutationBarrierRefusal(target) { return .failed(refusal) }
         let destination = destinationDirectory.appendingPathComponent(
             target.name,
             isDirectory: target.isDirectory
         )
         let root = self.root
         isMutating = true
-        Task {
-            do {
-                let move = try await Task.detached(priority: .userInitiated) {
-                    try WorkspaceFileOperations.move(
-                        item: target.url,
-                        to: destination,
-                        workspaceRoot: root
-                    )
-                }.value
-                didMoveItem(move.source, move.destination)
-                expanded = Set(expanded.map { path in
-                    WorkspaceFileOperations.replacingPrefix(
-                        of: URL(fileURLWithPath: path),
-                        from: move.source,
-                        to: move.destination
-                    )?.path ?? path
-                })
-                refresh(changedPaths: [move.source, move.destination])
-                ToastCenter.shared.show(
-                    "Moved \(target.name) to \(destinationDirectory.lastPathComponent)",
-                    style: .success
+        defer { isMutating = false }
+        do {
+            let move = try await Task.detached(priority: .userInitiated) {
+                try WorkspaceFileOperations.move(
+                    item: target.url,
+                    to: destination,
+                    workspaceRoot: root
                 )
-            } catch {
-                ToastCenter.shared.show(
-                    WorkspaceFileOperations.userFacingDescription(for: error, action: "move"),
-                    style: .error,
-                    duration: 5
-                )
-            }
-            isMutating = false
+            }.value
+            didMoveItem(move.source, move.destination)
+            expanded = Set(expanded.map { path in
+                WorkspaceFileOperations.replacingPrefix(
+                    of: URL(fileURLWithPath: path),
+                    from: move.source,
+                    to: move.destination
+                )?.path ?? path
+            })
+            refresh(changedPaths: [move.source, move.destination])
+            ToastCenter.shared.show(
+                "Moved \(target.name) to \(destinationDirectory.lastPathComponent)",
+                style: .success
+            )
+            return .succeeded
+        } catch {
+            return .failed(
+                WorkspaceFileOperations.userFacingDescription(for: error, action: "move")
+            )
         }
-        return true
     }
 
     private func performCreate() {
@@ -1039,19 +1049,48 @@ final class WorkspaceRowClickArbiter: ObservableObject {
     }
 }
 
-private struct WorkspaceMoveSheet: View {
-    @Environment(\.dismiss) private var dismiss
+/// What the Move sheet learns about an attempted move — the real result, not
+/// the fact that the work started.
+enum WorkspaceMoveOutcome: Equatable, Sendable {
+    case succeeded
+    case failed(String)
+}
+
+/// The Move sheet's own state: the destinations it found, the one the user
+/// picked, and how far the attempt has gotten. It lives outside the view so the
+/// rule that matters here — the sheet leaves only on a confirmed move — is a
+/// thing that can be exercised without presenting a sheet.
+@MainActor
+final class WorkspaceMoveController: ObservableObject {
+    enum Phase: Equatable {
+        case choosing
+        case moving
+        case failed(String)
+        case succeeded
+    }
 
     let root: URL
     let item: FileNode
-    let commit: (URL) -> Bool
 
-    @State private var directories: [URL] = []
-    @State private var selectedPath: String?
-    @State private var searchText = ""
-    @State private var isLoading = true
+    @Published private(set) var directories: [URL] = []
+    @Published private(set) var isLoading = true
+    @Published private(set) var phase: Phase = .choosing
+    @Published private(set) var selectedPath: String?
+    @Published var searchText = "" {
+        didSet {
+            guard searchText != oldValue else { return }
+            // A narrowed list can hide the current pick; fall back to the
+            // first thing the user can actually see.
+            if selectedDirectory == nil { selectedPath = visibleDirectories.first?.path }
+        }
+    }
 
-    private var visibleDirectories: [URL] {
+    init(root: URL, item: FileNode) {
+        self.root = root
+        self.item = item
+    }
+
+    var visibleDirectories: [URL] {
         let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty else { return directories }
         return directories.filter {
@@ -1059,10 +1098,92 @@ private struct WorkspaceMoveSheet: View {
         }
     }
 
-    private var selectedDirectory: URL? {
+    var selectedDirectory: URL? {
         guard let selectedPath else { return nil }
         return visibleDirectories.first { $0.path == selectedPath }
     }
+
+    var isMoving: Bool { phase == .moving }
+
+    /// The one failure the user needs in front of them, shown in the sheet
+    /// rather than in a toast behind it.
+    var failureMessage: String? {
+        guard case let .failed(message) = phase else { return nil }
+        return message
+    }
+
+    /// The sheet's only permission to close itself.
+    var isFinished: Bool { phase == .succeeded }
+
+    func select(_ directory: URL) {
+        guard !isMoving else { return }
+        selectedPath = directory.path
+        // The diagnostic described the previous destination.
+        if case .failed = phase { phase = .choosing }
+    }
+
+    func loadDestinations() async {
+        isLoading = true
+        let root = root
+        let movingItem = item.url
+        let loaded = await Task.detached(priority: .utility) {
+            ProjectFiles.moveDestinationDirectories(root: root, movingItem: movingItem)
+        }.value
+        guard !Task.isCancelled else { return }
+        directories = loaded
+        if selectedDirectory == nil { selectedPath = loaded.first?.path }
+        isLoading = false
+    }
+
+    /// Awaits the move and records the result. The item and the destination are
+    /// left exactly as they were on failure, so Retry is one more click rather
+    /// than a rebuilt operation.
+    func submit(_ move: @MainActor (URL) async -> WorkspaceMoveOutcome) async {
+        guard !isMoving, !isFinished, let destination = selectedDirectory else { return }
+        phase = .moving
+        switch await move(destination) {
+        case .succeeded:
+            phase = .succeeded
+        case let .failed(message):
+            phase = .failed(message)
+        }
+    }
+
+    func destinationLabel(_ directory: URL) -> String {
+        let root = root.standardizedFileURL
+        let directory = directory.standardizedFileURL
+        guard directory.path != root.path else {
+            return "\(root.lastPathComponent) — Project Root"
+        }
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard directory.path.hasPrefix(prefix) else { return directory.lastPathComponent }
+        return String(directory.path.dropFirst(prefix.count))
+    }
+}
+
+private struct WorkspaceMoveSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    let root: URL
+    let item: FileNode
+    let move: @MainActor (URL) async -> WorkspaceMoveOutcome
+
+    @StateObject private var controller: WorkspaceMoveController
+
+    init(
+        root: URL,
+        item: FileNode,
+        move: @escaping @MainActor (URL) async -> WorkspaceMoveOutcome
+    ) {
+        self.root = root
+        self.item = item
+        self.move = move
+        _controller = StateObject(wrappedValue: WorkspaceMoveController(root: root, item: item))
+    }
+
+    private var visibleDirectories: [URL] { controller.visibleDirectories }
+
+    private var selectedDirectory: URL? { controller.selectedDirectory }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1074,11 +1195,12 @@ private struct WorkspaceMoveSheet: View {
                     .foregroundStyle(.kaisolaSecondary)
             }
 
-            TextField("Search folders", text: $searchText)
+            TextField("Search folders", text: $controller.searchText)
                 .textFieldStyle(.roundedBorder)
+                .disabled(controller.isMoving)
 
             Group {
-                if isLoading {
+                if controller.isLoading {
                     VStack(spacing: 10) {
                         ProgressView().controlSize(.small)
                         Text("Finding project folders…")
@@ -1088,10 +1210,10 @@ private struct WorkspaceMoveSheet: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if visibleDirectories.isEmpty {
                     ContentUnavailableView(
-                        searchText.isEmpty ? "No Other Folders" : "No Matching Folders",
+                        controller.searchText.isEmpty ? "No Other Folders" : "No Matching Folders",
                         systemImage: "folder.badge.minus",
                         description: Text(
-                            searchText.isEmpty
+                            controller.searchText.isEmpty
                                 ? "This item has no safe cross-directory destination."
                                 : "Try a different folder search."
                         )
@@ -1100,9 +1222,9 @@ private struct WorkspaceMoveSheet: View {
                     ScrollView {
                         LazyVStack(spacing: 2) {
                             ForEach(visibleDirectories, id: \.path) { directory in
-                                let isSelected = selectedPath == directory.path
+                                let isSelected = controller.selectedPath == directory.path
                                 Button {
-                                    selectedPath = directory.path
+                                    controller.select(directory)
                                 } label: {
                                     HStack(spacing: 9) {
                                         Image(systemName: directory.path == root.standardizedFileURL.path
@@ -1130,6 +1252,7 @@ private struct WorkspaceMoveSheet: View {
                                     .contentShape(Rectangle())
                                 }
                                 .buttonStyle(.plain)
+                                .disabled(controller.isMoving)
                                 .accessibilityLabel("Move destination \(destinationLabel(directory))")
                                 .accessibilityValue(isSelected ? "Selected" : "Not selected")
                             }
@@ -1149,52 +1272,67 @@ private struct WorkspaceMoveSheet: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             Divider()
-            HStack {
-                Spacer()
+            if let failure = controller.failureMessage {
+                HStack(alignment: .firstTextBaseline, spacing: 7) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                    Text(failure)
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 0)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 8)
+                .background(
+                    Color.orange.opacity(0.13),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+                .accessibilityElement(children: .combine)
+                .accessibilityLabel("Move failed. \(failure)")
+                .accessibilityIdentifier("workspace.move.failure")
+            }
+            HStack(spacing: 9) {
+                if controller.isMoving {
+                    ProgressView().controlSize(.small)
+                    Text("Moving \(item.name)…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .accessibilityIdentifier("workspace.move.progress")
+                }
+                Spacer(minLength: 0)
                 Button("Cancel", role: .cancel) { dismiss() }
                     .keyboardShortcut(.cancelAction)
-                Button("Move") {
-                    guard let selectedDirectory, commit(selectedDirectory) else { return }
-                    dismiss()
+                    // The move is already in flight; leaving now would put its
+                    // result back where this sheet cannot show it.
+                    .disabled(controller.isMoving)
+                Button(controller.failureMessage == nil ? "Move" : "Retry") {
+                    Task { await submit() }
                 }
                 .keyboardShortcut(.defaultAction)
-                .disabled(selectedDirectory == nil || isLoading)
+                .disabled(selectedDirectory == nil || controller.isLoading || controller.isMoving)
+                .accessibilityIdentifier("workspace.move.commit")
             }
         }
         .padding(20)
         .frame(width: 460, height: 440)
+        .interactiveDismissDisabled(controller.isMoving)
         .task(id: item.id) {
-            isLoading = true
-            let root = root
-            let movingItem = item.url
-            let scan = Task.detached(priority: .utility) {
-                ProjectFiles.moveDestinationDirectories(
-                    root: root,
-                    movingItem: movingItem
-                )
-            }
-            let loaded = await scan.value
-            guard !Task.isCancelled else { return }
-            directories = loaded
-            selectedPath = loaded.first?.path
-            isLoading = false
-        }
-        .onChange(of: searchText) { _, _ in
-            if selectedDirectory == nil {
-                selectedPath = visibleDirectories.first?.path
-            }
+            await controller.loadDestinations()
         }
     }
 
+    /// The sheet leaves only once the move is confirmed. Anything else keeps
+    /// the item, the destination and the diagnostic on screen together.
+    private func submit() async {
+        await controller.submit(move)
+        if controller.isFinished { dismiss() }
+    }
+
     private func destinationLabel(_ directory: URL) -> String {
-        let root = root.standardizedFileURL
-        let directory = directory.standardizedFileURL
-        guard directory.path != root.path else {
-            return "\(root.lastPathComponent) — Project Root"
-        }
-        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
-        guard directory.path.hasPrefix(prefix) else { return directory.lastPathComponent }
-        return String(directory.path.dropFirst(prefix.count))
+        controller.destinationLabel(directory)
     }
 }
 

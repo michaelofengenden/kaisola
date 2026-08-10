@@ -6,8 +6,9 @@ import SwiftUI
 /// the same way the command palette is presented. The stack is click-through
 /// everywhere except the capsules themselves — an empty layout frame draws
 /// nothing, so it never intercepts hits, and only the capsules opt in — so the
-/// workspace underneath keeps taking clicks while a toast is visible. Tap a
-/// capsule to dismiss it early.
+/// workspace underneath keeps taking clicks while a toast is visible. Tap or
+/// keyboard-activate a capsule to dismiss it; the compact history menu retains
+/// the bounded recent-notice log after visible rows expire.
 struct ToastOverlayView: View {
     @ObservedObject private var center = ToastCenter.shared
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -22,15 +23,38 @@ struct ToastOverlayView: View {
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .accessibilityLabel(toast.message)
-                .accessibilityHint("Dismiss notification")
+                .accessibilityLabel(ToastAccessibility.label(for: toast))
+                .accessibilityHint(ToastAccessibility.dismissActionName)
+                .accessibilityAction(named: Text(ToastAccessibility.dismissActionName)) {
+                    center.dismiss(toast.id)
+                }
                 .transition(reduceMotion
                     ? .opacity
                     : .move(edge: .bottom).combined(with: .opacity))
                 .allowsHitTesting(true)
             }
+            if !center.recentToasts.isEmpty {
+                Menu {
+                    ForEach(center.recentToasts.reversed()) { toast in
+                        Text(ToastAccessibility.label(for: toast))
+                    }
+                    Divider()
+                    Button("Clear Notification History", role: .destructive) {
+                        center.clearRecent()
+                    }
+                } label: {
+                    Label("Recent notifications", systemImage: "clock.arrow.circlepath")
+                        .labelStyle(.iconOnly)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .accessibilityLabel("Recent notifications")
+                .accessibilityValue("\(center.recentToasts.count) notices")
+                .help("Inspect recent notifications")
+            }
         }
-        .padding(.bottom, 28)
+        .safeAreaPadding(.horizontal, 16)
+        .safeAreaPadding(.bottom, 28)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
         .animation(
             reduceMotion
@@ -47,6 +71,17 @@ struct ToastOverlayView: View {
     }
 }
 
+/// Spoken toast semantics stay independent of the visual capsule so repeated
+/// notices and dismissal remain understandable without relying on icon/color.
+enum ToastAccessibility {
+    static let dismissActionName = "Dismiss notification"
+
+    static func label(for toast: ToastCenter.Toast) -> String {
+        guard toast.occurrenceCount > 1 else { return toast.message }
+        return "\(toast.message), repeated \(toast.occurrenceCount) times"
+    }
+}
+
 /// `ToastCenter` is app-wide while every window renders its own overlay. Keep
 /// announcement de-duplication app-wide too, or VoiceOver would speak the same
 /// transient result once per open window.
@@ -57,8 +92,8 @@ private enum ToastAccessibilityAnnouncements {
     private static var announcementOrder: [UUID] = []
 
     static func postIfNeeded(_ toast: ToastCenter.Toast) {
-        guard announcedIDs.insert(toast.id).inserted else { return }
-        announcementOrder.append(toast.id)
+        guard announcedIDs.insert(toast.announcementToken).inserted else { return }
+        announcementOrder.append(toast.announcementToken)
         if announcementOrder.count > retentionLimit {
             let expiredCount = announcementOrder.count - retentionLimit
             let expired = Array(announcementOrder.prefix(expiredCount))
@@ -94,6 +129,12 @@ private struct ToastCapsule: View {
                 .font(.callout)
                 .foregroundStyle(.primary)
                 .lineLimit(2)
+            if toast.occurrenceCount > 1 {
+                Text("×\(toast.occurrenceCount)")
+                    .font(.caption.monospacedDigit().weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)

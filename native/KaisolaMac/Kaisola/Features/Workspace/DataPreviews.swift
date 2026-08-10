@@ -102,10 +102,21 @@ enum CsvTable {
         var truncated: Bool { truncation.isTruncated }
     }
 
+    struct DelimiterDetection: Equatable, Sendable {
+        let delimiter: Character
+        let inspectedByteCount: Int
+    }
+
     /// Rendering caps: excess rows/columns are dropped and flagged so a
     /// pathological file can never realize an unbounded grid.
     static let maxRows = 2_000
     static let maxCols = 64
+
+    /// Delimiter guessing is on the first-paint path. A normal record ends far
+    /// before this bound; the cap only matters for malformed or generated files
+    /// with no record separator, where scanning the whole document would turn a
+    /// cheap guess into a second full parse.
+    static let delimiterSampleByteLimit = 64 * 1_024
 
     /// Forward-only access to borrowed UTF-8 storage. Production uses either a
     /// contiguous view of the source or the source's own `String.UTF8View`, so
@@ -272,33 +283,64 @@ enum CsvTable {
         )
     }
 
-    /// Guess the delimiter from the first non-empty line by counting comma,
-    /// semicolon, and tab occurrences outside quotes. Comma wins ties and is the
-    /// fallback when no delimiter is present.
+    /// Guess the delimiter from a bounded sample of the first non-empty line.
+    /// Comma wins ties and is the fallback when no delimiter is present.
     nonisolated static func detectDelimiter(_ text: String) -> Character {
-        let candidates: [Character] = [",", ";", "\t"]
-        let firstLine = text.split(
-            omittingEmptySubsequences: true,
-            whereSeparator: { $0.isNewline }
-        ).first ?? ""
+        delimiterSample(in: text).delimiter
+    }
 
-        var counts: [Character: Int] = [:]
+    /// Exposes the sample size to the performance contract without requiring a
+    /// second traversal of the source string.
+    nonisolated static func delimiterSample(in text: String) -> DelimiterDetection {
+        if let detection = text.utf8.withContiguousStorageIfAvailable({ bytes in
+            delimiterSample(bytes)
+        }) {
+            return detection
+        }
+        return delimiterSample(text.utf8)
+    }
+
+    private nonisolated static func delimiterSample<Source: Collection>(
+        _ source: Source
+    ) -> DelimiterDetection where Source.Element == UInt8 {
+        var commaCount = 0
+        var semicolonCount = 0
+        var tabCount = 0
         var inQuotes = false
-        for character in firstLine {
-            if character == "\"" {
+        var lineHasContent = false
+        var inspectedByteCount = 0
+
+        for byte in source.prefix(delimiterSampleByteLimit) {
+            inspectedByteCount += 1
+
+            if byte == 0x0D || byte == 0x0A {
+                if lineHasContent { break }
+                continue
+            }
+
+            lineHasContent = true
+            if byte == 0x22 {
                 inQuotes.toggle()
-            } else if !inQuotes, candidates.contains(character) {
-                counts[character, default: 0] += 1
+            } else if !inQuotes {
+                switch byte {
+                case 0x2C: commaCount += 1
+                case 0x3B: semicolonCount += 1
+                case 0x09: tabCount += 1
+                default: break
+                }
             }
         }
 
         var best: Character = ","
-        var bestCount = 0
-        for candidate in candidates where (counts[candidate] ?? 0) > bestCount {
-            best = candidate
-            bestCount = counts[candidate] ?? 0
+        var bestCount = commaCount
+        if semicolonCount > bestCount {
+            best = ";"
+            bestCount = semicolonCount
         }
-        return best
+        if tabCount > bestCount {
+            best = "\t"
+        }
+        return DelimiterDetection(delimiter: best, inspectedByteCount: inspectedByteCount)
     }
 }
 

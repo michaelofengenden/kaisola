@@ -104,13 +104,38 @@ final class PreviewPreparationBudgetTests: XCTestCase {
     /// Delimiter detection reads the head of a file and must not scale with the
     /// whole of it — it runs before the parse, on the main thread's critical
     /// path to first paint.
-    func testDelimiterDetectionDoesNotReadTheWholeFile() {
+    func testDelimiterDetectionDoesNotReadTheWholeFile() throws {
         let text = csv(rows: 60_000, columns: 12)
-        let duration = elapsed { _ = CsvTable.detectDelimiter(text) }
+        var measuredDetection: CsvTable.DelimiterDetection?
+        let duration = elapsed { measuredDetection = CsvTable.delimiterSample(in: text) }
+        let detection = try XCTUnwrap(measuredDetection)
+
+        XCTAssertEqual(detection.delimiter, ",")
+        XCTAssertLessThan(
+            detection.inspectedByteCount,
+            256,
+            "the first record is short, so the multi-megabyte tail must remain unread"
+        )
+        XCTAssertLessThanOrEqual(
+            detection.inspectedByteCount,
+            CsvTable.delimiterSampleByteLimit
+        )
         XCTAssertLessThan(
             duration, 0.25,
             "delimiter detection took \(duration)s — it should sample, not scan"
         )
+    }
+
+    /// Even a malformed export with no record separator must leave the main
+    /// thread after one fixed-size sample instead of turning delimiter guessing
+    /// into another whole-file parse.
+    func testDelimiterDetectionCapsAPathologicalFirstRecord() {
+        let text = String(repeating: "field;", count: 100_000)
+        let detection = CsvTable.delimiterSample(in: text)
+
+        XCTAssertEqual(detection.delimiter, ";")
+        XCTAssertEqual(detection.inspectedByteCount, CsvTable.delimiterSampleByteLimit)
+        XCTAssertLessThan(detection.inspectedByteCount, text.utf8.count)
     }
 
     // MARK: - Markdown

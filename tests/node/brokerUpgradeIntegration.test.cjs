@@ -103,7 +103,7 @@ async function connectClient(config, access = 'controller') {
     socket.write(`${JSON.stringify({ type: 'request', id, method, params })}\n`)
     return next((frame) => frame.type === 'response' && frame.id === id)
   }
-  return { socket, hello, request }
+  return { socket, hello, request, nextFrame: next }
 }
 
 test('sealed broker identity is published and safe update commit rejects racing mutations', async (t) => {
@@ -215,27 +215,40 @@ test('rolling cutover preserves an idle PTY and rejects late activity, input, an
     stabilityWindowMs,
   })
 
-  const outputTrigger = path.join(fixture.root, 'emit-synthetic-output')
   const synthetic = await controller.request('terminal.create', {
     ownerId: '0',
     projectId: 'rolling-test',
     id: 'synthetic-output-terminal',
-    command: '/bin/sh',
+    command: process.execPath,
     args: [
-      '-c',
-      // Bounded poll (~60s ceiling): if the test aborts before writing the
-      // trigger file, the watcher exits on its own instead of spinning
-      // forever in an orphaned PTY.
-      'i=0; while [ ! -f "$1" ]; do i=$((i+1)); [ "$i" -gt 6000 ] && exit 1; sleep 0.01; done; printf synthetic-output; sleep 5',
-      'kaisola-output-race',
-      outputTrigger,
+      '-e',
+      [
+        "process.on('SIGUSR1', () => process.stdout.write('synthetic-output'))",
+        "process.stdout.write('synthetic-ready')",
+        'setTimeout(() => process.exit(1), 60_000).unref()',
+        'setInterval(() => {}, 1_000)',
+      ].join(';'),
+      // Keep the fixture root in the exact command line so the t.after pkill
+      // remains a bounded fallback if an assertion aborts before release.
+      fixture.root,
     ],
     cwd: fixture.root,
   })
   assert.equal(synthetic.result.ok, true)
-  const pendingOutputRace = prepare(300)
-  await delay(30)
-  fs.writeFileSync(outputTrigger, 'emit', { mode: 0o600 })
+  await controller.nextFrame((frame) => frame.type === 'event'
+    && frame.channel === 'terminal:data:synthetic-output-terminal'
+    && String(frame.payload).includes('synthetic-ready'))
+
+  const pendingOutputRace = prepare(2_000)
+  // Requests on one socket are parsed in order. Receiving this later status
+  // response proves prepareRollingUpdate reached its stability-window await;
+  // no guessed delay is needed before injecting the output race.
+  const outputRaceBarrier = await controller.request('broker.status', { ownerId: '0' })
+  assert.equal(outputRaceBarrier.result.generationState, 'current')
+  process.kill(synthetic.result.pid, 'SIGUSR1')
+  await controller.nextFrame((frame) => frame.type === 'event'
+    && frame.channel === 'terminal:data:synthetic-output-terminal'
+    && String(frame.payload).includes('synthetic-output'))
   const outputRace = await pendingOutputRace
   assert.equal(outputRace.result.state, 'pending')
   assert.equal(outputRace.result.reason, 'activity_changed')

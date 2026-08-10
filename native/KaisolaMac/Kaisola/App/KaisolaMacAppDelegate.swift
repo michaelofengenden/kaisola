@@ -5371,7 +5371,10 @@ struct NativeVisualExtensionsSettingsReceipt: Codable, Equatable {
         guard fixtureBrokerIsolated else { return "fixture-broker-route-live" }
         guard contentHeight >= 540 else { return "content-too-short-\(contentHeight)" }
         if surface == "settings-extensions" {
-            guard contentWidth >= 1_050 else { return "wide-content-too-narrow-\(contentWidth)" }
+            // The hosted WindowServer constrains the declared 1,100-point
+            // ideal Settings window to 1,024 points. Keep the receipt aligned
+            // with the workflow's 1,000-pixel wide-surface floor.
+            guard contentWidth >= 1_000 else { return "wide-content-too-narrow-\(contentWidth)" }
         } else {
             guard (800...900).contains(contentWidth) else {
                 return "narrow-content-out-of-range-\(contentWidth)"

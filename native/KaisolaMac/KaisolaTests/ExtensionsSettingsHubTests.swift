@@ -459,7 +459,8 @@ final class ExtensionsSettingsHubTests: XCTestCase {
             receipt(surface: "settings-extensions-narrow", width: 820).failure,
             "missing-compact-picker-label-ax"
         )
-        XCTAssertEqual(receipt(width: 900).failure, "wide-content-too-narrow-900.0")
+        XCTAssertEqual(receipt(width: 999).failure, "wide-content-too-narrow-999.0")
+        XCTAssertNil(receipt(width: 1_000).failure)
     }
 
     private func removalTheme(id: String, title: String) -> CustomThemeSpec {

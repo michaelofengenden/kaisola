@@ -296,7 +296,7 @@ jobs:
                   || !receipt.fixtureUpdaterDisabled
                   || !receipt.fixtureBrokerIsolated
                   || receipt.contentHeight < 540
-                  || (receipt.surface === "settings-extensions" && receipt.contentWidth < 1050)
+                  || (receipt.surface === "settings-extensions" && receipt.contentWidth < 1000)
                   || (receipt.surface === "settings-extensions-narrow"
                     && (receipt.contentWidth < 800 || receipt.contentWidth > 900))
                   || !receipt.accessibilityIdentifiers.includes("extensions.hub")

@@ -94,11 +94,13 @@ struct AdapterInstallManager: Sendable {
             try write(Payload(installs: current))
         }
 
-        func remove(agentID: String) {
+        @discardableResult
+        func remove(agentID: String) throws -> Bool {
             let current = records()
             let remaining = current.filter { $0.agentID != agentID }
-            guard remaining.count != current.count else { return }
-            try? write(Payload(installs: remaining))
+            guard remaining.count != current.count else { return false }
+            try write(Payload(installs: remaining))
+            return true
         }
 
         private func write(_ payload: Payload) throws {
@@ -172,6 +174,17 @@ struct AdapterInstallManager: Sendable {
     private struct TreeSnapshot: Equatable {
         let rootIdentity: PathIdentity
         let digest: String
+    }
+
+    /// One adapter tree atomically detached from its public agent name while a
+    /// cross-store deletion commits. The already-open root descriptor keeps a
+    /// parent-path replacement from redirecting either rollback or cleanup.
+    private struct StagedPurge {
+        let agentID: String
+        let stagedName: String?
+        let priorRecord: InstalledAdapterRecord?
+        let rootDescriptor: Int32
+        let rootIdentity: PathIdentity?
     }
 
     private enum TreeSafetyError: LocalizedError {
@@ -532,12 +545,186 @@ struct AdapterInstallManager: Sendable {
         return record
     }
 
+    /// A deletion whose primary failure was followed by an incomplete rollback.
+    /// The caller must not claim that nothing changed in this state.
+    enum PurgeError: LocalizedError {
+        case rollbackIncomplete(original: String, rollback: String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .rollbackIncomplete(original, rollback):
+                "Adapter deletion failed (\(original)); rollback was incomplete (\(rollback))."
+            }
+        }
+    }
+
+    /// Remove an install and its durable record as a reversible transaction.
+    ///
+    /// The tree is first renamed to an unguessable sibling through an already-
+    /// opened, identity-checked root descriptor. That makes a refused removal
+    /// fail before `committingRegistry` can change the custom-agent roster. The
+    /// install record is then removed durably, the caller commits its roster,
+    /// and only then are the staged bytes destroyed. Any failure before that
+    /// final destruction restores the exact tree and record; a failure during
+    /// destruction also asks the caller to restore its committed roster before
+    /// the same rollback. Missing trees and records are idempotent success.
+    func purge(
+        agentID: String,
+        committingRegistry: () throws -> Void = {},
+        rollingBackRegistry: () throws -> Void = {}
+    ) throws {
+        let staged = try stagePurge(agentID: agentID)
+        defer {
+            if staged.rootDescriptor >= 0 { Darwin.close(staged.rootDescriptor) }
+        }
+
+        var removedRecord = false
+        var committedRegistry = false
+        do {
+            removedRecord = try store.remove(agentID: agentID)
+            try committingRegistry()
+            committedRegistry = true
+            try finishPurge(staged)
+        } catch {
+            var rollbackFailures: [String] = []
+            do { try restoreStagedTree(staged) }
+            catch { rollbackFailures.append(error.localizedDescription) }
+            if removedRecord, let priorRecord = staged.priorRecord {
+                do { try store.upsert(priorRecord) }
+                catch { rollbackFailures.append(error.localizedDescription) }
+            }
+            if committedRegistry {
+                do { try rollingBackRegistry() }
+                catch { rollbackFailures.append(error.localizedDescription) }
+            }
+            guard rollbackFailures.isEmpty else {
+                throw PurgeError.rollbackIncomplete(
+                    original: error.localizedDescription,
+                    rollback: rollbackFailures.joined(separator: "; ")
+                )
+            }
+            throw error
+        }
+    }
+
     /// Remove an install and its record — disabling is reversible and total.
+    /// Best-effort: for callers with nowhere to report a failure.
     func uninstall(agentID: String) {
-        store.remove(agentID: agentID)
-        guard Self.isSafePathComponent(agentID),
-              (try? currentIdentity(of: installsRoot)) != nil else { return }
-        try? FileManager.default.removeItem(at: installRoot(agentID: agentID))
+        try? purge(agentID: agentID)
+    }
+
+    /// Detach the exact install tree without following an unsafe id, a symlink,
+    /// or a replaced cache root. The descriptor stays open for the transaction.
+    private func stagePurge(agentID: String) throws -> StagedPurge {
+        guard Self.isSafePathComponent(agentID) else {
+            throw InstallError.unresolvable("the adapter id is not filesystem-safe.")
+        }
+        let priorRecord = store.record(agentID: agentID)
+        var rootMetadata = stat()
+        guard lstat(installsRoot.path, &rootMetadata) == 0 else {
+            guard errno == ENOENT else {
+                throw InstallError.unresolvable("the adapter cache root could not be inspected.")
+            }
+            return StagedPurge(
+                agentID: agentID,
+                stagedName: nil,
+                priorRecord: priorRecord,
+                rootDescriptor: -1,
+                rootIdentity: nil
+            )
+        }
+
+        let identity = try currentIdentity(of: installsRoot)
+        let descriptor = try openInstallsRoot(expectedIdentity: identity)
+        do {
+            var installMetadata = stat()
+            guard fstatat(descriptor, agentID, &installMetadata, AT_SYMLINK_NOFOLLOW) == 0 else {
+                guard errno == ENOENT else {
+                    throw InstallError.unresolvable("the adapter install could not be inspected safely.")
+                }
+                return StagedPurge(
+                    agentID: agentID,
+                    stagedName: nil,
+                    priorRecord: priorRecord,
+                    rootDescriptor: descriptor,
+                    rootIdentity: identity
+                )
+            }
+            guard installMetadata.st_uid == getuid(),
+                  installMetadata.st_mode & S_IFMT == S_IFDIR else {
+                throw InstallError.unresolvable("the adapter install is not an app-owned directory.")
+            }
+
+            let stagedName = ".delete-\(UUID().uuidString)"
+            guard renameat(descriptor, agentID, descriptor, stagedName) == 0 else {
+                throw InstallError.unresolvable("the adapter install could not be staged for deletion.")
+            }
+            return StagedPurge(
+                agentID: agentID,
+                stagedName: stagedName,
+                priorRecord: priorRecord,
+                rootDescriptor: descriptor,
+                rootIdentity: identity
+            )
+        } catch {
+            Darwin.close(descriptor)
+            throw error
+        }
+    }
+
+    private func restoreStagedTree(_ staged: StagedPurge) throws {
+        guard let stagedName = staged.stagedName else { return }
+        var existing = stat()
+        guard fstatat(staged.rootDescriptor, staged.agentID, &existing, AT_SYMLINK_NOFOLLOW) != 0,
+              errno == ENOENT,
+              renameat(staged.rootDescriptor, stagedName, staged.rootDescriptor, staged.agentID) == 0 else {
+            throw InstallError.unresolvable("the staged adapter install could not be restored.")
+        }
+    }
+
+    private func finishPurge(_ staged: StagedPurge) throws {
+        guard let stagedName = staged.stagedName,
+              let rootIdentity = staged.rootIdentity else { return }
+        let root = try descriptorRootURL(
+            staged.rootDescriptor,
+            expectedIdentity: rootIdentity
+        )
+        let target = root.appendingPathComponent(stagedName, isDirectory: true)
+        do {
+            try FileManager.default.removeItem(at: target)
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            return
+        }
+    }
+
+    private func descriptorRootURL(
+        _ descriptor: Int32,
+        expectedIdentity: PathIdentity
+    ) throws -> URL {
+        var descriptorMetadata = stat()
+        var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+        guard fstat(descriptor, &descriptorMetadata) == 0,
+              PathIdentity(descriptorMetadata) == expectedIdentity,
+              fcntl(descriptor, F_GETPATH, &pathBuffer) == 0 else {
+            throw InstallError.unresolvable("the adapter cache root changed during deletion.")
+        }
+        let pathLength = pathBuffer.firstIndex(of: 0) ?? pathBuffer.endIndex
+        let root = URL(
+            fileURLWithPath: String(
+                decoding: pathBuffer[..<pathLength].map { UInt8(bitPattern: $0) },
+                as: UTF8.self
+            ),
+            isDirectory: true
+        )
+        var pathMetadata = stat()
+        guard lstat(root.path, &pathMetadata) == 0,
+              PathIdentity(pathMetadata) == expectedIdentity,
+              pathMetadata.st_uid == getuid(),
+              pathMetadata.st_mode & S_IFMT == S_IFDIR else {
+            throw InstallError.unresolvable("the adapter cache root changed during deletion.")
+        }
+        return root
     }
 
     private static func isSafePathComponent(_ value: String) -> Bool {

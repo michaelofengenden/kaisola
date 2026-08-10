@@ -475,6 +475,50 @@ struct CustomAgentStore: Sendable {
         return "\(base)-\(suffix)"
     }
 
+    /// The comparison form of a display name: whitespace runs collapsed to one
+    /// space, ends trimmed, case folded. Two names that fold together are the
+    /// same name to anyone reading the New menu, however their spacing or
+    /// capitalization differs.
+    static func normalizedName(_ name: String) -> String {
+        name.split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+            .lowercased()
+    }
+
+    /// Why `name` cannot label a row alongside `specs`, or nil when it is free.
+    /// `ignoring` exempts one row so an existing entry can be renamed — or
+    /// re-saved unchanged — without colliding with itself.
+    ///
+    /// Ids are already made unique by `slugify`, but two rows under one display
+    /// name are indistinguishable in every menu and every status line, so
+    /// neither can be picked or blamed with confidence.
+    static func duplicateNameError(
+        _ name: String,
+        in specs: [CustomAgentSpec],
+        ignoring id: String? = nil
+    ) -> String? {
+        let candidate = normalizedName(name)
+        guard !candidate.isEmpty else { return nil }
+        guard let clash = specs.first(where: {
+            $0.id != id && normalizedName($0.name) == candidate
+        }) else { return nil }
+        return "\"\(clash.name)\" already uses this name. "
+            + "Custom-agent names must differ by more than spacing or capitalization."
+    }
+
+    /// The roster after appending `spec`, or nil when its display name (or id)
+    /// is already taken. The refusal lives here rather than in the view so a
+    /// disabled Add button and a refused save can never disagree.
+    ///
+    /// Only the entry point is guarded: `save` still writes duplicate-named
+    /// rows it is handed, so a roster written before this rule existed keeps
+    /// every entry and stays repairable by renaming.
+    static func adding(_ spec: CustomAgentSpec, to specs: [CustomAgentSpec]) -> [CustomAgentSpec]? {
+        guard duplicateNameError(spec.name, in: specs) == nil,
+              !specs.contains(where: { $0.id == spec.id }) else { return nil }
+        return specs + [spec]
+    }
+
     private func persistenceFailure(
         _ entryID: String?,
         operation: PersistenceOperation,

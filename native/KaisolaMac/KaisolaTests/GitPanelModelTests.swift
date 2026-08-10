@@ -3,13 +3,15 @@ import Foundation
 import XCTest
 @testable import Kaisola
 
-/// The Git panel's two testable seams:
+/// The Git panel's two pure seams:
 ///
 /// 1. `GitRefreshPolicy` — the pure "should a filesystem event turn into a real
 ///    `git status` run yet?" decision that replaced the panel's 3s poll, plus a
 ///    live round-trip proving an *external* `git add` refreshes the open panel.
 /// 2. `GitPRPlanner` / `PRPlan` — the pure assembly of a reviewable pull-request
 ///    plan, so the first click can show exactly what the second click will do.
+///
+/// The panel's layout is measured separately, in `GitCleanTreeLayoutTests`.
 final class GitPanelModelTests: XCTestCase {
     private var repo: URL!
 

@@ -20,7 +20,8 @@ struct TerminalTranscriptView: View {
     @State private var renderedGeneration = 0
     @State private var searchWorker = TerminalTranscriptSearchWorker()
     @State private var preparedSearch: TerminalTranscriptSearchWorker.Prepared?
-    @State private var isLoading = false
+    @State private var initialLoadState = TerminalTranscriptInitialLoadState()
+    @State private var isSupplementalLoading = false
     @State private var didPositionAtBottom = false
     @State private var errorMessage: String?
     @State private var searchText = ""
@@ -192,8 +193,16 @@ struct TerminalTranscriptView: View {
         )
     }
 
+    private var isLoading: Bool {
+        initialLoadState.isLoading || isSupplementalLoading
+    }
+
+    private var visibleErrorMessage: String? {
+        initialLoadState.failureMessage ?? errorMessage
+    }
+
     private var statusText: String {
-        if let errorMessage { return errorMessage }
+        if let visibleErrorMessage { return visibleErrorMessage }
         guard let first = pages.first else {
             return context.endOffset == 0 ? "This terminal has no output yet." : "Loading retained history…"
         }
@@ -258,19 +267,35 @@ struct TerminalTranscriptView: View {
             .foregroundStyle(.kaisolaSecondary)
             .frame(maxWidth: .infinity)
             .padding(.vertical, 10)
-        } else if let errorMessage {
-            ContentUnavailableView("Could not load history", systemImage: "exclamationmark.triangle", description: Text(errorMessage))
+        } else if let errorMessage = initialLoadState.failureMessage {
+            ContentUnavailableView {
+                Label("Could not load history", systemImage: "exclamationmark.triangle")
+            } description: {
+                Text(errorMessage)
+            } actions: {
+                Button("Retry") {
+                    Task { await loadInitial(using: proxy) }
+                }
+                .disabled(!initialLoadState.canRetry)
+                .accessibilityIdentifier("terminal-transcript-retry")
+                .accessibilityHint("Loads retained history again without changing the live terminal")
+            }
                 .frame(maxWidth: .infinity, minHeight: 300)
         }
     }
 
     @MainActor
     private func loadInitial(using proxy: ScrollViewProxy) async {
-        guard pages.isEmpty, !isLoading, context.endOffset > 0 else {
-            didPositionAtBottom = true
+        guard let attempt = initialLoadState.begin(
+            hasLoadedPages: !pages.isEmpty,
+            endOffset: context.endOffset
+        ) else {
+            if !pages.isEmpty || context.endOffset <= 0 {
+                didPositionAtBottom = true
+            }
             return
         }
-        isLoading = true
+        errorMessage = nil
         do {
             let page = try await model.terminalHistoryPage(
                 context: context,
@@ -279,15 +304,19 @@ struct TerminalTranscriptView: View {
             )
             pages = [page]
             await renderNewPage(page)
-            errorMessage = nil
+            postInitialLoadAnnouncement(initialLoadState.finishSuccess(attempt: attempt))
             await Task.yield()
             proxy.scrollTo(bottomID, anchor: .bottom)
             await Task.yield()
             didPositionAtBottom = true
+        } catch is CancellationError {
+            initialLoadState.cancel(attempt: attempt)
         } catch {
-            errorMessage = transcriptErrorDescription(error)
+            postInitialLoadAnnouncement(initialLoadState.finishFailure(
+                transcriptErrorDescription(error),
+                attempt: attempt
+            ))
         }
-        isLoading = false
     }
 
     @MainActor
@@ -297,7 +326,7 @@ struct TerminalTranscriptView: View {
               first.id == oldFirstID,
               first.hasMore,
               first.startOffset > 0 else { return }
-        isLoading = true
+        isSupplementalLoading = true
         do {
             let page = try await model.terminalHistoryPage(
                 context: context,
@@ -319,13 +348,13 @@ struct TerminalTranscriptView: View {
         } catch {
             errorMessage = transcriptErrorDescription(error)
         }
-        isLoading = false
+        isSupplementalLoading = false
     }
 
     @MainActor
     private func loadAll() async {
         guard !isLoading, var first = pages.first, first.hasMore else { return }
-        isLoading = true
+        isSupplementalLoading = true
         do {
             var loaded = pages
             while first.hasMore, first.startOffset > 0 {
@@ -352,7 +381,7 @@ struct TerminalTranscriptView: View {
         } catch {
             errorMessage = transcriptErrorDescription(error)
         }
-        isLoading = false
+        isSupplementalLoading = false
     }
 
     @MainActor
@@ -448,6 +477,105 @@ struct TerminalTranscriptView: View {
     private func transcriptErrorDescription(_ error: any Error) -> String {
         (error as? any LocalizedError)?.errorDescription
             ?? "This terminal's retained history could not be loaded."
+    }
+
+    @MainActor
+    private func postInitialLoadAnnouncement(
+        _ announcement: TerminalTranscriptInitialLoadState.Announcement?
+    ) {
+        guard let announcement else { return }
+        let priority: NSAccessibilityPriorityLevel = switch announcement.priority {
+        case .medium: .medium
+        case .high: .high
+        }
+        NSAccessibility.post(
+            element: NSApplication.shared,
+            notification: .announcementRequested,
+            userInfo: [
+                .announcement: announcement.message,
+                .priority: priority.rawValue,
+            ]
+        )
+    }
+}
+
+/// Keeps the retry path deterministic across SwiftUI task restarts. The view
+/// clears a stale failure synchronously when `begin` accepts a retry, rejects
+/// concurrent activations, and settles each accepted attempt at most once.
+struct TerminalTranscriptInitialLoadState: Equatable {
+    enum Attempt: Equatable {
+        case initial
+        case retry
+    }
+
+    struct Announcement: Equatable {
+        enum Priority: Equatable {
+            case medium
+            case high
+        }
+
+        let message: String
+        let priority: Priority
+    }
+
+    private enum Phase: Equatable {
+        case idle
+        case loading(Attempt, previousFailure: String?)
+        case failed(String)
+        case loaded
+    }
+
+    private var phase: Phase = .idle
+
+    var isLoading: Bool {
+        if case .loading = phase { return true }
+        return false
+    }
+
+    var failureMessage: String? {
+        if case let .failed(message) = phase { return message }
+        return nil
+    }
+
+    var canRetry: Bool {
+        failureMessage != nil && !isLoading
+    }
+
+    mutating func begin(hasLoadedPages: Bool, endOffset: Int64) -> Attempt? {
+        guard !hasLoadedPages, endOffset > 0, !isLoading else { return nil }
+        let previousFailure = failureMessage
+        let attempt: Attempt = previousFailure == nil ? .initial : .retry
+        phase = .loading(attempt, previousFailure: previousFailure)
+        return attempt
+    }
+
+    mutating func finishSuccess(attempt: Attempt) -> Announcement? {
+        guard case let .loading(activeAttempt, _) = phase,
+              activeAttempt == attempt else { return nil }
+        phase = .loaded
+        guard attempt == .retry else { return nil }
+        return Announcement(message: "Terminal history loaded.", priority: .medium)
+    }
+
+    mutating func finishFailure(_ message: String, attempt: Attempt) -> Announcement? {
+        guard case let .loading(activeAttempt, _) = phase,
+              activeAttempt == attempt else { return nil }
+        phase = .failed(message)
+        guard attempt == .retry else { return nil }
+        return Announcement(
+            message: "Terminal history still could not be loaded. \(message)",
+            priority: .high
+        )
+    }
+
+    mutating func cancel(attempt: Attempt) {
+        guard case let .loading(activeAttempt, previousFailure) = phase,
+              activeAttempt == attempt else { return }
+        if let previousFailure {
+            phase = .failed(previousFailure)
+        } else {
+            phase = .idle
+        }
     }
 }
 

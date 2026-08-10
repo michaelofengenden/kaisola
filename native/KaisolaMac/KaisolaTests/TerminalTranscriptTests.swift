@@ -4,6 +4,72 @@ import XCTest
 
 @MainActor
 final class TerminalTranscriptTests: XCTestCase {
+    func testInitialLoadFailureExposesRetryAndRetryClearsStaleErrorBeforeRequest() throws {
+        var state = TerminalTranscriptInitialLoadState()
+
+        let initial = try XCTUnwrap(state.begin(hasLoadedPages: false, endOffset: 4_096))
+        XCTAssertEqual(initial, .initial)
+        XCTAssertTrue(state.isLoading)
+        XCTAssertFalse(state.canRetry)
+        XCTAssertNil(state.failureMessage)
+
+        XCTAssertNil(state.finishFailure("Broker unavailable", attempt: initial))
+        XCTAssertFalse(state.isLoading)
+        XCTAssertTrue(state.canRetry)
+        XCTAssertEqual(state.failureMessage, "Broker unavailable")
+
+        let retry = try XCTUnwrap(state.begin(hasLoadedPages: false, endOffset: 4_096))
+        XCTAssertEqual(retry, .retry)
+        XCTAssertTrue(state.isLoading)
+        XCTAssertFalse(state.canRetry)
+        XCTAssertNil(state.failureMessage, "Retry must clear the stale error before awaiting the broker")
+    }
+
+    func testInitialLoadRetryAnnouncesSuccessOrRepeatedFailureExactlyOnce() throws {
+        var successState = TerminalTranscriptInitialLoadState()
+        let firstFailure = try XCTUnwrap(successState.begin(hasLoadedPages: false, endOffset: 12))
+        XCTAssertNil(successState.finishFailure("Offline", attempt: firstFailure))
+        let successfulRetry = try XCTUnwrap(successState.begin(hasLoadedPages: false, endOffset: 12))
+
+        XCTAssertEqual(
+            successState.finishSuccess(attempt: successfulRetry),
+            .init(message: "Terminal history loaded.", priority: .medium)
+        )
+        XCTAssertNil(successState.finishSuccess(attempt: successfulRetry), "An attempt can settle only once")
+        XCTAssertFalse(successState.canRetry)
+        XCTAssertNil(successState.failureMessage)
+
+        var failureState = TerminalTranscriptInitialLoadState()
+        let initial = try XCTUnwrap(failureState.begin(hasLoadedPages: false, endOffset: 12))
+        XCTAssertNil(failureState.finishFailure("Timed out", attempt: initial))
+        let retry = try XCTUnwrap(failureState.begin(hasLoadedPages: false, endOffset: 12))
+
+        XCTAssertEqual(
+            failureState.finishFailure("Timed out again", attempt: retry),
+            .init(
+                message: "Terminal history still could not be loaded. Timed out again",
+                priority: .high
+            )
+        )
+        XCTAssertNil(failureState.finishFailure("duplicate", attempt: retry), "An attempt can settle only once")
+        XCTAssertTrue(failureState.canRetry)
+        XCTAssertEqual(failureState.failureMessage, "Timed out again")
+    }
+
+    func testInitialLoadGateRejectsEmptyHistoryLoadedPagesAndConcurrentActivation() throws {
+        var state = TerminalTranscriptInitialLoadState()
+
+        XCTAssertNil(state.begin(hasLoadedPages: false, endOffset: 0))
+        XCTAssertNil(state.begin(hasLoadedPages: true, endOffset: 4_096))
+
+        let attempt = try XCTUnwrap(state.begin(hasLoadedPages: false, endOffset: 4_096))
+        XCTAssertNil(state.begin(hasLoadedPages: false, endOffset: 4_096))
+        XCTAssertNil(state.finishFailure("late result", attempt: .retry))
+        XCTAssertTrue(state.isLoading, "A result for another attempt must not release the in-flight gate")
+        XCTAssertNil(state.finishSuccess(attempt: attempt))
+        XCTAssertFalse(state.isLoading)
+    }
+
     func testTranscriptPrependUsesMomentumPreservationWhenTheOSSupportsIt() {
         if #available(macOS 15.0, *) {
             XCTAssertTrue(TerminalTranscriptScrollPolicy.supportsVelocityPreservation)

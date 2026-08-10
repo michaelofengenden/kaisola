@@ -19,6 +19,48 @@ final class GitServiceTests: XCTestCase {
         try? FileManager.default.removeItem(at: repo)
     }
 
+    func testAgentReviewSnapshotHashesExactStagedUnstagedAndUntrackedContent() throws {
+        try write("both.swift", "let value = 1\n")
+        try git(["add", "both.swift"])
+        try git(["commit", "-q", "-m", "base"])
+
+        try write("both.swift", "let value = 2\n")
+        try git(["add", "both.swift"])
+        try write("both.swift", "let value = 3\n")
+        try write("notes with space.txt", "untracked α\n")
+
+        let service = GitService(repoRoot: repo)
+        let first = try service.agentReviewSnapshot()
+        let repeated = try service.agentReviewSnapshot()
+
+        XCTAssertEqual(first, repeated)
+        XCTAssertEqual(first.hash.count, 64)
+        XCTAssertEqual(first.files.map(\.path), ["both.swift", "notes with space.txt"])
+        XCTAssertTrue(first.files[0].stagedPatch.contains("let value = 2"))
+        XCTAssertTrue(first.files[0].unstagedPatch.contains("let value = 3"))
+        XCTAssertEqual(first.files[1].untrackedText, "untracked α\n")
+
+        try write("notes with space.txt", "untracked β\n")
+        let changed = try service.agentReviewSnapshot()
+        XCTAssertNotEqual(changed.hash, first.hash)
+        XCTAssertEqual(changed.files[0], first.files[0])
+        XCTAssertNotEqual(changed.files[1], first.files[1])
+    }
+
+    func testAgentReviewSnapshotRejectsOversizedPayloadInsteadOfTruncating() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try write(
+            "oversized.txt",
+            String(repeating: "x", count: GitService.AgentReviewSnapshot.maximumPayloadBytes + 1)
+        )
+
+        XCTAssertThrowsError(try GitService(repoRoot: repo).agentReviewSnapshot()) { error in
+            XCTAssertTrue(error.localizedDescription.contains("too large"), error.localizedDescription)
+        }
+    }
+
     func testCheckpointSnapshotsAndRestoresTrackedChanges() throws {
         try write("file.txt", "original\n")
         try git(["add", "file.txt"])
@@ -359,6 +401,174 @@ final class GitServiceTests: XCTestCase {
         try write("keep.txt", "dirty\n")
         try GitService(repoRoot: repo).restoreFile(path: "keep.txt")
         XCTAssertEqual(try String(contentsOf: repo.appendingPathComponent("keep.txt"), encoding: .utf8), "one\n")
+    }
+
+    func testAggregateReviewSurfacesSeparateIndexAndWorkingTreeHunks() throws {
+        let original = (1 ... 40).map { "line \($0)" }
+        try FileManager.default.createDirectory(
+            at: repo.appendingPathComponent("Sources", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        try write("Sources/Feature.swift", original.joined(separator: "\n") + "\n")
+        try git(["add", "Sources/Feature.swift"])
+        try git(["commit", "-q", "-m", "base"])
+
+        var staged = original
+        staged[1] = "staged line 2"
+        try write("Sources/Feature.swift", staged.joined(separator: "\n") + "\n")
+        try git(["add", "Sources/Feature.swift"])
+
+        var working = staged
+        working[34] = "unstaged line 35"
+        try write("Sources/Feature.swift", working.joined(separator: "\n") + "\n")
+
+        let reviews = try GitService(repoRoot: repo).reviewSurfaces()
+        XCTAssertEqual(reviews.staged.repoName, repo.lastPathComponent)
+        XCTAssertEqual(reviews.unstaged.repoName, repo.lastPathComponent)
+        XCTAssertEqual(reviews.staged.files.map(\.path), ["Sources/Feature.swift"])
+        XCTAssertEqual(reviews.unstaged.files.map(\.path), ["Sources/Feature.swift"])
+        XCTAssertEqual(reviews.staged.files[0].state, .text)
+        XCTAssertEqual(reviews.unstaged.files[0].state, .text)
+        XCTAssertEqual(reviews.staged.files[0].hunks.count, 1)
+        XCTAssertEqual(reviews.unstaged.files[0].hunks.count, 1)
+        XCTAssertTrue(reviews.staged.files[0].hunks[0].lines.contains("-line 2"))
+        XCTAssertTrue(reviews.staged.files[0].hunks[0].lines.contains("+staged line 2"))
+        XCTAssertTrue(reviews.unstaged.files[0].hunks[0].lines.contains("-line 35"))
+        XCTAssertTrue(reviews.unstaged.files[0].hunks[0].lines.contains("+unstaged line 35"))
+        XCTAssertTrue(
+            reviews.unstaged.files[0].hunks[0].lines.contains(where: { $0.hasPrefix(" line 34") }),
+            "the aggregate surface must retain context, not only changed lines"
+        )
+    }
+
+    func testReviewHunkActionsMoveOnlyTheSelectedHunkAndRestoreOnlyTheOther() throws {
+        let original = (1 ... 40).map { "line \($0)" }
+        try write("review.txt", original.joined(separator: "\n") + "\n")
+        try git(["add", "review.txt"])
+        try git(["commit", "-q", "-m", "base"])
+
+        var working = original
+        working[1] = "changed line 2"
+        working[34] = "changed line 35"
+        try write("review.txt", working.joined(separator: "\n") + "\n")
+
+        let service = GitService(repoRoot: repo)
+        let initial = try XCTUnwrap(service.reviewSurfaces().unstaged.files.first)
+        XCTAssertEqual(initial.hunks.map(\.newStart), [1, 32])
+
+        try service.applyReviewAction(.stage, to: initial.hunks[0])
+        var reviews = try service.reviewSurfaces()
+        XCTAssertEqual(reviews.staged.files.first?.hunks.map(\.newStart), [1])
+        XCTAssertEqual(reviews.unstaged.files.first?.hunks.map(\.newStart), [32])
+
+        let remaining = try XCTUnwrap(reviews.unstaged.files.first?.hunks.first)
+        try service.applyReviewAction(.restore, to: remaining)
+        let afterRestore = try String(contentsOf: repo.appendingPathComponent("review.txt"), encoding: .utf8)
+        XCTAssertTrue(afterRestore.contains("changed line 2"))
+        XCTAssertTrue(afterRestore.contains("line 35"))
+        XCTAssertFalse(afterRestore.contains("changed line 35"))
+
+        reviews = try service.reviewSurfaces()
+        let stagedHunk = try XCTUnwrap(reviews.staged.files.first?.hunks.first)
+        XCTAssertThrowsError(try service.applyReviewAction(.stage, to: stagedHunk))
+        try service.applyReviewAction(.unstage, to: stagedHunk)
+        reviews = try service.reviewSurfaces()
+        XCTAssertTrue(reviews.staged.files.isEmpty)
+        XCTAssertEqual(reviews.unstaged.files.first?.hunks.map(\.newStart), [1])
+    }
+
+    func testReviewParserKeepsSpecialEntriesTruthfulAndNonHunkActionable() throws {
+        let patch = """
+        diff --git a/image.bin b/image.bin
+        index 1111111..2222222 100644
+        Binary files a/image.bin and b/image.bin differ
+        diff --git a/old.txt b/new.txt
+        similarity index 100%
+        rename from old.txt
+        rename to new.txt
+        diff --cc conflict.txt
+        index 1111111,2222222..3333333
+        --- a/conflict.txt
+        +++ b/conflict.txt
+        @@@ -1,1 -1,1 +1,1 @@@
+        -ours
+         theirs
+        diff --git a/vendor/lib b/vendor/lib
+        index 1111111..2222222 160000
+        --- a/vendor/lib
+        +++ b/vendor/lib
+        @@ -1 +1 @@
+        -Subproject commit 1111111111111111111111111111111111111111
+        +Subproject commit 2222222222222222222222222222222222222222
+        diff --git a/ordinary.txt b/ordinary.txt
+        index 1111111..2222222 100644
+        --- a/ordinary.txt
+        +++ b/ordinary.txt
+        @@ -1 +1 @@
+        -old
+        +new
+        """
+        let surface = GitService.parseReviewSurface(
+            repoName: "Widget",
+            kind: .unstaged,
+            patch: patch,
+            entries: [
+                .init(path: "image.bin", code: "M"),
+                .init(path: "new.txt", code: "R", originalPath: "old.txt"),
+                .init(path: "conflict.txt", code: "U"),
+                .init(path: "vendor/lib", code: "M"),
+                .init(path: "ordinary.txt", code: "M"),
+            ],
+            untracked: ["new file.txt"]
+        )
+
+        XCTAssertEqual(surface.files.map(\.state), [
+            .binary,
+            .renamed(from: "old.txt"),
+            .conflicted,
+            .submodule,
+            .text,
+            .untracked,
+        ])
+        XCTAssertTrue(surface.files[0].hunks.isEmpty)
+        XCTAssertTrue(surface.files[1].hunks.isEmpty)
+        XCTAssertTrue(surface.files[2].hunks.isEmpty)
+        XCTAssertTrue(surface.files[3].hunks.isEmpty)
+        XCTAssertEqual(surface.files[4].hunks.count, 1)
+        XCTAssertTrue(surface.files[5].hunks.isEmpty)
+        XCTAssertEqual(surface.files[1].state.summary, "Renamed from old.txt")
+        XCTAssertEqual(surface.files[2].state.summary, "Resolve the conflict before reviewing hunks")
+    }
+
+    func testWholeRenameActionStagesAndUnstagesBothPathsAtomically() throws {
+        try write("old name.txt", "rename me\n")
+        try git(["add", "old name.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        try git(["mv", "old name.txt", "new name.txt"])
+
+        let service = GitService(repoRoot: repo)
+        var reviews = try service.reviewSurfaces()
+        let stagedRename = try XCTUnwrap(reviews.staged.files.first { $0.path == "new name.txt" })
+        XCTAssertEqual(stagedRename.originalPath, "old name.txt")
+        XCTAssertEqual(stagedRename.state, .renamed(from: "old name.txt"))
+        XCTAssertTrue(reviews.unstaged.files.isEmpty)
+
+        try service.applyReviewAction(.unstage, to: stagedRename)
+        reviews = try service.reviewSurfaces()
+        XCTAssertTrue(reviews.staged.files.isEmpty)
+        XCTAssertEqual(reviews.unstaged.files.first { $0.path == "old name.txt" }?.code, "D")
+        XCTAssertEqual(reviews.unstaged.files.first { $0.path == "new name.txt" }?.state, .untracked)
+
+        // An index-free worktree represents a rename as a deletion plus an
+        // untracked destination. The retained review row still owns both exact
+        // paths, so its stage action restores the single renamed index entry.
+        try service.applyReviewAction(.stage, to: stagedRename)
+        reviews = try service.reviewSurfaces()
+        XCTAssertTrue(reviews.unstaged.files.isEmpty)
+        XCTAssertEqual(
+            reviews.staged.files.first { $0.path == "new name.txt" }?.state,
+            .renamed(from: "old name.txt")
+        )
     }
 
     func testWorktreeAddDiffRemoveLifecycle() throws {

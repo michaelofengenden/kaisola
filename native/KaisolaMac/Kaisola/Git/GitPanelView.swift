@@ -2,6 +2,397 @@ import AppKit
 import Combine
 import SwiftUI
 
+enum GitReviewAccessibility {
+    static func fileLabel(repoName: String, file: GitService.ReviewFile) -> String {
+        let status: String
+        switch (file.code, file.state) {
+        case ("M", .text): status = "Modified text file"
+        case ("A", .text): status = "Added text file"
+        case ("D", .text): status = "Deleted text file"
+        case (_, .text): status = "Text file"
+        default: status = file.state.summary
+        }
+        let count = file.hunks.count
+        return "\(repoName) repository, \(file.path), \(status), \(count) \(count == 1 ? "hunk" : "hunks")"
+    }
+
+    static func hunkLabel(
+        repoName: String,
+        file: GitService.ReviewFile,
+        hunk: GitService.ReviewHunk
+    ) -> String {
+        let heading = hunk.sectionHeading.isEmpty ? "" : ", \(hunk.sectionHeading)"
+        return "\(repoName) repository, \(file.path), hunk at new line \(hunk.newStart)\(heading)"
+    }
+}
+
+enum GitReviewNavigation {
+    /// Stable file/hunk identities let SwiftUI retain the visible position when
+    /// both review surfaces refresh. If the acted-on hunk vanished, keep its
+    /// file at the top; if that file moved to the other surface, use the next
+    /// available file instead of jumping to an arbitrary offset.
+    static func reconciledAnchor(previous: String?, surface: GitService.ReviewSurface) -> String? {
+        guard let first = surface.files.first else { return nil }
+        guard let previous else { return first.anchorID }
+        if surface.files.contains(where: { $0.anchorID == previous }) { return previous }
+        if surface.files.contains(where: { file in file.hunks.contains(where: { $0.anchorID == previous }) }) {
+            return previous
+        }
+        if let file = surface.files.first(where: {
+            previous.hasPrefix("hunk:\(surface.kind.rawValue):\($0.path):")
+        }) {
+            return file.anchorID
+        }
+        return first.anchorID
+    }
+}
+
+enum GitReviewCapabilities {
+    static func fileActions(
+        kind: GitService.ReviewKind,
+        state: GitService.ReviewFileState
+    ) -> [GitService.ReviewAction] {
+        if kind == .staged { return [.unstage] }
+        switch state {
+        case .text, .binary, .submodule, .noTextualChanges: return [.restore, .stage]
+        case .renamed, .conflicted, .untracked: return [.stage]
+        }
+    }
+}
+
+struct GitAgentReviewFinding: Codable, Equatable, Identifiable, Sendable {
+    enum Severity: String, Codable, CaseIterable, Sendable {
+        case error
+        case warning
+        case note
+    }
+
+    let severity: Severity
+    let path: String
+    let line: Int
+    let message: String
+
+    var id: String { "\(severity.rawValue):\(path):\(line):\(message)" }
+}
+
+struct GitAgentReviewInput: Codable, Equatable, Sendable {
+    let diffHash: String
+    let baseDiffHash: String?
+    let files: [GitService.AgentReviewFile]
+    let removedPaths: [String]
+}
+
+struct GitAgentReviewResult: Equatable, Identifiable, Sendable {
+    let agentID: String
+    let agentName: String
+    let diffHash: String
+    let baseDiffHash: String?
+    let findings: [GitAgentReviewFinding]
+    let reused: Bool
+
+    var id: String { "\(agentID):\(diffHash)" }
+
+    func markedReused() -> Self {
+        Self(
+            agentID: agentID,
+            agentName: agentName,
+            diffHash: diffHash,
+            baseDiffHash: baseDiffHash,
+            findings: findings,
+            reused: true
+        )
+    }
+}
+
+struct GitAgentReviewResponse: Decodable, Equatable, Sendable {
+    let findings: [GitAgentReviewFinding]
+
+    static func parse(_ text: String, input: GitAgentReviewInput) throws -> Self {
+        guard text.utf8.count <= 64 * 1_024,
+              let first = text.firstIndex(of: "{"),
+              let last = text.lastIndex(of: "}"),
+              first <= last else {
+            throw GitService.GitError.commandFailed("The reviewer returned no bounded JSON result.")
+        }
+        let data = Data(text[first ... last].utf8)
+        let response: Self
+        do {
+            response = try JSONDecoder().decode(Self.self, from: data)
+        } catch {
+            throw GitService.GitError.commandFailed("The reviewer returned malformed findings JSON.")
+        }
+        guard response.findings.count <= 64 else {
+            throw GitService.GitError.commandFailed("The reviewer returned too many findings.")
+        }
+        let allowedPaths = Set(input.files.map(\.path))
+        for finding in response.findings {
+            guard allowedPaths.contains(finding.path), finding.line > 0,
+                  !finding.message.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  finding.message.utf8.count <= 2 * 1_024 else {
+                throw GitService.GitError.commandFailed(
+                    "The reviewer returned a finding without a valid reviewed file and line anchor."
+                )
+            }
+        }
+        return response
+    }
+}
+
+enum GitAgentReviewPrompt {
+    static func render(_ input: GitAgentReviewInput) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let payload = (try? encoder.encode(input)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+        let scope = input.baseDiffHash.map {
+            "Review only the changed-file delta from local diff \($0) to \(input.diffHash)."
+        } ?? "Review the complete local diff \(input.diffHash)."
+        return """
+        Perform a read-only code and security review. Do not edit files, invoke tools, or request permission.
+        \(scope)
+        Report only concrete regressions introduced by this payload. Every finding must name one payload file and a positive line number.
+        Return exactly one JSON object: {"findings":[{"severity":"error|warning|note","path":"relative/path","line":1,"message":"concise finding"}]}
+        Return {"findings":[]} when no actionable regression is present.
+
+        REVIEW_PAYLOAD_JSON
+        \(payload)
+        """
+    }
+}
+
+struct GitAgentReviewStore: Sendable {
+    enum Plan: Equatable, Sendable {
+        case reuse(GitAgentReviewResult)
+        case run(GitAgentReviewInput)
+    }
+
+    private struct Entry: Sendable {
+        let snapshot: GitService.AgentReviewSnapshot
+        let result: GitAgentReviewResult
+    }
+
+    let maximumEntries: Int
+    private var entries: [String: Entry] = [:]
+    private var order: [String] = []
+
+    init(maximumEntries: Int = 16) {
+        self.maximumEntries = max(1, maximumEntries)
+    }
+
+    func plan(
+        agentID: String,
+        snapshot: GitService.AgentReviewSnapshot,
+        deltaOnly: Bool
+    ) -> Plan {
+        let exactKey = key(agentID: agentID, hash: snapshot.hash)
+        if let exact = entries[exactKey] { return .reuse(exact.result) }
+
+        let previous = order.reversed().lazy.compactMap { entries[$0] }
+            .first { $0.result.agentID == agentID }
+        guard deltaOnly, let previous else {
+            return .run(GitAgentReviewInput(
+                diffHash: snapshot.hash,
+                baseDiffHash: nil,
+                files: snapshot.files,
+                removedPaths: []
+            ))
+        }
+
+        let oldFiles = Dictionary(uniqueKeysWithValues: previous.snapshot.files.map { ($0.path, $0) })
+        let newFiles = Dictionary(uniqueKeysWithValues: snapshot.files.map { ($0.path, $0) })
+        let changed = snapshot.files.filter { oldFiles[$0.path] != $0 }
+        let removed = oldFiles.keys.filter { newFiles[$0] == nil }.sorted()
+        return .run(GitAgentReviewInput(
+            diffHash: snapshot.hash,
+            baseDiffHash: previous.snapshot.hash,
+            files: changed,
+            removedPaths: removed
+        ))
+    }
+
+    mutating func record(_ result: GitAgentReviewResult, snapshot: GitService.AgentReviewSnapshot) {
+        let entryKey = key(agentID: result.agentID, hash: snapshot.hash)
+        entries[entryKey] = Entry(snapshot: snapshot, result: result)
+        order.removeAll { $0 == entryKey }
+        order.append(entryKey)
+        while order.count > maximumEntries, let oldest = order.first {
+            order.removeFirst()
+            entries[oldest] = nil
+        }
+    }
+
+    private func key(agentID: String, hash: String) -> String { "\(agentID):\(hash)" }
+}
+
+protocol GitAgentReviewRunning: Sendable {
+    func review(
+        agent: AgentProfile,
+        input: GitAgentReviewInput,
+        environment: [String: String]
+    ) async throws -> [GitAgentReviewFinding]
+}
+
+struct AcpGitAgentReviewRunner: GitAgentReviewRunning {
+    func review(
+        agent: AgentProfile,
+        input: GitAgentReviewInput,
+        environment: [String: String]
+    ) async throws -> [GitAgentReviewFinding] {
+        guard let adapter = AcpAdapter.forAgent(agent.id, environment: environment) else {
+            throw GitService.GitError.commandFailed("\(agent.name) has no configured ACP reviewer adapter.")
+        }
+        let reviewRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-local-review-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: reviewRoot, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: reviewRoot) }
+
+        let launch = try adapter.prepare(environment: environment, cwd: reviewRoot.path)
+        let client = AcpClient()
+        let collector = GitAgentReviewCollector()
+        await client.setEventHandler { event in
+            collector.consume(event)
+            if case let .permission(request) = event {
+                Task { await client.cancelPermission(id: request.id) }
+            }
+        }
+        let readOnlyAccess = AcpAdapterAccess(
+            workspaceRead: false,
+            workspaceWrite: false,
+            network: false,
+            childProcess: false,
+            hostTerminal: false
+        )
+        do {
+            _ = try await client.start(
+                command: launch.command,
+                arguments: launch.arguments,
+                environment: launch.environment,
+                cwd: reviewRoot.path,
+                mcpServers: [],
+                access: readOnlyAccess
+            )
+            try await client.prompt(GitAgentReviewPrompt.render(input))
+            await client.stop()
+            return try GitAgentReviewResponse.parse(collector.text, input: input).findings
+        } catch {
+            await client.stop()
+            throw error
+        }
+    }
+}
+
+private final class GitAgentReviewCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage = ""
+    var text: String { lock.withLock { storage } }
+
+    func consume(_ event: AcpEvent) {
+        guard case let .turnItem(.message(_, text)) = event else { return }
+        lock.withLock {
+            guard storage.utf8.count < 64 * 1_024 else { return }
+            storage.append(text)
+        }
+    }
+}
+
+/// User-facing identity and cancellation truth for one serialized Git command.
+/// Read-only work can be abandoned without changing the repository; mutating
+/// work may have completed an earlier Git step before cancellation is observed.
+struct GitPanelOperation: Equatable, Sendable {
+    enum CancellationPolicy: Equatable, Sendable {
+        case readOnly
+        case completedChangesRemain
+
+        var description: String {
+            switch self {
+            case .readOnly: "Safe to cancel; the repository is unchanged."
+            case .completedChangesRemain: "Cancel stops the command; completed Git changes remain."
+            }
+        }
+
+        var cancellationResult: String {
+            switch self {
+            case .readOnly: "The repository remains unchanged."
+            case .completedChangesRemain: "Completed Git changes remain."
+            }
+        }
+    }
+
+    let name: String
+    let cancellationPolicy: CancellationPolicy
+
+    var cancellationDescription: String { cancellationPolicy.description }
+
+    func accessibilityValue(cancellationRequested: Bool) -> String {
+        if cancellationRequested {
+            return "Canceling \(name). \(cancellationPolicy.cancellationResult)"
+        }
+        return "\(name) in progress. \(cancellationDescription)"
+    }
+
+    static let refresh = readOnly("Refreshing Git status")
+    static let stageAll = mutating("Staging all changes")
+    static let unstageAll = mutating("Unstaging all changes")
+    static let pull = mutating("Pulling latest changes")
+    static let commit = mutating("Committing changes")
+    static let history = readOnly("Loading recent history")
+    static let agentReview = readOnly("Running local agent review")
+    static let preparePullRequest = readOnly("Preparing pull request review")
+    static let createPullRequest = mutating("Pushing and creating pull request")
+
+    static func stage(_ path: String) -> Self { mutating("Staging \(path)") }
+    static func unstage(_ path: String) -> Self { mutating("Unstaging \(path)") }
+    static func diff(_ path: String) -> Self { readOnly("Loading diff for \(path)") }
+    static func restore(_ path: String) -> Self { mutating("Discarding changes to \(path)") }
+    static func review(_ kind: GitService.ReviewKind) -> Self {
+        readOnly("Loading \(kind.title.lowercased()) hunk review")
+    }
+    static func reviewHunk(_ action: GitService.ReviewAction, path: String) -> Self {
+        mutating("\(action.operationVerb) hunk in \(path)")
+    }
+    static func reviewFile(_ action: GitService.ReviewAction, path: String) -> Self {
+        mutating("\(action.operationVerb) \(path)")
+    }
+
+    private static func readOnly(_ name: String) -> Self {
+        .init(name: name, cancellationPolicy: .readOnly)
+    }
+
+    private static func mutating(_ name: String) -> Self {
+        .init(name: name, cancellationPolicy: .completedChangesRemain)
+    }
+}
+
+/// Field-local validity for the editable pull-request review. Kept pure so the
+/// view, confirmation guard, and tests all apply the same rules while a user is
+/// typing instead of discovering them only after pressing Confirm.
+struct GitPRDraftValidation: Equatable, Sendable {
+    let branchMessage: String?
+    let titleMessage: String?
+
+    var isValid: Bool { branchMessage == nil && titleMessage == nil }
+
+    static let valid = GitPRDraftValidation(branchMessage: nil, titleMessage: nil)
+
+    static func evaluate(plan: PRPlan, branch: String, title: String) -> Self {
+        let branchMessage: String?
+        if plan.createsBranch {
+            do {
+                _ = try GitPRPlanner.validatedBranchName(branch)
+                branchMessage = nil
+            } catch {
+                branchMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+        } else {
+            branchMessage = nil
+        }
+
+        let titleMessage = title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? "Enter a title for the pull request."
+            : nil
+        return GitPRDraftValidation(branchMessage: branchMessage, titleMessage: titleMessage)
+    }
+}
+
 /// A compact Git panel: branch + ahead/behind, staged / unstaged / untracked
 /// files with one-click stage/unstage, and a commit box. Backed by GitService
 /// (git as a child process). Operations are serialized so an older status cannot
@@ -26,11 +417,22 @@ final class GitPanelModel: ObservableObject {
     /// the repository, so the banner offers Retry instead of only explaining.
     @Published private(set) var errorIsRetryable = false
     @Published var commitMessage = ""
-    @Published private(set) var isBusy = false
+    @Published private(set) var activeOperation: GitPanelOperation?
+    @Published private(set) var isCancellingOperation = false
+    @Published var reviewKind: GitService.ReviewKind?
+    @Published private(set) var reviewSurfaces: GitService.ReviewSurfaces?
+    @Published var selectedReviewerAgentIDs: Set<String>
+    @Published var reviewDeltaOnly = false
+    @Published private(set) var agentReviewResults: [GitAgentReviewResult] = []
+    var isBusy: Bool { activeOperation != nil }
 
     /// Re-runs exactly the operation the timeout interrupted. Nil unless the
     /// last failure was retryable.
     private var retryOperation: (() -> Void)?
+    /// Type-erased cancellation for the current generic worker Task. The Git
+    /// process capture notices cancellation within 50 ms and stops the complete
+    /// process group (including hooks and credential helpers).
+    private var cancelActiveWork: (() -> Void)?
 
     /// One-click PR state: the current branch's push/PR readiness, plus the
     /// result of the last Create-PR run (a PR or compare URL, and a status note).
@@ -56,6 +458,33 @@ final class GitPanelModel: ObservableObject {
     @Published var prBranchDraft = "kaisola/pr-branch"
     @Published var prTitleDraft = ""
     @Published var prBodyDraft = ""
+
+    var prDraftValidation: GitPRDraftValidation? {
+        guard let prPlan else { return nil }
+        return .evaluate(plan: prPlan, branch: prBranchDraft, title: prTitleDraft)
+    }
+
+    var canConfirmPR: Bool {
+        guard let plan = prPlan, let validation = prDraftValidation else { return false }
+        return !isBusy
+            && !prPlanStale
+            && plan.destination.isReadyForPullRequest
+            && validation.isValid
+    }
+
+    var prConfirmationHelp: String {
+        if isBusy { return "Wait for the current Git operation to finish." }
+        if prPlanStale { return "Review the pull request again because the repository changed." }
+        guard let plan = prPlan, let validation = prDraftValidation else {
+            return "Review the pull request before confirming."
+        }
+        if !plan.destination.isReadyForPullRequest {
+            return "Add a web origin remote, then review the pull request again."
+        }
+        if let branchMessage = validation.branchMessage { return branchMessage }
+        if let titleMessage = validation.titleMessage { return titleMessage }
+        return "Push the reviewed branch and create the pull request."
+    }
     /// The title/body this model itself last wrote into the drafts above, so
     /// a later re-prepare ("Review Again", once the reviewed plan goes stale)
     /// can tell a user's edit apart from its own previous default and never
@@ -68,6 +497,16 @@ final class GitPanelModel: ObservableObject {
     /// subprocess) so the view can render the fallback note without re-probing.
     let ghAvailable: Bool
     private let service: GitService
+    private let agentReviewRunner: any GitAgentReviewRunning
+    private let onPrefillChat: @MainActor (AgentProfile, String) -> Void
+    private var agentReviewStore = GitAgentReviewStore()
+
+    var availableAgentReviewers: [AgentProfile] {
+        let environment = ProcessInfo.processInfo.environment.merging(
+            NativePreviewSettings.shared.agentEnvironmentOverlay
+        ) { _, configured in configured }
+        return AgentRegistry.all.filter { AcpAdapter.forAgent($0.id, environment: environment) != nil }
+    }
 
     /// Which inline patches are open and whether each represents the index.
     /// Every authoritative refresh recomputes these patches with the status in
@@ -94,10 +533,124 @@ final class GitPanelModel: ObservableObject {
     /// The running decide/wait/refresh loop; nil while idle.
     private var refreshPump: Task<Void, Never>?
 
-    init(repoRoot: URL) {
+    init(
+        repoRoot: URL,
+        agentReviewRunner: any GitAgentReviewRunning = AcpGitAgentReviewRunner(),
+        onPrefillChat: @escaping @MainActor (AgentProfile, String) -> Void = { _, _ in }
+    ) {
         self.repoRoot = repoRoot
         self.service = GitService(repoRoot: repoRoot)
         self.ghAvailable = GitService.ghAvailable()
+        self.agentReviewRunner = agentReviewRunner
+        self.onPrefillChat = onPrefillChat
+        let environment = ProcessInfo.processInfo.environment.merging(
+            NativePreviewSettings.shared.agentEnvironmentOverlay
+        ) { _, configured in configured }
+        let configured = AgentRegistry.all.filter {
+            AcpAdapter.forAgent($0.id, environment: environment) != nil
+        }
+        self.selectedReviewerAgentIDs = Set(configured.prefix(1).map(\.id))
+    }
+
+    func toggleReviewer(_ agentID: String) {
+        if selectedReviewerAgentIDs.contains(agentID) {
+            selectedReviewerAgentIDs.remove(agentID)
+        } else {
+            selectedReviewerAgentIDs.insert(agentID)
+        }
+    }
+
+    func runAgentReview() {
+        guard !isBusy else { return }
+        let selected = availableAgentReviewers.filter { selectedReviewerAgentIDs.contains($0.id) }
+        guard !selected.isEmpty else {
+            errorMessage = "Select at least one configured reviewer agent."
+            errorIsRetryable = false
+            return
+        }
+
+        activeOperation = .agentReview
+        isCancellingOperation = false
+        errorMessage = nil
+        errorIsRetryable = false
+        retryOperation = nil
+        lastActivityAt = Date()
+        let service = self.service
+        let runner = agentReviewRunner
+        let deltaOnly = reviewDeltaOnly
+        let environment = ProcessInfo.processInfo.environment.merging(
+            NativePreviewSettings.shared.agentEnvironmentOverlay
+        ) { _, configured in configured }
+        let snapshotWorker = Task.detached(priority: .userInitiated) {
+            try service.agentReviewSnapshot()
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let snapshot = try await snapshotWorker.value
+                var results: [GitAgentReviewResult] = []
+                for agent in selected {
+                    try Task.checkCancellation()
+                    switch self.agentReviewStore.plan(
+                        agentID: agent.id,
+                        snapshot: snapshot,
+                        deltaOnly: deltaOnly
+                    ) {
+                    case let .reuse(cached):
+                        results.append(cached.markedReused())
+                    case let .run(input):
+                        let findings = try await runner.review(
+                            agent: agent,
+                            input: input,
+                            environment: environment
+                        )
+                        let result = GitAgentReviewResult(
+                            agentID: agent.id,
+                            agentName: agent.name,
+                            diffHash: snapshot.hash,
+                            baseDiffHash: input.baseDiffHash,
+                            findings: findings,
+                            reused: false
+                        )
+                        self.agentReviewStore.record(result, snapshot: snapshot)
+                        results.append(result)
+                    }
+                }
+                self.agentReviewResults = results
+            } catch {
+                if Self.isCancellation(error) {
+                    self.errorMessage = nil
+                    self.errorIsRetryable = false
+                } else {
+                    self.errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                    self.errorIsRetryable = Self.isRetryable(error)
+                    self.retryOperation = self.errorIsRetryable
+                        ? { [weak self] in self?.runAgentReview() }
+                        : nil
+                }
+            }
+            guard self.activeOperation == .agentReview else { return }
+            self.cancelActiveWork = nil
+            self.activeOperation = nil
+            self.isCancellingOperation = false
+        }
+        cancelActiveWork = {
+            snapshotWorker.cancel()
+            task.cancel()
+        }
+    }
+
+    func prefillFollowUp(for result: GitAgentReviewResult) {
+        guard let agent = AgentRegistry.profile(id: result.agentID) else { return }
+        let findings = result.findings.map {
+            "\($0.path):\($0.line) [\($0.severity.rawValue)] \($0.message)"
+        }.joined(separator: "\n")
+        let draft = """
+        Follow up on the local review of diff \(result.diffHash):
+
+        \(findings.isEmpty ? "The review found no actionable regressions; double-check the diff." : findings)
+        """
+        onPrefillChat(agent, draft)
     }
 
     /// Load the current status and start following the repository. Idempotent.
@@ -127,6 +680,7 @@ final class GitPanelModel: ObservableObject {
         refreshPump?.cancel()
         refreshPump = nil
         pendingEventAt = nil
+        cancelActiveOperation()
     }
 
     /// A workspace or git-directory change was observed. The first event of a
@@ -164,7 +718,8 @@ final class GitPanelModel: ObservableObject {
 
     func refresh() {
         let requests = diffRequests
-        perform { svc -> GitRefreshSnapshot in
+        let includeReviews = reviewKind != nil
+        perform(.refresh) { svc -> GitRefreshSnapshot in
             let status = try svc.status()
             let livePaths = Set(
                 status.staged.map(\.path)
@@ -181,12 +736,14 @@ final class GitPanelModel: ObservableObject {
                 prep: try? svc.prPrep(),
                 headOID: try? svc.headOID(),
                 destination: svc.prDestination(),
-                diffs: patches
+                diffs: patches,
+                reviews: includeReviews ? try svc.reviewSurfaces(status: status) : nil
             )
         } apply: { snapshot in
             self.status = snapshot.status
             self.prPrepInfo = snapshot.prep
             self.diffs = snapshot.diffs
+            if let reviews = snapshot.reviews { self.reviewSurfaces = reviews }
             self.diffRequests = self.diffRequests.filter { snapshot.diffs[$0.key] != nil }
             // An open review card must not silently outlive the repository it
             // was assembled against: once a background refresh sees the HEAD
@@ -216,25 +773,84 @@ final class GitPanelModel: ObservableObject {
             self.diffs.removeAll()
             self.diffRequests.removeAll()
             self.log.removeAll()
+            if self.reviewKind != nil { self.reviewSurfaces = nil }
         }
     }
 
+    func openReview(_ kind: GitService.ReviewKind) {
+        reviewKind = kind
+        reviewSurfaces = nil
+        loadReviewSurfaces(kind: kind)
+    }
+
+    func closeReview() {
+        reviewKind = nil
+    }
+
+    func loadReviewSurfaces(kind: GitService.ReviewKind? = nil) {
+        let selected = kind ?? reviewKind ?? .unstaged
+        perform(.review(selected)) { service -> GitReviewMutationSnapshot in
+            let status = try service.status()
+            return GitReviewMutationSnapshot(
+                status: status,
+                reviews: try service.reviewSurfaces(status: status)
+            )
+        } apply: { snapshot in
+            self.status = snapshot.status
+            self.reviewSurfaces = snapshot.reviews
+        } onError: { _ in
+            self.reviewSurfaces = nil
+        }
+    }
+
+    func applyReviewHunkAction(_ action: GitService.ReviewAction, hunk: GitService.ReviewHunk) {
+        perform(.reviewHunk(action, path: hunk.path)) { service -> GitReviewMutationSnapshot in
+            try service.applyReviewAction(action, to: hunk)
+            let status = try service.status()
+            return GitReviewMutationSnapshot(
+                status: status,
+                reviews: try service.reviewSurfaces(status: status)
+            )
+        } apply: { snapshot in
+            self.applyReviewMutation(snapshot, path: hunk.path)
+        }
+    }
+
+    func applyReviewFileAction(_ action: GitService.ReviewAction, file: GitService.ReviewFile) {
+        perform(.reviewFile(action, path: file.path)) { service -> GitReviewMutationSnapshot in
+            try service.applyReviewAction(action, to: file)
+            let status = try service.status()
+            return GitReviewMutationSnapshot(
+                status: status,
+                reviews: try service.reviewSurfaces(status: status)
+            )
+        } apply: { snapshot in
+            self.applyReviewMutation(snapshot, path: file.path)
+        }
+    }
+
+    private func applyReviewMutation(_ snapshot: GitReviewMutationSnapshot, path: String) {
+        status = snapshot.status
+        reviewSurfaces = snapshot.reviews
+        closeDiff(path)
+    }
+
     func stage(_ path: String) {
-        perform { try $0.stage(path: path); return try $0.status() } apply: {
+        perform(.stage(path)) { try $0.stage(path: path); return try $0.status() } apply: {
             self.status = $0
             self.closeDiff(path)
         }
     }
 
     func unstage(_ path: String) {
-        perform { try $0.unstage(path: path); return try $0.status() } apply: {
+        perform(.unstage(path)) { try $0.unstage(path: path); return try $0.status() } apply: {
             self.status = $0
             self.closeDiff(path)
         }
     }
 
     func stageAll() {
-        perform { try $0.stageAll(); return try $0.status() } apply: {
+        perform(.stageAll) { try $0.stageAll(); return try $0.status() } apply: {
             self.status = $0
             self.diffs.removeAll()
             self.diffRequests.removeAll()
@@ -242,7 +858,7 @@ final class GitPanelModel: ObservableObject {
     }
 
     func unstageAll() {
-        perform { try $0.unstageAll(); return try $0.status() } apply: {
+        perform(.unstageAll) { try $0.unstageAll(); return try $0.status() } apply: {
             self.status = $0
             self.diffs.removeAll()
             self.diffRequests.removeAll()
@@ -266,7 +882,7 @@ final class GitPanelModel: ObservableObject {
 
     func pull() {
         guard canPull else { return }
-        perform { service in
+        perform(.pull) { service in
             let changed = try service.pullFastForward()
             return GitPullOutcome(
                 changed: changed,
@@ -310,7 +926,7 @@ final class GitPanelModel: ObservableObject {
     func commit() {
         guard canCommit else { return }
         let message = commitMessage
-        perform { (try $0.commit(message: message), try $0.status(), try? $0.prPrep()) } apply: {
+        perform(.commit) { (try $0.commit(message: message), try $0.status(), try? $0.prPrep()) } apply: {
             self.status = $0.1
             self.prPrepInfo = $0.2
             self.commitMessage = ""
@@ -333,7 +949,7 @@ final class GitPanelModel: ObservableObject {
             return
         }
         diffRequests[path] = staged
-        perform { try $0.diff(path: path, staged: staged) } apply: { patch in
+        perform(.diff(path)) { try $0.diff(path: path, staged: staged) } apply: { patch in
             guard self.diffRequests[path] == staged else { return }
             self.diffs[path] = patch.isEmpty ? "No changes." : patch
         } onError: { _ in
@@ -342,12 +958,12 @@ final class GitPanelModel: ObservableObject {
     }
 
     func loadLog() {
-        perform { try $0.log(limit: 10) } apply: { self.log = $0 }
+        perform(.history) { try $0.log(limit: 10) } apply: { self.log = $0 }
     }
 
     /// Discard unstaged changes to a file (destructive; confirmed by the view).
     func restore(_ path: String) {
-        perform { try $0.restoreFile(path: path); return try $0.status() } apply: {
+        perform(.restore(path)) { try $0.restoreFile(path: path); return try $0.status() } apply: {
             self.status = $0
             self.closeDiff(path)
         }
@@ -362,7 +978,7 @@ final class GitPanelModel: ObservableObject {
         prState = nil
         prURL = nil
         let requested = prBranchDraft
-        perform { service -> PRPlan in
+        perform(.preparePullRequest) { service -> PRPlan in
             let destination = service.prDestination()
             let changedFiles = try service.aheadChangedFiles()
             return try GitPRPlanner.assemble(
@@ -426,7 +1042,7 @@ final class GitPanelModel: ObservableObject {
     /// run resumes at the first phase that has not happened yet: a `gh` failure
     /// costs one more `gh` call, not a duplicate branch or a redundant push.
     func confirmPR() {
-        guard let reviewed = prPlan else { return }
+        guard let reviewed = prPlan, prDraftValidation?.isValid == true else { return }
         // An attempt that already forked the branch is standing on it, so its
         // name is settled — pin the draft to it rather than let a field the user
         // was still editing rename the head `gh` is told about.
@@ -447,7 +1063,7 @@ final class GitPanelModel: ObservableObject {
         prState = nil
         prURL = nil
         let resumed = prProgress
-        perform { service -> PROutcome in
+        perform(.createPullRequest) { service -> PROutcome in
             var progress = resumed
             if let stale = GitPRPlanner.stalenessMessage(
                 plan: plan,
@@ -556,12 +1172,14 @@ final class GitPanelModel: ObservableObject {
     /// Sendable result back on the main actor. GitService and Status are
     /// Sendable, so nothing unsafe crosses the boundary.
     private func perform<T: Sendable>(
+        _ operation: GitPanelOperation,
         _ work: @escaping @Sendable (GitService) throws -> T,
         apply: @escaping @MainActor (T) -> Void,
         onError: (@MainActor (any Error) -> Void)? = nil
     ) {
         guard !isBusy else { return }
-        isBusy = true
+        activeOperation = operation
+        isCancellingOperation = false
         errorMessage = nil
         errorIsRetryable = false
         retryOperation = nil
@@ -570,23 +1188,59 @@ final class GitPanelModel: ObservableObject {
         // git twice in the same window.
         lastActivityAt = Date()
         let service = self.service
-        Task {
-            do {
-                let value = try await Task.detached { try work(service) }.value
+        let worker = Task.detached(priority: .userInitiated) { try work(service) }
+        cancelActiveWork = { worker.cancel() }
+        Task { @MainActor [weak self] in
+            let result = await worker.result
+            guard let self, self.activeOperation == operation else { return }
+            self.cancelActiveWork = nil
+            var refreshAfterCancellation = false
+            defer {
+                self.activeOperation = nil
+                self.isCancellingOperation = false
+                if refreshAfterCancellation { self.refresh() }
+            }
+            switch result {
+            case let .success(value):
                 apply(value)
-                isBusy = false
-            } catch {
+            case let .failure(error):
+                if Self.isCancellation(error) {
+                    // Cancel is a requested outcome, not a red failure banner.
+                    // Mutating operation copy already warned that any completed
+                    // Git steps remain; the next refresh reports their truth.
+                    self.errorMessage = nil
+                    self.errorIsRetryable = false
+                    self.retryOperation = nil
+                    refreshAfterCancellation = operation.cancellationPolicy == .completedChangesRemain
+                    return
+                }
                 onError?(error)
-                errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                errorIsRetryable = Self.isRetryable(error)
+                self.errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                self.errorIsRetryable = Self.isRetryable(error)
                 // Hold the same closures, so Retry re-runs this operation
                 // rather than falling back to a generic refresh.
-                retryOperation = errorIsRetryable
-                    ? { [weak self] in self?.perform(work, apply: apply, onError: onError) }
+                self.retryOperation = self.errorIsRetryable
+                    ? { [weak self] in self?.perform(operation, work, apply: apply, onError: onError) }
                     : nil
-                isBusy = false
             }
         }
+    }
+
+    /// Stop the exact worker shown in the progress banner. `GitProcessCapture`
+    /// owns process-group termination, so a hook/helper cannot outlive the
+    /// canceled operation. The banner stays visible as “Canceling” until the
+    /// worker acknowledges the request and the model clears it.
+    func cancelActiveOperation() {
+        guard activeOperation != nil, let cancelActiveWork else { return }
+        isCancellingOperation = true
+        self.cancelActiveWork = nil
+        cancelActiveWork()
+    }
+
+    nonisolated static func isCancellation(_ error: any Error) -> Bool {
+        if error is CancellationError { return true }
+        guard let gitError = error as? GitService.GitError else { return false }
+        return gitError == .cancelled
     }
 
     /// Whether a failed operation is worth offering again. Pulled out as a pure
@@ -615,6 +1269,12 @@ private struct GitRefreshSnapshot: Sendable {
     let headOID: String?
     let destination: GitService.PRDestination
     let diffs: [String: String]
+    let reviews: GitService.ReviewSurfaces?
+}
+
+private struct GitReviewMutationSnapshot: Sendable {
+    let status: GitService.Status
+    let reviews: GitService.ReviewSurfaces
 }
 
 private struct GitPullOutcome: Sendable {
@@ -640,16 +1300,27 @@ private enum PRResult: Sendable {
 
 struct GitPanelView: View {
     @StateObject private var model: GitPanelModel
-    @State private var restoreCandidate: String?
+    @State private var restoreCandidate: GitDiscardCandidate?
+    @State private var showAgentReview = false
 
-    init(repoRoot: URL) {
-        _model = StateObject(wrappedValue: GitPanelModel(repoRoot: repoRoot))
+    init(
+        repoRoot: URL,
+        onPrefillChat: @escaping @MainActor (AgentProfile, String) -> Void = { _, _ in }
+    ) {
+        _model = StateObject(wrappedValue: GitPanelModel(
+            repoRoot: repoRoot,
+            onPrefillChat: onPrefillChat
+        ))
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
+            if let operation = model.activeOperation {
+                operationBanner(operation)
+                Divider()
+            }
             // An error shows as a banner ABOVE the content — it must never
             // replace the staged/unstaged lists, commit box, and PR section
             // (a transient op failure would otherwise blank the whole panel
@@ -711,13 +1382,64 @@ struct GitPanelView: View {
             isPresented: Binding(get: { restoreCandidate != nil }, set: { if !$0 { restoreCandidate = nil } })
         ) {
             Button("Discard Changes", role: .destructive) {
-                if let restoreCandidate { model.restore(restoreCandidate) }
+                if let restoreCandidate { model.restore(restoreCandidate.path) }
                 restoreCandidate = nil
             }
             Button("Cancel", role: .cancel) { restoreCandidate = nil }
         } message: {
-            Text("Unstaged changes to \((restoreCandidate as NSString?)?.lastPathComponent ?? "this file") are discarded permanently (git restore).")
+            Text(
+                restoreCandidate.map {
+                    GitDiscardConfirmation.message(path: $0.path, code: $0.code)
+                } ?? "These changes will be discarded permanently (git restore)."
+            )
+            .textSelection(.enabled)
+            .fixedSize(horizontal: false, vertical: true)
         }
+        .sheet(item: $model.reviewKind) { kind in
+            GitHunkReviewSheet(model: model, initialKind: kind)
+        }
+        .sheet(isPresented: $showAgentReview) {
+            GitAgentReviewSheet(model: model) { showAgentReview = false }
+        }
+    }
+
+    private func operationBanner(_ operation: GitPanelOperation) -> some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(model.isCancellingOperation ? "Canceling \(operation.name)…" : operation.name)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(operation.cancellationDescription)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Git operation")
+            .accessibilityValue(
+                operation.accessibilityValue(cancellationRequested: model.isCancellingOperation)
+            )
+            .accessibilityIdentifier("git.operation")
+            Button(model.isCancellingOperation ? "Canceling…" : "Cancel") {
+                model.cancelActiveOperation()
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+            .disabled(model.isCancellingOperation)
+            .accessibilityLabel(model.isCancellingOperation ? "Canceling Git operation" : "Cancel Git operation")
+            .accessibilityHint(operation.cancellationDescription)
+            .accessibilityIdentifier("git.operation.cancel")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.accentColor.opacity(0.08))
+        .accessibilityElement(children: .contain)
     }
 
     private var header: some View {
@@ -837,6 +1559,26 @@ struct GitPanelView: View {
                 .accessibilityIdentifier("git.stageAll")
             }
             Spacer()
+            Button {
+                model.openReview(.staged)
+            } label: {
+                Label("Review Staged", systemImage: "rectangle.stack")
+            }
+            .disabled(status.staged.isEmpty)
+            .accessibilityIdentifier("git.review.staged")
+            Button {
+                model.openReview(.unstaged)
+            } label: {
+                Label("Review Unstaged", systemImage: "rectangle.stack.badge.minus")
+            }
+            .disabled(status.unstaged.isEmpty && status.untracked.isEmpty)
+            .accessibilityIdentifier("git.review.unstaged")
+            Button {
+                showAgentReview = true
+            } label: {
+                Label("Agent Review", systemImage: "checklist.checked")
+            }
+            .accessibilityIdentifier("git.review.agent")
             if let summary = GitStatsRendering.summary(status.combinedStats) {
                 Text("Total \(summary)")
                     .foregroundStyle(.kaisolaSecondary)
@@ -952,6 +1694,8 @@ struct GitPanelView: View {
     /// The review itself: nothing here has run yet.
     @ViewBuilder
     private func reviewStage(_ plan: PRPlan) -> some View {
+        let validation = model.prDraftValidation ?? .valid
+
         VStack(alignment: .leading, spacing: 6) {
             if model.prPlanStale {
                 Label("Repository changed — Review again", systemImage: "exclamationmark.arrow.triangle.2.circlepath")
@@ -1082,12 +1826,30 @@ struct GitPanelView: View {
                     .disabled(model.prProgress.createdBranch != nil)
                     .accessibilityIdentifier("git.pr.branch")
                     .accessibilityLabel("Pull request branch name")
+                    .accessibilityHint(
+                        validation.branchMessage ?? "Required branch that will be created when the pull request is confirmed"
+                    )
+                if let branchMessage = validation.branchMessage {
+                    draftFieldError(
+                        branchMessage,
+                        fieldName: "Branch name",
+                        identifier: "git.pr.branch.error"
+                    )
+                }
             }
             TextField("Title", text: $model.prTitleDraft)
                 .textFieldStyle(.roundedBorder)
                 .font(.caption)
                 .accessibilityIdentifier("git.pr.title")
                 .accessibilityLabel("Pull request title")
+                .accessibilityHint(validation.titleMessage ?? "Required pull request title")
+            if let titleMessage = validation.titleMessage {
+                draftFieldError(
+                    titleMessage,
+                    fieldName: "Title",
+                    identifier: "git.pr.title.error"
+                )
+            }
             TextEditor(text: $model.prBodyDraft)
                 .font(.caption)
                 .frame(height: 68)
@@ -1121,12 +1883,10 @@ struct GitPanelView: View {
                     )
                         .font(.caption)
                 }
-                .disabled(
-                    model.isBusy
-                        || model.prPlanStale
-                        || !plan.destination.isReadyForPullRequest
-                )
+                .disabled(!model.canConfirmPR)
                 .accessibilityIdentifier("git.pr.confirm")
+                .accessibilityHint(model.prConfirmationHelp)
+                .help(model.prConfirmationHelp)
                 if model.prPlanStale {
                     Button {
                         model.preparePR()
@@ -1148,6 +1908,15 @@ struct GitPanelView: View {
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("git.pr.reviewStage")
         .accessibilityLabel(model.prPlanStale ? "Pull request review, repository changed, review again" : "Pull request review")
+    }
+
+    private func draftFieldError(_ message: String, fieldName: String, identifier: String) -> some View {
+        Label(message, systemImage: "exclamationmark.circle.fill")
+            .font(.caption2)
+            .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+            .accessibilityElement(children: .ignore)
+            .accessibilityIdentifier(identifier)
+            .accessibilityLabel("\(fieldName) error: \(message)")
     }
 
     private var reviewDisabled: Bool {
@@ -1182,7 +1951,11 @@ struct GitPanelView: View {
             ForEach(files, id: \.0) { path, code in
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 8) {
-                        Text(code).font(.caption.monospaced()).foregroundStyle(color(code)).frame(width: 14)
+                        Text(code)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(color(code))
+                            .frame(width: 14)
+                            .accessibilityHidden(true)
                         Button {
                             model.toggleDiff(path, staged: staged)
                         } label: {
@@ -1196,13 +1969,20 @@ struct GitPanelView: View {
                         .buttonStyle(.plain)
                         .disabled(model.isBusy)
                         .help("Show the diff")
+                        .accessibilityLabel(
+                            GitStatusAccessibility.rowLabel(path: path, code: code, staged: staged)
+                        )
+                        .accessibilityHint("Show the \(staged ? "staged" : "unstaged") diff")
                         Spacer()
                         if restorable {
-                            Button("Discard") { restoreCandidate = path }
+                            Button("Discard") {
+                                restoreCandidate = GitDiscardCandidate(path: path, code: code)
+                            }
                                 .buttonStyle(.borderless)
                                 .font(.caption)
                                 .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
                                 .disabled(model.isBusy)
+                                .accessibilityLabel("Discard unstaged changes to \(path)")
                         }
                         Button(action) { perform(path) }
                             .buttonStyle(.borderless)
@@ -1212,6 +1992,7 @@ struct GitPanelView: View {
                             // re-enable Push & Create PR (double-submit), and
                             // clobber status with a stale snapshot.
                             .disabled(model.isBusy)
+                            .accessibilityLabel("\(action) \(path)")
                     }
                     if let patch = model.diffs[path] {
                         PatchText(patch: patch)
@@ -1230,6 +2011,427 @@ struct GitPanelView: View {
         case "?": .secondary
         default: .primary
         }
+    }
+}
+
+private struct GitAgentReviewSheet: View {
+    @ObservedObject var model: GitPanelModel
+    let dismiss: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Local Agent Review")
+                        .font(.headline)
+                    Text("Snapshots the current local diff. Reviewing never changes or sends the repository.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Done", action: dismiss)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(14)
+            Divider()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    reviewerPicker
+
+                    Toggle("Review only changes since each agent's last result", isOn: $model.reviewDeltaOnly)
+                        .font(.caption)
+                        .disabled(model.isBusy)
+                        .accessibilityIdentifier("git.review.agent.deltaOnly")
+
+                    HStack(spacing: 10) {
+                        if model.activeOperation == .agentReview {
+                            ProgressView().controlSize(.small)
+                            Button("Cancel") { model.cancelActiveOperation() }
+                                .disabled(model.isCancellingOperation)
+                                .accessibilityIdentifier("git.review.agent.cancel")
+                        } else {
+                            Button {
+                                model.runAgentReview()
+                            } label: {
+                                Label("Run Review", systemImage: "play.fill")
+                            }
+                            .disabled(model.isBusy || model.selectedReviewerAgentIDs.isEmpty)
+                            .accessibilityIdentifier("git.review.agent.run")
+                        }
+                    }
+
+                    if let error = model.errorMessage {
+                        Label(error, systemImage: "exclamationmark.triangle")
+                            .font(.caption)
+                            .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                            .textSelection(.enabled)
+                    }
+
+                    ForEach(model.agentReviewResults) { result in
+                        resultCard(result)
+                    }
+                }
+                .padding(16)
+            }
+        }
+        .frame(width: 620, height: 540)
+    }
+
+    @ViewBuilder
+    private var reviewerPicker: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Configured reviewers")
+                .font(.subheadline.weight(.semibold))
+            if model.availableAgentReviewers.isEmpty {
+                Label("No configured ACP reviewer agents are available.", systemImage: "exclamationmark.triangle")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(model.availableAgentReviewers) { agent in
+                    Toggle(isOn: Binding(
+                        get: { model.selectedReviewerAgentIDs.contains(agent.id) },
+                        set: { _ in model.toggleReviewer(agent.id) }
+                    )) {
+                        Label(agent.name, systemImage: agent.symbol)
+                    }
+                    .toggleStyle(.checkbox)
+                    .disabled(model.isBusy)
+                    .accessibilityIdentifier("git.review.agent.reviewer.\(agent.id)")
+                }
+            }
+        }
+    }
+
+    private func resultCard(_ result: GitAgentReviewResult) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(result.agentName)
+                    .font(.subheadline.weight(.semibold))
+                Text(String(result.diffHash.prefix(12)))
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button("Follow up in Chat") { model.prefillFollowUp(for: result) }
+                    .font(.caption)
+                    .buttonStyle(.borderless)
+            }
+
+            if result.reused {
+                Label("Reused the result for this unchanged diff", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else if let base = result.baseDiffHash {
+                Text("Reviewed only changed files since \(base.prefix(12)).")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            if result.findings.isEmpty {
+                Label("No actionable regressions", systemImage: "checkmark.circle")
+                    .font(.caption)
+                    .foregroundStyle(KaisolaStatusTone.done.foregroundColor)
+            } else {
+                ForEach(result.findings) { finding in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: finding.severity == .error ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
+                            .foregroundStyle(
+                                finding.severity == .error
+                                    ? KaisolaStatusTone.failed.foregroundColor
+                                    : KaisolaStatusTone.needsYou.foregroundColor
+                            )
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("\(finding.path):\(finding.line)")
+                                .font(.caption.monospaced().weight(.semibold))
+                                .textSelection(.enabled)
+                            Text(finding.message)
+                                .font(.caption)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                    .accessibilityLabel(
+                        "\(finding.severity.rawValue), \(finding.path), line \(finding.line), \(finding.message)"
+                    )
+                }
+            }
+        }
+        .padding(12)
+        .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary))
+    }
+}
+
+private struct GitHunkReviewSheet: View {
+    @ObservedObject var model: GitPanelModel
+    let initialKind: GitService.ReviewKind
+    @State private var selectedKind: GitService.ReviewKind
+    @State private var scrollAnchor: String?
+    @State private var restoreTarget: GitReviewRestoreTarget?
+
+    init(model: GitPanelModel, initialKind: GitService.ReviewKind) {
+        self.model = model
+        self.initialKind = initialKind
+        _selectedKind = State(initialValue: initialKind)
+    }
+
+    private var surface: GitService.ReviewSurface? {
+        model.reviewSurfaces.map { $0[selectedKind] }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 12) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Git Hunk Review")
+                        .font(.headline)
+                    if let surface {
+                        Text("\(surface.repoName) · \(surface.files.count) files · \(surface.hunkCount) hunks")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                Picker("Review surface", selection: $selectedKind) {
+                    ForEach(GitService.ReviewKind.allCases) { kind in
+                        Text(kind.title).tag(kind)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .frame(width: 220)
+                .accessibilityIdentifier("git.review.surface")
+                Button("Close") { model.closeReview() }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(14)
+            Divider()
+
+            if let error = model.errorMessage, surface == nil {
+                ContentUnavailableView(
+                    "Review unavailable",
+                    systemImage: "exclamationmark.triangle",
+                    description: Text(error)
+                )
+            } else if let surface {
+                review(surface)
+            } else {
+                ProgressView("Loading \(selectedKind.title.lowercased()) changes…")
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+        .frame(minWidth: 720, idealWidth: 900, minHeight: 520, idealHeight: 700)
+        .overlay(alignment: .topTrailing) {
+            if model.isBusy {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(12)
+                    .accessibilityLabel(model.activeOperation?.name ?? "Git operation in progress")
+            }
+        }
+        .onAppear {
+            selectedKind = initialKind
+            if let surface { scrollAnchor = GitReviewNavigation.reconciledAnchor(previous: nil, surface: surface) }
+        }
+        .onChange(of: selectedKind) { _, _ in
+            if let surface { scrollAnchor = GitReviewNavigation.reconciledAnchor(previous: nil, surface: surface) }
+        }
+        .onChange(of: model.reviewSurfaces) { _, _ in
+            if let surface {
+                scrollAnchor = GitReviewNavigation.reconciledAnchor(previous: scrollAnchor, surface: surface)
+            }
+        }
+        .confirmationDialog(
+            "Discard selected changes?",
+            isPresented: Binding(get: { restoreTarget != nil }, set: { if !$0 { restoreTarget = nil } })
+        ) {
+            Button("Discard Changes", role: .destructive) {
+                guard let target = restoreTarget else { return }
+                switch target {
+                case let .file(file): model.applyReviewFileAction(.restore, file: file)
+                case let .hunk(hunk): model.applyReviewHunkAction(.restore, hunk: hunk)
+                }
+                restoreTarget = nil
+            }
+            Button("Cancel", role: .cancel) { restoreTarget = nil }
+        } message: {
+            Text(restoreTarget?.message ?? "The selected unstaged changes will be discarded permanently.")
+                .textSelection(.enabled)
+        }
+    }
+
+    private func review(_ surface: GitService.ReviewSurface) -> some View {
+        Group {
+            if surface.files.isEmpty {
+                ContentUnavailableView(
+                    "No \(surface.kind.title.lowercased()) changes",
+                    systemImage: "checkmark.seal"
+                )
+            } else {
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 14) {
+                        ForEach(surface.files) { file in
+                            reviewFile(surface: surface, file: file)
+                        }
+                    }
+                    .padding(14)
+                    .scrollTargetLayout()
+                }
+                .scrollPosition(id: $scrollAnchor, anchor: .top)
+                .scrollBounceBehavior(.basedOnSize)
+            }
+        }
+    }
+
+    private func reviewFile(
+        surface: GitService.ReviewSurface,
+        file: GitService.ReviewFile
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(file.code)
+                    .font(.caption.monospaced().weight(.bold))
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(surface.repoName) / \(file.path)")
+                        .font(.subheadline.monospaced().weight(.semibold))
+                        .textSelection(.enabled)
+                    if file.state != .text {
+                        Text(file.state.summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                Spacer()
+                reviewFileActions(surface: surface, file: file)
+            }
+            .id(file.anchorID)
+            .focusable()
+            .accessibilityElement(children: .contain)
+            .accessibilityLabel(GitReviewAccessibility.fileLabel(repoName: surface.repoName, file: file))
+
+            ForEach(file.hunks) { hunk in
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("\(surface.repoName) / \(file.path)")
+                                .font(.caption2.monospaced())
+                                .foregroundStyle(.secondary)
+                            Text(hunk.header)
+                                .font(.caption.monospaced().weight(.semibold))
+                                .textSelection(.enabled)
+                        }
+                        Spacer()
+                        reviewHunkActions(hunk)
+                    }
+                    PatchText(patch: hunk.displayPatch)
+                }
+                .padding(8)
+                .background(.quaternary.opacity(0.25), in: RoundedRectangle(cornerRadius: 8))
+                .id(hunk.anchorID)
+                .focusable()
+                .accessibilityElement(children: .contain)
+                .accessibilityLabel(
+                    GitReviewAccessibility.hunkLabel(repoName: surface.repoName, file: file, hunk: hunk)
+                )
+            }
+        }
+        .padding(10)
+        .background(.background, in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary))
+    }
+
+    @ViewBuilder
+    private func reviewFileActions(
+        surface: GitService.ReviewSurface,
+        file: GitService.ReviewFile
+    ) -> some View {
+        if surface.kind == .staged {
+            Button("Unstage File") { model.applyReviewFileAction(.unstage, file: file) }
+                .accessibilityLabel("Unstage \(file.path) from \(surface.repoName)")
+                .disabled(model.isBusy)
+        } else {
+            if GitReviewCapabilities.fileActions(kind: surface.kind, state: file.state).contains(.restore) {
+                Button("Discard File") { restoreTarget = .file(file) }
+                    .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                    .accessibilityLabel("Discard unstaged changes to \(file.path) in \(surface.repoName)")
+                    .disabled(model.isBusy)
+            }
+            Button("Stage File") { model.applyReviewFileAction(.stage, file: file) }
+                .accessibilityLabel("Stage \(file.path) from \(surface.repoName)")
+                .disabled(model.isBusy)
+        }
+    }
+
+    @ViewBuilder
+    private func reviewHunkActions(_ hunk: GitService.ReviewHunk) -> some View {
+        if hunk.kind == .staged {
+            Button("Unstage Hunk") { model.applyReviewHunkAction(.unstage, hunk: hunk) }
+                .accessibilityLabel("Unstage hunk in \(hunk.path)")
+                .disabled(model.isBusy)
+        } else {
+            Button("Discard Hunk") { restoreTarget = .hunk(hunk) }
+                .foregroundStyle(KaisolaStatusTone.failed.foregroundColor)
+                .accessibilityLabel("Discard unstaged hunk in \(hunk.path)")
+                .disabled(model.isBusy)
+            Button("Stage Hunk") { model.applyReviewHunkAction(.stage, hunk: hunk) }
+                .accessibilityLabel("Stage hunk in \(hunk.path)")
+                .disabled(model.isBusy)
+        }
+    }
+}
+
+private enum GitReviewRestoreTarget: Equatable {
+    case file(GitService.ReviewFile)
+    case hunk(GitService.ReviewHunk)
+
+    var message: String {
+        switch self {
+        case let .file(file): "All unstaged changes to \(file.path) will be discarded permanently (git restore)."
+        case let .hunk(hunk): "Only the selected hunk in \(hunk.path) will be discarded permanently."
+        }
+    }
+}
+
+private struct GitDiscardCandidate: Equatable {
+    let path: String
+    let code: String
+}
+
+enum GitStatusAccessibility {
+    /// Expand porcelain-v2's compact status codes without changing the visual
+    /// row. Unknown codes stay inspectable instead of being announced as an
+    /// unexplained letter.
+    static func statusName(for code: String) -> String {
+        switch code {
+        case "M": "Modified"
+        case "A": "Added"
+        case "D": "Deleted"
+        case "?": "Untracked"
+        case "R": "Renamed"
+        case "C": "Copied"
+        case "T": "Type changed"
+        case "U": "Unmerged"
+        case "": "Unknown Git status"
+        default: "Git status \(code)"
+        }
+    }
+
+    /// The filename button is the row's primary accessible element. Include
+    /// the complete relative path and index context so equal basenames and a
+    /// partially staged file remain unambiguous to VoiceOver.
+    static func rowLabel(path: String, code: String, staged: Bool) -> String {
+        "\(statusName(for: code)), \(staged ? "staged" : "unstaged"), \(path)"
+    }
+}
+
+enum GitDiscardConfirmation {
+    /// A destructive restore must identify both the status category and the
+    /// complete project-relative path. Keeping the path verbatim makes files
+    /// with equal basenames distinguishable and leaves long paths selectable.
+    static func message(path: String, code: String) -> String {
+        "\(GitStatusAccessibility.statusName(for: code)) unstaged changes to \(path) "
+            + "will be discarded permanently (git restore)."
     }
 }
 

@@ -28,10 +28,164 @@ final class GitPanelModelTests: XCTestCase {
         try? FileManager.default.removeItem(at: repo)
     }
 
+    func testAgentReviewStoreReusesExactHashAndBuildsOnlyChangedFileDelta() throws {
+        let first = GitService.AgentReviewSnapshot(
+            headOID: String(repeating: "a", count: 40),
+            files: [
+                .init(path: "A.swift", stagedPatch: "A1", unstagedPatch: "", untrackedText: nil),
+                .init(path: "B.swift", stagedPatch: "B1", unstagedPatch: "", untrackedText: nil),
+            ]
+        )
+        let result = GitAgentReviewResult(
+            agentID: "codex",
+            agentName: "Codex",
+            diffHash: first.hash,
+            baseDiffHash: nil,
+            findings: [.init(severity: .warning, path: "A.swift", line: 1, message: "Check A")],
+            reused: false
+        )
+        var store = GitAgentReviewStore(maximumEntries: 4)
+        store.record(result, snapshot: first)
+
+        XCTAssertEqual(store.plan(agentID: "codex", snapshot: first, deltaOnly: false), .reuse(result))
+
+        let second = GitService.AgentReviewSnapshot(
+            headOID: first.headOID,
+            files: [
+                first.files[0],
+                .init(path: "B.swift", stagedPatch: "B2", unstagedPatch: "", untrackedText: nil),
+                .init(path: "C.swift", stagedPatch: "", unstagedPatch: "", untrackedText: "new\n"),
+            ]
+        )
+        guard case let .run(input) = store.plan(agentID: "codex", snapshot: second, deltaOnly: true) else {
+            return XCTFail("a changed diff should run")
+        }
+        XCTAssertEqual(input.baseDiffHash, first.hash)
+        XCTAssertEqual(input.files.map(\.path), ["B.swift", "C.swift"])
+        XCTAssertEqual(input.removedPaths, [])
+    }
+
+    func testAgentReviewResponseRequiresAnchorsInsideTheReviewedSnapshot() throws {
+        let input = GitAgentReviewInput(
+            diffHash: String(repeating: "a", count: 64),
+            baseDiffHash: nil,
+            files: [.init(path: "Sources/App.swift", stagedPatch: "patch", unstagedPatch: "", untrackedText: nil)],
+            removedPaths: []
+        )
+        let valid = try GitAgentReviewResponse.parse(
+            #"{"findings":[{"severity":"warning","path":"Sources/App.swift","line":12,"message":"Handle the nil case."}]}"#,
+            input: input
+        )
+        XCTAssertEqual(valid.findings, [
+            .init(severity: .warning, path: "Sources/App.swift", line: 12, message: "Handle the nil case.")
+        ])
+
+        XCTAssertThrowsError(try GitAgentReviewResponse.parse(
+            #"{"findings":[{"severity":"error","path":"Secrets.txt","line":1,"message":"Not reviewed."}]}"#,
+            input: input
+        ))
+        XCTAssertThrowsError(try GitAgentReviewResponse.parse(
+            #"{"findings":[{"severity":"error","path":"Sources/App.swift","line":0,"message":"Bad anchor."}]}"#,
+            input: input
+        ))
+    }
+
+    func testAgentReviewPromptPinsHashDeltaAndReadOnlyContract() {
+        let input = GitAgentReviewInput(
+            diffHash: String(repeating: "b", count: 64),
+            baseDiffHash: String(repeating: "a", count: 64),
+            files: [.init(path: "A.swift", stagedPatch: "diff", unstagedPatch: "", untrackedText: nil)],
+            removedPaths: ["Old.swift"]
+        )
+        let prompt = GitAgentReviewPrompt.render(input)
+        XCTAssertTrue(prompt.contains(input.diffHash))
+        XCTAssertTrue(prompt.contains(input.baseDiffHash!))
+        XCTAssertTrue(prompt.contains("read-only"))
+        XCTAssertTrue(prompt.contains("A.swift"))
+        XCTAssertTrue(prompt.contains("Old.swift"))
+        XCTAssertFalse(prompt.contains("push"), "review must not imply a push side effect")
+    }
+
     // MARK: - GitRefreshPolicy (pure)
 
     private let now = Date(timeIntervalSince1970: 1_800_000_000)
     private let policy = GitRefreshPolicy()
+
+    func testHunkReviewAccessibilityNamesRepositoryFileAndHunk() {
+        let surface = GitService.parseReviewSurface(
+            repoName: "Widget",
+            kind: .unstaged,
+            patch: """
+            diff --git a/Sources/Feature.swift b/Sources/Feature.swift
+            index 1111111..2222222 100644
+            --- a/Sources/Feature.swift
+            +++ b/Sources/Feature.swift
+            @@ -7,3 +7,3 @@ func run() {
+             context
+            -old
+            +new
+            """,
+            entries: [.init(path: "Sources/Feature.swift", code: "M")]
+        )
+        let file = try! XCTUnwrap(surface.files.first)
+        let hunk = try! XCTUnwrap(file.hunks.first)
+
+        XCTAssertEqual(
+            GitReviewAccessibility.fileLabel(repoName: surface.repoName, file: file),
+            "Widget repository, Sources/Feature.swift, Modified text file, 1 hunk"
+        )
+        XCTAssertEqual(
+            GitReviewAccessibility.hunkLabel(repoName: surface.repoName, file: file, hunk: hunk),
+            "Widget repository, Sources/Feature.swift, hunk at new line 7, func run() {"
+        )
+    }
+
+    func testHunkReviewNavigationKeepsTheFileAnchorWhenAnActedHunkDisappears() {
+        let before = GitService.parseReviewSurface(
+            repoName: "Widget",
+            kind: .unstaged,
+            patch: """
+            diff --git a/a.txt b/a.txt
+            index 1111111..2222222 100644
+            --- a/a.txt
+            +++ b/a.txt
+            @@ -1 +1 @@
+            -old
+            +new
+            """,
+            entries: [.init(path: "a.txt", code: "M")]
+        )
+        let hunkAnchor = try! XCTUnwrap(before.files.first?.hunks.first?.anchorID)
+        let after = GitService.ReviewSurface(
+            repoName: "Widget",
+            kind: .unstaged,
+            files: [GitService.ReviewFile(path: "a.txt", code: "M", state: .binary, hunks: [])]
+        )
+
+        XCTAssertEqual(
+            GitReviewNavigation.reconciledAnchor(previous: hunkAnchor, surface: after),
+            after.files[0].anchorID
+        )
+        XCTAssertNil(
+            GitReviewNavigation.reconciledAnchor(
+                previous: hunkAnchor,
+                surface: .init(repoName: "Widget", kind: .unstaged, files: [])
+            )
+        )
+    }
+
+    func testHunkReviewCapabilitiesOfferOnlyValidWholeFileActions() {
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .staged, state: .binary), [.unstage])
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .unstaged, state: .text), [.restore, .stage])
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .unstaged, state: .binary), [.restore, .stage])
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .unstaged, state: .submodule), [.restore, .stage])
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .unstaged, state: .untracked), [.stage])
+        XCTAssertEqual(GitReviewCapabilities.fileActions(kind: .unstaged, state: .conflicted), [.stage])
+        XCTAssertEqual(
+            GitReviewCapabilities.fileActions(kind: .unstaged, state: .renamed(from: "old.txt")),
+            [.stage]
+        )
+    }
 
     func testNoPendingEventIsIdle() {
         XCTAssertEqual(
@@ -303,6 +457,44 @@ final class GitPanelModelTests: XCTestCase {
             requestedBranchName: "", commitSubjects: ["work"], changedFileCount: 1
         )
         XCTAssertEqual(try onBranch.applyingEdits(headBranch: "junk value", title: "t", body: "b").headBranch, "feature/x")
+    }
+
+    func testPullRequestDraftValidationTracksEditableFieldsAsTheyChange() throws {
+        let reviewed = try GitPRPlanner.assemble(
+            prep: prep(branch: "main", isDefault: true, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "f", count: 40),
+            requestedBranchName: "kaisola/pr-branch", commitSubjects: ["work"], changedFileCount: 1
+        )
+
+        let empty = GitPRDraftValidation.evaluate(plan: reviewed, branch: "   ", title: "\n\t")
+        XCTAssertEqual(empty.branchMessage, "Enter a branch name for the pull request.")
+        XCTAssertEqual(empty.titleMessage, "Enter a title for the pull request.")
+        XCTAssertFalse(empty.isValid)
+
+        let unsafe = GitPRDraftValidation.evaluate(plan: reviewed, branch: "bad branch;", title: "A title")
+        XCTAssertEqual(unsafe.branchMessage, "Invalid branch name — use letters, digits, and . _ / - only.")
+        XCTAssertNil(unsafe.titleMessage)
+        XCTAssertFalse(unsafe.isValid)
+
+        XCTAssertEqual(
+            GitPRDraftValidation.evaluate(plan: reviewed, branch: "  feature/reviewed  ", title: "  A title  "),
+            .valid
+        )
+
+        // Existing branches do not expose an editable branch field, so a stale
+        // value left in the shared draft must neither surface nor block confirm.
+        let existingBranch = try GitPRPlanner.assemble(
+            prep: prep(branch: "feature/x", isDefault: false, hasUpstream: true, ahead: 1),
+            defaultBranch: "main", headOID: String(repeating: "f", count: 40),
+            requestedBranchName: "", commitSubjects: ["work"], changedFileCount: 1
+        )
+        let hiddenBranch = GitPRDraftValidation.evaluate(
+            plan: existingBranch,
+            branch: "bad branch;",
+            title: "A title"
+        )
+        XCTAssertNil(hiddenBranch.branchMessage)
+        XCTAssertTrue(hiddenBranch.isValid)
     }
 
     func testAReviewedPlanIsRefusedOnceTheRepositoryMovesPastIt() throws {
@@ -595,6 +787,73 @@ final class GitPanelModelTests: XCTestCase {
 
     // MARK: - Live model behavior
 
+    @MainActor
+    func testAgentReviewRunsConfiguredAgentReusesExactDiffAndPrefillsChat() throws {
+        try write("review.swift", "let value = 1\n")
+        try git(["add", "review.swift"])
+        try git(["commit", "-q", "-m", "base"])
+        try write("review.swift", "let value = 2\n")
+        let runner = RecordingGitAgentReviewRunner()
+        var followUpAgent: AgentProfile?
+        var followUpDraft: String?
+        let model = GitPanelModel(repoRoot: repo, agentReviewRunner: runner) { agent, draft in
+            followUpAgent = agent
+            followUpDraft = draft
+        }
+        model.selectedReviewerAgentIDs = ["codex"]
+
+        model.runAgentReview()
+        XCTAssertTrue(pump(until: { !model.isBusy }, timeout: 12))
+        let first = try XCTUnwrap(model.agentReviewResults.first, model.errorMessage ?? "missing result")
+        XCTAssertEqual(first.agentID, "codex")
+        XCTAssertFalse(first.reused)
+        XCTAssertEqual(first.findings.first?.path, "review.swift")
+        XCTAssertEqual(runner.inputs.count, 1)
+        XCTAssertEqual(runner.inputs[0].diffHash, first.diffHash)
+
+        model.runAgentReview()
+        XCTAssertTrue(pump(until: { !model.isBusy }, timeout: 12))
+        let reused = try XCTUnwrap(model.agentReviewResults.first)
+        XCTAssertTrue(reused.reused)
+        XCTAssertEqual(runner.inputs.count, 1, "an unchanged diff must not launch the agent again")
+
+        model.prefillFollowUp(for: reused)
+        XCTAssertEqual(followUpAgent?.id, "codex")
+        XCTAssertTrue(followUpDraft?.contains("review.swift:1") == true)
+        XCTAssertTrue(followUpDraft?.contains(reused.diffHash) == true)
+    }
+
+    @MainActor
+    func testHunkActionRefreshesBothReviewSurfacesWithoutClosingTheSelectedView() throws {
+        let original = (1 ... 40).map { "line \($0)" }
+        try write("review.txt", original.joined(separator: "\n") + "\n")
+        try git(["add", "review.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        var working = original
+        working[1] = "changed line 2"
+        working[34] = "changed line 35"
+        try write("review.txt", working.joined(separator: "\n") + "\n")
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.openReview(.unstaged)
+        XCTAssertTrue(pump(
+            until: { model.reviewSurfaces != nil || model.errorMessage != nil },
+            timeout: 12
+        ))
+        let firstHunk = try XCTUnwrap(model.reviewSurfaces?.unstaged.files.first?.hunks.first)
+
+        model.applyReviewHunkAction(.stage, hunk: firstHunk)
+        XCTAssertTrue(pump(
+            until: {
+                !model.isBusy
+                    && model.reviewSurfaces?.staged.files.first?.hunks.count == 1
+                    && model.reviewSurfaces?.unstaged.files.first?.hunks.count == 1
+            },
+            timeout: 12
+        ), "expected both review surfaces to update, error: \(model.errorMessage ?? "none")")
+        XCTAssertEqual(model.reviewKind, .unstaged, "the active review stays open across a hunk mutation")
+    }
+
     /// The first click must assemble a review and execute NOTHING: no fork, no
     /// push, no `gh`, even with a real web destination configured.
     @MainActor
@@ -631,6 +890,66 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertNil(model.errorMessage)
         XCTAssertEqual(try gitOutput(["branch", "--format=%(refname:short)"]).split(separator: "\n").sorted(),
                        ["feature/live", "main"])
+    }
+
+    @MainActor
+    func testInvalidDefaultBranchDraftCannotConfirmAndPreservesEveryDraft() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let baseOID = try gitOutput(["rev-parse", "HEAD"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // Model a default branch that is one commit ahead of its reviewed
+        // origin without contacting a remote. The destination is still a real
+        // web identity, so validity—not missing setup—is what gates confirm.
+        try git(["remote", "add", "origin", "git@github.com:acme/widget.git"])
+        try git(["update-ref", "refs/remotes/origin/main", baseOID])
+        try git(["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"])
+        try write("work.txt", "review me\n")
+        try git(["add", "work.txt"])
+        try git(["commit", "-q", "-m", "feature work"])
+        let reviewedHead = try gitOutput(["rev-parse", "HEAD"])
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.preparePR()
+        XCTAssertTrue(pump(until: { model.prPlan != nil || model.errorMessage != nil }, timeout: 10))
+        XCTAssertTrue(try XCTUnwrap(model.prPlan).createsBranch)
+        XCTAssertTrue(try XCTUnwrap(model.prPlan).destination.isReadyForPullRequest)
+
+        model.prBranchDraft = "bad branch;"
+        model.prTitleDraft = " \n\t "
+        model.prBodyDraft = "Keep this exact body.\n\nIncluding spacing."
+        let preserved = (model.prBranchDraft, model.prTitleDraft, model.prBodyDraft)
+
+        XCTAssertEqual(
+            model.prDraftValidation?.branchMessage,
+            "Invalid branch name — use letters, digits, and . _ / - only."
+        )
+        XCTAssertEqual(model.prDraftValidation?.titleMessage, "Enter a title for the pull request.")
+        XCTAssertFalse(model.canConfirmPR)
+
+        model.confirmPR()
+
+        XCTAssertNil(model.activeOperation, "invalid drafts must not start push/PR work")
+        XCTAssertNil(model.errorMessage, "field validation must not become a detached panel banner")
+        XCTAssertNotNil(model.prPlan, "the editable review must stay open")
+        XCTAssertEqual(model.prBranchDraft, preserved.0)
+        XCTAssertEqual(model.prTitleDraft, preserved.1)
+        XCTAssertEqual(model.prBodyDraft, preserved.2)
+        XCTAssertEqual(try gitOutput(["rev-parse", "HEAD"]), reviewedHead)
+        XCTAssertEqual(
+            try gitOutput(["branch", "--format=%(refname:short)"])
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "main"
+        )
+
+        model.prBranchDraft = "feature/reviewed"
+        XCTAssertFalse(model.canConfirmPR, "the independently invalid title must still gate confirm")
+        model.prTitleDraft = " Reviewed title "
+        XCTAssertEqual(model.prDraftValidation, .valid)
+        XCTAssertTrue(model.canConfirmPR, "confirmation should unlock immediately when both fields become valid")
+        XCTAssertEqual(model.prBodyDraft, preserved.2)
     }
 
     /// Event-driven refresh: an external `git add` (an agent, a terminal) must
@@ -707,6 +1026,105 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertNil(GitStatsRendering.summary(.empty))
     }
 
+    func testGitStatusAccessibilityExpandsEveryPorcelainState() {
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "M"), "Modified")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "A"), "Added")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "D"), "Deleted")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "?"), "Untracked")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "R"), "Renamed")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "C"), "Copied")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "T"), "Type changed")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "U"), "Unmerged")
+        XCTAssertEqual(GitStatusAccessibility.statusName(for: "X"), "Git status X")
+    }
+
+    func testGitStatusAccessibilityNamesSectionAndFullPath() {
+        XCTAssertEqual(
+            GitStatusAccessibility.rowLabel(
+                path: "Sources/Feature/Status Row.swift",
+                code: "M",
+                staged: true
+            ),
+            "Modified, staged, Sources/Feature/Status Row.swift"
+        )
+        XCTAssertEqual(
+            GitStatusAccessibility.rowLabel(
+                path: "資料/新規.swift",
+                code: "?",
+                staged: false
+            ),
+            "Untracked, unstaged, 資料/新規.swift"
+        )
+    }
+
+    func testGitDiscardConfirmationNamesCategoryAndFullRelativePath() {
+        XCTAssertEqual(
+            GitDiscardConfirmation.message(
+                path: "Sources/Authentication/Recovery/AccountState.swift",
+                code: "M"
+            ),
+            "Modified unstaged changes to Sources/Authentication/Recovery/AccountState.swift "
+                + "will be discarded permanently (git restore)."
+        )
+    }
+
+    func testGitDiscardConfirmationDistinguishesDuplicateBasenamesAndPreservesLongUnicodePath() {
+        let first = GitDiscardConfirmation.message(path: "Client/Models/Status.swift", code: "D")
+        let second = GitDiscardConfirmation.message(path: "Server/Models/Status.swift", code: "D")
+        let unicodePath = "資料/非常に長いディレクトリ/調査結果/Status.swift"
+
+        XCTAssertEqual(
+            first,
+            "Deleted unstaged changes to Client/Models/Status.swift will be discarded permanently (git restore)."
+        )
+        XCTAssertEqual(
+            second,
+            "Deleted unstaged changes to Server/Models/Status.swift will be discarded permanently (git restore)."
+        )
+        XCTAssertNotEqual(first, second)
+        XCTAssertTrue(
+            GitDiscardConfirmation.message(path: unicodePath, code: "M").contains(unicodePath),
+            "The complete project-relative path must remain readable and unambiguous."
+        )
+    }
+
+    func testGitOperationPresentationNamesWorkAndCancellationPolicy() {
+        let refresh = GitPanelOperation.refresh
+        let stage = GitPanelOperation.stage("Client/Models/Status.swift")
+
+        XCTAssertEqual(refresh.name, "Refreshing Git status")
+        XCTAssertEqual(refresh.cancellationDescription, "Safe to cancel; the repository is unchanged.")
+        XCTAssertEqual(
+            refresh.accessibilityValue(cancellationRequested: false),
+            "Refreshing Git status in progress. Safe to cancel; the repository is unchanged."
+        )
+        XCTAssertEqual(stage.name, "Staging Client/Models/Status.swift")
+        XCTAssertEqual(stage.cancellationDescription, "Cancel stops the command; completed Git changes remain.")
+        XCTAssertEqual(
+            GitPanelOperation.unstage("Client/Models/Status.swift").name,
+            "Unstaging Client/Models/Status.swift"
+        )
+        XCTAssertEqual(GitPanelOperation.stageAll.name, "Staging all changes")
+        XCTAssertEqual(GitPanelOperation.unstageAll.name, "Unstaging all changes")
+        XCTAssertEqual(GitPanelOperation.pull.name, "Pulling latest changes")
+        XCTAssertEqual(GitPanelOperation.commit.name, "Committing changes")
+        XCTAssertEqual(
+            GitPanelOperation.diff("Client/Models/Status.swift").name,
+            "Loading diff for Client/Models/Status.swift"
+        )
+        XCTAssertEqual(GitPanelOperation.history.name, "Loading recent history")
+        XCTAssertEqual(
+            GitPanelOperation.restore("Client/Models/Status.swift").name,
+            "Discarding changes to Client/Models/Status.swift"
+        )
+        XCTAssertEqual(GitPanelOperation.preparePullRequest.name, "Preparing pull request review")
+        XCTAssertEqual(GitPanelOperation.createPullRequest.name, "Pushing and creating pull request")
+        XCTAssertEqual(
+            stage.accessibilityValue(cancellationRequested: true),
+            "Canceling Staging Client/Models/Status.swift. Completed Git changes remain."
+        )
+    }
+
     @MainActor
     func testRejectingCommitMessageHookKeepsDraftAndStagedIndexVisible() throws {
         try write("base.txt", "base\n")
@@ -729,14 +1147,65 @@ final class GitPanelModelTests: XCTestCase {
         XCTAssertTrue(pump(until: { model.status?.staged.map(\.path) == ["pending.txt"] }, timeout: 10))
         model.commitMessage = "keep my draft"
         model.commit()
+        XCTAssertEqual(model.activeOperation?.name, "Committing changes")
         XCTAssertTrue(pump(until: { model.errorMessage != nil && !model.isBusy }, timeout: 10))
 
+        XCTAssertNil(model.activeOperation, "a failed command must clear its progress state")
         XCTAssertEqual(model.commitMessage, "keep my draft")
         XCTAssertEqual(model.status?.staged.map(\.path), ["pending.txt"])
         XCTAssertFalse(model.errorIsRetryable)
         XCTAssertTrue(model.errorMessage?.contains("git commit exited with status 1") == true)
         XCTAssertTrue(model.errorMessage?.contains("panel hook stdout") == true)
         XCTAssertTrue(model.errorMessage?.contains("panel hook stderr") == true)
+        XCTAssertEqual(try gitOutput(["rev-parse", "HEAD"]), headBeforeCommit)
+        XCTAssertEqual(
+            try gitOutput(["diff", "--cached", "--name-only"])
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            "pending.txt"
+        )
+    }
+
+    @MainActor
+    func testCancelingCommitClearsProgressWithoutReportingAFailure() throws {
+        try write("base.txt", "base\n")
+        try git(["add", "base.txt"])
+        try git(["commit", "-q", "-m", "base"])
+        let headBeforeCommit = try gitOutput(["rev-parse", "HEAD"])
+        try write("pending.txt", "keep staged\n")
+        try git(["add", "pending.txt"])
+        try installCommitMessageHook(
+            """
+            #!/bin/sh
+            : > .git/cancel-hook-started
+            sleep 30
+            """
+        )
+
+        let model = GitPanelModel(repoRoot: repo)
+        model.refresh()
+        XCTAssertTrue(
+            pump(until: { model.status?.staged.map(\.path) == ["pending.txt"] && !model.isBusy }, timeout: 10),
+            "the shared commit gate must observe the staged index before this cancellation fixture starts"
+        )
+        model.commitMessage = "cancel me"
+        model.commit()
+        XCTAssertEqual(model.activeOperation?.name, "Committing changes")
+        XCTAssertTrue(
+            pump(until: {
+                FileManager.default.fileExists(
+                    atPath: self.repo.appendingPathComponent(".git/cancel-hook-started").path
+                )
+            }, timeout: 5),
+            "the hook must be running before cancellation is requested"
+        )
+
+        model.cancelActiveOperation()
+        XCTAssertTrue(model.isCancellingOperation)
+        XCTAssertTrue(pump(until: { !model.isBusy }, timeout: 5), "cancellation should stop the Git process")
+
+        XCTAssertNil(model.activeOperation)
+        XCTAssertFalse(model.isCancellingOperation)
+        XCTAssertNil(model.errorMessage, "user cancellation is an outcome, not an error banner")
         XCTAssertEqual(try gitOutput(["rev-parse", "HEAD"]), headBeforeCommit)
         XCTAssertEqual(
             try gitOutput(["diff", "--cached", "--name-only"])
@@ -844,12 +1313,14 @@ final class GitPanelModelTests: XCTestCase {
         // An unrelated operation (loading history) holds the model busy...
         model.loadLog()
         XCTAssertTrue(model.isBusy, "loadLog should mark the model busy synchronously, before its Task runs")
+        XCTAssertEqual(model.activeOperation?.name, "Loading recent history")
 
         // ...while an external change lands and is noted.
         try write("b.txt", "two\n")
         model.noteRepositoryEvent()
 
         XCTAssertTrue(pump(until: { !model.isBusy }, timeout: 10), "the busy operation should complete")
+        XCTAssertNil(model.activeOperation, "a successful command must clear its progress state")
         XCTAssertTrue(
             pump(until: { model.status?.untracked == ["b.txt"] }, timeout: 10),
             "an event noted while busy must still produce a refresh once isBusy clears"
@@ -1143,5 +1614,28 @@ final class GitPanelModelTests: XCTestCase {
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
         return String(data: data, encoding: .utf8) ?? ""
+    }
+}
+
+private final class RecordingGitAgentReviewRunner: GitAgentReviewRunning, @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedInputs: [GitAgentReviewInput] = []
+
+    var inputs: [GitAgentReviewInput] { lock.withLock { storedInputs } }
+
+    func review(
+        agent: AgentProfile,
+        input: GitAgentReviewInput,
+        environment: [String: String]
+    ) async throws -> [GitAgentReviewFinding] {
+        lock.withLock { storedInputs.append(input) }
+        return [
+            GitAgentReviewFinding(
+                severity: .warning,
+                path: input.files[0].path,
+                line: 1,
+                message: "Verify the changed value."
+            ),
+        ]
     }
 }

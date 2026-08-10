@@ -1,0 +1,245 @@
+name: native-keychain-boundaries
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/native-keychain-boundaries.yml'
+      - 'native/KaisolaMac/Kaisola/App/ApiKeyStore.swift'
+      - 'native/KaisolaMac/Kaisola/App/KaisolaKeychainTests.entitlements'
+      - 'native/KaisolaMac/Kaisola/Companion/CompanionIdentityStore.swift'
+      - 'native/KaisolaMac/KaisolaTests/ApiKeyStoreTests.swift'
+      - 'scripts/native-keychain-boundary-receipt.cjs'
+      - 'tests/node/nativeKeychainBoundaryReceipt.test.cjs'
+  pull_request:
+    paths:
+      - '.github/workflows/native-keychain-boundaries.yml'
+      - 'native/KaisolaMac/Kaisola/App/ApiKeyStore.swift'
+      - 'native/KaisolaMac/Kaisola/App/KaisolaKeychainTests.entitlements'
+      - 'native/KaisolaMac/Kaisola/Companion/CompanionIdentityStore.swift'
+      - 'native/KaisolaMac/KaisolaTests/ApiKeyStoreTests.swift'
+      - 'scripts/native-keychain-boundary-receipt.cjs'
+      - 'tests/node/nativeKeychainBoundaryReceipt.test.cjs'
+
+permissions:
+  contents: read
+
+jobs:
+  contract:
+    runs-on: macos-15
+    timeout-minutes: 10
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install exact Node dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+        env:
+          KAISOLA_SKIP_NATIVE_REBUILD: '1'
+      - name: Test the fail-closed Keychain receipt
+        run: node --test tests/node/nativeKeychainBoundaryReceipt.test.cjs
+
+  keychain-boundaries:
+    needs: contract
+    # Restricted signing credentials never enter fork or non-owner PR jobs. A
+    # physical boundary run is protected-main automation, an owner-authored
+    # same-repository candidate, or an owner-authorized dispatch.
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' &&
+       github.event.pull_request.head.repo.full_name == github.repository &&
+       github.actor == github.repository_owner) ||
+      (github.event_name == 'workflow_dispatch' && github.actor == github.repository_owner)
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install exact Node dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+        env:
+          KAISOLA_SKIP_NATIVE_REBUILD: '1'
+      - name: Prepare private boundary paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Data-protection Keychain items are per user and are not redirected
+          # by `security default-keychain`. Require GitHub's one-job fresh VM
+          # instead of pretending a throwaway legacy file Keychain isolates it.
+          test "${RUNNER_ENVIRONMENT:-}" = github-hosted
+          test "${RUNNER_OS:-}" = macOS
+          test "${RUNNER_ARCH:-}" = ARM64
+          BOUNDARY_ROOT="$RUNNER_TEMP/kaisola-keychain-boundary"
+          mkdir -m 700 -p "$BOUNDARY_ROOT"
+          printf 'KAISOLA_KEYCHAIN_BOUNDARY_ROOT=%s\n' "$BOUNDARY_ROOT" >> "$GITHUB_ENV"
+          printf 'KAISOLA_KEYCHAIN_DERIVED_DATA=%s/DerivedData\n' "$BOUNDARY_ROOT" >> "$GITHUB_ENV"
+          printf 'KAISOLA_KEYCHAIN_RESULT=%s/KaisolaKeychain.xcresult\n' "$BOUNDARY_ROOT" >> "$GITHUB_ENV"
+      - name: Import profile-capable Developer ID signing identity
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_PRIVATE_KEY: ${{ secrets.APPLE_API_PRIVATE_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          for name in CSC_LINK CSC_KEY_PASSWORD APPLE_TEAM_ID APPLE_API_KEY_ID APPLE_API_PRIVATE_KEY APPLE_API_ISSUER; do
+            test -n "${!name:-}" || { echo "Missing Keychain-boundary signing input: $name" >&2; exit 1; }
+          done
+
+          certificate_path="$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/signing.p12"
+          api_key_path="$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/apple-api-key.p8"
+          signing_keychain="$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/signing.keychain-db"
+          signing_password="$(openssl rand -hex 32)"
+          printf 'KAISOLA_SIGNING_CERTIFICATE=%s\n' "$certificate_path" >> "$GITHUB_ENV"
+          printf 'KAISOLA_SIGNING_KEYCHAIN=%s\n' "$signing_keychain" >> "$GITHUB_ENV"
+          printf 'KAISOLA_API_KEY_PATH=%s\n' "$api_key_path" >> "$GITHUB_ENV"
+          umask 077
+          printf '%s' "$CSC_LINK" | base64 --decode > "$certificate_path"
+          printf '%s' "$APPLE_API_PRIVATE_KEY" | base64 --decode > "$api_key_path"
+          test -s "$certificate_path"
+          test -s "$api_key_path"
+          security create-keychain -p "$signing_password" "$signing_keychain"
+          security set-keychain-settings -lut 21600 "$signing_keychain"
+          security unlock-keychain -p "$signing_password" "$signing_keychain"
+          security import "$certificate_path" \
+            -k "$signing_keychain" \
+            -P "$CSC_KEY_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$signing_password" \
+            "$signing_keychain"
+          security list-keychains -d user -s "$signing_keychain"
+          security find-identity -v -p codesigning "$signing_keychain" \
+            | grep -F 'Developer ID Application:' >/dev/null
+      - name: Compile an arm64 profile-authorized test host
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KAISOLA_API_KEY_PATH" \
+            -authenticationKeyID "$APPLE_API_KEY_ID" \
+            -authenticationKeyIssuerID "$APPLE_API_ISSUER" \
+            -project native/KaisolaMac/KaisolaMac.xcodeproj \
+            -scheme Kaisola \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$KAISOLA_KEYCHAIN_DERIVED_DATA" \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_STYLE=Automatic \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=YES \
+            KAISOLA_KEYCHAIN_BOUNDARY_ENTITLEMENTS=Kaisola/App/KaisolaKeychainTests.entitlements \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KAISOLA_SIGNING_KEYCHAIN" \
+            build-for-testing
+      - name: Run and seal isolated entitled Keychain boundaries
+        shell: bash
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+        run: |
+          set -euo pipefail
+          APP="$KAISOLA_KEYCHAIN_DERIVED_DATA/Build/Products/Debug/Kaisola.app"
+          PROFILE="$APP/Contents/embedded.provisionprofile"
+          RECEIPT="$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/keychain-boundary-receipt.json"
+
+          test -s "$PROFILE"
+          codesign --verify --deep --strict "$APP"
+          codesign -dv --verbose=4 "$APP" \
+            2> "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/signature.txt"
+          codesign -d --entitlements :- "$APP" \
+            > "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/entitlements.plist" 2>/dev/null
+          plutil -convert json -o "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/entitlements.json" \
+            "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/entitlements.plist"
+          security cms -D -i "$PROFILE" \
+            > "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/provisioning-profile.plist"
+          plutil -convert json -o "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/provisioning-profile.json" \
+            "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/provisioning-profile.plist"
+
+          xcodebuild \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$KAISOLA_API_KEY_PATH" \
+            -authenticationKeyID "$APPLE_API_KEY_ID" \
+            -authenticationKeyIssuerID "$APPLE_API_ISSUER" \
+            -project native/KaisolaMac/KaisolaMac.xcodeproj \
+            -scheme Kaisola \
+            -configuration Debug \
+            -destination 'platform=macOS,arch=arm64' \
+            -derivedDataPath "$KAISOLA_KEYCHAIN_DERIVED_DATA" \
+            -resultBundlePath "$KAISOLA_KEYCHAIN_RESULT" \
+            -only-testing:KaisolaTests/KeychainBoundaryTests \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGN_STYLE=Automatic \
+            CODE_SIGN_IDENTITY="Developer ID Application" \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" \
+            CODE_SIGN_INJECT_BASE_ENTITLEMENTS=YES \
+            KAISOLA_KEYCHAIN_BOUNDARY_ENTITLEMENTS=Kaisola/App/KaisolaKeychainTests.entitlements \
+            OTHER_CODE_SIGN_FLAGS="--keychain $KAISOLA_SIGNING_KEYCHAIN" \
+            TEST_RUNNER_KAISOLA_REQUIRE_KEYCHAIN_BOUNDARIES=1 \
+            TEST_RUNNER_KAISOLA_KEYCHAIN_BOUNDARY_ISOLATION=github-hosted-ephemeral-vm \
+            test-without-building
+
+          xcrun xcresulttool get test-results summary \
+            --path "$KAISOLA_KEYCHAIN_RESULT" --compact \
+            > "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/summary.json"
+          xcrun xcresulttool get test-results tests \
+            --path "$KAISOLA_KEYCHAIN_RESULT" --compact \
+            > "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/tests.json"
+          node scripts/native-keychain-boundary-receipt.cjs seal \
+            --summary "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/summary.json" \
+            --tests "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/tests.json" \
+            --signature "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/signature.txt" \
+            --entitlements "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/entitlements.json" \
+            --provisioning-profile "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/provisioning-profile.json" \
+            --keychain-isolation github-hosted-ephemeral-vm \
+            --cleanup-verified true \
+            --output "$RECEIPT"
+      - name: Upload redacted Keychain receipt
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-keychain-boundary-receipt
+          path: ${{ runner.temp }}/kaisola-keychain-boundary/keychain-boundary-receipt.json
+          if-no-files-found: error
+          retention-days: 14
+      - name: Remove ephemeral signing material
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          signing_keychain="${KAISOLA_SIGNING_KEYCHAIN:-$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/signing.keychain-db}"
+          if [[ -e "$signing_keychain" ]]; then
+            security delete-keychain "$signing_keychain" || true
+          fi
+          rm -f \
+            "${KAISOLA_SIGNING_CERTIFICATE:-$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/signing.p12}" \
+            "${KAISOLA_API_KEY_PATH:-$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/apple-api-key.p8}"

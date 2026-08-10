@@ -1510,6 +1510,42 @@ final class AppModelProjectContextTests: XCTestCase {
     }
 
     @MainActor
+    func testAppModelUsesUsageCentersExactRecoveryAuthorityAndState() async throws {
+        let root = storeFile.deletingLastPathComponent()
+            .appendingPathComponent("shared-project-account-recovery", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let accountURL = root.appendingPathComponent("project-accounts.json")
+        let recoveryCenter = ProjectAccountRecoveryCenter(
+            store: ProjectAccountStore(fileURL: accountURL)
+        )
+        let transcriptStore = AcpTranscriptStore(fileURL: root.appendingPathComponent("transcripts.json"))
+        let usageCenter = UsageCenter(
+            persistenceStore: transcriptStore,
+            projectAccountRecoveryCenter: recoveryCenter
+        )
+        let model = AppModel(
+            brokerPreparer: ProjectContextBrokerPreparer(),
+            fallbackPreparer: nil,
+            client: ProjectContextBrokerClient(),
+            sessionStore: NativeSessionStore(fileURL: root.appendingPathComponent("sessions.json")),
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            workspaceStateStore: NativeWorkspaceStateStore(fileURL: root.appendingPathComponent("workspace.json")),
+            transcriptStore: transcriptStore,
+            usageCenter: usageCenter
+        )
+
+        XCTAssertTrue(model.projectAccountRecoveryCenter === recoveryCenter)
+        XCTAssertTrue(usageCenter.projectAccountRecoveryCenter === recoveryCenter)
+
+        try Data("corrupt account mapping".utf8).write(to: accountURL)
+        _ = model.projectAccountRecoveryCenter.loadStatus()
+
+        XCTAssertEqual(recoveryCenter.issue?.kind, .corrupt)
+        XCTAssertEqual(usageCenter.projectAccountRecoveryCenter.issue?.kind, .corrupt)
+        await model.teardown()
+    }
+
+    @MainActor
     func testCorruptProjectAccountsBlockChatMeshAndTerminalCreationFunnels() async throws {
         let root = storeFile.deletingLastPathComponent()
             .appendingPathComponent("corrupt-project-account-launches", isDirectory: true)
@@ -1610,7 +1646,7 @@ final class AppModelProjectContextTests: XCTestCase {
         root: URL,
         identity: String,
         projectDirectory: URL,
-        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = .shared
+        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = ProjectAccountRecoveryCenter()
     ) -> AppModel {
         let sessionStore = NativeSessionStore(
             fileURL: root.appendingPathComponent("native-sessions-\(identity).json")

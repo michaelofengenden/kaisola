@@ -343,13 +343,15 @@ struct ProjectAccountsSection: View {
         projectID: String?,
         projectName: String?,
         workspace: URL? = nil,
-        recoveryCenter: ProjectAccountRecoveryCenter = .shared,
+        recoveryCenter: ProjectAccountRecoveryCenter? = nil,
         usage: UsageCenter = .shared
     ) {
         self.projectID = projectID
         self.projectName = projectName
         self.workspace = workspace
-        _recoveryCenter = ObservedObject(wrappedValue: recoveryCenter)
+        _recoveryCenter = ObservedObject(
+            wrappedValue: recoveryCenter ?? usage.projectAccountRecoveryCenter
+        )
         _usage = ObservedObject(wrappedValue: usage)
     }
 

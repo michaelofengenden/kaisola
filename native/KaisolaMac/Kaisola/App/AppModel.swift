@@ -416,7 +416,7 @@ final class AppModel: ObservableObject {
         cursorStore: TerminalCursorStore = TerminalCursorStore(fileURL: NativePreviewPaths.terminalCursorStore),
         workspaceStateStore: NativeWorkspaceStateStore = .live,
         transcriptStore: AcpTranscriptStore = .live,
-        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = .shared,
+        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter? = nil,
         adoptionStore: SessionAdoptionStore = SessionAdoptionStore(),
         pinStore: SessionPinStore = SessionPinStore(),
         usageCenter: UsageCenter = .shared,
@@ -444,6 +444,7 @@ final class AppModel: ObservableObject {
         self.workspaceStateStore = workspaceStateStore
         self.transcriptStore = transcriptStore
         self.projectAccountRecoveryCenter = projectAccountRecoveryCenter
+            ?? usageCenter.projectAccountRecoveryCenter
         self.adoptionStore = adoptionStore
         self.pinStore = pinStore
         self.usageCenter = usageCenter

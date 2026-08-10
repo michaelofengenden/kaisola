@@ -1008,7 +1008,9 @@ final class UsageCenter: ObservableObject {
         URL?, URL?, [String: String], [PlanUsageRequest]
     ) async -> ProviderPlanReadResult
     private let usageAccountStore: UsageAccountStore
-    private let projectAccountRecoveryCenter: ProjectAccountRecoveryCenter
+    /// Process-wide recovery authority for `shared`; custom UsageCenter
+    /// instances keep their injected authority for isolated tests/fixtures.
+    let projectAccountRecoveryCenter: ProjectAccountRecoveryCenter
     private var persistenceTask: Task<Void, Never>?
     private var chatSources: [String: Set<String>] = [:]
 
@@ -1016,7 +1018,7 @@ final class UsageCenter: ObservableObject {
         now: @escaping () -> Date = Date.init,
         persistenceStore: AcpTranscriptStore? = nil,
         usageAccountStore: UsageAccountStore = UsageAccountStore(),
-        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = .shared,
+        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter = ProjectAccountRecoveryCenter(),
         planUsageContextResolver: @escaping PlanUsageContextResolver = { workspace, environment in
             UsageCenter.planUsageContextKey(workspace: workspace, environment: environment)
         },

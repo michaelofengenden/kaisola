@@ -512,8 +512,6 @@ struct ProjectAccountStore: Sendable {
 /// or consumers from inventing conflicting ideas of whether launches are safe.
 @MainActor
 final class ProjectAccountRecoveryCenter: ObservableObject {
-    static let shared = ProjectAccountRecoveryCenter()
-
     @Published private(set) var issue: ProjectAccountRecoveryIssue?
     private let store: ProjectAccountStore
 

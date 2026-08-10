@@ -50,6 +50,10 @@ struct QuietStatusClock {
 /// session age, task duration, time since output, or active compute time. Ages
 /// over 99 days are capped so the sidebar lane cannot keep widening.
 enum QuietTimeLabel {
+    /// The compact slot stops counting here. Beyond this point the exact day
+    /// count belongs in the inspectable description, not in the title's lane.
+    static let maxDays = 99
+
     enum Age: Equatable {
         case unavailable
         case lessThanMinute
@@ -95,7 +99,7 @@ enum QuietTimeLabel {
         case ..<60: return .lessThanMinute
         case ..<3600: return .minutes(Int(seconds / 60))
         case ..<86_400: return .hours(Int(seconds / 3600))
-        case ..<(100 * 86_400): return .days(Int(seconds / 86_400))
+        case ..<(Double(maxDays + 1) * 86_400): return .days(Int(seconds / 86_400))
         default: return .moreThan99Days
         }
     }
@@ -104,6 +108,124 @@ enum QuietTimeLabel {
         let components = elapsed.components
         return Double(components.seconds)
             + Double(components.attoseconds) / 1_000_000_000_000_000_000
+    }
+}
+
+/// Turns the clock reading into the sentence exposed by the tooltip and
+/// VoiceOver. Every status has its own verb and transition meaning; all of them
+/// use the same continuous elapsed clock.
+enum QuietTimeSemantic {
+    static let stampThreshold: TimeInterval = 86_400
+
+    static func verb(for status: QuietSessionStatus) -> (word: String, ongoing: Bool) {
+        switch status {
+        case .working: ("Working", true)
+        case .needsYou: ("Waiting for you", true)
+        case .idle: ("Idle", true)
+        case .doneUnseen: ("Finished", false)
+        case .failed: ("Failed", false)
+        case .ended: ("Ended", false)
+        }
+    }
+
+    /// Spelled out rather than abbreviated so assistive technology reads a
+    /// duration, while the compact lane remains capped at four glyphs.
+    static func spelled(seconds: TimeInterval) -> String {
+        let seconds = max(0, seconds)
+        switch seconds {
+        case ..<60: return "less than a minute"
+        case ..<3600: return count(Int(seconds / 60), "minute")
+        case ..<86_400: return count(Int(seconds / 3600), "hour")
+        default: return count(Int(seconds / 86_400), "day")
+        }
+    }
+
+    static func observedPhrase(
+        status: QuietSessionStatus,
+        seconds: TimeInterval,
+        observedAt: Date,
+        wallClockChanged: Bool,
+        locale: Locale,
+        timeZone: TimeZone
+    ) -> String {
+        let verb = verb(for: status)
+        let elapsed = spelled(seconds: seconds)
+        let headline = verb.ongoing
+            ? "\(verb.word) for \(elapsed)"
+            : "\(verb.word) \(elapsed) ago"
+        var sentence = "\(headline) (\(transitionQualifier(for: status)))."
+        sentence += wallClockChanged
+            ? " The system wall clock changed during this state, so the value uses continuous elapsed time "
+                + "since Kaisola observed the transition. It includes time asleep."
+            : " Measured with continuous elapsed time since Kaisola observed the transition, including time asleep; "
+                + "wall-clock changes do not alter it."
+        if seconds >= stampThreshold, !wallClockChanged {
+            sentence += " Counting from \(stamp(observedAt, locale: locale, timeZone: timeZone))."
+        }
+        return sentence
+    }
+
+    /// A first observation is useful as a lower bound, but it is not a status
+    /// transition. Keep the compact lane explicitly unknown and put the honest
+    /// observation age here where the distinction can be explained.
+    static func firstObservationPhrase(
+        status: QuietSessionStatus,
+        seconds: TimeInterval,
+        observedAt: Date,
+        wallClockChanged: Bool,
+        locale: Locale,
+        timeZone: TimeZone
+    ) -> String {
+        let verb = verb(for: status)
+        let headline = verb.ongoing
+            ? "\(verb.word) for an unknown duration"
+            : "\(verb.word) at an unknown time"
+        var sentence = "\(headline). Kaisola first observed this status \(spelled(seconds: seconds)) ago, "
+            + "but the transition may be older."
+        if status == .working {
+            sentence += " This is not measured compute time."
+        }
+        sentence += wallClockChanged
+            ? " The system wall clock changed, so the observation age uses continuous elapsed time and includes time asleep."
+            : " The observation age uses continuous elapsed time, including time asleep; wall-clock changes do not alter it."
+        if seconds >= stampThreshold, !wallClockChanged {
+            sentence += " First observed at \(stamp(observedAt, locale: locale, timeZone: timeZone))."
+        }
+        return sentence
+    }
+
+    static func unavailablePhrase(status: QuietSessionStatus) -> String {
+        let verb = verb(for: status)
+        let headline = verb.ongoing
+            ? "\(verb.word) for an unknown duration"
+            : "\(verb.word) at an unknown time"
+        let computeCaveat = status == .working ? " It is not measured compute time." : ""
+        return "\(headline). Kaisola has no matching transition observation for this status; "
+            + "the transition time is unknown.\(computeCaveat)"
+    }
+
+    static func transitionQualifier(for status: QuietSessionStatus) -> String {
+        switch status {
+        case .working: return "time since it started working, not measured compute time"
+        case .needsYou: return "time since it began waiting for you"
+        case .idle: return "time since it became idle"
+        case .doneUnseen: return "time since it finished and began awaiting review"
+        case .failed: return "time since it failed"
+        case .ended: return "time since it ended"
+        }
+    }
+
+    static func stamp(_ date: Date, locale: Locale, timeZone: TimeZone) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = locale
+        formatter.timeZone = timeZone
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    private static func count(_ value: Int, _ unit: String) -> String {
+        "\(value) \(unit)\(value == 1 ? "" : "s")"
     }
 }
 
@@ -121,43 +243,55 @@ struct QuietTimeInStatePresentation: Equatable {
     static func make(
         status: QuietSessionStatus,
         entry: QuietStatusClock.Entry?,
-        now: QuietStatusClock.Reading
+        now: QuietStatusClock.Reading,
+        locale: Locale = .autoupdatingCurrent,
+        timeZone: TimeZone = .autoupdatingCurrent
     ) -> QuietTimeInStatePresentation {
-        let statusName = status.timeInStateName
-        guard let entry,
-              entry.status == status,
-              entry.origin == .observedTransition else {
+        guard let entry, entry.status == status else {
             return QuietTimeInStatePresentation(
                 compactLabel: "—",
-                expandedDescription: "Current status: \(statusName). Kaisola first observed this status when this "
-                    + "window began tracking the surface, so the transition time is unknown."
+                expandedDescription: QuietTimeSemantic.unavailablePhrase(status: status)
             )
         }
 
         let elapsed = entry.at.continuous.duration(to: now.continuous)
         let age = QuietTimeLabel.age(elapsed: elapsed)
-        guard let expandedAge = age.expanded else {
+        let seconds = QuietTimeLabel.seconds(elapsed: elapsed)
+        guard seconds.isFinite, seconds >= 0 else {
             return QuietTimeInStatePresentation(
-                compactLabel: age.compact,
-                expandedDescription: "Current status: \(statusName). Continuous elapsed time since Kaisola observed "
-                    + "the status change is unavailable."
+                compactLabel: "—",
+                expandedDescription: QuietTimeSemantic.unavailablePhrase(status: status)
             )
         }
 
         let wallElapsed = now.wall.timeIntervalSince(entry.at.wall)
-        let continuousElapsed = QuietTimeLabel.seconds(elapsed: elapsed)
         let wallClockChanged = !wallElapsed.isFinite
-            || abs(wallElapsed - continuousElapsed) >= 5
-        let meaning = wallClockChanged
-            ? "The system wall clock changed during this state, so the value uses continuous elapsed time "
-                + "since that observation. It includes time asleep and is not active compute time."
-            : "The value uses continuous elapsed time since that observation, including time asleep; "
-                + "wall-clock changes do not alter it, and it is not active compute time."
+            || abs(wallElapsed - seconds) >= 5
+
+        if entry.origin == .firstObservation {
+            return QuietTimeInStatePresentation(
+                compactLabel: "—",
+                expandedDescription: QuietTimeSemantic.firstObservationPhrase(
+                    status: status,
+                    seconds: seconds,
+                    observedAt: entry.at.wall,
+                    wallClockChanged: wallClockChanged,
+                    locale: locale,
+                    timeZone: timeZone
+                )
+            )
+        }
 
         return QuietTimeInStatePresentation(
             compactLabel: age.compact,
-            expandedDescription: "Current status: \(statusName). Kaisola observed the status change \(expandedAge) ago. "
-                + meaning
+            expandedDescription: QuietTimeSemantic.observedPhrase(
+                status: status,
+                seconds: seconds,
+                observedAt: entry.at.wall,
+                wallClockChanged: wallClockChanged,
+                locale: locale,
+                timeZone: timeZone
+            )
         )
     }
 }
@@ -167,7 +301,7 @@ struct QuietTimeInStatePresentation: Equatable {
 /// receives the full meaning as AXValue rather than a bare `34m` in AXLabel.
 enum QuietSurfaceRowSemantics {
     static func accessibilityLabel(title: String, status: QuietSessionStatus) -> String {
-        "\(title), \(status.timeInStateName)"
+        "\(title), \(status.rowSpeechWord)"
     }
 
     static func accessibilityValue(time: QuietTimeInStatePresentation) -> String {
@@ -192,6 +326,17 @@ private extension QuietSessionStatus {
         case .failed: return "failed"
         case .idle: return "idle"
         case .ended: return "ended"
+        }
+    }
+
+    /// Preserve the row's existing spoken status vocabulary while fixing the
+    /// old `ended` -> `idle` fallback. Richer time semantics live in AXValue.
+    var rowSpeechWord: String {
+        switch self {
+        case .idle: return "idle"
+        case .ended: return "ended"
+        case .needsYou, .working, .doneUnseen, .failed:
+            return accessibilityWord ?? timeInStateName
         }
     }
 }

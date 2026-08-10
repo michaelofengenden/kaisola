@@ -4,6 +4,8 @@ import XCTest
 final class QuietStatusClockTests: XCTestCase {
     private let wall0 = Date(timeIntervalSince1970: 1_000_000)
     private let continuous0 = ContinuousClock.now
+    private let posix = Locale(identifier: "en_US_POSIX")
+    private let gmt = TimeZone(secondsFromGMT: 0)!
 
     func testLabelBuckets() {
         XCTAssertEqual(QuietTimeLabel.label(elapsed: .seconds(30)), "now")
@@ -30,16 +32,16 @@ final class QuietStatusClockTests: XCTestCase {
     }
 
     func testEveryStatusHasAnExactObservedTransitionSemantic() {
-        let cases: [(QuietSessionStatus, String)] = [
-            (.needsYou, "needs your attention"),
-            (.working, "working"),
-            (.doneUnseen, "done, awaiting review"),
-            (.failed, "failed"),
-            (.idle, "idle"),
-            (.ended, "ended"),
+        let cases: [(QuietSessionStatus, String, String)] = [
+            (.needsYou, "Waiting for you for 34 minutes", "time since it began waiting for you"),
+            (.working, "Working for 34 minutes", "time since it started working"),
+            (.doneUnseen, "Finished 34 minutes ago", "time since it finished and began awaiting review"),
+            (.failed, "Failed 34 minutes ago", "time since it failed"),
+            (.idle, "Idle for 34 minutes", "time since it became idle"),
+            (.ended, "Ended 34 minutes ago", "time since it ended"),
         ]
 
-        for (status, name) in cases {
+        for (status, headline, qualifier) in cases {
             let entry = QuietStatusClock.Entry(
                 status: status,
                 at: reading(),
@@ -48,17 +50,16 @@ final class QuietStatusClockTests: XCTestCase {
             let presentation = QuietTimeInStatePresentation.make(
                 status: status,
                 entry: entry,
-                now: reading(wallOffset: 34 * 60, continuousOffset: 34 * 60)
+                now: reading(wallOffset: 34 * 60, continuousOffset: 34 * 60),
+                locale: posix,
+                timeZone: gmt
             )
 
             XCTAssertEqual(presentation.compactLabel, "34m", "status: \(status)")
-            XCTAssertEqual(
-                presentation.expandedDescription,
-                "Current status: \(name). Kaisola observed the status change 34 minutes ago. "
-                    + "The value uses continuous elapsed time since that observation, including time asleep; "
-                    + "wall-clock changes do not alter it, and it is not active compute time.",
-                "status: \(status)"
-            )
+            XCTAssertTrue(presentation.expandedDescription.hasPrefix(headline), "status: \(status)")
+            XCTAssertTrue(presentation.expandedDescription.contains(qualifier), "status: \(status)")
+            XCTAssertTrue(presentation.expandedDescription.contains("continuous elapsed time"), "status: \(status)")
+            XCTAssertTrue(presentation.expandedDescription.contains("including time asleep"), "status: \(status)")
         }
     }
 
@@ -71,15 +72,17 @@ final class QuietStatusClockTests: XCTestCase {
         let presentation = QuietTimeInStatePresentation.make(
             status: .working,
             entry: entry,
-            now: reading(wallOffset: 8 * 3600, continuousOffset: 8 * 3600)
+            now: reading(wallOffset: 8 * 3600, continuousOffset: 8 * 3600),
+            locale: posix,
+            timeZone: gmt
         )
 
         XCTAssertEqual(presentation.compactLabel, "—")
-        XCTAssertEqual(
-            presentation.expandedDescription,
-            "Current status: working. Kaisola first observed this status when this window began tracking "
-                + "the surface, so the transition time is unknown."
-        )
+        XCTAssertTrue(presentation.expandedDescription.hasPrefix("Working for an unknown duration"))
+        XCTAssertTrue(presentation.expandedDescription.contains("first observed this status 8 hours ago"))
+        XCTAssertTrue(presentation.expandedDescription.contains("transition may be older"))
+        XCTAssertTrue(presentation.expandedDescription.contains("not measured compute time"))
+        XCTAssertTrue(presentation.expandedDescription.contains("continuous elapsed time"))
     }
 
     func testStatusChangingBeforeTheClockCallbackDoesNotReuseThePriorStatusAge() {
@@ -97,8 +100,8 @@ final class QuietStatusClockTests: XCTestCase {
         XCTAssertEqual(presentation.compactLabel, "—")
         XCTAssertEqual(
             presentation.expandedDescription,
-            "Current status: done, awaiting review. Kaisola first observed this status when this window "
-                + "began tracking the surface, so the transition time is unknown."
+            "Finished at an unknown time. Kaisola has no matching transition observation for this status; "
+                + "the transition time is unknown."
         )
     }
 
@@ -128,10 +131,10 @@ final class QuietStatusClockTests: XCTestCase {
         )
 
         XCTAssertEqual(presentation.compactLabel, "8h")
-        XCTAssertTrue(presentation.expandedDescription.contains("8 hours ago"))
+        XCTAssertTrue(presentation.expandedDescription.contains("Working for 8 hours"))
         XCTAssertTrue(presentation.expandedDescription.contains("including time asleep"))
         XCTAssertTrue(presentation.expandedDescription.contains("continuous elapsed time"))
-        XCTAssertTrue(presentation.expandedDescription.contains("not active compute time"))
+        XCTAssertTrue(presentation.expandedDescription.contains("not measured compute time"))
     }
 
     func testVeryOldTransitionStaysBoundedAndExpanded() {
@@ -142,7 +145,40 @@ final class QuietStatusClockTests: XCTestCase {
         )
 
         XCTAssertEqual(presentation.compactLabel, "99d+")
-        XCTAssertTrue(presentation.expandedDescription.contains("more than 99 days ago"))
+        XCTAssertTrue(presentation.expandedDescription.contains("Ended 365 days ago"))
+        XCTAssertTrue(presentation.expandedDescription.contains("Counting from"))
+        XCTAssertTrue(presentation.expandedDescription.contains("1970"))
+    }
+
+    func testFirstObservationOldStateNamesOnlyTheObservationMoment() {
+        let entry = QuietStatusClock.Entry(
+            status: .idle,
+            at: reading(),
+            origin: .firstObservation
+        )
+        let presentation = QuietTimeInStatePresentation.make(
+            status: .idle,
+            entry: entry,
+            now: reading(wallOffset: 9 * 86_400, continuousOffset: 9 * 86_400),
+            locale: posix,
+            timeZone: gmt
+        )
+
+        XCTAssertEqual(presentation.compactLabel, "—")
+        XCTAssertTrue(presentation.expandedDescription.hasPrefix("Idle for an unknown duration"))
+        XCTAssertTrue(presentation.expandedDescription.contains("first observed this status 9 days ago"))
+        XCTAssertTrue(presentation.expandedDescription.contains("First observed at"))
+        XCTAssertFalse(presentation.expandedDescription.contains("Counting from"))
+    }
+
+    func testSpelledElapsedIsReadableAloudWithoutCompactCap() {
+        XCTAssertEqual(QuietTimeSemantic.spelled(seconds: 5), "less than a minute")
+        XCTAssertEqual(QuietTimeSemantic.spelled(seconds: 60), "1 minute")
+        XCTAssertEqual(QuietTimeSemantic.spelled(seconds: 34 * 60), "34 minutes")
+        XCTAssertEqual(QuietTimeSemantic.spelled(seconds: 3600), "1 hour")
+        XCTAssertEqual(QuietTimeSemantic.spelled(seconds: 5 * 3600), "5 hours")
+        XCTAssertEqual(QuietTimeSemantic.spelled(seconds: 86_400), "1 day")
+        XCTAssertEqual(QuietTimeSemantic.spelled(seconds: 400 * 86_400), "400 days")
     }
 
     func testRowSemanticsPutExpandedMeaningInTooltipAndAccessibilityValue() {
@@ -153,6 +189,10 @@ final class QuietStatusClockTests: XCTestCase {
         )
 
         XCTAssertEqual(QuietSurfaceRowSemantics.accessibilityLabel(title: "Build", status: .working), "Build, working")
+        XCTAssertEqual(QuietSurfaceRowSemantics.accessibilityLabel(title: "Build", status: .needsYou), "Build, needs you")
+        XCTAssertEqual(QuietSurfaceRowSemantics.accessibilityLabel(title: "Build", status: .doneUnseen), "Build, done")
+        XCTAssertEqual(QuietSurfaceRowSemantics.accessibilityLabel(title: "Build", status: .idle), "Build, idle")
+        XCTAssertEqual(QuietSurfaceRowSemantics.accessibilityLabel(title: "Build", status: .ended), "Build, ended")
         XCTAssertEqual(QuietSurfaceRowSemantics.accessibilityValue(time: presentation), presentation.expandedDescription)
         XCTAssertEqual(
             QuietSurfaceRowSemantics.tooltip(base: "PID 42 · swift", time: presentation),
@@ -173,7 +213,9 @@ final class QuietStatusClockTests: XCTestCase {
                 at: reading(),
                 origin: .observedTransition
             ),
-            now: reading(wallOffset: wallOffset, continuousOffset: continuousOffset)
+            now: reading(wallOffset: wallOffset, continuousOffset: continuousOffset),
+            locale: posix,
+            timeZone: gmt
         )
     }
 

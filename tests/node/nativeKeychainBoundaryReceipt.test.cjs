@@ -8,6 +8,7 @@ const {
   REQUIRED_TESTS,
   collectTestCases,
   validateBoundaryEvidence,
+  validateInputProvisioningProfile,
 } = require('../../scripts/native-keychain-boundary-receipt.cjs')
 
 const root = path.resolve(__dirname, '../..')
@@ -257,6 +258,21 @@ test('rejects ad-hoc restricted entitlements even when the bundle verifies', () 
   )
 })
 
+test('physical receipt requires Developer ID even if Apple Development is otherwise valid', () => {
+  const host = signedHost()
+  host.signature = host.signature.replace(
+    'Authority=Developer ID Application:',
+    'Authority=Apple Development:',
+  )
+  assert.throws(
+    () => validateBoundaryEvidence(
+      passingEvidence({ host }),
+      { requiredSignatureKind: 'developer-id' },
+    ),
+    /Developer ID Application signature/u,
+  )
+})
+
 test('fails closed unless the embedded profile authorizes the exact identity and group', () => {
   for (const provisioningProfile of [
     undefined,
@@ -308,6 +324,58 @@ test('fails closed unless the Keychain is isolated and secret cleanup is verifie
   )
 })
 
+test('accepts only an exact unexpired Developer ID input profile', () => {
+  const profile = {
+    ...signedHost().provisioningProfile,
+    Platform: ['OSX'],
+  }
+
+  assert.deepEqual(
+    validateInputProvisioningProfile(profile, TEST_TEAM_IDENTIFIER),
+    { uuid: '00000000-0000-0000-0000-000000000001' },
+  )
+
+  const legacyPrefix = 'LEGACYID01'
+  assert.deepEqual(
+    validateInputProvisioningProfile({
+      ...profile,
+      ApplicationIdentifierPrefix: [legacyPrefix],
+      Entitlements: {
+        'com.apple.application-identifier': `${legacyPrefix}.com.kaisola.mac`,
+        'keychain-access-groups': [`${legacyPrefix}.com.kaisola.mac`],
+      },
+    }, TEST_TEAM_IDENTIFIER),
+    { uuid: '00000000-0000-0000-0000-000000000001' },
+  )
+
+  for (const [changedProfile, message] of [
+    [{ ...profile, UUID: '../attacker' }, /UUID/u],
+    [{ ...profile, Name: '' }, /name/u],
+    [{ ...profile, Platform: ['iOS'] }, /macOS/u],
+    [{ ...profile, ApplicationIdentifierPrefix: [] }, /identifier prefix/u],
+    [{ ...profile, TeamIdentifier: ['ATTACKER1'] }, /signing team/u],
+    [{ ...profile, ProvisionsAllDevices: false }, /all devices/u],
+    [{ ...profile, ExpirationDate: '2001-01-01T00:00:00Z' }, /unexpired/u],
+    [{
+      ...profile,
+      Entitlements: {
+        'com.apple.application-identifier': `${TEST_TEAM_IDENTIFIER}.com.kaisola.mac`,
+        'keychain-access-groups': [`${TEST_TEAM_IDENTIFIER}.com.attacker.alias`],
+      },
+    }, /Keychain access group/u],
+  ]) {
+    assert.throws(
+      () => validateInputProvisioningProfile(changedProfile, TEST_TEAM_IDENTIFIER),
+      message,
+    )
+  }
+
+  assert.throws(
+    () => validateInputProvisioningProfile(profile, 'not-a-team'),
+    /team identifier/u,
+  )
+})
+
 test('workflow pins the signed lane and uploads only the redacted receipt', () => {
   const workflow = fs.readFileSync(
     path.join(root, '.github/workflows/native-keychain-boundaries.yml'),
@@ -326,7 +394,7 @@ test('workflow pins the signed lane and uploads only the redacted receipt', () =
   assert.doesNotMatch(workflow, /codesign --force --deep --sign - --entitlements/u)
   assert.doesNotMatch(
     workflow,
-    /^\s*(?:CODE_SIGNING_ALLOWED|CODE_SIGN_STYLE|CODE_SIGN_IDENTITY|DEVELOPMENT_TEAM|CODE_SIGN_INJECT_BASE_ENTITLEMENTS|OTHER_CODE_SIGN_FLAGS)=/mu,
+    /^\s*(?:CODE_SIGNING_ALLOWED|CODE_SIGN_STYLE|CODE_SIGN_IDENTITY|DEVELOPMENT_TEAM|CODE_SIGN_INJECT_BASE_ENTITLEMENTS|OTHER_CODE_SIGN_FLAGS|PROVISIONING_PROFILE(?:_SPECIFIER)?)=/mu,
   )
   assert.equal(
     (workflow.match(/^\s*KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_IDENTITY="Developer ID Application"/gmu) ?? []).length,
@@ -340,23 +408,48 @@ test('workflow pins the signed lane and uploads only the redacted receipt', () =
     (workflow.match(/^\s*KAISOLA_KEYCHAIN_BOUNDARY_OTHER_CODE_SIGN_FLAGS="--keychain \$KAISOLA_SIGNING_KEYCHAIN"/gmu) ?? []).length,
     2,
   )
-  assert.match(workflow, /-allowProvisioningUpdates/u)
-  assert.match(workflow, /-authenticationKeyPath/u)
+  assert.equal(
+    (workflow.match(/^\s*KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_STYLE=Manual/gmu) ?? []).length,
+    2,
+  )
+  assert.equal(
+    (workflow.match(/^\s*KAISOLA_KEYCHAIN_BOUNDARY_PROVISIONING_PROFILE_SPECIFIER="\$KAISOLA_KEYCHAIN_PROFILE_UUID"/gmu) ?? []).length,
+    2,
+  )
+  assert.doesNotMatch(workflow, /-allowProvisioningUpdates/u)
+  assert.doesNotMatch(workflow, /-authenticationKey(?:Path|ID|IssuerID)/u)
+  assert.doesNotMatch(workflow, /secrets\.APPLE_API_(?:KEY_ID|PRIVATE_KEY|ISSUER)/u)
   assert.match(workflow, /KAISOLA_KEYCHAIN_BOUNDARY_ENTITLEMENTS=/u)
+  assert.match(workflow, /secrets\.KAISOLA_KEYCHAIN_PROVISIONING_PROFILE/u)
+  assert.match(workflow, /security cms -D -i "\$profile_path"/u)
+  assert.match(workflow, /native-keychain-boundary-receipt\.cjs inspect-profile/u)
+  assert.match(
+    workflow,
+    /Library\/Developer\/Xcode\/UserData\/Provisioning Profiles/u,
+  )
+  assert.match(workflow, /\$profile_uuid\.provisionprofile/u)
+  assert.match(
+    workflow,
+    /test "\$embedded_profile_uuid" = "\$KAISOLA_KEYCHAIN_PROFILE_UUID"/u,
+  )
   assert.match(workflow, /embedded\.provisionprofile/u)
   assert.match(workflow, /--provisioning-profile/u)
   assert.match(workflow, /KAISOLA_REQUIRE_KEYCHAIN_BOUNDARIES=1/u)
   assert.match(workflow, /KAISOLA_KEYCHAIN_BOUNDARY_ISOLATION=github-hosted-ephemeral-vm/u)
   assert.match(workflow, /--cleanup-verified true/u)
+  assert.match(workflow, /--required-signature-kind developer-id/u)
   assert.match(workflow, /only-testing:KaisolaTests\/KeychainBoundaryTests/u)
   assert.match(workflow, /native-keychain-boundary-receipt\.cjs/u)
+  assert.match(workflow, /native\/KaisolaMac\/KaisolaMac\.xcodeproj\/project\.pbxproj/u)
   assert.match(workflow, /path:\s*[^\n]*keychain-boundary-receipt\.json/u)
   assert.doesNotMatch(workflow, /path:\s*[^\n]*(?:\.xcresult|xcodebuild|tests\.json)/u)
 
   for (const setting of [
     'CODE_SIGN_IDENTITY = "\\$\\(KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_IDENTITY\\)";',
+    'CODE_SIGN_STYLE = "\\$\\(KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_STYLE\\)";',
     'DEVELOPMENT_TEAM = "\\$\\(KAISOLA_KEYCHAIN_BOUNDARY_DEVELOPMENT_TEAM\\)";',
     'OTHER_CODE_SIGN_FLAGS = "\\$\\(inherited\\) \\$\\(KAISOLA_KEYCHAIN_BOUNDARY_OTHER_CODE_SIGN_FLAGS\\)";',
+    'PROVISIONING_PROFILE_SPECIFIER = "\\$\\(KAISOLA_KEYCHAIN_BOUNDARY_PROVISIONING_PROFILE_SPECIFIER\\)";',
   ]) {
     assert.equal(
       (project.match(new RegExp(setting, 'gu')) ?? []).length,
@@ -369,8 +462,33 @@ test('workflow pins the signed lane and uploads only the redacted receipt', () =
     1,
   )
   assert.match(project, /KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_IDENTITY = "-";/u)
+  assert.match(project, /KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_STYLE = Automatic;/u)
   assert.match(project, /KAISOLA_KEYCHAIN_BOUNDARY_DEVELOPMENT_TEAM = "";/u)
   assert.match(project, /KAISOLA_KEYCHAIN_BOUNDARY_OTHER_CODE_SIGN_FLAGS = "";/u)
+  assert.match(project, /KAISOLA_KEYCHAIN_BOUNDARY_PROVISIONING_PROFILE_SPECIFIER = "";/u)
+
+  const debugConfigurations = [...project.matchAll(
+    /^\t\t[A-F0-9]+ \/\* Debug \*\/ = \{\n([\s\S]*?)^\t\t\};$/gmu,
+  )].map(([block]) => block)
+  function debugConfiguration(bundleIdentifierSetting) {
+    const block = debugConfigurations.find((candidate) => candidate.includes(
+      `PRODUCT_BUNDLE_IDENTIFIER = ${bundleIdentifierSetting};`,
+    ))
+    assert.ok(block, `missing Debug configuration for ${bundleIdentifierSetting}`)
+    return block
+  }
+
+  const appDebug = debugConfiguration('com.kaisola.mac')
+  assert.match(appDebug, /CODE_SIGN_STYLE = "\$\(KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_STYLE\)";/u)
+  assert.match(appDebug, /PROVISIONING_PROFILE_SPECIFIER = "\$\(KAISOLA_KEYCHAIN_BOUNDARY_PROVISIONING_PROFILE_SPECIFIER\)";/u)
+  for (const dependencyDebug of [
+    debugConfiguration('com.kaisola.mac.tests'),
+    debugConfiguration('"com.kaisola.mac.broker-bootstrap"'),
+  ]) {
+    assert.match(dependencyDebug, /CODE_SIGN_STYLE = Automatic;/u)
+    assert.doesNotMatch(dependencyDebug, /KAISOLA_KEYCHAIN_BOUNDARY_/u)
+    assert.doesNotMatch(dependencyDebug, /PROVISIONING_PROFILE_SPECIFIER/u)
+  }
 
   const contractStart = workflow.indexOf('  contract:')
   const physicalStart = workflow.indexOf('  keychain-boundaries:')
@@ -389,5 +507,8 @@ test('workflow pins the signed lane and uploads only the redacted receipt', () =
     /github\.event\.pull_request\.head\.repo\.full_name == github\.repository/u,
   )
   assert.match(physicalJob, /secrets\.CSC_LINK/u)
-  assert.match(physicalJob, /secrets\.APPLE_API_PRIVATE_KEY/u)
+  assert.match(physicalJob, /secrets\.KAISOLA_KEYCHAIN_PROVISIONING_PROFILE/u)
+  assert.match(physicalJob, /rm -f "\$\{signing_material\[@\]\}"/u)
+  assert.match(physicalJob, /test ! -e "\$material"/u)
+  assert.match(physicalJob, /KAISOLA_INSTALLED_PROVISIONING_PROFILE/u)
 })

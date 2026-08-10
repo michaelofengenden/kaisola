@@ -194,7 +194,48 @@ function validateProvisioningProfile(profile, signature, identity) {
   return `${signature.kind}-profile-authorized`
 }
 
-function validateBoundaryEvidence(evidence) {
+function validateInputProvisioningProfile(profile, teamIdentifier) {
+  if (!/^[A-Z0-9]{10}$/u.test(teamIdentifier || '')) {
+    fail('input signing team identifier must be exactly 10 uppercase letters or digits')
+  }
+  if (!profile || typeof profile !== 'object' || Array.isArray(profile)) {
+    fail('input provisioning profile must be an object')
+  }
+
+  const uuid = profile.UUID
+  if (typeof uuid !== 'string'
+      || !/^[0-9A-F]{8}(?:-[0-9A-F]{4}){3}-[0-9A-F]{12}$/iu.test(uuid)) {
+    fail('input provisioning profile UUID is invalid')
+  }
+  if (typeof profile.Name !== 'string'
+      || profile.Name.trim().length === 0
+      || Buffer.byteLength(profile.Name, 'utf8') > 256) {
+    fail('input provisioning profile name is missing or over its byte limit')
+  }
+  if (!Array.isArray(profile.Platform)
+      || profile.Platform.length !== 1
+      || profile.Platform[0] !== 'OSX') {
+    fail('input provisioning profile must target only macOS')
+  }
+
+  const identifierPrefix = Array.isArray(profile.ApplicationIdentifierPrefix)
+    && profile.ApplicationIdentifierPrefix.length === 1
+    ? profile.ApplicationIdentifierPrefix[0]
+    : null
+  if (!/^[A-Z0-9]{10}$/u.test(identifierPrefix || '')) {
+    fail('input provisioning profile must contain one valid application identifier prefix')
+  }
+
+  const applicationIdentifier = `${identifierPrefix}.${EXPECTED_IDENTIFIER}`
+  validateProvisioningProfile(
+    profile,
+    { kind: 'developer-id', teamIdentifier },
+    { applicationIdentifier, identifierPrefix },
+  )
+  return { uuid: uuid.toUpperCase() }
+}
+
+function validateBoundaryEvidence(evidence, options = {}) {
   if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) {
     fail('evidence must be an object')
   }
@@ -211,6 +252,14 @@ function validateBoundaryEvidence(evidence) {
   }
 
   const parsedSignature = parseSignature(evidence.host?.signature)
+  if (options.requiredSignatureKind !== undefined) {
+    if (options.requiredSignatureKind !== 'developer-id') {
+      fail('required signature kind must be developer-id')
+    }
+    if (parsedSignature.kind !== options.requiredSignatureKind) {
+      fail('physical boundary host must use a Developer ID Application signature')
+    }
+  }
   const identity = validateEntitlements(
     evidence.host?.entitlements,
     parsedSignature,
@@ -305,16 +354,44 @@ function sealFromCLI(argv) {
       cleanupVerified: required(options, '--cleanup-verified') === 'true',
     },
   }
-  const receipt = validateBoundaryEvidence(evidence)
+  const receipt = validateBoundaryEvidence(evidence, {
+    requiredSignatureKind: required(options, '--required-signature-kind'),
+  })
   const output = path.resolve(required(options, '--output'))
   fs.mkdirSync(path.dirname(output), { recursive: true, mode: 0o700 })
   fs.writeFileSync(output, `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 })
   process.stdout.write(`Keychain boundary receipt sealed: ${receipt.testCount} tests passed\n`)
 }
 
+function inspectProfileFromCLI(argv) {
+  const options = parseOptions(argv)
+  const profile = readJSON(
+    required(options, '--profile'),
+    'input provisioning profile',
+  )
+  const result = validateInputProvisioningProfile(
+    profile,
+    required(options, '--team-identifier'),
+  )
+  process.stdout.write(`${result.uuid}\n`)
+}
+
+function runCLI(argv) {
+  const [command, ...rest] = argv
+  if (command === 'seal') {
+    sealFromCLI(argv)
+    return
+  }
+  if (command === 'inspect-profile') {
+    inspectProfileFromCLI(rest)
+    return
+  }
+  fail('expected the seal or inspect-profile command')
+}
+
 if (require.main === module) {
   try {
-    sealFromCLI(process.argv.slice(2))
+    runCLI(process.argv.slice(2))
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : 'Keychain receipt failed'}\n`)
     process.exitCode = 1
@@ -325,9 +402,11 @@ module.exports = {
   REQUIRED_TESTS,
   collectTestCases,
   parseSignature,
+  runCLI,
   sealFromCLI,
   validateBoundaryEvidence,
   validateEntitlements,
+  validateInputProvisioningProfile,
   validateProvisioningProfile,
   validateSummary,
 }

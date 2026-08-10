@@ -5,6 +5,49 @@ import XCTest
 @testable import Kaisola
 
 final class ObserveOnlyBrokerClientTests: XCTestCase {
+    func testInventoryResponseUsesCorrelatedMethodLimitBeforeDecode() async throws {
+        let transport = ScriptedBrokerTransport()
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 500_000_000
+        )
+        _ = try await client.connect(to: brokerInfo)
+        let inventory = Task { try await client.inventory() }
+        var requestID: String?
+        for _ in 0..<100 {
+            requestID = await transport.sentFrames().last?.objectValue?["id"]?.stringValue
+            if requestID != nil { break }
+            try await Task.sleep(nanoseconds: 1_000_000)
+        }
+        let id = try XCTUnwrap(requestID)
+        var response = try JSONEncoder().encode(JSONValue.object([
+            "type": .string("response"),
+            "id": .string(id),
+            "ok": .bool(true),
+            "result": .object([
+                "padding": .string(
+                    String(
+                        repeating: "x",
+                        count: BrokerWire.maximumEncodedBytes(for: .response("broker.status"))
+                    )
+                ),
+            ]),
+        ]))
+        response.append(0x0A)
+        await transport.inject(response)
+
+        do {
+            _ = try await inventory.value
+            XCTFail("broker.status must not inherit the 56 MiB transport ceiling.")
+        } catch {
+            XCTAssertEqual(
+                error as? BrokerWireError,
+                .frameTooLarge(maximum: BrokerWire.maximumEncodedBytes(for: .response("broker.status")))
+            )
+        }
+        await client.disconnect()
+    }
+
     func testConcurrentConnectsToSameBrokerShareOneTransportAndHandshake() async throws {
         let transport = ScriptedBrokerTransport(
             suspendConnect: true,
@@ -289,6 +332,29 @@ final class ObserveOnlyBrokerClientTests: XCTestCase {
         await client.disconnect()
     }
 
+    func testActivityEpochProbeUsesOnlyBrokerStatus() async throws {
+        let transport = ScriptedBrokerTransport(
+            helloAccess: "observer",
+            advertiseObserverRole: true,
+            replyToRequests: true,
+            activityEpoch: 73
+        )
+        let client = ObserveOnlyBrokerClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        _ = try await client.connect(to: brokerInfo)
+
+        let activityEpoch = try await client.inventoryActivityEpoch()
+        let methods = await transport.sentFrames().compactMap {
+            $0.objectValue?["method"]?.stringValue
+        }
+
+        XCTAssertEqual(activityEpoch, 73)
+        XCTAssertEqual(methods, ["broker.status"])
+        await client.disconnect()
+    }
+
     func testHistoryUsesBoundedTypedObserverRequest() async throws {
         let transport = ScriptedBrokerTransport(
             helloAccess: "observer",
@@ -513,6 +579,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     private let packageVersion: String?
     private let contentDigest: String?
     private let statusImplementationVersion: Int?
+    private let activityEpoch: Int64
     private let subscribeOutput: String?
     private let subscribeStartOffset: Int64
     private let historyPageBytes: Int?
@@ -539,6 +606,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         packageVersion: String? = "1.0.0",
         contentDigest: String? = String(repeating: "a", count: 64),
         statusImplementationVersion: Int? = nil,
+        activityEpoch: Int64 = 1,
         subscribeOutput: String? = nil,
         subscribeStartOffset: Int64 = 0,
         historyPageBytes: Int? = nil
@@ -555,6 +623,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
         self.packageVersion = packageVersion
         self.contentDigest = contentDigest
         self.statusImplementationVersion = statusImplementationVersion
+        self.activityEpoch = activityEpoch
         self.subscribeOutput = subscribeOutput
         self.subscribeStartOffset = subscribeStartOffset
         self.historyPageBytes = historyPageBytes
@@ -629,6 +698,7 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
                 "securityEpoch": .integer(Int64(BrokerWire.securityEpoch)),
                 "pid": .integer(12_345),
                 "startedAt": .integer(1_784_250_001_000),
+                "activityEpoch": .integer(activityEpoch),
             ]
             if let value = statusImplementationVersion ?? implementationVersion {
                 status["implementationVersion"] = .integer(Int64(value))
@@ -713,6 +783,8 @@ private actor ScriptedBrokerTransport: BrokerByteTransport {
     }
 
     func sentFrames() -> [JSONValue] { frames }
+
+    func inject(_ data: Data?) { deliver(data) }
 
     private func encoded(_ frame: JSONValue) throws -> Data {
         var data = try JSONEncoder().encode(frame)

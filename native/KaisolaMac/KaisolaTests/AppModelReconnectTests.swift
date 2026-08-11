@@ -237,6 +237,45 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    /// A busy agent flaps between the same two activity states for as long as
+    /// it runs. Each of those used to write into the @Published sessions array,
+    /// and writing one element republishes the array, so every repeat cost a
+    /// full-model invalidation to announce the value the model already held.
+    func testRepeatedIdenticalActivityDoesNotRepublishTheModel() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [])
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        let terminalID = ReconnectBrokerClient.firstTerminalID
+        let subscribedOwnerID = await fixture.client.subscribedOwnerID(for: terminalID)
+        let ownerID = try XCTUnwrap(subscribedOwnerID)
+
+        // Establish the busy state first; that transition is a real change.
+        await fixture.client.emitActivity(for: terminalID, ownerID: ownerID, busy: true)
+        try await Task.sleep(for: .milliseconds(30))
+
+        var publications = 0
+        let watcher = fixture.model.objectWillChange.sink { _ in publications += 1 }
+        defer { watcher.cancel() }
+
+        for _ in 0..<10 {
+            await fixture.client.emitActivity(for: terminalID, ownerID: ownerID, busy: true)
+        }
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(publications, 0, "repeating a state the model already holds must not republish it")
+
+        // A real edge still gets through, or the guard would be hiding changes
+        // rather than suppressing noise.
+        await fixture.client.emitActivity(
+            for: terminalID,
+            ownerID: ownerID,
+            busy: false,
+            completedAt: 1_784_250_009_000
+        )
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertGreaterThan(publications, 0, "a genuine busy-to-responded edge still publishes")
+        await fixture.model.disconnect()
+    }
+
     func testSecondaryBrokerBurstPublishesOnlyItsTerminalCard() async throws {
         let fixture = try Fixture(failingConnectAttempts: [])
         defer { fixture.cleanUp() }

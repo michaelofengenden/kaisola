@@ -6850,7 +6850,14 @@ final class AppModel: ObservableObject {
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 defer { self.metaScanTask = nil }
-                self.metaByTerminalID = collected
+                // Guarded because this runs every 5s whether or not the process
+                // table moved, and an unguarded assignment to a @Published
+                // property republishes the whole model — invalidating every view
+                // that observes it — to say nothing changed. The inventory tick
+                // below already compares before assigning; this is the same rule.
+                if self.metaByTerminalID != collected {
+                    self.metaByTerminalID = collected
+                }
                 self.detectedAgentNamesByTerminalID = self.detectedAgentNamesByTerminalID.filter {
                     collected[$0.key] != nil
                 }
@@ -6893,8 +6900,15 @@ final class AppModel: ObservableObject {
             }
             let branches = result
             await MainActor.run { [weak self] in
-                self?.branchesByCwd = branches
-                self?.branchScanTask = nil
+                guard let self else { return }
+                // Same guard as the process-table scan: this fires every 10s and
+                // a branch rarely changes between two of them, so an unguarded
+                // write spends a full-model invalidation announcing that nothing
+                // moved.
+                if self.branchesByCwd != branches {
+                    self.branchesByCwd = branches
+                }
+                self.branchScanTask = nil
             }
         }
     }
@@ -7928,24 +7942,32 @@ final class AppModel: ObservableObject {
         if !busy { acknowledgedAgentTurnTerminalIDs.remove(terminalID) }
         guard let index = sessions.firstIndex(where: { $0.id == terminalID }) else { return }
         let wasWorking = { if case .working = sessions[index].agentActivity { return true }; return false }()
-        if busy {
-            sessions[index].agentActivity = .working
+        let activity: AgentActivity = if busy {
+            .working
         } else if let completedAt {
-            sessions[index].agentActivity = .responded(at: completedAt)
-            // A completed terminal remains a needs-you moment until visited,
-            // even if it finished in the currently visible project.
-            if wasWorking {
-                let detectedCLI = detectedAgentNamesByTerminalID[terminalID]
-                attentionCenter.notifySessionResponded(
-                    targetID: terminalID,
-                    title: sessionTitle(for: sessions[index]),
-                    detail: detectedCLI.map { "\($0) finished" } ?? "Agent responded",
-                    completedAt: completedAt
-                )
-            }
+            .responded(at: completedAt)
         } else {
-            sessions[index].agentActivity = .idle
+            .idle
         }
+        if case let .responded(at: completedAt) = activity, wasWorking {
+            // A completed terminal remains a needs-you moment until visited,
+            // even if it finished in the currently visible project. Keyed on the
+            // working edge, not on the assignment, so the guard below cannot
+            // swallow it.
+            let detectedCLI = detectedAgentNamesByTerminalID[terminalID]
+            attentionCenter.notifySessionResponded(
+                targetID: terminalID,
+                title: sessionTitle(for: sessions[index]),
+                detail: detectedCLI.map { "\($0) finished" } ?? "Agent responded",
+                completedAt: completedAt
+            )
+        }
+        // Writing one element of a @Published array republishes the array, and
+        // this runs on the live broker activity stream, where a busy agent flaps
+        // between the same two states repeatedly. Every one of those wrote a
+        // full-model invalidation to announce the value it already held.
+        guard sessions[index].agentActivity != activity else { return }
+        sessions[index].agentActivity = activity
     }
 
     /// Inventory and observer events share one broker socket but can be

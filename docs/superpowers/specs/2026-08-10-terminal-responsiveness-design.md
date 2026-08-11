@@ -1,7 +1,7 @@
 # Terminal responsiveness for CLI agent sessions
 
 Date: 2026-08-10
-Status: revised after Codex plan-review, ready for user review
+Status: revised after two Codex plan-review rounds, ready for user review
 Base: `3a5aca1f3` (merge of PR #800, tagged `v0.1.114`)
 Branch: `perf/terminal-responsiveness`
 
@@ -97,9 +97,13 @@ A keystroke fixture in the style of the continuous-scroll fixture
 
 **The responder.** Not `cat`. A PTY in default mode echoes through the line
 discipline *and* through `cat`, so every keystroke produces two glyphs and the
-correlation is ambiguous. The fixture runs `stty -echo` first and uses a small
-responder that emits one known byte per input byte. Deterministic, single echo,
-no prompt, no OSC 133, no repaints.
+correlation is ambiguous.
+
+The fixture runs `stty raw -echo` (equivalently `-icanon -echo`) and uses a small
+responder that emits one known byte per input byte. Turning off echo alone is not
+enough: canonical mode still buffers until a newline, so a `read(1)` would block
+and single keystrokes would not produce single responses. The responder must read
+in raw mode or the probe measures nothing.
 
 **Timestamps.** All on one time base; `NSEvent.timestamp` and
 `ProcessInfo.systemUptime` already share it (`Features/Sessions/TerminalInputPolicy.swift:478`).
@@ -179,6 +183,24 @@ create and attach, it survives reconnect, input recovery, and startup restore.
 The previous draft's acceptance test covered only create and would have missed
 every reattach path.
 
+Three sites can enable primary delivery: new live records
+(`terminalManager.cjs:701-716`), cold-restored records (`:623-636`), and
+`setSender` (`:965-995`), whose only production callers are create
+(`terminalCreateRoute.cjs:389`) and attach (`:311`). Snapshot resume
+(`terminalManager.cjs:1139-1199`) does not enable it, and rolling generations
+route through ordinary attach (`Broker/BrokerGenerationRouting.swift:450-505`).
+So create and attach are sufficient coverage.
+
+**Plumbing that does not exist yet.** The `terminal.attach` dispatcher passes
+neither `params` nor `client.features` into `terminalAttachRoute`
+(`runtime/node-broker/session-broker.cjs:535-543`; the route signature at
+`terminalCreateRoute.cjs:290-298` accepts neither). Attach must carry the
+requested mode, and the broker must validate it against that specific
+connection's negotiated features. Capability is resolved **per routed broker
+client**, not globally: during a rolling upgrade the current and draining
+generations can have negotiated differently, and a global flag would apply one
+generation's answer to the other.
+
 `terminal:data:<id>` remains a supported contract. Existing tests that assert on
 it (`tests/node/terminalManager.test.cjs:467-553`,
 `tests/node/brokerUpgradeIntegration.test.cjs:678`) keep passing by not requesting
@@ -196,14 +218,39 @@ discontinuity surfaced to any client. A control-socket disconnect can detach the
 renderer while independent app and Companion observer sockets stay live, so this
 is reachable, not theoretical.
 
-**Mandatory synchronous flush** of the observer buffer before each of: observer
-exit, snapshot-required and gap boundaries, release and record deletion, stream
-epoch change, activity events, and controller attach or detach. The exit path
-already does exactly this for the primary buffer at `terminalManager.cjs:867`,
-with the comment "the tail of the stream must land before the exit signal". The
-observer path needs the same treatment or the exit event overtakes the terminal's
-final output. This is data loss, and it is the single most dangerous thing in
-this design.
+**Mandatory synchronous flush** of the observer buffer before each of:
+
+- observer exit
+- snapshot-required and gap boundaries
+- release and record deletion
+- stream epoch change
+- controller attach or detach
+- **observer subscribe and resubscribe**
+- **explicit `terminal.snapshot` and `terminal.output` responses**
+
+The exit path already does this for the primary buffer at
+`terminalManager.cjs:867`, with the comment "the tail of the stream must land
+before the exit signal". The observer path needs the same or the exit event
+overtakes the terminal's final output. This is data loss and it is the most
+dangerous thing in this design.
+
+The last two entries are the subtle ones, and both produce *duplicate* delivery
+rather than loss. `snapshotRecord` reports an `endOffset` taken from the cursor
+(`terminalManager.cjs:1176-1184`), which has already advanced past bytes still
+sitting in the observer buffer. A new subscriber therefore receives those bytes in
+its snapshot and again when the timer fires. The app answers a duplicate with gap
+recovery and Companion resets its projection. `terminal.snapshot` and
+`terminal.output` return `manager.snapshot(...)` directly
+(`session-broker.cjs:606-610`) and have the same problem. Attach and subscribe are
+different operations on different sockets; listing only attach is not enough.
+
+**Activity ordering needs a code change, not a flush.** `settleAgentTurn` calls
+`broadcastAgentActivity()` (`terminalManager.cjs:778-792`) and is invoked from the
+data callback at `:849`, before the `splitUtf8` and cursor-append loop at
+`:850-855`. So the activity event is emitted before the bytes that caused it
+exist in the buffer, and no flush inside the broadcast can reach them. Fix by
+appending first and settling after, so the causal bytes are flushable when the
+activity event goes out.
 
 **Focus.** The 100 ms blurred window stays out of the broker. `terminal.setFocused`
 is a global per-record flag with no production wiring, and moving the blurred
@@ -217,16 +264,32 @@ cap, which forces one `terminal:observer-snapshot-required` and then pauses the
 subscriber until it resubscribes, deleting it if the marker itself fails
 (`ipc/terminalObservers.cjs:50-81`). Queue acceptance uses encoded frame size plus
 `socket.writableLength`, not payload length, and JSON escaping expands ESC-dense
-agent output several times over. The coalescer therefore caps on *encoded*
-estimated size, not accumulated payload bytes, and the cap is set below the
-default 256 KiB queue budget.
+agent output several times over. So the coalescer caps on *encoded* estimated
+size, not accumulated payload bytes.
 
-**Then remove the app-side window** at `AppModel.swift:7577-7593`, draining on the
-same runloop turn instead. Note the app batcher is not pure overhead: it merges
-contiguous offsets and triggers gap recovery on discontinuity
-(`AppModel.swift:7537-7593`, recovery at `:7621-7643`). That merge and recovery
-logic stays; only the 16 ms sleep goes. A coalescer bug surfaces as gap recovery,
-which is visible and loud, not as silently dropped output.
+The cap is set against the **64 KiB configurable floor**
+(`MIN_OBSERVER_QUEUE_BYTES`, `ipc/terminalObservers.cjs:4`), not the 256 KiB
+default. A 200 KiB frame would satisfy a cap written against the default and still
+overflow a legitimately configured 64 KiB subscriber.
+
+Flushing before accumulating is not sufficient on its own. A single `splitUtf8`
+piece can already be 64 KiB before escaping (`terminalManager.cjs:428-443`), and
+control-dense output can expand one piece past the cap by itself. The coalescer
+must therefore be able to re-split an oversized single piece on UTF-8 boundaries,
+not merely decline to add it to an accumulator.
+
+**Then remove the app-side window** at `AppModel.swift:7577-7593` — but
+conditionally, not unconditionally. The app keeps its 16 ms timer for any terminal
+whose broker generation did not negotiate broker-side coalescing. Removing it
+outright would mean a new app against an old broker has no coalescer anywhere and
+pipes raw PTY chunks straight to the MainActor, which is worse than today. The
+compatibility matrix's "output renders" check would pass while that happened, so
+the mixed-version test asserts on batch rate, not just on rendering.
+
+The app batcher is not pure overhead in any case: it merges contiguous offsets and
+triggers gap recovery on discontinuity (`AppModel.swift:7537-7593`, recovery at
+`:7621-7643`). That logic stays. Only the sleep becomes conditional. A coalescer
+bug surfaces as gap recovery, which is loud, not as silently dropped output.
 
 #### 1.4 Fast-path the UTF-8 repair
 
@@ -313,27 +376,41 @@ is dropped.
 
 #### 2.1 Publish narrow projections, then cut the forwarding
 
-The forwarding cannot simply be deleted. Three consumers read nested conversation
+The forwarding cannot simply be deleted. Five consumers read nested conversation
 state *through* `AppModel`:
 
 - `SessionStrip` observes only `AppModel` but reads conversation title, running
   state, usage, and Mesh state (`RootShellView.swift:4510-4617`).
+- `RootShellView`'s surface chrome makes the same direct nested reads outside
+  `SessionStrip` (`RootShellView.swift:2730-2781`).
+- `QuietProjectRail` observes only `AppModel` (`Features/Sessions/QuietProjectRail.swift:542-544`)
+  and reads nested titles and Mesh stage (`:1076-1090`) plus `isRunning`,
+  `isConnected`, pending permissions, and status message (`:1227-1244`). Its
+  badges, tooltips, and attention state go stale silently if these are missed.
 - The Companion projection subscribes to `AppModel.objectWillChange` to rebuild
-  what the phone shows (`App/KaisolaMacAppDelegate.swift:2056-2090`).
-- Mesh overview and permission state depend on the same nesting
-  (`Mesh/MeshSession.swift:1513-1515`, `Mesh/MeshView.swift:615-683`).
+  what the phone shows (`App/KaisolaMacAppDelegate.swift:2056-2090`), and its
+  draft builder also reads `hasLocalTranscript` (`AppModel.swift:731-765`).
+- Mesh overview and permission state need column IDs, pending permissions, stage,
+  and per-column running state (`Mesh/MeshSession.swift:1513-1515`,
+  `Mesh/MeshView.swift:611-683`).
+
+The projection contract must therefore cover more than per-chat title, running
+state, and usage. It needs `hasLocalTranscript`, `isConnected`, pending
+permissions, status message, and the per-column Mesh fields above. The rule for
+the implementation: enumerate every nested read across all five consumers first,
+and let that enumeration define the projection, rather than defining a projection
+and hoping it covers them.
 
 Order, and it matters:
 
-1. Add narrow `@Published` projections on `AppModel` for what those three
-   actually read: per-chat title, running state, and usage totals. These update
-   on change, not per token.
-2. Repoint `SessionStrip`, the Companion projection, and Mesh overview at the
-   projections.
-3. Only then remove the five forwards, one at a time, each with a visual fixture.
+1. Enumerate the nested reads across all five consumers.
+2. Add narrow `@Published` projections on `AppModel` covering exactly that set.
+   These update on change, not per token.
+3. Repoint all five consumers at the projections.
+4. Only then remove the five forwards, one at a time, each with a visual fixture.
 
-Step 3 before steps 1 and 2 breaks Mesh state and the phone's view of a session,
-and neither failure shows up in a unit test.
+Removing forwards before the repointing breaks Mesh state, the sidebar rail, and
+the phone's view of a session. None of those failures shows up in a unit test.
 
 The end state matches what terminals already do: `publishTerminalSurfaceDocument`
 (`AppModel.swift:5249`) writes a plain dictionary and calls `feed.replace(...)` on
@@ -405,24 +482,37 @@ and re-measured after each layer.
 | 1.2 | Broker upgrade with live terminals |
 | 1.3 | Final chunk immediately followed by exit: the output lands before `terminal:observer-exit`, including with a slow or paused observer |
 | 1.3 | Attach during a pending observer batch does not discard it |
+| 1.3 | **Subscribe** during a pending observer batch delivers those bytes exactly once, not in both the snapshot and the next timer flush |
+| 1.3 | `terminal.snapshot` and `terminal.output` during a pending batch: same, exactly once |
+| 1.3 | An agent-settled activity event carries bytes appended in the same chunk, proving the append-then-settle reorder |
 | 1.3 | Control-socket loss while observer sockets survive does not discard observer bytes |
-| 1.3 | Encoded-size cap keeps frames under the observer queue budget; overflow still produces exactly one snapshot-required and a resubscribable subscriber |
+| 1.3 | Encoded-size cap holds against a **64 KiB** subscriber, not just the 256 KiB default; a single oversized piece re-splits on a UTF-8 boundary rather than overflowing |
+| 1.3 | Overflow still produces exactly one snapshot-required and a resubscribable subscriber |
+| 1.3 | New app against a broker generation without broker-side coalescing keeps the app-side window: assert on **batch rate**, not merely that output renders |
 | 1.3 | Companion: multiple subscribers, resubscription after snapshot-required, exit ordering |
 | 1.4 | Property test: fast path equals slow path for valid UTF-8 including astral-plane characters; lone surrogates still repair |
 | 1.5 | A frame over its method cap is still rejected; malformed inbound frames still rejected |
 | 1.7 | Value updates with VoiceOver on, is not built with it off, and repopulates when VoiceOver is enabled mid-session |
-| 2.1 | Per removed forward: a visual fixture covering `SessionStrip`, Mesh overview and permissions, and the Companion projection |
+| 2.1 | Per removed forward: a visual fixture covering `SessionStrip`, `RootShellView` surface chrome, `QuietProjectRail` badges and attention state, Mesh overview and permissions, and the Companion projection |
 | 2.2 | Cache invalidates on project rename and on session close, not only on session add |
 | 2.3 | Assignment skipped when unchanged |
 
 ## Risk
 
-**1.2 and 1.3 are one atomic app-and-broker change, not two revertable items.**
-A new app against an old broker would remove the only observer coalescer and pipe
-raw chunks to the MainActor; an old app against a new broker keeps two windows.
-Reverting the broker side alone while the app side stays applied is a severe
-regression. They ship together, behind the negotiated feature, and revert
-together.
+**1.1 through 1.3 are one atomic app-and-broker change, not three revertable
+items.** 1.2 reads `primaryStreamEnabled`, which 1.1 introduces, so reverting 1.1
+alone while 1.2 stays does not compile. The previous draft declared only 1.2 and
+1.3 atomic and contradicted itself.
+
+The one exception: 1.1 can land alone *as a pure prerequisite*, adding the field
+and threading it through `deliverPrimaryOutput` with the default left at true, so
+behavior is unchanged and it is safely revertable on its own. Once 1.2 requests
+it, the three move as a unit.
+
+Beyond compilation, the pairing is behavioral. An old app against a new broker
+keeps two coalescing windows, which is merely slower. A new app against an old
+broker is the dangerous direction, which is why the app-side window removal in 1.3
+is conditional on the negotiated generation rather than unconditional.
 
 The rest of Layer 1 and all of Layer 2 are independently revertable.
 

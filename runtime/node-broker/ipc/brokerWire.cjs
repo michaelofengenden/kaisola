@@ -47,6 +47,13 @@ const TERMINAL_EXIT_STATUS_FEATURE = 'terminal-exit-status-v1'
 // accounting are untouched either way: this decides what is sent, not who owns
 // the terminal or whether a renderer is attached.
 const TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE = 'terminal-observer-only-output-v1'
+// terminal.attach answers { id, ok } rather than a bare snapshot, so a caller
+// can tell "I adopted this terminal" from "the broker replied". Declaring it
+// tells the client the acknowledgement is available to check; a broker without
+// it cannot answer the question, and a client must not read that silence as a
+// refusal — doing so is what left every terminal read-only when v0.1.114 met a
+// retained v0.1.113 broker.
+const TERMINAL_ATTACH_ACK_FEATURE = 'terminal-attach-ack-v1'
 const FEATURES = Object.freeze([
   TERMINAL_OBSERVE_FEATURE,
   TERMINAL_HISTORY_FEATURE,
@@ -59,6 +66,7 @@ const FEATURES = Object.freeze([
   BROKER_ADMINISTRATION_FEATURE,
   TERMINAL_EXIT_STATUS_FEATURE,
   TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE,
+  TERMINAL_ATTACH_ACK_FEATURE,
 ])
 const TERMINAL_EXIT_CHANNEL_PREFIX = 'terminal:exit:'
 const CONTROLLER_ACCESS = 'controller'
@@ -378,6 +386,7 @@ module.exports = {
   MAX_CONFIGURABLE_LIVE_TERMINALS,
   TERMINAL_EXIT_STATUS_FEATURE,
   TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE,
+  TERMINAL_ATTACH_ACK_FEATURE,
   TERMINAL_EXIT_CHANNEL_PREFIX,
   FEATURES,
   CONTROLLER_ACCESS,

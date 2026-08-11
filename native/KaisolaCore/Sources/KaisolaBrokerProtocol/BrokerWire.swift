@@ -23,6 +23,12 @@ public enum BrokerWire {
     /// the one being kept. A broker too old to know the feature keeps sending a
     /// channel we were discarding anyway, so there is nothing to fall back to.
     public static let terminalObserverOnlyOutputFeature = "terminal-observer-only-output-v1"
+    /// The broker acknowledges `terminal.attach` with `{ id, ok }` rather than a
+    /// bare snapshot, so a caller can tell adoption from a broker that merely
+    /// answered. Brokers retained from before this cannot say either way, and
+    /// demanding proof they are incapable of giving is what left every terminal
+    /// read-only after the v0.1.114 update.
+    public static let terminalAttachAcknowledgementFeature = "terminal-attach-ack-v1"
     public static let terminalHistoryFeature = "terminal-history-v1"
     public static let observerRoleFeature = "observer-role-v1"
     public static let brokerUpdateFeature = "broker-update-v1"

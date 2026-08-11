@@ -364,6 +364,7 @@ final class AppModel: ObservableObject {
     private var pendingTerminalOutputOrder: [String] = []
     private var terminalOutputFlushTask: Task<Void, Never>?
     private var terminalOutputFlushGeneration = 0
+    private var lastTerminalOutputDrainUptime: UInt64 = 0
     static let terminalOutputFrameNanoseconds: UInt64 = 16_000_000
     /// One intent token per secondary subscription. Tokens fence late broker
     /// replies after minimize, promotion, reconnect, or a newer subscribe for
@@ -7574,8 +7575,30 @@ final class AppModel: ObservableObject {
         scheduleTerminalOutputFlush()
     }
 
+    /// Leading edge first, trailing edge only under load.
+    ///
+    /// This window was written when the broker broadcast observer output once
+    /// per pty chunk, so batching here was the only thing standing between an
+    /// agent redraw and a hundred main-thread passes a second. The broker
+    /// coalesces on its own window now, so in the ordinary case exactly one
+    /// batch arrives per frame and sleeping on it added a frame of latency to
+    /// every keystroke while merging nothing.
+    ///
+    /// Sleeping unconditionally is still right when batches genuinely are
+    /// arriving faster than a frame — an older broker that does not coalesce,
+    /// or a burst large enough to split. So the first batch after a quiet
+    /// period goes straight through, and anything arriving inside the next
+    /// frame is held and merged as before. No capability negotiation: this is
+    /// measured from actual arrival rate, so it degrades correctly against a
+    /// broker of any vintage.
     private func scheduleTerminalOutputFlush() {
         guard terminalOutputFlushTask == nil else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        if now &- lastTerminalOutputDrainUptime >= Self.terminalOutputFrameNanoseconds {
+            lastTerminalOutputDrainUptime = now
+            drainPendingTerminalOutputs()
+            return
+        }
         terminalOutputFlushGeneration &+= 1
         let generation = terminalOutputFlushGeneration
         terminalOutputFlushTask = Task { @MainActor [weak self] in
@@ -7588,6 +7611,7 @@ final class AppModel: ObservableObject {
                   !Task.isCancelled,
                   generation == self.terminalOutputFlushGeneration else { return }
             self.terminalOutputFlushTask = nil
+            self.lastTerminalOutputDrainUptime = DispatchTime.now().uptimeNanoseconds
             self.drainPendingTerminalOutputs()
         }
     }

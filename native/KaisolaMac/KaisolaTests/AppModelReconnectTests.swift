@@ -202,6 +202,41 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    /// The same burst against a broker that already batched it. The app must
+    /// not run a second window on top of the broker's: two stacked windows
+    /// spend up to two frames of latency merging what one already merged, which
+    /// is worse for the keystroke path than the per-chunk delivery this was
+    /// originally written to absorb.
+    func testBrokerSideCoalescingReplacesTheAppWindowRatherThanStackingOnIt() async throws {
+        let fixture = try Fixture(failingConnectAttempts: [], advertisesObserverCoalescing: true)
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        let feed = try XCTUnwrap(fixture.model.terminalSurfaceFeed(
+            for: ReconnectBrokerClient.firstTerminalID
+        ))
+        var terminalPublications = 0
+        var shellPublications = 0
+        let terminalWatcher = feed.$document.dropFirst().sink { _ in terminalPublications += 1 }
+        let shellWatcher = fixture.model.objectWillChange.sink { _ in shellPublications += 1 }
+        defer {
+            terminalWatcher.cancel()
+            shellWatcher.cancel()
+        }
+
+        await fixture.client.emitOutput(
+            for: ReconnectBrokerClient.firstTerminalID,
+            epoch: "epoch",
+            startOffset: 5,
+            data: " wo"
+        )
+        // No sleep: a batch the broker already coalesced is applied on arrival
+        // rather than a frame later, so the bytes are on screen without waiting.
+        XCTAssertEqual(fixture.model.terminalDocument.output, "hello wo")
+        XCTAssertEqual(terminalPublications, 1)
+        XCTAssertEqual(shellPublications, 0, "terminal bytes must not invalidate the full IDE shell")
+        await fixture.model.disconnect()
+    }
+
     func testSecondaryBrokerBurstPublishesOnlyItsTerminalCard() async throws {
         let fixture = try Fixture(failingConnectAttempts: [])
         defer { fixture.cleanUp() }
@@ -2036,7 +2071,8 @@ private final class Fixture {
         failingConnectAttempts: Set<Int>,
         completedAtByTerminalID: [String: Int64] = [:],
         transcriptRemovalFailure: AcpTranscriptStore.RemovalFailurePoint? = nil,
-        transcriptTombstoneFailure: AcpTranscriptStore.TombstoneFailurePoint? = nil
+        transcriptTombstoneFailure: AcpTranscriptStore.TombstoneFailurePoint? = nil,
+        advertisesObserverCoalescing: Bool = false
     ) throws {
         root = URL(fileURLWithPath: "/tmp/kaisola-app-model-\(UUID().uuidString.prefix(8))", isDirectory: true)
         try FileManager.default.createDirectory(
@@ -2047,7 +2083,8 @@ private final class Fixture {
         _ = chmod(root.path, 0o700)
         client = ReconnectBrokerClient(
             failingConnectAttempts: failingConnectAttempts,
-            completedAtByTerminalID: completedAtByTerminalID
+            completedAtByTerminalID: completedAtByTerminalID,
+            advertisesObserverCoalescing: advertisesObserverCoalescing
         )
         let legacyTranscriptURL = root.appendingPathComponent("agent-chat-transcripts-v1.json")
         transcriptStore = AcpTranscriptStore(
@@ -2138,6 +2175,11 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
 
     private let failingConnectAttempts: Set<Int>
     private let completedAtByTerminalID: [String: Int64]
+    /// Whether this double stands in for a broker that batches observer output
+    /// on its own frame window. Off by default so the existing tests keep
+    /// describing a broker that does not, where the app's window is the only
+    /// coalescer in the path.
+    private let advertisesObserverCoalescing: Bool
     private var connectCount = 0
     private var inventoryFailuresRemaining = 0
     private var cursors: [TerminalCursor?] = []
@@ -2156,8 +2198,10 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
 
     init(
         failingConnectAttempts: Set<Int>,
-        completedAtByTerminalID: [String: Int64] = [:]
+        completedAtByTerminalID: [String: Int64] = [:],
+        advertisesObserverCoalescing: Bool = false
     ) {
+        self.advertisesObserverCoalescing = advertisesObserverCoalescing
         self.failingConnectAttempts = failingConnectAttempts
         self.completedAtByTerminalID = completedAtByTerminalID
     }
@@ -2181,12 +2225,23 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
             implementationVersion: BrokerWire.implementationVersion,
             packageSchema: nil,
             packageVersion: nil,
-            features: [BrokerWire.terminalObserveFeature, BrokerWire.observerRoleFeature],
+            features: advertisedFeatures,
             pid: info.pid,
             startedAt: info.startedAt,
             version: info.version,
             serverEnforcedObserver: true
         )
+    }
+
+    private var advertisedFeatures: Set<String> {
+        var features: Set<String> = [
+            BrokerWire.terminalObserveFeature,
+            BrokerWire.observerRoleFeature,
+        ]
+        if advertisesObserverCoalescing {
+            features.insert(BrokerWire.terminalObserverCoalescingFeature)
+        }
+        return features
     }
 
     func inventory() async throws -> BrokerStatus {
@@ -2200,7 +2255,7 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
             implementationVersion: BrokerWire.implementationVersion,
             packageSchema: nil,
             packageVersion: nil,
-            features: [BrokerWire.terminalObserveFeature, BrokerWire.observerRoleFeature],
+            features: advertisedFeatures,
             pid: 12_345,
             startedAt: 1_784_250_001_000,
             version: "test",

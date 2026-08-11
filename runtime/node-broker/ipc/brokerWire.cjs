@@ -54,6 +54,12 @@ const TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE = 'terminal-observer-only-output-v1'
 // refusal — doing so is what left every terminal read-only when v0.1.114 met a
 // retained v0.1.113 broker.
 const TERMINAL_ATTACH_ACK_FEATURE = 'terminal-attach-ack-v1'
+// Observer output is batched on a frame window here rather than broadcast per
+// pty chunk. A client that knows this stops running a second window of its own:
+// two stacked windows cost up to two frames of latency to merge what one
+// already merged. A client talking to a broker without this must keep its own,
+// or it gets raw per-chunk output straight onto its main thread.
+const TERMINAL_OBSERVER_COALESCING_FEATURE = 'terminal-observer-coalescing-v1'
 const FEATURES = Object.freeze([
   TERMINAL_OBSERVE_FEATURE,
   TERMINAL_HISTORY_FEATURE,
@@ -67,6 +73,7 @@ const FEATURES = Object.freeze([
   TERMINAL_EXIT_STATUS_FEATURE,
   TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE,
   TERMINAL_ATTACH_ACK_FEATURE,
+  TERMINAL_OBSERVER_COALESCING_FEATURE,
 ])
 const TERMINAL_EXIT_CHANNEL_PREFIX = 'terminal:exit:'
 const CONTROLLER_ACCESS = 'controller'
@@ -387,6 +394,7 @@ module.exports = {
   TERMINAL_EXIT_STATUS_FEATURE,
   TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE,
   TERMINAL_ATTACH_ACK_FEATURE,
+  TERMINAL_OBSERVER_COALESCING_FEATURE,
   TERMINAL_EXIT_CHANNEL_PREFIX,
   FEATURES,
   CONTROLLER_ACCESS,

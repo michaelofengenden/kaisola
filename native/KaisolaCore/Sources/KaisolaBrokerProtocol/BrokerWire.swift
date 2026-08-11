@@ -29,6 +29,13 @@ public enum BrokerWire {
     /// demanding proof they are incapable of giving is what left every terminal
     /// read-only after the v0.1.114 update.
     public static let terminalAttachAcknowledgementFeature = "terminal-attach-ack-v1"
+    /// The broker batches observer output on a frame window instead of
+    /// broadcasting per pty chunk. A client that sees this stops running a
+    /// second window of its own, because two stacked windows spend up to two
+    /// frames of latency merging what one already merged. Against a broker
+    /// without it the client must keep its own, or raw per-chunk output lands
+    /// straight on the main thread.
+    public static let terminalObserverCoalescingFeature = "terminal-observer-coalescing-v1"
     public static let terminalHistoryFeature = "terminal-history-v1"
     public static let observerRoleFeature = "observer-role-v1"
     public static let brokerUpdateFeature = "broker-update-v1"

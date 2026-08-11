@@ -632,6 +632,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       cursor,
       observers: null,
       rendererVisible: true,
+      primaryStreamEnabled: true,
       pending: '',
       flushTimer: null,
       truncated: false,
@@ -712,6 +713,13 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     cursor,
     observers: null,
     rendererVisible: true,
+    // Whether `terminal:data:<id>` is produced at all. That is a different
+    // question from who owns the terminal (`sender`, which authorization reads)
+    // and from whether a renderer is attached (`rendererVisible`, which drives
+    // detached-byte accounting and `exitedWhileDetached`). A client reading the
+    // observer stream asks for this to be false so the broker stops serialising
+    // a second copy nobody reads; ownership and detach accounting stay put.
+    primaryStreamEnabled: true,
     pending: '', // coalesced-but-unsent output (already part of the ring)
     flushTimer: null,
     truncated: false,
@@ -834,7 +842,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     if (!rec.pending) return
     const chunk = rec.pending
     rec.pending = ''
-    if (rec.rendererVisible) deliverPrimaryOutput(rec, id, chunk)
+    if (rec.rendererVisible && rec.primaryStreamEnabled) deliverPrimaryOutput(rec, id, chunk)
   }
   rec.flushPending = flushPending
   p.onData((data) => {
@@ -854,8 +862,12 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
         endOffset: chunk.endOffset,
       })
     }
+    // Detach accounting is deliberately keyed on rendererVisible alone. A client
+    // that reads the observer stream is still attached; it just does not want a
+    // second copy. Folding primaryStreamEnabled in here would count visible
+    // output as detached and make a visible exit report exitedWhileDetached.
     if (!rec.rendererVisible) rec.detachedBytes += Buffer.byteLength(data)
-    if (rec.rendererVisible) {
+    if (rec.rendererVisible && rec.primaryStreamEnabled) {
       rec.pending += data
       if (rec.pending.length >= FLUSH_CAP) flushPending()
       else if (!rec.flushTimer) rec.flushTimer = setTimeout(flushPending, flushMs)

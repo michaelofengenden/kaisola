@@ -1597,3 +1597,32 @@ test('a subscriber joining mid-batch is not handed the same bytes twice', async 
     }
   })
 })
+
+// Exact boundary cases, tested against the pure decision rather than through a
+// pty, because a pty will not produce two adjacent 32 KiB pieces on demand and
+// a cap test that cannot fail against the bug is worth nothing.
+test('a chunk may only extend a batch while the merge stays inside the cap', () => {
+  const { observerChunkExtendsBatch } = __test
+  const cap = 64 * 1024
+  const batch = (start, end) => ({ streamEpoch: 'e', startOffset: start, endOffset: end })
+  const chunk = (start, end) => ({ streamEpoch: 'e', startOffset: start, endOffset: end })
+
+  // Exactly filling the cap is allowed; one byte past it is not. This pair is
+  // the regression: measuring after appending accepted both.
+  assert.equal(observerChunkExtendsBatch(batch(0, 32 * 1024), chunk(32 * 1024, 64 * 1024), cap), true)
+  assert.equal(observerChunkExtendsBatch(batch(0, 32 * 1024), chunk(32 * 1024, 64 * 1024 + 1), cap), false)
+
+  // A batch just under the cap must not absorb a whole further piece.
+  assert.equal(observerChunkExtendsBatch(batch(0, cap - 1), chunk(cap - 1, cap - 1 + 24 * 1024), cap), false)
+
+  // Non-adjacent bytes never merge, whatever the sizes: the app reads a hole as
+  // a gap and answers it with a snapshot refetch.
+  assert.equal(observerChunkExtendsBatch(batch(0, 10), chunk(11, 20), cap), false)
+  // Nor across a stream epoch change.
+  assert.equal(
+    observerChunkExtendsBatch({ streamEpoch: 'a', startOffset: 0, endOffset: 10 }, chunk(10, 20), cap),
+    false
+  )
+  // Nothing to extend.
+  assert.equal(observerChunkExtendsBatch(null, chunk(0, 10), cap), false)
+})

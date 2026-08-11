@@ -28,6 +28,7 @@ const brokerRuntimeTestFiles = Object.freeze([
   'tests/node/shellEnv.test.cjs',
   'tests/node/terminalAttachRoute.test.cjs',
   'tests/node/terminalCreateRoute.test.cjs',
+  'tests/node/terminalCursorUnicodeFastPath.test.cjs',
   'tests/node/terminalDetachOwnerRoute.test.cjs',
   'tests/node/terminalKillRoute.test.cjs',
   'tests/node/terminalManager.test.cjs',

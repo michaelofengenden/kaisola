@@ -1470,3 +1470,121 @@ test('an observer-only owner stops receiving terminal:data, and reattach does no
   assert.ok(live, 'the terminal is still owned and still inventoried')
   assert.equal(live.exitedWhileDetached ?? false, false, 'a visible terminal is not reported as detached')
 })
+
+/** Spawn `cat`, subscribe one observer, and capture every frame it receives. */
+async function withObservedTerminal(t, id, run) {
+  const owner = `instance-${id}|renderer-1|project-a`
+  const frames = []
+  manager.setEventSink((sender, channel, payload) => {
+    if (sender !== owner) return true
+    frames.push({ channel, payload })
+    return true
+  })
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+    sender: owner,
+  })
+  const exited = new Promise((resolve) => record.pty.onExit(resolve))
+  t.after(async () => {
+    manager.release(id)
+    await exited
+    manager.setEventSink(null)
+  })
+  manager.subscribe(id, owner, {})
+  const settle = (ms = 80) => new Promise((resolve) => setTimeout(resolve, ms))
+  await run({ owner, frames, settle, record })
+}
+
+test('observer output coalesces without changing the bytes or breaking contiguity', async (t) => {
+  await withObservedTerminal(t, 'observer-coalescing-bytes', async ({ frames, settle }) => {
+    const lines = Array.from({ length: 40 }, (_, index) => `line-${index}\n`)
+    for (const line of lines) manager.write('observer-coalescing-bytes', line)
+    await settle(250)
+
+    const output = frames.filter((frame) => frame.channel === 'terminal:observer-output')
+    assert.ok(output.length > 0, 'the observer received output')
+    // The point of the change: 40 writes must not mean 40 frames.
+    assert.ok(
+      output.length < lines.length,
+      `expected coalescing, got ${output.length} frames for ${lines.length} writes`
+    )
+    // Contiguity is what the app's batch merge requires; a hole here becomes a
+    // gap-recovery snapshot refetch rather than a cheap merge.
+    for (let index = 1; index < output.length; index++) {
+      assert.equal(
+        output[index].payload.startOffset,
+        output[index - 1].payload.endOffset,
+        'observer frames stay contiguous across the coalescer'
+      )
+    }
+    const joined = output.map((frame) => frame.payload.data).join('')
+    // Compared without the trailing newline: a pty echoes CR LF for the LF that
+    // was written, so the bytes on the wire legitimately differ from the bytes
+    // written even though nothing was lost.
+    for (const line of lines) {
+      const text = line.trim()
+      assert.ok(joined.includes(text), `coalesced stream still contains ${text}`)
+    }
+    assert.equal(
+      output[output.length - 1].payload.endOffset - output[0].payload.startOffset,
+      Buffer.byteLength(joined, 'utf8'),
+      'the offsets describe exactly the bytes delivered'
+    )
+  })
+})
+
+test('a terminal exit never overtakes the output that preceded it', async (t) => {
+  await withObservedTerminal(t, 'observer-exit-ordering', async ({ frames, settle }) => {
+    // Written and killed inside the same 16ms window, so the tail is still held
+    // in the observer batch when the exit event is broadcast.
+    manager.write('observer-exit-ordering', 'final tail before exit\n')
+    manager.kill('observer-exit-ordering')
+    await settle(400)
+
+    const exitIndex = frames.findIndex((frame) => frame.channel === 'terminal:observer-exit')
+    assert.ok(exitIndex >= 0, 'the observer saw the exit')
+    const deliveredBeforeExit = frames
+      .slice(0, exitIndex)
+      .filter((frame) => frame.channel === 'terminal:observer-output')
+      .map((frame) => frame.payload.data)
+      .join('')
+    assert.ok(
+      deliveredBeforeExit.includes('final tail before exit'),
+      'the tail lands before the exit signal, not after it'
+    )
+  })
+})
+
+test('a subscriber joining mid-batch is not handed the same bytes twice', async (t) => {
+  await withObservedTerminal(t, 'observer-subscribe-dedupe', async ({ settle }) => {
+    const latecomer = 'instance-latecomer|renderer-2|project-a'
+    const latecomerFrames = []
+    manager.setEventSink((sender, channel, payload) => {
+      if (sender !== latecomer) return true
+      latecomerFrames.push({ channel, payload })
+      return true
+    })
+
+    // Written and subscribed inside the same window, so the bytes are still
+    // batched when the snapshot that reports them is built.
+    manager.write('observer-subscribe-dedupe', 'bytes written before the join\n')
+    const joined = manager.subscribe('observer-subscribe-dedupe', latecomer, {})
+    assert.equal(joined.ok, true)
+    // A fresh subscriber with no cursor is resumed in snapshot mode, so the
+    // offset it has already been given lives on the snapshot.
+    const snapshotEnd = joined.snapshot?.endOffset ?? joined.cursor?.offset
+    assert.ok(Number.isInteger(snapshotEnd), 'the join reported an offset it covers through')
+    await settle(300)
+
+    const output = latecomerFrames.filter((frame) => frame.channel === 'terminal:observer-output')
+    for (const frame of output) {
+      assert.ok(
+        frame.payload.startOffset >= snapshotEnd,
+        `a frame starting at ${frame.payload.startOffset} repeats bytes the snapshot already carried through ${snapshotEnd}`
+      )
+    }
+  })
+})

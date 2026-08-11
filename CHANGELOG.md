@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.116 — 2026-08-11
+
+- Agent output is cheaper to show, again. Repairing damaged Unicode used to rebuild every chunk of every terminal one character at a time, even when there was nothing to repair — which is nearly always. It now checks first and rebuilds only when a chunk really was split mid-character, about five times faster on a chunk of agent output.
+- The window no longer redraws itself for every word an agent types. A running chat published to the whole app on each chunk, so the sidebar, the session strip and everything around them were rebuilt tens of times a second to show a transcript none of them display. They now hear about the things they actually show: titles, running state, permissions.
+
 ## 0.1.115 — 2026-08-11
 
 - Terminals you had open before updating can be typed into again. When a broker from the previous version was still running as 0.1.114 arrived, every restored terminal came back read-only and at the wrong size: the app asked that older broker a question it had no way to answer, then read the silence as a refusal. It now only asks brokers that can answer, and a terminal that comes back owned gets resized to its pane the way it always did.

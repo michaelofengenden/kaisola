@@ -136,7 +136,38 @@ function repairedByteBuffer(input) {
   }
 }
 
+/** Whether the string carries a surrogate that is not half of a valid pair.
+ *
+ * One pass, no allocation, no concatenation. The repair below rebuilds the
+ * whole string a code unit at a time and then encodes the rebuilt copy, which
+ * is far too expensive to run over output needing no repair — and needing
+ * repair is the rare case, arising only when a pty chunk splits a scalar. This
+ * runs on every chunk of every terminal, so it is the difference between a
+ * scan and a full rebuild per burst of agent output.
+ *
+ * `charCodeAt` past the end returns NaN and every comparison against NaN is
+ * false, so a high surrogate in the final position falls through to `true`
+ * rather than reading past the string. */
+function hasLoneSurrogate(value) {
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index)
+    if (code < 0xd800 || code > 0xdfff) continue
+    if (code <= 0xdbff) {
+      const following = value.charCodeAt(index + 1)
+      if (following >= 0xdc00 && following <= 0xdfff) {
+        index += 1
+        continue
+      }
+    }
+    return true
+  }
+  return false
+}
+
 function repairedStringBuffer(value) {
+  // With nothing to replace the loop below reconstructs `value` exactly, so
+  // encoding the original yields the same bytes without the intermediate copy.
+  if (!hasLoneSurrogate(value)) return { buffer: Buffer.from(value, 'utf8') }
   let repaired = ''
   let replacements = 0
   for (let index = 0; index < value.length; index += 1) {

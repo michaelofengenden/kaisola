@@ -659,6 +659,42 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertEqual(tabs.last?.url.lastPathComponent, "file-23.md")
     }
 
+    /// A streaming turn publishes on its conversation for every chunk, and
+    /// several conversations can stream at once. The shell renders a title, a
+    /// running dot and a permission badge — never a transcript — so almost all
+    /// of that announced a change no observer outside the chat surface could
+    /// see. AppModel now re-broadcasts only when one of the rendered fields
+    /// actually moved.
+    @MainActor
+    func testConversationChurnDoesNotInvalidateTheShellButDisplayedChangesDo() async throws {
+        let (model, _) = makeModel()
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        model.openChat(agent, inDirectory: URL(fileURLWithPath: "/tmp/ctx-churn", isDirectory: true))
+        let chat = try XCTUnwrap(model.chats.first)
+        // Let the open itself settle so the baseline is quiet.
+        try await Task.sleep(for: .milliseconds(60))
+
+        var publications = 0
+        let watcher = model.objectWillChange.sink { _ in publications += 1 }
+        defer { watcher.cancel() }
+
+        // A conversation publishing without any rendered field moving is what a
+        // token arriving looks like from the shell's point of view.
+        for _ in 0..<20 {
+            chat.conversation.objectWillChange.send()
+        }
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertEqual(publications, 0, "conversation churn must not invalidate the shell")
+
+        // A field the shell actually renders still gets through, or this would
+        // be hiding changes rather than filtering noise.
+        chat.conversation.title = "renamed while running"
+        try await Task.sleep(for: .milliseconds(80))
+        XCTAssertGreaterThan(publications, 0, "a rendered change still invalidates the shell")
+
+        if let chatID = model.chats.first?.id { await model.deleteChat(chatID) }
+    }
+
     @MainActor
     func testChatIsPersistedAndGroupedUnderItsProject() async throws {
         let (model, _) = makeModel()

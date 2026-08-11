@@ -113,6 +113,12 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
     private let transport: any BrokerByteTransport
     private let operationTimeoutNanoseconds: UInt64
     private var decoder = BrokerLineFrameDecoder()
+    /// Held rather than built per frame. Terminal output arrives as many small
+    /// frames a second, and a JSONDecoder is a class with configuration to
+    /// allocate and tear down on each one. Reuse is safe here: this type is
+    /// actor-isolated so no two decodes overlap, and the decoder keeps no state
+    /// between calls as it is used.
+    private let jsonDecoder = JSONDecoder()
     private var info: BrokerInfo?
     private var hello: BrokerHello?
     private var connectTarget: BrokerInfo?
@@ -603,7 +609,7 @@ actor ObserveOnlyBrokerClient: ObserveOnlyBrokerServing {
                     _ = try BrokerWire.validateDecodedFrame(data) { id in
                         pending[id]?.method
                     }
-                    let frame = try JSONDecoder().decode(JSONValue.self, from: data)
+                    let frame = try jsonDecoder.decode(JSONValue.self, from: data)
                     try handle(frame)
                 }
                 decoder = activeDecoder

@@ -554,6 +554,38 @@ final class AppModel: ObservableObject {
     /// Child surfaces are observable objects of their own. Relay their live
     /// state changes so project activity badges and tabs update immediately.
     private var surfaceObservers: [String: AnyCancellable] = [:]
+    /// What the shell actually shows about a chat, as opposed to everything a
+    /// conversation publishes.
+    ///
+    /// Views outside the chat surface read these through the conversation at
+    /// render time — the strip and the rail want a title, a running dot, a
+    /// permission badge. None of them render the transcript. So the shell needs
+    /// to be invalidated when one of these changes, and not when a token
+    /// arrives, which is what a blanket re-broadcast could not distinguish.
+    private struct ChatSurfaceSummary: Equatable {
+        let title: String
+        let isRunning: Bool
+        let isConnected: Bool
+        let statusMessage: String?
+        let pendingPermissionCount: Int
+        let queuedCount: Int
+        let hasRows: Bool
+        let usage: AcpUsage?
+    }
+    private var chatSurfaceSummaries: [String: ChatSurfaceSummary] = [:]
+    private var surfaceSummaryCheckScheduled = false
+    /// The same idea for Mesh. The shell shows a title, a running dot, a stage
+    /// word, and builds a run-target list from column worktrees. `MeshView`
+    /// renders the columns and their transcripts, but it holds the session as
+    /// its own `@ObservedObject`, so it keeps updating from the session
+    /// directly and does not depend on this re-broadcast.
+    private struct MeshSurfaceSummary: Equatable {
+        let title: String
+        let anyRunning: Bool
+        let stage: String
+        let columnTargets: [String]
+    }
+    private var meshSurfaceSummaries: [String: MeshSurfaceSummary] = [:]
     /// The separate native-profile broker used when Electron's is incompatible.
     private let fallbackPreparer: (any BrokerInfoPreparing)?
     /// True when this window is connected to the app's own separate broker
@@ -2985,7 +3017,7 @@ final class AppModel: ObservableObject {
                 )
                 wireMeshPersistence(mesh)
                 surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-                    self?.objectWillChange.send()
+                    self?.scheduleSurfaceSummaryCheck()
                 }
                 meshes.append(mesh)
 
@@ -3510,7 +3542,7 @@ final class AppModel: ObservableObject {
         }
         chats.append(handle)
         surfaceObservers[chatID] = conversation.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            self?.scheduleSurfaceSummaryCheck()
         }
         reconcileChatAccountAvailability(for: handle)
         if requiresAccountResolution, accountAccess.phase == .resolving {
@@ -3732,6 +3764,69 @@ final class AppModel: ObservableObject {
         if transition == .requiresResumeInvalidation {
             scheduleChatResumeInvalidation(chat.id)
         }
+    }
+
+    /// Coalesced to one pass per runloop turn, for two reasons.
+    ///
+    /// `objectWillChange` fires *before* the property changes, so reading a
+    /// conversation inside its own sink returns the previous value. Deferring
+    /// the read to the next turn is what makes the comparison meaningful.
+    ///
+    /// It also collapses a burst: a streaming turn publishes rows and
+    /// contentVersion for every chunk, and several conversations can stream at
+    /// once. One comparison per turn answers all of them.
+    private func scheduleSurfaceSummaryCheck() {
+        guard !surfaceSummaryCheckScheduled else { return }
+        surfaceSummaryCheckScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.surfaceSummaryCheckScheduled = false
+            self.publishIfSurfacesChanged()
+        }
+    }
+
+    /// Re-broadcast only when something the shell renders about a chat moved.
+    ///
+    /// The shell used to be invalidated by every conversation publish, which
+    /// during a streaming turn is every chunk — and with several conversations
+    /// running, several times that. Nothing outside the chat surface renders a
+    /// transcript, so almost all of it announced a change no observer could see.
+    private func publishIfSurfacesChanged() {
+        var summaries: [String: ChatSurfaceSummary] = [:]
+        summaries.reserveCapacity(chats.count)
+        for chat in chats {
+            let conversation = chat.conversation
+            summaries[chat.id] = ChatSurfaceSummary(
+                title: conversation.title,
+                isRunning: conversation.isRunning,
+                isConnected: conversation.isConnected,
+                statusMessage: conversation.statusMessage,
+                pendingPermissionCount: conversation.pendingPermissionCount,
+                queuedCount: conversation.queued.count,
+                hasRows: !conversation.rows.isEmpty,
+                usage: conversation.usage
+            )
+        }
+        var meshSummaries: [String: MeshSurfaceSummary] = [:]
+        meshSummaries.reserveCapacity(meshes.count)
+        for mesh in meshes {
+            meshSummaries[mesh.id] = MeshSurfaceSummary(
+                title: mesh.title,
+                anyRunning: mesh.anyRunning,
+                stage: mesh.stage,
+                // The shell builds run targets from column worktrees, which move
+                // when a column is configured rather than when one streams.
+                columnTargets: mesh.columns.map { column in
+                    "\(column.worktreePath ?? "")|\(column.branch ?? "")"
+                }
+            )
+        }
+        guard summaries != chatSurfaceSummaries || meshSummaries != meshSurfaceSummaries else {
+            return
+        }
+        chatSurfaceSummaries = summaries
+        meshSurfaceSummaries = meshSummaries
+        objectWillChange.send()
     }
 
     private func scheduleChatResumeInvalidation(_ chatID: String) {
@@ -4090,7 +4185,7 @@ final class AppModel: ObservableObject {
         )
         wireMeshPersistence(mesh)
         surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            self?.scheduleSurfaceSummaryCheck()
         }
         meshes.append(mesh)
         selectedMeshID = mesh.id
@@ -4283,7 +4378,7 @@ final class AppModel: ObservableObject {
         _ = removeRecentlyClosedPane(id: surfaceID)
         wireMeshPersistence(mesh)
         surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            self?.scheduleSurfaceSummaryCheck()
         }
         meshes.append(mesh)
         keepsClaim = true
@@ -4843,7 +4938,7 @@ final class AppModel: ObservableObject {
             agents: Array(AgentRegistry.builtIns.prefix(max(1, agentCount)))
         )
         surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            self?.scheduleSurfaceSummaryCheck()
         }
         meshes = [mesh]
         selectedSessionID = nil
@@ -6850,7 +6945,14 @@ final class AppModel: ObservableObject {
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 defer { self.metaScanTask = nil }
-                self.metaByTerminalID = collected
+                // Guarded because this runs every 5s whether or not the process
+                // table moved, and an unguarded assignment to a @Published
+                // property republishes the whole model — invalidating every view
+                // that observes it — to say nothing changed. The inventory tick
+                // below already compares before assigning; this is the same rule.
+                if self.metaByTerminalID != collected {
+                    self.metaByTerminalID = collected
+                }
                 self.detectedAgentNamesByTerminalID = self.detectedAgentNamesByTerminalID.filter {
                     collected[$0.key] != nil
                 }
@@ -6893,8 +6995,15 @@ final class AppModel: ObservableObject {
             }
             let branches = result
             await MainActor.run { [weak self] in
-                self?.branchesByCwd = branches
-                self?.branchScanTask = nil
+                guard let self else { return }
+                // Same guard as the process-table scan: this fires every 10s and
+                // a branch rarely changes between two of them, so an unguarded
+                // write spends a full-model invalidation announcing that nothing
+                // moved.
+                if self.branchesByCwd != branches {
+                    self.branchesByCwd = branches
+                }
+                self.branchScanTask = nil
             }
         }
     }
@@ -7928,24 +8037,32 @@ final class AppModel: ObservableObject {
         if !busy { acknowledgedAgentTurnTerminalIDs.remove(terminalID) }
         guard let index = sessions.firstIndex(where: { $0.id == terminalID }) else { return }
         let wasWorking = { if case .working = sessions[index].agentActivity { return true }; return false }()
-        if busy {
-            sessions[index].agentActivity = .working
+        let activity: AgentActivity = if busy {
+            .working
         } else if let completedAt {
-            sessions[index].agentActivity = .responded(at: completedAt)
-            // A completed terminal remains a needs-you moment until visited,
-            // even if it finished in the currently visible project.
-            if wasWorking {
-                let detectedCLI = detectedAgentNamesByTerminalID[terminalID]
-                attentionCenter.notifySessionResponded(
-                    targetID: terminalID,
-                    title: sessionTitle(for: sessions[index]),
-                    detail: detectedCLI.map { "\($0) finished" } ?? "Agent responded",
-                    completedAt: completedAt
-                )
-            }
+            .responded(at: completedAt)
         } else {
-            sessions[index].agentActivity = .idle
+            .idle
         }
+        if case let .responded(at: completedAt) = activity, wasWorking {
+            // A completed terminal remains a needs-you moment until visited,
+            // even if it finished in the currently visible project. Keyed on the
+            // working edge, not on the assignment, so the guard below cannot
+            // swallow it.
+            let detectedCLI = detectedAgentNamesByTerminalID[terminalID]
+            attentionCenter.notifySessionResponded(
+                targetID: terminalID,
+                title: sessionTitle(for: sessions[index]),
+                detail: detectedCLI.map { "\($0) finished" } ?? "Agent responded",
+                completedAt: completedAt
+            )
+        }
+        // Writing one element of a @Published array republishes the array, and
+        // this runs on the live broker activity stream, where a busy agent flaps
+        // between the same two states repeatedly. Every one of those wrote a
+        // full-model invalidation to announce the value it already held.
+        guard sessions[index].agentActivity != activity else { return }
+        sessions[index].agentActivity = activity
     }
 
     /// Inventory and observer events share one broker socket but can be

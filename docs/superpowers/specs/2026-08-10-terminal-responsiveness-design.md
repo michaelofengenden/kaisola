@@ -545,10 +545,70 @@ Wire changes now come after the mechanical ones, which is what the risk section
 always intended. The previous draft's sequence contradicted its own risk section
 by putting the wire change at step 2.
 
+## Outcome, 2026-08-11
+
+Recorded here because several items in this document turned out to be wrong, and
+the reasons are more useful than the plan was.
+
+### Landed
+
+| Item | Notes |
+|---|---|
+| 1.1 state separation | `primaryStreamEnabled`, distinct from ownership and detach accounting |
+| 1.2 negotiated observer-only output | Per connection, resolved in `setSender` so it survives every reattach |
+| 1.3 observer coalescing | Own buffer, seven mandatory flush points, append-then-settle reorder |
+| 1.4 UTF-8 fast path | Measured 5x on a 9 KB agent-output chunk |
+| 2.1 forwarding | Filtered rather than removed; see below |
+| 2.2 step 1 | `SessionStrip` hoist, twelve rebuilds to one |
+| 2.3 guards | `applyActivity`, `metaByTerminalID`, `branchesByCwd` |
+| App-side window | Dropped only when the broker advertises it coalesces |
+
+Plus the `terminal-attach-ack-v1` compatibility fix, which was not in this design
+at all: it is why terminals were read-only after v0.1.114 met a retained
+v0.1.113 broker.
+
+### 2.1 was smaller than this document assumed
+
+The plan called for narrow projections across five consumers, then repointing,
+then removing the forwards. Enumerating what those consumers actually read
+showed none of that was needed.
+
+Outside the chat and Mesh surfaces, consumers read scalars: title, running
+state, connection, status message, permission counts, queue depth, usage, stage,
+column worktrees. Everything else in the grep was a method call or closure
+wiring, not a render-path read. And the two views that *do* render transcripts,
+`AcpChatView` and `MeshView`, hold their objects as their own `@ObservedObject`,
+so they never depended on the re-broadcast.
+
+So the fix is a summary comparison in `AppModel`: forward only when something
+the shell renders has moved, coalesced to one pass per runloop turn because
+`objectWillChange` fires before the value lands. Consumers are untouched.
+
+The estimate was wrong twice — once for ACP, once for Mesh — in the same
+direction. Enumerate before scoping.
+
+### Withdrawn, with reasons
+
+| Item | Why not |
+|---|---|
+| Drop the `String(data:)` UTF-8 probe | `BrokerWireTests` asserts the typed `.invalidUTF8` error; replacing it means a bespoke UTF-8 state machine at a security boundary |
+| Unpublish `contentVersion` | Live `.onChange` handlers in `AcpChatView` and `MeshView` depend on it |
+| Debounce `onTranscriptChanged` | Reorders against the wave-30 tombstone-before-cleanup fence |
+| Route tool-call updates through the chunk coalescer | That coalescer is text-only by documented design; status transitions and `publishFileActivity` are what the UI reads |
+| Leading-edge output drain | Broke the one-publish-per-interval invariant in `AppModelReconnectTests`; superseded by the capability gate |
+| Deadline instead of a `Task` for cursor persistence | Changes durability timing from save-after-quiet to save-during-stream |
+| Cache `resolveFont` | A newly installed font would not appear until settings change |
+| Gate the accessibility tail on VoiceOver | Retained value goes stale for anyone enabling VoiceOver mid-session; needs a status-change signal |
+
+Every one trades a real guarantee for a saving nobody has measured. That is what
+Layer 0 exists to settle, and skipping it is why this list is long.
+
 ## Open items
 
+- **Layer 0, the probe.** Now the blocking item for everything above. Plan at
+  `docs/superpowers/plans/2026-08-11-input-latency-probe.md`.
 - Whether 2.2 needs the caching step. Decided by measurement after the hoist.
-- Whether the router hop in 1.9 is worth a synchronization redesign. Decided by
-  the probe's stage breakdown.
-- Focus-aware throttling per subscriber. Out of scope here; revisit if the loaded
-  workload shows blurred windows would help.
+- Whether the router hop in 1.9 is worth a synchronization redesign.
+- Focus-aware throttling per subscriber.
+- The `optimized-macos-pdf` gate computes a "p95" from six samples and fails on
+  unmodified code. Fix the statistic, not the threshold.

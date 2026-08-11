@@ -4521,23 +4521,28 @@ private struct SessionStrip: View {
         model.projects.first { $0.id == projectID }
     }
 
-    private var sessions: [BrokerTerminalRecord] { project?.sessions ?? [] }
-    private var chats: [AcpChatHandle] {
-        project.map { model.chats(in: $0.id) } ?? []
-    }
-    private var meshes: [MeshSession] {
-        project.map { model.meshes(in: $0.id) } ?? []
-    }
-    private var recentlyClosed: [AppModel.RecentlyClosedSurface] {
-        project.map { model.recentlyClosedSurfaces(in: $0.id) } ?? []
-    }
-
     private var selectedSurfaceID: String? {
         model.selectedChatID ?? model.selectedMeshID ?? model.selectedSessionID
     }
 
     var body: some View {
-        ScrollViewReader { proxy in
+        // Derived once per pass, on purpose.
+        //
+        // These were four computed properties, each reaching `project`, which
+        // rebuilds `model.projects` — six dictionaries, three filtered counts, a
+        // set union and a sort. The body reads them a dozen times, so a single
+        // render rebuilt that a dozen times, in a view that re-renders whenever
+        // anything on AppModel publishes.
+        //
+        // Kept as locals rather than properties so the cost cannot quietly come
+        // back: a new reference in this body reuses the binding instead of
+        // reaching through an accessor that looks free and is not.
+        let project = self.project
+        let sessions = project?.sessions ?? []
+        let chats = project.map { model.chats(in: $0.id) } ?? []
+        let meshes = project.map { model.meshes(in: $0.id) } ?? []
+        let recentlyClosed = project.map { model.recentlyClosedSurfaces(in: $0.id) } ?? []
+        return ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                 if sessions.isEmpty, chats.isEmpty, meshes.isEmpty, recentlyClosed.isEmpty {

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.115 — 2026-08-11
+
+- Terminals you had open before updating can be typed into again. When a broker from the previous version was still running as 0.1.114 arrived, every restored terminal came back read-only and at the wrong size: the app asked that older broker a question it had no way to answer, then read the silence as a refusal. It now only asks brokers that can answer, and a terminal that comes back owned gets resized to its pane the way it always did.
+- Showing agent output costs the machine much less. A CLI agent redrawing a spinner had the broker building every terminal's output twice — one copy went to a reader that threw it away — and handing the other over a few hundred times a second. It now builds it once and sends it a frame at a time.
+
 ## 0.1.105 — 2026-08-04
 
 - The glass is a quarter less saturated everywhere — the wallpaper's colour arrives calmer while its texture and detail stay exactly as they were. The idle canvas keeps its transparency but reads as glass over the picture rather than the picture at full strength.

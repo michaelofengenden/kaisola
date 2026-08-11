@@ -7574,8 +7574,25 @@ final class AppModel: ObservableObject {
         scheduleTerminalOutputFlush()
     }
 
+    /// One coalescer in the path, not two.
+    ///
+    /// This window was written when the broker broadcast observer output once
+    /// per pty chunk, so batching here was the only thing standing between an
+    /// agent redraw and a hundred main-thread passes a second. A broker that
+    /// batches on its own frame window has already done that merging, and a
+    /// second window stacked on top spends up to another frame of latency
+    /// merging what now usually arrives as a single batch.
+    ///
+    /// Against a broker without the capability the window stays exactly as it
+    /// was, because there it is still the only coalescer in the path. The merge
+    /// and gap-recovery logic in `drainPendingTerminalOutputs` runs either way;
+    /// only the wait is conditional.
     private func scheduleTerminalOutputFlush() {
         guard terminalOutputFlushTask == nil else { return }
+        if connectedBrokerFeatures.contains(BrokerWire.terminalObserverCoalescingFeature) {
+            drainPendingTerminalOutputs()
+            return
+        }
         terminalOutputFlushGeneration &+= 1
         let generation = terminalOutputFlushGeneration
         terminalOutputFlushTask = Task { @MainActor [weak self] in

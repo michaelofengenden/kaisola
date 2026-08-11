@@ -272,9 +272,17 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         let encoded: Data
         do {
             try await transport.connect(path: info.socketPath)
-            let requestedFeatures: [JSONValue] = access == .administrator
-                ? [.string(BrokerWire.brokerAdministrationFeature)]
-                : []
+            // The controller reads output on the observer connection and throws
+            // this connection's copy away, so ask the broker not to build it.
+            // An older broker ignores the unknown feature and keeps sending the
+            // channel we already discard, which is exactly today's behaviour.
+            var requestedFeatures: [JSONValue] = [
+                .string(BrokerWire.terminalObserverOnlyOutputFeature),
+                .string(BrokerWire.terminalAttachAcknowledgementFeature),
+            ]
+            if access == .administrator {
+                requestedFeatures.append(.string(BrokerWire.brokerAdministrationFeature))
+            }
             let frame: JSONValue = .object([
                 "type": .string("hello"),
                 "protocol": .integer(Int64(BrokerWire.protocolVersion)),
@@ -387,8 +395,29 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             .attach,
             params: identity(projectID: projectID, terminalID: terminalID)
         )
-        guard let object = result.objectValue,
-              object["ok"]?.boolValue == true,
+        guard let object = result.objectValue else {
+            throw BrokerClientError.requestFailed("terminal.attach")
+        }
+        // Attach is an ownership mutation, so a broker that cannot prove it
+        // adopted the terminal must not be believed. That check is worth
+        // keeping — but only a broker that acknowledges attach can satisfy it.
+        //
+        // A broker retained from before the acknowledgement existed answers
+        // with a bare snapshot: no `ok`, no `id`. Demanding them turned every
+        // attach against a still-running older broker into a refusal, and
+        // `restoreOwnedSessions` reads a thrown attach as "another controller
+        // holds it". Terminals came back read-only, and because only owned
+        // terminals reach `scheduleDesiredTerminalResize`, they also stayed at
+        // whatever geometry the broker had retained.
+        //
+        // The question is therefore what the broker is capable of saying, not
+        // what this particular response happens to contain. Inferring "old
+        // broker" from a missing field would also excuse a current broker that
+        // answered malformed, which is exactly the case worth failing on.
+        guard connectedFeatures.contains(BrokerWire.terminalAttachAcknowledgementFeature) else {
+            return
+        }
+        guard object["ok"]?.boolValue == true,
               object["id"]?.stringValue == terminalID else {
             throw BrokerClientError.requestFailed("terminal.attach")
         }

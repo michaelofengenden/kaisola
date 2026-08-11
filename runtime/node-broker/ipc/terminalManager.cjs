@@ -173,6 +173,48 @@ const FLUSH_MS_BLURRED = 100
 let flushMs = FLUSH_MS_FOCUSED
 const FLUSH_CAP = 65_536 // a burst bigger than this flushes immediately
 const OBSERVER_CHUNK_BYTES = 64 * 1024
+// The observer stream is broadcast straight out of the pty callback, once per
+// splitUtf8 piece, so an agent TUI redrawing a spinner produced hundreds of
+// frames a second — each one a JSON encode, a socket write, and a full decode
+// plus two actor hops on the far side. This is the same 16 ms window the
+// primary path always had.
+//
+// Deliberately not split into focused/blurred like FLUSH_MS_*. Observer sockets
+// are not all the desktop app: Companion subscribes too, and a broker-side
+// blurred delay would slow the phone's output whenever the Mac lost focus,
+// which is exactly when someone is driving the terminal from their phone.
+const OBSERVER_FLUSH_MS = 16
+// Never accumulate past what one piece could already produce. splitUtf8 caps a
+// piece at OBSERVER_CHUNK_BYTES, and JSON escaping of control-dense output
+// expands that severalfold, so a single piece can already approach a small
+// subscriber's queue budget (configurable down to 64 KiB in terminalObservers).
+// Coalescing must not make the worst-case frame any larger than it is today.
+const OBSERVER_BATCH_CAP = OBSERVER_CHUNK_BYTES
+
+/** Whether `chunk` may extend `batch`, decided before any merging happens.
+ *
+ * Pure, and exported for tests, because the cases that matter are exact sizes
+ * at the boundary and a pty will not produce those on demand.
+ *
+ * Appending first and measuring afterwards was the bug this replaced: a batch
+ * sitting just under the cap could absorb a whole further piece and reach
+ * nearly twice it. writeFrame compares the *encoded* envelope against each
+ * subscriber's queue budget, and control-dense output expands several times
+ * over under JSON escaping, so an oversized frame is not merely wasteful — it
+ * can be refused for a healthy subscriber, force a snapshot-required marker,
+ * and pause that subscriber's live stream. */
+function observerChunkExtendsBatch(batch, chunk, cap = OBSERVER_BATCH_CAP) {
+  if (!batch) return false
+  if (batch.streamEpoch !== chunk.streamEpoch) return false
+  // Adjacency is checked rather than assumed: the app merges batches only when
+  // one ends exactly where the next begins, and reads a hole as a gap worth
+  // recovering from.
+  if (batch.endOffset !== chunk.startOffset) return false
+  const batchBytes = batch.endOffset - batch.startOffset
+  const chunkBytes = chunk.endOffset - chunk.startOffset
+  return batchBytes + chunkBytes <= cap
+}
+
 const AGENT_QUIET_MS = 4500
 const CWD_REFRESH_COALESCE_MS = 250
 // An exit wait lives as long as the pty it watches, which for a dev server is
@@ -208,6 +250,10 @@ let spoolDir = path.join(os.tmpdir(), `kaisola-terminal-cache-${process.pid}`)
 let asyncSpoolWrites = true
 let eventSink = null
 let activitySink = null
+// Answers "does this owner's connection still want terminal:data:<id>?". Unset
+// means yes, so a host that never installs a policy — every existing test, and
+// any embedder that does not negotiate — keeps the primary stream.
+let primaryStreamPolicy = null
 let lastCwdRefreshAt = 0
 let maximumLiveTerminals = DEFAULT_MAX_LIVE_TERMINALS
 
@@ -274,6 +320,24 @@ function setEventSink(sink) {
  * for process truth. */
 function setActivitySink(sink) {
   activitySink = typeof sink === 'function' ? sink : null
+}
+
+/** The broker owns feature negotiation, and negotiation is per connection, so
+ * the manager asks rather than deciding. */
+function setPrimaryStreamPolicy(policy) {
+  primaryStreamPolicy = typeof policy === 'function' ? policy : null
+}
+
+/** Fail open. A policy that throws, or one that has not been installed, must
+ * leave the primary stream on: sending a copy nobody reads wastes work, but
+ * withholding one a renderer is waiting for blanks the terminal. */
+function primaryStreamWanted(sender) {
+  if (!primaryStreamPolicy) return true
+  try {
+    return primaryStreamPolicy(sender) !== false
+  } catch {
+    return true
+  }
 }
 
 function reportActivity(kind, id = null) {
@@ -632,8 +696,11 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       cursor,
       observers: null,
       rendererVisible: true,
+      primaryStreamEnabled: true,
       pending: '',
       flushTimer: null,
+      observerPending: null,
+      observerFlushTimer: null,
       truncated: false,
       exited: true,
       exitStatus: retainedMeta.exitStatus ?? null,
@@ -712,8 +779,22 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     cursor,
     observers: null,
     rendererVisible: true,
+    // Whether `terminal:data:<id>` is produced at all. That is a different
+    // question from who owns the terminal (`sender`, which authorization reads)
+    // and from whether a renderer is attached (`rendererVisible`, which drives
+    // detached-byte accounting and `exitedWhileDetached`). A client reading the
+    // observer stream asks for this to be false so the broker stops serialising
+    // a second copy nobody reads; ownership and detach accounting stay put.
+    primaryStreamEnabled: true,
     pending: '', // coalesced-but-unsent output (already part of the ring)
     flushTimer: null,
+    // The observer batch is kept apart from `pending` on purpose. setSender and
+    // detachRenderer discard `pending` because a reattaching renderer replays
+    // the snapshot; observers get no such replay, and the cursor has already
+    // advanced past these bytes, so the same discard would lose output without
+    // surfacing a discontinuity to anyone.
+    observerPending: null,
+    observerFlushTimer: null,
     truncated: false,
     exited: false,
     exitStatus: null, // { exitCode, signal }
@@ -753,6 +834,10 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     onDrop: () => syncSpoolVisibility(rec),
   })
   const broadcastAgentActivity = () => {
+    // This event reports cursor.nextOffset, which already counts bytes sitting
+    // in the observer batch. Sending it first would claim an offset the client
+    // has not been given the output for.
+    rec.flushObserverOutput?.()
     send(rec.sender || rec.lastSender, 'terminal:agent-activity', {
       id,
       busy: rec.agentBusy,
@@ -834,9 +919,63 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
     if (!rec.pending) return
     const chunk = rec.pending
     rec.pending = ''
-    if (rec.rendererVisible) deliverPrimaryOutput(rec, id, chunk)
+    if (rec.rendererVisible && rec.primaryStreamEnabled) deliverPrimaryOutput(rec, id, chunk)
   }
   rec.flushPending = flushPending
+  const flushObserverOutput = () => {
+    if (rec.observerFlushTimer) {
+      clearTimeout(rec.observerFlushTimer)
+      rec.observerFlushTimer = null
+    }
+    const batch = rec.observerPending
+    if (!batch) return
+    rec.observerPending = null
+    rec.observers.broadcast('terminal:observer-output', { id, ...batch }, {
+      streamEpoch: batch.streamEpoch,
+      endOffset: batch.endOffset,
+    })
+  }
+  rec.flushObserverOutput = flushObserverOutput
+  /** Merge into the open batch when the bytes are genuinely adjacent, and
+   * otherwise send what is held and start a new one. Adjacency is checked
+   * rather than assumed: the app merges batches only when endOffset meets the
+   * next startOffset exactly, and treats any discontinuity as a gap worth
+   * recovering from, so a coalescer that silently spanned one would turn a
+   * cheap merge into a snapshot refetch. */
+  const appendObserverChunk = (chunk) => {
+    const batch = rec.observerPending
+    // A repair carries counts with their own validation on the far side.
+    // Summing them here would invent semantics for a diagnostic, and repairs
+    // are rare by construction, so such a chunk simply travels alone.
+    if (chunk.unicodeRepair) {
+      flushObserverOutput()
+      rec.observerPending = { ...chunk }
+      flushObserverOutput()
+      return
+    }
+    // The cursor offsets are byte offsets, so sizes here are subtractions.
+    // Measuring the accumulated string with Buffer.byteLength instead would
+    // re-walk every byte already in the batch on each append, which is O(n^2)
+    // over a burst — in the one path this change exists to make cheaper.
+    if (observerChunkExtendsBatch(batch, chunk)) {
+      batch.data += chunk.data
+      batch.endOffset = chunk.endOffset
+    } else {
+      flushObserverOutput()
+      rec.observerPending = { ...chunk }
+    }
+    // A piece that reaches the cap on its own travels immediately. splitUtf8
+    // already bounds a piece to OBSERVER_CHUNK_BYTES, so with the guard above a
+    // batch can never exceed what one piece produced before any of this — which
+    // is the parity that keeps subscriber queue behaviour unchanged.
+    if (rec.observerPending.endOffset - rec.observerPending.startOffset >= OBSERVER_BATCH_CAP) {
+      flushObserverOutput()
+      return
+    }
+    if (!rec.observerFlushTimer) {
+      rec.observerFlushTimer = setTimeout(flushObserverOutput, OBSERVER_FLUSH_MS)
+    }
+  }
   p.onData((data) => {
     reportActivity('terminal-output', id)
     rec.spool.push(data)
@@ -846,16 +985,21 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
         rec.agentRespondedAt = responseAt
       }
     }
-    if (rec.agentTurnOpen && consumeCommandEndMark(rec, data)) settleAgentTurn('shell-command-end')
+    // Append before settling. settleAgentTurn broadcasts activity, and activity
+    // flushes the observer buffer so a client never sees "turn ended" ahead of
+    // the bytes that ended it. Settling first put the broadcast before those
+    // bytes were even appended, so no flush could have reached them.
+    const endsAgentTurn = rec.agentTurnOpen && consumeCommandEndMark(rec, data)
     for (const piece of splitUtf8(data)) {
-      const chunk = rec.cursor.append(piece)
-      rec.observers.broadcast('terminal:observer-output', { id, ...chunk }, {
-        streamEpoch: rec.cursor.streamEpoch,
-        endOffset: chunk.endOffset,
-      })
+      appendObserverChunk(rec.cursor.append(piece))
     }
+    if (endsAgentTurn) settleAgentTurn('shell-command-end')
+    // Detach accounting is deliberately keyed on rendererVisible alone. A client
+    // that reads the observer stream is still attached; it just does not want a
+    // second copy. Folding primaryStreamEnabled in here would count visible
+    // output as detached and make a visible exit report exitedWhileDetached.
     if (!rec.rendererVisible) rec.detachedBytes += Buffer.byteLength(data)
-    if (rec.rendererVisible) {
+    if (rec.rendererVisible && rec.primaryStreamEnabled) {
       rec.pending += data
       if (rec.pending.length >= FLUSH_CAP) flushPending()
       else if (!rec.flushTimer) rec.flushTimer = setTimeout(flushPending, flushMs)
@@ -865,6 +1009,7 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
   p.onExit(({ exitCode, signal }) => {
     reportActivity('terminal-exit', id)
     flushPending() // the tail of the stream must land before the exit signal
+    flushObserverOutput() // and the same tail on the stream anyone actually reads
     rec.exited = true
     rec.exitedWhileDetached = !rec.rendererVisible
     rec.exitStatus = { exitCode: exitCode ?? 0, signal: signal ?? null }
@@ -984,11 +1129,19 @@ function setSender(id, sender) {
     clearTimeout(r.flushTimer)
     r.flushTimer = null
   }
+  r.flushObserverOutput?.() // attach must not strand the batch either
   r.pending = ''
   r.sender = sender
   r.primaryOutputPaused = false
   r.lastSender = sender
   r.rendererVisible = true
+  // Resolved here rather than at spawn because this is the one function both
+  // create and attach go through, so a reconnect, an input recovery and a
+  // startup restore all re-answer it for whoever is attaching now. Asking the
+  // owner's own connection also keeps the answer per-client: during a rolling
+  // update one broker serves app lanes of different vintages, and the current
+  // and draining generations can have negotiated differently.
+  r.primaryStreamEnabled = primaryStreamWanted(sender)
   r.spool.setVisible(true)
   r.detachedAt = null
   r.detachedBytes = 0
@@ -1001,6 +1154,12 @@ function setSender(id, sender) {
 function detachRenderer(id, sender, viewState) {
   const r = terms.get(id)
   if (!r || (sender && r.sender && !sameSender(sender, r.sender))) return false
+  // Discarding r.pending is safe because the reattaching renderer replays the
+  // snapshot. Observer bytes have no such second chance: the cursor has already
+  // advanced past them, so dropping them loses output with no discontinuity for
+  // anyone to notice. A control socket can drop while independent app and
+  // Companion observer sockets stay live, so this is reachable, not theoretical.
+  r.flushObserverOutput?.()
   if (r.flushTimer) {
     clearTimeout(r.flushTimer)
     r.flushTimer = null
@@ -1060,6 +1219,14 @@ function missingSnapshot() {
 }
 
 function snapshotRecord(r) {
+  // The authoritative flush point, because this is where endOffset is taken
+  // from the cursor. Flushing only at the entry of snapshot()/subscribe() is
+  // not enough: when the spool has to settle asynchronously first, pty output
+  // can arrive during that await and land in the observer batch. The snapshot
+  // built afterwards already counts those bytes, and the pending timer then
+  // sends them again — the exact duplicate delivery the flush exists to stop,
+  // answered by gap recovery in the app and a projection reset in Companion.
+  r.flushObserverOutput?.()
   const retained = r.spool.snapshot(r.outputByteLimit ?? SNAPSHOT_CAP)
   const outputBytes = Buffer.byteLength(retained.output, 'utf8')
   return {
@@ -1080,6 +1247,9 @@ function snapshotRecord(r) {
 function snapshot(id, { responseBarrier = false } = {}) {
   const r = terms.get(id)
   if (!r) return missingSnapshot()
+  // Early flush so the batch is usually already empty by the time the spool is
+  // consulted. snapshotRecord holds the flush that actually guarantees it.
+  r.flushObserverOutput?.()
   const waiting = r.spool.whenSettled()
   if (waiting) {
     let pausedForResponse = false
@@ -1176,6 +1346,11 @@ function syncSpoolVisibility(r) {
 function subscribe(id, subscriber, { streamEpoch, afterOffset, maxQueueBytes } = {}) {
   const r = terms.get(id)
   if (!r) return { ok: false, message: 'Terminal is no longer available.' }
+  // Same early flush as snapshot. `finish` below may run after the spool
+  // settles asynchronously, so snapshotRecord flushes again at the point the
+  // end offset is taken — subscribe and attach are different operations on
+  // different sockets, and neither covers the other.
+  r.flushObserverOutput?.()
   const finish = (record) => {
     record.observers.subscribe(subscriber, { maxQueueBytes })
     syncSpoolVisibility(record)
@@ -1453,6 +1628,9 @@ function waitForReleaseConfirmation(record) {
 function release(id) {
   cancelRelease(id)
   const r = terms.get(id)
+  // The record and its observers are about to go. Anything still batched has
+  // nowhere else to be delivered from.
+  r?.flushObserverOutput?.()
   if (!r) {
     const deletion = TerminalSpool.cleanup(id, spoolDir)
     return {
@@ -1656,4 +1834,4 @@ function diagnostics() {
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, configureCapacity, capacity, setEventSink, setActivitySink, diagnostics, DEFAULT_MAX_LIVE_TERMINALS, MAX_CONFIGURABLE_LIVE_TERMINALS, MAX_TERMINAL_WRITE_BYTES, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, liveTerminalCount, validatedMaximumLiveTerminals, TerminalCapacityError, MAX_EXIT_WAITERS, RELEASE_CONFIRM_MS } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, configureCapacity, capacity, setEventSink, setActivitySink, setPrimaryStreamPolicy, diagnostics, DEFAULT_MAX_LIVE_TERMINALS, MAX_CONFIGURABLE_LIVE_TERMINALS, MAX_TERMINAL_WRITE_BYTES, __test: { observerChunkExtendsBatch, resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, liveTerminalCount, validatedMaximumLiveTerminals, TerminalCapacityError, MAX_EXIT_WAITERS, RELEASE_CONFIRM_MS } }

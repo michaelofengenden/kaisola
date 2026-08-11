@@ -15,6 +15,8 @@ const {
   DEFAULT_MAX_LIVE_TERMINALS,
   MAX_CONFIGURABLE_LIVE_TERMINALS,
   TERMINAL_HISTORY_CONTINUOUS_FEATURE,
+  TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE,
+  TERMINAL_ATTACH_ACK_FEATURE,
   FEATURES,
   brokerVersionsCompatible,
 } = require('../../runtime/node-broker/ipc/brokerWire.cjs')
@@ -34,6 +36,29 @@ test('independent broker implementation and helper package versions are pinned',
   assert.ok(FEATURES.includes(BROKER_MUTATION_IDEMPOTENCY_FEATURE))
   assert.ok(FEATURES.includes(BROKER_INVENTORY_FEATURE))
   assert.ok(FEATURES.includes(BROKER_ADMINISTRATION_FEATURE))
+})
+
+// These two strings are the whole negotiation. Swift declares them separately
+// in BrokerWire.swift, and a drift on either side fails silently rather than
+// loudly: the observer-only request stops being recognised and the broker goes
+// back to serialising output nobody reads, and — worse — the attach
+// acknowledgement stops being advertised, which is what left every terminal
+// read-only when v0.1.114 met a retained v0.1.113 broker.
+test('the terminal output and attach negotiation strings are pinned on the wire', () => {
+  assert.equal(TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE, 'terminal-observer-only-output-v1')
+  assert.equal(TERMINAL_ATTACH_ACK_FEATURE, 'terminal-attach-ack-v1')
+  assert.ok(FEATURES.includes(TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE))
+  assert.ok(FEATURES.includes(TERMINAL_ATTACH_ACK_FEATURE))
+
+  // A broker advertising the acknowledgement must actually answer with one, or
+  // clients hold it to a promise it does not keep.
+  const source = fs.readFileSync(
+    path.join(__dirname, '..', '..', 'runtime', 'node-broker', 'ipc', 'terminalCreateRoute.cjs'),
+    'utf8',
+  )
+  const attachRoute = source.slice(source.indexOf('function terminalAttachRoute'))
+  assert.ok(attachRoute.includes('ok: true'), 'terminal.attach acknowledges success')
+  assert.ok(attachRoute.includes('ok: false'), 'terminal.attach reports refusal explicitly')
 })
 
 test('Node and Swift consume the same broker N/N+1 compatibility matrix', () => {

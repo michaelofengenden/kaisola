@@ -262,10 +262,11 @@ final class BrokerControlClientTests: XCTestCase {
         let frames = await transport.sentFrames()
         let hello = try XCTUnwrap(frames.first?.objectValue)
         XCTAssertEqual(hello["access"]?.stringValue, "administrator")
-        XCTAssertEqual(
-            hello["features"]?.arrayValue?.compactMap(\.stringValue),
-            [BrokerWire.brokerAdministrationFeature]
-        )
+        // Asserted by membership rather than by exact array: this test is named
+        // for the administrative capability, and pinning the whole list makes it
+        // fail whenever an unrelated feature is negotiated.
+        let requested = try XCTUnwrap(hello["features"]?.arrayValue?.compactMap(\.stringValue))
+        XCTAssertTrue(requested.contains(BrokerWire.brokerAdministrationFeature))
         await client.disconnect()
     }
 
@@ -305,8 +306,72 @@ final class BrokerControlClientTests: XCTestCase {
         let frames = await transport.sentFrames()
         let hello = try XCTUnwrap(frames.first?.objectValue)
         XCTAssertEqual(hello["access"]?.stringValue, "controller")
-        XCTAssertEqual(hello["features"]?.arrayValue, [])
+        let requested = try XCTUnwrap(hello["features"]?.arrayValue?.compactMap(\.stringValue))
+        XCTAssertFalse(requested.contains(BrokerWire.brokerAdministrationFeature))
+        // An ordinary controller does ask not to be sent terminal:data:<id>,
+        // because it reads output on its observer connection and discards this
+        // one. Absence of the administrative capability is what this test is
+        // named for; the presence of that request is asserted here so the
+        // handshake's actual contents stay covered.
+        XCTAssertTrue(requested.contains(BrokerWire.terminalObserverOnlyOutputFeature))
         await client.disconnect()
+    }
+
+    /// A broker retained from before `terminal.attach` reported `{ id, ok }`
+    /// answers with a bare snapshot: no `ok`, no `id`. Refusing that shape is
+    /// what made every terminal read-only after the v0.1.114 update, because
+    /// `restoreOwnedSessions` treats a thrown attach as "another controller
+    /// holds it" and then never schedules the terminal's resize either.
+    func testAttachAcceptsARetainedBrokerSnapshotWithoutOkOrID() async throws {
+        let transport = ScriptedControlResultBrokerTransport(result: .object([
+            "output": .string(""),
+            "startOffset": .integer(0),
+            "endOffset": .integer(0),
+            "truncated": .bool(false),
+            "exited": .bool(false),
+            "agentBusy": .bool(false),
+            // A retained broker really does send these as null, so the fixture
+            // keeps them rather than a tidied-up shape that would not prove the
+            // decode path handles the response we actually receive.
+            "streamEpoch": .null,
+            "exitStatus": .null,
+            "continuation": .null,
+        ]), grantAttachAcknowledgement: false)
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+        try await client.attach(projectID: "project.one", terminalID: "terminal-one")
+        await client.disconnect()
+    }
+
+    /// Compatibility is keyed on what the broker can say, not on what one reply
+    /// happened to omit. A broker that negotiated the acknowledgement is held to
+    /// it, so a malformed answer from a current broker still fails closed rather
+    /// than being excused as an old one.
+    func testAttachStillRefusesExplicitRejectionAndMismatchedIdentity() async throws {
+        let refusals: [JSONValue] = [
+            .object(["id": .string("terminal-one"), "ok": .bool(false)]),
+            .object(["id": .string("someone-elses-terminal"), "ok": .bool(true)]),
+            .object(["id": .string("terminal-one")]),
+            .object(["ok": .bool(true)]),
+        ]
+        for result in refusals {
+            let transport = ScriptedControlResultBrokerTransport(result: result)
+            let client = BrokerControlClient(
+                transport: transport,
+                operationTimeoutNanoseconds: 100_000_000
+            )
+            try await client.connect(to: controlBrokerInfo, ownerID: "native-test")
+            do {
+                try await client.attach(projectID: "project.one", terminalID: "terminal-one")
+                XCTFail("A broker that refused the attach must not be reported as adopted.")
+            } catch {
+                XCTAssertEqual(error as? BrokerClientError, .requestFailed("terminal.attach"))
+            }
+            await client.disconnect()
+        }
     }
 
     func testCreateSurfacesTypedTerminalCapacityWithoutRawBrokerDetails() async throws {
@@ -1353,7 +1418,8 @@ private func scriptedControlHello(
     for request: JSONValue,
     info: BrokerInfo = primaryControlBrokerInfo,
     accessOverride: String? = nil,
-    grantAdministratorFeature: Bool = true
+    grantAdministratorFeature: Bool = true,
+    grantAttachAcknowledgement: Bool = true
 ) -> JSONValue {
     let requestObject = request.objectValue
     let requestedAccess = requestObject?["access"]?.stringValue ?? "controller"
@@ -1375,10 +1441,18 @@ private func scriptedControlHello(
         "pid": .integer(Int64(info.pid)),
         "startedAt": .integer(info.startedAt),
         "version": .string(info.version),
-        "features": .array([
-            .string(BrokerWire.terminalObserveFeature),
-            .string(BrokerWire.brokerAdministrationFeature),
-        ]),
+        // Advertised capability, which is what the client stores as
+        // `connectedFeatures`. A broker predating the attach acknowledgement
+        // simply does not list it, and that absence is how these doubles model
+        // a retained older broker.
+        "features": .array(
+            [
+                JSONValue.string(BrokerWire.terminalObserveFeature),
+                JSONValue.string(BrokerWire.brokerAdministrationFeature),
+            ] + (grantAttachAcknowledgement
+                ? [JSONValue.string(BrokerWire.terminalAttachAcknowledgementFeature)]
+                : [])
+        ),
         "negotiatedFeatures": .array(
             grantsAdministrator ? [.string(BrokerWire.brokerAdministrationFeature)] : []
         ),
@@ -1565,12 +1639,14 @@ private actor ScriptedControlBrokerTransport: BrokerByteTransport {
 /// shared controller fixture used by transport and resize contracts.
 private actor ScriptedControlResultBrokerTransport: BrokerByteTransport {
     private let result: JSONValue
+    private let grantAttachAcknowledgement: Bool
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []
     private var waiter: CheckedContinuation<Data?, Never>?
 
-    init(result: JSONValue) {
+    init(result: JSONValue, grantAttachAcknowledgement: Bool = true) {
         self.result = result
+        self.grantAttachAcknowledgement = grantAttachAcknowledgement
     }
 
     func connect(path: String) async throws {}
@@ -1584,7 +1660,10 @@ private actor ScriptedControlResultBrokerTransport: BrokerByteTransport {
         guard let object = frame.objectValue,
               let type = object["type"]?.stringValue else { return }
         if type == "hello" {
-            deliver(try encoded(scriptedControlHello(for: frame)))
+            deliver(try encoded(scriptedControlHello(
+                for: frame,
+                grantAttachAcknowledgement: grantAttachAcknowledgement
+            )))
             return
         }
         guard type == "request", let id = object["id"]?.stringValue else { return }

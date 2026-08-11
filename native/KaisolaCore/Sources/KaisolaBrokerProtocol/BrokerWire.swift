@@ -14,6 +14,28 @@ public enum BrokerWire {
     /// rather than widening this range silently.
     public static let compatibleImplementationVersions = 1...2
     public static let terminalObserveFeature = "terminal-observe-v1"
+    /// Declares that this controller reads terminal output through its observer
+    /// connection, so the broker stops producing `terminal:data:<id>` for the
+    /// terminals it owns. `BrokerControlClient` already discards that channel —
+    /// see its `case "event"` branch — so the copy was wasted on both ends.
+    ///
+    /// Only the controller connection declares it; the observer connection is
+    /// the one being kept. A broker too old to know the feature keeps sending a
+    /// channel we were discarding anyway, so there is nothing to fall back to.
+    public static let terminalObserverOnlyOutputFeature = "terminal-observer-only-output-v1"
+    /// The broker acknowledges `terminal.attach` with `{ id, ok }` rather than a
+    /// bare snapshot, so a caller can tell adoption from a broker that merely
+    /// answered. Brokers retained from before this cannot say either way, and
+    /// demanding proof they are incapable of giving is what left every terminal
+    /// read-only after the v0.1.114 update.
+    public static let terminalAttachAcknowledgementFeature = "terminal-attach-ack-v1"
+    /// The broker batches observer output on a frame window instead of
+    /// broadcasting per pty chunk. A client that sees this stops running a
+    /// second window of its own, because two stacked windows spend up to two
+    /// frames of latency merging what one already merged. Against a broker
+    /// without it the client must keep its own, or raw per-chunk output lands
+    /// straight on the main thread.
+    public static let terminalObserverCoalescingFeature = "terminal-observer-coalescing-v1"
     public static let terminalHistoryFeature = "terminal-history-v1"
     public static let observerRoleFeature = "observer-role-v1"
     public static let brokerUpdateFeature = "broker-update-v1"

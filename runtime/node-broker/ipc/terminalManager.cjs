@@ -937,7 +937,11 @@ function spawn({ id, command, args, cwd, env, outputByteLimit, cols, rows, sende
       flushObserverOutput()
       rec.observerPending = { ...chunk }
     }
-    if (Buffer.byteLength(rec.observerPending.data, 'utf8') >= OBSERVER_BATCH_CAP) {
+    // The cursor offsets are byte offsets, so the batch size is a subtraction.
+    // Measuring the accumulated string with Buffer.byteLength instead would
+    // re-walk every byte already in the batch on each append, which is O(n^2)
+    // over a burst — in the one path this change exists to make cheaper.
+    if (rec.observerPending.endOffset - rec.observerPending.startOffset >= OBSERVER_BATCH_CAP) {
       flushObserverOutput()
       return
     }

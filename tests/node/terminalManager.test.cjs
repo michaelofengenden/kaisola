@@ -1488,14 +1488,22 @@ async function withObservedTerminal(t, id, run) {
     sender: owner,
   })
   const exited = new Promise((resolve) => record.pty.onExit(resolve))
+  const subscribers = new Set([owner])
   t.after(async () => {
-    manager.release(id)
+    for (const subscriber of subscribers) manager.unsubscribe(id, subscriber)
+    // Awaited, unlike the older tests nearby. release() resolves once the
+    // record is finalized and its spool deleted; leaving it in flight races the
+    // file-level after() hook that removes the shared spool directory, which
+    // surfaces as ENOTEMPTY on a runner slow enough to lose the race. These
+    // tests write far more output than the ones this pattern came from, so they
+    // are the ones that open the window.
+    await manager.release(id)
     await exited
     manager.setEventSink(null)
   })
   manager.subscribe(id, owner, {})
   const settle = (ms = 80) => new Promise((resolve) => setTimeout(resolve, ms))
-  await run({ owner, frames, settle, record })
+  await run({ owner, frames, settle, record, subscribers })
 }
 
 test('observer output coalesces without changing the bytes or breaking contiguity', async (t) => {
@@ -1559,8 +1567,9 @@ test('a terminal exit never overtakes the output that preceded it', async (t) =>
 })
 
 test('a subscriber joining mid-batch is not handed the same bytes twice', async (t) => {
-  await withObservedTerminal(t, 'observer-subscribe-dedupe', async ({ settle }) => {
+  await withObservedTerminal(t, 'observer-subscribe-dedupe', async ({ settle, subscribers }) => {
     const latecomer = 'instance-latecomer|renderer-2|project-a'
+    subscribers.add(latecomer)
     const latecomerFrames = []
     manager.setEventSink((sender, channel, payload) => {
       if (sender !== latecomer) return true

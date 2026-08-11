@@ -573,7 +573,19 @@ final class AppModel: ObservableObject {
         let usage: AcpUsage?
     }
     private var chatSurfaceSummaries: [String: ChatSurfaceSummary] = [:]
-    private var chatSurfaceSummaryCheckScheduled = false
+    private var surfaceSummaryCheckScheduled = false
+    /// The same idea for Mesh. The shell shows a title, a running dot, a stage
+    /// word, and builds a run-target list from column worktrees. `MeshView`
+    /// renders the columns and their transcripts, but it holds the session as
+    /// its own `@ObservedObject`, so it keeps updating from the session
+    /// directly and does not depend on this re-broadcast.
+    private struct MeshSurfaceSummary: Equatable {
+        let title: String
+        let anyRunning: Bool
+        let stage: String
+        let columnTargets: [String]
+    }
+    private var meshSurfaceSummaries: [String: MeshSurfaceSummary] = [:]
     /// The separate native-profile broker used when Electron's is incompatible.
     private let fallbackPreparer: (any BrokerInfoPreparing)?
     /// True when this window is connected to the app's own separate broker
@@ -3005,7 +3017,7 @@ final class AppModel: ObservableObject {
                 )
                 wireMeshPersistence(mesh)
                 surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-                    self?.objectWillChange.send()
+                    self?.scheduleSurfaceSummaryCheck()
                 }
                 meshes.append(mesh)
 
@@ -3530,7 +3542,7 @@ final class AppModel: ObservableObject {
         }
         chats.append(handle)
         surfaceObservers[chatID] = conversation.objectWillChange.sink { [weak self] _ in
-            self?.scheduleChatSurfaceSummaryCheck()
+            self?.scheduleSurfaceSummaryCheck()
         }
         reconcileChatAccountAvailability(for: handle)
         if requiresAccountResolution, accountAccess.phase == .resolving {
@@ -3763,13 +3775,13 @@ final class AppModel: ObservableObject {
     /// It also collapses a burst: a streaming turn publishes rows and
     /// contentVersion for every chunk, and several conversations can stream at
     /// once. One comparison per turn answers all of them.
-    private func scheduleChatSurfaceSummaryCheck() {
-        guard !chatSurfaceSummaryCheckScheduled else { return }
-        chatSurfaceSummaryCheckScheduled = true
+    private func scheduleSurfaceSummaryCheck() {
+        guard !surfaceSummaryCheckScheduled else { return }
+        surfaceSummaryCheckScheduled = true
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.chatSurfaceSummaryCheckScheduled = false
-            self.publishIfChatSurfacesChanged()
+            self.surfaceSummaryCheckScheduled = false
+            self.publishIfSurfacesChanged()
         }
     }
 
@@ -3779,7 +3791,7 @@ final class AppModel: ObservableObject {
     /// during a streaming turn is every chunk — and with several conversations
     /// running, several times that. Nothing outside the chat surface renders a
     /// transcript, so almost all of it announced a change no observer could see.
-    private func publishIfChatSurfacesChanged() {
+    private func publishIfSurfacesChanged() {
         var summaries: [String: ChatSurfaceSummary] = [:]
         summaries.reserveCapacity(chats.count)
         for chat in chats {
@@ -3795,8 +3807,25 @@ final class AppModel: ObservableObject {
                 usage: conversation.usage
             )
         }
-        guard summaries != chatSurfaceSummaries else { return }
+        var meshSummaries: [String: MeshSurfaceSummary] = [:]
+        meshSummaries.reserveCapacity(meshes.count)
+        for mesh in meshes {
+            meshSummaries[mesh.id] = MeshSurfaceSummary(
+                title: mesh.title,
+                anyRunning: mesh.anyRunning,
+                stage: mesh.stage,
+                // The shell builds run targets from column worktrees, which move
+                // when a column is configured rather than when one streams.
+                columnTargets: mesh.columns.map { column in
+                    "\(column.worktreePath ?? "")|\(column.branch ?? "")"
+                }
+            )
+        }
+        guard summaries != chatSurfaceSummaries || meshSummaries != meshSurfaceSummaries else {
+            return
+        }
         chatSurfaceSummaries = summaries
+        meshSurfaceSummaries = meshSummaries
         objectWillChange.send()
     }
 
@@ -4156,7 +4185,7 @@ final class AppModel: ObservableObject {
         )
         wireMeshPersistence(mesh)
         surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            self?.scheduleSurfaceSummaryCheck()
         }
         meshes.append(mesh)
         selectedMeshID = mesh.id
@@ -4349,7 +4378,7 @@ final class AppModel: ObservableObject {
         _ = removeRecentlyClosedPane(id: surfaceID)
         wireMeshPersistence(mesh)
         surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            self?.scheduleSurfaceSummaryCheck()
         }
         meshes.append(mesh)
         keepsClaim = true
@@ -4909,7 +4938,7 @@ final class AppModel: ObservableObject {
             agents: Array(AgentRegistry.builtIns.prefix(max(1, agentCount)))
         )
         surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            self?.scheduleSurfaceSummaryCheck()
         }
         meshes = [mesh]
         selectedSessionID = nil

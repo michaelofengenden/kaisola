@@ -263,7 +263,21 @@ extension NativeTerminalSurface {
             surfaceDelta: TerminalSurfaceDelta? = nil,
             to view: ReadOnlyTerminalView
         ) {
-            view.updateAccessibilityValue(from: scrollback)
+            // Skipped only on the path that is about to return having rendered
+            // nothing. `updateNSView` runs this on every SwiftUI update, not
+            // only on new output, and building the value walks the page table
+            // and joins an 8,000-character tail — real work to restate a value
+            // that cannot have changed, because the guard below returns exactly
+            // when the epoch and end offset both match what is already drawn.
+            //
+            // Deliberately not gated on whether VoiceOver is running. That is
+            // the larger saving, but the retained value would then be stale for
+            // anyone enabling VoiceOver mid-session, and doing it correctly
+            // needs a status-change signal to repopulate from. Not worth
+            // guessing at for an allocation nobody has measured.
+            if !(epoch == renderedEpoch && endOffset == renderedEndOffset) {
+                view.updateAccessibilityValue(from: scrollback)
+            }
             if isProgressivelyReplaying {
                 queuedPagedDuringProgressiveReplay = (
                     scrollback,

@@ -262,10 +262,11 @@ final class BrokerControlClientTests: XCTestCase {
         let frames = await transport.sentFrames()
         let hello = try XCTUnwrap(frames.first?.objectValue)
         XCTAssertEqual(hello["access"]?.stringValue, "administrator")
-        XCTAssertEqual(
-            hello["features"]?.arrayValue?.compactMap(\.stringValue),
-            [BrokerWire.brokerAdministrationFeature]
-        )
+        // Asserted by membership rather than by exact array: this test is named
+        // for the administrative capability, and pinning the whole list makes it
+        // fail whenever an unrelated feature is negotiated.
+        let requested = try XCTUnwrap(hello["features"]?.arrayValue?.compactMap(\.stringValue))
+        XCTAssertTrue(requested.contains(BrokerWire.brokerAdministrationFeature))
         await client.disconnect()
     }
 
@@ -305,7 +306,14 @@ final class BrokerControlClientTests: XCTestCase {
         let frames = await transport.sentFrames()
         let hello = try XCTUnwrap(frames.first?.objectValue)
         XCTAssertEqual(hello["access"]?.stringValue, "controller")
-        XCTAssertEqual(hello["features"]?.arrayValue, [])
+        let requested = try XCTUnwrap(hello["features"]?.arrayValue?.compactMap(\.stringValue))
+        XCTAssertFalse(requested.contains(BrokerWire.brokerAdministrationFeature))
+        // An ordinary controller does ask not to be sent terminal:data:<id>,
+        // because it reads output on its observer connection and discards this
+        // one. Absence of the administrative capability is what this test is
+        // named for; the presence of that request is asserted here so the
+        // handshake's actual contents stay covered.
+        XCTAssertTrue(requested.contains(BrokerWire.terminalObserverOnlyOutputFeature))
         await client.disconnect()
     }
 

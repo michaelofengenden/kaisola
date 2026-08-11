@@ -554,6 +554,26 @@ final class AppModel: ObservableObject {
     /// Child surfaces are observable objects of their own. Relay their live
     /// state changes so project activity badges and tabs update immediately.
     private var surfaceObservers: [String: AnyCancellable] = [:]
+    /// What the shell actually shows about a chat, as opposed to everything a
+    /// conversation publishes.
+    ///
+    /// Views outside the chat surface read these through the conversation at
+    /// render time — the strip and the rail want a title, a running dot, a
+    /// permission badge. None of them render the transcript. So the shell needs
+    /// to be invalidated when one of these changes, and not when a token
+    /// arrives, which is what a blanket re-broadcast could not distinguish.
+    private struct ChatSurfaceSummary: Equatable {
+        let title: String
+        let isRunning: Bool
+        let isConnected: Bool
+        let statusMessage: String?
+        let pendingPermissionCount: Int
+        let queuedCount: Int
+        let hasRows: Bool
+        let usage: AcpUsage?
+    }
+    private var chatSurfaceSummaries: [String: ChatSurfaceSummary] = [:]
+    private var chatSurfaceSummaryCheckScheduled = false
     /// The separate native-profile broker used when Electron's is incompatible.
     private let fallbackPreparer: (any BrokerInfoPreparing)?
     /// True when this window is connected to the app's own separate broker
@@ -3510,7 +3530,7 @@ final class AppModel: ObservableObject {
         }
         chats.append(handle)
         surfaceObservers[chatID] = conversation.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
+            self?.scheduleChatSurfaceSummaryCheck()
         }
         reconcileChatAccountAvailability(for: handle)
         if requiresAccountResolution, accountAccess.phase == .resolving {
@@ -3732,6 +3752,52 @@ final class AppModel: ObservableObject {
         if transition == .requiresResumeInvalidation {
             scheduleChatResumeInvalidation(chat.id)
         }
+    }
+
+    /// Coalesced to one pass per runloop turn, for two reasons.
+    ///
+    /// `objectWillChange` fires *before* the property changes, so reading a
+    /// conversation inside its own sink returns the previous value. Deferring
+    /// the read to the next turn is what makes the comparison meaningful.
+    ///
+    /// It also collapses a burst: a streaming turn publishes rows and
+    /// contentVersion for every chunk, and several conversations can stream at
+    /// once. One comparison per turn answers all of them.
+    private func scheduleChatSurfaceSummaryCheck() {
+        guard !chatSurfaceSummaryCheckScheduled else { return }
+        chatSurfaceSummaryCheckScheduled = true
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.chatSurfaceSummaryCheckScheduled = false
+            self.publishIfChatSurfacesChanged()
+        }
+    }
+
+    /// Re-broadcast only when something the shell renders about a chat moved.
+    ///
+    /// The shell used to be invalidated by every conversation publish, which
+    /// during a streaming turn is every chunk — and with several conversations
+    /// running, several times that. Nothing outside the chat surface renders a
+    /// transcript, so almost all of it announced a change no observer could see.
+    private func publishIfChatSurfacesChanged() {
+        var summaries: [String: ChatSurfaceSummary] = [:]
+        summaries.reserveCapacity(chats.count)
+        for chat in chats {
+            let conversation = chat.conversation
+            summaries[chat.id] = ChatSurfaceSummary(
+                title: conversation.title,
+                isRunning: conversation.isRunning,
+                isConnected: conversation.isConnected,
+                statusMessage: conversation.statusMessage,
+                pendingPermissionCount: conversation.pendingPermissionCount,
+                queuedCount: conversation.queued.count,
+                hasRows: !conversation.rows.isEmpty,
+                usage: conversation.usage
+            )
+        }
+        guard summaries != chatSurfaceSummaries else { return }
+        chatSurfaceSummaries = summaries
+        objectWillChange.send()
     }
 
     private func scheduleChatResumeInvalidation(_ chatID: String) {

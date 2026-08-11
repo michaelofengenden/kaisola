@@ -14,6 +14,15 @@ public enum BrokerWire {
     /// rather than widening this range silently.
     public static let compatibleImplementationVersions = 1...2
     public static let terminalObserveFeature = "terminal-observe-v1"
+    /// Declares that this controller reads terminal output through its observer
+    /// connection, so the broker stops producing `terminal:data:<id>` for the
+    /// terminals it owns. `BrokerControlClient` already discards that channel —
+    /// see its `case "event"` branch — so the copy was wasted on both ends.
+    ///
+    /// Only the controller connection declares it; the observer connection is
+    /// the one being kept. A broker too old to know the feature keeps sending a
+    /// channel we were discarding anyway, so there is nothing to fall back to.
+    public static let terminalObserverOnlyOutputFeature = "terminal-observer-only-output-v1"
     public static let terminalHistoryFeature = "terminal-history-v1"
     public static let observerRoleFeature = "observer-role-v1"
     public static let brokerUpdateFeature = "broker-update-v1"

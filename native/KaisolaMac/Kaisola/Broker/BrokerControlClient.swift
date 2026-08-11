@@ -272,9 +272,14 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         let encoded: Data
         do {
             try await transport.connect(path: info.socketPath)
-            let requestedFeatures: [JSONValue] = access == .administrator
-                ? [.string(BrokerWire.brokerAdministrationFeature)]
-                : []
+            // The controller reads output on the observer connection and throws
+            // this connection's copy away, so ask the broker not to build it.
+            // An older broker ignores the unknown feature and keeps sending the
+            // channel we already discard, which is exactly today's behaviour.
+            var requestedFeatures: [JSONValue] = [.string(BrokerWire.terminalObserverOnlyOutputFeature)]
+            if access == .administrator {
+                requestedFeatures.append(.string(BrokerWire.brokerAdministrationFeature))
+            }
             let frame: JSONValue = .object([
                 "type": .string("hello"),
                 "protocol": .integer(Int64(BrokerWire.protocolVersion)),

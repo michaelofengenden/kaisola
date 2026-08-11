@@ -177,6 +177,48 @@ final class NativeVisualLayoutAuditTests: XCTestCase {
         XCTAssertEqual(failingRules(snapshot, expectations), [])
     }
 
+    func testControlOverlapIgnoresAChildClippedOutsideItsScrollViewport() throws {
+        let expectations = try loadExpectations()
+        let snapshot = snapshot(elements: [
+            element(
+                id: "0/scroll",
+                frame: .init(x: 0.4, y: 0.02, width: 0.5, height: 0.2),
+                role: "AXScrollArea",
+                leaf: false
+            ),
+            element(
+                id: "0/scroll/tab",
+                frame: .init(x: -0.1, y: 0.01, width: 0.2, height: 0.04),
+                role: "AXUnknown"
+            ),
+        ])
+        XCTAssertFalse(
+            failingRules(snapshot, expectations).contains(NativeVisualLayoutRule.controlOverlap),
+            "offscreen scroll content is not visibly drawn over the window buttons"
+        )
+    }
+
+    func testControlOverlapStillFailsForAVisibleChildInsideItsScrollViewport() throws {
+        let expectations = try loadExpectations()
+        let snapshot = snapshot(elements: [
+            element(
+                id: "0/scroll",
+                frame: .init(x: 0.04, y: 0, width: 0.5, height: 0.2),
+                role: "AXScrollArea",
+                leaf: false
+            ),
+            element(
+                id: "0/scroll/tab",
+                frame: .init(x: 0, y: 0.01, width: 0.1, height: 0.04),
+                role: "AXUnknown"
+            ),
+        ])
+        XCTAssertTrue(
+            failingRules(snapshot, expectations).contains(NativeVisualLayoutRule.controlOverlap),
+            "viewport clipping must not hide a genuinely visible titlebar collision"
+        )
+    }
+
     func testMasksDropNondeterministicMaterialFromInkRules() {
         let grid = NativeVisualLayoutSnapshot.InkGrid(
             columns: 2,

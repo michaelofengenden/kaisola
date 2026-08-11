@@ -441,6 +441,25 @@ enum NativeVisualLayoutAudit {
                 && $0.frame.width < expectations.containerSpanShare
                 && $0.frame.height < expectations.containerSpanShare
         }
+        let elementsByID = Dictionary(
+            snapshot.elements.map { ($0.id, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
+
+        func frameClippedToScrollAncestors(
+            _ element: NativeVisualLayoutSnapshot.Element
+        ) -> NativeVisualLayoutSnapshot.Rect {
+            var frame = element.frame
+            var ancestorID = element.id
+            while let separator = ancestorID.lastIndex(of: "/") {
+                ancestorID = String(ancestorID[..<separator])
+                guard let ancestor = elementsByID[ancestorID],
+                      ancestor.role == "AXScrollArea" else { continue }
+                frame = frame.intersection(ancestor.frame)
+                if frame.area == 0 { break }
+            }
+            return frame
+        }
 
         // 1. Window controls: present, and nothing drawn on top of them.
         let visibleControls = snapshot.windowControls.filter { !$0.isHidden }
@@ -452,14 +471,18 @@ enum NativeVisualLayoutAudit {
         }
         if let zone = snapshot.controlZone {
             for element in leaves {
-                let overlap = element.frame.intersection(zone).area
+                // Scroll documents keep raw frames for offscreen children.
+                // Judge only the portion inside every enclosing viewport, or
+                // a hidden tab can look as though it sits on the titlebar.
+                let visibleFrame = frameClippedToScrollAncestors(element)
+                let overlap = visibleFrame.intersection(zone).area
                 guard zone.area > 0,
                       overlap / zone.area >= expectations.controlOverlapShare else { continue }
                 record(
                     NativeVisualLayoutRule.controlOverlap,
                     "element=\(element.id) role=\(element.role) "
                         + "label=\(reportable(element.label)) "
-                        + "frame=[\(element.frame.describedForReport)] "
+                        + "frame=[\(visibleFrame.describedForReport)] "
                         + String(format: "share=%.3f", overlap / zone.area)
                 )
             }

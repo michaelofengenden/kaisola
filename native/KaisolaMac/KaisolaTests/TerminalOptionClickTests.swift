@@ -285,6 +285,34 @@ final class TerminalOptionClickTests: XCTestCase {
         XCTAssertTrue(capture.sent.isEmpty, "semantic navigation must never write to the PTY")
     }
 
+    func testContinuousScrollFixtureRestoresSemanticMarksAfterLateGridReflow() {
+        let capture = Capture()
+        let view = makeView(capture)
+        view.changeScrollback(1_000)
+        view.getTerminal().resize(cols: 80, rows: 8)
+        view.configureSemanticPromptMarks()
+        view.getTerminal().feed(text: VisualTerminalContinuousScrollFixture.initialOutput)
+        XCTAssertFalse(view.semanticTracker.commands.isEmpty)
+
+        // A late host-layout reflow deliberately invalidates row-addressed OSC
+        // marks. The optimized fixture must therefore seed a fresh lifecycle
+        // through its live packet lane before claiming prompt preservation.
+        view.resetSemanticPromptMarks()
+        XCTAssertTrue(view.semanticTracker.commands.isEmpty)
+        for index in 1...24 {
+            view.getTerminal().feed(
+                text: VisualTerminalContinuousScrollFixture.packet(index: index)
+            )
+        }
+
+        XCTAssertFalse(view.semanticTracker.commands.isEmpty)
+        view.scrollToLiveBottom()
+        let bottom = view.getTerminal().getTopVisibleRow()
+        XCTAssertTrue(view.navigateSemanticPrompt(backward: true))
+        XCTAssertLessThan(view.getTerminal().getTopVisibleRow(), bottom)
+        XCTAssertTrue(capture.sent.isEmpty)
+    }
+
     func testSemanticMarksAreDiscardedWhenGridReflowChangesCoordinates() {
         let view = makeView(Capture())
         view.configureSemanticPromptMarks()

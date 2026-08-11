@@ -42,6 +42,54 @@ final class AcpProcessIntegrationTests: XCTestCase {
         XCTAssertEqual(opaqueDetail, "adapter rejected [redacted]")
     }
 
+    func testStderrDrainFinalizationWaitsForAnInFlightReadBeforeInspectingTheTail() throws {
+        let tail = AcpStderrTail(byteLimit: 128)
+        let source = BlockingStderrReadSource(
+            payload: Data("adapter-two failed\n".utf8)
+        )
+        let drain = AcpStderrDrain(tail: tail, readOperation: source.read)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            drain.consumeReadable()
+        }
+        XCTAssertEqual(
+            source.readStarted.wait(timeout: .now() + 1),
+            .success,
+            "the simulated readability callback never consumed stderr"
+        )
+
+        let finishStarted = DispatchSemaphore(value: 0)
+        let finishReturned = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            finishStarted.signal()
+            drain.finish()
+            finishReturned.signal()
+        }
+        XCTAssertEqual(
+            finishStarted.wait(timeout: .now() + 1),
+            .success,
+            "the simulated finalization task never started"
+        )
+        let prematureFinish = finishReturned.wait(timeout: .now() + 0.05)
+        source.allowAppend.signal()
+
+        XCTAssertEqual(
+            prematureFinish,
+            .timedOut,
+            "finalization inspected the tail before the consumed bytes were appended"
+        )
+        XCTAssertEqual(finishReturned.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(tail.failureDetail(), "adapter-two failed")
+
+        let readsAtFinish = source.readCount
+        drain.consumeReadable()
+        XCTAssertEqual(
+            source.readCount,
+            readsAtFinish,
+            "a late readability callback must not touch a closed or reused descriptor"
+        )
+    }
+
     func testAdapterExitSurfacesOnlyCurrentGenerationStderrWithoutMixingStdout() async throws {
         let transport = AcpProcessTransport(stderrByteLimit: 96)
         let environment = [
@@ -735,6 +783,41 @@ final class AcpProcessIntegrationTests: XCTestCase {
             }
             return result
         }
+    }
+}
+
+private final class BlockingStderrReadSource: @unchecked Sendable {
+    let readStarted = DispatchSemaphore(value: 0)
+    let allowAppend = DispatchSemaphore(value: 0)
+
+    private let lock = NSLock()
+    private let payload: Data
+    private var didRead = false
+    private var readCountStorage = 0
+
+    init(payload: Data) {
+        self.payload = payload
+    }
+
+    func read() -> Data? {
+        lock.lock()
+        readCountStorage += 1
+        guard !didRead else {
+            lock.unlock()
+            return nil
+        }
+        didRead = true
+        lock.unlock()
+
+        readStarted.signal()
+        allowAppend.wait()
+        return payload
+    }
+
+    var readCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return readCountStorage
     }
 }
 

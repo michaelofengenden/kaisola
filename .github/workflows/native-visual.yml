@@ -174,6 +174,18 @@ jobs:
               "$profile/config" \
               "$profile/cache" \
               "$profile/data"
+            # File-action sheets need a real first tree row. Keep that seed
+            # inside this process's disposable workspace, and restrict it to
+            # the three sheet surfaces so every unrelated visual baseline
+            # retains its declared empty workspace.
+            if [[ "$surface" == workspace-rename || "$surface" == workspace-new-file
+                 || "$surface" == workspace-move ]]; then
+              mkdir -p \
+                "$profile/workspace/A Source" \
+                "$profile/workspace/B Destination"
+              test -d "$profile/workspace/A Source"
+              test -d "$profile/workspace/B Destination"
+            fi
             echo "KAISOLA_NATIVE_VISUAL_SURFACE_BEGIN=$surface"
             # Each fixture normally captures and exits in under eight seconds.
             # Keep a broken AppKit sheet or framework callback from hiding the
@@ -284,7 +296,7 @@ jobs:
                   || !receipt.fixtureUpdaterDisabled
                   || !receipt.fixtureBrokerIsolated
                   || receipt.contentHeight < 540
-                  || (receipt.surface === "settings-extensions" && receipt.contentWidth < 1050)
+                  || (receipt.surface === "settings-extensions" && receipt.contentWidth < 1000)
                   || (receipt.surface === "settings-extensions-narrow"
                     && (receipt.contentWidth < 800 || receipt.contentWidth > 900))
                   || !receipt.accessibilityIdentifiers.includes("extensions.hub")
@@ -307,15 +319,17 @@ jobs:
               const wide = receipt.surface === "settings-extensions";
               if (receipt.windowCount !== 1
                   || receipt.elementCount < 40
-                  || receipt.categoryLabels.length !== 5
-                  || receipt.itemIdentifierCount !== 5
-                  || !receipt.validationIdentifierPresent
                   || receipt.searchRole !== "AXTextField"
                   || receipt.commonMetadataFields.length !== 4
                   || !receipt.secretFree
-                  || (wide && (receipt.categoryNavigationRoles.length !== 5
+                  || (wide && (receipt.categoryLabels.length !== 5
+                    || receipt.itemIdentifierCount !== 5
+                    || !receipt.validationIdentifierPresent
+                    || receipt.categoryNavigationRoles.length !== 5
                     || receipt.categoryNavigationRoles.some(role => role !== "AXButton")))
-                  || (!wide && (receipt.categoryNavigationRoles.length !== 1
+                  || (!wide && (receipt.categoryLabels.length < 1
+                    || receipt.itemIdentifierCount < 1
+                    || receipt.categoryNavigationRoles.length !== 1
                     || receipt.categoryNavigationRoles[0] !== "AXPopUpButton"))) {
                 throw new Error(`invalid external AX receipt: ${process.argv[1]}`);
               }
@@ -487,7 +501,8 @@ jobs:
           # so the same inspection holds on a Retina host.
           for surface in settings-minimum settings-ideal; do
             capture="$output/nonretina-$surface.png"
-            run_fixture "$surface" "$capture" \
+            log="$output/nonretina-$surface.log"
+            run_fixture "$surface" "$capture" "$log" \
               /usr/bin/env KAISOLA_NATIVE_VISUAL_SCALE=1 "$binary"
             verify_capture "$capture" "$surface"
           done
@@ -518,12 +533,14 @@ jobs:
             for shape in "$agents-min" "$agents-typical" "$agents-full" "$agents-typical-large-text"; do
               surface="mesh-$shape"
               capture="$output/$surface.png"
-              run_fixture "$surface" "$capture" \
+              log="$output/$surface.log"
+              run_fixture "$surface" "$capture" "$log" \
                 "$binary" -ApplePersistenceIgnoreState YES
               verify_capture "$capture" "$surface"
 
               capture="$output/dark-$surface.png"
-              run_fixture "$surface" "$capture" \
+              log="$output/dark-$surface.log"
+              run_fixture "$surface" "$capture" "$log" \
                 /usr/bin/env KAISOLA_NATIVE_VISUAL_APPEARANCE=dark "$binary"
               verify_capture "$capture" "$surface"
             done

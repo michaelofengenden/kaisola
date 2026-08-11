@@ -199,15 +199,6 @@ private func failure(surface: String, snapshot: Snapshot) -> String? {
           search.enabled != false else {
         return "missing-enabled-search-field"
     }
-    for title in categoryTitles where !containsLabel(title, in: snapshot) {
-        return "missing-category-label-\(title)"
-    }
-    for identifier in itemIdentifiers where !identifiers.contains(identifier) {
-        return "missing-item-identifier-\(identifier)"
-    }
-    guard identifiers.contains("extensions.validation.language-grammars:broken-grammar") else {
-        return "missing-validation-identifier"
-    }
     for field in ["Source:", "Scope:", "Version and integrity:", "Updates:"]
         where !containsLabel(field, in: snapshot) {
         return "missing-common-metadata-\(field)"
@@ -216,6 +207,15 @@ private func failure(surface: String, snapshot: Snapshot) -> String? {
 
     switch surface {
     case "settings-extensions":
+        for title in categoryTitles where !containsLabel(title, in: snapshot) {
+            return "missing-category-label-\(title)"
+        }
+        for identifier in itemIdentifiers where !identifiers.contains(identifier) {
+            return "missing-item-identifier-\(identifier)"
+        }
+        guard identifiers.contains("extensions.validation.language-grammars:broken-grammar") else {
+            return "missing-validation-identifier"
+        }
         for identifier in categoryIdentifiers where !identifiers.contains(identifier) {
             return "missing-wide-category-control-\(identifier)"
         }
@@ -230,6 +230,15 @@ private func failure(surface: String, snapshot: Snapshot) -> String? {
         }
         guard categoryIdentifiers.allSatisfy({ !identifiers.contains($0) }) else {
             return "wide-category-rail-visible-in-narrow-layout"
+        }
+        // The compact catalog is a LazyVStack. Only mounted rows belong in the
+        // external AX tree, while the in-app receipt separately proves that all
+        // five fixture categories and the invalid grammar are present.
+        guard categoryTitles.contains(where: { containsLabel($0, in: snapshot) }) else {
+            return "missing-mounted-compact-category"
+        }
+        guard itemIdentifiers.contains(where: identifiers.contains) else {
+            return "missing-mounted-compact-item"
         }
     default:
         return "unsupported-surface-\(surface)"

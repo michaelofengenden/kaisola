@@ -35,6 +35,18 @@ const MAX_CONFIGURABLE_LIVE_TERMINALS = 512
 // declare this feature receive the same { exitCode, signal } record the
 // observer channel already carries.
 const TERMINAL_EXIT_STATUS_FEATURE = 'terminal-exit-status-v1'
+// A controller that reads terminal output through its observer connection has
+// no use for terminal:data:<id>, and the broker was serialising, size-scanning
+// and writing that second copy for a client which discards it. Declaring this
+// feature says "I read output through observers"; the broker then stops
+// producing the primary copy for terminals that client owns.
+//
+// It has to be negotiated rather than assumed. A client that never declares it
+// still needs terminal:data:<id>, and silently suppressing the channel would
+// give an older app a permanently blank terminal. Ownership and detach
+// accounting are untouched either way: this decides what is sent, not who owns
+// the terminal or whether a renderer is attached.
+const TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE = 'terminal-observer-only-output-v1'
 const FEATURES = Object.freeze([
   TERMINAL_OBSERVE_FEATURE,
   TERMINAL_HISTORY_FEATURE,
@@ -46,6 +58,7 @@ const FEATURES = Object.freeze([
   BROKER_INVENTORY_FEATURE,
   BROKER_ADMINISTRATION_FEATURE,
   TERMINAL_EXIT_STATUS_FEATURE,
+  TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE,
 ])
 const TERMINAL_EXIT_CHANNEL_PREFIX = 'terminal:exit:'
 const CONTROLLER_ACCESS = 'controller'
@@ -364,6 +377,7 @@ module.exports = {
   DEFAULT_MAX_LIVE_TERMINALS,
   MAX_CONFIGURABLE_LIVE_TERMINALS,
   TERMINAL_EXIT_STATUS_FEATURE,
+  TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE,
   TERMINAL_EXIT_CHANNEL_PREFIX,
   FEATURES,
   CONTROLLER_ACCESS,

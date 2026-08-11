@@ -1409,3 +1409,64 @@ test('managed shutdown waits for each asynchronous spool writer to become durabl
   assert.equal(fs.readFileSync(record.spool.file, 'utf8'), 'durable shutdown tail')
   assert.equal(TerminalSpool.readMeta(id, managerSpoolDir)?.id, id)
 })
+
+test('an observer-only owner stops receiving terminal:data, and reattach does not undo it', async (t) => {
+  const id = 'observer-only-primary-suppression'
+  const owner = 'instance-observer-only|renderer-1|project-a'
+  const dataFrames = []
+  manager.setEventSink((sender, channel, payload) => {
+    // Other manager tests can still be receiving asynchronous native exit
+    // callbacks under an owner that is not this client's.
+    if (sender !== owner) return true
+    if (channel === `terminal:data:${id}`) dataFrames.push(payload)
+    return true
+  })
+  // Default policy first: this owner still wants the primary copy, which is what
+  // every client that never negotiated the feature looks like.
+  let observerOnly = false
+  manager.setPrimaryStreamPolicy((sender) => (sender === owner ? !observerOnly : true))
+
+  const record = manager.spawn({
+    id,
+    command: '/bin/cat',
+    args: [],
+    cwd: managerSpoolDir,
+    sender: owner,
+  })
+  const exited = new Promise((resolve) => record.pty.onExit(resolve))
+  t.after(async () => {
+    manager.release(id)
+    await exited
+    manager.setEventSink(null)
+    manager.setPrimaryStreamPolicy(null)
+  })
+
+  const settle = () => new Promise((resolve) => setTimeout(resolve, 60))
+
+  manager.write(id, 'before\n')
+  await settle()
+  assert.ok(dataFrames.length > 0, 'a client that did not negotiate still gets terminal:data')
+
+  // The owner reconnects having negotiated observer-only output. Attach is the
+  // path a reconnect, an input recovery and a startup restore all take.
+  observerOnly = true
+  manager.setSender(id, owner)
+  const afterOptIn = dataFrames.length
+
+  manager.write(id, 'after\n')
+  await settle()
+  assert.equal(dataFrames.length, afterOptIn, 'no terminal:data once the owner reads through observers')
+
+  // The bug this guards: setSender used to force the primary stream back on, so
+  // every reconnect silently resumed the duplicate copy. Attaching again must
+  // re-answer the question, not reset it.
+  manager.setSender(id, owner)
+  manager.write(id, 'after reattach\n')
+  await settle()
+  assert.equal(dataFrames.length, afterOptIn, 'reattach re-answers the policy rather than forcing the stream on')
+
+  // Ownership and detach accounting are separate questions and must be untouched.
+  const live = manager.list().find((entry) => entry.id === id)
+  assert.ok(live, 'the terminal is still owned and still inventoried')
+  assert.equal(live.exitedWhileDetached ?? false, false, 'a visible terminal is not reported as detached')
+})

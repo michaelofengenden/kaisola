@@ -50,6 +50,7 @@ const {
   brokerOwnerIDAllowedForAccess,
   negotiateFeatures,
   eventPayloadForFeatures,
+  TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE,
   // Framing and queue accounting live in brokerWire so the observer layer can
   // be exercised against the exact delivery verdict a real socket produces.
   writeFrame: send,
@@ -314,6 +315,19 @@ mgr.setEventSink((owner, channel, payload, options) => {
   }, options)
 })
 mgr.setActivitySink(() => noteActivity())
+// Same per-client resolution as the event sink above, and for the same reason:
+// during a rolling update the current and draining generations can have
+// negotiated differently, so this is answered from the owner's own connection
+// rather than from a broker-wide flag. An owner whose connection is gone keeps
+// the primary stream, because the next attach re-answers this anyway and the
+// cost of a wrong "yes" is wasted work while a wrong "no" is a blank terminal.
+mgr.setPrimaryStreamPolicy((owner) => {
+  const parts = terminalOwnerParts(owner)
+  if (!parts) return true
+  const client = clients.get(parts.instanceId)
+  if (!client) return true
+  return !client.features?.has(TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE)
+})
 
 async function dispatch(client, method, params = {}) {
   if (!brokerMethodAllowedForAccess(client.access, method)) {

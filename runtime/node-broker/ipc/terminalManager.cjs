@@ -208,6 +208,10 @@ let spoolDir = path.join(os.tmpdir(), `kaisola-terminal-cache-${process.pid}`)
 let asyncSpoolWrites = true
 let eventSink = null
 let activitySink = null
+// Answers "does this owner's connection still want terminal:data:<id>?". Unset
+// means yes, so a host that never installs a policy — every existing test, and
+// any embedder that does not negotiate — keeps the primary stream.
+let primaryStreamPolicy = null
 let lastCwdRefreshAt = 0
 let maximumLiveTerminals = DEFAULT_MAX_LIVE_TERMINALS
 
@@ -274,6 +278,24 @@ function setEventSink(sink) {
  * for process truth. */
 function setActivitySink(sink) {
   activitySink = typeof sink === 'function' ? sink : null
+}
+
+/** The broker owns feature negotiation, and negotiation is per connection, so
+ * the manager asks rather than deciding. */
+function setPrimaryStreamPolicy(policy) {
+  primaryStreamPolicy = typeof policy === 'function' ? policy : null
+}
+
+/** Fail open. A policy that throws, or one that has not been installed, must
+ * leave the primary stream on: sending a copy nobody reads wastes work, but
+ * withholding one a renderer is waiting for blanks the terminal. */
+function primaryStreamWanted(sender) {
+  if (!primaryStreamPolicy) return true
+  try {
+    return primaryStreamPolicy(sender) !== false
+  } catch {
+    return true
+  }
 }
 
 function reportActivity(kind, id = null) {
@@ -1001,6 +1023,13 @@ function setSender(id, sender) {
   r.primaryOutputPaused = false
   r.lastSender = sender
   r.rendererVisible = true
+  // Resolved here rather than at spawn because this is the one function both
+  // create and attach go through, so a reconnect, an input recovery and a
+  // startup restore all re-answer it for whoever is attaching now. Asking the
+  // owner's own connection also keeps the answer per-client: during a rolling
+  // update one broker serves app lanes of different vintages, and the current
+  // and draining generations can have negotiated differently.
+  r.primaryStreamEnabled = primaryStreamWanted(sender)
   r.spool.setVisible(true)
   r.detachedAt = null
   r.detachedBytes = 0
@@ -1668,4 +1697,4 @@ function diagnostics() {
   }))
 }
 
-module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, configureCapacity, capacity, setEventSink, setActivitySink, diagnostics, DEFAULT_MAX_LIVE_TERMINALS, MAX_CONFIGURABLE_LIVE_TERMINALS, MAX_TERMINAL_WRITE_BYTES, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, liveTerminalCount, validatedMaximumLiveTerminals, TerminalCapacityError, MAX_EXIT_WAITERS, RELEASE_CONFIRM_MS } }
+module.exports = { available, has, isLive, ownership, spawn, write, agentTurn, resize, setSender, detachRenderer, detachSender, detachSenderPrefix, snapshot, history, subscribe, unsubscribe, unsubscribeSubscriberPrefix, waitForExit, cancelExitWaiters, cancelExitWaitersPrefix, kill, release, scheduleRelease, cancelRelease, trackChild, untrackChild, upgradeReadiness, rollingUpdateReadiness, killAll, list, setAppFocused, configureStorage, configureCapacity, capacity, setEventSink, setActivitySink, setPrimaryStreamPolicy, diagnostics, DEFAULT_MAX_LIVE_TERMINALS, MAX_CONFIGURABLE_LIVE_TERMINALS, MAX_TERMINAL_WRITE_BYTES, __test: { resizeRecord, resumeFromSnapshot, splitUtf8, terminalEnv, summarizeUpgradeReadiness, consumeCommandEndMark, parseLsofCwd, refreshTerminalCwds, prepareHelperDir, installSpawnHelper, exitWaiterCount, liveTerminalCount, validatedMaximumLiveTerminals, TerminalCapacityError, MAX_EXIT_WAITERS, RELEASE_CONFIRM_MS } }

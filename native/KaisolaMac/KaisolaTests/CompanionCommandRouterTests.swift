@@ -4,6 +4,35 @@ import XCTest
 @testable import Kaisola
 
 @MainActor
+private final class CommandAuthorizationState {
+    var value = true
+}
+
+@MainActor
+private final class SuspendedCommandRoute {
+    private var started = false
+    private var startedWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        started = true
+        for waiter in startedWaiters { waiter.resume() }
+        startedWaiters.removeAll()
+        await withCheckedContinuation { releaseContinuation = $0 }
+    }
+
+    func waitUntilStarted() async {
+        if started { return }
+        await withCheckedContinuation { startedWaiters.append($0) }
+    }
+
+    func release() {
+        releaseContinuation?.resume()
+        releaseContinuation = nil
+    }
+}
+
+@MainActor
 final class CompanionCommandRouterTests: XCTestCase {
     func testAttentionAckRequiresExactProjectAndRevisionAndIsAtMostOnce() async throws {
         let router = CompanionCommandRouter()
@@ -131,6 +160,295 @@ final class CompanionCommandRouterTests: XCTestCase {
         XCTAssertEqual(unavailable.status, .unavailable)
     }
 
+    func testEffectiveGrantDeniesBeforeExternalRouteOrReceiptCache() async throws {
+        let router = CompanionCommandRouter()
+        let device = try pairedDevice(capabilities: [.observe, .terminalControl])
+        var externalCalls = 0
+        let result = try await router.route(
+            terminalCommandEnvelope(id: "command-downgraded", type: "terminal.write"),
+            device: device,
+            effectiveCapabilities: [.observe],
+            authorityGeneration: 2,
+            projection: nil,
+            acknowledgeAttention: { _ in false },
+            handleExternal: { _ in
+                externalCalls += 1
+                return nil
+            }
+        )
+        XCTAssertEqual(result.status, .rejected)
+        XCTAssertEqual(
+            result.message,
+            "This device's Companion access changed. Refresh and try again."
+        )
+        XCTAssertEqual(externalCalls, 0)
+    }
+
+    func testGenerationChangeCancelsLateResultAndSealsCommandIdentity() async throws {
+        let router = CompanionCommandRouter()
+        let device = try pairedDevice(capabilities: [.observe, .terminalControl])
+        let envelope = try terminalCommandEnvelope(
+            id: "command-generation-race",
+            type: "terminal.write"
+        )
+        let started = expectation(description: "external route started")
+        let gate = CommandGate()
+        var authorityIsCurrent = true
+        var externalCalls = 0
+        let firstTask = Task { @MainActor in
+            try await router.route(
+                envelope,
+                device: device,
+                effectiveCapabilities: [.observe, .terminalControl],
+                authorityGeneration: 7,
+                authorityIsCurrent: { authorityIsCurrent },
+                projection: nil,
+                acknowledgeAttention: { _ in false },
+                handleExternal: { command in
+                    externalCalls += 1
+                    started.fulfill()
+                    await gate.wait()
+                    return CompanionReceiptBody(
+                        type: "command.receipt",
+                        commandId: command.commandId,
+                        status: .applied,
+                        message: "applied",
+                        payload: nil
+                    )
+                }
+            )
+        }
+        await fulfillment(of: [started], timeout: 2)
+        authorityIsCurrent = false
+        router.invalidate(deviceID: device.deviceId)
+        await gate.release()
+        let first = try await firstTask.value
+        XCTAssertEqual(first.status, .rejected)
+
+        authorityIsCurrent = true
+        let second = try await router.route(
+            envelope,
+            device: device,
+            effectiveCapabilities: [.observe, .terminalControl],
+            authorityGeneration: 8,
+            authorityIsCurrent: { authorityIsCurrent },
+            projection: nil,
+            acknowledgeAttention: { _ in false },
+            handleExternal: { command in
+                externalCalls += 1
+                return CompanionReceiptBody(
+                    type: "command.receipt",
+                    commandId: command.commandId,
+                    status: .applied,
+                    message: "applied after regrant",
+                    payload: nil
+                )
+            }
+        )
+        XCTAssertEqual(second.status, .rejected)
+        XCTAssertEqual(
+            second.message,
+            "This device's Companion access changed. Refresh and try again."
+        )
+        XCTAssertEqual(externalCalls, 1)
+    }
+
+    func testRevocationRejectsQueuedCommandsAndPurgesPriorReceipts() async throws {
+        let router = CompanionCommandRouter()
+        let device = try pairedDevice()
+        let envelope = try commandEnvelope(
+            id: "command-revoked",
+            projectID: "project-1",
+            targetID: "attention-session-1",
+            expectedRevision: 7
+        )
+        let authorization = CommandAuthorizationState()
+        var applied: [String] = []
+
+        let first = try await router.route(
+            envelope,
+            device: device,
+            projection: projection(revision: 7),
+            isAuthorized: { authorization.value },
+            acknowledgeAttention: { applied.append($0); return true }
+        )
+        XCTAssertEqual(first.status, .applied)
+        XCTAssertEqual(applied, ["session-1"])
+
+        authorization.value = false
+        router.revoke(deviceID: device.deviceId)
+        let revoked = try await router.route(
+            envelope,
+            device: device,
+            projection: projection(revision: 7),
+            isAuthorized: { authorization.value },
+            acknowledgeAttention: { _ in XCTFail("revoked command applied"); return true }
+        )
+        XCTAssertEqual(revoked.status, .rejected)
+        XCTAssertEqual(applied, ["session-1"])
+
+        authorization.value = true
+        let repaired = try await router.route(
+            envelope,
+            device: device,
+            projection: projection(revision: 7),
+            isAuthorized: { authorization.value },
+            acknowledgeAttention: { applied.append($0); return true }
+        )
+        XCTAssertEqual(repaired.status, .applied)
+        XCTAssertEqual(applied, ["session-1", "session-1"])
+    }
+
+    func testRevocationRejectsLateInFlightResultWithoutPoisoningNewAuthority() async throws {
+        let router = CompanionCommandRouter()
+        let device = try pairedDevice(capabilities: [.observe, .terminalControl])
+        let envelope = try terminalCommandEnvelope(
+            id: "command-in-flight-revocation",
+            type: "terminal.interrupt"
+        )
+        let authorization = CommandAuthorizationState()
+        let gate = SuspendedCommandRoute()
+        var routeCount = 0
+
+        let staleTask = Task { @MainActor in
+            try await router.route(
+                envelope,
+                device: device,
+                projection: nil,
+                isAuthorized: { authorization.value },
+                acknowledgeAttention: { _ in false },
+                handleExternal: { command in
+                    routeCount += 1
+                    await gate.suspend()
+                    return CompanionReceiptBody(
+                        type: "command.receipt",
+                        commandId: command.commandId,
+                        status: .applied,
+                        message: "stale result",
+                        payload: nil
+                    )
+                }
+            )
+        }
+        await gate.waitUntilStarted()
+        authorization.value = false
+        router.revoke(deviceID: device.deviceId)
+        gate.release()
+
+        let stale = try await staleTask.value
+        XCTAssertEqual(stale.status, .rejected)
+        XCTAssertEqual(routeCount, 1)
+
+        authorization.value = true
+        let repaired = try await router.route(
+            envelope,
+            device: device,
+            projection: nil,
+            isAuthorized: { authorization.value },
+            acknowledgeAttention: { _ in false },
+            handleExternal: { command in
+                routeCount += 1
+                return CompanionReceiptBody(
+                    type: "command.receipt",
+                    commandId: command.commandId,
+                    status: .applied,
+                    message: "fresh result",
+                    payload: nil
+                )
+            }
+        )
+        XCTAssertEqual(repaired.status, .applied)
+        XCTAssertEqual(repaired.message, "fresh result")
+        XCTAssertEqual(routeCount, 2)
+    }
+
+    func testAccountTransitionRejectsLateRoutesAndPurgesEveryDeviceReceipt() async throws {
+        let router = CompanionCommandRouter()
+        let firstDevice = try pairedDevice(capabilities: [.observe, .terminalControl])
+        let secondDevice = try pairedDevice(
+            id: "device-account-transition-2",
+            capabilities: [.observe]
+        )
+        let inFlightEnvelope = try terminalCommandEnvelope(
+            id: "command-shared-across-accounts",
+            type: "terminal.interrupt"
+        )
+        let cachedEnvelope = try commandEnvelope(
+            id: "command-cached-before-account-switch",
+            projectID: "project-1",
+            targetID: "attention-session-1",
+            expectedRevision: 7
+        )
+        let gate = SuspendedCommandRoute()
+        var externalRouteCount = 0
+        var attentionApplyCount = 0
+
+        let cached = try await router.route(
+            cachedEnvelope,
+            device: secondDevice,
+            projection: projection(revision: 7),
+            acknowledgeAttention: { _ in attentionApplyCount += 1; return true }
+        )
+        XCTAssertEqual(cached.status, .applied)
+        XCTAssertEqual(attentionApplyCount, 1)
+
+        let staleTask = Task { @MainActor in
+            try await router.route(
+                inFlightEnvelope,
+                device: firstDevice,
+                projection: nil,
+                acknowledgeAttention: { _ in false },
+                handleExternal: { command in
+                    externalRouteCount += 1
+                    await gate.suspend()
+                    return CompanionReceiptBody(
+                        type: "command.receipt",
+                        commandId: command.commandId,
+                        status: .applied,
+                        message: "stale account result",
+                        payload: nil
+                    )
+                }
+            )
+        }
+        await gate.waitUntilStarted()
+        router.invalidateAll()
+        gate.release()
+
+        let stale = try await staleTask.value
+        XCTAssertEqual(stale.status, .rejected)
+        XCTAssertEqual(externalRouteCount, 1)
+
+        let fresh = try await router.route(
+            inFlightEnvelope,
+            device: firstDevice,
+            projection: nil,
+            acknowledgeAttention: { _ in false },
+            handleExternal: { command in
+                externalRouteCount += 1
+                return CompanionReceiptBody(
+                    type: "command.receipt",
+                    commandId: command.commandId,
+                    status: .applied,
+                    message: "fresh account result",
+                    payload: nil
+                )
+            }
+        )
+        XCTAssertEqual(fresh.status, .applied)
+        XCTAssertEqual(fresh.message, "fresh account result")
+
+        let recached = try await router.route(
+            cachedEnvelope,
+            device: secondDevice,
+            projection: projection(revision: 7),
+            acknowledgeAttention: { _ in attentionApplyCount += 1; return true }
+        )
+        XCTAssertEqual(recached.status, .applied)
+        XCTAssertEqual(attentionApplyCount, 2)
+        XCTAssertEqual(externalRouteCount, 2)
+    }
+
     private func projection(revision: Int) -> CompanionProjection {
         CompanionProjection(
             projectionKind: "kaisola.companion.projection",
@@ -158,16 +476,18 @@ final class CompanionCommandRouterTests: XCTestCase {
     }
 
     private func pairedDevice(
+        id: String = "device-router-test",
         capabilities: [CompanionCapability] = [.observe]
     ) throws -> CompanionPairedDeviceRecord {
         CompanionPairedDeviceRecord(
-            deviceId: "device-router-test",
+            deviceId: id,
             displayName: "iPhone",
             identityPublic: Data(repeating: 1, count: 32).base64URLEncodedString(),
             x25519StaticPublic: Data(repeating: 2, count: 32).base64URLEncodedString(),
             capabilities: capabilities,
             pairedAt: 1,
-            lastSeenAt: 1
+            lastSeenAt: 1,
+            accountScope: try CompanionAccountScope(accountID: "command-router-test-account")
         )
     }
 
@@ -221,5 +541,18 @@ final class CompanionCommandRouterTests: XCTestCase {
                 payload: nil
             ))
         )
+    }
+}
+
+private actor CommandGate {
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
     }
 }

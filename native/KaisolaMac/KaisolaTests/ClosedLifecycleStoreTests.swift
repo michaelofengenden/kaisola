@@ -32,12 +32,58 @@ final class ClosedLifecycleStoreTests: XCTestCase {
 
     func testCommitCloseRemovesTombstonesQueuesAndPushesUndo() {
         let session = seedSession()
-        store.commitCloseTerminal(session.id)
+        store.commitCloseTerminal(session.id, brokerGenerationID: "generation-a")
 
         XCTAssertFalse(store.owns(terminalID: session.id))
         XCTAssertTrue(store.isTerminalTombstoned(session.id))
         XCTAssertEqual(store.pendingReleaseList().map(\.id), [session.id])
+        XCTAssertEqual(store.pendingReleaseList().first?.brokerGenerationID, "generation-a")
         XCTAssertEqual(store.closedSessions().last?.sourceTerminalID, session.id)
+    }
+
+    func testLegacyReleaseQueueCoalescesByTerminalAndPersistsNewestBoundedSuffix() throws {
+        let overflow = 10
+        var releases: [[String: Any]] = (0..<(NativeSessionStore.maximumPendingReleases + overflow))
+            .map { index in
+                [
+                    "id": String(format: "term-%03d", index),
+                    "projectID": "project-original",
+                    "brokerGenerationID": "generation-original",
+                ]
+            }
+        releases.append([
+            "id": "term-015",
+            "projectID": "project-newest",
+            "brokerGenerationID": "generation-newest",
+        ])
+        let archive: [String: Any] = [
+            "ownerID": "native-release-queue",
+            "sessions": [],
+            "pendingReleases": releases,
+        ]
+        let data = try JSONSerialization.data(withJSONObject: archive, options: [.sortedKeys])
+        try FileManager.default.createDirectory(
+            at: store.fileURL.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: store.fileURL)
+
+        let compacted = store.pendingReleaseList()
+
+        XCTAssertEqual(compacted.count, NativeSessionStore.maximumPendingReleases)
+        XCTAssertEqual(compacted.first?.id, "term-010")
+        XCTAssertEqual(compacted.last?.id, "term-015")
+        XCTAssertEqual(compacted.last?.projectID, "project-newest")
+        XCTAssertEqual(compacted.last?.brokerGenerationID, "generation-newest")
+        XCTAssertEqual(Set(compacted.map(\.id)).count, compacted.count)
+
+        let persisted = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: store.fileURL)) as? [String: Any]
+        )
+        let persistedReleases = try XCTUnwrap(persisted["pendingReleases"] as? [[String: Any]])
+        XCTAssertEqual(persistedReleases.count, NativeSessionStore.maximumPendingReleases)
+        XCTAssertEqual(persistedReleases.first?["id"] as? String, "term-010")
+        XCTAssertEqual(persistedReleases.last?["brokerGenerationID"] as? String, "generation-newest")
     }
 
     func testUpsertRefusesTombstonedID() {

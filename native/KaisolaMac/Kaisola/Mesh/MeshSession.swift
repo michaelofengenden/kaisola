@@ -3,6 +3,555 @@ import Darwin
 import Foundation
 import KaisolaCore
 
+/// Version 1 of the Mesh host hook lifecycle. Payloads are JSON objects whose
+/// keys are stable, whose user-controlled fields are bounded, and whose secret
+/// values are redacted before either preview or execution.
+enum MeshLifecycleHookEvent: String, Codable, CaseIterable, Equatable, Hashable, Sendable {
+    case beforeSubmit
+    case afterResponse
+    case compaction
+    case subagentStarted
+    case subagentStopped
+    case turnCompleted
+}
+
+/// A mesh-scoped hook observes the whole run. A column-scoped hook is invoked
+/// only for payloads carrying a concrete column identity.
+enum MeshLifecycleHookScope: String, Codable, Equatable, Hashable, Sendable {
+    case mesh
+    case column
+}
+
+/// Declared effects are audit metadata, not a capability grant. Version 1 does
+/// not pass host credentials or interpret hook output as a prompt mutation.
+enum MeshLifecycleHookSideEffect: String, Codable, CaseIterable, Equatable, Hashable, Sendable {
+    case none
+    case notification
+    case metrics
+    case workspaceRead
+    case workspaceWrite
+    case network
+}
+
+enum MeshLifecycleHookFailurePolicy: String, Codable, Equatable, Sendable {
+    /// Record the failure and continue the host lifecycle.
+    case `continue`
+    /// Refuse only a before-submit prompt. Post-submit lifecycle events can
+    /// never be configured to retroactively fail closed.
+    case failClosed
+}
+
+/// One external hook declaration. Executables are launched directly (never
+/// through a shell), receive one bounded JSON payload on stdin, inherit no host
+/// secrets, and are killed when their declared timeout expires.
+struct MeshLifecycleHookConfiguration: Codable, Equatable, Sendable {
+    // Keep these value-only constants out of stored global initializers. Xcode
+    // 16.4 / Swift 6.1 crashes while lowering newly added lazy globals after
+    // this integrated module reaches its current size.
+    static var apiVersion: Int { 1 }
+    static var minimumTimeoutMilliseconds: Int { 10 }
+    static var maximumTimeoutMilliseconds: Int { 5_000 }
+
+    let apiVersion: Int
+    let id: String
+    let executable: String
+    let arguments: [String]
+    let events: Set<MeshLifecycleHookEvent>
+    let scope: MeshLifecycleHookScope
+    let sideEffects: Set<MeshLifecycleHookSideEffect>
+    let timeoutMilliseconds: Int
+    let failurePolicy: MeshLifecycleHookFailurePolicy
+    let enabled: Bool
+
+    init(
+        apiVersion: Int = Self.apiVersion,
+        id: String,
+        executable: String,
+        arguments: [String] = [],
+        events: Set<MeshLifecycleHookEvent>,
+        scope: MeshLifecycleHookScope,
+        sideEffects: Set<MeshLifecycleHookSideEffect>,
+        timeoutMilliseconds: Int = 1_000,
+        failurePolicy: MeshLifecycleHookFailurePolicy = .continue,
+        enabled: Bool = true
+    ) {
+        self.apiVersion = apiVersion
+        self.id = id
+        self.executable = executable
+        self.arguments = arguments
+        self.events = events
+        self.scope = scope
+        self.sideEffects = sideEffects
+        self.timeoutMilliseconds = timeoutMilliseconds
+        self.failurePolicy = failurePolicy
+        self.enabled = enabled
+    }
+
+    var validationErrors: [String] {
+        var errors: [String] = []
+        if apiVersion != Self.apiVersion {
+            errors.append("Unsupported hook API version \(apiVersion); expected \(Self.apiVersion).")
+        }
+        if id.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || id.utf8.count > 128 {
+            errors.append("Hook id must contain 1–128 UTF-8 bytes.")
+        }
+        if !executable.hasPrefix("/") || executable.utf8.count > 4_096 {
+            errors.append("Hook executable must be a bounded absolute path.")
+        }
+        if arguments.count > 64 || arguments.contains(where: { $0.utf8.count > 4_096 }) {
+            errors.append("Hook arguments exceed the 64-item or 4 KiB per-item limit.")
+        }
+        if events.isEmpty { errors.append("Hook events cannot be empty.") }
+        if sideEffects.isEmpty {
+            errors.append("Hook side effects must be declared.")
+        } else if sideEffects.contains(.none), sideEffects.count != 1 {
+            errors.append("The none side effect cannot be combined with other effects.")
+        }
+        if !(Self.minimumTimeoutMilliseconds...Self.maximumTimeoutMilliseconds).contains(timeoutMilliseconds) {
+            errors.append("Hook timeout must be 10–5000 milliseconds.")
+        }
+        if failurePolicy == .failClosed,
+           (events.isEmpty || events.contains(where: { $0 != .beforeSubmit })) {
+            errors.append("Fail-closed hooks may subscribe only to beforeSubmit.")
+        }
+        return errors
+    }
+}
+
+/// The documented v1 stdin payload. `fields` is event-specific:
+/// - beforeSubmit: prompt
+/// - afterResponse: response, agentID, role
+/// - compaction: previousUsed, currentUsed, max
+/// - subagentStarted/subagentStopped: agentID, role
+/// - turnCompleted: agentID, role, response
+struct MeshLifecycleHookPayload: Codable, Equatable, Sendable {
+    static var apiVersion: Int { 1 }
+    static var maximumEncodedBytes: Int { 16_384 }
+    private static var maximumFieldBytes: Int { 4_096 }
+    private static var maximumFields: Int { 32 }
+
+    let apiVersion: Int
+    let event: MeshLifecycleHookEvent
+    let meshID: String
+    let projectID: String
+    let columnID: String?
+    let fields: [String: String]
+
+    init(
+        apiVersion: Int = Self.apiVersion,
+        event: MeshLifecycleHookEvent,
+        meshID: String,
+        projectID: String,
+        columnID: String? = nil,
+        fields: [String: String] = [:]
+    ) {
+        self.apiVersion = apiVersion
+        self.event = event
+        self.meshID = meshID
+        self.projectID = projectID
+        self.columnID = columnID
+        self.fields = fields
+    }
+
+    fileprivate func redactedAndBounded() -> Self {
+        var safeFields: [String: String] = [:]
+        var remaining = 12_000
+        for rawKey in fields.keys.sorted().prefix(Self.maximumFields) {
+            let key = Self.boundedUTF8(rawKey, maximumBytes: 128)
+            guard !key.isEmpty, remaining > 0 else { continue }
+            let sensitiveKey = key.lowercased().contains("secret")
+                || key.lowercased().contains("token")
+                || key.lowercased().contains("password")
+                || key.lowercased().contains("authorization")
+                || key.lowercased().replacingOccurrences(of: "_", with: "").contains("apikey")
+            let redacted = sensitiveKey ? "[redacted]" : Self.redact(fields[rawKey] ?? "")
+            let budget = min(Self.maximumFieldBytes, remaining)
+            let value = Self.boundedUTF8(redacted, maximumBytes: budget)
+            safeFields[key] = value
+            remaining -= key.utf8.count + value.utf8.count + 8
+        }
+        return Self(
+            apiVersion: apiVersion,
+            event: event,
+            meshID: Self.boundedUTF8(meshID, maximumBytes: 256),
+            projectID: Self.boundedUTF8(projectID, maximumBytes: 256),
+            columnID: columnID.map { Self.boundedUTF8($0, maximumBytes: 256) },
+            fields: safeFields
+        )
+    }
+
+    fileprivate static func encoded(_ payload: Self) -> Data {
+        var safe = payload.redactedAndBounded()
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        while true {
+            let data = (try? encoder.encode(safe)) ?? Data("{}".utf8)
+            if data.count <= maximumEncodedBytes || safe.fields.isEmpty { return data }
+            var fields = safe.fields
+            if let last = fields.keys.sorted().last { fields.removeValue(forKey: last) }
+            safe = Self(
+                apiVersion: safe.apiVersion,
+                event: safe.event,
+                meshID: safe.meshID,
+                projectID: safe.projectID,
+                columnID: safe.columnID,
+                fields: fields
+            )
+        }
+    }
+
+    fileprivate static func redact(_ input: String) -> String {
+        var safe = boundedUTF8(input, maximumBytes: 16_384)
+        let replacements: [(String, String)] = [
+            (#"(?i)(bearer\s+)[A-Za-z0-9._~+\-/=]+"#, "$1[redacted]"),
+            (#"(?i)\b(?:sk|ghp|github_pat|xox[baprs]|AIza)[-_A-Za-z0-9]{8,}\b"#, "[redacted]"),
+            (#"(?i)((?:api[_-]?key|token|secret|password|authorization)\s*[:=]\s*)[^\s,;]+"#, "$1[redacted]"),
+        ]
+        for (pattern, replacement) in replacements {
+            safe = safe.replacingOccurrences(
+                of: pattern,
+                with: replacement,
+                options: .regularExpression
+            )
+        }
+        return safe
+    }
+
+    fileprivate static func boundedUTF8(_ input: String, maximumBytes: Int) -> String {
+        guard input.utf8.count > maximumBytes else { return input }
+        var bytes = Array(input.utf8.prefix(maximumBytes))
+        while !bytes.isEmpty {
+            if let value = String(bytes: bytes, encoding: .utf8) { return value }
+            bytes.removeLast()
+        }
+        return ""
+    }
+}
+
+struct MeshLifecycleHookExecutionOutput: Equatable, Sendable {
+    let exitStatus: Int32
+    let standardOutput: String
+    let standardError: String
+
+    init(exitStatus: Int32, standardOutput: String, standardError: String) {
+        self.exitStatus = exitStatus
+        self.standardOutput = standardOutput
+        self.standardError = standardError
+    }
+}
+
+struct MeshLifecycleHookReceipt: Codable, Equatable, Sendable {
+    enum Outcome: String, Codable, Equatable, Sendable {
+        case succeeded
+        case failed
+        case timedOut
+        case reentrant
+        case invalid
+    }
+
+    let hookID: String
+    let event: MeshLifecycleHookEvent
+    let outcome: Outcome
+    let message: String
+    let blocked: Bool
+}
+
+struct MeshLifecycleHookDecision: Equatable, Sendable {
+    let allowed: Bool
+    let receipts: [MeshLifecycleHookReceipt]
+}
+
+struct MeshLifecycleHookPreview: Equatable, Sendable {
+    let apiVersion: Int
+    let hookID: String
+    let event: MeshLifecycleHookEvent
+    let scope: MeshLifecycleHookScope
+    let sideEffects: Set<MeshLifecycleHookSideEffect>
+    let timeoutMilliseconds: Int
+    let failurePolicy: MeshLifecycleHookFailurePolicy
+    let encodedPayload: String
+    let validationErrors: [String]
+}
+
+/// Executes validated hook declarations in stable id order. The actor retains
+/// active hook ids across suspension points, preventing a hook-triggered host
+/// callback from recursively invoking the same integration.
+actor MeshLifecycleHookHost {
+    typealias Executor = @Sendable (
+        MeshLifecycleHookConfiguration,
+        Data
+    ) async throws -> MeshLifecycleHookExecutionOutput
+
+    private let configurations: [MeshLifecycleHookConfiguration]
+    private let executor: Executor
+    private var activeHookIDs: Set<String> = []
+
+    init(
+        configurations: [MeshLifecycleHookConfiguration],
+        executor: @escaping Executor = MeshLifecycleHookProcessExecutor.execute
+    ) {
+        self.configurations = configurations.sorted { $0.id < $1.id }
+        self.executor = executor
+    }
+
+    func preview(
+        configurationID: String,
+        payload: MeshLifecycleHookPayload
+    ) -> MeshLifecycleHookPreview {
+        guard let configuration = configurations.first(where: { $0.id == configurationID }) else {
+            return MeshLifecycleHookPreview(
+                apiVersion: MeshLifecycleHookConfiguration.apiVersion,
+                hookID: configurationID,
+                event: payload.event,
+                scope: .mesh,
+                sideEffects: [],
+                timeoutMilliseconds: 0,
+                failurePolicy: .continue,
+                encodedPayload: String(decoding: MeshLifecycleHookPayload.encoded(payload), as: UTF8.self),
+                validationErrors: ["Unknown hook id."]
+            )
+        }
+        return MeshLifecycleHookPreview(
+            apiVersion: configuration.apiVersion,
+            hookID: configuration.id,
+            event: payload.event,
+            scope: configuration.scope,
+            sideEffects: configuration.sideEffects,
+            timeoutMilliseconds: configuration.timeoutMilliseconds,
+            failurePolicy: configuration.failurePolicy,
+            encodedPayload: String(decoding: MeshLifecycleHookPayload.encoded(payload), as: UTF8.self),
+            validationErrors: configuration.validationErrors
+        )
+    }
+
+    func invoke(_ payload: MeshLifecycleHookPayload) async -> MeshLifecycleHookDecision {
+        let matching = configurations.filter { configuration in
+            configuration.enabled
+                && configuration.events.contains(payload.event)
+                && (configuration.scope == .mesh || payload.columnID != nil)
+        }
+        guard !matching.isEmpty else { return MeshLifecycleHookDecision(allowed: true, receipts: []) }
+        let encoded = MeshLifecycleHookPayload.encoded(payload)
+        var receipts: [MeshLifecycleHookReceipt] = []
+        var allowed = true
+        for configuration in matching {
+            let blocks = configuration.failurePolicy == .failClosed && payload.event == .beforeSubmit
+            let receipt: MeshLifecycleHookReceipt
+            let validationErrors = configuration.validationErrors
+            if !validationErrors.isEmpty {
+                receipt = Self.receipt(
+                    configuration: configuration,
+                    event: payload.event,
+                    outcome: .invalid,
+                    detail: validationErrors.joined(separator: " "),
+                    blocked: blocks
+                )
+            } else if activeHookIDs.contains(configuration.id) {
+                receipt = Self.receipt(
+                    configuration: configuration,
+                    event: payload.event,
+                    outcome: .reentrant,
+                    detail: "Recursive hook invocation was refused.",
+                    blocked: blocks
+                )
+            } else {
+                activeHookIDs.insert(configuration.id)
+                let result = await execute(configuration, payload: encoded)
+                activeHookIDs.remove(configuration.id)
+                switch result {
+                case let .completed(output) where output.exitStatus == 0:
+                    receipt = Self.receipt(
+                        configuration: configuration,
+                        event: payload.event,
+                        outcome: .succeeded,
+                        detail: Self.combinedOutput(output),
+                        blocked: false
+                    )
+                case let .completed(output):
+                    receipt = Self.receipt(
+                        configuration: configuration,
+                        event: payload.event,
+                        outcome: .failed,
+                        detail: "Exit \(output.exitStatus). \(Self.combinedOutput(output))",
+                        blocked: blocks
+                    )
+                case let .failed(message):
+                    receipt = Self.receipt(
+                        configuration: configuration,
+                        event: payload.event,
+                        outcome: .failed,
+                        detail: message,
+                        blocked: blocks
+                    )
+                case .timedOut:
+                    receipt = Self.receipt(
+                        configuration: configuration,
+                        event: payload.event,
+                        outcome: .timedOut,
+                        detail: "Timed out after \(configuration.timeoutMilliseconds) ms.",
+                        blocked: blocks
+                    )
+                }
+            }
+            receipts.append(receipt)
+            if receipt.blocked { allowed = false }
+        }
+        return MeshLifecycleHookDecision(allowed: allowed, receipts: receipts)
+    }
+
+    private enum TimedExecution: Sendable {
+        case completed(MeshLifecycleHookExecutionOutput)
+        case failed(String)
+        case timedOut
+    }
+
+    private func execute(
+        _ configuration: MeshLifecycleHookConfiguration,
+        payload: Data
+    ) async -> TimedExecution {
+        await withTaskGroup(of: TimedExecution.self) { group in
+            group.addTask { [executor] in
+                do { return .completed(try await executor(configuration, payload)) }
+                catch { return .failed(error.localizedDescription) }
+            }
+            group.addTask {
+                do {
+                    try await Task.sleep(for: .milliseconds(configuration.timeoutMilliseconds))
+                    return .timedOut
+                } catch {
+                    return .failed("Hook execution was cancelled.")
+                }
+            }
+            let first = await group.next() ?? .failed("Hook execution did not start.")
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private static func combinedOutput(_ output: MeshLifecycleHookExecutionOutput) -> String {
+        [output.standardOutput, output.standardError]
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+    }
+
+    private static func receipt(
+        configuration: MeshLifecycleHookConfiguration,
+        event: MeshLifecycleHookEvent,
+        outcome: MeshLifecycleHookReceipt.Outcome,
+        detail: String,
+        blocked: Bool
+    ) -> MeshLifecycleHookReceipt {
+        let redacted = MeshLifecycleHookPayload.redact(detail)
+        let bounded = MeshLifecycleHookPayload.boundedUTF8(redacted, maximumBytes: 512)
+        return MeshLifecycleHookReceipt(
+            hookID: configuration.id,
+            event: event,
+            outcome: outcome,
+            message: bounded,
+            blocked: blocked
+        )
+    }
+}
+
+/// Direct-process executor used by the production hook host. Output is written
+/// to owner-only temporary files so a chatty hook cannot fill an unread pipe.
+private enum MeshLifecycleHookProcessExecutor {
+    private final class ProcessState: @unchecked Sendable {
+        private let lock = NSLock()
+        private var process: Process?
+        private var cancellationRequested = false
+
+        func install(_ process: Process) {
+            lock.lock()
+            self.process = process
+            let shouldTerminate = cancellationRequested
+            lock.unlock()
+            if shouldTerminate, process.isRunning { process.terminate() }
+        }
+
+        func terminate() {
+            lock.lock()
+            cancellationRequested = true
+            let process = self.process
+            lock.unlock()
+            guard let process, process.isRunning else { return }
+            let pid = process.processIdentifier
+            process.terminate()
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + .milliseconds(100)) { [weak self] in
+                self?.forceKillIfRunning(pid: pid)
+            }
+        }
+
+        private func forceKillIfRunning(pid: Int32) {
+            lock.lock()
+            let process = self.process
+            lock.unlock()
+            if process?.processIdentifier == pid, process?.isRunning == true {
+                _ = Darwin.kill(pid, SIGKILL)
+            }
+        }
+    }
+
+    static func execute(
+        _ configuration: MeshLifecycleHookConfiguration,
+        _ payload: Data
+    ) async throws -> MeshLifecycleHookExecutionOutput {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-hook-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let stdoutURL = directory.appendingPathComponent("stdout")
+        let stderrURL = directory.appendingPathComponent("stderr")
+        FileManager.default.createFile(atPath: stdoutURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        FileManager.default.createFile(atPath: stderrURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
+        let state = ProcessState()
+
+        return try await withTaskCancellationHandler {
+            try await Task.detached(priority: .utility) {
+                let process = Process()
+                let input = Pipe()
+                let stdout = try FileHandle(forWritingTo: stdoutURL)
+                let stderr = try FileHandle(forWritingTo: stderrURL)
+                defer {
+                    try? stdout.close()
+                    try? stderr.close()
+                }
+                process.executableURL = URL(fileURLWithPath: configuration.executable)
+                process.arguments = configuration.arguments
+                process.environment = [
+                    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                    "LANG": "en_US.UTF-8",
+                    "KAISOLA_HOOK_API_VERSION": "\(MeshLifecycleHookConfiguration.apiVersion)",
+                ]
+                process.standardInput = input
+                process.standardOutput = stdout
+                process.standardError = stderr
+                try process.run()
+                state.install(process)
+                input.fileHandleForWriting.write(payload)
+                try? input.fileHandleForWriting.close()
+                process.waitUntilExit()
+                if Task.isCancelled { throw CancellationError() }
+                try? stdout.synchronize()
+                try? stderr.synchronize()
+                let stdoutData = (try? Data(contentsOf: stdoutURL, options: .mappedIfSafe)) ?? Data()
+                let stderrData = (try? Data(contentsOf: stderrURL, options: .mappedIfSafe)) ?? Data()
+                return MeshLifecycleHookExecutionOutput(
+                    exitStatus: process.terminationStatus,
+                    standardOutput: String(decoding: stdoutData.prefix(4_096), as: UTF8.self),
+                    standardError: String(decoding: stderrData.prefix(4_096), as: UTF8.self)
+                )
+            }.value
+        } onCancel: {
+            state.terminate()
+        }
+    }
+}
+
 /// How a Mesh fans work out. `.flat` (v1 default) sends the SAME prompt to every
 /// agent at once. `.staged` runs the scout → execute pipeline: one agent scouts
 /// the repo read-only and writes a numbered task contract, then the rest execute
@@ -93,6 +642,11 @@ final class MeshSession: ObservableObject, Identifiable {
     @Published private(set) var stagedQueuedPromptCount = 0
     @Published private(set) var stagedQueueIsRunning = false
     @Published private(set) var lifecycle: NativeMeshLifecycle
+    /// Bounded, user-visible audit trail for hook success/failure. Hook stdout
+    /// and stderr are redacted and capped before reaching this collection.
+    @Published private(set) var hookReceipts: [MeshLifecycleHookReceipt] = []
+    @Published private(set) var hookNotice: String?
+    @Published private(set) var hookSubmissionInProgress = false
     @Published var draft: String {
         didSet { onDraftChanged?(draft) }
     }
@@ -124,6 +678,9 @@ final class MeshSession: ObservableObject, Identifiable {
     private let fileManager: FileManager
     private let worktreeRoot: URL
     private let usageCenter: UsageCenter
+    private let hookHost: MeshLifecycleHookHost?
+    private var hookUsageByColumn: [String: Int] = [:]
+    private var hookStartedColumnIDs: Set<String> = []
     /// Relay each column's live conversation state through this Mesh object so
     /// parent project navigation can show accurate working activity.
     private var columnObservers = Set<AnyCancellable>()
@@ -145,6 +702,14 @@ final class MeshSession: ObservableObject, Identifiable {
     /// find and adopt the exact path/branch pair instead of orphaning it.
     private var provisioningColumns: [NativeRestorableMeshColumnDescriptor] = []
     private var retiredColumnIDs: Set<String> = []
+
+    private struct WorktreeCleanupTarget: Sendable {
+        let id: String
+        let agentName: String
+        let path: String
+        let branch: String
+        let createdBaseOID: String
+    }
 
     /// Transaction-boundary persistence is mandatory before any Git mutation.
     /// A missing or failed writer is treated as a safety failure, never as a
@@ -182,7 +747,8 @@ final class MeshSession: ObservableObject, Identifiable {
         initialStagedPrompts: [String] = [],
         worktreeRoot: URL = NativePreviewPaths.meshWorktreesDirectory,
         fileManager: FileManager = .default,
-        usageCenter: UsageCenter = .shared
+        usageCenter: UsageCenter = .shared,
+        hookHost: MeshLifecycleHookHost? = nil
     ) {
         self.id = id
         self.baseDirectory = baseDirectory.standardizedFileURL
@@ -194,6 +760,7 @@ final class MeshSession: ObservableObject, Identifiable {
         self.worktreeRoot = worktreeRoot.standardizedFileURL
         self.fileManager = fileManager
         self.usageCenter = usageCenter
+        self.hookHost = hookHost
         self.stagedPromptQueue = initialStagedPrompts
         self.stagedQueuedPromptCount = initialStagedPrompts.count
     }
@@ -436,7 +1003,7 @@ final class MeshSession: ObservableObject, Identifiable {
         }
         for column in columns {
             guard !isSuspended, !isDestroyed, startupGeneration == generation else { return }
-            await column.conversation.start()
+            await startColumn(columnID: column.id)
         }
         lifecycle = provisioningColumns.isEmpty ? .active : .recoveryRequired
         onDescriptorChanged?()
@@ -530,6 +1097,11 @@ final class MeshSession: ObservableObject, Identifiable {
         // surface; success completes the tombstone through the caller's
         // pendingDeletion cleanup path.
         if lifecycle == .pendingDeletion {
+            // The constructor has no live columns yet. Seed the exact persisted
+            // cleanup manifest so destruction can resume a registered
+            // worktree or a branch-only partial transaction without launching
+            // an adapter or recreating a directory.
+            provisioningColumns = states.map(\.descriptor)
             _ = await destroy(allowRecoverableWork: true)
             onDescriptorChanged?()
             return
@@ -668,9 +1240,16 @@ final class MeshSession: ObservableObject, Identifiable {
         cancelStageCoordinator()
         stage = "Interrupted"
         for column in columns {
+            let wasConnected = column.conversation.isConnected
             _ = await column.conversation.stop()
+            if wasConnected {
+                await runSubagentHook(.subagentStopped, column: column)
+                hookStartedColumnIDs.remove(column.id)
+            }
         }
-        lifecycle = provisioningColumns.isEmpty ? .suspended : .recoveryRequired
+        if lifecycle != .pendingDeletion {
+            lifecycle = provisioningColumns.isEmpty ? .suspended : .recoveryRequired
+        }
         onDescriptorChanged?()
         await persistBestEffort()
     }
@@ -704,37 +1283,48 @@ final class MeshSession: ObservableObject, Identifiable {
     /// Inventory uncommitted files AND unique commits. Any probe failure blocks
     /// deletion; uncertainty must never be treated as a clean worktree.
     func discardAssessment() async -> DiscardAssessment {
-        let editing = columns.filter { $0.worktreePath != nil || $0.branch != nil }
         let pendingEditing = provisioningColumns.filter { $0.workspaceKind == .worktree }
-        guard pendingEditing.isEmpty else {
+        guard pendingEditing.isEmpty || lifecycle == .pendingDeletion else {
             return .blocked("Mesh is still provisioning or needs recovery; its worktrees were preserved.")
+        }
+        let targets: [WorktreeCleanupTarget]
+        do {
+            targets = try worktreeCleanupTargets(includeProvisioning: lifecycle == .pendingDeletion)
+        } catch {
+            return .blocked(error.localizedDescription)
         }
         var atRisk = 0
         let baseDirectory = baseDirectory
-        for column in editing {
-            guard let path = column.worktreePath,
-                  let branch = column.branch,
-                  let baseOID = column.createdBaseOID,
-                  isOwnedWorktreePath(path, agentID: column.agent.id) else {
-                return .blocked("A Mesh worktree manifest is incomplete; nothing was deleted.")
-            }
-            let result = await Task.detached(priority: .userInitiated) { () -> Result<GitService.MeshDiscardInventory, Error> in
+        for target in targets {
+            let result = await Task.detached(priority: .userInitiated) { () -> Result<GitService.MeshDiscardInventory?, Error> in
                 do {
                     let baseService = GitService(repoRoot: baseDirectory)
-                    guard try baseService.isRegisteredWorktree(path: path, branch: branch) else {
-                        throw GitService.GitError.commandFailed("The Mesh worktree is no longer registered.")
+                    switch try baseService.worktreeRemovalPhase(path: target.path, branch: target.branch) {
+                    case .registered:
+                        let worktreeService = GitService(
+                            repoRoot: URL(fileURLWithPath: target.path, isDirectory: true)
+                        )
+                        return .success(
+                            try worktreeService.meshDiscardInventory(
+                                createdBaseOID: target.createdBaseOID
+                            )
+                        )
+                    case .branchCleanupPending, .complete:
+                        // The destructive worktree step already completed.
+                        // There is no directory left to inventory or confirm.
+                        return .success(nil)
                     }
-                    let worktreeService = GitService(repoRoot: URL(fileURLWithPath: path, isDirectory: true))
-                    return .success(try worktreeService.meshDiscardInventory(createdBaseOID: baseOID))
                 } catch {
                     return .failure(error)
                 }
             }.value
             switch result {
-            case let .success(inventory):
+            case let .success(inventory?):
                 if inventory.hasRecoverableWork { atRisk += 1 }
+            case .success(nil):
+                break
             case let .failure(error):
-                return .blocked("Could not verify \(column.agent.name)'s worktree: \(error.localizedDescription)")
+                return .blocked("Could not verify \(target.agentName)'s worktree: \(error.localizedDescription)")
             }
         }
         return atRisk == 0 ? .safe : .recoverableWork(columns: atRisk)
@@ -761,31 +1351,40 @@ final class MeshSession: ObservableObject, Identifiable {
         }
 
         let service = GitService(repoRoot: baseDirectory)
-        let editingColumns = columns.filter { $0.worktreePath != nil || $0.branch != nil }
-        for column in editingColumns {
-            guard let path = column.worktreePath, let branch = column.branch else {
-                lifecycle = .recoveryRequired
-                await persistBestEffort()
-                return .blocked("A Mesh cleanup manifest is incomplete; nothing else was deleted.")
-            }
+        let cleanupTargets: [WorktreeCleanupTarget]
+        do {
+            cleanupTargets = try worktreeCleanupTargets(includeProvisioning: true)
+        } catch {
+            lifecycle = .pendingDeletion
+            isolationNote = error.localizedDescription
+            await persistBestEffort()
+            return .blocked(error.localizedDescription)
+        }
+        for target in cleanupTargets {
             do {
-                try await Task.detached(priority: .utility) {
-                    try service.worktreeRemove(path: path, branch: branch)
+                _ = try await Task.detached(priority: .utility) {
+                    try service.worktreeRemove(path: target.path, branch: target.branch)
                 }.value
                 // Persist each successful cleanup before attempting the next.
                 // A later Git failure therefore leaves only the genuinely
                 // remaining pair in the retryable manifest.
-                columns.removeAll { $0.id == column.id }
-                retiredColumnIDs.insert(column.id)
-                usageCenter.remove(chatID: column.id)
+                columns.removeAll { $0.id == target.id }
+                provisioningColumns.removeAll { $0.id == target.id }
+                retiredColumnIDs.insert(target.id)
+                usageCenter.remove(chatID: target.id)
                 onDescriptorChanged?()
                 guard await persistBoundary("Cleanup paused because the updated recovery manifest could not be saved.") else {
                     return .blocked(isolationNote ?? "Cleanup paused because the recovery manifest could not be saved.")
                 }
             } catch {
-                lifecycle = .recoveryRequired
+                // Deletion intent was persisted before the first Git mutation.
+                // Keep that lifecycle plus the exact path/branch manifest so a
+                // relaunch can derive branchCleanupPending and resume safely.
+                lifecycle = .pendingDeletion
+                isolationNote = "Mesh cleanup stopped: \(error.localizedDescription)"
+                onDescriptorChanged?()
                 await persistBestEffort()
-                return .blocked("Mesh cleanup stopped: \(error.localizedDescription)")
+                return .blocked(isolationNote ?? "Mesh cleanup stopped.")
             }
         }
         isDestroyed = true
@@ -802,6 +1401,49 @@ final class MeshSession: ObservableObject, Identifiable {
             return .blocked(isolationNote ?? "Mesh cleanup completed, but its final tombstone could not be saved.")
         }
         return .safe
+    }
+
+    private func worktreeCleanupTargets(
+        includeProvisioning: Bool
+    ) throws -> [WorktreeCleanupTarget] {
+        var targets: [WorktreeCleanupTarget] = []
+        for column in columns where column.worktreePath != nil || column.branch != nil {
+            guard let path = column.worktreePath,
+                  let branch = column.branch,
+                  let createdBaseOID = column.createdBaseOID,
+                  isOwnedWorktreePath(path, agentID: column.agent.id) else {
+                throw GitService.GitError.commandFailed(
+                    "A Mesh worktree manifest is incomplete; nothing else was deleted."
+                )
+            }
+            targets.append(WorktreeCleanupTarget(
+                id: column.id,
+                agentName: column.agent.name,
+                path: path,
+                branch: branch,
+                createdBaseOID: createdBaseOID
+            ))
+        }
+        if includeProvisioning {
+            for descriptor in provisioningColumns where descriptor.workspaceKind == .worktree {
+                guard let path = descriptor.worktreePath,
+                      let branch = descriptor.branch,
+                      let createdBaseOID = descriptor.createdBaseOID,
+                      isOwnedWorktreePath(path, agentID: descriptor.agentID) else {
+                    throw GitService.GitError.commandFailed(
+                        "A Mesh cleanup manifest is incomplete; nothing else was deleted."
+                    )
+                }
+                targets.append(WorktreeCleanupTarget(
+                    id: descriptor.id,
+                    agentName: AgentRegistry.profile(id: descriptor.agentID)?.name ?? descriptor.agentID,
+                    path: path,
+                    branch: branch,
+                    createdBaseOID: createdBaseOID
+                ))
+            }
+        }
+        return targets
     }
 
     private func makeConversation(
@@ -824,6 +1466,7 @@ final class MeshSession: ObservableObject, Identifiable {
             title: agent.name,
             command: adapter.command,
             arguments: adapter.arguments,
+            containment: adapter.containment,
             environment: environment,
             cwd: cwd,
             mcpServers: mcp,
@@ -874,7 +1517,8 @@ final class MeshSession: ObservableObject, Identifiable {
         conversation.$usage
             .compactMap { $0 }
             .sink { [weak self] usage in
-                self?.usageCenter.record(
+                guard let self else { return }
+                self.usageCenter.record(
                     chatID: columnID,
                     title: usageTitle,
                     agentID: agent.id,
@@ -883,12 +1527,37 @@ final class MeshSession: ObservableObject, Identifiable {
                     costAmount: usage.costAmount,
                     costCurrency: usage.costCurrency
                 )
+                let previous = self.hookUsageByColumn.updateValue(usage.used, forKey: columnID)
+                if let previous, usage.used < previous {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        _ = await self.invokeHook(.init(
+                            event: .compaction,
+                            meshID: self.id,
+                            projectID: self.projectID,
+                            columnID: columnID,
+                            fields: [
+                                "agentID": agent.id,
+                                "role": self.columns.first(where: { $0.id == columnID })?.role.rawValue ?? "unknown",
+                                "previousUsed": "\(previous)",
+                                "currentUsed": "\(usage.used)",
+                                "max": "\(usage.max)",
+                            ]
+                        ))
+                    }
+                }
             }
             .store(in: &columnObservers)
         conversation.$isRunning
             .scan((false, false)) { ($0.1, $1) }
             .filter { $0.0 && !$0.1 }
-            .sink { [weak self] _ in self?.usageCenter.recordTurn(chatID: columnID) }
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.usageCenter.recordTurn(chatID: columnID)
+                Task { @MainActor [weak self] in
+                    await self?.runColumnCompletionHooks(columnID: columnID)
+                }
+            }
             .store(in: &columnObservers)
         return conversation
     }
@@ -930,6 +1599,129 @@ final class MeshSession: ObservableObject, Identifiable {
             provisioning: .recoveryRequired,
             workspaceKind: descriptor.workspaceKind
         )
+    }
+
+    /// The hook-aware UI/API submission path. The original prompt is not
+    /// removed from the draft or handed to an agent until every configured
+    /// fail-closed before-submit hook succeeds. Hook output is audit-only and
+    /// is never interpreted as replacement prompt text.
+    @discardableResult
+    func submit(_ text: String) async -> Bool {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !hookSubmissionInProgress else { return false }
+        hookSubmissionInProgress = true
+        defer { hookSubmissionInProgress = false }
+        let decision = await invokeHook(.init(
+            event: .beforeSubmit,
+            meshID: id,
+            projectID: projectID,
+            fields: ["prompt": trimmed]
+        ))
+        guard decision.allowed else { return false }
+        switch (purpose, mode) {
+        case (.idea, _): return sendIdea(trimmed)
+        case (.build, .staged): return sendStaged(trimmed)
+        case (.build, .flat): return send(trimmed)
+        }
+    }
+
+    /// Safe approval harness: callers can render the exact redacted stdin JSON,
+    /// declared effects, timeout, and validation errors without launching the
+    /// executable or enabling the hook.
+    func previewHook(
+        configurationID: String,
+        event: MeshLifecycleHookEvent,
+        columnID: String? = nil,
+        fields: [String: String] = [:]
+    ) async -> MeshLifecycleHookPreview? {
+        guard let hookHost else { return nil }
+        return await hookHost.preview(
+            configurationID: configurationID,
+            payload: .init(
+                event: event,
+                meshID: id,
+                projectID: projectID,
+                columnID: columnID,
+                fields: fields
+            )
+        )
+    }
+
+    private func invokeHook(
+        _ payload: MeshLifecycleHookPayload
+    ) async -> MeshLifecycleHookDecision {
+        guard let hookHost else { return MeshLifecycleHookDecision(allowed: true, receipts: []) }
+        let decision = await hookHost.invoke(payload)
+        appendHookReceipts(decision.receipts)
+        return decision
+    }
+
+    private func appendHookReceipts(_ receipts: [MeshLifecycleHookReceipt]) {
+        guard !receipts.isEmpty else { return }
+        hookReceipts.append(contentsOf: receipts)
+        if hookReceipts.count > 64 {
+            hookReceipts.removeFirst(hookReceipts.count - 64)
+        }
+        if let failure = receipts.last(where: { $0.outcome != .succeeded }) {
+            let fallback = failure.outcome == .timedOut
+                ? "Lifecycle hook \(failure.hookID) timed out."
+                : "Lifecycle hook \(failure.hookID) failed."
+            hookNotice = failure.message.isEmpty ? fallback : failure.message
+        }
+    }
+
+    private func runColumnCompletionHooks(columnID: String) async {
+        guard let column = columns.first(where: { $0.id == columnID }) else { return }
+        let response = Self.lastMessageText(in: column.conversation.rows)
+        let common = [
+            "agentID": column.agent.id,
+            "role": column.role.rawValue,
+            "response": response,
+        ]
+        if !response.isEmpty {
+            _ = await invokeHook(.init(
+                event: .afterResponse,
+                meshID: id,
+                projectID: projectID,
+                columnID: columnID,
+                fields: common
+            ))
+        }
+        _ = await invokeHook(.init(
+            event: .turnCompleted,
+            meshID: id,
+            projectID: projectID,
+            columnID: columnID,
+            fields: common
+        ))
+    }
+
+    private func runSubagentHook(
+        _ event: MeshLifecycleHookEvent,
+        column: Column
+    ) async {
+        _ = await invokeHook(.init(
+            event: event,
+            meshID: id,
+            projectID: projectID,
+            columnID: column.id,
+            fields: [
+                "agentID": column.agent.id,
+                "role": column.role.rawValue,
+            ]
+        ))
+    }
+
+    /// Starts one lazily restored/focused column and emits subagentStarted once
+    /// only after its adapter actually connects. Multiple SwiftUI `.task`
+    /// callers safely collapse onto the conversation's idempotent start.
+    func startColumn(columnID: String) async {
+        guard let column = columns.first(where: { $0.id == columnID }) else { return }
+        await column.conversation.start()
+        if column.conversation.isConnected,
+           hookStartedColumnIDs.insert(column.id).inserted {
+            await runSubagentHook(.subagentStarted, column: column)
+        }
     }
 
     /// Fan the prompt out to every connected column (each queues if busy).
@@ -1262,6 +2054,28 @@ final class MeshSession: ObservableObject, Identifiable {
         }.value
     }
 
+    /// Graft a column's worktree diff onto the base project and report what
+    /// happened as a value. Success, "there was nothing to apply", a conflicted
+    /// graft, and an outright failure are four cases the caller can switch on;
+    /// the view never has to read English out of an error to decide how loud to
+    /// be about it.
+    func integrate(columnID: String) async -> MeshIntegrationOutcome {
+        let name = columns.first { $0.id == columnID }?.agent.name ?? "column"
+        let base = baseDirectory
+        let patch = await diff(for: columnID)
+        guard !patch.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return .noChanges(agent: name)
+        }
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try GitService(repoRoot: base).applyPatch(patch)
+            }.value
+            return .applied(agent: name, destination: base.lastPathComponent)
+        } catch {
+            return .from(applyError: error, agent: name)
+        }
+    }
+
     /// Per-worktree review lines for judging the run: files changed + rough +/-
     /// line counts, parsed from each editing column's diff against HEAD. Read-only
     /// columns (scout, ideator) have no worktree and are skipped.
@@ -1397,5 +2211,195 @@ enum MeshDiffStats {
         }
         let noun = files == 1 ? "file" : "files"
         return "\(files) \(noun) changed, +\(added) -\(removed)"
+    }
+}
+
+/// What one integration attempt did, carried as a value instead of a sentence.
+/// Success, "there was nothing to apply", a conflicted graft, and an outright
+/// failure are four cases; severity, symbol, the VoiceOver announcement and the
+/// offered recovery are all computed from the case. The message is display text
+/// only, so a permission or I/O failure keeps its weight no matter how git
+/// happened to word it. Kept free of the main actor so tests can build outcomes
+/// directly.
+enum MeshIntegrationOutcome: Equatable, Sendable {
+    case applied(agent: String, destination: String)
+    case noChanges(agent: String)
+    case conflicted(agent: String, paths: [String])
+    case failed(agent: String, reason: Reason)
+
+    /// Why an integration failed, mirroring `GitService.PatchApplyFailure`
+    /// without its conflict/empty cases — those are outcomes of their own above.
+    /// `detail` is git's own words, shown but never inspected.
+    enum Reason: Equatable, Sendable {
+        case notARepository
+        case permissionDenied(detail: String)
+        case patchRejected(detail: String)
+        case io(detail: String)
+        case gitFailed(detail: String)
+
+        var detail: String {
+            switch self {
+            case .notARepository: ""
+            case let .permissionDenied(detail), let .patchRejected(detail),
+                 let .io(detail), let .gitFailed(detail): detail
+            }
+        }
+
+        /// Shown when git said nothing useful, so the line is never blank.
+        var headline: String {
+            switch self {
+            case .notARepository: "the destination folder is not a git repository."
+            case .permissionDenied: "the destination folder is not writable."
+            case .patchRejected: "git refused this diff and left the project unchanged."
+            case .io: "the integration could not run."
+            case .gitFailed: "git apply failed."
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .notARepository: "questionmark.folder"
+            case .permissionDenied: "lock.fill"
+            case .patchRejected: "xmark.circle.fill"
+            case .io: "externaldrive.badge.exclamationmark"
+            case .gitFailed: "exclamationmark.octagon.fill"
+            }
+        }
+    }
+
+    /// How loud the status line should be. Views map this to a tint; nothing
+    /// maps a message to a tint.
+    enum Severity: Equatable, Sendable {
+        case success
+        case informational
+        case warning
+        case failure
+
+        /// Spoken first, so VoiceOver carries the urgency that the tint carries
+        /// visually.
+        var spokenLabel: String {
+            switch self {
+            case .success: "Integration succeeded"
+            case .informational: "Integration notice"
+            case .warning: "Integration needs you"
+            case .failure: "Integration failed"
+            }
+        }
+    }
+
+    /// The recovery a given outcome earns. Buttons come from this list, so a
+    /// failure always offers a way forward and a success does not offer a
+    /// pointless retry.
+    enum Recovery: String, Equatable, Sendable, Identifiable {
+        case reviewDiff
+        case retry
+        case revealDestination
+        case dismiss
+
+        var id: String { rawValue }
+
+        var title: String {
+            switch self {
+            case .reviewDiff: "Review Diff"
+            case .retry: "Try Again"
+            case .revealDestination: "Reveal in Finder"
+            case .dismiss: "Dismiss"
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .reviewDiff: "doc.text.magnifyingglass"
+            case .retry: "arrow.clockwise"
+            case .revealDestination: "folder"
+            case .dismiss: "xmark"
+            }
+        }
+
+        var help: String {
+            switch self {
+            case .reviewDiff: "Re-read this column's worktree diff"
+            case .retry: "Attempt the integration again"
+            case .revealDestination: "Open the base project in Finder"
+            case .dismiss: "Hide this integration status"
+            }
+        }
+    }
+
+    var severity: Severity {
+        switch self {
+        case .applied: .success
+        case .noChanges: .informational
+        case .conflicted: .warning
+        case .failed: .failure
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .applied: "checkmark.circle.fill"
+        case .noChanges: "tray"
+        case .conflicted: "exclamationmark.triangle.fill"
+        case let .failed(_, reason): reason.symbol
+        }
+    }
+
+    var message: String {
+        switch self {
+        case let .applied(agent, destination):
+            "Applied \(agent)'s diff to \(destination)."
+        case let .noChanges(agent):
+            "\(agent): no changes to apply."
+        case let .conflicted(agent, paths):
+            "\(agent): applied with conflicts in \(GitService.PatchApplyFailure.naming(paths)). Resolve the git markers (<<<<<<< / ======= / >>>>>>>) left in those files."
+        case let .failed(agent, reason):
+            "\(agent): \(reason.detail.isEmpty ? reason.headline : reason.detail)"
+        }
+    }
+
+    var accessibilityAnnouncement: String {
+        "\(severity.spokenLabel). \(message)"
+    }
+
+    var recoveryActions: [Recovery] {
+        switch self {
+        case .applied, .noChanges:
+            [.dismiss]
+        case .conflicted:
+            [.revealDestination, .dismiss]
+        case let .failed(_, reason):
+            switch reason {
+            case .notARepository: [.revealDestination, .dismiss]
+            case .permissionDenied: [.revealDestination, .retry, .dismiss]
+            case .patchRejected: [.reviewDiff, .retry, .dismiss]
+            case .io, .gitFailed: [.retry, .dismiss]
+            }
+        }
+    }
+
+    /// Narrow a thrown apply error to an outcome. Everything is decided by the
+    /// typed case; the error's text only ever becomes display detail. An error
+    /// from outside `GitService` is a genuine unknown and stays a failure.
+    static func from(applyError: Error, agent: String) -> MeshIntegrationOutcome {
+        guard let failure = applyError as? GitService.PatchApplyFailure else {
+            return .failed(agent: agent, reason: .gitFailed(detail: applyError.localizedDescription))
+        }
+        let detail = failure.errorDescription ?? ""
+        switch failure {
+        case .emptyPatch:
+            return .noChanges(agent: agent)
+        case let .conflicted(paths, _):
+            return .conflicted(agent: agent, paths: paths)
+        case .notARepository:
+            return .failed(agent: agent, reason: .notARepository)
+        case .permissionDenied:
+            return .failed(agent: agent, reason: .permissionDenied(detail: detail))
+        case .patchRejected:
+            return .failed(agent: agent, reason: .patchRejected(detail: detail))
+        case .io:
+            return .failed(agent: agent, reason: .io(detail: detail))
+        case .gitFailed:
+            return .failed(agent: agent, reason: .gitFailed(detail: detail))
+        }
     }
 }

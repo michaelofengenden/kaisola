@@ -1,6 +1,6 @@
 {
   "name": "kaisola-native",
-  "version": "0.1.114",
+  "version": "0.1.117",
   "private": true,
   "description": "Native Swift macOS and iPhone apps for Kaisola",
   "engines": {
@@ -12,7 +12,9 @@
     "native:resource": "node scripts/native-resource-gate.cjs",
     "native:frame-trace": "node scripts/native-frame-trace-gate.cjs",
     "native:frame-cadence": "node scripts/native-frame-cadence-gate.cjs",
+    "native:terminal-history-gate": "node scripts/native-terminal-history-gate.cjs",
     "native:resource-fixture": "node scripts/native-resource-fixture-gate.cjs",
+    "native:pdf-preview-budget": "node scripts/native-pdf-preview-budget.cjs",
     "native:dev": "./scripts/native-dev.sh",
     "native:canary": "./scripts/native-canary.sh",
     "native:canary:archive": "./scripts/native-canary.sh --install-only --archive",
@@ -30,6 +32,7 @@
     "native:helper:download": "node scripts/download-native-node-runtime.cjs all",
     "native:helper:probe": "node scripts/native-broker-helper-probe.cjs",
     "release:fast": "node scripts/release-fast.cjs",
+    "companion:device-acceptance": "node scripts/companion-device-acceptance.cjs",
     "companion:sim": "./scripts/companion-simulator.sh"
   },
   "dependencies": {

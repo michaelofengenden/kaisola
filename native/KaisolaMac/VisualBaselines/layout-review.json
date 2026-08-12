@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "expectationsDigest": "3c653f49640ba62e5213375c45c43fe3770c743a25eb365f3ca015d4b1cbd430",
+  "reviewedBy": "Michael Ofengenden",
+  "reviewedAt": "2026-08-08",
+  "reason": "First baseline for the native-visual layout gate (issue #309). Thresholds are set so app-drawn ink on the window buttons and an empty content layer fail, and so the rules that read the element inventory report without failing until a hosted run shows what that inventory contains.",
+  "beforeArtifact": "Settings before the fix: the sidebar mark and headline printed over the window buttons and every image-gate check still passed. Recorded as tests/fixtures/native-visual/settings-traffic-light-overlap.layout.json, and reproduced live by NativeVisualLayoutAuditTests.testStandaloneSettingsWindowKeepsItsHeaderOffTheWindowControls, which fails on the pre-fix view with control-zone-ink range=0.430.",
+  "afterArtifact": "Settings after the fix, captured locally with the same hosted fixture the workflow runs, along with terminal, mixed, mesh, topbar, onboarding, usage, settings-mcp, workspace-rename and account-picker: gate PASS on all ten, 26 observations, no failures.",
+  "howToUpdate": [
+    "1. Change native/KaisolaMac/VisualBaselines/layout-expectations.json.",
+    "2. Run native-visual before and after, and download both artifacts.",
+    "3. Look at the screenshots the change affects, not only the gate log.",
+    "4. Put the new digest (shasum -a 256 layout-expectations.json), your name, the date, the reason, and both artifact references here.",
+    "The gate fails the whole run while the digest and this record disagree, so a baseline cannot move without step 3 having a name attached to it."
+  ]
+}

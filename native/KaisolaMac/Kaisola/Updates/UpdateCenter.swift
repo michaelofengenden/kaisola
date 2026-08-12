@@ -22,18 +22,36 @@ final class UpdateCenter: ObservableObject {
     static let shared = UpdateCenter()
 
     struct PendingUpdate: Equatable {
+        enum Phase: Equatable {
+            case ready
+            case installing
+        }
+
         let version: String
+        let phase: Phase
         /// Sparkle's immediate-installation block. Invoking it installs and
-        /// relaunches with no further Sparkle UI.
-        let install: () -> Void
+        /// relaunches with no further Sparkle UI. It is removed before the
+        /// phase becomes `installing`, so no path can retain and invoke it
+        /// twice while the relaunch is pending.
+        fileprivate let install: (() -> Void)?
 
         static func == (lhs: PendingUpdate, rhs: PendingUpdate) -> Bool {
-            lhs.version == rhs.version
+            lhs.version == rhs.version && lhs.phase == rhs.phase
         }
     }
 
-    /// Non-nil once an update is downloaded, verified, and ready to install.
+    /// Non-nil once an update is downloaded and verified. The phase remains
+    /// visible while installation starts so every app window can remove its
+    /// restart action before Sparkle begins relaunching.
     @Published private(set) var pendingUpdate: PendingUpdate?
+
+    var canInstallPendingUpdate: Bool {
+        pendingUpdate?.phase == .ready
+    }
+
+    var isInstallingUpdate: Bool {
+        pendingUpdate?.phase == .installing
+    }
 
     /// True while Sparkle is showing its own update UI, so Kaisola's affordance
     /// can step aside rather than duplicate it.
@@ -102,7 +120,36 @@ final class UpdateCenter: ObservableObject {
 
     private var bridge: PreferenceBridge?
 
-    private init() {}
+    /// The app always goes through `shared`; the initializer is reachable so
+    /// check-status transitions can be driven on a throwaway instance while
+    /// installed-app QA can inject its explicitly gated visual environment.
+    init(environment: [String: String] = ProcessInfo.processInfo.environment) {
+        pendingUpdate = Self.visualFixturePendingUpdate(environment: environment)
+    }
+
+    /// Installed-app QA can exercise the real ready → installing UI without
+    /// asking Sparkle to contact a feed or relaunch the fixture. Both gates are
+    /// required so an ordinary launch can never manufacture update state.
+    static func visualFixturePendingUpdate(
+        environment: [String: String]
+    ) -> PendingUpdate? {
+        guard environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1" else { return nil }
+        let phase: PendingUpdate.Phase
+        switch environment["KAISOLA_NATIVE_VISUAL_UPDATE_PHASE"] {
+        case "ready": phase = .ready
+        case "installing": phase = .installing
+        default: return nil
+        }
+        let requestedVersion = environment["KAISOLA_NATIVE_VISUAL_UPDATE_VERSION"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let version = requestedVersion.flatMap { $0.isEmpty ? nil : $0 } ?? "99.0"
+        let install: (() -> Void)? = phase == .ready ? {
+            let line = Data("KAISOLA_NATIVE_VISUAL_UPDATE_INSTALL=PASS\n".utf8)
+            FileHandle.standardOutput.write(line)
+            try? FileHandle.standardOutput.synchronize()
+        } : nil
+        return PendingUpdate(version: version, phase: phase, install: install)
+    }
 
     func installPreferenceBridge(_ bridge: PreferenceBridge) {
         self.bridge = bridge
@@ -131,9 +178,12 @@ final class UpdateCenter: ObservableObject {
         // Sparkle can hand the block over more than once — the docs note the
         // installer may re-offer when a termination request is cancelled, which
         // Kaisola's `applicationShouldTerminate` does on its first pass. Keep
-        // the newest block and do not re-toast for a version already pending.
+        // the newest ready block and do not re-toast for a version already
+        // pending. Once installation starts, however, never restore an action
+        // that another window could invoke during relaunch latency.
+        guard pendingUpdate?.phase != .installing else { return }
         let alreadyPending = pendingUpdate?.version == version
-        pendingUpdate = PendingUpdate(version: version, install: install)
+        pendingUpdate = PendingUpdate(version: version, phase: .ready, install: install)
         guard !alreadyPending else { return }
         ToastCenter.shared.show("Kaisola \(version) is ready — restart to install", style: .success)
     }
@@ -150,7 +200,14 @@ final class UpdateCenter: ObservableObject {
     /// the detached broker — but in-process ACP chats and Mesh columns do not,
     /// so callers should warn when `AppModel.interruptibleTurnCount` is nonzero.
     func installAndRelaunch() {
-        guard let pendingUpdate else { return }
-        pendingUpdate.install()
+        guard let pendingUpdate,
+              pendingUpdate.phase == .ready,
+              let install = pendingUpdate.install else { return }
+        self.pendingUpdate = PendingUpdate(
+            version: pendingUpdate.version,
+            phase: .installing,
+            install: nil
+        )
+        install()
     }
 }

@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import CryptoKit
+import Darwin
 import Foundation
 
 /// Serializes the competing process-exit and timeout callbacks without tying
@@ -16,6 +17,54 @@ final class UsageProcessCompletionGate: @unchecked Sendable {
         guard !claimed else { return false }
         claimed = true
         return true
+    }
+}
+
+/// Directory identity for named accounts.
+///
+/// Two pointers at one credential directory are one account, however the path
+/// was spelled: a symlink, a `..` hop, a trailing slash, or the same name in a
+/// different case on a case-insensitive volume. Duplicate detection used to
+/// compare tilde-expanded strings, so an alias registered a second copy of a
+/// subscription and split its usage and attribution between the two rows.
+enum AccountDirectory {
+    /// Absolute, lexically standardized, symlink-resolved path, or nil when the
+    /// value cannot name a directory at all.
+    ///
+    /// Existing symlink components are resolved now rather than at use time.
+    /// Otherwise changing a profile symlink after session creation could
+    /// silently redirect an existing provider continuation to different
+    /// credentials.
+    static func canonicalPath(_ rawValue: String) -> String? {
+        guard let trimmed = UsageAccountProfile.validatedDirectory(rawValue) else { return nil }
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        guard expanded.hasPrefix("/") else { return nil }
+        let canonical = URL(fileURLWithPath: expanded, isDirectory: true)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+            .path
+        return UsageAccountProfile.validatedDirectory(canonical)
+    }
+
+    /// Volume + inode of a directory that exists, as a comparable key. Resolved
+    /// paths miss the aliases the filesystem itself collapses: a case-insensitive
+    /// volume answers `~/.Claude-Work` and `~/.claude-work` with one directory,
+    /// and a firmlinked path spells one directory two ways.
+    static func fileIdentity(_ path: String) -> String? {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: path),
+              let device = attributes[.systemNumber] as? NSNumber,
+              let inode = attributes[.systemFileNumber] as? NSNumber else { return nil }
+        return "\(device.uint64Value)\u{1f}\(inode.uint64Value)"
+    }
+
+    /// The key duplicate detection compares: filesystem identity when the
+    /// directory exists, the resolved path when it does not. A named account is
+    /// often added before its provider CLI has created the directory, so an
+    /// absent path still has to compare equal to itself.
+    static func identityKey(_ rawValue: String) -> String? {
+        guard let path = canonicalPath(rawValue) else { return nil }
+        guard let identity = fileIdentity(path) else { return "path\u{1f}\(path)" }
+        return "node\u{1f}\(identity)"
     }
 }
 
@@ -39,10 +88,24 @@ struct UsageAccountProfile: Codable, Equatable, Identifiable, Sendable {
     var label: String
     var directory: String
 
+    /// Credential-directory pointers are persisted and later copied into a
+    /// provider subprocess environment. Keep their UTF-8 representation within
+    /// one 4 KiB field and reject terminal/NUL control bytes before storage.
+    static let maximumDirectoryBytes = 4_096
+
+    static func validatedDirectory(_ rawValue: String) -> String? {
+        guard rawValue.utf8.count <= maximumDirectoryBytes,
+              !rawValue.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else { return nil }
+        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed
+    }
+
     var normalized: UsageAccountProfile? {
         let cleanLabel = label.trimmingCharacters(in: .whitespacesAndNewlines)
-        let cleanDirectory = directory.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !cleanLabel.isEmpty, !cleanDirectory.isEmpty else { return nil }
+        guard !cleanLabel.isEmpty,
+              let cleanDirectory = Self.validatedDirectory(directory) else { return nil }
         return UsageAccountProfile(
             id: id,
             provider: provider,
@@ -53,6 +116,19 @@ struct UsageAccountProfile: Codable, Equatable, Identifiable, Sendable {
 
     var expandedDirectory: String {
         (directory as NSString).expandingTildeInPath
+    }
+
+    /// The directory this account actually points at, with `~`, `.`, `..`,
+    /// trailing slashes and symlinks resolved. `expandedDirectory` stays the
+    /// value handed to a provider CLI; this is the one identity comparisons use.
+    var canonicalDirectory: String {
+        AccountDirectory.canonicalPath(directory) ?? expandedDirectory
+    }
+
+    /// Provider-scoped duplicate key. Same provider plus same directory on disk
+    /// is one account, whichever alias the path was typed as.
+    var identityKey: String {
+        "\(provider.rawValue)\u{1f}\(AccountDirectory.identityKey(directory) ?? expandedDirectory)"
     }
 }
 
@@ -112,7 +188,8 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
         store: CustomAgentStore = CustomAgentStore()
     ) -> UsageAccountProfile.Provider? {
         if let builtin = provider(forAgentID: agentID) { return builtin }
-        guard let spec = store.all().first(where: { $0.id == agentID }) else { return nil }
+        guard case let .success(specs) = store.load(),
+              let spec = specs.first(where: { $0.id == agentID }) else { return nil }
         switch spec.resolvedCredentials {
         case .claude: return .claude
         case .codex: return .codex
@@ -187,9 +264,11 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
         /// constraint, which is what "spent" actually means. An account at 0%
         /// on five hours and 100% on its weekly bucket is spent.
         let usedPercent: Double
+        let bindingWindowLabel: String
         /// An account of the same provider with meaningfully more room.
         let alternativeLabel: String?
         let alternativeUsedPercent: Double?
+        let alternativeWindowLabel: String?
     }
 
     /// At or above this, an account counts as spent. Not 100: the last few
@@ -203,35 +282,58 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
 
     static func headroomAdvice(
         for binding: SessionAccountBinding,
-        readings: [UsageCenter.ProviderPlanUsage]
+        readings: [UsageCenter.ProviderPlanUsage],
+        now: Date = Date()
     ) -> HeadroomAdvice? {
-        func worst(_ reading: UsageCenter.ProviderPlanUsage) -> Double? {
-            reading.windows.compactMap(\.usedPercent).max()
+        func bindingWindow(
+            _ reading: UsageCenter.ProviderPlanUsage
+        ) -> UsageCenter.PlanWindow? {
+            guard reading.ok, reading.isFresh(at: now) else { return nil }
+            var result: UsageCenter.PlanWindow?
+            for candidate in reading.windows {
+                guard let used = candidate.reportedUsedPercent else { continue }
+                if result?.reportedUsedPercent.map({ used > $0 }) ?? true {
+                    result = candidate
+                }
+            }
+            return result
         }
         let current = readings.first {
-            $0.provider == binding.provider.rawValue
-                && $0.profileID != nil
-                && $0.profileLabel == binding.label
+            guard $0.provider == binding.provider.rawValue else { return false }
+            if let accountID = binding.accountID, !accountID.isEmpty {
+                return $0.profileID == accountID
+            }
+            return $0.profileLabel == binding.label
         }
-        guard let current, let used = worst(current), used >= exhaustedPercent else { return nil }
+        guard let current,
+              let currentWindow = bindingWindow(current),
+              let used = currentWindow.reportedUsedPercent,
+              used >= exhaustedPercent else { return nil }
 
         let ceiling = used - worthSwitchingMargin
         var bestLabel: String?
         var bestUsed: Double?
+        var bestWindowLabel: String?
         for reading in readings {
             guard reading.provider == binding.provider.rawValue else { continue }
+            if let accountID = binding.accountID, reading.profileID == accountID { continue }
             guard let label = reading.profileLabel, !label.isEmpty, label != binding.label else { continue }
-            guard let value = worst(reading), value <= ceiling else { continue }
+            guard let window = bindingWindow(reading),
+                  let value = window.reportedUsedPercent,
+                  value <= ceiling else { continue }
             if bestUsed == nil || value < bestUsed! {
                 bestUsed = value
                 bestLabel = label
+                bestWindowLabel = window.label
             }
         }
 
         return HeadroomAdvice(
             usedPercent: used,
+            bindingWindowLabel: currentWindow.label,
             alternativeLabel: bestLabel,
-            alternativeUsedPercent: bestUsed
+            alternativeUsedPercent: bestUsed,
+            alternativeWindowLabel: bestWindowLabel
         )
     }
 
@@ -288,15 +390,18 @@ struct SessionAccountBinding: Codable, Equatable, Hashable, Sendable {
     /// One sentence a person can act on, or nothing.
     static func headroomWarning(
         for binding: SessionAccountBinding,
-        readings: [UsageCenter.ProviderPlanUsage]
+        readings: [UsageCenter.ProviderPlanUsage],
+        now: Date = Date()
     ) -> String? {
-        guard let advice = headroomAdvice(for: binding, readings: readings) else { return nil }
-        let used = Int(advice.usedPercent.rounded())
+        guard let advice = headroomAdvice(for: binding, readings: readings, now: now) else { return nil }
+        let used = UsageCenter.PlanWindow.percentCaption(advice.usedPercent)
+        let current = "\(binding.label) is \(used) used on its \(advice.bindingWindowLabel) limit."
         guard let label = advice.alternativeLabel,
-              let alternative = advice.alternativeUsedPercent else {
-            return "\(binding.label) is \(used)% used."
+              let alternative = advice.alternativeUsedPercent,
+              let alternativeWindow = advice.alternativeWindowLabel else {
+            return current
         }
-        return "\(binding.label) is \(used)% used. \(label) is at \(Int(alternative.rounded()))%."
+        return "\(current) \(label) is at \(UsageCenter.PlanWindow.percentCaption(alternative)) on its \(alternativeWindow) limit."
     }
 
     static func applying(
@@ -362,20 +467,7 @@ enum SessionModelOverride {
 
 extension SessionAccountBinding {
     fileprivate static func canonicalDirectory(_ rawValue: String) -> String? {
-        let trimmed = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty,
-              trimmed.count <= 4_096,
-              !trimmed.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
-        else { return nil }
-        let expanded = (trimmed as NSString).expandingTildeInPath
-        guard expanded.hasPrefix("/") else { return nil }
-        // Resolve any existing symlink components now. Otherwise changing a
-        // profile symlink after session creation could silently redirect an
-        // existing provider continuation to different credentials.
-        return URL(fileURLWithPath: expanded, isDirectory: true)
-            .standardizedFileURL
-            .resolvingSymlinksInPath()
-            .path
+        AccountDirectory.canonicalPath(rawValue)
     }
 }
 
@@ -390,21 +482,54 @@ struct UsageAccountStore: Sendable {
 
     static let schemaVersion = 1
     let fileURL: URL
+    private let installTemporary: @Sendable (URL, URL) throws -> Void
 
-    init(fileURL: URL = NativePreviewPaths.applicationSupportDirectory
-        .appendingPathComponent("usage-accounts.json", isDirectory: false)) {
+    init(
+        fileURL: URL = NativePreviewPaths.applicationSupportDirectory
+            .appendingPathComponent("usage-accounts.json", isDirectory: false),
+        installTemporary: @escaping @Sendable (URL, URL) throws -> Void = { temporary, destination in
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: temporary)
+            } else {
+                try FileManager.default.moveItem(at: temporary, to: destination)
+            }
+        }
+    ) {
         self.fileURL = fileURL
+        self.installTemporary = installTemporary
     }
 
     func profiles() -> [UsageAccountProfile] {
         guard let data = try? Data(contentsOf: fileURL),
               let payload = try? JSONDecoder().decode(Payload.self, from: data),
               payload.schemaVersion == Self.schemaVersion else { return [] }
+        // Already-stored rows are collapsed by canonical identity too: two
+        // aliases of one credential directory may have been saved before the
+        // add path knew to compare them.
         var seen = Set<String>()
-        return payload.profiles.compactMap(\.normalized).filter { profile in
-            let key = "\(profile.provider.rawValue)\u{1f}\(profile.expandedDirectory)"
-            return seen.insert(key).inserted
+        return payload.profiles.compactMap(\.normalized).filter { seen.insert($0.identityKey).inserted }
+    }
+
+    /// The account that already owns `directory`, compared by canonical
+    /// directory identity rather than by the typed string, so an alias is
+    /// recognized as the account it aliases. Callers use the returned profile to
+    /// say *which* account the directory collides with.
+    static func existingProfile(
+        in profiles: [UsageAccountProfile],
+        provider: UsageAccountProfile.Provider,
+        directory: String
+    ) -> UsageAccountProfile? {
+        guard let key = AccountDirectory.identityKey(directory) else { return nil }
+        return profiles.first {
+            $0.provider == provider && AccountDirectory.identityKey($0.directory) == key
         }
+    }
+
+    func existingProfile(
+        provider: UsageAccountProfile.Provider,
+        directory: String
+    ) -> UsageAccountProfile? {
+        Self.existingProfile(in: profiles(), provider: provider, directory: directory)
     }
 
     @discardableResult
@@ -415,7 +540,31 @@ struct UsageAccountStore: Sendable {
             label: label,
             directory: directory
         ).normalized else { return nil }
+        return withRegistryLock { current -> UsageAccountProfile? in
+            guard Self.existingProfile(
+                in: current,
+                provider: profile.provider,
+                directory: profile.directory
+            ) == nil else { return nil }
+            guard write(current + [profile]) else { return nil }
+            return profile
+        }
+    }
+
+    /// Re-register an immutable account binding that a restored chat still
+    /// names. This is used only after the user explicitly chooses Sign In from
+    /// that chat's recovery card; keeping the original id lets the auth probe
+    /// and every persisted continuation continue to refer to the same account.
+    @discardableResult
+    func restore(_ requested: UsageAccountProfile) -> UsageAccountProfile? {
+        guard let profile = requested.normalized,
+              profile.id.count <= 128,
+              !profile.id.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
+        else { return nil }
         var current = profiles()
+        if let existing = current.first(where: { $0.id == profile.id }) {
+            return existing == profile ? existing : nil
+        }
         guard !current.contains(where: {
             $0.provider == profile.provider && $0.expandedDirectory == profile.expandedDirectory
         }) else { return nil }
@@ -426,10 +575,61 @@ struct UsageAccountStore: Sendable {
 
     @discardableResult
     func remove(id: String) -> Bool {
-        let current = profiles()
-        let remaining = current.filter { $0.id != id }
-        guard remaining.count != current.count else { return false }
-        return write(remaining)
+        withRegistryLock { current -> Bool? in
+            let remaining = current.filter { $0.id != id }
+            guard remaining.count != current.count else { return false }
+            return write(remaining)
+        } ?? false
+    }
+
+    /// Advisory lock guarding a mutation's read-modify-write. It is a sidecar
+    /// file rather than the registry itself because every write replaces the
+    /// registry inode, and a lock held on a replaced inode guards nothing.
+    var lockURL: URL {
+        fileURL.deletingLastPathComponent().appendingPathComponent(
+            ".\(fileURL.lastPathComponent).lock",
+            isDirectory: false
+        )
+    }
+
+    /// How long a mutation waits for another writer. The critical section is
+    /// one small decode plus an atomic replace, so genuine contention clears in
+    /// well under a millisecond; the deadline exists only so a wedged holder
+    /// cannot freeze the Settings window indefinitely.
+    private static let lockTimeout: TimeInterval = 2
+    private static let lockRetryInterval: TimeInterval = 0.005
+
+    /// Run one mutation with the registry serialized against every other
+    /// writer, `body` receiving the profiles as they are *inside* the lock.
+    ///
+    /// add() and remove() used to load the whole registry, edit their own copy
+    /// and write it back with no interlock, so two Settings windows saving at
+    /// once each erased the other's account. `flock` is held per open file
+    /// description, which means two `UsageAccountStore` values in one process
+    /// contend exactly the way two app instances do.
+    ///
+    /// Reads stay lock-free: a write only ever swaps the file whole, so
+    /// `profiles()` sees one complete generation or the other, never a tear.
+    private func withRegistryLock<T>(_ body: ([UsageAccountProfile]) -> T?) -> T? {
+        let directory = fileURL.deletingLastPathComponent()
+        try? FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let descriptor = open(lockURL.path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
+        guard descriptor >= 0 else { return nil }
+        defer { Darwin.close(descriptor) }
+
+        let deadline = Date().addingTimeInterval(Self.lockTimeout)
+        while flock(descriptor, LOCK_EX | LOCK_NB) != 0 {
+            let failure = errno
+            guard failure == EWOULDBLOCK || failure == EINTR, Date() < deadline else { return nil }
+            Thread.sleep(forTimeInterval: Self.lockRetryInterval)
+        }
+        defer { _ = flock(descriptor, LOCK_UN) }
+
+        return body(profiles())
     }
 
     static func suggestedDirectory(provider: UsageAccountProfile.Provider, label: String) -> String? {
@@ -453,6 +653,18 @@ struct UsageAccountStore: Sendable {
 
     private func write(_ profiles: [UsageAccountProfile]) -> Bool {
         let directory = fileURL.deletingLastPathComponent()
+        // Named ahead of the `do` so the defer can delete this exact fragment.
+        // A locked destination fails `replaceItemAt` and a dangling symlink
+        // fails `moveItem` *after* the temporary already exists, so a catch
+        // that only returned false silted up the credential directory with
+        // `.usage-accounts.json.<uuid>` leftovers on every retry.
+        let temporary = directory.appendingPathComponent(
+            ".\(fileURL.lastPathComponent).\(UUID().uuidString)",
+            isDirectory: false
+        )
+        defer {
+            try? FileManager.default.removeItem(at: temporary)
+        }
         do {
             try FileManager.default.createDirectory(
                 at: directory,
@@ -461,17 +673,9 @@ struct UsageAccountStore: Sendable {
             )
             let payload = Payload(schemaVersion: Self.schemaVersion, profiles: profiles)
             let data = try JSONEncoder().encode(payload)
-            let temporary = directory.appendingPathComponent(
-                ".\(fileURL.lastPathComponent).\(UUID().uuidString)",
-                isDirectory: false
-            )
             try data.write(to: temporary, options: [.atomic])
             try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
-            if FileManager.default.fileExists(atPath: fileURL.path) {
-                _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
-            } else {
-                try FileManager.default.moveItem(at: temporary, to: fileURL)
-            }
+            try installTemporary(temporary, fileURL)
             return true
         } catch {
             return false
@@ -505,7 +709,7 @@ final class UsageCenter: ObservableObject {
             ? nil
             : .live
     )
-    static let automaticPlanUsageTTL: TimeInterval = 180
+    nonisolated static let automaticPlanUsageTTL: TimeInterval = 180
 
     /// One chat's usage rollup. `latest*` is the most recent context-window
     /// reading (what the gauge shows); `peakUsed` is the high-water mark of used
@@ -554,14 +758,44 @@ final class UsageCenter: ObservableObject {
         let resetsAt: Double?
 
         var id: String { label }
+
+        /// Provider percentages may legitimately carry a fractional component.
+        /// Missing, negative, and non-finite values are unknown rather than 0%.
+        nonisolated var reportedUsedPercent: Double? {
+            guard let usedPercent,
+                  usedPercent.isFinite,
+                  usedPercent >= 0,
+                  usedPercent <= 10_000 else { return nil }
+            return usedPercent
+        }
+
+        /// At most one decimal place keeps exact provider precision without
+        /// turning whole percentages into noisy `37.0%` labels.
+        nonisolated static func percentCaption(_ value: Double?) -> String {
+            guard let value,
+                  value.isFinite,
+                  value >= 0,
+                  value <= 10_000 else { return "—" }
+            let tenths = (value * 10).rounded() / 10
+            if tenths.rounded() == tenths {
+                return String(format: "%.0f%%", locale: Locale(identifier: "en_US_POSIX"), tenths)
+            }
+            return String(format: "%.1f%%", locale: Locale(identifier: "en_US_POSIX"), tenths)
+        }
     }
 
     struct ProviderPlanUsage: Codable, Equatable, Identifiable, Sendable {
+        struct WindowRow: Identifiable, Equatable, Sendable {
+            let id: Int
+            let window: PlanWindow
+        }
+
         let provider: String
         let displayName: String
         let profileID: String?
         let profileLabel: String?
         let ok: Bool
+        let authRequired: Bool?
         let sourceLabel: String
         let experimental: Bool?
         let account: String?
@@ -572,12 +806,43 @@ final class UsageCenter: ObservableObject {
 
         var id: String { "\(provider):\(profileID ?? "active")" }
 
+        /// Position is the identity because providers can report two distinct
+        /// buckets with the same display label. Keying SwiftUI by label silently
+        /// coalesces those rows and violates the provider's ordering.
+        nonisolated var windowRows: [WindowRow] {
+            windows.enumerated().map { WindowRow(id: $0.offset, window: $0.element) }
+        }
+
+        nonisolated var updatedDate: Date? {
+            guard let updatedAt, updatedAt.isFinite, updatedAt > 0 else { return nil }
+            let seconds = updatedAt > 10_000_000_000 ? updatedAt / 1_000 : updatedAt
+            guard seconds.isFinite, seconds > 0 else { return nil }
+            return Date(timeIntervalSince1970: seconds)
+        }
+
+        /// Launch advice is actionable only while its source reading is inside
+        /// the same freshness window used by automatic provider refresh. A
+        /// bounded future skew tolerates clock jitter without accepting corrupt
+        /// far-future timestamps indefinitely.
+        nonisolated func isFresh(
+            at now: Date,
+            maximumAge: TimeInterval = UsageCenter.automaticPlanUsageTTL,
+            maximumFutureSkew: TimeInterval = 60
+        ) -> Bool {
+            guard maximumAge > 0,
+                  maximumFutureSkew >= 0,
+                  let updatedDate else { return false }
+            let age = now.timeIntervalSince(updatedDate)
+            return age >= -maximumFutureSkew && age < maximumAge
+        }
+
         init(
             provider: String,
             displayName: String,
             profileID: String? = nil,
             profileLabel: String? = nil,
             ok: Bool,
+            authRequired: Bool? = nil,
             sourceLabel: String,
             experimental: Bool? = nil,
             account: String? = nil,
@@ -591,6 +856,7 @@ final class UsageCenter: ObservableObject {
             self.profileID = profileID
             self.profileLabel = profileLabel
             self.ok = ok
+            self.authRequired = authRequired
             self.sourceLabel = sourceLabel
             self.experimental = experimental
             self.account = account
@@ -607,6 +873,7 @@ final class UsageCenter: ObservableObject {
                 profileID: request.profileID,
                 profileLabel: request.profileLabel,
                 ok: ok,
+                authRequired: authRequired,
                 sourceLabel: sourceLabel,
                 experimental: experimental,
                 account: account,
@@ -615,6 +882,18 @@ final class UsageCenter: ObservableObject {
                 message: safeMessage,
                 updatedAt: updatedAt
             )
+        }
+    }
+
+    /// A failed live refresh may still have an exact-context snapshot worth
+    /// showing. Keep the failure and the snapshot's age together so callers
+    /// cannot accidentally present cached limits as current.
+    struct PlanUsageStaleness: Equatable, Sendable {
+        let error: String
+        let lastSuccessfulRefresh: Date
+
+        func notice(lastUpdatedDescription: String) -> String {
+            "\(error) Showing account limits last updated \(lastUpdatedDescription)."
         }
     }
 
@@ -708,19 +987,30 @@ final class UsageCenter: ObservableObject {
     }
     @Published private(set) var isRefreshingPlanUsage = false
     @Published private(set) var planUsageError: String?
+    @Published private(set) var planUsageStaleness: PlanUsageStaleness?
 
     private var planRefreshTask: Task<Void, Never>?
     private var planRefreshGeneration = 0
     private var planRefreshContextKey: String?
     private var planUsageCache: [String: (providers: [ProviderPlanUsage], fetchedAt: Date)] = [:]
+    private var planUsageFailures: [String: PlanUsageStaleness] = [:]
     /// Disk backing for `planUsageCache`, so cards render on launch instead of
     /// after a multi-second probe. Hydrated lazily on first access.
     private let planUsageSnapshots = PlanUsageSnapshotStore()
+    private lazy var planUsageSnapshotSaveQueue = PlanUsageSnapshotSaveQueue { [planUsageSnapshots] snapshot in
+        planUsageSnapshots.save(snapshot)
+    }
     private var hasHydratedPlanUsageSnapshots = false
     private let now: () -> Date
     private let persistenceStore: AcpTranscriptStore?
     private let planUsageContextResolver: PlanUsageContextResolver
+    private let planUsageReader: @Sendable (
+        URL?, URL?, [String: String], [PlanUsageRequest]
+    ) async -> ProviderPlanReadResult
     private let usageAccountStore: UsageAccountStore
+    /// Process-wide recovery authority for `shared`; custom UsageCenter
+    /// instances keep their injected authority for isolated tests/fixtures.
+    let projectAccountRecoveryCenter: ProjectAccountRecoveryCenter
     private var persistenceTask: Task<Void, Never>?
     private var chatSources: [String: Set<String>] = [:]
 
@@ -728,14 +1018,28 @@ final class UsageCenter: ObservableObject {
         now: @escaping () -> Date = Date.init,
         persistenceStore: AcpTranscriptStore? = nil,
         usageAccountStore: UsageAccountStore = UsageAccountStore(),
+        projectAccountRecoveryCenter: ProjectAccountRecoveryCenter? = nil,
         planUsageContextResolver: @escaping PlanUsageContextResolver = { workspace, environment in
             UsageCenter.planUsageContextKey(workspace: workspace, environment: environment)
+        },
+        planUsageReader: @escaping @Sendable (
+            URL?, URL?, [String: String], [PlanUsageRequest]
+        ) async -> ProviderPlanReadResult = { helperRoot, currentDirectory, environment, requests in
+            await UsageCenter.readProviderPlanUsage(
+                helperRoot: helperRoot,
+                currentDirectory: currentDirectory,
+                environment: environment,
+                requests: requests
+            )
         }
     ) {
         self.now = now
         self.persistenceStore = persistenceStore
         self.usageAccountStore = usageAccountStore
+        self.projectAccountRecoveryCenter = projectAccountRecoveryCenter
+            ?? ProjectAccountRecoveryCenter()
         self.planUsageContextResolver = planUsageContextResolver
+        self.planUsageReader = planUsageReader
     }
 
     /// Every tracked chat, heaviest first (peak used tokens, descending). The
@@ -948,15 +1252,26 @@ final class UsageCenter: ObservableObject {
     /// credential reads, package hashing, and provider processes stay off the
     /// main actor.
     func refreshPlanUsage(workspace: URL?, force: Bool = false) {
-        let projectOverride = workspace.map {
-            ProjectAccountStore().override(
-                forProject: NativeSessionStore.projectID(forDirectory: $0.path)
-            )
-        } ?? nil
-        let overlay = ProjectAccountStore.mergedOverlay(
-            app: NativePreviewSettings.shared.agentEnvironmentOverlay,
-            project: projectOverride
-        )
+        let appOverlay = NativePreviewSettings.shared.agentEnvironmentOverlay
+        let overlay: [String: String]
+        if let workspace {
+            switch projectAccountRecoveryCenter.launchOverlay(
+                app: appOverlay,
+                forProject: NativeSessionStore.projectID(forDirectory: workspace.path)
+            ) {
+            case .success(let resolved):
+                overlay = resolved
+            case .failure(let issue):
+                planRefreshTask?.cancel()
+                planRefreshTask = nil
+                planRefreshGeneration &+= 1
+                isRefreshingPlanUsage = false
+                planUsageError = issue.message
+                return
+            }
+        } else {
+            overlay = appOverlay
+        }
         let environment = ProcessInfo.processInfo.environment.merging(overlay) { _, project in project }
         let profiles = usageAccountStore.profiles()
         let requests = Self.planUsageRequests(
@@ -969,11 +1284,13 @@ final class UsageCenter: ObservableObject {
         let generation = planRefreshGeneration
         isRefreshingPlanUsage = true
         planUsageError = nil
+        planUsageStaleness = nil
 
         let helperRoot = Bundle.main.resourceURL?
             .appendingPathComponent("BrokerHelper", isDirectory: true)
         let currentDirectory = workspace
         let contextResolver = planUsageContextResolver
+        let planUsageReader = planUsageReader
 
         planRefreshTask = Task { [weak self] in
             // Credential files can live on a slow or synchronized volume. Their
@@ -1001,7 +1318,9 @@ final class UsageCenter: ObservableObject {
                self.now().timeIntervalSince(cached.fetchedAt) < Self.automaticPlanUsageTTL {
                 self.planRefreshContextKey = contextKey
                 self.planUsage = cached.providers
-                self.planUsageError = nil
+                let staleness = self.planUsageFailures[contextKey]
+                self.planUsageError = staleness?.error
+                self.planUsageStaleness = staleness
                 self.isRefreshingPlanUsage = false
                 self.planRefreshTask = nil
                 return
@@ -1016,14 +1335,12 @@ final class UsageCenter: ObservableObject {
                 self.planUsage = self.planUsageCache[contextKey]?.providers ?? []
             }
             self.planRefreshContextKey = contextKey
+            let priorFailure = self.planUsageFailures[contextKey]
+            self.planUsageError = priorFailure?.error
+            self.planUsageStaleness = priorFailure
 
             let reader = Task.detached(priority: .userInitiated) {
-                await Self.readProviderPlanUsage(
-                    helperRoot: helperRoot,
-                    currentDirectory: currentDirectory,
-                    environment: environment,
-                    requests: requests
-                )
+                await planUsageReader(helperRoot, currentDirectory, environment, requests)
             }
             let result = await withTaskCancellationHandler {
                 await reader.value
@@ -1035,16 +1352,29 @@ final class UsageCenter: ObservableObject {
                   self.planRefreshContextKey == contextKey else { return }
             switch result {
             case let .success(providers):
+                let fetchedAt = self.now()
                 self.planUsage = providers
                 // Reuse the already-resolved opaque context. Re-reading and
                 // hashing credentials here used to double the I/O for every
                 // successful refresh.
-                self.storeCachedPlanUsage(providers, contextKey: contextKey, fetchedAt: self.now())
+                self.storeCachedPlanUsage(providers, contextKey: contextKey, fetchedAt: fetchedAt)
                 self.planUsageError = nil
+                self.planUsageStaleness = nil
             case let .failure(message):
-                self.planUsageCache.removeValue(forKey: contextKey)
-                self.planUsage = []
                 self.planUsageError = message
+                if let cached = self.planUsageCache[contextKey] {
+                    self.planUsage = cached.providers
+                    let staleness = PlanUsageStaleness(
+                        error: message,
+                        lastSuccessfulRefresh: cached.fetchedAt
+                    )
+                    self.planUsageFailures[contextKey] = staleness
+                    self.planUsageStaleness = staleness
+                } else {
+                    self.planUsage = []
+                    self.planUsageFailures.removeValue(forKey: contextKey)
+                    self.planUsageStaleness = nil
+                }
             }
             self.isRefreshingPlanUsage = false
             self.planRefreshTask = nil
@@ -1098,13 +1428,13 @@ final class UsageCenter: ObservableObject {
     ) {
         hydratePlanUsageSnapshotsIfNeeded()
         planUsageCache[contextKey] = (providers, fetchedAt)
+        planUsageFailures.removeValue(forKey: contextKey)
         // Persist off the main actor: this is a small JSON write, but it runs
         // on every completed refresh and must not sit in the UI's path.
         let snapshot = planUsageCache.mapValues {
             PlanUsageSnapshotStore.Entry(providers: $0.providers, fetchedAt: $0.fetchedAt)
         }
-        let store = planUsageSnapshots
-        Task.detached(priority: .utility) { store.save(snapshot) }
+        planUsageSnapshotSaveQueue.enqueue(snapshot)
     }
 
     /// Seed the in-memory cache from disk once per process.
@@ -1149,16 +1479,18 @@ final class UsageCenter: ObservableObject {
         profiles: [UsageAccountProfile]
     ) -> [PlanUsageRequest] {
         let home = environment["HOME"] ?? FileManager.default.homeDirectoryForCurrentUser.path
-        func canonical(_ value: String) -> String {
-            let expanded = (value as NSString).expandingTildeInPath
-            return URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL.path
+        // Compare accounts by what they point at, not by how the path is
+        // spelled: an alias of the active directory has to collapse into the
+        // active request instead of billing one subscription a second query.
+        func identity(_ value: String) -> String {
+            AccountDirectory.identityKey(value) ?? (value as NSString).expandingTildeInPath
         }
-        func activeDirectory(for provider: UsageAccountProfile.Provider) -> String {
+        func activeIdentity(for provider: UsageAccountProfile.Provider) -> String {
             if let configured = environment[provider.environmentKey]?
                 .trimmingCharacters(in: .whitespacesAndNewlines), !configured.isEmpty {
-                return canonical(configured)
+                return identity(configured)
             }
-            return canonical((home as NSString).appendingPathComponent(
+            return identity((home as NSString).appendingPathComponent(
                 provider == .claude ? ".claude" : ".codex"
             ))
         }
@@ -1172,8 +1504,8 @@ final class UsageCenter: ObservableObject {
                     if $0.label != $1.label { return $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
                     return $0.id < $1.id
                 }
-            let active = activeDirectory(for: provider)
-            let matched = providerProfiles.first { canonical($0.expandedDirectory) == active }
+            let active = activeIdentity(for: provider)
+            let matched = providerProfiles.first { identity($0.directory) == active }
             requests.append(PlanUsageRequest(
                 provider: provider,
                 profileID: matched?.id ?? "active",
@@ -1181,7 +1513,7 @@ final class UsageCenter: ObservableObject {
                 environment: environment
             ))
 
-            for profile in providerProfiles where canonical(profile.expandedDirectory) != active {
+            for profile in providerProfiles where identity(profile.directory) != active {
                 var profileEnvironment = environment
                 profileEnvironment[provider.environmentKey] = profile.expandedDirectory
                 requests.append(PlanUsageRequest(
@@ -1315,6 +1647,7 @@ final class UsageCenter: ObservableObject {
             ),
         ]
         planUsageError = nil
+        planUsageStaleness = nil
         isRefreshingPlanUsage = false
     }
 
@@ -1510,7 +1843,7 @@ final class UsageCenter: ObservableObject {
     }
 }
 
-private enum ProviderPlanReadResult: Sendable {
+enum ProviderPlanReadResult: Sendable {
     case success([UsageCenter.ProviderPlanUsage])
     case failure(String)
 }

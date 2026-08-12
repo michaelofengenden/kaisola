@@ -51,7 +51,10 @@ actor CompanionConnectionSession {
     )
     private var phase: Phase = .handshaking
     private var authenticated: CompanionAuthenticatedConnection?
+    private var storedCapabilities: [CompanionCapability] = []
+    private var capabilityGeneration: UInt64 = 0
     private var effectiveCapabilities: [CompanionCapability] = []
+    private var requestedCapabilities: Set<CompanionCapability> = []
     private var nextOutgoingSequence: Int64 = 1
     private var lastStateSequence: Int64 = 0
     private var lastProjectionRevision = 0
@@ -92,7 +95,7 @@ actor CompanionConnectionSession {
                 case .handshaking:
                     try await receiveHandshakeFrame(frame)
                 case .authenticated, .live:
-                    try receiveApplicationFrame(frame)
+                    try await receiveApplicationFrame(frame)
                 case .closed:
                     return
                 }
@@ -135,7 +138,19 @@ actor CompanionConnectionSession {
               envelope.epoch == epoch else {
             throw CompanionWireError.connectionUnavailable
         }
-        try await sendSecure(envelope, channel: authenticated.channel)
+        let body = try authorizedBody(kind: envelope.kind, body: envelope.body)
+        let authorized = try CompanionEnvelope(
+            kind: envelope.kind,
+            desktopId: envelope.desktopId,
+            deviceId: envelope.deviceId,
+            connectionId: envelope.connectionId,
+            epoch: envelope.epoch,
+            seq: envelope.seq,
+            id: envelope.id,
+            sentAt: envelope.sentAt,
+            body: body
+        )
+        try await sendSecure(authorized, channel: authenticated.channel)
     }
 
     @discardableResult
@@ -147,6 +162,7 @@ actor CompanionConnectionSession {
         guard phase == .live, let authenticated else {
             throw CompanionWireError.connectionUnavailable
         }
+        let body = try authorizedBody(kind: kind, body: body)
         let sequence = nextOutgoingSequence
         guard sequence >= 1, sequence < 9_007_199_254_740_991 else {
             throw CompanionWireError.connectionUnavailable
@@ -183,6 +199,7 @@ actor CompanionConnectionSession {
         guard phase == .live, let authenticated else {
             throw CompanionWireError.connectionUnavailable
         }
+        let body = try authorizedBody(kind: kind, body: body)
         if kind == .snapshot || kind == .event {
             // Full projection snapshots make a late older state frame
             // unnecessary. Reserve before the awaited write because this actor
@@ -212,13 +229,19 @@ actor CompanionConnectionSession {
     /// older revision is ignored rather than regressing the phone's view.
     func sendProjection(_ projection: CompanionProjection) async throws {
         guard projection.revision > lastProjectionRevision else { return }
+        guard let sanitized = CompanionCapabilityPolicy.sanitizedProjection(
+            projection,
+            grantedCapabilities: Set(effectiveCapabilities)
+        ) else {
+            throw CompanionWireError.connectionUnavailable
+        }
         // Reserve the revision before the awaited write for the same reentrant
         // actor reason as sequence allocation. A failed write closes the peer.
         lastProjectionRevision = projection.revision
         let body = CompanionSnapshotBody(
             type: "snapshot.projects",
-            revision: projection.revision,
-            projection: projection
+            revision: sanitized.revision,
+            projection: sanitized
         )
         _ = try await send(
             kind: .snapshot,
@@ -270,9 +293,113 @@ actor CompanionConnectionSession {
         }
     }
 
+    /// May run immediately after Noise authentication, before device hello.
+    /// This closes the final race where revocation lands after the roster
+    /// authorizes a resume but before the host adopts that connection.
+    func sendDeviceRevoked() async throws {
+        guard phase == .authenticated || phase == .live,
+              let authenticated else { throw CompanionWireError.connectionUnavailable }
+        let sequence = nextOutgoingSequence
+        nextOutgoingSequence += 1
+        let envelope = try CompanionEnvelope(
+            kind: .error,
+            desktopId: authenticated.context.desktopId,
+            deviceId: authenticated.context.deviceId,
+            connectionId: authenticated.context.connectionId,
+            epoch: epoch,
+            seq: sequence,
+            id: "device-revoked-\(UUID().uuidString.lowercased())",
+            sentAt: now(),
+            body: CompanionBody(CompanionErrorBody(
+                type: "error",
+                code: "device_revoked",
+                message: "This iPhone was revoked on the Mac. Pair it again to reconnect."
+            ))
+        )
+        try await sendSecure(envelope, channel: authenticated.channel)
+    }
+
     func authenticationTimedOut() async {
         guard phase == .handshaking else { return }
         await close(reason: "authentication_timeout")
+    }
+
+    private func authorizedBody(
+        kind: CompanionEnvelopeKind,
+        body: CompanionBody
+    ) throws -> CompanionBody {
+        let granted = Set(effectiveCapabilities)
+        guard CompanionCapabilityPolicy.allowsOutbound(
+            kind: kind,
+            bodyType: body.type,
+            grantedCapabilities: granted
+        ) else {
+            throw CompanionWireError.connectionUnavailable
+        }
+        guard kind == .snapshot, body.type == "snapshot.projects" else { return body }
+        let snapshot = try body.decode(CompanionSnapshotBody.self)
+        guard let projection = CompanionCapabilityPolicy.sanitizedProjection(
+            snapshot.projection,
+            grantedCapabilities: granted
+        ) else {
+            throw CompanionWireError.connectionUnavailable
+        }
+        return try CompanionBody(CompanionSnapshotBody(
+            type: snapshot.type,
+            revision: projection.revision,
+            projection: projection
+        ))
+    }
+
+    /// Replace the persisted grant on a live authenticated session. Effective
+    /// authority changes before the awaited hello write, so a slow transport
+    /// cannot extend a removed grant. The device can only receive capabilities
+    /// it requested in its authenticated hello.
+    func updateCapabilities(
+        _ capabilities: [CompanionCapability]
+    ) async throws -> [CompanionCapability] {
+        guard phase == .authenticated || phase == .live,
+              let authenticated else {
+            throw CompanionWireError.connectionUnavailable
+        }
+        let stored = Set(capabilities)
+        guard stored.contains(.observe), stored.count == capabilities.count else {
+            await close(reason: "invalid_capability_update")
+            throw CompanionWireError.connectionUnavailable
+        }
+        storedCapabilities = CompanionCapability.allCases.filter(stored.contains)
+        capabilityGeneration &+= 1
+        let updatedConnection = CompanionAuthenticatedConnection(
+            device: Self.deviceRecord(
+                authenticated.device,
+                capabilities: storedCapabilities
+            ),
+            channel: authenticated.channel,
+            context: authenticated.context,
+            resumed: authenticated.resumed
+        )
+        self.authenticated = updatedConnection
+        if phase == .authenticated {
+            try await sendDesktopHello(
+                connection: updatedConnection,
+                capabilities: storedCapabilities
+            )
+            guard phase == .authenticated || phase == .live else {
+                throw CompanionWireError.connectionUnavailable
+            }
+            return phase == .live ? effectiveCapabilities : []
+        }
+        let next = CompanionCapability.allCases.filter {
+            stored.contains($0) && requestedCapabilities.contains($0)
+        }
+        guard next.contains(.observe) else {
+            await close(reason: "observe_capability_removed")
+            throw CompanionWireError.connectionUnavailable
+        }
+        effectiveCapabilities = next
+        try await sendDesktopHello(connection: updatedConnection, capabilities: next)
+        guard phase == .live else { throw CompanionWireError.connectionUnavailable }
+        return next
     }
 
     func close(reason: String) async {
@@ -280,6 +407,9 @@ actor CompanionConnectionSession {
         phase = .closed
         authenticated = nil
         effectiveCapabilities = []
+        storedCapabilities = []
+        capabilityGeneration &+= 1
+        requestedCapabilities = []
         await coordinator.release(socketID: socketID)
         await closer()
         eventSink(.closed(reason: Self.safeReason(reason)))
@@ -310,16 +440,28 @@ actor CompanionConnectionSession {
                 throw CompanionWireError.connectionUnavailable
             }
             authenticated = connection
+            storedCapabilities = connection.device.capabilities
+            capabilityGeneration &+= 1
             phase = .authenticated
-            try await sendDesktopHello(connection: connection)
+            try await sendDesktopHello(
+                connection: connection,
+                capabilities: storedCapabilities
+            )
             eventSink(.authenticated(device: device, resumed: resumed))
+        case .revoked:
+            // The coordinator already queued the Noise-authenticated,
+            // content-free terminal frame. Close only after it is written.
+            await close(reason: "device_revoked")
         }
     }
 
-    private func sendDesktopHello(connection: CompanionAuthenticatedConnection) async throws {
+    private func sendDesktopHello(
+        connection: CompanionAuthenticatedConnection,
+        capabilities: [CompanionCapability]
+    ) async throws {
         let hello = CompanionHelloBody(
             role: .desktop,
-            capabilities: connection.device.capabilities,
+            capabilities: capabilities,
             transportHint: transportHint
         )
         let envelope = try CompanionEnvelope(
@@ -336,7 +478,7 @@ actor CompanionConnectionSession {
         try await sendSecure(envelope, channel: connection.channel)
     }
 
-    private func receiveApplicationFrame(_ payload: Data) throws {
+    private func receiveApplicationFrame(_ payload: Data) async throws {
         guard let authenticated else { throw CompanionWireError.connectionUnavailable }
         let secure = try JSONDecoder().decode(CompanionSecureFrame.self, from: payload)
         let envelope = try CompanionProtocolCodec.decode(authenticated.channel.decrypt(secure))
@@ -351,21 +493,41 @@ actor CompanionConnectionSession {
                 throw CompanionCryptoError.authenticationFailed
             }
             let hello = try envelope.body.decode(CompanionHelloBody.self)
+            let observedGeneration = capabilityGeneration
+            guard let refreshedDevice = await coordinator.currentDevice(
+                authenticated.device.deviceId
+            ) else {
+                throw CompanionCryptoError.authenticationFailed
+            }
+            if capabilityGeneration == observedGeneration {
+                storedCapabilities = refreshedDevice.capabilities
+            }
             let requested = Set(hello.capabilities)
-            let granted = authenticated.device.capabilities.filter(requested.contains)
+            let granted = storedCapabilities.filter(requested.contains)
             guard hello.role == .device,
                   requested.contains(.observe),
                   Set(hello.capabilities).count == hello.capabilities.count,
                   granted.contains(.observe) else {
                 throw CompanionCryptoError.authenticationFailed
             }
+            requestedCapabilities = requested
             effectiveCapabilities = granted
+            let currentDevice = Self.deviceRecord(
+                refreshedDevice,
+                capabilities: storedCapabilities
+            )
+            self.authenticated = CompanionAuthenticatedConnection(
+                device: currentDevice,
+                channel: authenticated.channel,
+                context: authenticated.context,
+                resumed: authenticated.resumed
+            )
             phase = .live
             let cursor = hello.lastAck.map {
                 CompanionAckCursor(epoch: envelope.epoch, seq: $0)
             }
             eventSink(.live(
-                device: authenticated.device,
+                device: currentDevice,
                 capabilities: granted,
                 resumeCursor: cursor
             ))
@@ -404,6 +566,22 @@ actor CompanionConnectionSession {
 
     private func sendPayload(_ payload: Data) async throws {
         try await writer(CompanionLengthFrameDecoder.encode(payload))
+    }
+
+    private static func deviceRecord(
+        _ record: CompanionPairedDeviceRecord,
+        capabilities: [CompanionCapability]
+    ) -> CompanionPairedDeviceRecord {
+        CompanionPairedDeviceRecord(
+            deviceId: record.deviceId,
+            displayName: record.displayName,
+            identityPublic: record.identityPublic,
+            x25519StaticPublic: record.x25519StaticPublic,
+            capabilities: capabilities,
+            pairedAt: record.pairedAt,
+            lastSeenAt: record.lastSeenAt,
+            accountScope: record.accountScope
+        )
     }
 
     private static func safeReason(_ value: String) -> String {
@@ -465,6 +643,10 @@ protocol CompanionHostConnection: Actor {
         sequence: Int64?,
         sentAt: Int64?
     ) async throws
+    func updateCapabilities(
+        _ capabilities: [CompanionCapability]
+    ) async throws -> [CompanionCapability]
+    func sendDeviceRevoked() async throws
     func close(reason: String) async
 }
 
@@ -585,6 +767,18 @@ actor CompanionNetworkConnection: CompanionHostConnection {
     ) async throws {
         guard let session else { throw CompanionWireError.connectionUnavailable }
         try await session.sendReceipt(receipt, sequence: sequence, sentAt: sentAt)
+    }
+
+    func updateCapabilities(
+        _ capabilities: [CompanionCapability]
+    ) async throws -> [CompanionCapability] {
+        guard let session else { throw CompanionWireError.connectionUnavailable }
+        return try await session.updateCapabilities(capabilities)
+    }
+
+    func sendDeviceRevoked() async throws {
+        guard let session else { throw CompanionWireError.connectionUnavailable }
+        try await session.sendDeviceRevoked()
     }
 
     func close(reason: String = "closed") async {

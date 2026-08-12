@@ -44,6 +44,7 @@ struct AppCommandID: RawRepresentable, Codable, Hashable, Sendable {
     static let focusNextPane = Self(rawValue: "pane.focus-next")
     static let openSettings = Self(rawValue: "app.open-settings")
     static let checkForUpdates = Self(rawValue: "app.check-for-updates")
+    static var readinessChecklist: Self { Self(rawValue: "app.readiness-checklist") }
     static let openHelp = Self(rawValue: "app.open-help")
 
     static func newAgent(_ agentID: String) -> Self {
@@ -366,6 +367,14 @@ enum AppCommandRegistry {
             definition(.focusNextPane, "Focus Next Pane", .view, "arrow.right.to.line", "command+control+right"),
             definition(.openSettings, "Settings…", .app, "gearshape", "command+comma"),
             definition(.checkForUpdates, "Check for Updates…", .app, "arrow.triangle.2.circlepath", nil),
+            definition(
+                .readinessChecklist,
+                "Readiness Checklist…",
+                .help,
+                "checklist.checked",
+                nil,
+                surfaces: [.palette]
+            ),
             definition(.openHelp, "Kaisola Help", .help, "questionmark.circle", "command+shift+slash"),
         ]
 
@@ -486,10 +495,18 @@ enum AppCommandRegistry {
                 ? .available
                 : .unavailable("There is no recently closed file tab to reopen.")
         }
-        if id == .toggleDocumentPreview || id == .openExternalEditor {
+        if id == .toggleDocumentPreview {
             return (model.previewedFileURL ?? model.currentProjectDirectory) == nil
                 ? .unavailable("Open a project or file first.")
                 : .available
+        }
+        if id == .openExternalEditor {
+            guard (model.previewedFileURL ?? model.currentProjectDirectory) != nil else {
+                return .unavailable("Open a project or file first.")
+            }
+            return context.settings.externalEditorResolution.isAvailable
+                ? .available
+                : .unavailable("Choose a valid external editor in Settings first.")
         }
         if id == .previousFileTab || id == .nextFileTab {
             return model.fileTabs(for: model.selectedProjectID).count > 1
@@ -594,7 +611,7 @@ enum AppCommandRegistry {
             delegate?.performCheckForUpdatesCommand()
         case .openHelp:
             delegate?.performOpenHelpCommand()
-        case .commandPalette, .messageCurrentAgent, .toggleDocumentPreview:
+        case .commandPalette, .messageCurrentAgent, .toggleDocumentPreview, .readinessChecklist:
             NotificationCenter.default.post(
                 name: .kaisolaLocalCommand,
                 object: model,
@@ -968,7 +985,7 @@ struct CommandKeymapSettingsView: View {
                             }
                         }
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 12)
@@ -980,7 +997,7 @@ struct CommandKeymapSettingsView: View {
                             .textSelection(.enabled)
                         Text("Use version 1 and a bindings object, for example: \"view.toggle-files\": \"command+option+b\".")
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(.kaisolaSecondary)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 16)

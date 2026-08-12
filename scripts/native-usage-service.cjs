@@ -42,6 +42,12 @@ function normalizedWindow(label, raw) {
   }
 }
 
+function authenticationRequired(raw) {
+  if (raw?.authRequired === true) return true
+  const message = String(raw?.message || '')
+  return /\bnot (?:signed|logged) in\b|\b(?:sign|log)[ -]?in (?:again|with)\b|\bsign[ -]?in expired\b|\bauthentication required\b|\btoken (?:expired|revoked)\b|\bunauthori[sz]ed\b|\binvalidated oauth\b/i.test(message)
+}
+
 /** Name a lone Codex window from how far out it resets.
  *
  * A window resetting within a day is the short rolling limit; anything further
@@ -61,6 +67,7 @@ function normalizeCodex(raw, now = Date.now()) {
       provider: 'codex',
       displayName: 'Codex',
       ok: false,
+      ...(authenticationRequired(raw) ? { authRequired: true } : {}),
       sourceLabel: 'Codex CLI app-server',
       message: String(raw?.message || 'Codex account limits are unavailable.'),
       windows: [],
@@ -104,6 +111,7 @@ function normalizeClaude(raw, now = Date.now()) {
       provider: 'claude',
       displayName: 'Claude',
       ok: false,
+      ...(authenticationRequired(raw) ? { authRequired: true } : {}),
       sourceLabel: `Claude Agent SDK ${CLAUDE_SDK_VERSION}`,
       experimental: true,
       message: String(raw?.message || 'Claude Agent SDK usage is unavailable.'),
@@ -127,6 +135,7 @@ function normalizeClaude(raw, now = Date.now()) {
     provider: 'claude',
     displayName: 'Claude',
     ok: windows.length > 0,
+    ...(windows.length === 0 && raw.rateLimitsAvailable === false ? { authRequired: true } : {}),
     sourceLabel: raw.sourceLabel || `Claude Agent SDK ${CLAUDE_SDK_VERSION}`,
     experimental: true,
     ...(account ? { account } : {}),

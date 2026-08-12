@@ -3,14 +3,23 @@ import Foundation
 enum BrokerGenerationDiagnostics {
     static func detail(
         appVersion: String,
-        topology: BrokerGenerationTopology
+        topology: BrokerGenerationTopology,
+        retirementDiagnostics: [BrokerRetirementDiagnostic] = []
     ) -> String {
         let current = generationDetail(topology.current)
         let drains = topology.draining.map(generationDetail).joined(separator: "; ")
+        let drainingIDs = Set(topology.draining.map(\.id))
+        let retirement = retirementDiagnostics
+            .filter { drainingIDs.contains($0.generationID) }
+            .map(\.detail)
+            .joined(separator: "; ")
+        let base: String
         if drains.isEmpty {
-            return "App \(appVersion) · Current broker \(current) · No draining brokers"
+            base = "App \(appVersion) · Current broker \(current) · No draining brokers"
+        } else {
+            base = "App \(appVersion) · Current broker \(current) · Draining brokers: \(drains)"
         }
-        return "App \(appVersion) · Current broker \(current) · Draining brokers: \(drains)"
+        return retirement.isEmpty ? base : "\(base) · \(retirement)"
     }
 
     private static func generationDetail(_ generation: BrokerGenerationRecord) -> String {
@@ -24,16 +33,28 @@ enum BrokerGenerationDiagnostics {
 /// controller lanes. The validated inventory is authoritative for existing
 /// terminals; only terminal.create can add an owner between inventory polls.
 actor BrokerGenerationRouteTable {
+    enum ReleaseRoute: Equatable, Sendable {
+        case generation(String)
+        case terminalAbsent
+        case generationAbsent
+    }
+
     private var topology: BrokerGenerationTopology?
     private var terminalOwners: [String: String] = [:]
+    private var hasAuthoritativeInventory = false
     /// A create reply is authoritative even if an inventory request that began
     /// just before it finishes afterward. Keep that acknowledged owner until a
     /// later inventory observes it (or release explicitly removes it), so the
     /// stale snapshot cannot make the terminal temporarily unroutable.
     private var createdAwaitingInventory: [String: String] = [:]
 
-    func configure(_ topology: BrokerGenerationTopology) {
+    func configure(
+        _ topology: BrokerGenerationTopology,
+        invalidateInventory: Bool = true
+    ) {
+        let topologyChanged = self.topology != topology
         self.topology = topology
+        if invalidateInventory || topologyChanged { hasAuthoritativeInventory = false }
         let liveGenerations = Set(topology.all.map(\.id))
         terminalOwners = terminalOwners.filter { liveGenerations.contains($0.value) }
         createdAwaitingInventory = createdAwaitingInventory.filter {
@@ -63,6 +84,7 @@ actor BrokerGenerationRouteTable {
             createdAwaitingInventory.removeValue(forKey: terminalID)
         }
         terminalOwners = reconciled
+        hasAuthoritativeInventory = true
     }
 
     func noteCreated(terminalID: String) throws {
@@ -74,6 +96,17 @@ actor BrokerGenerationRouteTable {
     func noteReleased(terminalID: String) {
         terminalOwners.removeValue(forKey: terminalID)
         createdAwaitingInventory.removeValue(forKey: terminalID)
+    }
+
+    /// Atomically bind route replacement to the exact registry revision that
+    /// produced the collected inventories. The legacy overload remains for
+    /// callers that already execute wholly inside one configured route epoch.
+    func replaceTerminalOwners(
+        _ owners: [String: String],
+        matching expectedTopology: BrokerGenerationTopology
+    ) throws {
+        guard topology == expectedTopology else { throw BrokerClientError.identityChanged }
+        try replaceTerminalOwners(owners)
     }
 
     func generationID(for terminalID: String, hint: String? = nil) throws -> String {
@@ -91,6 +124,34 @@ actor BrokerGenerationRouteTable {
         return owner
     }
 
+    /// Release is the one terminal mutation allowed to target an absent row:
+    /// the broker operation is idempotent. A persisted generation hint routes
+    /// to that exact still-live broker even when its inventory no longer names
+    /// the terminal; a hint outside the validated topology is permanently
+    /// impossible and may drain without an RPC.
+    func releaseRoute(
+        for terminalID: String,
+        generationHint: String?
+    ) throws -> ReleaseRoute {
+        guard let topology else { throw BrokerClientError.notConnected }
+        if let generationHint {
+            if let owner = terminalOwners[terminalID], owner != generationHint {
+                throw BrokerClientError.identityChanged
+            }
+            guard topology.all.contains(where: { $0.id == generationHint }) else {
+                return .generationAbsent
+            }
+            return .generation(generationHint)
+        }
+        guard let owner = terminalOwners[terminalID] else {
+            guard hasAuthoritativeInventory else {
+                throw BrokerClientError.requestFailed("terminal generation unavailable")
+            }
+            return .terminalAbsent
+        }
+        return .generation(owner)
+    }
+
     func currentGenerationID() throws -> String {
         guard let topology else { throw BrokerClientError.notConnected }
         return topology.current.id
@@ -105,6 +166,7 @@ actor BrokerGenerationRouteTable {
 /// `detachedGenerationIDs`).
 actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
     typealias ClientFactory = @Sendable () -> any ObserveOnlyBrokerServing
+    private static let maximumInventoryMergeAttempts = 3
 
     private let routes: BrokerGenerationRouteTable
     private let factory: ClientFactory
@@ -176,11 +238,26 @@ actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
     }
 
     func inventory() async throws -> BrokerStatus {
-        guard let topology else { throw BrokerClientError.notConnected }
+        for _ in 0..<Self.maximumInventoryMergeAttempts {
+            if let stable = try await inventoryAttempt() { return stable }
+        }
+        throw BrokerClientError.requestFailed(
+            "broker inventory kept changing while generations were merged"
+        )
+    }
+
+    /// Two collects establish one real interval in which every child snapshot
+    /// and the registry topology coexisted. If any broker-wide activity epoch
+    /// or the registry revision changes, the caller discards the entire merge
+    /// and starts again instead of publishing a mixed-generation route table.
+    private func inventoryAttempt() async throws -> BrokerStatus? {
+        guard let capturedTopology = topology else { throw BrokerClientError.notConnected }
         var routed: [BrokerTerminalRecord] = []
         var owners: [String: String] = [:]
         var emptyDrains: Set<String> = []
-        for generation in topology.all {
+        var activityEpochs: [String: Int64] = [:]
+        var capturedClients: [String: any ObserveOnlyBrokerServing] = [:]
+        for generation in capturedTopology.all {
             // Already detached as an empty drain: it has no terminals to
             // report and no client on purpose. Skipping keeps the poll loop
             // healthy while the registry owner gets around to retirement.
@@ -189,6 +266,16 @@ actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
                 throw BrokerClientError.notConnected
             }
             let status = try await client.inventory()
+            guard topology == capturedTopology else { return nil }
+            if capturedTopology.all.count > 1 {
+                guard let activityEpoch = status.activityEpoch else {
+                    throw BrokerClientError.malformedResponse
+                }
+                activityEpochs[generation.id] = activityEpoch
+            } else if let activityEpoch = status.activityEpoch {
+                activityEpochs[generation.id] = activityEpoch
+            }
+            capturedClients[generation.id] = client
             if generation.role == .draining, status.terminals.isEmpty {
                 emptyDrains.insert(generation.id)
             }
@@ -199,7 +286,27 @@ actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
                 routed.append(terminal.routed(to: generation))
             }
         }
-        try await routes.replaceTerminalOwners(owners)
+        guard topology == capturedTopology else { return nil }
+
+        // Re-read the exact children in the same generation order. Stable
+        // epochs across both passes mean all snapshots overlapped between the
+        // end of pass one and the start of pass two.
+        for generation in capturedTopology.all {
+            guard let expectedEpoch = activityEpochs[generation.id] else { continue }
+            guard let client = capturedClients[generation.id],
+                  try await client.inventoryActivityEpoch() == expectedEpoch,
+                  topology == capturedTopology else {
+                return nil
+            }
+        }
+
+        do {
+            try await routes.replaceTerminalOwners(owners, matching: capturedTopology)
+        } catch BrokerClientError.identityChanged {
+            guard topology == capturedTopology else { return nil }
+            throw BrokerClientError.identityChanged
+        }
+        guard topology == capturedTopology else { return nil }
         emptyDrainingGenerationIDs = emptyDrains
         return BrokerStatus(terminals: routed)
     }
@@ -344,9 +451,11 @@ actor BrokerGenerationControlRouter: BrokerControlServing {
         to requestedTopology: BrokerGenerationTopology,
         ownerID: String
     ) async throws {
-        if topology == requestedTopology, clients[requestedTopology.current.id] != nil { return }
+        if topology == requestedTopology,
+           clients[requestedTopology.current.id] != nil,
+           !reportedDisconnect { return }
         await disconnect()
-        await routes.configure(requestedTopology)
+        await routes.configure(requestedTopology, invalidateInventory: false)
         topology = requestedTopology
         reportedDisconnect = false
         do {
@@ -413,8 +522,35 @@ actor BrokerGenerationControlRouter: BrokerControlServing {
     }
 
     func release(projectID: String, terminalID: String) async throws {
-        try await client(for: terminalID).release(projectID: projectID, terminalID: terminalID)
-        await routes.noteReleased(terminalID: terminalID)
+        _ = try await release(
+            projectID: projectID,
+            terminalID: terminalID,
+            brokerGenerationID: nil
+        )
+    }
+
+    func release(
+        projectID: String,
+        terminalID: String,
+        brokerGenerationID: String?
+    ) async throws -> BrokerTerminalReleaseDisposition {
+        switch try await routes.releaseRoute(
+            for: terminalID,
+            generationHint: brokerGenerationID
+        ) {
+        case .generation(let generationID):
+            guard let client = clients[generationID] else {
+                throw BrokerClientError.notConnected
+            }
+            try await client.release(projectID: projectID, terminalID: terminalID)
+            await routes.noteReleased(terminalID: terminalID)
+            return .released
+        case .terminalAbsent:
+            return .terminalAbsent
+        case .generationAbsent:
+            await routes.noteReleased(terminalID: terminalID)
+            return .generationAbsent
+        }
     }
 
     func detachOwner(projectID: String, terminalID: String) async throws {

@@ -26,7 +26,8 @@ final class CompanionConnectionSessionTests: XCTestCase {
             displayName: "Test iPhone"
         )
         let roster = try CompanionDeviceRosterStore(
-            fileURL: directory.appendingPathComponent("devices-v1.json")
+            fileURL: directory.appendingPathComponent("devices-v3.json"),
+            accountScope: try CompanionAccountScope(accountID: "connection-session-test-account")
         )
         _ = try await roster.pair(
             peer: CompanionIdentityPin(
@@ -35,7 +36,7 @@ final class CompanionConnectionSessionTests: XCTestCase {
                 x25519StaticPublic: device.x25519StaticPublic
             ),
             displayName: device.displayName,
-            capabilities: [.observe],
+            capabilities: [.observe, .terminalControl],
             now: 1_800_000_000_000
         )
         let coordinator = try CompanionPairingCoordinator(identity: desktop, roster: roster)
@@ -68,6 +69,7 @@ final class CompanionConnectionSessionTests: XCTestCase {
             "desktopId": .string(desktop.id),
             "deviceId": .string(device.id),
             "connectionId": .string(connectionID),
+            "accountScope": .string(roster.accountScope.rawValue),
         ])
         let initiator = try NoiseXXInitiator(
             identity: device,
@@ -83,6 +85,7 @@ final class CompanionConnectionSessionTests: XCTestCase {
             "type": .string("resume.start"),
             "deviceId": .string(device.id),
             "connectionId": .string(connectionID),
+            "accountScope": .string(roster.accountScope.rawValue),
             "message1": .string(try initiator.writeMessage1().base64URLEncodedString()),
         ]))
         let startWire = try CompanionLengthFrameDecoder.encode(startPayload)
@@ -137,7 +140,7 @@ final class CompanionConnectionSessionTests: XCTestCase {
         XCTAssertEqual(desktopHello.epoch, "epoch-session-test")
         let desktopHelloBody = try desktopHello.body.decode(CompanionHelloBody.self)
         XCTAssertEqual(desktopHelloBody.role, .desktop)
-        XCTAssertEqual(desktopHelloBody.capabilities, [.observe])
+        XCTAssertEqual(desktopHelloBody.capabilities, [.observe, .terminalControl])
         XCTAssertEqual(events.snapshot(), ["authenticated:device-session-test:true"])
 
         let deviceHello = try CompanionEnvelope(
@@ -160,10 +163,10 @@ final class CompanionConnectionSessionTests: XCTestCase {
         )))
         XCTAssertEqual(events.snapshot(), [
             "authenticated:device-session-test:true",
-            "live:device-session-test:observe:epoch-session-test:7",
+            "live:device-session-test:observe,terminal-control:epoch-session-test:7",
         ])
 
-        let projection = CompanionProjectionBuilder.build(
+        var projection = CompanionProjectionBuilder.build(
             drafts: [RememberedSessionDraft(
                 id: "terminal-test",
                 projectID: "project-test",
@@ -186,6 +189,10 @@ final class CompanionConnectionSessionTests: XCTestCase {
             revision: 7,
             nowMilliseconds: 1_800_000_000_102
         )
+        projection.projects[0].repo = "/Users/private/secret"
+        projection.projects[0].branch = "private-branch"
+        projection.sessions[0].summary = "private-summary"
+        projection.sessions[0].terminalOutput = "private-output"
         try await session.sendProjection(projection)
         writes = await wire.all()
         XCTAssertEqual(writes.count, 4)
@@ -205,6 +212,10 @@ final class CompanionConnectionSessionTests: XCTestCase {
             "kaisola.companion.projection"
         )
         XCTAssertEqual(snapshotBody.projection.sessions.first?.terminalEndOffset, 42)
+        XCTAssertNil(snapshotBody.projection.projects.first?.repo)
+        XCTAssertNil(snapshotBody.projection.projects.first?.branch)
+        XCTAssertNil(snapshotBody.projection.sessions.first?.summary)
+        XCTAssertNil(snapshotBody.projection.sessions.first?.terminalOutput)
         try await session.sendProjection(projection)
         let writesAfterDuplicateProjection = await wire.all()
         XCTAssertEqual(writesAfterDuplicateProjection.count, 4)
@@ -267,6 +278,23 @@ final class CompanionConnectionSessionTests: XCTestCase {
         XCTAssertEqual(receipt.commandId, observeCommandID)
         XCTAssertEqual(receipt.status, .unavailable)
 
+        let downgraded = try await session.updateCapabilities([.observe])
+        XCTAssertEqual(downgraded, [.observe])
+        writes = await wire.all()
+        XCTAssertEqual(writes.count, 6)
+        let downgradeHelloSecure = try JSONDecoder().decode(
+            CompanionSecureFrame.self,
+            from: payload(from: writes[5])
+        )
+        let downgradeHello = try CompanionProtocolCodec.decode(
+            deviceChannel.decrypt(downgradeHelloSecure)
+        )
+        XCTAssertEqual(downgradeHello.kind, .hello)
+        XCTAssertEqual(
+            try downgradeHello.body.decode(CompanionHelloBody.self).capabilities,
+            [.observe]
+        )
+
         let unauthorizedCommandID = "command-terminal-write-test"
         let unauthorizedCommand = try CompanionEnvelope(
             kind: .command,
@@ -308,7 +336,8 @@ final class CompanionConnectionSessionTests: XCTestCase {
             displayName: "Test Mac"
         )
         let roster = try CompanionDeviceRosterStore(
-            fileURL: directory.appendingPathComponent("devices-v1.json")
+            fileURL: directory.appendingPathComponent("devices-v3.json"),
+            accountScope: try CompanionAccountScope(accountID: "connection-session-revoked-account")
         )
         let coordinator = try CompanionPairingCoordinator(identity: desktop, roster: roster)
         let wire = WireCapture()

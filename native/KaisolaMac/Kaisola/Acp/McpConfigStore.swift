@@ -1,5 +1,182 @@
+import CryptoKit
 import Foundation
 import KaisolaCore
+import Security
+
+enum McpOAuthSecretLocation: String, Sendable {
+    case environment
+    case header
+}
+
+/// Opaque, deterministic account names for MCP credentials. The reference is
+/// safe to persist and export: its digest carries no workspace path, server
+/// name, header name, or credential material.
+enum McpOAuthSecretReference {
+    static func make(
+        projectID: String,
+        serverName: String,
+        location: McpOAuthSecretLocation,
+        pairName: String
+    ) -> String {
+        let material = [projectID, serverName, location.rawValue, pairName]
+            .joined(separator: "\u{1F}")
+        let digest = SHA256.hash(data: Data(material.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return "mcp-oauth-v1:\(digest)"
+    }
+
+    static func isValid(_ value: String) -> Bool {
+        value.range(of: #"^mcp-oauth-v1:[0-9a-f]{64}$"#, options: .regularExpression) != nil
+    }
+}
+
+enum McpOAuthSecretMigrationError: Error, Equatable, LocalizedError {
+    case consentRequired
+    case configurationWriteFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .consentRequired:
+            "Confirm moving the saved MCP credentials to this Mac's Keychain before continuing."
+        case .configurationWriteFailed:
+            "The MCP configuration could not be rewritten, so its existing credentials were left unchanged."
+        }
+    }
+}
+
+enum McpConfigMutationError: Error, Equatable, LocalizedError {
+    case serverNotFound(String)
+    case identityChanged
+    case invalidServer(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .serverNotFound(name):
+            "The MCP server \"\(name)\" no longer exists, so no changes were saved."
+        case .identityChanged:
+            "An MCP server must keep its existing name while it is edited."
+        case let .invalidServer(message):
+            message
+        }
+    }
+}
+
+/// Injectable secret boundary. Production uses a this-device-only,
+/// data-protection Keychain generic-password item. Tests use an in-memory vault
+/// and can deterministically refuse writes without touching a developer login
+/// Keychain.
+struct McpSecretVault: Sendable {
+    let read: @Sendable (String) throws -> String?
+    let write: @Sendable (String, String) throws -> Void
+    let delete: @Sendable (String) throws -> Void
+
+    static var keychain: McpSecretVault {
+        McpSecretVault(
+            read: McpOAuthKeychain.read,
+            write: McpOAuthKeychain.write,
+            delete: McpOAuthKeychain.delete
+        )
+    }
+}
+
+private enum McpOAuthKeychain {
+    static let service = "com.kaisola.mac.mcp-oauth"
+
+    static func read(_ reference: String) throws -> String? {
+        guard McpOAuthSecretReference.isValid(reference) else { return nil }
+        var query = baseQuery(reference)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound { return nil }
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let value = String(data: data, encoding: .utf8),
+              !value.isEmpty else {
+            throw keychainError(status, operation: "read")
+        }
+        return value
+    }
+
+    static func write(_ reference: String, _ value: String) throws {
+        guard McpOAuthSecretReference.isValid(reference),
+              !value.isEmpty,
+              value.utf8.count <= 4_096,
+              !value.contains("\0"), !value.contains("\r"), !value.contains("\n"),
+              let data = value.data(using: .utf8) else {
+            throw keychainError(errSecParam, operation: "save")
+        }
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            // OAuth bearer material is useful only while the user is logged in.
+            // This is stricter than the app's background API-key boundary and
+            // never synchronizes to another device.
+            kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+            kSecAttrSynchronizable as String: false,
+        ]
+        var status = SecItemUpdate(baseQuery(reference) as CFDictionary, attributes as CFDictionary)
+        if status == errSecItemNotFound {
+            var query = baseQuery(reference)
+            for (key, value) in attributes { query[key] = value }
+            status = SecItemAdd(query as CFDictionary, nil)
+        }
+        guard status == errSecSuccess else { throw keychainError(status, operation: "save") }
+    }
+
+    static func delete(_ reference: String) throws {
+        guard McpOAuthSecretReference.isValid(reference) else { return }
+        let status = SecItemDelete(baseQuery(reference) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw keychainError(status, operation: "remove")
+        }
+    }
+
+    private static func baseQuery(_ reference: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: reference,
+            kSecUseDataProtectionKeychain as String: true,
+        ]
+    }
+
+    private static func keychainError(_ status: OSStatus, operation: String) -> NSError {
+        let detail = SecCopyErrorMessageString(status, nil).map { $0 as String } ?? "OSStatus \(status)"
+        return NSError(
+            domain: service,
+            code: Int(status),
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "Kaisola could not \(operation) the MCP credential in this Mac's Keychain. (\(detail))",
+            ]
+        )
+    }
+}
+
+enum McpOAuthSecretPolicy {
+    static func requiresKeychain(_ pair: McpServerConfig.Pair) -> Bool {
+        guard pair.secretReference == nil, !pair.value.isEmpty, !isPlaceholder(pair.value) else {
+            return false
+        }
+        let normalized = pair.name.lowercased().filter(\.isLetter)
+        return normalized == "authorization"
+            || normalized.contains("secret")
+            || normalized.hasSuffix("token")
+            || normalized.hasSuffix("password")
+            || normalized.hasSuffix("credential")
+            || normalized.hasSuffix("apikey")
+            || normalized.hasSuffix("privatekey")
+    }
+
+    private static func isPlaceholder(_ value: String) -> Bool {
+        value.range(
+            of: #"^(Bearer\s+)?\$\{[A-Z_][A-Z0-9_]*\}$"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
+    }
+}
 
 /// One configured MCP server, scoped to a workspace. `id` is the `name`, so a
 /// workspace can hold at most one server per name (mirroring the Node registry's
@@ -17,6 +194,34 @@ struct McpServerConfig: Codable, Equatable, Identifiable, Sendable {
     struct Pair: Codable, Equatable, Sendable {
         var name: String
         var value: String
+        var secretReference: String?
+
+        init(name: String, value: String, secretReference: String? = nil) {
+            self.name = name
+            self.value = value
+            self.secretReference = secretReference
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case name, value, secretReference
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            name = try container.decode(String.self, forKey: .name)
+            secretReference = try container.decodeIfPresent(String.self, forKey: .secretReference)
+            value = try container.decodeIfPresent(String.self, forKey: .value) ?? ""
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(name, forKey: .name)
+            if let secretReference {
+                try container.encode(secretReference, forKey: .secretReference)
+            } else {
+                try container.encode(value, forKey: .value)
+            }
+        }
     }
 
     var name: String
@@ -55,9 +260,11 @@ struct McpServerConfig: Codable, Equatable, Identifiable, Sendable {
             }
         case .http, .sse:
             guard let url, url.utf8.count <= 4_096,
+                  Self.unambiguousURIText(url),
                   let components = URLComponents(string: url),
                   components.scheme?.lowercased() == "https",
-                  components.host?.isEmpty == false else {
+                  let host = components.host, !host.isEmpty,
+                  Self.unambiguousURIText(host) else {
                 return "Remote MCP servers must use a valid HTTPS URL."
             }
             guard components.user == nil, components.password == nil else {
@@ -65,6 +272,19 @@ struct McpServerConfig: Codable, Equatable, Identifiable, Sendable {
             }
         }
         return nil
+    }
+
+    /// A remote server URL is stored as text and re-read by parsers that
+    /// disagree about these bytes. WHATWG (`new URL` in
+    /// `scripts/native-mcp-registry.cjs`) folds a literal backslash into `/` for
+    /// http(s) and strips TAB/LF/CR before parsing, while RFC 3986 parsers keep
+    /// them, so `https:\\evil.test` and `https://good.test\@evil.test` name a
+    /// different host depending on who reads it. `URLComponents` also
+    /// percent-decodes `host`, so `%09` smuggles a separator past a raw-text
+    /// check; the decoded host goes through here too. Reject the ambiguous
+    /// spelling rather than pick a winner.
+    private static func unambiguousURIText(_ value: String) -> Bool {
+        !value.unicodeScalars.contains { $0 == "\\" || $0.value <= 0x20 || $0.value == 0x7F }
     }
 
     private static func safeRequired(_ value: String) -> Bool {
@@ -78,10 +298,14 @@ struct McpServerConfig: Codable, Equatable, Identifiable, Sendable {
     }
 
     private static func safePair(_ pair: Pair) -> Bool {
-        pair.name.utf8.count <= 128
+        let safeName = pair.name.utf8.count <= 128
             && safeRequired(pair.name.trimmingCharacters(in: .whitespacesAndNewlines))
             && pair.name.rangeOfCharacter(from: .controlCharacters) == nil
-            && pair.value.utf8.count <= 4_096
+        guard safeName else { return false }
+        if let secretReference = pair.secretReference {
+            return pair.value.isEmpty && McpOAuthSecretReference.isValid(secretReference)
+        }
+        return pair.value.utf8.count <= 4_096
             && !pair.value.contains("\0")
             && !pair.value.contains("\r")
             && !pair.value.contains("\n")
@@ -129,14 +353,19 @@ struct McpConfigStore: Sendable {
     }
 
     let fileURL: URL
+    private let projectID: String
+    private let secretVault: McpSecretVault
 
     init(
         workspace: URL,
-        rootDirectory: URL = NativePreviewPaths.applicationSupportDirectory
+        rootDirectory: URL = NativePreviewPaths.applicationSupportDirectory,
+        secretVault: McpSecretVault = .keychain
     ) {
         // Same digest the session store uses for project identity, so one
         // workspace ⇒ one config file regardless of how it was opened.
         let digest = NativeSessionStore.projectID(forDirectory: workspace.path)
+        projectID = digest
+        self.secretVault = secretVault
         fileURL = rootDirectory
             .appendingPathComponent("mcp", isDirectory: true)
             .appendingPathComponent("\(digest).json", isDirectory: false)
@@ -151,14 +380,18 @@ struct McpConfigStore: Sendable {
     }
 
     func save(_ servers: [McpServerConfig]) {
+        try? persist(servers)
+    }
+
+    private func persist(_ servers: [McpServerConfig]) throws {
         let directory = fileURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(
+        try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
         let validated = Array(servers.filter { $0.validationError == nil }.prefix(Self.maximumServerCount))
-        guard let data = try? JSONEncoder().encode(Payload(servers: validated)) else { return }
+        let data = try JSONEncoder().encode(Payload(servers: validated))
         let temporary = directory.appendingPathComponent(
             ".\(fileURL.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier)"
         )
@@ -168,6 +401,178 @@ struct McpConfigStore: Sendable {
             _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
         } catch {
             try? FileManager.default.removeItem(at: temporary)
+            throw error
+        }
+    }
+
+    struct MigrationReceipt: Equatable, Sendable {
+        let servers: [McpServerConfig]
+        let migratedCount: Int
+    }
+
+    func pendingPlaintextOAuthSecretCount() -> Int {
+        servers().reduce(into: 0) { count, server in
+            count += server.envPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+            count += server.headerPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+        }
+    }
+
+    /// Move legacy plaintext OAuth material only after the user confirms. Each
+    /// Keychain write lands before the atomic JSON rewrite. If any step fails,
+    /// prior Keychain state is restored and the original config file remains
+    /// byte-for-byte untouched.
+    func migratePlaintextOAuthSecrets(consent: Bool) throws -> MigrationReceipt {
+        try secureAndPersist(servers(), consent: consent)
+    }
+
+    /// New/manual entries take the same route without ever first writing the
+    /// plaintext draft to disk. The Add action is the user's explicit consent;
+    /// failures leave both the prior catalog and Keychain state unchanged.
+    func saveSecuringOAuthSecrets(
+        _ servers: [McpServerConfig],
+        consent: Bool
+    ) throws -> MigrationReceipt {
+        try secureAndPersist(servers, consent: consent)
+    }
+
+    /// Append one manually entered server without treating unrelated legacy
+    /// credentials as implicitly approved. The Add action consents only to the
+    /// new draft's secret fields; the separate migration confirmation remains
+    /// authoritative for every older plaintext value.
+    func appendSecuringOAuthServer(
+        _ server: McpServerConfig,
+        to servers: [McpServerConfig],
+        consent: Bool
+    ) throws -> MigrationReceipt {
+        try secureAndPersist(
+            servers + [server],
+            consent: consent,
+            migratingServerIndices: [servers.count]
+        )
+    }
+
+    /// Replace one configured row in place. The selected name is its durable
+    /// identity, so an edit cannot reorder the catalog, rename another row, or
+    /// accidentally flip its enabled state. Only the edited row is eligible
+    /// for a consented Keychain migration; unrelated legacy plaintext keeps
+    /// requiring the separate migration confirmation.
+    func replaceSecuringOAuthServer(
+        _ replacement: McpServerConfig,
+        identifiedBy identity: String,
+        in servers: [McpServerConfig],
+        consent: Bool
+    ) throws -> MigrationReceipt {
+        guard let index = servers.firstIndex(where: { $0.id == identity }) else {
+            throw McpConfigMutationError.serverNotFound(identity)
+        }
+        guard replacement.name == identity else {
+            throw McpConfigMutationError.identityChanged
+        }
+        var sealed = replacement
+        sealed.name = servers[index].name
+        sealed.enabled = servers[index].enabled
+        if let validationError = sealed.validationError {
+            throw McpConfigMutationError.invalidServer(validationError)
+        }
+        var updated = servers
+        updated[index] = sealed
+        return try secureAndPersist(
+            updated,
+            consent: consent,
+            migratingServerIndices: [index]
+        )
+    }
+
+    private func secureAndPersist(
+        _ input: [McpServerConfig],
+        consent: Bool,
+        migratingServerIndices: Set<Int>? = nil
+    ) throws -> MigrationReceipt {
+        let indices = migratingServerIndices ?? Set(input.indices)
+        let pending = input.indices.filter(indices.contains).reduce(into: 0) { count, index in
+            let server = input[index]
+            count += server.envPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+            count += server.headerPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+        }
+        if pending > 0, !consent { throw McpOAuthSecretMigrationError.consentRequired }
+        var migrated = input
+        var rollback: [(reference: String, previous: String?)] = []
+        var count = 0
+
+        do {
+            for serverIndex in migrated.indices where indices.contains(serverIndex) {
+                count += try migratePairs(
+                    &migrated[serverIndex].envPairs,
+                    serverName: migrated[serverIndex].name,
+                    location: .environment,
+                    rollback: &rollback
+                )
+                count += try migratePairs(
+                    &migrated[serverIndex].headerPairs,
+                    serverName: migrated[serverIndex].name,
+                    location: .header,
+                    rollback: &rollback
+                )
+            }
+            do {
+                try persist(migrated)
+            } catch {
+                throw McpOAuthSecretMigrationError.configurationWriteFailed
+            }
+            return MigrationReceipt(servers: migrated, migratedCount: count)
+        } catch {
+            for item in rollback.reversed() {
+                if let previous = item.previous {
+                    try? secretVault.write(item.reference, previous)
+                } else {
+                    try? secretVault.delete(item.reference)
+                }
+            }
+            throw error
+        }
+    }
+
+    private func migratePairs(
+        _ pairs: inout [McpServerConfig.Pair],
+        serverName: String,
+        location: McpOAuthSecretLocation,
+        rollback: inout [(reference: String, previous: String?)]
+    ) throws -> Int {
+        var count = 0
+        for index in pairs.indices where McpOAuthSecretPolicy.requiresKeychain(pairs[index]) {
+            let reference = McpOAuthSecretReference.make(
+                projectID: projectID,
+                serverName: serverName,
+                location: location,
+                pairName: pairs[index].name
+            )
+            let previous = try secretVault.read(reference)
+            try secretVault.write(reference, pairs[index].value)
+            rollback.append((reference, previous))
+            pairs[index].value = ""
+            pairs[index].secretReference = reference
+            count += 1
+        }
+        return count
+    }
+
+    /// Export is safe even before a user approves migration: legacy plaintext
+    /// OAuth values are replaced by an explicit pending reference and are never
+    /// copied into an export, diagnostic, or crash attachment.
+    func exportData() throws -> Data {
+        let redacted = servers().map { server in
+            var server = server
+            server.envPairs = Self.redactedPairs(server.envPairs)
+            server.headerPairs = Self.redactedPairs(server.headerPairs)
+            return server
+        }
+        return try JSONEncoder().encode(Payload(servers: redacted))
+    }
+
+    private static func redactedPairs(_ pairs: [McpServerConfig.Pair]) -> [McpServerConfig.Pair] {
+        pairs.map { pair in
+            guard McpOAuthSecretPolicy.requiresKeychain(pair) else { return pair }
+            return .init(name: pair.name, value: "", secretReference: "mcp-oauth-v1:" + String(repeating: "0", count: 64))
         }
     }
 
@@ -181,53 +586,126 @@ struct McpConfigStore: Sendable {
     /// servers are emitted. Capability filtering (dropping http/sse an agent can't
     /// reach) is NOT applied here — `AcpClient.sessionMcpServers` does it later,
     /// client-side, keyed off the `type` field this method stamps.
-    static func jsonValues(_ servers: [McpServerConfig]) -> [JSONValue] {
+    static func jsonValues(
+        _ servers: [McpServerConfig],
+        resolveSecret: (String) -> String? = { try? McpOAuthKeychain.read($0) }
+    ) -> [JSONValue] {
         servers.compactMap { server in
             guard server.enabled, server.validationError == nil else { return nil }
+            guard let environment = materializedPairs(server.envPairs, resolveSecret: resolveSecret),
+                  let headers = materializedPairs(server.headerPairs, resolveSecret: resolveSecret) else {
+                return nil
+            }
             switch server.kind {
             case .stdio:
                 return .object([
                     "name": .string(server.name),
                     "command": .string(server.command ?? ""),
                     "args": .array(server.args.map(JSONValue.string)),
-                    "env": .array(server.envPairs.map(Self.pairObject)),
+                    "env": .array(environment.map(Self.pairObject)),
                 ])
             case .http, .sse:
                 return .object([
                     "type": .string(server.kind.rawValue),
                     "name": .string(server.name),
                     "url": .string(server.url ?? ""),
-                    "headers": .array(server.headerPairs.map(Self.pairObject)),
+                    "headers": .array(headers.map(Self.pairObject)),
                 ])
             }
         }
+    }
+
+    func sessionJSONValues(_ servers: [McpServerConfig]? = nil) -> [JSONValue] {
+        Self.jsonValues(servers ?? self.servers()) { reference in
+            try? secretVault.read(reference)
+        }
+    }
+
+    func materializedServer(_ server: McpServerConfig) -> McpServerConfig? {
+        guard let environment = Self.materializedPairs(server.envPairs, resolveSecret: {
+            try? secretVault.read($0)
+        }), let headers = Self.materializedPairs(server.headerPairs, resolveSecret: {
+            try? secretVault.read($0)
+        }) else { return nil }
+        var server = server
+        server.envPairs = environment
+        server.headerPairs = headers
+        return server
+    }
+
+    private static func materializedPairs(
+        _ pairs: [McpServerConfig.Pair],
+        resolveSecret: (String) -> String?
+    ) -> [McpServerConfig.Pair]? {
+        var result: [McpServerConfig.Pair] = []
+        result.reserveCapacity(pairs.count)
+        for pair in pairs {
+            if let reference = pair.secretReference {
+                guard let value = resolveSecret(reference),
+                      !value.isEmpty, value.utf8.count <= 4_096,
+                      !value.contains("\0"), !value.contains("\r"), !value.contains("\n") else {
+                    return nil
+                }
+                result.append(.init(name: pair.name, value: value))
+            } else {
+                // A legacy plaintext OAuth value never crosses into ACP. The
+                // server stays disabled-at-launch until the user consents to
+                // the transactional Keychain migration in Settings.
+                guard !McpOAuthSecretPolicy.requiresKeychain(pair) else { return nil }
+                result.append(pair)
+            }
+        }
+        return result
     }
 
     private static func pairObject(_ pair: McpServerConfig.Pair) -> JSONValue {
         .object(["name": .string(pair.name), "value": .string(pair.value)])
     }
 
+    struct ImportReceipt: Equatable, Sendable {
+        let servers: [McpServerConfig]
+        let importedCount: Int
+        let migratedSecretCount: Int
+    }
+
     /// Imports only the explicit discoveries selected by the user. New entries
     /// always arrive disabled: reading a sibling config must never spawn a
-    /// process or contact a remote endpoint. Existing names win and the
-    /// workspace catalog remains bounded.
-    @discardableResult
-    func importDiscovered(_ discoveries: [McpDiscoveredServer]) -> Int {
+    /// process or contact a remote endpoint. Literal credentials are migrated
+    /// directly to Keychain only after explicit import consent; they are never
+    /// first written to Kaisola's JSON. Existing names win and the catalog
+    /// remains bounded.
+    func importDiscovered(
+        _ discoveries: [McpDiscoveredServer],
+        consentToMigrateSecrets: Bool
+    ) throws -> ImportReceipt {
         var current = servers()
         var names = Set(current.map(\.name))
         var imported = 0
+        var importedIndices = Set<Int>()
         for discovery in discoveries {
             guard current.count < Self.maximumServerCount,
                   !names.contains(discovery.config.name) else { continue }
             var config = discovery.config
             config.enabled = false
             guard config.validationError == nil else { continue }
+            importedIndices.insert(current.count)
             current.append(config)
             names.insert(config.name)
             imported += 1
         }
-        if imported > 0 { save(current) }
-        return imported
+        guard imported > 0 else {
+            return ImportReceipt(servers: current, importedCount: 0, migratedSecretCount: 0)
+        }
+        let migration = try secureAndPersist(
+            current,
+            consent: consentToMigrateSecrets,
+            migratingServerIndices: importedIndices
+        )
+        return ImportReceipt(
+            servers: migration.servers,
+            importedCount: imported,
+            migratedSecretCount: migration.migratedCount
+        )
     }
 }
 
@@ -238,11 +716,16 @@ struct McpDiscoveredServer: Equatable, Identifiable, Sendable {
     let config: McpServerConfig
 
     var id: String { "\(origin)\u{1F}\(config.name)" }
+    var plaintextSecretCount: Int {
+        config.envPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+            + config.headerPairs.filter(McpOAuthSecretPolicy.requiresKeychain).count
+    }
 }
 
 /// Reads the MCP shapes already used by common local clients. Discovery is a
 /// read-only, bounded operation: it never expands `${VAR}`, follows no custom
-/// paths, imports no literal credentials, and does not arm anything.
+/// paths, logs no values, and arms nothing. A selected literal credential stays
+/// memory-only until the explicit import confirmation migrates it to Keychain.
 enum McpConfigDiscovery {
     private struct Source {
         let origin: String
@@ -260,15 +743,17 @@ enum McpConfigDiscovery {
 
     private static let maximumFileBytes = 1_000_000
     private static let maximumEntriesPerSource = 24
-    private static let sources = [
-        Source("Cursor", ".cursor/mcp.json"),
-        Source("Claude Desktop", "Library/Application Support/Claude/claude_desktop_config.json"),
-        Source("Claude CLI", ".claude.json"),
-        Source("Codex CLI", ".codex/config.toml", isCodexTOML: true),
-        Source("Gemini CLI", ".gemini/settings.json"),
-        Source("VS Code", "Library/Application Support/Code/User/mcp.json", mapKeys: ["servers", "mcpServers"]),
-        Source("Windsurf", ".codeium/windsurf/mcp_config.json"),
-    ]
+    private static var sources: [Source] {
+        [
+            Source("Cursor", ".cursor/mcp.json"),
+            Source("Claude Desktop", "Library/Application Support/Claude/claude_desktop_config.json"),
+            Source("Claude CLI", ".claude.json"),
+            Source("Codex CLI", ".codex/config.toml", isCodexTOML: true),
+            Source("Gemini CLI", ".gemini/settings.json"),
+            Source("VS Code", "Library/Application Support/Code/User/mcp.json", mapKeys: ["servers", "mcpServers"]),
+            Source("Windsurf", ".codeium/windsurf/mcp_config.json"),
+        ]
+    }
 
     static func scan(homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser) -> [McpDiscoveredServer] {
         var result: [McpDiscoveredServer] = []
@@ -308,7 +793,7 @@ enum McpConfigDiscovery {
     }
 
     private static func sanitizedConfig(name: String, raw: [String: Any]) -> McpServerConfig? {
-        guard isSafeName(name), name != "kaisola", !containsLiteralSecret(raw) else { return nil }
+        guard isSafeName(name), name != "kaisola", !containsCredentialedURL(raw) else { return nil }
         if let rawURL = raw["url"] as? String, !rawURL.isEmpty {
             let kind: McpServerConfig.Kind = (raw["type"] as? String) == "sse" ? .sse : .http
             let pairs = sanitizedPairs(raw["headers"], namesAreEnvironment: false)
@@ -355,18 +840,7 @@ enum McpConfigDiscovery {
         return value.range(of: pattern, options: .regularExpression) != nil
     }
 
-    private static func containsLiteralSecret(_ raw: [String: Any]) -> Bool {
-        let sensitive = #"(?i)(authorization|api[-_]?key|token|secret|password|credential)"#
-        let placeholder = #"(?i)^(Bearer\s+)?\$\{[A-Z_][A-Z0-9_]*\}$"#
-        for field in ["env", "headers"] {
-            guard let map = raw[field] as? [String: Any] else { continue }
-            for (name, anyValue) in map {
-                guard name.range(of: sensitive, options: .regularExpression) != nil,
-                      let value = anyValue as? String,
-                      !value.isEmpty else { continue }
-                if value.range(of: placeholder, options: .regularExpression) == nil { return true }
-            }
-        }
+    private static func containsCredentialedURL(_ raw: [String: Any]) -> Bool {
         if let rawURL = raw["url"] as? String,
            let components = URLComponents(string: rawURL),
            components.user != nil || components.password != nil { return true }
@@ -470,7 +944,426 @@ enum McpConfigDiscovery {
     }
 }
 
+// MARK: - Provider-facing MCP tool schemas
+
+/// A tool rejected at the MCP -> provider boundary. The reason is deliberately
+/// short and free of server payloads so Settings can surface it without letting
+/// an untrusted schema flood the row or disclose arbitrary schema contents.
+struct McpDisabledTool: Equatable, Sendable {
+    let name: String
+    let reason: String
+}
+
+/// Resolves the local-reference subset emitted by Zod, Pydantic, and similar
+/// schema generators at Kaisola's owned `tools/list` boundary. The resulting
+/// provider-facing subset is explicit: every assertion we accept is preserved,
+/// while an unknown keyword, an unsafe reference, or an exhausted budget rejects
+/// only that tool. This is intentionally not a permissive JSON Schema converter;
+/// silently dropping an assertion would widen the tool's accepted input.
+enum McpToolSchemaNormalizer {
+    struct Limits: Equatable, Sendable {
+        var maximumInputBytes = 128 * 1_024
+        var maximumOutputBytes = 192 * 1_024
+        var maximumDepth = 48
+        var maximumNodes = 4_096
+    }
+
+    struct Result {
+        let usable: [[String: Any]]
+        let disabled: [McpDisabledTool]
+    }
+
+    private struct Rejection: Error {
+        let reason: String
+    }
+
+    private struct Context {
+        let root: [String: Any]
+        let limits: Limits
+        var visitedNodes = 0
+        var activeReferences: Set<String> = []
+
+        mutating func visit(depth: Int) throws {
+            guard depth <= limits.maximumDepth else {
+                throw Rejection(reason: "Schema depth budget exceeded.")
+            }
+            visitedNodes += 1
+            guard visitedNodes <= limits.maximumNodes else {
+                throw Rejection(reason: "Schema node budget exceeded.")
+            }
+        }
+
+        mutating func normalize(_ schema: [String: Any], depth: Int) throws -> [String: Any] {
+            try visit(depth: depth)
+            if let rawReference = schema["$ref"] {
+                guard let reference = rawReference as? String else {
+                    throw Rejection(reason: "Schema reference must be a string.")
+                }
+                let permittedSiblings: Set<String> = [
+                    "$ref", "$defs", "definitions", "$schema", "$comment",
+                    "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly",
+                ]
+                if let unsupported = schema.keys.sorted().first(where: { !permittedSiblings.contains($0) }) {
+                    throw Rejection(reason: boundedReason("Unsupported sibling of schema reference: \(unsupported)."))
+                }
+                let (target, canonicalReference) = try resolve(reference)
+                guard activeReferences.insert(canonicalReference).inserted else {
+                    throw Rejection(reason: "Schema reference cycle detected.")
+                }
+                defer { activeReferences.remove(canonicalReference) }
+                guard let targetSchema = target as? [String: Any] else {
+                    throw Rejection(reason: "Local schema reference must resolve to an object.")
+                }
+                var output = try normalize(targetSchema, depth: depth + 1)
+                for key in schema.keys.sorted() where McpToolSchemaNormalizer.annotationKeys.contains(key) {
+                    output[key] = try normalizeAnnotation(schema[key] as Any, key: key)
+                }
+                return output
+            }
+
+            var output: [String: Any] = [:]
+            for key in schema.keys.sorted() {
+                let value = schema[key] as Any
+                switch key {
+                case "$defs", "definitions", "$comment":
+                    // Definitions are non-assertive after all local references
+                    // have been inlined. Provider payloads do not need them.
+                    continue
+                case "$schema":
+                    guard let dialect = value as? String,
+                          McpToolSchemaNormalizer.acceptedDialects.contains(dialect) else {
+                        throw Rejection(reason: "Unsupported JSON Schema dialect.")
+                    }
+                case "title", "description", "format", "pattern", "contentEncoding", "contentMediaType":
+                    guard value is String else { throw invalidValue(key) }
+                    output[key] = value
+                case "default", "const":
+                    guard JSONSerialization.isValidJSONObject([value]) else { throw invalidValue(key) }
+                    output[key] = value
+                case "examples", "enum":
+                    guard let values = value as? [Any], !values.isEmpty,
+                          JSONSerialization.isValidJSONObject(values) else { throw invalidValue(key) }
+                    output[key] = values
+                case "deprecated", "readOnly", "writeOnly", "uniqueItems":
+                    guard value is Bool else { throw invalidValue(key) }
+                    output[key] = value
+                case "multipleOf", "maximum", "exclusiveMaximum", "minimum", "exclusiveMinimum",
+                     "maxLength", "minLength", "maxItems", "minItems", "maxProperties", "minProperties":
+                    guard McpToolSchemaNormalizer.isJSONNumber(value) else { throw invalidValue(key) }
+                    output[key] = value
+                case "type":
+                    output[key] = try normalizeType(value)
+                case "required":
+                    guard let names = value as? [String], Set(names).count == names.count else {
+                        throw invalidValue(key)
+                    }
+                    output[key] = names
+                case "properties":
+                    guard let properties = value as? [String: Any] else { throw invalidValue(key) }
+                    var normalized: [String: Any] = [:]
+                    for name in properties.keys.sorted() {
+                        guard let property = properties[name] as? [String: Any] else { throw invalidValue(key) }
+                        normalized[name] = try normalize(property, depth: depth + 1)
+                    }
+                    output[key] = normalized
+                case "additionalProperties":
+                    if value is Bool {
+                        output[key] = value
+                    } else if let nested = value as? [String: Any] {
+                        output[key] = try normalize(nested, depth: depth + 1)
+                    } else {
+                        throw invalidValue(key)
+                    }
+                case "items", "not":
+                    guard let nested = value as? [String: Any] else { throw invalidValue(key) }
+                    output[key] = try normalize(nested, depth: depth + 1)
+                case "anyOf", "oneOf", "allOf":
+                    guard let alternatives = value as? [Any], !alternatives.isEmpty else { throw invalidValue(key) }
+                    output[key] = try alternatives.map { alternative in
+                        guard let nested = alternative as? [String: Any] else { throw invalidValue(key) }
+                        return try normalize(nested, depth: depth + 1)
+                    }
+                default:
+                    throw Rejection(reason: boundedReason("Unsupported schema keyword: \(key)."))
+                }
+            }
+            return output
+        }
+
+        private mutating func normalizeAnnotation(_ value: Any, key: String) throws -> Any {
+            switch key {
+            case "title", "description":
+                guard value is String else { throw invalidValue(key) }
+            case "deprecated", "readOnly", "writeOnly":
+                guard value is Bool else { throw invalidValue(key) }
+            case "examples":
+                guard let examples = value as? [Any], JSONSerialization.isValidJSONObject(examples) else {
+                    throw invalidValue(key)
+                }
+            case "default":
+                guard JSONSerialization.isValidJSONObject([value]) else { throw invalidValue(key) }
+            default:
+                throw invalidValue(key)
+            }
+            return value
+        }
+
+        private mutating func normalizeType(_ value: Any) throws -> Any {
+            let accepted = McpToolSchemaNormalizer.acceptedTypes
+            if let type = value as? String, accepted.contains(type) { return type }
+            if let types = value as? [String], !types.isEmpty,
+               Set(types).count == types.count,
+               types.allSatisfy(accepted.contains) {
+                return types
+            }
+            throw invalidValue("type")
+        }
+
+        private func resolve(_ reference: String) throws -> (Any, String) {
+            guard reference == "#" || reference.hasPrefix("#/") else {
+                throw Rejection(reason: "Only local schema references are supported.")
+            }
+            guard let fragment = String(reference.dropFirst()).removingPercentEncoding else {
+                throw Rejection(reason: "Schema reference has invalid escaping.")
+            }
+            let rawTokens = fragment.isEmpty ? [] : fragment.dropFirst().split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+            let tokens = try rawTokens.map(McpToolSchemaNormalizer.decodePointerToken)
+            var value: Any = root
+            for token in tokens {
+                if let object = value as? [String: Any], let next = object[token] {
+                    value = next
+                } else if let array = value as? [Any],
+                          token == "0" || (!token.hasPrefix("0") && token.allSatisfy(\.isNumber)),
+                          let index = Int(token), array.indices.contains(index) {
+                    value = array[index]
+                } else {
+                    throw Rejection(reason: "Missing local schema reference.")
+                }
+            }
+            let canonicalData = try? JSONSerialization.data(withJSONObject: tokens, options: [.sortedKeys])
+            return (value, canonicalData?.base64EncodedString() ?? reference)
+        }
+    }
+
+    // Keep these immutable value catalogs out of stored global initializers.
+    // Xcode 16.4 / Swift 6.1 crashes while lowering this module's complex lazy
+    // globals; computed catalogs preserve the exact values without state.
+    private static var annotationKeys: Set<String> {
+        ["title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly"]
+    }
+
+    private static var acceptedTypes: Set<String> {
+        ["array", "boolean", "integer", "null", "number", "object", "string"]
+    }
+
+    private static var acceptedDialects: Set<String> {
+        [
+            "https://json-schema.org/draft/2020-12/schema",
+            "https://json-schema.org/draft/2019-09/schema",
+            "http://json-schema.org/draft-07/schema#",
+            "https://json-schema.org/draft-07/schema",
+        ]
+    }
+
+    static func normalizeTools(_ tools: [Any], limits: Limits = Limits()) -> Result {
+        var usable: [[String: Any]] = []
+        var disabled: [McpDisabledTool] = []
+        for (index, rawTool) in tools.enumerated() {
+            let fallbackName = "Tool \(index + 1)"
+            guard var tool = rawTool as? [String: Any] else {
+                disabled.append(.init(name: fallbackName, reason: "Tool definition must be an object."))
+                continue
+            }
+            let name = boundedToolName(tool["name"] as? String, fallback: fallbackName)
+            do {
+                guard let rawName = tool["name"] as? String,
+                      !rawName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                      rawName.count <= 128,
+                      !rawName.unicodeScalars.contains(where: { $0.value < 0x20 || $0.value == 0x7F }) else {
+                    throw Rejection(reason: "Tool name is invalid.")
+                }
+                if let description = tool["description"], !(description is String) {
+                    throw Rejection(reason: "Tool description must be a string.")
+                }
+                guard let schema = tool["inputSchema"] as? [String: Any] else {
+                    throw Rejection(reason: "Tool input schema must be an object.")
+                }
+                let input = try stableData(schema)
+                guard input.count <= limits.maximumInputBytes else {
+                    throw Rejection(reason: "Schema byte budget exceeded.")
+                }
+                var context = Context(root: schema, limits: limits)
+                let normalized = try context.normalize(schema, depth: 0)
+                let output = try stableData(normalized)
+                guard output.count <= limits.maximumOutputBytes else {
+                    throw Rejection(reason: "Normalized schema byte budget exceeded.")
+                }
+                tool["inputSchema"] = normalized
+                usable.append(tool)
+            } catch let rejection as Rejection {
+                disabled.append(.init(name: name, reason: boundedReason(rejection.reason)))
+            } catch {
+                disabled.append(.init(name: name, reason: "Invalid tool input schema."))
+            }
+        }
+        return Result(usable: usable, disabled: disabled)
+    }
+
+    static func stableData(_ schema: [String: Any]) throws -> Data {
+        guard JSONSerialization.isValidJSONObject(schema) else {
+            throw Rejection(reason: "Tool input schema is not valid JSON.")
+        }
+        return try JSONSerialization.data(withJSONObject: schema, options: [.sortedKeys])
+    }
+
+    private static func decodePointerToken(_ token: String) throws -> String {
+        var output = ""
+        var index = token.startIndex
+        while index < token.endIndex {
+            if token[index] != "~" {
+                output.append(token[index])
+                index = token.index(after: index)
+                continue
+            }
+            let escape = token.index(after: index)
+            guard escape < token.endIndex else {
+                throw Rejection(reason: "Schema reference has invalid JSON Pointer escaping.")
+            }
+            switch token[escape] {
+            case "0": output.append("~")
+            case "1": output.append("/")
+            default: throw Rejection(reason: "Schema reference has invalid JSON Pointer escaping.")
+            }
+            index = token.index(after: escape)
+        }
+        return output
+    }
+
+    private static func invalidValue(_ key: String) -> Rejection {
+        Rejection(reason: boundedReason("Invalid value for schema keyword: \(key)."))
+    }
+
+    private static func isJSONNumber(_ value: Any) -> Bool {
+        guard value is NSNumber else { return false }
+        return !(value is Bool)
+    }
+
+    private static func boundedToolName(_ candidate: String?, fallback: String) -> String {
+        let clean = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return String((clean.isEmpty ? fallback : clean).prefix(80))
+    }
+
+    private static func boundedReason(_ reason: String) -> String {
+        let singleLine = reason.replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\r", with: " ")
+        return String(singleLine.prefix(160))
+    }
+}
+
 // MARK: - Non-executing health probe
+
+/// Authentication is independent of MCP reachability. In particular, a probe
+/// that times out or cannot interpret a server response has not proven that the
+/// user is signed out. Unknown reasons stay explicit so Settings can offer a
+/// safe follow-up without inventing an OAuth or credential-clearing side effect.
+enum McpAuthenticationState: Equatable, Sendable {
+    enum UnknownReason: String, CaseIterable, Sendable {
+        case timeout
+        case keychainDenied
+        case unsupported
+        case connectionFailure
+        case credentialRejected
+    }
+
+    case probing
+    case signedIn
+    case signedOut
+    case expired
+    case unknown(UnknownReason)
+
+    var presentation: McpAuthenticationPresentation {
+        switch self {
+        case .probing:
+            .init(copy: "Checking authentication", action: .none)
+        case .signedIn:
+            .init(copy: "Signed in", action: .none)
+        case .signedOut:
+            .init(copy: "Signed out", action: .reviewCredentialSetup)
+        case .expired:
+            .init(copy: "Credentials expired", action: .replaceExpiredCredential)
+        case .unknown(.timeout):
+            .init(copy: "Authentication unknown · server timed out", action: .retryProbe)
+        case .unknown(.keychainDenied):
+            .init(copy: "Authentication unknown · Keychain access denied", action: .reviewKeychainAccess)
+        case .unknown(.unsupported):
+            .init(copy: "Authentication unknown · status unsupported", action: .reviewCompatibility)
+        case .unknown(.connectionFailure):
+            .init(copy: "Authentication unknown · connection failed", action: .retryProbe)
+        case .unknown(.credentialRejected):
+            .init(copy: "Authentication unknown · credentials rejected", action: .reviewCredentialSetup)
+        }
+    }
+}
+
+/// User-directed follow-ups only. There is deliberately no launch-OAuth or
+/// clear-credential action: probes report evidence and leave configuration
+/// untouched. The current MCP architecture has neither an OAuth controller nor
+/// a Keychain-backed MCP credential provider.
+enum McpAuthenticationAction: Equatable, Sendable {
+    case none
+    case reviewCredentialSetup
+    case replaceExpiredCredential
+    case retryProbe
+    case reviewKeychainAccess
+    case reviewCompatibility
+
+    var title: String? {
+        switch self {
+        case .none: nil
+        case .reviewCredentialSetup: "Review credential setup"
+        case .replaceExpiredCredential: "Replace credentials"
+        case .retryProbe: "Check again"
+        case .reviewKeychainAccess: "Review Keychain access"
+        case .reviewCompatibility: "Review compatibility"
+        }
+    }
+
+    var launchesOAuth: Bool { false }
+    var clearsCredentials: Bool { false }
+}
+
+struct McpAuthenticationPresentation: Equatable, Sendable {
+    let copy: String
+    let action: McpAuthenticationAction
+}
+
+/// Evidence-only classification shared by the probe and focused tests. A bare
+/// 401 proves signed-out only when no credential was sent. A rejected credential
+/// is called expired solely when the challenge says so; otherwise it remains
+/// unknown rather than prompting a destructive login loop.
+enum McpAuthenticationPolicy {
+    static func hasConfiguredCredential(_ headers: [McpServerConfig.Pair]) -> Bool {
+        let credentialNames = Set(["authorization", "proxy-authorization", "x-api-key", "api-key"])
+        return headers.contains {
+            credentialNames.contains($0.name.lowercased())
+                && !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+    }
+
+    static func stateForHTTPFailure(
+        statusCode: Int,
+        authenticateHeader: String?,
+        hasConfiguredCredential: Bool
+    ) -> McpAuthenticationState {
+        guard statusCode == 401 else { return .unknown(.unsupported) }
+        guard hasConfiguredCredential else { return .signedOut }
+        let challenge = authenticateHeader?.lowercased() ?? ""
+        if challenge.contains("expired") {
+            return .expired
+        }
+        return .unknown(.credentialRejected)
+    }
+}
 
 struct McpProbeResult: Equatable, Sendable {
     enum Status: String, Sendable {
@@ -482,10 +1375,43 @@ struct McpProbeResult: Equatable, Sendable {
     let status: Status
     let verified: Bool
     let message: String
+    let authentication: McpAuthenticationState
     var serverName: String?
     var serverVersion: String?
     var toolCount: Int?
     var hasMoreTools = false
+    var disabledTools: [McpDisabledTool] = []
+
+    init(
+        status: Status,
+        verified: Bool,
+        message: String,
+        authentication: McpAuthenticationState = .unknown(.unsupported),
+        serverName: String? = nil,
+        serverVersion: String? = nil,
+        toolCount: Int? = nil,
+        hasMoreTools: Bool = false,
+        disabledTools: [McpDisabledTool] = []
+    ) {
+        self.status = status
+        self.verified = verified
+        self.message = message
+        self.authentication = authentication
+        self.serverName = serverName
+        self.serverVersion = serverVersion
+        self.toolCount = toolCount
+        self.hasMoreTools = hasMoreTools
+        self.disabledTools = disabledTools
+    }
+
+    static var probing: McpProbeResult {
+        McpProbeResult(
+            status: .configured,
+            verified: false,
+            message: "Checking MCP server",
+            authentication: .probing
+        )
+    }
 }
 
 /// Pure MCP `initialize` revision negotiation: given the server's reply,
@@ -506,7 +1432,7 @@ enum McpProtocolRevision {
 
     /// Every revision this probe can correctly speak, most-preferred
     /// first. A reply outside this set is genuinely unsupported.
-    static let accepted: [String] = ["2025-11-25", "2025-06-18"]
+    static var accepted: [String] { ["2025-11-25", "2025-06-18"] }
 
     /// Whether `reply` (the server's `initialize` `result.protocolVersion`)
     /// is a revision this probe can speak.
@@ -531,8 +1457,14 @@ actor McpProbeService {
         let sessionID: String?
     }
 
-    private enum ProbeFailure: Error {
-        case message(String)
+    private struct ProbeFailure: Error {
+        let message: String
+        let authentication: McpAuthenticationState
+
+        init(_ message: String, authentication: McpAuthenticationState = .unknown(.unsupported)) {
+            self.message = message
+            self.authentication = authentication
+        }
     }
 
     private static let maximumResponseBytes = 200_000
@@ -589,16 +1521,16 @@ actor McpProbeService {
                 negotiatedVersion: nil,
                 allowEmpty: false
             )
-            guard let response = initialize.object else { throw ProbeFailure.message("Empty initialize response") }
+            guard let response = initialize.object else { throw ProbeFailure("Empty initialize response") }
             if let error = response["error"] as? [String: Any] {
-                throw ProbeFailure.message("Initialize failed: \(safeServerMessage(error["message"]))")
+                throw ProbeFailure("Initialize failed: \(safeServerMessage(error["message"]))")
             }
             guard let result = response["result"] as? [String: Any],
                   let negotiated = result["protocolVersion"] as? String else {
-                throw ProbeFailure.message("Malformed initialize response")
+                throw ProbeFailure("Malformed initialize response")
             }
             guard McpProtocolRevision.isAccepted(negotiated) else {
-                throw ProbeFailure.message("Unsupported protocol version \(safeInline(negotiated))")
+                throw ProbeFailure("Unsupported protocol version \(safeInline(negotiated))")
             }
             let info = result["serverInfo"] as? [String: Any]
             let serverName = safeOptionalInline(info?["name"] as? String)
@@ -624,6 +1556,7 @@ actor McpProbeService {
                     status: .ready,
                     verified: true,
                     message: "Ready · server declares no tools capability",
+                    authentication: authenticationAfterSuccessfulProbe(server),
                     serverName: serverName,
                     serverVersion: serverVersion
                 )
@@ -641,31 +1574,60 @@ actor McpProbeService {
                 negotiatedVersion: negotiated,
                 allowEmpty: false
             )
-            guard let toolsResponse = tools.object else { throw ProbeFailure.message("Empty tools response") }
+            guard let toolsResponse = tools.object else { throw ProbeFailure("Empty tools response") }
             if let error = toolsResponse["error"] as? [String: Any] {
-                throw ProbeFailure.message("Tool listing failed: \(safeServerMessage(error["message"]))")
+                throw ProbeFailure("Tool listing failed: \(safeServerMessage(error["message"]))")
             }
             guard let toolsResult = toolsResponse["result"] as? [String: Any],
                   let listedTools = toolsResult["tools"] as? [Any] else {
-                throw ProbeFailure.message("Malformed tools response")
+                throw ProbeFailure("Malformed tools response")
             }
             let hasMore = toolsResult["nextCursor"] is String
+            let normalized = McpToolSchemaNormalizer.normalizeTools(listedTools)
             return .init(
                 status: .ready,
                 verified: true,
-                message: hasMore ? "Ready · \(listedTools.count)+ tools" : "Ready · \(listedTools.count) tools",
+                message: toolSummary(
+                    usable: normalized.usable.count,
+                    advertised: listedTools.count,
+                    disabled: normalized.disabled,
+                    hasMore: hasMore
+                ),
+                authentication: authenticationAfterSuccessfulProbe(server),
                 serverName: serverName,
                 serverVersion: serverVersion,
-                toolCount: listedTools.count,
-                hasMoreTools: hasMore
+                toolCount: normalized.usable.count,
+                hasMoreTools: hasMore,
+                disabledTools: normalized.disabled
             )
-        } catch let ProbeFailure.message(message) {
-            return .init(status: .failed, verified: true, message: message)
+        } catch let failure as ProbeFailure {
+            return .init(
+                status: .failed,
+                verified: true,
+                message: failure.message,
+                authentication: failure.authentication
+            )
         } catch let error as URLError where error.code == .timedOut {
-            return .init(status: .failed, verified: true, message: "Timed out after 3.5 seconds")
+            return .init(
+                status: .failed,
+                verified: true,
+                message: "Timed out after 3.5 seconds",
+                authentication: .unknown(.timeout)
+            )
         } catch {
-            return .init(status: .failed, verified: true, message: "Connection failed")
+            return .init(
+                status: .failed,
+                verified: true,
+                message: "Connection failed",
+                authentication: .unknown(.connectionFailure)
+            )
         }
+    }
+
+    private func authenticationAfterSuccessfulProbe(_ server: McpServerConfig) -> McpAuthenticationState {
+        McpAuthenticationPolicy.hasConfiguredCredential(server.headerPairs)
+            ? .signedIn
+            : .unknown(.unsupported)
     }
 
     private func post(
@@ -689,25 +1651,32 @@ actor McpProbeService {
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
 
         let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else { throw ProbeFailure.message("Non-HTTP response") }
+        guard let http = response as? HTTPURLResponse else { throw ProbeFailure("Non-HTTP response") }
         guard (200..<300).contains(http.statusCode) else {
-            throw ProbeFailure.message("Server returned HTTP \(http.statusCode)")
+            throw ProbeFailure(
+                "Server returned HTTP \(http.statusCode)",
+                authentication: McpAuthenticationPolicy.stateForHTTPFailure(
+                    statusCode: http.statusCode,
+                    authenticateHeader: http.value(forHTTPHeaderField: "WWW-Authenticate"),
+                    hasConfiguredCredential: McpAuthenticationPolicy.hasConfiguredCredential(configuredHeaders)
+                )
+            )
         }
-        guard data.count <= Self.maximumResponseBytes else { throw ProbeFailure.message("Response exceeded 200 KB") }
+        guard data.count <= Self.maximumResponseBytes else { throw ProbeFailure("Response exceeded 200 KB") }
         let sessionID = http.value(forHTTPHeaderField: "Mcp-Session-Id") ?? sessionID
         guard !data.isEmpty else {
             if allowEmpty { return RPCReply(object: nil, sessionID: sessionID) }
-            throw ProbeFailure.message("Empty server response")
+            throw ProbeFailure("Empty server response")
         }
         let contentType = http.value(forHTTPHeaderField: "Content-Type") ?? ""
         let object: Any
         if contentType.localizedCaseInsensitiveContains("text/event-stream") {
-            guard let eventData = lastSSEData(in: data) else { throw ProbeFailure.message("Invalid SSE response") }
+            guard let eventData = lastSSEData(in: data) else { throw ProbeFailure("Invalid SSE response") }
             object = try JSONSerialization.jsonObject(with: eventData)
         } else {
             object = try JSONSerialization.jsonObject(with: data)
         }
-        guard let dictionary = object as? [String: Any] else { throw ProbeFailure.message("Non-object JSON response") }
+        guard let dictionary = object as? [String: Any] else { throw ProbeFailure("Non-object JSON response") }
         return RPCReply(object: dictionary, sessionID: sessionID)
     }
 
@@ -739,6 +1708,21 @@ actor McpProbeService {
 
     private func safeInline(_ value: String) -> String {
         String(value.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F }.prefix(160))
+    }
+
+    private func toolSummary(
+        usable: Int,
+        advertised: Int,
+        disabled: [McpDisabledTool],
+        hasMore: Bool
+    ) -> String {
+        guard let first = disabled.first else {
+            return hasMore ? "Ready · \(usable)+ tools" : "Ready · \(usable) tools"
+        }
+        let moreDisabled = disabled.count > 1 ? " +\(disabled.count - 1) more" : ""
+        let advertisedText = hasMore ? "\(advertised)+" : "\(advertised)"
+        let message = "Ready · \(usable) usable of \(advertisedText) tools · \(disabled.count) disabled (\(first.name): \(first.reason)\(moreDisabled))"
+        return String(message.prefix(240))
     }
 }
 

@@ -20,9 +20,29 @@ final class NativeUpdateController: NSObject {
 
     private(set) var availability: Availability
     private var standardController: SPUStandardUpdaterController?
+    private(set) var startedUpdater = false
 
     override convenience init() {
         self.init(bundle: .main)
+    }
+
+    /// Visual/resource fixtures exercise the installed application bundle in
+    /// place. Starting Sparkle there would allow a background update to replace
+    /// that evidence target and relaunch without the fixture's isolation
+    /// environment, so these processes receive an inert controller that never
+    /// constructs or starts an `SPUUpdater`.
+    convenience init(isolatedFixture: Bool) {
+        if isolatedFixture {
+            self.init(disabledReason: "Updates are disabled in isolated fixtures.")
+        } else {
+            self.init(bundle: .main)
+        }
+    }
+
+    private init(disabledReason: String) {
+        availability = .unavailable(disabledReason)
+        standardController = nil
+        super.init()
     }
 
     init(bundle: Bundle) {
@@ -42,6 +62,7 @@ final class NativeUpdateController: NSObject {
             )
             try controller.updater.start()
             standardController = controller
+            startedUpdater = true
             availability = .ready
             UpdateCenter.shared.installPreferenceBridge(
                 UpdateCenter.PreferenceBridge(
@@ -61,36 +82,36 @@ final class NativeUpdateController: NSObject {
         }
     }
 
-    /// The generation of the in-flight explicit check, matched against
-    /// Sparkle's cycle-finished callback so a stale completion cannot
-    /// overwrite a newer check's status (2026-08-06 spec §3d).
-    private var activeCheckGeneration: UInt64?
+    /// Owns the generation of the in-flight explicit check and matches
+    /// Sparkle's cycle callbacks to it, so a stale, duplicate, or scheduled
+    /// completion cannot overwrite a newer check's status (2026-08-06 spec
+    /// §3d).
+    private let checks = UpdateCheckArbiter(center: .shared)
 
+    /// The menu item, the command palette, Settings' "Check Now", and the
+    /// `.kaisolaCheckForUpdates` notification all land here, so two of them can
+    /// easily arrive back to back. A trigger during a live cycle is a no-op:
+    /// Sparkle folds a second request into the cycle it is already running, so
+    /// asking again would only leave the running cycle's completion attached to
+    /// a generation nobody is waiting on.
     func checkForUpdates(_ sender: Any?) {
         guard availability.canCheck, let standardController else { return }
-        activeCheckGeneration = UpdateCenter.shared.beginCheck()
+        guard checks.beginExplicitCheck() else { return }
         standardController.checkForUpdates(sender)
     }
 
-    fileprivate func finishCycle(error: (any Error)?, foundUpdate: Bool) {
-        guard let generation = activeCheckGeneration else { return }
-        activeCheckGeneration = nil
-        if let error {
-            let ns = error as NSError
-            // "The user cancelled" and "no update found" both surface as
-            // errors from Sparkle; only real failures should read as failed.
-            if ns.domain == "SUSparkleErrorDomain", ns.code == 1_001 {
-                UpdateCenter.shared.finishCheckUpToDate(generation: generation)
-            } else {
-                UpdateCenter.shared.finishCheckFailed(
-                    generation: generation,
-                    reason: ns.localizedDescription
-                )
-            }
-        } else if foundUpdate {
-            UpdateCenter.shared.finishCheckFoundUpdate(generation: generation)
+    fileprivate func finishCycle(_ cycle: UpdateCheckArbiter.Cycle, error: (any Error)?) {
+        guard let error else {
+            checks.finish(cycle: cycle, outcome: .upToDate)
+            return
+        }
+        let ns = error as NSError
+        // "The user cancelled" and "no update found" both surface as errors
+        // from Sparkle; only real failures should read as failed.
+        if ns.domain == "SUSparkleErrorDomain", ns.code == 1_001 {
+            checks.finish(cycle: cycle, outcome: .upToDate)
         } else {
-            UpdateCenter.shared.finishCheckUpToDate(generation: generation)
+            checks.finish(cycle: cycle, outcome: .failed(reason: ns.localizedDescription))
         }
     }
 
@@ -154,10 +175,11 @@ extension NativeUpdateController: SPUUpdaterDelegate {
         didFinishUpdateCycleFor updateCheck: SPUUpdateCheck,
         error: (any Error)?
     ) {
+        let cycle = UpdateCheckArbiter.Cycle(updateCheck)
         let boxed = error.map(UncheckedSendableBox.init)
         DispatchQueue.main.async {
             MainActor.assumeIsolated { [weak self] in
-                self?.finishCycle(error: boxed?.value, foundUpdate: false)
+                self?.finishCycle(cycle, error: boxed?.value)
             }
         }
     }
@@ -165,7 +187,7 @@ extension NativeUpdateController: SPUUpdaterDelegate {
     nonisolated func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) {
         DispatchQueue.main.async {
             MainActor.assumeIsolated { [weak self] in
-                self?.finishCycle(error: nil, foundUpdate: true)
+                self?.checks.finish(cycle: .explicit, outcome: .foundUpdate)
             }
         }
     }
@@ -209,6 +231,81 @@ extension NativeUpdateController: SPUStandardUserDriverDelegate {
                 UpdateCenter.shared.setSparklePresenting(false)
             }
         }
+    }
+}
+
+// MARK: - Check arbitration
+
+/// Serializes explicit update checks against Sparkle's single update cycle.
+///
+/// `SPUUpdater` runs one cycle at a time. A second user-initiated request while
+/// one is in flight is folded into the running cycle instead of starting
+/// another, and a scheduled cycle is cancelled outright to make room for a
+/// user-initiated one — that cancellation arrives as its own finished-cycle
+/// callback. So the naive "mint a generation per trigger, resolve on the next
+/// callback" pairing is wrong in both directions: the cancellation resolves a
+/// check that never ran, and the real cycle's completion arrives with its
+/// generation already consumed, leaving the spinner up for good.
+///
+/// One generation per real cycle fixes both. Deliberately free of Sparkle types
+/// so the racing rules can be driven directly rather than through the updater.
+@MainActor
+final class UpdateCheckArbiter {
+    /// Which Sparkle cycle a completion belongs to.
+    enum Cycle: Equatable {
+        /// `SPUUpdateCheckUpdates` — the user-initiated cycle this arbiter owns.
+        case explicit
+        /// A scheduled or informational cycle. Kaisola's check status never
+        /// belongs to one, so its completion must not resolve anything.
+        case background
+    }
+
+    /// How a cycle ended, in Kaisola's terms rather than Sparkle's.
+    enum Outcome: Equatable {
+        case upToDate
+        case foundUpdate
+        case failed(reason: String)
+    }
+
+    private let center: UpdateCenter
+    private var activeGeneration: UInt64?
+
+    init(center: UpdateCenter) {
+        self.center = center
+    }
+
+    /// True while an explicit cycle is unresolved.
+    var isChecking: Bool { activeGeneration != nil }
+
+    /// Claims the cycle for a new explicit check. Returns `false` when one is
+    /// already running, in which case the caller must leave Sparkle alone.
+    @discardableResult
+    func beginExplicitCheck() -> Bool {
+        guard activeGeneration == nil else { return false }
+        activeGeneration = center.beginCheck()
+        return true
+    }
+
+    /// Resolves the explicit cycle. Completions from any other cycle, and
+    /// completions that arrive after the explicit one already resolved, are
+    /// dropped rather than allowed to rewrite the status.
+    func finish(cycle: Cycle, outcome: Outcome) {
+        guard cycle == .explicit, let generation = activeGeneration else { return }
+        activeGeneration = nil
+        switch outcome {
+        case .upToDate:
+            center.finishCheckUpToDate(generation: generation)
+        case .foundUpdate:
+            center.finishCheckFoundUpdate(generation: generation)
+        case let .failed(reason):
+            center.finishCheckFailed(generation: generation, reason: reason)
+        }
+    }
+}
+
+extension UpdateCheckArbiter.Cycle {
+    init(_ updateCheck: SPUUpdateCheck) {
+        self = updateCheck == .updates ? .explicit : .background
     }
 }
 

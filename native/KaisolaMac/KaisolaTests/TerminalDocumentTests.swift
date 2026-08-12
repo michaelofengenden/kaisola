@@ -257,4 +257,87 @@ final class TerminalDocumentTests: XCTestCase {
         XCTAssertEqual(document.output, "new")
         XCTAssertTrue(document.truncated)
     }
+
+    func testSpoolReadFailurePreservesTheRenderedTranscript() throws {
+        let rendered = TerminalDocument(
+            sessionID: "t1",
+            output: "hello",
+            cursor: TerminalCursor(streamEpoch: "epoch", offset: 5),
+            truncated: false,
+            exited: false,
+            errorMessage: nil
+        )
+        // The broker could not read the spool, so it answers with no bytes at
+        // the live cursor. That payload is byte-for-byte what a terminal which
+        // never produced output looks like; only `readError` separates them.
+        let unreadable = try TerminalSnapshot(value: .object([
+            "streamEpoch": .string("epoch"),
+            "output": .string(""),
+            "startOffset": .integer(9),
+            "endOffset": .integer(9),
+            "truncated": .bool(true),
+            "readError": .string("EACCES"),
+        ]))
+        let document = rendered.applying(
+            .snapshot(unreadable, resetReason: "event_gap"),
+            sessionID: "t1"
+        )
+
+        XCTAssertEqual(document.output, "hello")
+        XCTAssertEqual(document.cursor, TerminalCursor(streamEpoch: "epoch", offset: 5))
+        XCTAssertTrue(document.truncated)
+        XCTAssertNil(document.surfaceDelta)
+        XCTAssertEqual(document.errorMessage, TerminalDocument.spoolReadDiagnostic("EACCES"))
+        XCTAssertEqual(document.errorMessage?.contains("EACCES"), true)
+    }
+
+    func testAuthoritativeEmptySnapshotStillReplacesTheTranscript() throws {
+        let rendered = TerminalDocument(
+            sessionID: "t1",
+            output: "hello",
+            cursor: TerminalCursor(streamEpoch: "old-epoch", offset: 5),
+            truncated: false,
+            exited: false,
+            errorMessage: nil
+        )
+        let empty = try TerminalSnapshot(value: .object([
+            "streamEpoch": .string("new-epoch"),
+            "output": .string(""),
+            "startOffset": .integer(0),
+            "endOffset": .integer(0),
+        ]))
+        let document = rendered.applying(
+            .snapshot(empty, resetReason: "epoch_mismatch"),
+            sessionID: "t1"
+        )
+
+        XCTAssertEqual(document.output, "")
+        XCTAssertEqual(document.cursor, TerminalCursor(streamEpoch: "new-epoch", offset: 0))
+        XCTAssertNil(document.errorMessage)
+    }
+
+    func testSpoolReadFailureOnAContiguousResumeFlagsTheDocument() throws {
+        let rendered = TerminalDocument(
+            sessionID: "t1",
+            output: "hello",
+            cursor: TerminalCursor(streamEpoch: "epoch", offset: 5),
+            truncated: false,
+            exited: false,
+            errorMessage: nil
+        )
+        let unreadable = try TerminalSnapshot(value: .object([
+            "streamEpoch": .string("epoch"),
+            "output": .string(""),
+            "startOffset": .integer(5),
+            "endOffset": .integer(5),
+            "truncated": .bool(true),
+            "readError": .string("EIO"),
+        ]))
+        let document = rendered.applying(.snapshot(unreadable, resetReason: nil), sessionID: "t1")
+
+        XCTAssertEqual(document.output, "hello")
+        XCTAssertEqual(document.cursor, TerminalCursor(streamEpoch: "epoch", offset: 5))
+        XCTAssertTrue(document.truncated)
+        XCTAssertEqual(document.errorMessage, TerminalDocument.spoolReadDiagnostic("EIO"))
+    }
 }

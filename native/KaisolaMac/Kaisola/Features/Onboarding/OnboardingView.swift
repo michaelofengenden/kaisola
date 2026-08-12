@@ -106,21 +106,38 @@ enum OnboardingReadiness {
         checksAutomatically: Bool,
         pendingVersion: String?
     ) -> OnboardingReadinessStatus {
-        if let pendingVersion {
-            return .init(
-                kind: .needsAction,
-                detail: "Kaisola \(pendingVersion) is ready to install from Settings."
-            )
-        }
         guard canConfigure else {
             return .init(
                 kind: .information,
                 detail: "Update controls become available in a signed Kaisola build."
             )
         }
+        if let pendingVersion {
+            return .init(
+                kind: .needsAction,
+                detail: "Kaisola \(pendingVersion) is ready to install from Settings."
+            )
+        }
         return checksAutomatically
             ? .init(kind: .ready, detail: "Kaisola will check for signed updates automatically.")
             : .init(kind: .needsAction, detail: "Automatic update checks are off.")
+    }
+
+    /// The action the Updates row may offer, if any.
+    ///
+    /// An `.information` status reports a limitation Settings cannot change:
+    /// an unsigned build has no updater, so the Settings toggles are disabled
+    /// there too, and a checklist button that changes nothing teaches people
+    /// that these buttons are dead ends. Only `.needsAction` states reach a
+    /// live control, whether that is switching automatic checks on or
+    /// installing a pending version with Restart and Update.
+    static func updateAction(for status: OnboardingReadinessStatus) -> String? {
+        switch status.kind {
+        case .needsAction:
+            return "Update Settings"
+        case .ready, .checking, .information:
+            return nil
+        }
     }
 }
 
@@ -207,7 +224,7 @@ struct OnboardingView: View {
                             title: "Updates",
                             symbol: "arrow.triangle.2.circlepath",
                             status: updateStatus,
-                            actionTitle: updateStatus.kind == .ready ? nil : "Update Settings",
+                            actionTitle: OnboardingReadiness.updateAction(for: updateStatus),
                             action: openUpdateSettings
                         )
                     }
@@ -218,7 +235,7 @@ struct OnboardingView: View {
                             systemImage: "info.circle"
                         )
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     }
                 }
                 .padding(28)
@@ -252,7 +269,7 @@ struct OnboardingView: View {
                     .font(.largeTitle.weight(.bold))
                 Text("Confirm the essentials, then start a terminal or agent in your first project.")
                     .font(.title3)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
             }
         }
     }
@@ -288,14 +305,14 @@ struct OnboardingView: View {
         HStack(alignment: .center, spacing: 12) {
             statusSymbol(status.kind)
             Image(systemName: symbol)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .frame(width: 19)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 Text(title).font(.headline)
                 Text(status.detail)
                     .font(.subheadline)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             Spacer(minLength: 12)
@@ -346,15 +363,22 @@ struct OnboardingView: View {
                 .accessibilityLabel("Needs action")
         case .information:
             Image(systemName: "info.circle.fill")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityLabel("Information")
         }
     }
 
     private var controls: some View {
         HStack(spacing: 12) {
-            Button("Do This Later", action: dismiss)
-                .fixedSize()
+            HStack(spacing: 9) {
+                Button("Do This Later", action: dismiss)
+                    .fixedSize()
+                Text(OnboardingState.reopenInstruction)
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("onboarding.reopen-instruction")
+            }
             Spacer()
             Button(startButtonTitle, action: startFirstSession)
                 .keyboardShortcut(.defaultAction)
@@ -398,6 +422,8 @@ struct OnboardingView: View {
 /// setup flow once without disturbing the v1 record.
 enum OnboardingState {
     private static let seenKey = "onboardingSeen.v2"
+    static let reopenInstruction =
+        "Reopen anytime: press Command-K and choose Readiness Checklist…"
 
     static func shouldShow(defaults: UserDefaults = .standard) -> Bool {
         !defaults.bool(forKey: seenKey)

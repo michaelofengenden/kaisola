@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "cases": [
+    {
+      "snapshot": "settings-traffic-light-overlap.layout.json",
+      "expectedRules": ["control-overlap", "control-zone-ink"],
+      "note": "Settings as shipped before this gate: the sidebar mark and headline sit on the window buttons (issue #309)."
+    },
+    {
+      "snapshot": "settings-reserved-titlebar.layout.json",
+      "expectedRules": [],
+      "note": "Same surface with the titlebar strip reserved. A gate that fails everything proves nothing, so the clean control must pass."
+    },
+    {
+      "snapshot": "rename-sheet-truncated-label.layout.json",
+      "expectedRules": ["truncated-text"],
+      "note": "Deliberate truncation: the rename sheet's message wants more width than its frame."
+    },
+    {
+      "snapshot": "settings-blank-content-layer.layout.json",
+      "expectedRules": ["content-ink-floor"],
+      "note": "Nothing drawn on the content layer. Catches a probe or surface that renders empty while the PNG still looks plausible."
+    }
+  ]
+}

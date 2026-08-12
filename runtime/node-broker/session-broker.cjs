@@ -12,18 +12,48 @@ const net = require('node:net')
 const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
-const { terminalCreateRoute } = require('./ipc/terminalCreateRoute.cjs')
+const {
+  backgroundRejection,
+  createBrokerRejectionSupervisor,
+} = require('./ipc/brokerRejectionPolicy.cjs')
+const {
+  terminalAttachRoute,
+  terminalCreateRoute,
+  terminalIdLengthRejection,
+  terminalKillRoute,
+  terminalReleaseRoute,
+  terminalResizeRoute,
+} = require('./ipc/terminalCreateRoute.cjs')
+const { terminalDetachOwnerRoute } = require('./ipc/terminalDetachOwnerRoute.cjs')
+const { BrokerMutationLedger, BrokerRequestGate, dispatchBrokerRequest } = require('./ipc/brokerRequestGate.cjs')
+const { collectBrokerInventorySnapshot } = require('./ipc/brokerInventorySnapshot.cjs')
 const { terminalOwnerAllowed, terminalOwnerParts } = require('./ipc/securityPolicy.cjs')
 const {
   PROTOCOL,
   SECURITY_EPOCH,
   BROKER_IMPLEMENTATION_VERSION,
   BROKER_PACKAGE_SCHEMA,
+  BROKER_ADMINISTRATION_FEATURE,
   FEATURES,
-  OBSERVER_ACCESS,
+  CONTROLLER_ACCESS,
+  ADMINISTRATOR_ACCESS,
   MAX_FRAME,
+  inspectBrokerFrame,
+  validateEncodedBrokerFrame,
   atomicJson,
+  administratorMethod,
+  brokerAccessSupported,
   brokerMethodAllowedForAccess,
+  brokerAccessGrantsAdministration,
+  brokerAccessGrantsGlobalObservation,
+  normalizeBrokerOwnerID,
+  brokerOwnerIDAllowedForAccess,
+  negotiateFeatures,
+  eventPayloadForFeatures,
+  TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE,
+  // Framing and queue accounting live in brokerWire so the observer layer can
+  // be exercised against the exact delivery verdict a real socket produces.
+  writeFrame: send,
 } = require('./ipc/brokerWire.cjs')
 
 const NO_CLIENT_EXIT_MS = process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_NO_CLIENT_EXIT_MS
@@ -35,6 +65,15 @@ const NO_CLIENT_EXIT_MS = process.env.NODE_ENV === 'test' && process.env.KAISOLA
 // the pathname cheaply and publish a replacement listener without disturbing
 // existing authenticated connections or terminal processes.
 const SOCKET_PATH_CHECK_MS = 1_000
+// The info file is how a restarted GUI finds and authenticates to this broker.
+// A transient write failure (ENOSPC, a momentarily unwritable userData) leaves
+// every socket and PTY alive but strands those durable sessions, so republish
+// on a doubling backoff until the file is back. The ceiling is derived from the
+// base so a shortened test loop keeps a bounded, quick retry cadence.
+const RENDEZVOUS_RETRY_MIN_MS = process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_RENDEZVOUS_RETRY_MS
+  ? Math.max(10, Math.min(1_000, Number(process.env.KAISOLA_TEST_BROKER_RENDEZVOUS_RETRY_MS) || 250))
+  : 250
+const RENDEZVOUS_RETRY_MAX_MS = Math.min(15_000, RENDEZVOUS_RETRY_MIN_MS * 64)
 
 function readLaunch() {
   const marker = process.argv.indexOf('--launch')
@@ -57,6 +96,12 @@ function readLaunch() {
   for (const key of ['socketPath', 'infoFile', 'lockFile', 'storageDir', 'logFile']) {
     if (!path.isAbsolute(String(config[key] || ''))) throw new Error(`invalid ${key}`)
   }
+  if (config.maximumLiveTerminals != null
+      && (!Number.isSafeInteger(config.maximumLiveTerminals)
+        || config.maximumLiveTerminals < 1
+        || config.maximumLiveTerminals > mgr.MAX_CONFIGURABLE_LIVE_TERMINALS)) {
+    throw new Error('invalid maximumLiveTerminals')
+  }
   return config
 }
 
@@ -64,6 +109,7 @@ const config = readLaunch()
 const smoke = config.smoke === true
 process.umask(0o077)
 mgr.configureStorage(config.storageDir)
+mgr.configureCapacity(config.maximumLiveTerminals ?? mgr.DEFAULT_MAX_LIVE_TERMINALS)
 
 function log(message) {
   try {
@@ -74,6 +120,8 @@ function log(message) {
     fs.appendFileSync(config.logFile, `${new Date().toISOString()} ${message}\n`, { mode: 0o600 })
   } catch { /* diagnostics must never stop sessions */ }
 }
+
+const rejectionSupervisor = createBrokerRejectionSupervisor({ log })
 
 function tokenMatches(candidate) {
   const a = Buffer.from(String(candidate || ''))
@@ -93,6 +141,8 @@ let activityEpoch = 1
 let companionLeaseEpoch = 1
 const companionLeases = new Set()
 let inFlightMutations = 0
+const requestGate = new BrokerRequestGate()
+const mutationLedger = new BrokerMutationLedger()
 let everConnected = false
 
 const MUTATING_METHODS = new Set([
@@ -111,6 +161,41 @@ const MUTATING_METHODS = new Set([
   'terminal.setFocused',
   'terminal.controlLease',
 ])
+const IDEMPOTENT_METHODS = new Set([
+  ...MUTATING_METHODS,
+  'broker.shutdownForUpdate',
+  'broker.prepareRollingUpdate',
+  'broker.cancelRollingUpdate',
+  'broker.retireDraining',
+])
+
+const MUTATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+
+function canonicalMutationValue(value) {
+  if (Array.isArray(value)) return value.map(canonicalMutationValue)
+  if (!value || typeof value !== 'object') return value
+  const result = {}
+  for (const key of Object.keys(value).sort()) {
+    if (key !== 'mutationId') result[key] = canonicalMutationValue(value[key])
+  }
+  return result
+}
+
+function mutationIdempotency(client, method, params) {
+  if (params?.mutationId == null) return null
+  const mutationId = String(params.mutationId)
+  if (!MUTATION_ID_PATTERN.test(mutationId)) return { invalid: true }
+  const key = JSON.stringify([
+    client.instanceId,
+    String(params.ownerId ?? '0'),
+    String(params.projectId ?? LEGACY_PROJECT_SCOPE),
+    mutationId,
+  ])
+  const fingerprint = crypto.createHash('sha256')
+    .update(JSON.stringify([method, canonicalMutationValue(params)]))
+    .digest('hex')
+  return { ledger: mutationLedger, key, fingerprint }
+}
 
 function noteActivity() {
   activityEpoch = activityEpoch >= Number.MAX_SAFE_INTEGER ? 1 : activityEpoch + 1
@@ -133,18 +218,6 @@ function waitMilliseconds(milliseconds) {
   })
 }
 
-function send(socket, frame, { maxQueueBytes, force = false } = {}) {
-  if (!socket || socket.destroyed) return false
-  try {
-    const encoded = `${JSON.stringify(frame)}\n`
-    const frameBytes = Buffer.byteLength(encoded, 'utf8')
-    if (!force && Number.isFinite(maxQueueBytes) && socket.writableLength + frameBytes > maxQueueBytes) return false
-    return socket.write(encoded)
-  } catch {
-    return false // reconnect replays snapshots
-  }
-}
-
 const LEGACY_PROJECT_SCOPE = 'legacy'
 
 function projectScope(value) {
@@ -154,17 +227,8 @@ function projectScope(value) {
   return scope
 }
 
-function ownerId(value) {
-  const id = String(value ?? '0').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80)
-  return id || '0'
-}
-
 function ownerKey(instanceId, rendererId, projectId) {
-  return `${instanceId}|${ownerId(rendererId)}|${projectScope(projectId)}`
-}
-
-function rendererOwnerPrefix(instanceId, rendererId) {
-  return `${instanceId}|${ownerId(rendererId)}|`
+  return `${instanceId}|${normalizeBrokerOwnerID(rendererId)}|${projectScope(projectId)}`
 }
 
 function clearNoClientTimer() {
@@ -196,10 +260,42 @@ function scheduleNoClientExit() {
   noClientTimer.unref?.()
 }
 
+function brokerStatusSnapshot(terminals, terminalCapacity = null) {
+  return {
+    ok: true,
+    protocol: PROTOCOL,
+    securityEpoch: SECURITY_EPOCH,
+    implementationVersion: BROKER_IMPLEMENTATION_VERSION,
+    packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
+    packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
+    contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
+    features: FEATURES,
+    pid: process.pid,
+    startedAt: config.startedAt,
+    version: config.version,
+    activityEpoch,
+    companionLeaseEpoch,
+    companionLeaseCount: companionLeases.size,
+    inFlightMutations,
+    generationState: drainingTarget ? 'draining' : 'current',
+    drainingTargetContentDigest: drainingTarget?.targetContentDigest ?? null,
+    // Degraded means the live sockets and PTYs are fine but the info file is
+    // stale or absent, so a restarted GUI cannot rendezvous yet.
+    rendezvous: rendezvousStatus(),
+    health: rejectionSupervisor.status(),
+    authenticatedClientCount: clients.size,
+    ...(terminalCapacity == null ? {} : { terminalCapacity }),
+    terminals,
+  }
+}
+
 function detachInstance(instanceId) {
   if (!instanceId) return
   mgr.detachSenderPrefix(`${instanceId}|`)
   mgr.unsubscribeSubscriberPrefix(`${instanceId}|`)
+  // A pending exit wait can never be answered once the socket is gone, and the
+  // pty it watches may run for hours: drop those closures with the connection.
+  mgr.cancelExitWaitersPrefix(`${instanceId}|`)
   scheduleNoClientExit()
 }
 
@@ -208,22 +304,59 @@ mgr.setEventSink((owner, channel, payload, options) => {
   if (!parts) return false
   const client = clients.get(parts.instanceId)
   if (!client) return false
-  return send(client.socket, { type: 'event', ownerId: parts.ownerId, projectId: parts.projectId, channel, payload }, options)
+  return send(client.socket, {
+    type: 'event',
+    ownerId: parts.ownerId,
+    projectId: parts.projectId,
+    channel,
+    // One live broker serves app lanes of different vintages across a rolling
+    // update, so the shape is per-client, not per-broker.
+    payload: eventPayloadForFeatures(channel, payload, client.features),
+  }, options)
 })
 mgr.setActivitySink(() => noteActivity())
+// Same per-client resolution as the event sink above, and for the same reason:
+// during a rolling update the current and draining generations can have
+// negotiated differently, so this is answered from the owner's own connection
+// rather than from a broker-wide flag. An owner whose connection is gone keeps
+// the primary stream, because the next attach re-answers this anyway and the
+// cost of a wrong "yes" is wasted work while a wrong "no" is a blank terminal.
+mgr.setPrimaryStreamPolicy((owner) => {
+  const parts = terminalOwnerParts(owner)
+  if (!parts) return true
+  const client = clients.get(parts.instanceId)
+  if (!client) return true
+  return !client.features?.has(TERMINAL_OBSERVER_ONLY_OUTPUT_FEATURE)
+})
 
 async function dispatch(client, method, params = {}) {
   if (!brokerMethodAllowedForAccess(client.access, method)) {
-    throw new Error('observer access cannot invoke broker mutations')
+    throw new Error(client.access === CONTROLLER_ACCESS && administratorMethod(method)
+      ? 'controller access cannot invoke broker administration'
+      : 'observer access cannot invoke broker mutations')
+  }
+  if (!brokerOwnerIDAllowedForAccess(client.access, params.ownerId)) {
+    throw new Error('controller access requires a nonzero owner identity')
+  }
+  if (!rejectionSupervisor.allows(method)) {
+    throw new Error('broker mutations are fenced after an invariant failure')
   }
   if (updateCommitted && method !== 'broker.status') {
     throw new Error('broker helper update is already committed')
   }
-  const admin = String(params.ownerId ?? '0') === '0'
+  const admin = brokerAccessGrantsAdministration(client.access)
+  const globalObservation = brokerAccessGrantsGlobalObservation(client.access)
   const requestProject = projectScope(params.projectId)
   const owner = ownerKey(client.instanceId, params.ownerId, requestProject)
-  const terminalId = () => String(params.id || '').slice(0, 240)
-  if (drainingTarget && method === 'terminal.create' && !mgr.has(terminalId())) {
+  const rawTerminalId = String(params.id || '')
+  const idRejection = terminalIdLengthRejection(rawTerminalId)
+  const terminalId = () => {
+    if (idRejection) throw new Error(idRejection.message)
+    return rawTerminalId
+  }
+  // Let terminal.create return its structured rejection without consulting a
+  // truncated/existing ownership key, even while this generation is draining.
+  if (drainingTarget && method === 'terminal.create' && !idRejection && !mgr.has(rawTerminalId)) {
     throw new Error('broker generation is draining; create on the current generation')
   }
   const allowed = (id, adopt = false) => {
@@ -244,29 +377,29 @@ async function dispatch(client, method, params = {}) {
   const requireAllowed = (id, adopt = false) => {
     if (!allowed(id, adopt)) throw new Error('terminal access denied')
   }
+  const visibleRows = (rows) => globalObservation ? rows : rows.filter((row) => terminalOwnerAllowed({
+    recordOwner: row.owner,
+    recordLastOwner: row.lastOwner,
+    requestOwner: owner,
+    requestProject,
+  }))
   switch (method) {
     case 'broker.status':
-      return {
-        ok: true,
-        protocol: PROTOCOL,
-        securityEpoch: SECURITY_EPOCH,
-        implementationVersion: BROKER_IMPLEMENTATION_VERSION,
-        packageSchema: Number(config.packageSchema) || BROKER_PACKAGE_SCHEMA,
-        packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
-        contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
-        features: FEATURES,
-        pid: process.pid,
-        startedAt: config.startedAt,
-        version: config.version,
-        activityEpoch,
-        companionLeaseEpoch,
-        companionLeaseCount: companionLeases.size,
-        inFlightMutations,
-        generationState: drainingTarget ? 'draining' : 'current',
-        drainingTargetContentDigest: drainingTarget?.targetContentDigest ?? null,
-        authenticatedClientCount: clients.size,
-        terminals: mgr.diagnostics(),
-      }
+      return brokerStatusSnapshot(
+        visibleRows(mgr.diagnostics()),
+        globalObservation ? mgr.capacity() : null,
+      )
+    case 'broker.inventory':
+      return collectBrokerInventorySnapshot({
+        activityEpoch: () => activityEpoch,
+        inFlightMutations: () => inFlightMutations,
+        status: () => brokerStatusSnapshot(
+          visibleRows(mgr.diagnostics()),
+          globalObservation ? mgr.capacity() : null,
+        ),
+        diagnostics: () => visibleRows(mgr.diagnostics()),
+        live: () => visibleRows(mgr.list()),
+      })
     case 'broker.shutdown':
       setTimeout(() => gracefulExit(true), 20).unref?.()
       return { ok: true }
@@ -415,13 +548,13 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.attach': {
       const id = terminalId()
-      requireAllowed(id, true)
-      const continuity = mgr.setSender(id, owner)
-      const previousInstance = continuity?.previousOwner?.split('|')[0]
-      const continuation = continuity && previousInstance && previousInstance !== client.instanceId
-        ? { ...continuity, acrossRestart: true, reattachedAt: Date.now(), brokerPid: process.pid }
-        : null
-      return { ...mgr.snapshot(id), continuation }
+      return terminalAttachRoute({
+        manager: mgr,
+        id,
+        owner,
+        clientInstanceId: client.instanceId,
+        requireAllowed,
+      })
     }
     case 'terminal.subscribe': {
       if (admin) throw new Error('terminal observer requires an exact project capability')
@@ -454,15 +587,14 @@ async function dispatch(client, method, params = {}) {
       requireAllowed(id)
       return { ok: mgr.detachRenderer(id, owner, params.viewState) }
     }
-    case 'terminal.detachOwner':
-      // A WebContents can own parked terminals in several project tabs. Window
-      // teardown drops every one, while normal project handoff remains explicit
-      // through attach/create with that project's capability.
-      return { ok: true, detached: mgr.detachSenderPrefix(rendererOwnerPrefix(client.instanceId, params.ownerId)) }
+    case 'terminal.detachOwner': {
+      terminalId()
+      return terminalDetachOwnerRoute({ manager: mgr, params, owner, requireAllowed })
+    }
     case 'terminal.write': {
       const id = terminalId()
       requireAllowed(id)
-      return mgr.write(id, String(params.data ?? ''))
+      return mgr.write(id, params.data)
     }
     case 'terminal.agentTurn': {
       const id = terminalId()
@@ -483,19 +615,20 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.resize': {
       const id = terminalId()
-      requireAllowed(id)
-      return mgr.resize(id, Number(params.cols), Number(params.rows))
+      return terminalResizeRoute({ manager: mgr, id, params, requireAllowed })
     }
     case 'terminal.snapshot':
     case 'terminal.output': {
       const id = terminalId()
       requireAllowed(id)
-      return mgr.snapshot(id)
+      return mgr.snapshot(id, { responseBarrier: true })
     }
     case 'terminal.waitForExit': {
       const id = terminalId()
       requireAllowed(id)
-      return await mgr.waitForExit(id)
+      // The owner key is the wait's identity: it collapses a client's repeat
+      // asks onto one resolver and is what a socket close cancels by prefix.
+      return await mgr.waitForExit(id, { owner, timeoutMs: params.timeoutMs })
     }
     case 'terminal.signal': {
       const id = terminalId()
@@ -504,15 +637,13 @@ async function dispatch(client, method, params = {}) {
     }
     case 'terminal.kill': {
       const id = terminalId()
-      requireAllowed(id)
-      return { ok: mgr.kill(id) }
+      return terminalKillRoute({ manager: mgr, id, requireAllowed })
     }
     case 'terminal.release': {
       const id = terminalId()
-      requireAllowed(id)
-      mgr.release(id)
+      const result = terminalReleaseRoute({ manager: mgr, id, requireAllowed })
       scheduleNoClientExit()
-      return { ok: true }
+      return result
     }
     case 'terminal.scheduleRelease': {
       const id = terminalId()
@@ -527,22 +658,10 @@ async function dispatch(client, method, params = {}) {
       return { ok: mgr.cancelRelease(id) }
     }
     case 'terminal.list': {
-      const rows = mgr.list()
-      return admin ? rows : rows.filter((row) => terminalOwnerAllowed({
-        recordOwner: row.owner,
-        recordLastOwner: row.lastOwner,
-        requestOwner: owner,
-        requestProject,
-      }))
+      return visibleRows(mgr.list())
     }
     case 'terminal.diagnostics': {
-      const rows = mgr.diagnostics()
-      return admin ? rows : rows.filter((row) => terminalOwnerAllowed({
-        recordOwner: row.owner,
-        recordLastOwner: row.lastOwner,
-        requestOwner: owner,
-        requestProject,
-      }))
+      return visibleRows(mgr.diagnostics())
     }
     case 'terminal.setFocused':
       mgr.setAppFocused(!!params.focused)
@@ -553,6 +672,24 @@ async function dispatch(client, method, params = {}) {
 }
 
 function handleLine(client, line) {
+  let envelope
+  try {
+    envelope = inspectBrokerFrame(line)
+    validateEncodedBrokerFrame(line, { envelope })
+  } catch (error) {
+    if (client.authenticated && error?.code === 'BROKER_FRAME_TOO_LARGE'
+        && envelope?.type === 'request' && envelope.id && envelope.method) {
+      send(client.socket, {
+        type: 'response',
+        id: envelope.id,
+        ok: false,
+        message: `broker request exceeds ${error.maximumBytes} byte limit`,
+      }, { method: envelope.method })
+    } else if (!client.authenticated) {
+      client.socket.destroy()
+    }
+    return
+  }
   let frame
   try { frame = JSON.parse(line) } catch { return }
   if (!client.authenticated) {
@@ -566,15 +703,27 @@ function handleLine(client, line) {
       client.socket.destroy()
       return
     }
-    const prior = clients.get(instanceId)
-    if (prior && prior.socket !== client.socket) prior.socket.destroy()
-    const access = frame.access == null ? 'controller' : String(frame.access)
-    if (access !== 'controller' && access !== OBSERVER_ACCESS) {
+    const access = frame.access == null ? CONTROLLER_ACCESS : String(frame.access)
+    if (!brokerAccessSupported(access)) {
+      send(client.socket, { type: 'hello', ok: false, message: 'broker authentication failed' })
       client.socket.destroy()
       return
     }
+    const negotiatedFeatures = negotiateFeatures(frame.features)
+    if (access === ADMINISTRATOR_ACCESS
+        && !negotiatedFeatures.has(BROKER_ADMINISTRATION_FEATURE)) {
+      send(client.socket, { type: 'hello', ok: false, message: 'broker authentication failed' })
+      client.socket.destroy()
+      return
+    }
+    if (access !== ADMINISTRATOR_ACCESS) {
+      negotiatedFeatures.delete(BROKER_ADMINISTRATION_FEATURE)
+    }
+    const prior = clients.get(instanceId)
+    if (prior && prior.socket !== client.socket) prior.socket.destroy()
     client.instanceId = instanceId
     client.access = access
+    client.features = negotiatedFeatures
     client.authenticated = true
     everConnected = true
     clients.set(instanceId, client)
@@ -589,6 +738,9 @@ function handleLine(client, line) {
       packageVersion: typeof config.packageVersion === 'string' ? config.packageVersion : null,
       contentDigest: typeof config.contentDigest === 'string' ? config.contentDigest : null,
       features: FEATURES,
+      // What this connection actually asked for and got, so a client never has
+      // to infer its own event shapes from the broker's full capability list.
+      negotiatedFeatures: [...client.features],
       access,
       pid: process.pid,
       startedAt: config.startedAt,
@@ -598,21 +750,43 @@ function handleLine(client, line) {
   }
   if (frame?.type !== 'request' || typeof frame.id !== 'string' || typeof frame.method !== 'string') return
   const mutating = MUTATING_METHODS.has(frame.method)
-  if (mutating) beginMutation()
-  void dispatch(client, frame.method, frame.params).finally(() => {
-    if (mutating) endMutation()
-  }).then(
-    (result) => {
-      send(client.socket, { type: 'response', id: frame.id, ok: true, result })
-      scheduleNoClientExit()
-    },
-    (error) => send(client.socket, { type: 'response', id: frame.id, ok: false, message: String(error?.message || error) }),
-  )
+  const idempotency = IDEMPOTENT_METHODS.has(frame.method)
+    ? mutationIdempotency(client, frame.method, frame.params)
+    : null
+  if (idempotency?.invalid) {
+    send(client.socket, {
+      type: 'response', id: frame.id, ok: false,
+      code: 'invalid_mutation_id', message: 'broker mutation id is invalid',
+    }, { method: frame.method })
+    return
+  }
+  dispatchBrokerRequest({
+    gate: requestGate,
+    client,
+    requestID: frame.id,
+    mutating,
+    dispatch: () => dispatch(client, frame.method, frame.params),
+    beginMutation,
+    endMutation,
+    // The gate owns admission and settlement, while the wire layer still needs
+    // the originating method to enforce its response-specific encoded cap.
+    respond: (response) => send(client.socket, response, { method: frame.method }),
+    onSuccess: scheduleNoClientExit,
+    idempotency,
+  })
 }
 
 function acceptClient(socket) {
   socket.setNoDelay(true)
-  const client = { socket, authenticated: false, instanceId: null, access: 'controller', buffer: '', decoder: new StringDecoder('utf8') }
+  const client = {
+    socket,
+    authenticated: false,
+    instanceId: null,
+    access: CONTROLLER_ACCESS,
+    features: new Set(),
+    buffer: '',
+    decoder: new StringDecoder('utf8'),
+  }
   socket.on('data', (chunk) => {
     client.buffer += client.decoder.write(chunk)
     if (Buffer.byteLength(client.buffer) > MAX_FRAME) {
@@ -640,6 +814,12 @@ const servers = new Set()
 let server = null
 let socketRecoveryPending = false
 let socketPathTimer = null
+let rendezvousState = 'pending' // 'pending' | 'published' | 'degraded'
+let rendezvousPublishedAt = null
+let rendezvousFailures = 0
+let rendezvousLastError = null
+let rendezvousRetryTimer = null
+let rendezvousRetryMs = RENDEZVOUS_RETRY_MIN_MS
 
 function brokerInfo() {
   return {
@@ -673,13 +853,77 @@ function configureServer(candidate, { recovery = false } = {}) {
   return candidate
 }
 
+function rendezvousStatus() {
+  return {
+    state: rendezvousState,
+    publishedAt: rendezvousPublishedAt,
+    consecutiveFailures: rendezvousFailures,
+    lastError: rendezvousLastError,
+    retryPending: rendezvousRetryTimer != null,
+  }
+}
+
+function clearRendezvousRetry() {
+  if (rendezvousRetryTimer) clearTimeout(rendezvousRetryTimer)
+  rendezvousRetryTimer = null
+}
+
+function listenerHealthy() {
+  return !shuttingDown && server?.listening === true && socketPathState() !== 'missing'
+}
+
+function scheduleRendezvousRetry() {
+  if (shuttingDown || rendezvousRetryTimer) return
+  rendezvousRetryTimer = setTimeout(() => {
+    rendezvousRetryTimer = null
+    publishRendezvous()
+  }, rendezvousRetryMs)
+  rendezvousRetryTimer.unref?.()
+  rendezvousRetryMs = Math.min(RENDEZVOUS_RETRY_MAX_MS, rendezvousRetryMs * 2)
+}
+
+// Info-file publication is diagnostics/rendezvous, not session state. A
+// transient write failure (ENOSPC, unwritable userData) during socket-path
+// recovery must degrade — letting it escape into uncaughtException would
+// gracefulExit(true) and kill every live PTY over a bookkeeping file. Degrading
+// alone still strands those PTYs, because a restarted GUI has no other way to
+// discover or authenticate to them, so keep republishing on a bounded backoff
+// until the write lands again.
+function publishRendezvous() {
+  if (shuttingDown) return
+  if (!listenerHealthy()) {
+    // A vanished socket path belongs to the recovery timer, whose own
+    // publishListener call re-arms rendezvous publication for the replacement
+    // listener. Republishing now would only advertise an unreachable path.
+    log(`publish info deferred socket=${socketPathState()} failures=${rendezvousFailures}`)
+    return
+  }
+  try {
+    atomicJson(config.infoFile, brokerInfo())
+  } catch (error) {
+    rendezvousFailures++
+    rendezvousLastError = String(error?.code || error?.message || error).slice(0, 200)
+    rendezvousState = 'degraded'
+    log(`publish info failed attempt=${rendezvousFailures} retryInMs=${rendezvousRetryMs} ${error?.code || ''} ${error?.message || error}`)
+    scheduleRendezvousRetry()
+    return
+  }
+  if (rendezvousState === 'degraded') log(`publish info recovered afterFailures=${rendezvousFailures}`)
+  clearRendezvousRetry()
+  rendezvousState = 'published'
+  rendezvousPublishedAt = Date.now()
+  rendezvousFailures = 0
+  rendezvousLastError = null
+  rendezvousRetryMs = RENDEZVOUS_RETRY_MIN_MS
+}
+
 function publishListener({ recovered = false } = {}) {
   if (process.platform !== 'win32') try { fs.chmodSync(config.socketPath, 0o600) } catch { /* token still gates */ }
-  // Info-file publication is diagnostics/rendezvous, not session state. A
-  // transient write failure (ENOSPC, unwritable userData) during socket-path
-  // recovery must degrade — letting it escape into uncaughtException would
-  // gracefulExit(true) and kill every live PTY over a bookkeeping file.
-  try { atomicJson(config.infoFile, brokerInfo()) } catch (error) { log(`publish info failed ${error?.code || ''} ${error?.message || error}`) }
+  // A fresh listener deserves a fresh backoff: whatever stalled the previous
+  // generation's info file has nothing to say about this one.
+  clearRendezvousRetry()
+  rendezvousRetryMs = RENDEZVOUS_RETRY_MIN_MS
+  publishRendezvous()
   log(`${recovered ? 'recovered socket' : 'ready'} pid=${process.pid} protocol=${PROTOCOL} version=${config.version}`)
 }
 
@@ -728,29 +972,42 @@ function gracefulExit(killSessions) {
   if (shuttingDown) return
   shuttingDown = true
   clearNoClientTimer()
+  clearRendezvousRetry()
   if (socketPathTimer) clearInterval(socketPathTimer)
   socketPathTimer = null
-  if (killSessions) mgr.killAll()
-  else for (const client of clients.values()) detachInstance(client.instanceId)
+  const draining = killSessions ? mgr.killAll() : null
+  if (!killSessions) for (const client of clients.values()) detachInstance(client.instanceId)
   for (const client of clients.values()) client.socket.destroy()
   clients.clear()
-  const active = server
-  for (const candidate of servers) {
-    if (candidate === active) continue
-    try { candidate.close() } catch {}
-  }
-  active.close(() => {
-    cleanupFiles()
-    process.exit(0)
-  })
   const hard = setTimeout(() => { cleanupFiles(); process.exit(0) }, 1500)
   hard.unref?.()
+  const finish = () => {
+    const active = server
+    for (const candidate of servers) {
+      if (candidate === active) continue
+      try { candidate.close() } catch {}
+    }
+    active.close(() => {
+      cleanupFiles()
+      process.exit(0)
+    })
+  }
+  if (draining && typeof draining.then === 'function') draining.then(finish, finish)
+  else finish()
 }
 
 process.on('SIGTERM', () => gracefulExit(true))
 process.on('SIGINT', () => gracefulExit(true))
 process.on('uncaughtException', (error) => { log(`fatal ${error?.stack || error}`); gracefulExit(true) })
-process.on('unhandledRejection', (error) => { log(`rejection ${error?.stack || error}`) })
+process.on('unhandledRejection', (reason) => { rejectionSupervisor.handle(reason) })
+
+// Deterministic process-boundary fixture. Production never installs these
+// handlers; tests use one signal for a classified background failure and one
+// for an unclassified invariant failure after a live PTY already exists.
+if (process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_REJECTION_PROBE === '1') {
+  process.on('SIGUSR1', () => { void Promise.reject(backgroundRejection('test-probe')) })
+  process.on('SIGUSR2', () => { void Promise.reject(new Error('rejection-probe-secret-marker')) })
+}
 
 try {
   const lockFd = fs.openSync(config.lockFile, 'wx', 0o600)

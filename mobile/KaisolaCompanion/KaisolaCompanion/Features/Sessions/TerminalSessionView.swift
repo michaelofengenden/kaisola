@@ -5,17 +5,19 @@ import SwiftUI
 struct TerminalSessionView: View {
     @EnvironmentObject private var store: CompanionStore
     @EnvironmentObject private var coordinator: CompanionConnectionCoordinator
+    @Environment(\.dismiss) private var dismiss
     @State private var changingControl = false
     @State private var pendingPaste: Data?
     @State private var confirmPaste = false
     @State private var streamWaitExpired = false
+    @State private var accountIntent: CompanionConnectionCoordinator.AccountIntent?
 
     let sessionId: String
 
     private var session: CompanionSession? { store.session(for: sessionId) }
     private var isControlled: Bool {
         guard let session else { return false }
-        return coordinator.hasTerminalControl(session)
+        return coordinator.hasTerminalControl(session, intent: accountIntent)
     }
 
     var body: some View {
@@ -54,7 +56,15 @@ struct TerminalSessionView: View {
                             controlEnabled: isControlled,
                             onInput: handleInput,
                             onResize: { cols, rows in
-                                Task { await coordinator.resizeTerminal(session, cols: cols, rows: rows) }
+                                let intent = accountIntent
+                                Task {
+                                    await coordinator.resizeTerminal(
+                                        session,
+                                        cols: cols,
+                                        rows: rows,
+                                        intent: intent
+                                    )
+                                }
                             }
                         )
                         .opacity(hasTerminalSnapshot(session) ? 1 : 0)
@@ -65,6 +75,9 @@ struct TerminalSessionView: View {
                 }
                 .background(KaisolaTheme.terminalBackground)
                 .task(id: session.id) {
+                    if accountIntent == nil {
+                        accountIntent = coordinator.captureAccountIntent()
+                    }
                     requestStream(session)
                     do { try await Task.sleep(for: .seconds(5)) } catch { return }
                     if store.connection == .live,
@@ -75,14 +88,25 @@ struct TerminalSessionView: View {
                 }
                 .onChange(of: store.connection) { previous, current in
                     guard previous != .live, current == .live else { return }
-                    coordinator.setTerminalStream(projectId: session.projectId, sessionId: session.id, subscribed: true)
+                    coordinator.setTerminalStream(
+                        projectId: session.projectId,
+                        sessionId: session.id,
+                        subscribed: true,
+                        intent: accountIntent
+                    )
                 }
                 .onChange(of: session.terminalStreamEpoch) { _, epoch in
                     if epoch != nil { streamWaitExpired = false }
                 }
                 .onDisappear {
-                    coordinator.setTerminalStream(projectId: session.projectId, sessionId: session.id, subscribed: false)
-                    Task { await coordinator.releaseTerminalControl(session) }
+                    coordinator.setTerminalStream(
+                        projectId: session.projectId,
+                        sessionId: session.id,
+                        subscribed: false,
+                        intent: accountIntent
+                    )
+                    let intent = accountIntent
+                    Task { await coordinator.releaseTerminalControl(session, intent: intent) }
                 }
                 .navigationTitle(session.title)
                 .navigationBarTitleDisplayMode(.inline)
@@ -90,7 +114,8 @@ struct TerminalSessionView: View {
                 .toolbar {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button {
-                            Task { await toggleControl(session) }
+                            let intent = accountIntent
+                            Task { await toggleControl(session, intent: intent) }
                         } label: {
                             Label(isControlled ? "Done" : "Control", systemImage: isControlled ? "lock.open.fill" : "hand.tap")
                                 .font(.caption.weight(.semibold))
@@ -102,7 +127,14 @@ struct TerminalSessionView: View {
                     Button("Send paste") {
                         guard let pendingPaste else { return }
                         self.pendingPaste = nil
-                        Task { _ = await coordinator.sendTerminalInput(pendingPaste, to: session) }
+                        let intent = accountIntent
+                        Task {
+                            _ = await coordinator.sendTerminalInput(
+                                pendingPaste,
+                                to: session,
+                                intent: intent
+                            )
+                        }
                     }
                     Button("Cancel", role: .cancel) { pendingPaste = nil }
                 } message: {
@@ -111,6 +143,11 @@ struct TerminalSessionView: View {
             } else {
                 ContentUnavailableView("Terminal ended", systemImage: "terminal")
             }
+        }
+        .onAppear { accountIntent = coordinator.captureAccountIntent() }
+        .onChange(of: coordinator.accountGeneration) { _, generation in
+            guard accountIntent?.generation != generation else { return }
+            dismiss()
         }
     }
 
@@ -141,7 +178,8 @@ struct TerminalSessionView: View {
             projectId: session.projectId,
             sessionId: session.id,
             subscribed: true,
-            force: force
+            force: force,
+            intent: accountIntent
         )
     }
 
@@ -179,7 +217,8 @@ struct TerminalSessionView: View {
                     key("↓", text: "\u{1b}[B", session: session)
                     key("→", text: "\u{1b}[C", session: session)
                     Button {
-                        Task { _ = await coordinator.interruptTerminal(session) }
+                        let intent = accountIntent
+                        Task { _ = await coordinator.interruptTerminal(session, intent: intent) }
                     } label: {
                         Text("⌃C").terminalKeyStyle()
                     }
@@ -192,7 +231,8 @@ struct TerminalSessionView: View {
         } else {
             Button {
                 guard store.canControlTerminals || store.isPreview else { return }
-                Task { await toggleControl(session) }
+                let intent = accountIntent
+                Task { await toggleControl(session, intent: intent) }
             } label: {
                 HStack(spacing: 8) {
                     Image(systemName: store.canControlTerminals || store.isPreview ? "hand.tap" : "eye")
@@ -218,7 +258,10 @@ struct TerminalSessionView: View {
 
     private func key(_ title: String, bytes: [UInt8], session: CompanionSession) -> some View {
         Button {
-            Task { _ = await coordinator.sendTerminalInput(Data(bytes), to: session) }
+            let intent = accountIntent
+            Task {
+                _ = await coordinator.sendTerminalInput(Data(bytes), to: session, intent: intent)
+            }
         } label: {
             Text(title.uppercased()).terminalKeyStyle()
         }
@@ -235,14 +278,18 @@ struct TerminalSessionView: View {
             confirmPaste = true
             return
         }
-        Task { _ = await coordinator.sendTerminalInput(data, to: session) }
+        let intent = accountIntent
+        Task { _ = await coordinator.sendTerminalInput(data, to: session, intent: intent) }
     }
 
-    private func toggleControl(_ session: CompanionSession) async {
+    private func toggleControl(
+        _ session: CompanionSession,
+        intent: CompanionConnectionCoordinator.AccountIntent?
+    ) async {
         changingControl = true
         defer { changingControl = false }
-        if isControlled { await coordinator.releaseTerminalControl(session) }
-        else { _ = await coordinator.acquireTerminalControl(session) }
+        if isControlled { await coordinator.releaseTerminalControl(session, intent: intent) }
+        else { _ = await coordinator.acquireTerminalControl(session, intent: intent) }
     }
 }
 

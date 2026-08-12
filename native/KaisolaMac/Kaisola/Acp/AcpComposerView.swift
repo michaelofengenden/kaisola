@@ -14,6 +14,8 @@ struct AcpComposerCard: View {
     @ObservedObject var conversation: AcpConversation
     @Binding var draft: String
     @FocusState.Binding var focused: Bool
+    @FocusState.Binding var attachmentFocused: Bool
+    var attachmentAccessibilityFocused: AccessibilityFocusState<Bool>.Binding
     /// True while the conversation has produced nothing, which is the only
     /// thing that changes about the card: its placeholder.
     var isNewConversation = false
@@ -24,6 +26,7 @@ struct AcpComposerCard: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @State private var menuPresented = false
+    @State private var attachmentMenuPresented = false
     @State private var menuQuery = ""
     /// Bumped on every open so the menu's own `@State` — which row is armed,
     /// where the highlight sits, whether Advanced is expanded — starts clean.
@@ -65,7 +68,7 @@ struct AcpComposerCard: View {
     private var sendEnabled: Bool {
         AcpComposerSendPolicy.isEnabled(
             draft: draft,
-            isConnected: conversation.isConnected,
+            isConnected: conversation.allowsInference,
             isRunning: conversation.isRunning,
             hasAttachments: !conversation.pendingAttachments.isEmpty
         )
@@ -80,6 +83,8 @@ struct AcpComposerCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
+            providerLaunchNotice
+
             TextField(placeholder, text: $draft, axis: .vertical)
                 .textFieldStyle(.plain)
                 .font(.callout)
@@ -109,6 +114,65 @@ struct AcpComposerCard: View {
         .accessibilityIdentifier("acp.composer")
         .task(id: agentName) {
             favorites = favoritesStore.favorites(agentKey: agentName)
+        }
+    }
+
+    @ViewBuilder
+    private var providerLaunchNotice: some View {
+        if let fallback = conversation.pendingModelFallback {
+            VStack(alignment: .leading, spacing: 7) {
+                Label("Confirm model fallback", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.orange)
+                Text("Requested \(fallback.requestedLabel); \(fallback.providerName) account “\(fallback.accountLabel)” selected \(fallback.actualLabel). No prompt will run until you choose.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                HStack(spacing: 8) {
+                    Button("Use \(fallback.actualLabel)") {
+                        conversation.acceptModelFallback()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("acp.model-fallback.accept")
+                    Button("Cancel") {
+                        Task { await conversation.cancelModelFallback() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .accessibilityIdentifier("acp.model-fallback.cancel")
+                }
+            }
+            .padding(12)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("acp.model-fallback")
+            Divider()
+        } else if let failure = conversation.providerStartupFailure {
+            VStack(alignment: .leading, spacing: 7) {
+                Label("\(failure.providerName) could not start", systemImage: "exclamationmark.octagon.fill")
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.red)
+                Text("Account: \(failure.accountLabel)")
+                    .font(.caption.weight(.medium))
+                Text(failure.detail)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Button("Open \(failure.settingsTitle)") {
+                    NotificationCenter.default.post(
+                        name: .kaisolaOpenProviderSettings,
+                        object: model,
+                        userInfo: [AcpProviderSettingsNotificationKey.sectionID: failure.settingsSectionID]
+                    )
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .accessibilityIdentifier("acp.provider-failure.settings")
+            }
+            .padding(12)
+            .accessibilityElement(children: .contain)
+            .accessibilityIdentifier("acp.provider-failure")
+            Divider()
         }
     }
 
@@ -142,6 +206,7 @@ struct AcpComposerCard: View {
 
             Spacer(minLength: 8)
 
+            runProfileChip
             settingsPill
                 .layoutPriority(1)
             trailingControls
@@ -157,25 +222,61 @@ struct AcpComposerCard: View {
             .accessibilityHidden(true)
     }
 
+    /// Visible before the first prompt because capability advertisement has
+    /// already been fixed for this adapter process. Selecting another profile
+    /// asks AppModel to rebuild the process rather than mutating its policy.
+    private var runProfileChip: some View {
+        let profile = conversation.runProfile
+        let knownServers = McpConfigStore(workspace: conversation.workspaceURL).servers().map(\.name)
+        let warnings = profile.availabilityWarnings(knownMCPServerNames: knownServers)
+        return Menu {
+            ForEach(AcpRunProfileStore().all()) { candidate in
+                Button {
+                    guard let chatID = model.chats.first(where: {
+                        $0.conversation === conversation
+                    })?.id else { return }
+                    Task { await model.switchChatRunProfile(chatID, to: candidate.id) }
+                } label: {
+                    if candidate.id == profile.id {
+                        Label(candidate.name, systemImage: "checkmark")
+                    } else {
+                        Text(candidate.name)
+                    }
+                }
+            }
+            if !warnings.isEmpty {
+                Divider()
+                ForEach(warnings, id: \.self) { warning in
+                    Text(warning)
+                }
+            }
+            Divider()
+            Button("Manage Profiles…") {
+                NSApp.sendAction(
+                    #selector(KaisolaMacAppDelegate.openAgentSettings(_:)),
+                    to: nil,
+                    from: nil
+                )
+            }
+        } label: {
+            AcpComposerChipLabel(label: profile.name, tint: warnings.isEmpty ? nil : .orange) {
+                Image(systemName: warnings.isEmpty ? "checkmark.shield" : "exclamationmark.triangle")
+                    .font(.system(size: 10, weight: .medium))
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help(warnings.first ?? "Run profile: model, host tools, and MCP availability")
+        .accessibilityLabel("Run profile: \(profile.name)" + (warnings.isEmpty ? "" : ", \(warnings.joined(separator: " "))"))
+        .accessibilityIdentifier("acp.composer.run-profile")
+    }
+
     // MARK: - Attachment menu
 
     private var attachmentMenu: some View {
-        Menu {
-            Button(action: openAttachmentPanel) {
-                Label("Add files or photos", systemImage: "paperclip")
-            }
-            .keyboardShortcut("u", modifiers: .command)
-
-            // "Add folder" and "Import GitHub issue" are deliberately absent:
-            // `AcpAttachmentClassifier` rejects directories, and nothing in the
-            // app turns an issue into a prompt. A greyed-out row would only
-            // advertise a capability that does not exist.
-            if !conversation.commands.isEmpty {
-                Divider()
-                Button(action: beginSlashCommand) {
-                    Label("Slash commands", systemImage: "text.badge.plus")
-                }
-            }
+        Button {
+            attachmentMenuPresented = true
         } label: {
             Group {
                 if conversation.preparingAttachmentCount > 0 {
@@ -187,13 +288,64 @@ struct AcpComposerCard: View {
             .frame(width: 22, height: 22)
             .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
         .fixedSize()
-        .disabled(!conversation.isConnected)
+        .disabled(!conversation.allowsInference)
         .help("Attach files or photos, or insert a slash command")
         .accessibilityLabel("Add attachments")
         .accessibilityIdentifier("acp.composer.attach")
+        .focusable()
+        .focused($attachmentFocused)
+        .accessibilityFocused(attachmentAccessibilityFocused)
+        .background {
+            // Popover content is not mounted while it is closed, so a shortcut
+            // declared on the row inside it disappears from AppKit's command
+            // routing. Keep one zero-layout key-equivalent owner beside the
+            // always-mounted trigger instead. Focus scopes it to the composer
+            // the user is actually operating; the AppKit bridge adds the key-
+            // window gate so another project window cannot answer the press.
+            AcpAttachmentCommandKeyEquivalent(
+                isEnabled: conversation.isConnected
+                    && (focused || attachmentFocused || attachmentMenuPresented),
+                panelPresenter: {
+                    attachmentMenuPresented = false
+                    openAttachmentPanel()
+                }
+            )
+            .frame(width: 1, height: 1)
+            .accessibilityHidden(true)
+        }
+        .popover(isPresented: $attachmentMenuPresented, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 4) {
+                Button {
+                    attachmentMenuPresented = false
+                    openAttachmentPanel()
+                } label: {
+                    Label("Add files or photos", systemImage: "paperclip")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+
+                // "Add folder" and "Import GitHub issue" are deliberately absent:
+                // `AcpAttachmentClassifier` rejects directories, and nothing in the
+                // app turns an issue into a prompt. A greyed-out row would only
+                // advertise a capability that does not exist.
+                if !conversation.commands.isEmpty {
+                    Divider()
+                    Button {
+                        attachmentMenuPresented = false
+                        beginSlashCommand()
+                    } label: {
+                        Label("Slash commands", systemImage: "text.badge.plus")
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .padding(8)
+            .frame(minWidth: 190)
+        }
     }
 
     private func beginSlashCommand() {
@@ -238,12 +390,19 @@ struct AcpComposerCard: View {
             menuGeneration += 1
             menuPresented = true
         } label: {
-            AcpComposerPillLabel(primary: values.primary, secondary: values.secondary) {
+            AcpComposerPillLabel(
+                primary: values.primary,
+                secondary: values.secondary,
+                isPending: conversation.pendingConfigOptionID != nil
+            ) {
                 QuietIdentityMarkView(identity: identity, size: 13)
             }
         }
         .buttonStyle(AcpComposerChipButtonStyle(shape: AnyShape(Capsule()), restingOpacity: 0.32))
-        .help("Agent, model, and the settings this chat runs on")
+        .disabled(conversation.pendingConfigOptionID != nil || conversation.pendingModelFallback != nil)
+        .help(conversation.pendingConfigOptionID == nil
+            ? "Agent, model, and the settings this chat runs on"
+            : "Waiting for the agent to confirm this setting")
         .accessibilityLabel(pillAccessibilityLabel(values))
         .accessibilityIdentifier("acp.composer.settings")
         .popover(isPresented: $menuPresented, arrowEdge: .top) {
@@ -281,7 +440,8 @@ struct AcpComposerCard: View {
 
     private func pillAccessibilityLabel(_ values: (primary: String, secondary: String?)) -> String {
         let tail = values.secondary.map { ", \($0)" } ?? ""
-        return "Chat settings: \(values.primary)\(tail)"
+        let pending = conversation.pendingConfigOptionID == nil ? "" : ", change pending"
+        return "Chat settings: \(values.primary)\(tail)\(pending)"
     }
 
     private func submenu(_ target: AcpComposerMenuRow.Target) -> AcpComposerSubmenu {
@@ -416,7 +576,7 @@ struct AcpComposerCard: View {
                     .foregroundStyle(Color.white.opacity(sendEnabled ? 1 : 0.7))
                     .frame(width: 26, height: 26)
                     .background(
-                        sendEnabled ? Color.accentColor : Color.secondary.opacity(0.32),
+                        sendEnabled ? Color.accentColor : Color.kaisolaDisabled,
                         in: Circle()
                     )
             }
@@ -425,6 +585,51 @@ struct AcpComposerCard: View {
             .help(sendAction == .queue ? "Queue this as a follow-up" : "Send")
             .accessibilityLabel(sendAction == .queue ? "Queue follow-up" : "Send message")
             .accessibilityIdentifier("acp.composer.send")
+        }
+    }
+}
+
+/// The attachment shortcut has to outlive the popover it can dismiss.
+///
+/// SwiftUI's `.keyboardShortcut` is presentation-scoped: putting Command-U on
+/// a button inside a closed popover leaves no registered command. This mounted
+/// AppKit view participates in the normal key-equivalent traversal instead. It
+/// deliberately refuses repeats, extra modifiers, inactive windows, and an
+/// inactive/disconnected composer before invoking the injected panel action.
+@MainActor
+struct AcpAttachmentCommandKeyEquivalent: NSViewRepresentable {
+    let isEnabled: Bool
+    let panelPresenter: @MainActor () -> Void
+
+    func makeNSView(context: Context) -> CommandView {
+        let view = CommandView()
+        view.setAccessibilityElement(false)
+        return view
+    }
+
+    func updateNSView(_ nsView: CommandView, context: Context) {
+        nsView.isShortcutEnabled = isEnabled
+        nsView.panelPresenter = panelPresenter
+    }
+
+    @MainActor
+    final class CommandView: NSView {
+        var isShortcutEnabled = false
+        var panelPresenter: (@MainActor () -> Void)?
+
+        override func performKeyEquivalent(with event: NSEvent) -> Bool {
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard isShortcutEnabled,
+                  window?.isKeyWindow == true,
+                  event.type == .keyDown,
+                  !event.isARepeat,
+                  modifiers == [.command],
+                  event.charactersIgnoringModifiers?.lowercased() == "u",
+                  let panelPresenter else {
+                return super.performKeyEquivalent(with: event)
+            }
+            panelPresenter()
+            return true
         }
     }
 }
@@ -451,7 +656,7 @@ struct AcpComposerChipLabel<Leading: View>: View {
                 .lineLimit(1)
             Image(systemName: "chevron.down")
                 .font(.system(size: 7, weight: .semibold))
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.kaisolaTertiary)
         }
         .foregroundStyle(tint ?? .primary)
         .padding(.horizontal, 7)
@@ -467,11 +672,18 @@ struct AcpComposerChipLabel<Leading: View>: View {
 struct AcpComposerPillLabel<Leading: View>: View {
     let primary: String
     var secondary: String?
+    var isPending = false
     @ViewBuilder var leading: () -> Leading
 
-    init(primary: String, secondary: String? = nil, @ViewBuilder leading: @escaping () -> Leading) {
+    init(
+        primary: String,
+        secondary: String? = nil,
+        isPending: Bool = false,
+        @ViewBuilder leading: @escaping () -> Leading
+    ) {
         self.primary = primary
         self.secondary = secondary
+        self.isPending = isPending
         self.leading = leading
     }
 
@@ -485,12 +697,19 @@ struct AcpComposerPillLabel<Leading: View>: View {
             if let secondary {
                 Text(secondary)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(1)
             }
-            Image(systemName: "chevron.down")
-                .font(.system(size: 7, weight: .semibold))
-                .foregroundStyle(.tertiary)
+            if isPending {
+                ProgressView()
+                    .controlSize(.mini)
+                    .frame(width: 9, height: 9)
+                    .accessibilityHidden(true)
+            } else {
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 7, weight: .semibold))
+                    .foregroundStyle(.kaisolaTertiary)
+            }
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 5)

@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Foundation
 import SwiftUI
 import WebKit
@@ -59,131 +60,294 @@ actor PreviewParseCache<Value: Sendable> {
 
 /// RFC-4180-ish CSV/TSV parsing. Pure so tests can drive it directly.
 enum CsvTable {
+    struct Truncation: Equatable, Sendable {
+        let actualRowCount: Int
+        let displayedRowCount: Int
+        let actualColumnCount: Int
+        let displayedColumnCount: Int
+
+        static let empty = Truncation(
+            actualRowCount: 0,
+            displayedRowCount: 0,
+            actualColumnCount: 0,
+            displayedColumnCount: 0
+        )
+
+        var rowsWereTruncated: Bool { actualRowCount > displayedRowCount }
+        var columnsWereTruncated: Bool { actualColumnCount > displayedColumnCount }
+        var isTruncated: Bool { rowsWereTruncated || columnsWereTruncated }
+
+        /// A dimension-specific summary for the visible warning. Counts name
+        /// both the retained grid and the complete parsed document so the
+        /// warning never implies missing rows for a column-only truncation.
+        var notice: String? {
+            switch (rowsWereTruncated, columnsWereTruncated) {
+            case (true, true):
+                "Showing \(displayedRowCount) of \(actualRowCount) rows and "
+                    + "\(displayedColumnCount) of \(actualColumnCount) columns."
+            case (true, false):
+                "Showing \(displayedRowCount) of \(actualRowCount) rows."
+            case (false, true):
+                "Showing \(displayedColumnCount) of \(actualColumnCount) columns."
+            case (false, false):
+                nil
+            }
+        }
+    }
+
+    struct ParseResult: Equatable, Sendable {
+        let rows: [[String]]
+        let truncation: Truncation
+
+        var truncated: Bool { truncation.isTruncated }
+    }
+
+    struct DelimiterDetection: Equatable, Sendable {
+        let delimiter: Character
+        let inspectedByteCount: Int
+    }
+
     /// Rendering caps: excess rows/columns are dropped and flagged so a
     /// pathological file can never realize an unbounded grid.
     static let maxRows = 2_000
     static let maxCols = 64
 
+    /// Delimiter guessing is on the first-paint path. A normal record ends far
+    /// before this bound; the cap only matters for malformed or generated files
+    /// with no record separator, where scanning the whole document would turn a
+    /// cheap guess into a second full parse.
+    static let delimiterSampleByteLimit = 64 * 1_024
+
+    /// Forward-only access to borrowed UTF-8 storage. Production uses either a
+    /// contiguous view of the source or the source's own `String.UTF8View`, so
+    /// parsing never begins by materializing the document as `[Character]`.
+    struct UTF8Cursor<Source: Collection> where Source.Element == UInt8 {
+        private let source: Source
+        private var index: Source.Index
+
+        init(_ source: Source) {
+            self.source = source
+            index = source.startIndex
+        }
+
+        func peek() -> UInt8? {
+            guard index != source.endIndex else { return nil }
+            return source[index]
+        }
+
+        @discardableResult
+        mutating func take() -> UInt8? {
+            guard index != source.endIndex else { return nil }
+            let byte = source[index]
+            index = source.index(after: index)
+            return byte
+        }
+
+        /// Consume `bytes` only when the complete sequence is next. A failed
+        /// lookahead leaves the cursor unchanged.
+        mutating func consume(_ bytes: ArraySlice<UInt8>) -> Bool {
+            var candidate = index
+            for expected in bytes {
+                guard candidate != source.endIndex, source[candidate] == expected else {
+                    return false
+                }
+                candidate = source.index(after: candidate)
+            }
+            index = candidate
+            return true
+        }
+    }
+
     /// Parse `text` into rows of fields. Handles quoted fields, `""`-escaped
     /// quotes, embedded newlines inside quotes, and CRLF/CR/LF record endings.
-    /// Returns the (capped) rows plus a `truncated` flag set when any row or
-    /// column past the cap was dropped.
+    /// Returns the capped rows plus separate actual/displayed dimensions for
+    /// rows and columns. Counting continues after either render cap is reached,
+    /// but discarded field contents are never retained.
     ///
     /// Pure — `nonisolated` keeps CI's strict-concurrency inference from pinning
     /// it to the main actor just because the file also defines SwiftUI views.
-    nonisolated static func parse(_ text: String, delimiter: Character = ",") -> (rows: [[String]], truncated: Bool) {
-        let chars = Array(text)
-        let count = chars.count
+    nonisolated static func parse(_ text: String, delimiter: Character = ",") -> ParseResult {
+        // A Character can contain multiple UTF-8 bytes. Delimiters used by the
+        // preview are ASCII, but preserving the public parser contract costs
+        // only this tiny, delimiter-sized buffer.
+        let delimiterBytes = Array(String(delimiter).utf8)
+
+        // Native Swift strings normally expose contiguous UTF-8 storage. Parse
+        // that storage in place for an integer-indexed hot loop, while retaining
+        // a single-pass view fallback for strings without contiguous storage.
+        if let result = text.utf8.withContiguousStorageIfAvailable({ bytes in
+            parse(bytes, delimiterBytes: delimiterBytes)
+        }) {
+            return result
+        }
+        return parse(text.utf8, delimiterBytes: delimiterBytes)
+    }
+
+    private nonisolated static func parse<Source: Collection>(
+        _ source: Source,
+        delimiterBytes: [UInt8]
+    ) -> ParseResult where Source.Element == UInt8 {
+        var cursor = UTF8Cursor(source)
         var rows: [[String]] = []
         var record: [String] = []
-        var field = ""
+        var fieldBytes: [UInt8] = []
+        // Once a row or column is outside the render cap its value is not
+        // retained. This separate flag preserves field-start quote semantics
+        // even when `field` deliberately stays empty.
+        var fieldIsEmpty = true
+        var fieldCount = 0
+        var actualRowCount = 0
+        var actualColumnCount = 0
         var inQuotes = false
-        var truncated = false
-        var index = 0
+
+        func appendToField(_ byte: UInt8) {
+            if rows.count < maxRows, record.count < maxCols {
+                fieldBytes.append(byte)
+            }
+            fieldIsEmpty = false
+        }
 
         func endField() {
-            if record.count < maxCols {
-                record.append(field)
-            } else {
-                truncated = true
+            fieldCount += 1
+            if rows.count < maxRows, record.count < maxCols {
+                record.append(String(decoding: fieldBytes, as: UTF8.self))
             }
-            field = ""
+            fieldBytes.removeAll(keepingCapacity: true)
+            fieldIsEmpty = true
         }
         func endRecord() {
             endField()
+            actualRowCount += 1
+            actualColumnCount = max(actualColumnCount, fieldCount)
             if rows.count < maxRows {
                 rows.append(record)
-            } else {
-                truncated = true
             }
             record = []
+            fieldCount = 0
         }
 
-        while index < count {
-            let character = chars[index]
+        while let byte = cursor.take() {
             if inQuotes {
-                if character == "\"" {
+                if byte == 0x22 {
                     // A doubled quote inside a quoted field is a literal quote;
                     // a lone quote closes the field.
-                    if index + 1 < count, chars[index + 1] == "\"" {
-                        field.append("\"")
-                        index += 2
+                    if cursor.peek() == 0x22 {
+                        appendToField(0x22)
+                        cursor.take()
                     } else {
                         inQuotes = false
-                        index += 1
                     }
                 } else {
-                    field.append(character)
-                    index += 1
+                    appendToField(byte)
                 }
                 continue
             }
 
-            switch character {
-            case "\"" where field.isEmpty:
+            if byte == 0x22, fieldIsEmpty {
                 // A quote opens a quoted field ONLY at field start (RFC-4180).
                 // A quote mid-field (e.g. 3"5) is a literal character — handled
                 // by `default` — so one stray quote can't swallow the rest of
                 // the file into a single never-closed field.
                 inQuotes = true
-                index += 1
-            case delimiter:
+            } else if byte == delimiterBytes[0],
+                      delimiterBytes.count == 1 || cursor.consume(delimiterBytes.dropFirst()) {
                 endField()
-                index += 1
-            case "\r\n", "\r", "\n":
-                // Swift segments a CRLF pair into ONE grapheme Character, so the
-                // "\r\n" literal matches that combined form; lone CR / LF cover
-                // the classic-Mac and Unix endings.
+            } else if byte == 0x0D {
+                // Treat CRLF as one record separator while retaining both
+                // bytes verbatim when the pair appears inside a quoted field.
+                if cursor.peek() == 0x0A {
+                    cursor.take()
+                }
                 endRecord()
-                index += 1
-            default:
-                field.append(character)
-                index += 1
+            } else if byte == 0x0A {
+                endRecord()
+            } else {
+                appendToField(byte)
             }
         }
 
         // Flush a trailing record only when real data is pending, so a file that
         // ends on a newline does not yield a spurious empty final row.
-        if !field.isEmpty || !record.isEmpty {
+        if !fieldIsEmpty || fieldCount > 0 {
             endRecord()
         }
-        return (rows, truncated)
+        let displayedColumnCount = rows.reduce(0) { max($0, $1.count) }
+        return ParseResult(
+            rows: rows,
+            truncation: Truncation(
+                actualRowCount: actualRowCount,
+                displayedRowCount: rows.count,
+                actualColumnCount: actualColumnCount,
+                displayedColumnCount: displayedColumnCount
+            )
+        )
     }
 
-    /// Guess the delimiter from the first non-empty line by counting comma,
-    /// semicolon, and tab occurrences outside quotes. Comma wins ties and is the
-    /// fallback when no delimiter is present.
+    /// Guess the delimiter from a bounded sample of the first non-empty line.
+    /// Comma wins ties and is the fallback when no delimiter is present.
     nonisolated static func detectDelimiter(_ text: String) -> Character {
-        let candidates: [Character] = [",", ";", "\t"]
-        let firstLine = text.split(
-            omittingEmptySubsequences: true,
-            whereSeparator: { $0.isNewline }
-        ).first ?? ""
+        delimiterSample(in: text).delimiter
+    }
 
-        var counts: [Character: Int] = [:]
+    /// Exposes the sample size to the performance contract without requiring a
+    /// second traversal of the source string.
+    nonisolated static func delimiterSample(in text: String) -> DelimiterDetection {
+        if let detection = text.utf8.withContiguousStorageIfAvailable({ bytes in
+            delimiterSample(bytes)
+        }) {
+            return detection
+        }
+        return delimiterSample(text.utf8)
+    }
+
+    private nonisolated static func delimiterSample<Source: Collection>(
+        _ source: Source
+    ) -> DelimiterDetection where Source.Element == UInt8 {
+        var commaCount = 0
+        var semicolonCount = 0
+        var tabCount = 0
         var inQuotes = false
-        for character in firstLine {
-            if character == "\"" {
+        var lineHasContent = false
+        var inspectedByteCount = 0
+
+        for byte in source.prefix(delimiterSampleByteLimit) {
+            inspectedByteCount += 1
+
+            if byte == 0x0D || byte == 0x0A {
+                if lineHasContent { break }
+                continue
+            }
+
+            lineHasContent = true
+            if byte == 0x22 {
                 inQuotes.toggle()
-            } else if !inQuotes, candidates.contains(character) {
-                counts[character, default: 0] += 1
+            } else if !inQuotes {
+                switch byte {
+                case 0x2C: commaCount += 1
+                case 0x3B: semicolonCount += 1
+                case 0x09: tabCount += 1
+                default: break
+                }
             }
         }
 
         var best: Character = ","
-        var bestCount = 0
-        for candidate in candidates where (counts[candidate] ?? 0) > bestCount {
-            best = candidate
-            bestCount = counts[candidate] ?? 0
+        var bestCount = commaCount
+        if semicolonCount > bestCount {
+            best = ";"
+            bestCount = semicolonCount
         }
-        return best
+        if tabCount > bestCount {
+            best = "\t"
+        }
+        return DelimiterDetection(delimiter: best, inspectedByteCount: inspectedByteCount)
     }
 }
 
-/// The render-ready projection of a CSV/TSV document: capped rows, the
-/// truncation flag, and the fixed per-column widths that keep cells aligned
-/// across a vertically lazy list. Built once per content identity — this used to
-/// run in `CsvPreview.init`, so every SwiftUI body evaluation re-parsed the
+/// The render-ready projection of a CSV/TSV document: capped rows, exact
+/// truncation dimensions, and fixed per-column widths that keep cells aligned
+/// across a vertically lazy list. Built once per content identity — this used
+/// to run in `CsvPreview.init`, so every SwiftUI body evaluation re-parsed the
 /// whole file.
 struct CsvPreviewModel: Equatable, Sendable {
     static let minimumColumnWidth: CGFloat = 46
@@ -193,14 +357,16 @@ struct CsvPreviewModel: Equatable, Sendable {
     static let cellPadding: CGFloat = 10
 
     let rows: [[String]]
-    let truncated: Bool
+    let truncation: CsvTable.Truncation
     let columnWidths: [CGFloat]
 
-    static let empty = CsvPreviewModel(rows: [], truncated: false, columnWidths: [])
+    var truncated: Bool { truncation.isTruncated }
+
+    static let empty = CsvPreviewModel(rows: [], truncation: .empty, columnWidths: [])
 
     nonisolated static func make(_ text: String) -> CsvPreviewModel {
         let parsed = CsvTable.parse(text, delimiter: CsvTable.detectDelimiter(text))
-        let columnCount = parsed.rows.map(\.count).max() ?? 0
+        let columnCount = parsed.truncation.displayedColumnCount
         var widths = [CGFloat](repeating: minimumColumnWidth, count: columnCount)
         for row in parsed.rows {
             for (column, value) in row.enumerated() where column < columnCount {
@@ -211,22 +377,202 @@ struct CsvPreviewModel: Equatable, Sendable {
                 if fitted > widths[column] { widths[column] = fitted }
             }
         }
-        return CsvPreviewModel(rows: parsed.rows, truncated: parsed.truncated, columnWidths: widths)
+        return CsvPreviewModel(rows: parsed.rows, truncation: parsed.truncation, columnWidths: widths)
     }
 }
 
-/// A scrollable table for CSV/TSV text. The first row is styled as a header;
-/// cells are monospaced 12pt with fixed per-column widths so columns align
-/// across a vertically lazy list. Delimiter is auto-detected.
+/// Stable, lossless metadata for one visible CSV cell. The coordinate-based
+/// identity keeps duplicate values distinct and remains stable while a value is
+/// disclosed; the full source value never depends on the table's visual
+/// truncation.
+struct CsvCellInspection: Equatable, Sendable, Identifiable {
+    struct ID: Hashable, Sendable {
+        let rowIndex: Int
+        let columnIndex: Int
+    }
+
+    let id: ID
+    let value: String
+    private let rowAccessibilityLabel: String
+
+    init(
+        rowIndex: Int,
+        columnIndex: Int,
+        value: String,
+        rowAccessibilityLabel: String? = nil
+    ) {
+        id = ID(rowIndex: rowIndex, columnIndex: columnIndex)
+        self.value = value
+        self.rowAccessibilityLabel = rowAccessibilityLabel ?? "Row \(rowIndex + 1)"
+    }
+
+    var accessibilityLabel: String {
+        "\(rowAccessibilityLabel), column \(id.columnIndex + 1)"
+    }
+
+    var accessibilityValue: String {
+        value.isEmpty ? "Empty cell" : value
+    }
+
+    var accessibilityHint: String {
+        "Press Return to inspect the complete value and copy it."
+    }
+}
+
+/// A small seam keeps exact-value clipboard behavior deterministic in tests and
+/// lets the UI surface pasteboard refusal instead of claiming a copy succeeded.
+enum CsvCellClipboard {
+    @discardableResult
+    static func copy(_ value: String, to pasteboard: NSPasteboard = .general) -> Bool {
+        pasteboard.clearContents()
+        return pasteboard.setString(value, forType: .string)
+    }
+}
+
+enum CsvHeaderMode: String, CaseIterable, Identifiable, Sendable {
+    case automatic
+    case firstRowIsHeader
+    case noHeader
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .automatic: "Auto"
+        case .firstRowIsHeader: "First Row Is Header"
+        case .noHeader: "No Header"
+        }
+    }
+}
+
+struct CsvHeaderResolution: Equatable, Sendable {
+    let mode: CsvHeaderMode
+    let hasHeader: Bool
+
+    init(mode: CsvHeaderMode, rows: [[String]]) {
+        self.mode = mode
+        switch mode {
+        case .automatic:
+            hasHeader = Self.automaticHeaderEvidence(in: rows)
+        case .firstRowIsHeader:
+            hasHeader = !rows.isEmpty
+        case .noHeader:
+            hasHeader = false
+        }
+    }
+
+    func isHeader(rowIndex: Int) -> Bool {
+        hasHeader && rowIndex == 0
+    }
+
+    func dataRowNumber(rowIndex: Int) -> Int? {
+        guard rowIndex >= 0 else { return nil }
+        if hasHeader {
+            return rowIndex == 0 ? nil : rowIndex
+        }
+        return rowIndex + 1
+    }
+
+    func accessibilityLabel(rowIndex: Int, columnIndex: Int) -> String {
+        if isHeader(rowIndex: rowIndex) {
+            return "Header, column \(columnIndex + 1)"
+        }
+        return "Row \(dataRowNumber(rowIndex: rowIndex) ?? rowIndex + 1), column \(columnIndex + 1)"
+    }
+
+    /// Automatic mode only promotes row zero when a later value supplies
+    /// concrete type evidence (for example `age` followed by `36`). Ambiguous
+    /// all-text tables remain data rows until the user explicitly opts in.
+    private static func automaticHeaderEvidence(in rows: [[String]]) -> Bool {
+        guard rows.count > 1 else { return false }
+        let first = rows[0]
+        let second = rows[1]
+        let comparableColumns = min(first.count, second.count)
+        guard comparableColumns > 0 else { return false }
+        return (0..<comparableColumns).contains { column in
+            let candidate = first[column].trimmingCharacters(in: .whitespacesAndNewlines)
+            let value = second[column].trimmingCharacters(in: .whitespacesAndNewlines)
+            return !candidate.isEmpty
+                && !Self.isTypedData(candidate)
+                && Self.isTypedData(value)
+        }
+    }
+
+    private static func isTypedData(_ value: String) -> Bool {
+        guard !value.isEmpty else { return false }
+        if Double(value) != nil { return true }
+        switch value.lowercased() {
+        case "true", "false", "yes", "no", "null", "nil": return true
+        default: return false
+        }
+    }
+}
+
+/// Per-document preference storage. The key contains only a SHA-256 digest of
+/// the standardized path, so UserDefaults never becomes an absolute-path
+/// inventory. Automatic is the implicit default and removes any stored value.
+final class CsvHeaderPreferenceStore: @unchecked Sendable {
+    static let shared = CsvHeaderPreferenceStore()
+
+    private static let keyPrefix = "csvHeaderMode.v1."
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+    }
+
+    func mode(forPath path: String) -> CsvHeaderMode {
+        guard let rawValue = defaults.string(forKey: key(forPath: path)) else {
+            return .automatic
+        }
+        return CsvHeaderMode(rawValue: rawValue) ?? .automatic
+    }
+
+    func set(_ mode: CsvHeaderMode, forPath path: String) {
+        let key = key(forPath: path)
+        if mode == .automatic {
+            defaults.removeObject(forKey: key)
+        } else {
+            defaults.set(mode.rawValue, forKey: key)
+        }
+    }
+
+    private func key(forPath path: String) -> String {
+        let standardized = URL(fileURLWithPath: path).standardizedFileURL.path
+        let digest = SHA256.hash(data: Data(standardized.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        return Self.keyPrefix + digest
+    }
+}
+
+/// A scrollable table for CSV/TSV text. Header semantics are inferred or
+/// explicitly selected per document; cells are monospaced 12pt with fixed
+/// per-column widths so columns align across a vertically lazy list.
 struct CsvPreview: View {
     let text: String
     let identity: PreviewParseIdentity
+    private let preferenceStore: CsvHeaderPreferenceStore
 
     @State private var cache = PreviewParseCache<CsvPreviewModel>()
     @State private var model: CsvPreviewModel?
     @State private var preparedIdentity: PreviewParseIdentity?
+    @State private var inspectedCell: CsvCellInspection?
+    @State private var headerMode: CsvHeaderMode
+    @FocusState private var focusedCellID: CsvCellInspection.ID?
 
     private static let cellFont = Font.system(size: 12, design: .monospaced)
+
+    init(
+        text: String,
+        identity: PreviewParseIdentity,
+        preferenceStore: CsvHeaderPreferenceStore = .shared
+    ) {
+        self.text = text
+        self.identity = identity
+        self.preferenceStore = preferenceStore
+        _headerMode = State(initialValue: preferenceStore.mode(forPath: identity.path))
+    }
 
     var body: some View {
         Group {
@@ -239,6 +585,11 @@ struct CsvPreview: View {
             }
         }
         .task(id: identity) {
+            // A retargeted preview must never keep disclosing a value from the
+            // previous document while its replacement is parsing.
+            inspectedCell = nil
+            focusedCellID = nil
+            headerMode = preferenceStore.mode(forPath: identity.path)
             let source = text
             let parsed = await cache.value(for: source, parse: CsvPreviewModel.make)
             guard !Task.isCancelled else { return }
@@ -248,8 +599,10 @@ struct CsvPreview: View {
     }
 
     private func table(_ model: CsvPreviewModel) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if model.truncated { truncationNotice(rowCount: model.rows.count) }
+        let headerResolution = CsvHeaderResolution(mode: headerMode, rows: model.rows)
+        return VStack(alignment: .leading, spacing: 0) {
+            headerControls(headerResolution)
+            if let notice = model.truncation.notice { truncationNotice(notice) }
             if model.rows.isEmpty {
                 ContentUnavailableView(
                     "Empty file",
@@ -261,7 +614,12 @@ struct CsvPreview: View {
                 ScrollView([.horizontal, .vertical]) {
                     LazyVStack(alignment: .leading, spacing: 0) {
                         ForEach(Array(model.rows.enumerated()), id: \.offset) { index, row in
-                            rowView(row, columnWidths: model.columnWidths, isHeader: index == 0)
+                            rowView(
+                                row,
+                                rowIndex: index,
+                                columnWidths: model.columnWidths,
+                                headerResolution: headerResolution
+                            )
                             Divider()
                         }
                     }
@@ -271,40 +629,193 @@ struct CsvPreview: View {
         }
     }
 
-    private func rowView(_ row: [String], columnWidths: [CGFloat], isHeader: Bool) -> some View {
-        HStack(spacing: 0) {
+    private func headerControls(_ resolution: CsvHeaderResolution) -> some View {
+        HStack(spacing: 8) {
+            Text("Header Row")
+                .font(.caption.weight(.medium))
+            Picker("Header Row", selection: headerModeSelection) {
+                ForEach(CsvHeaderMode.allCases) { mode in
+                    Text(mode.title).tag(mode)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .accessibilityLabel("CSV header row")
+            .accessibilityValue(headerMode.title)
+            .accessibilityIdentifier("csv.headerMode")
+            if headerMode == .automatic {
+                Text(resolution.hasHeader ? "Header detected" : "No header detected")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .accessibilityLabel(
+                        resolution.hasHeader
+                            ? "Auto detected a header row"
+                            : "Auto detected no header row"
+                    )
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 5)
+        .background(Color.primary.opacity(0.035))
+    }
+
+    private var headerModeSelection: Binding<CsvHeaderMode> {
+        Binding(
+            get: { headerMode },
+            set: { mode in
+                headerMode = mode
+                preferenceStore.set(mode, forPath: identity.path)
+            }
+        )
+    }
+
+    private func rowView(
+        _ row: [String],
+        rowIndex: Int,
+        columnWidths: [CGFloat],
+        headerResolution: CsvHeaderResolution
+    ) -> some View {
+        let isHeader = headerResolution.isHeader(rowIndex: rowIndex)
+        let dataRowNumber = headerResolution.dataRowNumber(rowIndex: rowIndex)
+        return HStack(spacing: 0) {
+            Text(isHeader ? "Header" : String(dataRowNumber ?? rowIndex + 1))
+                .font(.caption2.monospacedDigit().weight(isHeader ? .semibold : .regular))
+                .foregroundStyle(.secondary)
+                .frame(width: 48, alignment: .trailing)
+                .padding(.trailing, 8)
+                .help(isHeader ? "Header row" : "Data row \(dataRowNumber ?? rowIndex + 1)")
+                .accessibilityHidden(true)
             ForEach(Array(columnWidths.enumerated()), id: \.offset) { column, width in
-                cell(column < row.count ? row[column] : "", width: width, isHeader: isHeader)
+                cell(
+                    CsvCellInspection(
+                        rowIndex: rowIndex,
+                        columnIndex: column,
+                        value: column < row.count ? row[column] : "",
+                        rowAccessibilityLabel: isHeader
+                            ? "Header"
+                            : "Row \(dataRowNumber ?? rowIndex + 1)"
+                    ),
+                    width: width,
+                    isHeader: isHeader
+                )
             }
         }
         .background(isHeader ? Color.secondary.opacity(0.15) : Color.clear)
     }
 
-    private func cell(_ value: String, width: CGFloat, isHeader: Bool) -> some View {
-        Text(value)
-            .font(Self.cellFont)
-            .fontWeight(isHeader ? .semibold : .regular)
-            .lineLimit(1)
-            .truncationMode(.tail)
-            .textSelection(.enabled)
-            .padding(.horizontal, CsvPreviewModel.cellPadding)
-            .padding(.vertical, 5)
-            .frame(width: width, alignment: .leading)
-            // A trailing hairline as a column separator; an overlay matches the
-            // cell's height exactly, avoiding the ambiguity a bare Divider has
-            // inside an HStack.
-            .overlay(alignment: .trailing) {
-                Rectangle().fill(Color.primary.opacity(0.08)).frame(width: 1)
-            }
+    private func cell(
+        _ inspection: CsvCellInspection,
+        width: CGFloat,
+        isHeader: Bool
+    ) -> some View {
+        Button {
+            inspectedCell = inspection
+        } label: {
+            Text(inspection.value)
+                .font(Self.cellFont)
+                .fontWeight(isHeader ? .semibold : .regular)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .padding(.horizontal, CsvPreviewModel.cellPadding)
+                .padding(.vertical, 5)
+                .frame(width: width, alignment: .leading)
+                .contentShape(Rectangle())
+                // A trailing hairline as a column separator; an overlay matches
+                // the cell's height exactly, avoiding the ambiguity a bare
+                // Divider has inside an HStack.
+                .overlay(alignment: .trailing) {
+                    Rectangle().fill(Color.primary.opacity(0.08)).frame(width: 1)
+                }
+                .overlay {
+                    if focusedCellID == inspection.id {
+                        RoundedRectangle(cornerRadius: 2)
+                            .stroke(Color.accentColor, lineWidth: 2)
+                            .padding(1)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+        .focused($focusedCellID, equals: inspection.id)
+        .help("Inspect complete cell value")
+        .accessibilityLabel(inspection.accessibilityLabel)
+        .accessibilityValue(inspection.accessibilityValue)
+        .accessibilityHint(inspection.accessibilityHint)
+        .accessibilityAction(named: Text("Copy Cell")) {
+            copyCell(inspection)
+        }
+        .contextMenu {
+            Button("Copy Cell") { copyCell(inspection) }
+        }
+        .popover(isPresented: inspectionBinding(for: inspection), arrowEdge: .bottom) {
+            cellInspector(inspection)
+        }
     }
 
-    private func truncationNotice(rowCount: Int) -> some View {
+    private func inspectionBinding(for inspection: CsvCellInspection) -> Binding<Bool> {
+        Binding(
+            get: { inspectedCell?.id == inspection.id },
+            set: { isPresented in
+                if !isPresented, inspectedCell?.id == inspection.id {
+                    inspectedCell = nil
+                }
+            }
+        )
+    }
+
+    private func cellInspector(_ inspection: CsvCellInspection) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Complete Cell Value")
+                        .font(.headline)
+                    Text(inspection.accessibilityLabel)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                Button("Copy Cell") { copyCell(inspection) }
+                    .keyboardShortcut("c", modifiers: .command)
+                Button("Done") { inspectedCell = nil }
+                    .keyboardShortcut(.cancelAction)
+            }
+            .padding(12)
+            Divider()
+            ScrollView([.horizontal, .vertical]) {
+                if inspection.value.isEmpty {
+                    Text("Empty cell")
+                        .foregroundStyle(.secondary)
+                        .padding(12)
+                } else {
+                    Text(inspection.value)
+                        .font(Self.cellFont)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: true, vertical: true)
+                        .padding(12)
+                        .accessibilityLabel("Complete cell value")
+                        .accessibilityValue(inspection.value)
+                }
+            }
+            .frame(minWidth: 360, idealWidth: 520, maxWidth: 640)
+            .frame(minHeight: 160, idealHeight: 280, maxHeight: 420)
+        }
+    }
+
+    private func copyCell(_ inspection: CsvCellInspection) {
+        if CsvCellClipboard.copy(inspection.value) {
+            ToastCenter.shared.show("Copied cell", style: .success)
+        } else {
+            ToastCenter.shared.show("Could not copy cell", style: .error)
+        }
+    }
+
+    private func truncationNotice(_ notice: String) -> some View {
         Label(
-            "Showing the first \(rowCount) rows (preview caps at \(CsvTable.maxRows) rows × \(CsvTable.maxCols) columns).",
+            notice,
             systemImage: "exclamationmark.triangle.fill"
         )
         .font(.caption)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.kaisolaSecondary)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -321,16 +832,20 @@ enum JsonTree {
     static let maxDepth = 12
     static let maxNodes = 2_000
 
-    /// The identity of the root value. Child paths extend it with `.key` for
-    /// object members and `[index]` for array elements.
-    static let rootPath = "$"
+    /// The identity of the root value. Paths are RFC 6901 JSON Pointers: the
+    /// whole document is the empty pointer, and each level appends `/` plus one
+    /// escaped token. Joining raw keys with `.` and `[index]` used to alias
+    /// distinct values — `{"a.b":1}` and `{"a":{"b":1}}` both landed on
+    /// `$.a.b` — which crossed disclosure state between unrelated rows and gave
+    /// SwiftUI two children with one identity.
+    static let rootPath = ""
 
     /// One node in the rendered JSON tree. A reference type so SwiftUI can hold
     /// stable identities across expand/collapse.
     final class Node: Identifiable, @unchecked Sendable {
         enum Kind: Equatable, Sendable { case object, array, string, number, bool, null, truncated }
 
-        /// The path to this value (`$.meta.items[3]`), not a fresh `UUID`.
+        /// The JSON Pointer to this value (`/meta/items/3`), not a fresh `UUID`.
         /// Disclosure state is keyed by node identity, so a rebuilt tree — a
         /// re-render, a reload, a returning tab — must reuse the same ids or
         /// every expanded object silently snaps shut.
@@ -377,12 +892,29 @@ enum JsonTree {
         return build(data, key: key, path: rootPath, depth: 0, count: &count)
     }
 
-    /// The identity of a container's truncation marker. Object children always
-    /// join with `.` and array children with `[`, so a suffix using neither can
-    /// never collide with a real member — including a key literally named
-    /// `truncated`.
+    /// The pointer for an object member. RFC 6901 escaping (`~` first, then
+    /// `/`) is what makes the join injective: an escaped token can never carry
+    /// the `/` that separates levels, so no key — however many dots, brackets,
+    /// pipes or slashes it holds — can imitate a deeper path.
+    nonisolated private static func childPath(_ path: String, key: String) -> String {
+        let escaped = key
+            .replacingOccurrences(of: "~", with: "~0")
+            .replacingOccurrences(of: "/", with: "~1")
+        return "\(path)/\(escaped)"
+    }
+
+    /// The pointer for an array element. Indices need no escaping, and an
+    /// object key that reads like an index cannot collide with one: a given
+    /// path is either an object or an array, never both.
+    nonisolated private static func childPath(_ path: String, index: Int) -> String {
+        "\(path)/\(index)"
+    }
+
+    /// The identity of a container's truncation marker. Escaping leaves `~`
+    /// only ever followed by `0` or `1`, so a `~t` token is one no real member
+    /// can spell — including a key literally named `truncated`.
     nonisolated private static func truncationPath(_ path: String) -> String {
-        path + "|truncated"
+        "\(path)/~truncated"
     }
 
     nonisolated private static func build(
@@ -415,7 +947,7 @@ enum JsonTree {
                 children.append(build(
                     dictionary[childKey] as Any,
                     key: childKey,
-                    path: "\(path).\(childKey)",
+                    path: childPath(path, key: childKey),
                     depth: depth + 1,
                     count: &count
                 ))
@@ -438,7 +970,7 @@ enum JsonTree {
                 children.append(build(
                     element,
                     key: "[\(index)]",
-                    path: "\(path)[\(index)]",
+                    path: childPath(path, index: index),
                     depth: depth + 1,
                     count: &count
                 ))
@@ -540,7 +1072,7 @@ struct JsonPreview: View {
             systemImage: "exclamationmark.triangle.fill"
         )
         .font(.caption)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.kaisolaSecondary)
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -601,8 +1133,8 @@ private struct JsonNodeRow: View {
     private var leafRow: some View {
         HStack(alignment: .firstTextBaseline, spacing: 4) {
             if let key = node.key {
-                Text(key).foregroundStyle(.secondary)
-                Text(":").foregroundStyle(.tertiary)
+                Text(key).foregroundStyle(.kaisolaSecondary)
+                Text(":").foregroundStyle(.kaisolaTertiary)
             }
             Text(scalarText)
                 .foregroundStyle(scalarColor)
@@ -614,10 +1146,10 @@ private struct JsonNodeRow: View {
     private var containerLabel: some View {
         HStack(spacing: 4) {
             if let key = node.key {
-                Text(key).foregroundStyle(.secondary)
-                Text(":").foregroundStyle(.tertiary)
+                Text(key).foregroundStyle(.kaisolaSecondary)
+                Text(":").foregroundStyle(.kaisolaTertiary)
             }
-            Text(node.display).foregroundStyle(.tertiary)
+            Text(node.display).foregroundStyle(.kaisolaTertiary)
         }
     }
 
@@ -646,8 +1178,12 @@ private struct JsonNodeRow: View {
 /// preview keeps project scripts off by default, but an empty app shell should
 /// explain that choice instead of presenting a mysterious blank pane.
 enum HTMLPreviewReadiness {
+    nonisolated static func containsJavaScript(_ source: String) -> Bool {
+        contains(source, pattern: #"<script\b"#)
+    }
+
     nonisolated static func requiresJavaScriptPrompt(_ source: String) -> Bool {
-        guard contains(source, pattern: #"<script\b"#) else { return false }
+        guard containsJavaScript(source) else { return false }
 
         let body = firstCapture(
             in: source,
@@ -705,6 +1241,190 @@ enum HTMLPreviewReadiness {
     }
 }
 
+/// Tracks the exact document an HTML preview's JavaScript opt-in applies to.
+///
+/// The path alone is not a document. A preview pane keeps the same path while
+/// the bytes behind it are replaced — an agent rewrites the file, the built-in
+/// editor saves over it, the changed-on-disk banner reloads it — so a grant
+/// tied to the path lets replaced content inherit permission the user gave to
+/// something else. The grant therefore names the parse identity it was made
+/// for, which changes on retarget, disk snapshot, and revision alike, and
+/// carries a fingerprint of the approved source so a reload that produced
+/// byte-identical content does not re-prompt.
+struct HTMLScriptApproval: Equatable {
+    private var mountedFingerprint: String?
+    private var approvedIdentity: PreviewParseIdentity?
+    private var approvedFingerprint: String?
+
+    init() {}
+
+    /// Scripts run only for the identity the user opted in for. Every other
+    /// identity — including the same file one revision later — reads as false
+    /// in the same body evaluation that mounts the new content.
+    func allowsJavaScript(for identity: PreviewParseIdentity) -> Bool {
+        approvedIdentity == identity
+    }
+
+    /// The user allowed scripts for what is on screen right now.
+    mutating func allow(for identity: PreviewParseIdentity) {
+        approvedIdentity = identity
+        approvedFingerprint = mountedFingerprint
+    }
+
+    mutating func revoke() {
+        approvedIdentity = nil
+        approvedFingerprint = nil
+    }
+
+    /// The preview finished preparing a document's source. A grant carries
+    /// over only when the same file came back with the same bytes. Anything
+    /// else — replaced content, a save, another file that happens to match —
+    /// drops the grant outright rather than parking it, so no later identity
+    /// can collide back into it.
+    mutating func adopt(identity: PreviewParseIdentity, fingerprint: String) {
+        mountedFingerprint = fingerprint
+        guard let approvedIdentity else { return }
+        guard approvedIdentity.path == identity.path, approvedFingerprint == fingerprint else {
+            revoke()
+            return
+        }
+        self.approvedIdentity = identity
+    }
+
+    /// Stable fingerprint of preview source text.
+    nonisolated static func fingerprint(_ source: String) -> String {
+        SHA256.hash(data: Data(source.utf8))
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+}
+
+/// Cached preparation of the HTML source: whether it contains scripts,
+/// whether its blank shell needs the automatic review, and the fingerprint
+/// that pins a grant to these exact bytes. All work stays off the main actor
+/// and is reused for identical content.
+struct HTMLPreviewPreparation: Equatable, Sendable {
+    let containsJavaScript: Bool
+    let requiresJavaScriptPrompt: Bool
+    let fingerprint: String
+
+    nonisolated static func make(_ source: String) -> HTMLPreviewPreparation {
+        HTMLPreviewPreparation(
+            containsJavaScript: HTMLPreviewReadiness.containsJavaScript(source),
+            requiresJavaScriptPrompt: HTMLPreviewReadiness.requiresJavaScriptPrompt(source),
+            fingerprint: HTMLScriptApproval.fingerprint(source)
+        )
+    }
+}
+
+/// Keeps JavaScript-disabled affordances exhaustive without conflating two
+/// different jobs: blank-shell detection may open the review automatically,
+/// while a page that already renders static content still keeps a persistent
+/// route into that same security review.
+struct HTMLJavaScriptDisabledPresentation: Equatable, Sendable {
+    let containsJavaScript: Bool
+    let requiresAutomaticReview: Bool
+
+    init(containsJavaScript: Bool, requiresAutomaticReview: Bool) {
+        self.containsJavaScript = containsJavaScript
+        self.requiresAutomaticReview = requiresAutomaticReview
+    }
+
+    init(preparation: HTMLPreviewPreparation) {
+        self.init(
+            containsJavaScript: preparation.containsJavaScript,
+            requiresAutomaticReview: preparation.requiresJavaScriptPrompt
+        )
+    }
+
+    var showsAutomaticReview: Bool {
+        containsJavaScript && requiresAutomaticReview
+    }
+
+    var showsCompactIndicator: Bool {
+        containsJavaScript && !requiresAutomaticReview
+    }
+
+    var indicatorTitle: String { "JavaScript is off" }
+    var reviewActionTitle: String { "Review and Allow…" }
+}
+
+/// User-facing disclosure derived from the same effective local-file boundary
+/// passed to WebKit. Keeping these together prevents the approval copy from
+/// claiming a narrower or broader scope than the page actually receives.
+struct HTMLJavaScriptSecurityScope: Equatable, Sendable {
+    struct Disclosure: Equatable, Sendable, Identifiable {
+        enum ID: String, Hashable, Sendable {
+            case localFiles
+            case network
+            case storage
+            case navigation
+        }
+
+        let id: ID
+        let title: String
+        let detail: String
+        let systemImage: String
+    }
+
+    static let revokeActionTitle = "Revoke JavaScript"
+
+    let fileURL: URL
+    let readAccessRoot: URL?
+
+    var effectiveReadAccessRoot: URL {
+        let fallback = fileURL.deletingLastPathComponent()
+        guard let candidate = readAccessRoot?.standardizedFileURL,
+              WorkspacePreviewLinkPolicy.isContained(fileURL, in: candidate) else {
+            return fallback
+        }
+        return candidate
+    }
+
+    var approvalSummary: String {
+        "Approval applies only to \(fileName) at its current contents."
+    }
+
+    var enabledNotice: String {
+        "JavaScript is enabled for \(fileName) only."
+    }
+
+    var disclosures: [Disclosure] {
+        [
+            Disclosure(
+                id: .localFiles,
+                title: "Local files",
+                detail: "Scripts can read this file and other files inside "
+                    + "\(effectiveReadAccessRoot.path).",
+                systemImage: "folder"
+            ),
+            Disclosure(
+                id: .network,
+                title: "Network",
+                detail: "Scripts can contact network hosts permitted by the page and WebKit.",
+                systemImage: "network"
+            ),
+            Disclosure(
+                id: .storage,
+                title: "Temporary storage",
+                detail: "Website data is temporary and is not persisted by this preview.",
+                systemImage: "internaldrive"
+            ),
+            Disclosure(
+                id: .navigation,
+                title: "External navigation",
+                detail: "Only clicked HTTP or HTTPS links open in your browser; off-project "
+                    + "redirects and custom schemes stay blocked.",
+                systemImage: "arrow.up.right.square"
+            ),
+        ]
+    }
+
+    private var fileName: String {
+        fileURL.lastPathComponent.isEmpty ? "this file" : fileURL.lastPathComponent
+    }
+}
+
 private enum HTMLPreviewLoadState: Equatable {
     case loading
     case ready
@@ -724,12 +1444,32 @@ struct HtmlFilePreview: View {
     let zoom: CGFloat
     let contentRevision: Int
 
-    @State private var readinessCache = PreviewParseCache<Bool>()
+    @State private var preparationCache = PreviewParseCache<HTMLPreviewPreparation>()
+    @State private var containsJavaScript = false
     @State private var requiresJavaScriptPrompt = false
     @State private var preparedIdentity: PreviewParseIdentity?
     @State private var reloadToken = 0
-    @State private var allowsJavaScript = false
+    @State private var scriptApproval = HTMLScriptApproval()
     @State private var loadState: HTMLPreviewLoadState = .loading
+    @State private var showsJavaScriptReview = false
+
+    /// Derived rather than stored: the approval names one document, so content
+    /// swapped in behind the same path drops to false without waiting for an
+    /// effect to run.
+    private var allowsJavaScript: Bool {
+        scriptApproval.allowsJavaScript(for: identity)
+    }
+
+    private var javaScriptSecurityScope: HTMLJavaScriptSecurityScope {
+        HTMLJavaScriptSecurityScope(fileURL: fileURL, readAccessRoot: readAccessRoot)
+    }
+
+    private var javaScriptDisabledPresentation: HTMLJavaScriptDisabledPresentation {
+        HTMLJavaScriptDisabledPresentation(
+            containsJavaScript: containsJavaScript,
+            requiresAutomaticReview: requiresJavaScriptPrompt
+        )
+    }
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -769,21 +1509,37 @@ struct HtmlFilePreview: View {
                 }
             }
 
-            if !allowsJavaScript, requiresJavaScriptPrompt {
+            if !allowsJavaScript,
+               javaScriptDisabledPresentation.showsAutomaticReview || showsJavaScriptReview {
                 VStack(spacing: 10) {
                     Image(systemName: "curlybraces.square")
                         .font(.system(size: 23, weight: .medium))
                         .foregroundStyle(Color.accentColor)
-                    Text("This page needs JavaScript")
+                        .accessibilityHidden(true)
+                    Text(javaScriptDisabledPresentation.showsAutomaticReview
+                        ? "This page needs JavaScript"
+                        : "Review JavaScript Access")
                         .font(.headline)
-                    Text("Project scripts stay off until you allow them for this preview.")
+                    Text("Review what project-controlled code can access before allowing it.")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .multilineTextAlignment(.center)
-                        .frame(maxWidth: 260)
+                    Text(javaScriptSecurityScope.approvalSummary)
+                        .font(.caption.weight(.semibold))
+                    HTMLJavaScriptSecurityDisclosureView(scope: javaScriptSecurityScope)
                     HStack(spacing: 8) {
-                        Button("Allow JavaScript") { allowsJavaScript = true }
-                            .buttonStyle(.borderedProminent)
+                        Button("Allow JavaScript") {
+                            scriptApproval.allow(for: identity)
+                            showsJavaScriptReview = false
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .keyboardShortcut(.defaultAction)
+                        if showsJavaScriptReview,
+                           !javaScriptDisabledPresentation.showsAutomaticReview {
+                            Button("Cancel") { showsJavaScriptReview = false }
+                                .buttonStyle(.bordered)
+                                .keyboardShortcut(.cancelAction)
+                        }
                         Button("Open in Browser") { NSWorkspace.shared.open(fileURL) }
                             .buttonStyle(.bordered)
                     }
@@ -794,8 +1550,28 @@ struct HtmlFilePreview: View {
                 .background(.regularMaterial)
             }
 
+            if !allowsJavaScript,
+               javaScriptDisabledPresentation.showsCompactIndicator,
+               !showsJavaScriptReview {
+                javaScriptDisabledBanner
+                    .padding(8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+            }
+
+            if allowsJavaScript {
+                javaScriptEnabledBanner
+                    .padding(8)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+            }
+
             Menu {
-                Toggle("Allow project JavaScript", isOn: $allowsJavaScript)
+                if allowsJavaScript {
+                    Button(HTMLJavaScriptSecurityScope.revokeActionTitle, role: .destructive) {
+                        scriptApproval.revoke()
+                    }
+                } else {
+                    Button("Review JavaScript Access…") { showsJavaScriptReview = true }
+                }
                 Button("Reload") { reloadToken &+= 1 }
                 Divider()
                 Button("Open in Browser") { NSWorkspace.shared.open(fileURL) }
@@ -814,7 +1590,11 @@ struct HtmlFilePreview: View {
         .background(Color(nsColor: .windowBackgroundColor))
         // Approval is deliberately one-file-at-a-time. Navigating from a
         // trusted document must never silently grant scripts to the next file.
-        .onChange(of: fileURL) { _, _ in allowsJavaScript = false }
+        .onChange(of: fileURL) { _, _ in
+            showsJavaScriptReview = false
+            scriptApproval.revoke()
+        }
+        .onChange(of: identity) { _, _ in showsJavaScriptReview = false }
         .overlay {
             if preparedIdentity != identity {
                 ZStack {
@@ -826,21 +1606,96 @@ struct HtmlFilePreview: View {
         }
         .task(id: identity) {
             let html = source
-            let readiness = await readinessCache.value(
+            let preparation = await preparationCache.value(
                 for: html,
-                parse: HTMLPreviewReadiness.requiresJavaScriptPrompt
+                parse: HTMLPreviewPreparation.make
             )
             guard !Task.isCancelled else { return }
-            requiresJavaScriptPrompt = readiness
+            containsJavaScript = preparation.containsJavaScript
+            requiresJavaScriptPrompt = preparation.requiresJavaScriptPrompt
+            scriptApproval.adopt(identity: identity, fingerprint: preparation.fingerprint)
             preparedIdentity = identity
         }
     }
+
+    private var javaScriptDisabledBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "curlybraces.square")
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            Text(javaScriptDisabledPresentation.indicatorTitle)
+                .font(.caption.weight(.medium))
+            Button(javaScriptDisabledPresentation.reviewActionTitle) {
+                showsJavaScriptReview = true
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityHint("Reviews the security scope before allowing project scripts")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.10)))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("html-preview.javascript-disabled")
+    }
+
+    private var javaScriptEnabledBanner: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "curlybraces.square.fill")
+                .foregroundStyle(Color.accentColor)
+                .accessibilityHidden(true)
+            Text(javaScriptSecurityScope.enabledNotice)
+                .font(.caption.weight(.medium))
+                .lineLimit(1)
+            Button(HTMLJavaScriptSecurityScope.revokeActionTitle) {
+                scriptApproval.revoke()
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .accessibilityHint("Stops project scripts and reloads this preview")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.primary.opacity(0.10)))
+    }
 }
 
-/// A WKWebView with a non-persistent data store and project-confined file
-/// access. JavaScript follows the visible preview toggle. Explicit off-scope
-/// top-level links open in the system browser; other off-scope navigations are
-/// dropped.
+private struct HTMLJavaScriptSecurityDisclosureView: View {
+    let scope: HTMLJavaScriptSecurityScope
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 9) {
+                ForEach(scope.disclosures) { disclosure in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: disclosure.systemImage)
+                            .foregroundStyle(.secondary)
+                            .frame(width: 16)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(disclosure.title)
+                                .font(.caption.weight(.medium))
+                            Text(disclosure.detail)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                        }
+                    }
+                    .accessibilityElement(children: .combine)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(maxWidth: 460, maxHeight: 240)
+    }
+}
+
+/// A WKWebView with a non-persistent data store of its own — not the browser
+/// card's — and project-confined file access. JavaScript follows the visible
+/// preview toggle. Explicit off-scope top-level links open in the system
+/// browser; other off-scope navigations are dropped.
 private struct ConfinedFileWebView: NSViewRepresentable {
     let fileURL: URL
     let readAccessRoot: URL?
@@ -854,11 +1709,10 @@ private struct ConfinedFileWebView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> WKWebView {
-        let configuration = WKWebViewConfiguration()
-        // Ephemeral, and SHARED with the browser card: same trust class, and
-        // one store gives the content surfaces shared process affinity
-        // instead of isolated ephemeral state per view (spec §2e).
-        configuration.websiteDataStore = SharedWebKit.ephemeralContentStore
+        // Ephemeral, and ISOLATED from the browser card: approved project
+        // JavaScript must never read the cookies or storage of an
+        // authenticated local dev server (spec §2e, revised).
+        let configuration = SharedWebKit.contentConfiguration(for: .filePreview)
         // The web view is ephemeral and file-confined. Script execution remains
         // off until the user opts in from the visible preview menu.
         let pagePreferences = WKWebpagePreferences()
@@ -903,10 +1757,10 @@ private struct ConfinedFileWebView: NSViewRepresentable {
     }
 
     private var effectiveReadAccessRoot: URL {
-        let fallback = fileURL.deletingLastPathComponent()
-        guard let candidate = readAccessRoot?.standardizedFileURL,
-              WorkspacePreviewLinkPolicy.isContained(fileURL, in: candidate) else { return fallback }
-        return candidate
+        HTMLJavaScriptSecurityScope(
+            fileURL: fileURL,
+            readAccessRoot: readAccessRoot
+        ).effectiveReadAccessRoot
     }
 
     final class Coordinator: NSObject, WKNavigationDelegate {

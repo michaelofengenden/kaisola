@@ -12,6 +12,14 @@ const SCHEMA_VERSION = 1
 const CONFIG_DIRECTORY = path.join('mcp', 'workspaces')
 const SERVER_ID_RE = /^[a-z0-9][a-z0-9._-]{0,79}$/i
 const TRANSPORTS = new Set(['stdio', 'http', 'sse'])
+// A remote server URL is stored as text and re-read by parsers that disagree
+// about these bytes. WHATWG (`new URL`) folds a literal backslash into `/` for
+// http(s) and strips TAB/LF/CR before parsing, while RFC 3986 parsers keep them
+// (Swift's URLComponents in McpConfigStore, ajv's fast-uri), so
+// `https:\\evil.test` and `https://good.test\@evil.test` name a different host
+// depending on who reads it. Reject the ambiguous spelling rather than pick a
+// winner; percent-encoded spellings such as %5C stay ordinary data.
+const AMBIGUOUS_URL_BYTE_RE = /[\\\u0000-\u0020\u007F]/u
 
 function defaultBaseDir() {
   if (process.env.KAISOLA_NATIVE_APP_SUPPORT_DIR) {
@@ -107,6 +115,7 @@ function validateServer(server) {
   }
 
   const rawUrl = cleanRequiredString(server.url, 'url')
+  if (AMBIGUOUS_URL_BYTE_RE.test(rawUrl)) throw new Error('url is ambiguous')
   let parsed
   try {
     parsed = new URL(rawUrl)

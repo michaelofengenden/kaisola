@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 @testable import Kaisola
@@ -8,6 +9,522 @@ import XCTest
 /// handshake + streamed turn + permission callback. Skips cleanly if node or
 /// the mock is unavailable so it never fails a machine without the toolchain.
 final class AcpProcessIntegrationTests: XCTestCase {
+    func testStderrTailIsByteBoundedAndRedactsSensitiveDiagnostics() throws {
+        let tail = AcpStderrTail(byteLimit: 128)
+        tail.append(Data(String(repeating: "discarded-prefix-\n", count: 32).utf8))
+        tail.append(Data("\u{1B}[31mfatal\u{1B}[0m api_".utf8))
+        tail.append(Data("key=sk-ABCDEFGHIJKLMNOPQRST at /Users/alice/private/project\n".utf8))
+
+        let snapshot = tail.snapshotForTesting()
+        XCTAssertEqual(snapshot.retainedByteCount, 128)
+        XCTAssertTrue(snapshot.didTruncate)
+        let detail = try XCTUnwrap(snapshot.failureDetail)
+        XCTAssertTrue(detail.contains("fatal"))
+        XCTAssertTrue(detail.contains("api_key=[redacted]"))
+        XCTAssertTrue(detail.contains("[local path]"))
+        XCTAssertTrue(detail.contains("Earlier adapter stderr was truncated"))
+        XCTAssertFalse(detail.contains("ABCDEFGHIJKLMNOPQRST"))
+        XCTAssertFalse(detail.contains("alice"))
+        XCTAssertFalse(detail.contains("\u{1B}"))
+
+        let boundary = AcpStderrTail(byteLimit: 12)
+        boundary.append(Data("api_key=boundary-secret-without-newline".utf8))
+        let boundaryDetail = try XCTUnwrap(boundary.snapshotForTesting().failureDetail)
+        XCTAssertTrue(boundaryDetail.contains("no complete diagnostic line was safe"))
+        XCTAssertFalse(boundaryDetail.contains("secret"))
+
+        let opaque = AcpStderrTail(
+            byteLimit: 128,
+            sensitiveValues: ["opaque-environment-credential"]
+        )
+        opaque.append(Data("adapter rejected opaque-environment-credential\n".utf8))
+        let opaqueDetail = try XCTUnwrap(opaque.snapshotForTesting().failureDetail)
+        XCTAssertEqual(opaqueDetail, "adapter rejected [redacted]")
+    }
+
+    func testStderrDrainFinalizationWaitsForAnInFlightReadBeforeInspectingTheTail() throws {
+        let tail = AcpStderrTail(byteLimit: 128)
+        let source = BlockingStderrReadSource(
+            payload: Data("adapter-two failed\n".utf8)
+        )
+        let drain = AcpStderrDrain(tail: tail, readOperation: source.read)
+
+        DispatchQueue.global(qos: .userInitiated).async {
+            drain.consumeReadable()
+        }
+        XCTAssertEqual(
+            source.readStarted.wait(timeout: .now() + 1),
+            .success,
+            "the simulated readability callback never consumed stderr"
+        )
+
+        let finishStarted = DispatchSemaphore(value: 0)
+        let finishReturned = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            finishStarted.signal()
+            drain.finish()
+            finishReturned.signal()
+        }
+        XCTAssertEqual(
+            finishStarted.wait(timeout: .now() + 1),
+            .success,
+            "the simulated finalization task never started"
+        )
+        let prematureFinish = finishReturned.wait(timeout: .now() + 0.05)
+        source.allowAppend.signal()
+
+        XCTAssertEqual(
+            prematureFinish,
+            .timedOut,
+            "finalization inspected the tail before the consumed bytes were appended"
+        )
+        XCTAssertEqual(finishReturned.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(tail.failureDetail(), "adapter-two failed")
+
+        let readsAtFinish = source.readCount
+        drain.consumeReadable()
+        XCTAssertEqual(
+            source.readCount,
+            readsAtFinish,
+            "a late readability callback must not touch a closed or reused descriptor"
+        )
+    }
+
+    func testAdapterExitSurfacesOnlyCurrentGenerationStderrWithoutMixingStdout() async throws {
+        let transport = AcpProcessTransport(stderrByteLimit: 96)
+        let environment = [
+            "PATH": "/usr/bin:/bin",
+            "CUSTOM_API_KEY": "first-generation-secret",
+        ]
+        let cwd = FileManager.default.temporaryDirectory.path
+
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: [
+                "-c",
+                "printf '%s\\n' 'wire-one'; "
+                    + "printf 'adapter-one rejected %s\\n' \"$CUSTOM_API_KEY\" >&2; exit 23",
+            ],
+            environment: environment,
+            cwd: cwd
+        )
+        let firstWire = try await transport.receive(maximumBytes: 1_024)
+        XCTAssertEqual(firstWire, Data("wire-one\n".utf8), "stderr must never enter ACP stdout")
+        let firstFailure = try await stderrFailureMessage(from: transport)
+        XCTAssertTrue(firstFailure.contains("code 23"), firstFailure)
+        XCTAssertTrue(firstFailure.contains("adapter-one rejected [redacted]"), firstFailure)
+        XCTAssertTrue(firstFailure.contains("adapter-one"), firstFailure)
+        XCTAssertFalse(firstFailure.contains("first-generation-secret"), firstFailure)
+
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: [
+                "-c",
+                "printf '%s\\n' 'wire-two'; printf '%s\\n' 'adapter-two failed' >&2; exit 7",
+            ],
+            environment: environment,
+            cwd: cwd
+        )
+        let secondWire = try await transport.receive(maximumBytes: 1_024)
+        XCTAssertEqual(secondWire, Data("wire-two\n".utf8))
+        let secondFailure = try await stderrFailureMessage(from: transport)
+        XCTAssertTrue(secondFailure.contains("code 7"), secondFailure)
+        XCTAssertTrue(secondFailure.contains("adapter-two failed"), secondFailure)
+        XCTAssertFalse(secondFailure.contains("adapter-one"), secondFailure)
+        XCTAssertFalse(secondFailure.contains("first-generation-secret"), secondFailure)
+        await transport.terminate()
+    }
+
+    func testAdapterExitWithoutStderrPreservesCleanEOF() async throws {
+        let transport = AcpProcessTransport(stderrByteLimit: 96)
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", "printf '%s\\n' 'wire-only'; exit 3"],
+            environment: ["PATH": "/usr/bin:/bin"],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+
+        let wire = try await transport.receive(maximumBytes: 1_024)
+        XCTAssertEqual(wire, Data("wire-only\n".utf8))
+        let eof = try await transport.receive(maximumBytes: 1_024)
+        XCTAssertNil(eof)
+        let code = await transport.exitCode()
+        XCTAssertEqual(code, 3)
+        await transport.terminate()
+    }
+
+    func testChattyStderrKeepsDrainingAfterTheTailReachesItsByteLimit() async throws {
+        let transport = AcpProcessTransport(stderrByteLimit: 128)
+        let script = #"""
+        index=0
+        while [ "$index" -lt 4096 ]; do
+          printf '%s\n' 'stderr-padding-0123456789abcdefghijklmnopqrstuvwxyz'
+          index=$((index + 1))
+        done >&2
+        printf '%s\n' 'final-adapter-diagnostic' >&2
+        printf '%s\n' 'wire-after-stderr'
+        exit 11
+        """#
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", script],
+            environment: ["PATH": "/usr/bin:/bin"],
+            cwd: FileManager.default.temporaryDirectory.path
+        )
+
+        let wire = try await receive(from: transport, timeout: .seconds(3))
+        XCTAssertEqual(wire, Data("wire-after-stderr\n".utf8))
+        let failure = try await stderrFailureMessage(from: transport)
+        XCTAssertTrue(failure.contains("code 11"), failure)
+        XCTAssertTrue(failure.contains("Earlier adapter stderr was truncated"), failure)
+        XCTAssertTrue(failure.contains("final-adapter-diagnostic"), failure)
+        XCTAssertLessThan(failure.utf8.count, 512)
+        await transport.terminate()
+    }
+
+    func testStdinQueueWritesFramesInFIFOOrderWithEnqueueTimeDeadlines() async throws {
+        let clock = LockedMonotonicClock(1_000)
+        let writer = SuspendedStdinWriter()
+        let queue = AcpStdinWriteQueue(
+            descriptor: -1,
+            frameDeadlineNanoseconds: 100,
+            maximumQueuedFrames: 4,
+            maximumQueuedBytes: 64,
+            writeOperation: { try await writer.write(data: $1, deadline: $2) },
+            monotonicNow: { clock.value }
+        )
+
+        let first = Task { try await queue.send(Data("first".utf8)) }
+        await writer.waitForCallCount(1)
+        clock.value = 2_000
+        let second = Task { try await queue.send(Data("second".utf8)) }
+        await waitForQueuedFrames(2, in: queue)
+
+        let activeCallCount = await writer.callCount
+        XCTAssertEqual(activeCallCount, 1, "only one descriptor write may be active")
+        await writer.succeedNext()
+        await writer.waitForCallCount(2)
+        await writer.succeedNext()
+        try await first.value
+        try await second.value
+
+        let calls = await writer.calls
+        XCTAssertEqual(calls.map(\.payload), ["first", "second"])
+        XCTAssertEqual(calls.map(\.deadline), [1_100, 2_100])
+        let drainedSnapshot = await queue.snapshotForTesting()
+        XCTAssertEqual(
+            drainedSnapshot,
+            .init(queuedFrameCount: 0, queuedBytes: 0, isWriting: false, isClosed: false)
+        )
+        await queue.close()
+    }
+
+    func testStdinQueueOverflowFailsEveryFrameWithoutUnboundedRetention() async throws {
+        let writer = SuspendedStdinWriter()
+        let queue = AcpStdinWriteQueue(
+            descriptor: -1,
+            frameDeadlineNanoseconds: 1_000,
+            maximumQueuedFrames: 2,
+            maximumQueuedBytes: 9,
+            writeOperation: { try await writer.write(data: $1, deadline: $2) },
+            monotonicNow: { 10 }
+        )
+        let first = Task { try await queue.send(Data("1234".utf8)) }
+        await writer.waitForCallCount(1)
+        let second = Task { try await queue.send(Data("5678".utf8)) }
+        await waitForQueuedFrames(2, in: queue)
+
+        let overflowMessage: String
+        do {
+            try await queue.send(Data("9".utf8))
+            XCTFail("the third frame must exceed the two-frame bound")
+            overflowMessage = ""
+        } catch let AcpClientError.requestFailed(message) {
+            overflowMessage = message
+        } catch {
+            throw error
+        }
+        XCTAssertTrue(overflowMessage.contains("bounded capacity"))
+        await assertFailed(first, message: overflowMessage)
+        await assertFailed(second, message: overflowMessage)
+        let failedSnapshot = await queue.snapshotForTesting()
+        XCTAssertEqual(
+            failedSnapshot,
+            .init(queuedFrameCount: 0, queuedBytes: 0, isWriting: false, isClosed: true)
+        )
+
+        // The scripted operation intentionally ignores task cancellation until
+        // the test releases it. Production poll slices observe cancellation.
+        await writer.failNext(CancellationError())
+        await queue.close()
+    }
+
+    func testAdapterThatNeverReadsStdinFailsAtTheFrameDeadlineAndClosesItsTree() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport(stdinFrameDeadlineNanoseconds: 150_000_000)
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.termIgnoringTreeScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path
+        )
+        let pids = try await fixture.waitForPIDs()
+        let startedAt = ContinuousClock.now
+
+        do {
+            try await transport.send(Data(repeating: 0x78, count: 2 * 1_024 * 1_024))
+            XCTFail("a non-consuming adapter must not accept an unbounded frame")
+        } catch let AcpClientError.requestFailed(message) {
+            XCTAssertTrue(message.contains("stopped reading requests"))
+        } catch {
+            XCTFail("unexpected stdin failure: \(error)")
+        }
+
+        XCTAssertLessThan(
+            startedAt.duration(to: .now),
+            .seconds(1),
+            "the descriptor write must return at its own deadline, before process-group teardown"
+        )
+        let stopped = await fixture.waitUntilStopped(pids, timeout: .seconds(4))
+        XCTAssertTrue(stopped, "stdin timeout must close and reap the owned adapter group")
+    }
+
+    @MainActor
+    func testAdapterThatStopsReadingStdinFailsConnectionAndPreservesRetryablePrompt() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport(stdinFrameDeadlineNanoseconds: 150_000_000)
+        let client = AcpClient(transport: transport)
+        let conversation = AcpConversation(
+            title: "Backpressure",
+            command: "/bin/sh",
+            arguments: ["-c", Self.handshakeThenStopReadingStdinScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path,
+            client: client
+        )
+        await conversation.start()
+        XCTAssertTrue(conversation.isConnected)
+        let pids = try await fixture.waitForPIDs()
+        let prompt = String(repeating: "backpressure-payload-", count: 100_000)
+
+        XCTAssertTrue(conversation.send(prompt))
+        try await waitUntil(timeout: .seconds(2)) {
+            !conversation.isRunning && conversation.rows.contains { row in
+                if case let .user(_, text, failed) = row { return failed && text == prompt }
+                return false
+            }
+        }
+
+        let failedRow = try XCTUnwrap(conversation.rows.last)
+        guard case let .user(rowID, retainedText, failed) = failedRow else {
+            return XCTFail("the failed prompt must remain a user row")
+        }
+        XCTAssertTrue(failed)
+        XCTAssertEqual(retainedText, prompt)
+        XCTAssertTrue(conversation.statusMessage?.contains("stopped reading requests") == true)
+
+        let stopped = await fixture.waitUntilStopped(pids, timeout: .seconds(4))
+        XCTAssertTrue(stopped, "write timeout must close and reap the owned adapter group")
+        try await waitUntil(timeout: .seconds(1)) { !conversation.isConnected }
+
+        // The failed row itself and its exact original payload survive the
+        // dead connection. Exercising Retry proves it is not display-only.
+        conversation.retryFailed("user-\(rowID)")
+        try await waitUntil(timeout: .seconds(1)) { !conversation.isRunning }
+        guard case let .user(_, retriedText, retryFailed)? = conversation.rows.last else {
+            return XCTFail("retry must re-dispatch the retained user payload")
+        }
+        XCTAssertTrue(retryFailed)
+        XCTAssertEqual(retriedText, prompt)
+        _ = await conversation.stop()
+    }
+
+    func testTransportStopTerminatesItsAdapterAndAppServerChild() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport()
+
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.ownedTreeScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path
+        )
+        let pids = try await fixture.waitForPIDs()
+        let startedAt = ContinuousClock.now
+
+        await transport.terminate()
+
+        XCTAssertLessThan(
+            startedAt.duration(to: .now),
+            .seconds(1),
+            "ordinary SIGTERM cleanup must not wait for the SIGKILL grace"
+        )
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "adapter and app-server child must both stop")
+    }
+
+    func testStdoutEOFClosesTheOwningConnectionAndTerminatesTheProcessTree() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let client = AcpClient()
+        let collector = IntegrationCollector()
+        await client.setEventHandler { event in collector.append(event) }
+
+        _ = try await client.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.handshakeThenCloseStdoutScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path,
+            mcpServers: []
+        )
+        let pids = try await fixture.waitForPIDs()
+
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "stdout EOF must tear down the adapter tree even when the adapter remains alive")
+        XCTAssertTrue(collector.events.contains { if case .exited = $0 { return true } else { return false } })
+        await client.stop()
+    }
+
+    func testAdapterExitReapsTheAppServerChildItLeavesBehind() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport()
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.exitLeavingChildScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path
+        )
+        let pids = try await fixture.waitForPIDs()
+        let eof = try await transport.receive(maximumBytes: 1_024)
+        XCTAssertNil(eof)
+
+        await transport.terminate()
+
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "an exited adapter must not orphan its surviving app-server child")
+    }
+
+    func testCancellingGUIStartupTaskTerminatesThePartiallyStartedProcessTree() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let client = AcpClient()
+        let environment = fixture.environment
+        let cwd = fixture.directory.path
+        let startup = Task { @Sendable in
+            try await client.start(
+                command: "/bin/sh",
+                arguments: ["-c", Self.ownedTreeScript],
+                environment: environment,
+                cwd: cwd,
+                mcpServers: []
+            )
+        }
+        let pids = try await fixture.waitForPIDs()
+
+        startup.cancel()
+
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "task cancellation must close startup ownership")
+        await client.stop()
+        switch await startup.result {
+        case let .failure(error): XCTAssertTrue(error is CancellationError)
+        case .success: XCTFail("cancelled startup must finish with CancellationError")
+        }
+    }
+
+    func testStartupProtocolFailureTerminatesThePartiallyStartedProcessTree() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let client = AcpClient()
+
+        do {
+            _ = try await client.start(
+                command: "/bin/sh",
+                arguments: ["-c", Self.unsupportedHandshakeScript],
+                environment: fixture.environment,
+                cwd: fixture.directory.path,
+                mcpServers: []
+            )
+            XCTFail("expected unsupported protocol")
+        } catch let AcpClientError.unsupportedProtocol(version) {
+            XCTAssertEqual(version, 2)
+        } catch {
+            XCTFail("unexpected startup error: \(error)")
+        }
+        let pids = try await fixture.waitForPIDs()
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "failed startup must leave no owned children")
+    }
+
+    func testTransportCanRepeatedlyOpenAndCloseWithoutLeakingChildren() async throws {
+        let transport = AcpProcessTransport()
+        var fixtures: [OwnedProcessFixture] = []
+        defer { fixtures.forEach { $0.forceCleanup() } }
+
+        for _ in 0..<3 {
+            let fixture = try OwnedProcessFixture()
+            fixtures.append(fixture)
+            try await transport.start(
+                command: "/bin/sh",
+                arguments: ["-c", Self.ownedTreeScript],
+                environment: fixture.environment,
+                cwd: fixture.directory.path
+            )
+            let pids = try await fixture.waitForPIDs()
+            await transport.terminate()
+            let stopped = await fixture.waitUntilStopped(pids)
+            XCTAssertTrue(stopped)
+        }
+    }
+
+    func testTerminationEscalatesWithinABoundWhenOwnedChildrenIgnoreSIGTERM() async throws {
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport()
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.termIgnoringTreeScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path
+        )
+        let pids = try await fixture.waitForPIDs()
+        let startedAt = ContinuousClock.now
+
+        await transport.terminate()
+
+        XCTAssertLessThan(startedAt.duration(to: .now), .seconds(4))
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped, "SIGKILL escalation must reap a stubborn tree")
+    }
+
+    func testTransportTeardownDoesNotTouchAnUnownedDurableProcess() async throws {
+        let durable = try DetachedProcessFixture()
+        defer { _ = durable.forceCleanup() }
+        let fixture = try OwnedProcessFixture()
+        defer { fixture.forceCleanup() }
+        let transport = AcpProcessTransport()
+        try await transport.start(
+            command: "/bin/sh",
+            arguments: ["-c", Self.ownedTreeScript],
+            environment: fixture.environment,
+            cwd: fixture.directory.path
+        )
+        let pids = try await fixture.waitForPIDs()
+
+        await transport.terminate()
+
+        let stopped = await fixture.waitUntilStopped(pids)
+        XCTAssertTrue(stopped)
+        XCTAssertTrue(durable.isRunning, "detached broker PTYs are outside ACP process ownership")
+        let cleanupStartedAt = ContinuousClock.now
+        XCTAssertTrue(durable.forceCleanup(), "durable fixture cleanup must be bounded and reap its child")
+        XCTAssertLessThan(cleanupStartedAt.duration(to: .now), .seconds(2))
+    }
+
     func testSpawnsMockAgentAndStreamsARealTurn() async throws {
         guard let node = Self.resolveNode(), let mock = Self.resolveMock() else {
             throw XCTSkip("node or the ACP mock agent is unavailable")
@@ -141,6 +658,391 @@ final class AcpProcessIntegrationTests: XCTestCase {
             if FileManager.default.fileExists(atPath: candidate.path) { return candidate.path }
         }
         return nil
+    }
+
+    private static let ownedTreeScript = #"""
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" HUP; exec /bin/sleep 60' \
+      </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" > "$KAISOLA_FIXTURE_CHILD_PID"
+    while :; do /bin/sleep 1; done
+    """#
+
+    private static let termIgnoringTreeScript = #"""
+    trap '' TERM
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" TERM; printf "%s\n" "$$" > "$KAISOLA_FIXTURE_CHILD_PID"; while :; do /bin/sleep 1; done' \
+      </dev/null >/dev/null 2>&1 &
+    while :; do /bin/sleep 1; done
+    """#
+
+    private static let exitLeavingChildScript = #"""
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" HUP TERM; printf "%s\n" "$$" > "$KAISOLA_FIXTURE_CHILD_PID"; while :; do /bin/sleep 1; done' \
+      </dev/null >/dev/null 2>&1 &
+    while [ ! -s "$KAISOLA_FIXTURE_CHILD_PID" ]; do /bin/sleep 0.01; done
+    exit 23
+    """#
+
+    private static let unsupportedHandshakeScript = #"""
+    trap '' TERM
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" TERM; printf "%s\n" "$$" > "$KAISOLA_FIXTURE_CHILD_PID"; while :; do /bin/sleep 1; done' \
+      </dev/null >/dev/null 2>&1 &
+    IFS= read -r _
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":2,"agentCapabilities":{}}}'
+    while :; do /bin/sleep 1; done
+    """#
+
+    private static let handshakeThenCloseStdoutScript = #"""
+    trap '' TERM
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" TERM; printf "%s\n" "$$" > "$KAISOLA_FIXTURE_CHILD_PID"; while :; do /bin/sleep 1; done' \
+      </dev/null >/dev/null 2>&1 &
+    IFS= read -r _
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+    IFS= read -r _
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture-session"}}'
+    exec 1>&-
+    while :; do /bin/sleep 1; done
+    """#
+
+    private static let handshakeThenStopReadingStdinScript = #"""
+    trap '' TERM
+    printf '%s\n' "$$" > "$KAISOLA_FIXTURE_PARENT_PID"
+    /bin/sh -c 'trap "" TERM; printf "%s\n" "$$" > "$KAISOLA_FIXTURE_CHILD_PID"; while :; do /bin/sleep 1; done' \
+      </dev/null >/dev/null 2>&1 &
+    IFS= read -r _
+    printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+    IFS= read -r _
+    printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"sessionId":"fixture-session"}}'
+    while :; do /bin/sleep 1; done
+    """#
+
+    private func waitForQueuedFrames(_ count: Int, in queue: AcpStdinWriteQueue) async {
+        for _ in 0..<1_000 {
+            if await queue.snapshotForTesting().queuedFrameCount == count { return }
+            await Task.yield()
+        }
+        XCTFail("stdin queue did not reach \(count) frames")
+    }
+
+    @MainActor
+    private func waitUntil(
+        timeout: Duration,
+        condition: @MainActor () -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while !condition(), ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(condition(), "condition did not become true within \(timeout)")
+    }
+
+    private func assertFailed(
+        _ task: Task<Void, any Error>,
+        message: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async {
+        do {
+            try await task.value
+            XCTFail("expected queued write to fail", file: file, line: line)
+        } catch let AcpClientError.requestFailed(actual) {
+            XCTAssertEqual(actual, message, file: file, line: line)
+        } catch {
+            XCTFail("unexpected write error: \(error)", file: file, line: line)
+        }
+    }
+
+    private func stderrFailureMessage(from transport: AcpProcessTransport) async throws -> String {
+        do {
+            let unexpected = try await transport.receive(maximumBytes: 1_024)
+            await transport.terminate()
+            XCTFail("stderr-bearing adapter EOF must expose a diagnostic failure, got \(String(describing: unexpected))")
+            return ""
+        } catch let AcpClientError.requestFailed(message) {
+            return message
+        }
+    }
+
+    private func receive(
+        from transport: AcpProcessTransport,
+        timeout: Duration
+    ) async throws -> Data? {
+        try await withThrowingTaskGroup(of: Data?.self) { group in
+            group.addTask { try await transport.receive(maximumBytes: 1_024) }
+            group.addTask {
+                try await Task.sleep(for: timeout)
+                await transport.terminate()
+                throw AcpProcessIntegrationTestError.receiveTimedOut
+            }
+            defer { group.cancelAll() }
+            guard let result = try await group.next() else {
+                throw AcpProcessIntegrationTestError.receiveTimedOut
+            }
+            return result
+        }
+    }
+}
+
+private final class BlockingStderrReadSource: @unchecked Sendable {
+    let readStarted = DispatchSemaphore(value: 0)
+    let allowAppend = DispatchSemaphore(value: 0)
+
+    private let lock = NSLock()
+    private let payload: Data
+    private var didRead = false
+    private var readCountStorage = 0
+
+    init(payload: Data) {
+        self.payload = payload
+    }
+
+    func read() -> Data? {
+        lock.lock()
+        readCountStorage += 1
+        guard !didRead else {
+            lock.unlock()
+            return nil
+        }
+        didRead = true
+        lock.unlock()
+
+        readStarted.signal()
+        allowAppend.wait()
+        return payload
+    }
+
+    var readCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return readCountStorage
+    }
+}
+
+private enum AcpProcessIntegrationTestError: Error {
+    case receiveTimedOut
+}
+
+private final class LockedMonotonicClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: UInt64
+
+    init(_ value: UInt64) { storage = value }
+
+    var value: UInt64 {
+        get { lock.withLock { storage } }
+        set { lock.withLock { storage = newValue } }
+    }
+}
+
+private actor SuspendedStdinWriter {
+    struct Call: Equatable, Sendable {
+        let payload: String
+        let deadline: UInt64
+    }
+
+    private(set) var calls: [Call] = []
+    private var pending: [CheckedContinuation<Void, any Error>] = []
+    private var callWaiters: [(target: Int, continuation: CheckedContinuation<Void, Never>)] = []
+
+    var callCount: Int { calls.count }
+
+    func write(data: Data, deadline: UInt64) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            calls.append(Call(payload: String(decoding: data, as: UTF8.self), deadline: deadline))
+            pending.append(continuation)
+            let ready = callWaiters.filter { calls.count >= $0.target }
+            callWaiters.removeAll { calls.count >= $0.target }
+            for waiter in ready { waiter.continuation.resume() }
+        }
+    }
+
+    func waitForCallCount(_ target: Int) async {
+        if calls.count >= target { return }
+        await withCheckedContinuation { continuation in
+            callWaiters.append((target, continuation))
+        }
+    }
+
+    func succeedNext() {
+        guard !pending.isEmpty else { return }
+        pending.removeFirst().resume()
+    }
+
+    func failNext(_ error: any Error) {
+        guard !pending.isEmpty else { return }
+        pending.removeFirst().resume(throwing: error)
+    }
+}
+
+private struct OwnedProcessFixture: @unchecked Sendable {
+    let directory: URL
+    private let parentPIDFile: URL
+    private let childPIDFile: URL
+
+    init() throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("kaisola-acp-owned-\(UUID().uuidString)", isDirectory: true)
+        parentPIDFile = directory.appendingPathComponent("adapter.pid")
+        childPIDFile = directory.appendingPathComponent("app-server.pid")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    var environment: [String: String] {
+        ProcessInfo.processInfo.environment.merging([
+            "KAISOLA_FIXTURE_PARENT_PID": parentPIDFile.path,
+            "KAISOLA_FIXTURE_CHILD_PID": childPIDFile.path,
+        ]) { _, fixture in fixture }
+    }
+
+    func waitForPIDs(timeout: Duration = .seconds(3)) async throws -> (pid_t, pid_t) {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if let parent = pid(from: parentPIDFile), let child = pid(from: childPIDFile) {
+                return (parent, child)
+            }
+            try await Task.sleep(for: .milliseconds(20))
+        }
+        throw OwnedProcessFixtureError.didNotPublishPIDs
+    }
+
+    func waitUntilStopped(_ pids: (pid_t, pid_t), timeout: Duration = .seconds(3)) async -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        while ContinuousClock.now < deadline {
+            if !Self.isAlive(pids.0), !Self.isAlive(pids.1) { return true }
+            try? await Task.sleep(for: .milliseconds(20))
+        }
+        return !Self.isAlive(pids.0) && !Self.isAlive(pids.1)
+    }
+
+    func forceCleanup() {
+        let parent = pid(from: parentPIDFile)
+        let child = pid(from: childPIDFile)
+        let verifiedGroup = parent.flatMap { group in
+            if Darwin.getpgid(group) == group || child.map({ Darwin.getpgid($0) == group }) == true {
+                return group
+            }
+            return nil
+        }
+        if let group = verifiedGroup {
+            _ = Darwin.kill(-group, SIGKILL)
+        } else {
+            // Pre-fix/failed-spawn fallback: never group-signal unless the
+            // fixture parent is still the group leader we expect.
+            for file in [parentPIDFile, childPIDFile] {
+                if let process = pid(from: file), Self.isAlive(process) {
+                    _ = Darwin.kill(process, SIGKILL)
+                }
+            }
+        }
+        try? FileManager.default.removeItem(at: directory)
+    }
+
+    private func pid(from file: URL) -> pid_t? {
+        guard let text = try? String(contentsOf: file, encoding: .utf8),
+              let value = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              value > 1 else { return nil }
+        return value
+    }
+
+    private static func isAlive(_ pid: pid_t) -> Bool {
+        Darwin.kill(pid, 0) == 0 || errno == EPERM
+    }
+}
+
+private enum OwnedProcessFixtureError: Error {
+    case didNotPublishPIDs
+}
+
+/// A deliberately independent process group that models broker-owned durable
+/// work without relying on Foundation.Process's run-loop-based waitUntilExit().
+/// The test owns this fixture directly and always reaps it within a fixed bound.
+private final class DetachedProcessFixture: @unchecked Sendable {
+    let pid: pid_t
+
+    init() throws {
+        var attributes: posix_spawnattr_t?
+        guard posix_spawnattr_init(&attributes) == 0 else { throw POSIXError(.EIO) }
+        defer { posix_spawnattr_destroy(&attributes) }
+
+        var defaultSignals = sigset_t()
+        sigemptyset(&defaultSignals)
+        sigaddset(&defaultSignals, SIGTERM)
+        var signalMask = sigset_t()
+        sigemptyset(&signalMask)
+        let flags = Int16(
+            POSIX_SPAWN_SETPGROUP
+                | POSIX_SPAWN_CLOEXEC_DEFAULT
+                | POSIX_SPAWN_SETSIGDEF
+                | POSIX_SPAWN_SETSIGMASK
+        )
+        guard posix_spawnattr_setpgroup(&attributes, 0) == 0,
+              posix_spawnattr_setsigdefault(&attributes, &defaultSignals) == 0,
+              posix_spawnattr_setsigmask(&attributes, &signalMask) == 0,
+              posix_spawnattr_setflags(&attributes, flags) == 0 else {
+            throw POSIXError(.EIO)
+        }
+
+        let argv = [strdup("/bin/sleep"), strdup("30"), nil]
+        let environment = [UnsafeMutablePointer<CChar>?](arrayLiteral: nil)
+        defer { argv.dropLast().forEach { free($0) } }
+        var spawnedPID: pid_t = 0
+        let result = argv.withUnsafeBufferPointer { arguments in
+            environment.withUnsafeBufferPointer { variables in
+                posix_spawn(
+                    &spawnedPID,
+                    "/bin/sleep",
+                    nil,
+                    &attributes,
+                    UnsafeMutablePointer(mutating: arguments.baseAddress),
+                    UnsafeMutablePointer(mutating: variables.baseAddress)
+                )
+            }
+        }
+        guard result == 0, spawnedPID > 1 else {
+            throw POSIXError(POSIXErrorCode(rawValue: result) ?? .EIO)
+        }
+        pid = spawnedPID
+    }
+
+    var isRunning: Bool {
+        var status: Int32 = 0
+        let result = Darwin.waitpid(pid, &status, WNOHANG)
+        if result == 0 { return Darwin.kill(pid, 0) == 0 || errno == EPERM }
+        return false
+    }
+
+    @discardableResult
+    func forceCleanup() -> Bool {
+        if reapWithin(.zero) { return true }
+        signalOwnedGroup(SIGTERM)
+        if reapWithin(.milliseconds(300)) { return true }
+        signalOwnedGroup(SIGKILL)
+        return reapWithin(.milliseconds(500))
+    }
+
+    private func signalOwnedGroup(_ signal: Int32) {
+        // The unreaped leader keeps this PID from being reused. Group-signal
+        // only while it remains the independent group leader we spawned.
+        if Darwin.getpgid(pid) == pid {
+            _ = Darwin.kill(-pid, signal)
+        } else if Darwin.kill(pid, 0) == 0 || errno == EPERM {
+            _ = Darwin.kill(pid, signal)
+        }
+    }
+
+    private func reapWithin(_ timeout: Duration) -> Bool {
+        let deadline = ContinuousClock.now.advanced(by: timeout)
+        repeat {
+            var status: Int32 = 0
+            let result = Darwin.waitpid(pid, &status, WNOHANG)
+            if result == pid || (result < 0 && errno == ECHILD) { return true }
+            if result < 0 && errno != EINTR { return false }
+            if ContinuousClock.now >= deadline { return false }
+            usleep(10_000)
+        } while true
     }
 }
 

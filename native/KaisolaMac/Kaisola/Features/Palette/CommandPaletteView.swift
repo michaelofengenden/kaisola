@@ -32,6 +32,13 @@ struct PaletteItem: Identifiable {
     }
 }
 
+enum CommandPaletteResultIdentity {
+    static func itemID(at selection: Int, in items: [PaletteItem]) -> String? {
+        guard items.indices.contains(selection) else { return nil }
+        return items[selection].id
+    }
+}
+
 /// A ⌘K fuzzy command palette: app actions (new terminal/agent/chat, open
 /// folder), view toggles (layout/appearance), and jump-to targets (projects,
 /// sessions, chats). Filters with `FuzzyMatch`, arrow-key navigable, Enter runs,
@@ -52,7 +59,7 @@ struct CommandPaletteView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(spacing: 8) {
-                Image(systemName: "magnifyingglass").foregroundStyle(.secondary)
+                Image(systemName: "magnifyingglass").foregroundStyle(.kaisolaSecondary)
                 TextField("Run a command or jump to…", text: $query)
                     .textFieldStyle(.plain)
                     .font(.title3)
@@ -83,22 +90,26 @@ struct CommandPaletteView: View {
                             .accessibilityHint(item.disabledReason ?? shortcutAccessibilityHint(item))
                             .accessibilityAddTraits(.isButton)
                             .accessibilityAddTraits(index == selection ? .isSelected : [])
-                            .id(index)
+                            .id(item.id)
                         }
                         if filtered.isEmpty {
                             Text("No matching commands")
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(.kaisolaSecondary)
                                 .padding(16)
                         }
                     }
                 }
                 .frame(maxHeight: 360)
                 .onChange(of: selection) { _, new in
+                    guard let itemID = CommandPaletteResultIdentity.itemID(
+                        at: new,
+                        in: filtered
+                    ) else { return }
                     if reduceMotion {
-                        proxy.scrollTo(new, anchor: .center)
+                        proxy.scrollTo(itemID, anchor: .center)
                     } else {
                         withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) {
-                            proxy.scrollTo(new, anchor: .center)
+                            proxy.scrollTo(itemID, anchor: .center)
                         }
                     }
                 }
@@ -127,20 +138,20 @@ struct CommandPaletteView: View {
         return HStack(spacing: 10) {
             Image(systemName: item.systemImage)
                 .frame(width: 18)
-                .foregroundStyle(selected ? selectedText : .secondary)
+                .foregroundStyle(selected ? selectedText : .kaisolaSecondary)
             VStack(alignment: .leading, spacing: 2) {
                 Text(item.title)
                     .foregroundStyle(selected ? selectedText : .primary)
                 Text(item.disabledReason ?? item.subtitle)
                     .font(.caption)
-                    .foregroundStyle(selected ? selectedText.opacity(0.78) : .secondary)
+                    .foregroundStyle(selected ? selectedText.opacity(0.78) : .kaisolaSecondary)
                     .lineLimit(2)
             }
             Spacer()
             if let shortcutHint = item.shortcutHint {
                 Text(shortcutHint)
                     .font(.caption.monospaced())
-                    .foregroundStyle(selected ? selectedText.opacity(0.8) : .secondary)
+                    .foregroundStyle(selected ? selectedText.opacity(0.8) : .kaisolaSecondary)
                     .accessibilityHidden(true)
             }
         }

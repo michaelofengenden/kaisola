@@ -6,11 +6,14 @@ const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
 const {
+  brokerSources,
   contentDigest,
   createManifest,
   roleFor,
   verifyPackage,
 } = require('../../scripts/native-broker-package.cjs')
+
+const repoRoot = path.resolve(__dirname, '../..')
 
 const policy = {
   schemaVersion: 1,
@@ -94,4 +97,20 @@ test('native broker manifest roles distinguish nested executable code', () => {
   assert.equal(roleFor('lib/node_modules/node-pty/prebuilds/darwin-arm64/pty.node'), 'native-module')
   assert.equal(roleFor('lib/node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper'), 'node-pty-spawn-helper')
   assert.equal(roleFor('lib/node_modules/@anthropic-ai/claude-agent-sdk/sdk.mjs'), 'broker-javascript')
+})
+
+test('native broker source inventory includes every local CommonJS dependency', () => {
+  const packagedSources = new Set(brokerSources)
+  const localRequire = /require\(\s*(['"])(\.[^'"]+)\1\s*\)/g
+
+  for (const relative of brokerSources) {
+    const source = fs.readFileSync(path.join(repoRoot, relative), 'utf8')
+    for (const match of source.matchAll(localRequire)) {
+      const dependency = path.posix.normalize(path.posix.join(path.posix.dirname(relative), match[2]))
+      assert.ok(
+        packagedSources.has(dependency),
+        `${relative} requires unpackaged local dependency ${dependency}`
+      )
+    }
+  }
 })

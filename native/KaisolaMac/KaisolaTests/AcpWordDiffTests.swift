@@ -27,6 +27,95 @@ final class AcpWordDiffTests: XCTestCase {
         XCTAssertEqual(added.filter(\.changed).map(\.text), ["2"])
     }
 
+    func testProsePunctuationEditDoesNotMarkTheAdjacentWordsChanged() {
+        let (removed, added) = AcpDiff.wordSegments(
+            removed: "Result: robust.",
+            added: "Result; robust."
+        )
+
+        XCTAssertEqual(removed.map(\.text).joined(), "Result: robust.")
+        XCTAssertEqual(added.map(\.text).joined(), "Result; robust.")
+        XCTAssertEqual(removed.filter(\.changed).map(\.text), [":"])
+        XCTAssertEqual(added.filter(\.changed).map(\.text), [";"])
+    }
+
+    func testMarkdownLinkCitationAndSentenceStructureStayContext() {
+        let (removed, added) = AcpDiff.wordSegments(
+            removed: "- See [Smith 2024](paper.md), p. 4; result: robust.",
+            added: "- See [Smith 2025](paper.md), p. 6; result: fragile."
+        )
+
+        XCTAssertEqual(
+            removed.filter(\.changed).map(\.text),
+            ["2024", "4", "robust"]
+        )
+        XCTAssertEqual(
+            added.filter(\.changed).map(\.text),
+            ["2025", "6", "fragile"]
+        )
+        XCTAssertTrue(removed.contains { !$0.changed && $0.text.contains("](paper.md), p. ") })
+        XCTAssertTrue(added.contains { !$0.changed && $0.text.contains("](paper.md), p. ") })
+    }
+
+    func testAdjacentMarkdownDelimiterStaysContextWhenOnlyMarkerChanges() {
+        let (removed, added) = AcpDiff.wordSegments(
+            removed: "Citation [@smith2024]",
+            added: "Citation [#smith2024]"
+        )
+
+        XCTAssertEqual(removed.filter(\.changed).map(\.text), ["@"])
+        XCTAssertEqual(added.filter(\.changed).map(\.text), ["#"])
+        XCTAssertTrue(removed.contains { !$0.changed && $0.text.hasSuffix("[") })
+        XCTAssertTrue(added.contains { !$0.changed && $0.text.hasSuffix("[") })
+    }
+
+    func testCanonicalUnicodeEquivalentProseStaysContextWithoutChangingEitherSide() {
+        let decomposed = "Cafe\u{301}"
+        let precomposed = "Café"
+
+        let (removed, added) = AcpDiff.wordSegments(
+            removed: "## \(decomposed) findings",
+            added: "## \(precomposed) findings"
+        )
+
+        XCTAssertEqual(removed.map(\.text).joined(), "## \(decomposed) findings")
+        XCTAssertEqual(added.map(\.text).joined(), "## \(precomposed) findings")
+        XCTAssertTrue(removed.allSatisfy { !$0.changed })
+        XCTAssertTrue(added.allSatisfy { !$0.changed })
+    }
+
+    func testMarkdownRowsPreserveHeadingsListsLinksCitationsAndParagraphBreaks() {
+        let old = """
+        # Findings
+
+        - [Claim](paper.md) cites [@smith2024, p. 4].
+
+        Closing paragraph.
+        """
+        let new = """
+        # Findings
+
+        - [Claim](paper.md) cites [@smith2025, p. 6].
+
+        Closing paragraph.
+        """
+
+        let rows = AcpDiff.rows(old: old, new: new)
+
+        XCTAssertEqual(
+            rows.compactMap(\.old).map { $0.map(\.text).joined() }.joined(separator: "\n"),
+            old
+        )
+        XCTAssertEqual(
+            rows.compactMap(\.new).map { $0.map(\.text).joined() }.joined(separator: "\n"),
+            new
+        )
+        let changedOld = rows.compactMap(\.old).flatMap { $0 }.filter(\.changed).map(\.text)
+        let changedNew = rows.compactMap(\.new).flatMap { $0 }.filter(\.changed).map(\.text)
+        XCTAssertEqual(changedOld, ["smith2024", "4"])
+        XCTAssertEqual(changedNew, ["smith2025", "6"])
+    }
+
     func testIdenticalLinesHaveNoChangedSegments() {
         let (removed, added) = AcpDiff.wordSegments(removed: "same line", added: "same line")
         XCTAssertTrue(removed.allSatisfy { !$0.changed })

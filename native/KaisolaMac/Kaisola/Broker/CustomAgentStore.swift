@@ -10,10 +10,99 @@ import Foundation
 /// additive optionals: every legacy roster entry decodes with them absent,
 /// which reads as terminal-only and chat-disabled (the adversarial review's
 /// finding 4 — a missing enablement flag must never decode as enabled).
-struct CustomAgentSpec: Codable, Equatable, Identifiable {
+enum CustomAdapterPrivilege: String, Codable, CaseIterable, Hashable, Identifiable, Sendable {
+    /// Permit outbound IP connections. Unix-domain sockets, listeners, and
+    /// inbound connections remain outside the boundary.
+    case network
+    /// Permit direct adapter reads in the current session workspace. The ACP
+    /// fs bridge is gated by the same declaration.
+    case workspaceRead
+    /// Permit direct adapter writes in the current session workspace. The ACP
+    /// fs bridge is gated separately from reads, so this does not imply read.
+    case workspaceWrite
+    /// Permit child processes inside the same Seatbelt profile. Kaisola's host
+    /// terminal bridge remains unavailable to custom adapters because it would
+    /// otherwise escape both the sandbox and the minimal environment.
+    case childProcess
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .network: "Outbound network"
+        case .workspaceRead: "Read workspace"
+        case .workspaceWrite: "Write workspace"
+        case .childProcess: "Spawn child processes"
+        }
+    }
+
+    var reviewDetail: String {
+        switch self {
+        case .network: "remote IP plus required macOS resolver/network services; forwards enabled HTTP/SSE MCP definitions and their configured headers"
+        case .workspaceRead: "direct reads plus ACP read_text_file in this session's workspace"
+        case .workspaceWrite: "direct writes plus ACP write_text_file in this session's workspace"
+        case .childProcess: "subprocesses inherit the sandbox and allowlist; enabled stdio MCP definitions include their configured environment values"
+        }
+    }
+}
+
+/// The exact containment grant captured with an installed adapter. The policy
+/// version makes a future boundary change an approval change rather than a
+/// silent widening. Stored strings keep older readers and unknown future
+/// values fail-closed instead of making the entire roster undecodable.
+struct CustomAdapterApproval: Codable, Equatable, Hashable, Sendable {
+    static let currentBoundaryVersion = 1
+
+    let boundaryVersion: Int
+    let credentials: String
+    let privileges: [String]
+
+    init(
+        credentials: CustomAgentSpec.Credentials,
+        privileges: Set<CustomAdapterPrivilege>,
+        boundaryVersion: Int = currentBoundaryVersion
+    ) {
+        self.boundaryVersion = boundaryVersion
+        self.credentials = credentials.rawValue
+        self.privileges = CustomAdapterPrivilege.allCases
+            .filter(privileges.contains)
+            .map(\.rawValue)
+    }
+
+    var resolvedCredentials: CustomAgentSpec.Credentials? {
+        CustomAgentSpec.Credentials(rawValue: credentials)
+    }
+
+    var resolvedPrivileges: Set<CustomAdapterPrivilege>? {
+        let values = privileges.compactMap(CustomAdapterPrivilege.init(rawValue:))
+        guard values.count == privileges.count,
+              Set(privileges).count == privileges.count else { return nil }
+        return Set(values)
+    }
+
+    var isCurrentAndValid: Bool {
+        boundaryVersion == Self.currentBoundaryVersion
+            && resolvedCredentials != nil
+            && resolvedPrivileges != nil
+    }
+
+    var reviewSummary: String {
+        let access = resolvedPrivileges.map { privileges in
+            CustomAdapterPrivilege.allCases
+                .filter(privileges.contains)
+                .map(\.title)
+                .joined(separator: ", ")
+        } ?? "Invalid access declaration"
+        let accessSummary = access.isEmpty ? "No workspace, network, or process access" : access
+        let credentialSummary = resolvedCredentials?.title ?? "Unknown credential context"
+        return "\(accessSummary) · \(credentialSummary)"
+    }
+}
+
+struct CustomAgentSpec: Codable, Equatable, Identifiable, Sendable {
     /// Whose credentials a chat with this agent uses — declared data, never
     /// inferred from an id or a package name (review finding 3).
-    enum Credentials: String, Codable, CaseIterable, Identifiable {
+    enum Credentials: String, Codable, CaseIterable, Identifiable, Sendable {
         /// The Claude account bindings (CLAUDE_CONFIG_DIR profiles).
         case claude
         /// The Codex account bindings (CODEX_HOME profiles).
@@ -44,9 +133,50 @@ struct CustomAgentSpec: Codable, Equatable, Identifiable {
     /// Whether the user has explicitly enabled the chat surface for this
     /// agent. Enablement is only honored when a verified install exists.
     var chatEnabled: Bool?
+    /// Closed, explicitly reviewed containment privileges. Missing means a
+    /// legacy entry that has never reviewed the sandbox contract and therefore
+    /// cannot launch chat. Empty is a valid explicit least-privilege grant.
+    var acpPrivileges: [String]? = nil
 
     var resolvedCredentials: Credentials {
         credentials.flatMap(Credentials.init) ?? .none
+    }
+
+    /// The declaration used for containment approval. A missing legacy value
+    /// still means credential-free, but an unknown non-nil value must not be
+    /// silently collapsed to `.none`: a future credential kind could otherwise
+    /// widen an old approval without another review.
+    private var declaredCredentials: Credentials? {
+        guard let credentials else { return Credentials.none }
+        return Credentials(rawValue: credentials)
+    }
+
+    var containmentApproval: CustomAdapterApproval? {
+        guard let acpPrivileges, let declaredCredentials else { return nil }
+        let parsed = acpPrivileges.compactMap(CustomAdapterPrivilege.init(rawValue:))
+        guard parsed.count == acpPrivileges.count,
+              Set(acpPrivileges).count == acpPrivileges.count else { return nil }
+        return CustomAdapterApproval(
+            credentials: declaredCredentials,
+            privileges: Set(parsed)
+        )
+    }
+
+    var containmentIssue: String? {
+        if let credentials, Credentials(rawValue: credentials) == nil {
+            return "The credential context is unknown; choose it again before enabling chat."
+        }
+        guard let acpPrivileges else {
+            return "Review this adapter's contained access before enabling chat."
+        }
+        if Set(acpPrivileges).count != acpPrivileges.count {
+            return "The contained-access declaration repeats a privilege; review it again."
+        }
+        let unknown = acpPrivileges.filter { CustomAdapterPrivilege(rawValue: $0) == nil }
+        if !unknown.isEmpty {
+            return "The contained-access declaration has unknown privileges: \(unknown.joined(separator: ", "))."
+        }
+        return nil
     }
 
     /// Why the declared ACP package can never be installed, or nil when the
@@ -73,50 +203,246 @@ struct CustomAgentSpec: Codable, Equatable, Identifiable {
     }
 }
 
-/// Persists the user's custom agents to the native application-support directory
-/// (never Electron's). Atomic writes, corrupt file → empty, capped — mirroring
-/// `SessionPinStore`/`PermissionRuleStore`.
+/// Persists the user's executable custom-agent registry to the native
+/// application-support directory (never Electron's). Reads and writes are
+/// deliberately failure-visible: a caller must distinguish an empty registry
+/// from one this build could not safely understand, and no save may overwrite
+/// bytes that failed that check.
 struct CustomAgentStore: Sendable {
+    enum PersistenceOperation: String, Equatable, Sendable {
+        case encodeRegistry
+        case createDirectory
+        case writeTemporaryFile
+        case setPermissions
+        case replaceRegistry
+
+        var description: String {
+            switch self {
+            case .encodeRegistry: "encoding the registry"
+            case .createDirectory: "creating its private directory"
+            case .writeTemporaryFile: "writing its temporary file"
+            case .setPermissions: "setting private file permissions"
+            case .replaceRegistry: "atomically replacing the registry"
+            }
+        }
+    }
+
+    enum StoreError: Error, Equatable, Sendable {
+        case registryUnreadable(path: String, reason: String)
+        case corruptRegistry(path: String)
+        case unsupportedSchema(found: Int, supported: Int)
+        case invalidEntry(index: Int, id: String?, reason: String)
+        case persistenceFailed(
+            entryID: String?,
+            operation: PersistenceOperation,
+            path: String,
+            reason: String
+        )
+    }
+
+    typealias LoadResult = Result<[CustomAgentSpec], StoreError>
+    typealias SaveResult = Result<[CustomAgentSpec], StoreError>
+
+    static let schemaVersion = 1
+
     private struct Payload: Codable {
+        var schemaVersion: Int
         var agents: [CustomAgentSpec]
+
+        init(agents: [CustomAgentSpec]) {
+            self.schemaVersion = CustomAgentStore.schemaVersion
+            self.agents = agents
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case schemaVersion
+            case agents
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            // The original registry was unversioned. It is schema 1 by
+            // definition, so existing users migrate without rewriting on read.
+            schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion) ?? 1
+            agents = try container.decode([CustomAgentSpec].self, forKey: .agents)
+        }
+    }
+
+    private struct Header: Decodable {
+        let schemaVersion: Int?
     }
 
     let fileURL: URL
     /// A deliberately small ceiling: the New menu is a launcher, not a registry.
     private let cap = 12
+    private let replaceRegistry: @Sendable (URL, URL) throws -> Void
 
     init(fileURL: URL = NativePreviewPaths.applicationSupportDirectory
         .appendingPathComponent("custom-agents.json", isDirectory: false)) {
-        self.fileURL = fileURL
+        self.init(fileURL: fileURL, replaceRegistry: Self.atomicReplace)
     }
 
-    /// The stored custom agents, in insertion order. Corrupt file → empty.
+    /// `replaceRegistry` is an internal fault-injection seam for proving that
+    /// an interrupted final rename leaves the old registry byte-for-byte intact.
+    init(
+        fileURL: URL,
+        replaceRegistry: @escaping @Sendable (URL, URL) throws -> Void
+    ) {
+        self.fileURL = fileURL.standardizedFileURL
+        self.replaceRegistry = replaceRegistry
+    }
+
+    /// Compatibility convenience for non-authoritative display code. Settings
+    /// and every launch decision consume `load()` directly so a failure can
+    /// never be mistaken for an intentionally empty registry.
     func all() -> [CustomAgentSpec] {
-        read()?.agents ?? []
+        (try? load().get()) ?? []
     }
 
-    /// Replace the stored set. Keeps the first `cap` entries if handed more, so
-    /// the file can never grow unbounded even if a caller ignores the ceiling.
-    /// Duplicate ids keep only their first row: an id is a contract key, and
-    /// a second row under it could cross packages and credentials.
-    func save(_ specs: [CustomAgentSpec]) {
-        var seen = Set<String>()
-        let unique = specs.filter { seen.insert($0.id).inserted }
-        let capped = unique.count > cap ? Array(unique.prefix(cap)) : unique
-        write(Payload(agents: capped))
+    /// Load the complete registry or a typed failure. Decoding is all-or-none:
+    /// one malformed row makes the entire result unusable for launching, while
+    /// the original bytes remain untouched for diagnosis and recovery.
+    func load() -> LoadResult {
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            return .success([])
+        }
+
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            return .failure(.registryUnreadable(
+                path: fileURL.path,
+                reason: error.localizedDescription
+            ))
+        }
+
+        let decoder = JSONDecoder()
+        let header: Header
+        do {
+            header = try decoder.decode(Header.self, from: data)
+        } catch {
+            return .failure(.corruptRegistry(path: fileURL.path))
+        }
+        let foundSchema = header.schemaVersion ?? 1
+        guard foundSchema == Self.schemaVersion else {
+            return .failure(.unsupportedSchema(
+                found: foundSchema,
+                supported: Self.schemaVersion
+            ))
+        }
+
+        let payload: Payload
+        do {
+            payload = try decoder.decode(Payload.self, from: data)
+        } catch {
+            return .failure(Self.decodingFailure(error, data: data, path: fileURL.path))
+        }
+        if let error = Self.validationFailure(in: payload.agents, cap: cap) {
+            return .failure(error)
+        }
+        return .success(payload.agents)
+    }
+
+    /// Replace the stored set as one transaction. Overflow and duplicate ids
+    /// are rejected with the exact entry index instead of silently applying a
+    /// subset: an id is a package and credential contract key.
+    @discardableResult
+    func save(_ specs: [CustomAgentSpec], affectedAgentID: String? = nil) -> SaveResult {
+        if let error = Self.validationFailure(in: specs, cap: cap) {
+            return .failure(error)
+        }
+
+        // A corrupt, partial, unreadable, or forward-version registry is not
+        // an empty starting point. Refuse the write and preserve those bytes.
+        if FileManager.default.fileExists(atPath: fileURL.path),
+           case let .failure(error) = load() {
+            return .failure(error)
+        }
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let data: Data
+        do {
+            data = try encoder.encode(Payload(agents: specs))
+        } catch {
+            return persistenceFailure(
+                affectedAgentID,
+                operation: .encodeRegistry,
+                path: fileURL.path,
+                error: error
+            )
+        }
+
+        let directory = fileURL.deletingLastPathComponent()
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        } catch {
+            return persistenceFailure(
+                affectedAgentID,
+                operation: .createDirectory,
+                path: directory.path,
+                error: error
+            )
+        }
+
+        let temporary = directory.appendingPathComponent(
+            ".\(fileURL.lastPathComponent).\(UUID().uuidString).tmp"
+        )
+        do {
+            try data.write(to: temporary, options: [])
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            return persistenceFailure(
+                affectedAgentID,
+                operation: .writeTemporaryFile,
+                path: temporary.path,
+                error: error
+            )
+        }
+        do {
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: temporary.path
+            )
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            return persistenceFailure(
+                affectedAgentID,
+                operation: .setPermissions,
+                path: temporary.path,
+                error: error
+            )
+        }
+        do {
+            try replaceRegistry(temporary, fileURL)
+        } catch {
+            try? FileManager.default.removeItem(at: temporary)
+            return persistenceFailure(
+                affectedAgentID,
+                operation: .replaceRegistry,
+                path: fileURL.path,
+                error: error
+            )
+        }
+        return .success(specs)
     }
 
     /// Map each spec into an `AgentProfile` for `AgentRegistry`. An empty symbol
     /// falls back to "terminal" so the session row always has a glyph.
-    func asProfiles() -> [AgentProfile] {
-        all().map { spec in
+    func asProfiles() -> Result<[AgentProfile], StoreError> {
+        load().map { specs in specs.map { spec in
             AgentProfile(
                 id: spec.id,
                 name: spec.name,
                 launchCommand: spec.launchCommand,
                 symbol: spec.symbol.isEmpty ? "terminal" : spec.symbol
             )
-        }
+        } }
     }
 
     /// Derive a stable, filesystem-safe id from a display name: lowercased, ASCII
@@ -149,26 +475,175 @@ struct CustomAgentStore: Sendable {
         return "\(base)-\(suffix)"
     }
 
-    private func read() -> Payload? {
-        guard let data = try? Data(contentsOf: fileURL) else { return nil }
-        return try? JSONDecoder().decode(Payload.self, from: data)
+    /// The comparison form of a display name: whitespace runs collapsed to one
+    /// space, ends trimmed, case folded. Two names that fold together are the
+    /// same name to anyone reading the New menu, however their spacing or
+    /// capitalization differs.
+    static func normalizedName(_ name: String) -> String {
+        name.split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+            .lowercased()
     }
 
-    private func write(_ payload: Payload) {
-        let directory = fileURL.deletingLastPathComponent()
-        try? FileManager.default.createDirectory(
-            at: directory,
-            withIntermediateDirectories: true,
-            attributes: [.posixPermissions: 0o700]
-        )
-        guard let data = try? JSONEncoder().encode(payload) else { return }
-        let temporary = directory.appendingPathComponent(".\(fileURL.lastPathComponent).\(ProcessInfo.processInfo.processIdentifier)")
-        do {
-            try data.write(to: temporary, options: [])
-            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: temporary.path)
-            _ = try FileManager.default.replaceItemAt(fileURL, withItemAt: temporary)
-        } catch {
-            try? FileManager.default.removeItem(at: temporary)
+    /// Why `name` cannot label a row alongside `specs`, or nil when it is free.
+    /// `ignoring` exempts one row so an existing entry can be renamed — or
+    /// re-saved unchanged — without colliding with itself.
+    ///
+    /// Ids are already made unique by `slugify`, but two rows under one display
+    /// name are indistinguishable in every menu and every status line, so
+    /// neither can be picked or blamed with confidence.
+    static func duplicateNameError(
+        _ name: String,
+        in specs: [CustomAgentSpec],
+        ignoring id: String? = nil
+    ) -> String? {
+        let candidate = normalizedName(name)
+        guard !candidate.isEmpty else { return nil }
+        guard let clash = specs.first(where: {
+            $0.id != id && normalizedName($0.name) == candidate
+        }) else { return nil }
+        return "\"\(clash.name)\" already uses this name. "
+            + "Custom-agent names must differ by more than spacing or capitalization."
+    }
+
+    /// The roster after appending `spec`, or nil when its display name (or id)
+    /// is already taken. The refusal lives here rather than in the view so a
+    /// disabled Add button and a refused save can never disagree.
+    ///
+    /// Only the entry point is guarded: `save` still writes duplicate-named
+    /// rows it is handed, so a roster written before this rule existed keeps
+    /// every entry and stays repairable by renaming.
+    static func adding(_ spec: CustomAgentSpec, to specs: [CustomAgentSpec]) -> [CustomAgentSpec]? {
+        guard duplicateNameError(spec.name, in: specs) == nil,
+              !specs.contains(where: { $0.id == spec.id }) else { return nil }
+        return specs + [spec]
+    }
+
+    private func persistenceFailure(
+        _ entryID: String?,
+        operation: PersistenceOperation,
+        path: String,
+        error: Error
+    ) -> SaveResult {
+        .failure(.persistenceFailed(
+            entryID: entryID,
+            operation: operation,
+            path: path,
+            reason: error.localizedDescription
+        ))
+    }
+
+    private static func atomicReplace(temporary: URL, registry: URL) throws {
+        if rename(temporary.path, registry.path) != 0 {
+            let code = POSIXErrorCode(rawValue: errno) ?? .EIO
+            throw POSIXError(code)
+        }
+    }
+
+    private static func decodingFailure(_ error: Error, data: Data, path: String) -> StoreError {
+        let codingPath: [CodingKey]
+        let reason: String
+        switch error {
+        case let DecodingError.keyNotFound(key, context):
+            codingPath = context.codingPath
+            reason = "Missing required field \"\(key.stringValue)\"."
+        case let DecodingError.typeMismatch(_, context):
+            codingPath = context.codingPath
+            reason = context.debugDescription
+        case let DecodingError.valueNotFound(_, context):
+            codingPath = context.codingPath
+            reason = context.debugDescription
+        case let DecodingError.dataCorrupted(context):
+            codingPath = context.codingPath
+            reason = context.debugDescription
+        default:
+            return .corruptRegistry(path: path)
+        }
+
+        guard let index = codingPath.compactMap(\.intValue).first else {
+            return .corruptRegistry(path: path)
+        }
+        let id = rawAgentID(at: index, data: data)
+        return .invalidEntry(index: index, id: id, reason: reason)
+    }
+
+    private static func rawAgentID(at index: Int, data: Data) -> String? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let agents = object["agents"] as? [[String: Any]],
+              agents.indices.contains(index) else { return nil }
+        return agents[index]["id"] as? String
+    }
+
+    private static func validationFailure(
+        in specs: [CustomAgentSpec],
+        cap: Int
+    ) -> StoreError? {
+        guard specs.count <= cap else {
+            let index = cap
+            return .invalidEntry(
+                index: index,
+                id: specs[index].id,
+                reason: "The registry supports at most \(cap) custom agents."
+            )
+        }
+
+        var seen = Set<String>()
+        let reserved = Set(["claude-code", "codex", "opencode", "gemini"])
+        for (index, spec) in specs.enumerated() {
+            let id = spec.id
+            if id.isEmpty || id != id.trimmingCharacters(in: .whitespacesAndNewlines) {
+                return .invalidEntry(index: index, id: id, reason: "The agent id is empty or contains surrounding whitespace.")
+            }
+            if reserved.contains(id) {
+                return .invalidEntry(index: index, id: id, reason: "The agent id is reserved for a built-in agent.")
+            }
+            if !seen.insert(id).inserted {
+                return .invalidEntry(index: index, id: id, reason: "The agent id duplicates an earlier entry.")
+            }
+            if spec.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return .invalidEntry(index: index, id: id, reason: "The display name is empty.")
+            }
+            if spec.launchCommand.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return .invalidEntry(index: index, id: id, reason: "The launch command is empty.")
+            }
+            if let credentials = spec.credentials,
+               CustomAgentSpec.Credentials(rawValue: credentials) == nil {
+                return .invalidEntry(
+                    index: index,
+                    id: id,
+                    reason: "The credential context \"\(credentials)\" is not recognized."
+                )
+            }
+            if spec.chatEnabled == true {
+                if spec.acpPackage?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+                    return .invalidEntry(
+                        index: index,
+                        id: id,
+                        reason: "Chat cannot be enabled without an ACP adapter package."
+                    )
+                }
+                if let reason = spec.acpPackageValidationError {
+                    return .invalidEntry(index: index, id: id, reason: reason)
+                }
+            }
+        }
+        return nil
+    }
+}
+
+extension CustomAgentStore.StoreError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case let .registryUnreadable(path, reason):
+            "Custom-agent registry at \(path) could not be read: \(reason)"
+        case let .corruptRegistry(path):
+            "Custom-agent registry at \(path) is malformed. Its bytes were preserved and no custom agent will launch."
+        case let .unsupportedSchema(found, supported):
+            "Custom-agent registry uses schema \(found), but this build supports schema \(supported). It was preserved unchanged and no custom agent will launch."
+        case let .invalidEntry(index, id, reason):
+            "Custom-agent entry \(index + 1)\(id.map { " (\($0))" } ?? "") is invalid: \(reason)"
+        case let .persistenceFailed(entryID, operation, path, reason):
+            "Could not save \(entryID.map { "custom agent \($0)" } ?? "the custom-agent registry") while \(operation.description) at \(path): \(reason). The previous registry was preserved."
         }
     }
 }

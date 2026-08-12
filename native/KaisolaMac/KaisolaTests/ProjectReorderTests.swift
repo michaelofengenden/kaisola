@@ -81,4 +81,99 @@ final class ProjectReorderTests: XCTestCase {
         store.moveProject(id: "nproj_missing", toIndex: 0)
         XCTAssertTrue(store.projects().isEmpty)
     }
+
+    func testAccessibleStepPlansOnlyAvailableNeighborMoves() {
+        XCTAssertEqual(
+            ProjectTabReorder.availableDirections(index: 0, count: 3),
+            [.right]
+        )
+        XCTAssertEqual(
+            ProjectTabReorder.availableDirections(index: 1, count: 3),
+            [.left, .right]
+        )
+        XCTAssertEqual(
+            ProjectTabReorder.availableDirections(index: 2, count: 3),
+            [.left]
+        )
+        XCTAssertEqual(ProjectTabReorder.availableDirections(index: 0, count: 1), [])
+        XCTAssertEqual(ProjectTabReorder.availableDirections(index: -1, count: 3), [])
+        XCTAssertEqual(ProjectTabReorder.positionDescription(index: 0, count: 3), "Position 1 of 3")
+        XCTAssertEqual(ProjectTabReorder.positionDescription(index: 2, count: 3), "Position 3 of 3")
+        XCTAssertNil(ProjectTabReorder.positionDescription(index: 3, count: 3))
+    }
+
+    func testAccessibleStepsUseThePointerPathAndAnnounceThePersistedPosition() {
+        let ids = openFour()
+        var announcements: [String] = []
+
+        XCTAssertTrue(
+            ProjectTabReorder.perform(
+                projectID: ids.c,
+                projectName: "Charlie",
+                index: 2,
+                count: 4,
+                direction: .left,
+                reorder: { store.moveProject(id: $0, toIndex: $1) },
+                announce: { announcements.append($0) }
+            )
+        )
+        XCTAssertEqual(store.projects().map(\.id), [ids.a, ids.c, ids.b, ids.d])
+        XCTAssertEqual(announcements, ["Moved Charlie to position 2 of 4."])
+
+        let reopened = NativeSessionStore(fileURL: fileURL)
+        XCTAssertEqual(reopened.projects().map(\.id), [ids.a, ids.c, ids.b, ids.d])
+
+        XCTAssertTrue(
+            ProjectTabReorder.perform(
+                projectID: ids.c,
+                projectName: "Charlie",
+                index: 1,
+                count: 4,
+                direction: .right,
+                reorder: { store.moveProject(id: $0, toIndex: $1) },
+                announce: { announcements.append($0) }
+            )
+        )
+        XCTAssertEqual(store.projects().map(\.id), [ids.a, ids.b, ids.c, ids.d])
+        XCTAssertEqual(
+            announcements,
+            [
+                "Moved Charlie to position 2 of 4.",
+                "Moved Charlie to position 3 of 4.",
+            ]
+        )
+    }
+
+    func testAccessibleBoundaryStepDoesNotReorderOrAnnounce() {
+        let ids = openFour()
+        var reorderCalls: [(String, Int)] = []
+        var announcements: [String] = []
+
+        XCTAssertFalse(
+            ProjectTabReorder.perform(
+                projectID: ids.a,
+                projectName: "Alpha",
+                index: 0,
+                count: 4,
+                direction: .left,
+                reorder: { reorderCalls.append(($0, $1)) },
+                announce: { announcements.append($0) }
+            )
+        )
+        XCTAssertFalse(
+            ProjectTabReorder.perform(
+                projectID: ids.d,
+                projectName: "Delta",
+                index: 3,
+                count: 4,
+                direction: .right,
+                reorder: { reorderCalls.append(($0, $1)) },
+                announce: { announcements.append($0) }
+            )
+        )
+        XCTAssertTrue(reorderCalls.isEmpty)
+        XCTAssertTrue(announcements.isEmpty)
+        XCTAssertEqual(store.projects().map(\.id), [ids.a, ids.b, ids.c, ids.d])
+    }
+
 }

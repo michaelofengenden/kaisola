@@ -74,10 +74,11 @@ public struct CompanionPairingPayload: Codable, Hashable, Sendable {
     public let requestedCapabilities: [CompanionCapability]
     public let transportHint: CompanionPairingTransportHint
     public let expiresAt: Int64
+    public let accountScope: CompanionAccountScope?
 
     private enum CodingKeys: String, CodingKey, CaseIterable {
         case type, protocolVersion, noiseProtocol, desktopId, identityPublic, keyRecord
-        case pairingNonce, requestedCapabilities, transportHint, expiresAt
+        case pairingNonce, requestedCapabilities, transportHint, expiresAt, accountScope
     }
 
     public init(
@@ -87,7 +88,8 @@ public struct CompanionPairingPayload: Codable, Hashable, Sendable {
         pairingNonce: String,
         requestedCapabilities: [CompanionCapability],
         transportHint: CompanionPairingTransportHint,
-        expiresAt: Int64
+        expiresAt: Int64,
+        accountScope: CompanionAccountScope
     ) {
         type = "kaisola-companion-pairing"
         protocolVersion = CompanionCrypto.protocolVersion
@@ -99,6 +101,7 @@ public struct CompanionPairingPayload: Codable, Hashable, Sendable {
         self.requestedCapabilities = requestedCapabilities
         self.transportHint = transportHint
         self.expiresAt = expiresAt
+        self.accountScope = accountScope
     }
 
     public init(from decoder: Decoder) throws {
@@ -128,6 +131,7 @@ public struct CompanionPairingPayload: Codable, Hashable, Sendable {
         requestedCapabilities = CompanionCapability.allCases.filter(requested.contains)
         transportHint = try container.decode(CompanionPairingTransportHint.self, forKey: .transportHint)
         expiresAt = try container.decode(Int64.self, forKey: .expiresAt)
+        accountScope = try container.decodeIfPresent(CompanionAccountScope.self, forKey: .accountScope)
     }
 
     public func validate(now: Date = .now, clockSkewMilliseconds: Int64 = 30_000) throws {
@@ -144,6 +148,7 @@ public struct CompanionPairingPayload: Codable, Hashable, Sendable {
               requestedCapabilities.contains(.observe),
               Set(requestedCapabilities).count == requestedCapabilities.count,
               requestedCapabilities.count <= CompanionCapability.allCases.count,
+              accountScope != nil,
               expiresAt >= 0,
               expiresAt <= 9_007_199_254_740_991,
               clockSkewMilliseconds >= 0 else {
@@ -170,14 +175,18 @@ public struct CompanionPairingPayload: Codable, Hashable, Sendable {
     public func handshakeContext(connectionId: String) throws -> JSONValue {
         _ = try CompanionCrypto.validateIdentifier(connectionId, label: "connectionId")
         let hash = CompanionCrypto.sha256(try CanonicalJSON.data(from: self)).base64URLEncodedString()
-        return .object([
+        var fields: [String: JSONValue] = [
             "v": .integer(Int64(CompanionCrypto.protocolVersion)),
             "mode": .string("pair"),
             "protocol": .string(CompanionCrypto.noiseProtocol),
             "desktopId": .string(desktopId),
             "connectionId": .string(connectionId),
             "qrHash": .string(hash),
-        ])
+        ]
+        if let accountScope {
+            fields["accountScope"] = .string(accountScope.rawValue)
+        }
+        return .object(fields)
     }
 }
 
@@ -187,19 +196,22 @@ public struct CompanionPairedDesktop: Codable, Hashable, Sendable {
     public let x25519StaticPublic: String
     public let capabilities: [CompanionCapability]
     public let transportHint: CompanionPairingTransportHint?
+    public let accountScope: CompanionAccountScope
 
     public init(
         desktopId: String,
         identityPublic: String,
         x25519StaticPublic: String,
         capabilities: [CompanionCapability],
-        transportHint: CompanionPairingTransportHint?
+        transportHint: CompanionPairingTransportHint?,
+        accountScope: CompanionAccountScope
     ) {
         self.desktopId = desktopId
         self.identityPublic = identityPublic
         self.x25519StaticPublic = x25519StaticPublic
         self.capabilities = capabilities
         self.transportHint = transportHint
+        self.accountScope = accountScope
     }
 
     public var pin: CompanionIdentityPin {
@@ -221,6 +233,7 @@ public struct CompanionPairedDesktop: Codable, Hashable, Sendable {
             "desktopId": .string(desktopId),
             "deviceId": .string(deviceId),
             "connectionId": .string(connectionId),
+            "accountScope": .string(accountScope.rawValue),
         ])
     }
 }

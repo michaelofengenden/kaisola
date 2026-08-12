@@ -33,5 +33,37 @@
     "terminal.interrupt": "terminal-control",
     "terminal.release-control": "terminal-control"
   },
+  "snapshotCapabilities": {
+    "snapshot.projects": "observe",
+    "terminal.snapshot": "observe"
+  },
+  "eventCapabilities": {
+    "desktop.status": "observe",
+    "project.updated": "observe",
+    "session.updated": "observe",
+    "attention.raised": "observe",
+    "attention.cleared": "observe",
+    "agent.turn.delta": "observe",
+    "agent.turn.completed": "observe",
+    "agent.permission.requested": "observe",
+    "agent.permission.resolved": "observe",
+    "terminal.snapshot": "observe",
+    "terminal.output": "observe",
+    "terminal.exit": "observe",
+    "ledger.task.updated": "observe"
+  },
+  "projectionFields": {
+    "projection": ["projectionKind", "revision", "generatedAt", "freshness", "projects", "sessions", "attention", "permissions", "board"],
+    "project": ["id", "name", "connection", "lastContactAt", "counts"],
+    "projectCounts": ["running", "waiting", "done", "failed"],
+    "session": ["id", "projectId", "kind", "title", "status", "needsYou", "unread", "updatedAt", "completedAt", "provider", "startedAt", "terminalStreamEpoch", "terminalEndOffset"],
+    "attention": ["id", "projectId", "sessionId", "kind", "title", "detail", "createdAt", "severity"],
+    "permission": ["permId", "projectId", "sessionId", "agent", "title", "kind", "requestedAt", "options", "diffs", "revision", "completeness"],
+    "permissionOption": ["id", "label"],
+    "permissionDiff": ["relativePath", "oldText", "newText"],
+    "board": ["columns"],
+    "boardColumn": ["id", "title", "sourceLabel", "count", "cards"],
+    "boardCard": ["id", "type", "projectId", "title", "status", "needsYou", "updatedAt", "provider"]
+  },
   "receiptStatuses": ["accepted", "applied", "rejected", "stale", "unavailable", "timed_out"]
 }

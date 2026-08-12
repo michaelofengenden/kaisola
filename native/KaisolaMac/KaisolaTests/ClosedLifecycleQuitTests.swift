@@ -58,4 +58,101 @@ final class ClosedLifecycleQuitTests: XCTestCase {
         )
         XCTAssertFalse(model.paneLayout(for: projectID).contains(terminalID))
     }
+
+    @MainActor
+    func testPendingReleaseCapturesGenerationRetriesErrorsAndDrainsImpossibleGeneration() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("closed-release-\(UUID().uuidString.prefix(8))")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let store = NativeSessionStore(fileURL: root.appendingPathComponent("sessions.json"))
+        let control = ClosedLifecycleReleaseControl()
+        let model = AppModel(
+            controlClient: control,
+            sessionStore: store,
+            workspaceStateStore: NativeWorkspaceStateStore(
+                fileURL: root.appendingPathComponent("workspace.json")
+            )
+        )
+        model.loadVisualFixture(workspace: root)
+        await control.setError(.connectionClosed)
+
+        model.commitClose("visual-terminal")
+        let queued = try XCTUnwrap(store.pendingReleaseList().first)
+        XCTAssertEqual(queued.brokerGenerationID, AppModel.visualFixtureBrokerGenerationID)
+
+        await model.drainPendingReleases()
+        XCTAssertEqual(store.pendingReleaseList().map(\.id), ["visual-terminal"])
+
+        await control.setError(nil)
+        await control.setDisposition(.generationAbsent)
+        await model.drainPendingReleases()
+
+        XCTAssertTrue(store.pendingReleaseList().isEmpty)
+        XCTAssertTrue(store.isTerminalTombstoned("visual-terminal"))
+        let releases = await control.releases()
+        XCTAssertEqual(releases, [
+            .init(terminalID: "visual-terminal", generationID: AppModel.visualFixtureBrokerGenerationID),
+            .init(terminalID: "visual-terminal", generationID: AppModel.visualFixtureBrokerGenerationID),
+        ])
+    }
+}
+
+private struct ClosedLifecycleReleaseCall: Equatable, Sendable {
+    let terminalID: String
+    let generationID: String?
+}
+
+private actor ClosedLifecycleReleaseControl: BrokerControlServing {
+    private var disposition: BrokerTerminalReleaseDisposition = .released
+    private var error: BrokerClientError?
+    private var calls: [ClosedLifecycleReleaseCall] = []
+
+    func connect(to info: BrokerInfo, ownerID: String) async throws {}
+
+    func createTerminal(
+        projectID: String,
+        terminalID: String,
+        command: String,
+        arguments: [String],
+        cwd: String,
+        columns: Int,
+        rows: Int,
+        restore: Bool
+    ) async throws -> TerminalCreation {
+        TerminalCreation(
+            terminalID: terminalID,
+            projectID: projectID,
+            pid: nil,
+            streamEpoch: nil
+        )
+    }
+
+    func attach(projectID: String, terminalID: String) async throws {}
+    func write(projectID: String, terminalID: String, data: String) async throws {}
+    func resize(projectID: String, terminalID: String, columns: Int, rows: Int) async throws {}
+    func kill(projectID: String, terminalID: String) async throws {}
+    func release(projectID: String, terminalID: String) async throws {}
+
+    func release(
+        projectID: String,
+        terminalID: String,
+        brokerGenerationID: String?
+    ) async throws -> BrokerTerminalReleaseDisposition {
+        calls.append(.init(terminalID: terminalID, generationID: brokerGenerationID))
+        if let error { throw error }
+        return disposition
+    }
+
+    func detachOwner(projectID: String, terminalID: String) async throws {}
+    func setAgentTurn(projectID: String, terminalID: String, busy: Bool) async throws {}
+    func setControlLease(projectID: String, terminalID: String, active: Bool) async throws {}
+    func disconnect() async {}
+
+    func setDisposition(_ disposition: BrokerTerminalReleaseDisposition) {
+        self.disposition = disposition
+    }
+
+    func setError(_ error: BrokerClientError?) { self.error = error }
+    func releases() -> [ClosedLifecycleReleaseCall] { calls }
 }

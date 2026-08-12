@@ -110,6 +110,65 @@ enum GlassBackdropSource: String, CaseIterable, Identifiable, Sendable {
     var title: String { self == .wallpaper ? "Wallpaper" : "Live" }
 }
 
+/// The one theme control Settings offers: **Glass or Solid.**
+///
+/// Settings used to carry six separate glass rows — sidebar treatment, source,
+/// pinned wallpaper, clarity, blur and colour — plus a seventh for the canvas.
+/// Twenty-seven combinations of the middle three alone, every one measured and
+/// defended in this file, and none of them a decision anybody should have to
+/// make to open a terminal. Michael: "I'd make settings only have two options
+/// for theme (glass/solid) makes things easier."
+///
+/// So the knobs stop being knobs. They keep their types, because the render path
+/// and the whole measured corpus are written against them, but the values are a
+/// *preset* this enum names rather than a grid the user has to navigate.
+enum KaisolaTheme: String, CaseIterable, Identifiable, Sendable {
+    case glass
+    case solid
+
+    var id: String { rawValue }
+    var title: String { self == .glass ? "Glass" : "Solid" }
+
+    var sidebarAppearance: SidebarAppearance { self == .glass ? .glass : .solid }
+    var workspaceBackdrop: WorkspaceBackdropMode { self == .glass ? .glass : .system }
+}
+
+/// The one glass recipe: **soft, muted, and live** — and deliberately NOT
+/// frosted.
+///
+/// Michael asked for two things that pull against each other: "glass settings by
+/// default should be darker and on soft, frosted, and muted, modes" and "ACTUALLY
+/// reflect the live wallpaper/desktop/behind the screen", then, on seeing the
+/// frosted build, "glass mode is not really glassy at all".
+///
+/// Frosted is what caused that. It multiplies every veil coverage by 1.16, so it
+/// makes the surface *less* see-through — the opposite of showing the desktop.
+/// Asked to choose, Michael picked transparency, so clarity ships at `balanced`
+/// and the darkening is bought where it costs no transmission: the still's own
+/// luminance target (`DesktopBackdropRenderer.targetLuminance`) and the chrome
+/// panel that used to lighten dark mode.
+///
+/// `behindWindow` is the live half. The shipped default was a *painted* backdrop:
+/// a blurred copy of a wallpaper file found by asking `NSWorkspace` which picture
+/// the desktop shows — a question macOS refuses to answer for a rotating or
+/// dynamic desktop, where it hands back a stand-in and the ladder falls through
+/// to a thumbnail magnified many times over. Nothing in that path is live.
+/// Behind-window vibrancy samples whatever is genuinely behind the window at
+/// composite time, with no permission prompt, no bake and no guessing. What it
+/// gives up is the painted path's one guarantee: other applications' windows do
+/// show through when they are behind Kaisola. That is the trade, and it is the
+/// one the request describes ("behind the screen").
+///
+/// `texture` and `colour` only feed the bake, so on the live path they are inert;
+/// they are still set to the asked-for values so the painted fallback (Reduce
+/// Transparency) looks like the rest of this.
+enum GlassPreset {
+    static let source: GlassBackdropSource = .behindWindow
+    static let texture: GlassTexture = .soft
+    static let colour: GlassColour = .muted
+    static let clarity: GlassClarity = .balanced
+}
+
 /// How far past legibility the wallpaper under the glass is blurred, as the
 /// **scattering length of the material in screen points**.
 ///
@@ -684,6 +743,20 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(workspaceBackdrop.rawValue, forKey: Keys.workspaceBackdrop) }
     }
 
+    /// The single theme control Settings vends, over the two properties above.
+    ///
+    /// Reads as Glass only when *both* surfaces are glass, so a workspace left on
+    /// Solid by an older build reports Solid rather than claiming a state it is
+    /// only half in. Writing sets both, which is the point: they were separate
+    /// rows nobody wanted to reason about independently.
+    var theme: KaisolaTheme {
+        get { sidebarAppearance == .glass && workspaceBackdrop == .glass ? .glass : .solid }
+        set {
+            sidebarAppearance = newValue.sidebarAppearance
+            workspaceBackdrop = newValue.workspaceBackdrop
+        }
+    }
+
     @Published var toolCallDensity: ToolCallDensity {
         didSet { persist(toolCallDensity.rawValue, forKey: Keys.toolCallDensity) }
     }
@@ -1094,15 +1167,21 @@ final class NativePreviewSettings: ObservableObject {
         workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .glass
         toolCallDensity = defaults.string(forKey: Keys.toolCallDensity)
             .flatMap(ToolCallDensity.init) ?? .balanced
-        glassBackdropSource = defaults.string(forKey: Keys.glassBackdropSource)
-            .flatMap(GlassBackdropSource.init) ?? .wallpaper
+        // The four glass knobs are a preset now, not preferences, so they are
+        // NOT read back from defaults: a value stored by a build that still
+        // offered the pickers would otherwise outlive the pickers themselves and
+        // leave someone on a recipe they can no longer see or change. See
+        // `GlassPreset`. They stay settable — the measured test corpus sweeps
+        // them — and `Keys` still names them, so restoring a picker later needs
+        // no migration.
+        glassBackdropSource = GlassPreset.source
+        glassTexture = GlassPreset.texture
+        glassColour = GlassPreset.colour
+        glassClarity = GlassPreset.clarity
+        // Still a real preference: pinning a picture is the one glass choice
+        // that is about *content* rather than about the material, and it stays
+        // meaningful as the painted fallback's input.
         glassWallpaper = defaults.string(forKey: Keys.glassWallpaper) ?? ""
-        glassTexture = defaults.string(forKey: Keys.glassTexture)
-            .flatMap(GlassTexture.init) ?? .balanced
-        glassColour = defaults.string(forKey: Keys.glassColour)
-            .flatMap(GlassColour.init) ?? .balanced
-        glassClarity = defaults.string(forKey: Keys.glassClarity)
-            .flatMap(GlassClarity.init) ?? .balanced
         let stored = defaults.double(forKey: Keys.terminalFontSize)
         terminalFontSize = stored > 0
             ? min(max(stored, Self.terminalFontRange.lowerBound), Self.terminalFontRange.upperBound)

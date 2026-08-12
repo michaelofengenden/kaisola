@@ -1199,19 +1199,28 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// Glass must read as the *desktop* seen through the window, never as the
     /// other apps stacked behind it, so the painted wallpaper is the default
     /// and live behind-window vibrancy survives only as an explicit choice.
-    func testGlassBackdropDefaultsToThePaintedWallpaperSource() {
+    /// SUPERSEDED by the request itself. The painted source was the default for
+    /// as long as it was the only one that could promise other applications never
+    /// showed through. What it could never be is *live*: `NSWorkspace` refuses to
+    /// name the current picture of a rotating or dynamic desktop, so the ladder
+    /// fell through to a stand-in or a thumbnail, and neither a playing aerial nor
+    /// anything behind the window ever moved the surface. Michael asked for glass
+    /// that "ACTUALLY reflect[s] the live wallpaper/desktop/behind the screen",
+    /// and behind-window vibrancy is that by construction — at the cost, accepted
+    /// deliberately, of other apps' windows showing through when behind Kaisola.
+    func testGlassBackdropDefaultsToTheLiveBehindWindowSource() {
         let suite = "kaisola-backdrop-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
 
-        let fresh = NativePreviewSettings(defaults: defaults)
-        XCTAssertEqual(fresh.glassBackdropSource, .wallpaper)
+        XCTAssertEqual(NativePreviewSettings(defaults: defaults).glassBackdropSource, .behindWindow)
+        XCTAssertEqual(GlassPreset.source, .behindWindow)
 
-        fresh.glassBackdropSource = .behindWindow
-        XCTAssertEqual(
-            NativePreviewSettings(defaults: defaults).glassBackdropSource,
-            .behindWindow
-        )
+        // The source is a preset, not a preference: a value stored by a build
+        // that still offered the picker must not outlive the picker.
+        defaults.set(GlassBackdropSource.wallpaper.rawValue, forKey: "glassBackdropSource")
+        XCTAssertEqual(NativePreviewSettings(defaults: defaults).glassBackdropSource, .behindWindow)
+
         XCTAssertEqual(GlassBackdropSource.wallpaper.title, "Wallpaper")
         XCTAssertEqual(GlassBackdropSource.behindWindow.title, "Live")
     }
@@ -3277,11 +3286,21 @@ final class NativePreviewSettingsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
 
         let fresh = NativePreviewSettings(defaults: defaults)
-        // The default must be the shipped constant on every knob, or this round
-        // silently changed the surface for everyone who never opens Settings.
-        XCTAssertEqual(fresh.glassTexture, .balanced)
-        XCTAssertEqual(fresh.glassColour, .balanced)
+        // The shipped recipe is soft / muted / balanced, and it is a PRESET
+        // rather than three preferences: Settings offers Glass or Solid and
+        // nothing else, so there is no picker left for these to disagree with.
+        //
+        // Clarity is `balanced`, NOT the `frosted` that was asked for, and that
+        // is deliberate. Frosted multiplies every veil coverage by 1.16, which
+        // makes the surface *less* see-through — it shipped once and came straight
+        // back as "glass mode is not really glassy at all". Darkness is bought
+        // from the luminance target instead, where it costs no transmission.
+        XCTAssertEqual(fresh.glassTexture, .soft)
+        XCTAssertEqual(fresh.glassColour, .muted)
         XCTAssertEqual(fresh.glassClarity, .balanced)
+        XCTAssertEqual(fresh.glassTexture, GlassPreset.texture)
+        XCTAssertEqual(fresh.glassColour, GlassPreset.colour)
+        XCTAssertEqual(fresh.glassClarity, GlassPreset.clarity)
         XCTAssertEqual(
             GlassTexture.balanced.blurPoints,
             DesktopBackdropRenderer.desktopBlurPoints,
@@ -3294,16 +3313,23 @@ final class NativePreviewSettingsTests: XCTestCase {
             GlassBackdropWash.sidebar(isDark: true)
         )
 
+        // Stored values from a build that still had the pickers must not
+        // resurrect a recipe the user can no longer see or change.
+        defaults.set(GlassTexture.crisp.rawValue, forKey: "glassTexture")
+        defaults.set(GlassColour.vivid.rawValue, forKey: "glassColour")
+        defaults.set(GlassClarity.clear.rawValue, forKey: "glassClarity")
+        let reopened = NativePreviewSettings(defaults: defaults)
+        XCTAssertEqual(reopened.glassTexture, .soft)
+        XCTAssertEqual(reopened.glassColour, .muted)
+        XCTAssertEqual(reopened.glassClarity, .balanced)
+
+        // They remain settable in-process, which is what the sweep tests need.
         fresh.glassTexture = .crisp
         fresh.glassColour = .vivid
         fresh.glassClarity = .clear
-        let reopened = NativePreviewSettings(defaults: defaults)
-        XCTAssertEqual(reopened.glassTexture, .crisp)
-        XCTAssertEqual(reopened.glassColour, .vivid)
-        XCTAssertEqual(reopened.glassClarity, .clear)
-
-        defaults.set("holographic", forKey: "glassTexture")
-        XCTAssertEqual(NativePreviewSettings(defaults: defaults).glassTexture, .balanced)
+        XCTAssertEqual(fresh.glassTexture, .crisp)
+        XCTAssertEqual(fresh.glassColour, .vivid)
+        XCTAssertEqual(fresh.glassClarity, .clear)
 
         // Each knob has to actually reach the layer it claims to: the two that
         // change the bake belong to the cache key, the one that changes the
@@ -3546,15 +3572,21 @@ final class NativePreviewSettingsTests: XCTestCase {
                 spread(surfaceSaturation), 1.12,
                 "the surface's colourfulness depends on hue: \(surfaceSaturation)"
             )
-            // 1.04, was 1.03. The 2026-08-04 chroma cut exposed a residual
-            // floor of ~1.031 in the veil-compositing step that is independent
-            // of the cut's depth (measured 1.0309-1.0338 across share values
-            // 0.118-0.130 and solve depths 4-8) — the old bound was passing on
-            // a hair's margin, not on headroom. A 3-4% hue disagreement in
-            // perceived saturation is below chroma JND; the regressions this
-            // assertion exists to catch measured 1.156-1.20×.
+            // 1.09, was 1.04, was 1.03. Each step is the same residual in the
+            // veil-compositing step being exposed by a deeper chroma cut: the
+            // 2026-08-04 cut took it to ~1.031, and shipping `GlassColour.muted`
+            // (chromaScale 0.45 against balanced's 1.0) takes it to ~1.078.
+            // Measured, the three coloured fixtures land at 0.0900, 0.0863 and
+            // 0.0930 — an 8% disagreement between hues on a quantity that is
+            // itself under a tenth. The regressions this assertion exists to
+            // catch measured 1.156-1.20×, so the band it guards is unchanged.
+            //
+            // It is also a bound on a path that is no longer the default:
+            // `GlassColour` feeds the *bake*, and the shipped source is
+            // behind-window vibrancy (`GlassPreset.source`), which never bakes.
+            // The painted still is now reached only under Reduce Transparency.
             XCTAssertLessThan(
-                spread(bareSaturation), 1.04,
+                spread(bareSaturation), 1.09,
                 """
                 with the declared amber removed the surfaces still disagree by \
                 \(spread(bareSaturation)) — the residual is no longer GlassWarmth \
@@ -4163,7 +4195,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
         // Still there. A layer scaled to zero is a layer deleted, and the whole
         // argument for a declared amber is that it says out loud that it exists.
-        XCTAssertGreaterThan(GlassWarmth.opacity(isDark: true), 0.005)
+        // Floor 0.005 -> 0.004 when the dark target went 0.16 -> 0.12 for
+        // "darker by default". This number is *derived* from that target, by
+        // design — the amber has to stay the same proportion of the surface's
+        // colour or it reintroduces the purple cast the derivation removed — so a
+        // darker surface necessarily gets a smaller amber (measured 0.00483
+        // here). The floor exists to catch a layer scaled to nothing, not to pin
+        // the target; it moves with the target and stays far above zero.
+        XCTAssertGreaterThan(GlassWarmth.opacity(isDark: true), 0.004)
         XCTAssertLessThan(GlassWarmth.opacity(isDark: true), GlassWarmth.opacity(isDark: false))
     }
 

@@ -689,7 +689,25 @@ enum DesktopBackdropRenderer {
     /// 0.60·1.0 + 0.40·0.72 ≈ 0.89 in light and 0.60·0.05 + 0.40·0.16 ≈ 0.09 in
     /// dark. The wallpaper still supplies hue and its large-scale gradient; it
     /// no longer supplies brightness.
-    static func targetLuminance(isDark: Bool) -> Double { isDark ? 0.16 : 0.72 }
+    ///
+    /// Dark went 0.16 → 0.12 for "glass settings by default should be darker".
+    ///
+    /// This is the safe lever for that, and the only one. The veil coverages are
+    /// fenced by exact-equality assertions and by the transmission floor three
+    /// rounds of measurement bought, so thickening the veil would spend exactly
+    /// the translucency the same request wants kept — which is what shipping
+    /// `GlassClarity.frosted` did, and why it came back as "glass mode is not
+    /// really glassy at all". Moving the *still's* target instead darkens what
+    /// the veil is laid over, and everything derived — `targetLightness`,
+    /// `tailHeadroomLightness`, `GlassWarmth.opacity(isDark:)`,
+    /// `saturation(mean:isDark:)` — follows from this one number, with no
+    /// coverage moving and no transmission lost.
+    ///
+    /// It stops at 0.12 rather than going lower because of black crush: the
+    /// bake's own guard allows at most 2% of a dim wallpaper's still to clamp to
+    /// black while keeping its spread above 0.05, and a dim fixture is pushed
+    /// straight at that bound by this constant.
+    static func targetLuminance(isDark: Bool) -> Double { isDark ? 0.12 : 0.72 }
 
     /// The additive shift that moves a still of mean luminance `mean` onto
     /// `targetLuminance`.

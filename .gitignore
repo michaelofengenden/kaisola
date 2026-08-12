@@ -18,3 +18,4 @@ release/
 .env.*
 !.env.example
 .claude/worktrees/
+site/changelog.html

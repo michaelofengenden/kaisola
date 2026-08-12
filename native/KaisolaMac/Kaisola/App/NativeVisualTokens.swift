@@ -33,13 +33,10 @@ enum KaisolaVisualSystem {
     static let chromeInset: CGFloat = 6
     static let hairline: CGFloat = 0.5
     static let focusStroke: CGFloat = 1
-    /// Sidebar row leading glyphs (terminal, chat, mesh). Deliberately small:
-    /// the row's scarce resource is horizontal space for the session title, and
-    /// the agent name is already the title's prefix, so the glyph is a texture
-    /// cue rather than the identifying signal.
-    static let rowIconSize: CGFloat = 15
-    static let rowIconGlyph: CGFloat = 10
-    static let rowIconRadius: CGFloat = 4
+    // The three `rowIcon*` constants that used to sit here described the tiled
+    // sidebar row glyph, and the v1.1.7 "every mark is naked" pass deleted the
+    // tile without deleting them. `QuietIdentityMarkView` owns that geometry now
+    // and documents its own optical sizes.
     static let hoverDuration = 0.09
     static let stateDuration = 0.14
     static let layoutDuration = 0.22
@@ -677,14 +674,41 @@ private struct KaisolaChromePanelModifier: ViewModifier {
             .padding(.bottom, inset)
     }
 
+    /// Dark appearance darkens the panel instead of lightening it.
+    ///
+    /// `.thinMaterial` is a *light-leaning* material: it lifts whatever is under
+    /// it toward white in both appearances. Over the detail column — which is
+    /// most of the window — that meant the one surface the glass work was solved
+    /// for was covered by something pulling the opposite way, so dark mode read
+    /// as washed grey rather than dark glass, and the composite the veil
+    /// constants were measured against never actually reached the screen. It is
+    /// a large part of why the glass did not look dark, and no amount of tuning
+    /// the bake underneath it would have shown.
+    ///
+    /// The replacement keeps the panel's real job — isolating content from the
+    /// backdrop so text keeps its floor — but does it with neutral black over a
+    /// thinner material, so the surface moves down instead of up and the backdrop
+    /// still shows through. Light appearance is unchanged: there `.thinMaterial`
+    /// already moves the surface the way it should go.
     @ViewBuilder
     private func panelFill(_ shape: RoundedRectangle) -> some View {
         if reduceTransparency {
             shape.fill(Color(nsColor: .controlBackgroundColor))
+        } else if colorScheme == .dark {
+            ZStack {
+                shape.fill(.ultraThinMaterial)
+                shape.fill(Color.black.opacity(Self.darkPanelCoverage))
+            }
         } else {
             shape.fill(.thinMaterial)
         }
     }
+
+    /// How much neutral black the dark panel lays over its own thin material.
+    /// Chosen so the panel is at least as isolating as `.thinMaterial` was —
+    /// content legibility must not regress — while moving the surface down
+    /// rather than up.
+    static let darkPanelCoverage: Double = 0.34
 
     /// The lit top edge is what sells a floating card. Reduce Transparency
     /// swaps it for the flat semantic separator so nothing reads as glass.

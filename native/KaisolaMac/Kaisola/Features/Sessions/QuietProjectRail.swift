@@ -279,7 +279,15 @@ enum QuietSessionOrderCommit {
 /// sidebar is smaller than the time label; symbol glyphs (the hover chevron and
 /// `+`) may be smaller, since they carry no reading load.
 enum QuietRailMetrics {
-    static let headerText: CGFloat = 13
+    /// Project names read one step *below* the surfaces inside them.
+    ///
+    /// They used to match the session titles at 13pt and beat them on both ink
+    /// (primary against secondary) and weight (bold against regular), so the
+    /// folder names were the loudest text in a column that exists to point at
+    /// the things inside the folders. 11pt secondary is the ordinary grammar for
+    /// a group heading — Finder and Safari both do it — and it costs nothing,
+    /// because which project is active was always carried by weight alone.
+    static let headerText: CGFloat = 11
     static let titleText: CGFloat = 13
     static let secondaryText: CGFloat = 10.5
     static let chevronText: CGFloat = 9
@@ -316,6 +324,13 @@ enum QuietRailMetrics {
     /// One cadence for every row in the rail: sessions, compact projects and
     /// the active project header all measure 32pt.
     static let rowHeight: CGFloat = 32
+    /// How far a selected session's pill starts ahead of its identity mark.
+    ///
+    /// The pill used to run the full column, painting tens of points of fill to
+    /// the left of a row whose ink does not begin until the indent — a bar, not
+    /// a selected row. Ten points of lead-in is enough for the fill to read as
+    /// containing the mark rather than starting at it.
+    static let pillMarkLead: CGFloat = 10
     static let horizontalInset: CGFloat = 8
     static let trailingInset: CGFloat = 10
     /// macOS's `List` reserves a fixed row inset (8pt leading, 9pt trailing)
@@ -330,6 +345,15 @@ enum QuietRailMetrics {
     /// costs only the row's own leading indent and trailing padding — the mark,
     /// title, time and dot all sit inside that margin.
     static let listRowBleed = EdgeInsets(top: 0, leading: -8, bottom: 0, trailing: -9)
+    /// The same bleed with air above it, for project rows only.
+    ///
+    /// Every row in the rail measured 32pt flush against its neighbours, so a
+    /// collapsed rail was an unbroken column of evenly spaced names and where one
+    /// project ended had to be inferred from indent alone. Six points above each
+    /// heading is a grouping cue rather than a section break: the row cadence is
+    /// untouched, sessions stay flush under the project they belong to, and only
+    /// the boundary between groups gains anything.
+    static let projectRowBleed = EdgeInsets(top: 6, leading: -8, bottom: 0, trailing: -9)
     /// Gap inside the trailing lane (reveal · time · dot, or rollup · chevron).
     /// Tighter than `markGap` so the lane costs the title as little as possible.
     static let laneGap: CGFloat = 5
@@ -493,7 +517,11 @@ private enum QuietProjectPlacement {
 /// later pass can quietly re-tint.
 enum QuietProjectEmphasis {
     /// The project you are in.
-    static let activeWeight: Font.Weight = .bold
+    /// Semibold rather than bold. At 11pt secondary the heading no longer
+    /// competes with the session titles for ink, so it no longer needs the
+    /// heaviest weight in the column to stay legible — and bold-against-regular
+    /// at a smaller size reads as shouting rather than as emphasis.
+    static let activeWeight: Font.Weight = .semibold
     /// Every other project.
     static let restingWeight: Font.Weight = .regular
 
@@ -783,7 +811,7 @@ private struct QuietProjectGroup: View {
                             size: QuietRailMetrics.headerText,
                             weight: QuietProjectEmphasis.weight(isActive: true)
                         ))
-                        .foregroundStyle(HierarchicalShapeStyle.primary)
+                        .foregroundStyle(HierarchicalShapeStyle.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .layoutPriority(1)
@@ -871,7 +899,7 @@ private struct QuietProjectGroup: View {
                             size: QuietRailMetrics.headerText,
                             weight: QuietProjectEmphasis.weight(isActive: false)
                         ))
-                        .foregroundStyle(HierarchicalShapeStyle.primary)
+                        .foregroundStyle(HierarchicalShapeStyle.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
                         .layoutPriority(1)
@@ -1312,7 +1340,7 @@ private struct QuietProjectRowChrome: ViewModifier {
             .accessibilityElement(children: .contain)
             .accessibilityAction(named: Text(expandLabel)) { toggle() }
             .onAppear { onAppear() }
-            .listRowInsets(QuietRailMetrics.listRowBleed)
+            .listRowInsets(QuietRailMetrics.projectRowBleed)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
     }
@@ -1408,19 +1436,29 @@ enum QuietRowSelection {
 
 /// Every number the selected row's pill is made of.
 ///
-/// Neutral on purpose. The colour in this row is the *label*, in the user's own
-/// accent; a tinted pill under tinted text is the coloured chip the v1.1.7 pass
-/// was right to delete. The fill exists only to give the accent something to sit
-/// on, which is why both values are single digits of opacity.
+/// **Accent, not neutral.** The fill used to be the row's own ink at single-digit
+/// opacity — black at 6%, white at 10% — which is a *grey bar*, and grey is what
+/// the sidebar had least reason to spend its one fill on. Michael: "perhaps only
+/// highlight tabs with blue, get rid of the gray highlighting when tab is on."
+///
+/// That is also Safari's actual grammar, which the v1.1.9 pass named but applied
+/// backwards: Safari tints the selected row's *background* in the accent and puts
+/// the accent in the label too. The rail had neutral fill and accent text, so the
+/// one coloured thing in the column was a single line of 13pt type while the
+/// loudest painted object stayed grey.
+///
+/// Coverage stays low. This is a tint the eye reads as "this one", not the
+/// saturated chip v1.1.7 was right to delete.
 enum QuietSelectionPill {
-    /// Light appearance: a whisper of the label colour's own ink.
-    static let lightFillOpacity: Double = 0.06
-    /// Dark appearance, where the same recipe would disappear: white, slightly
-    /// stronger, because a dark rail swallows a 6% black.
-    static let darkFillOpacity: Double = 0.10
-    /// Shares the app's inset radius, so the pill is the same corner as every
-    /// other rounded surface in the window.
-    static var cornerRadius: CGFloat { KaisolaVisualSystem.insetRadius }
+    /// Light appearance: enough accent to read as colour on white.
+    static let lightFillOpacity: Double = 0.13
+    /// Dark appearance, where the same coverage would vanish: a dark rail
+    /// swallows a low-alpha accent, so it takes nearly twice as much.
+    static let darkFillOpacity: Double = 0.22
+    /// One step tighter than the app's inset radius: the pill is nested inside
+    /// the sidebar's own chrome corner, so it sits one rung down the ladder, and
+    /// a 12pt radius on a 32pt row reads as a lozenge rather than a row.
+    static var cornerRadius: CGFloat { KaisolaVisualSystem.controlRadius }
     /// Inset from the row's own edges, so the pill floats inside the column
     /// rather than reaching the sidebar's border.
     static let horizontalInset: CGFloat = 6
@@ -1433,23 +1471,47 @@ enum QuietSelectionPill {
     static let companionOpacity: Double = 0.55
 
     static func fillOpacity(dark: Bool) -> Double { dark ? darkFillOpacity : lightFillOpacity }
+
+    /// The ink for a selected row's title and mark: the user's accent, stepped
+    /// away from the pill it now sits on.
+    ///
+    /// Raw `controlAccentColor` is not usable here. System blue on white is
+    /// already only about 4.0:1, and putting a 13% blue tint underneath drops
+    /// that to roughly 3.35:1 — under the floor, and worse than the plain
+    /// secondary ink it replaced. Blending the accent toward the appearance's own
+    /// extreme buys the contrast back while keeping the hue the user chose, so a
+    /// Graphite accent still reads as graphite.
+    ///
+    /// Resolved inside the `NSColor(name:)` provider rather than at declaration:
+    /// `controlAccentColor` is itself dynamic, so blending eagerly would freeze
+    /// whichever appearance happened to be current when this file's statics were
+    /// first touched.
+    static let ink = Color(nsColor: NSColor(name: nil) { appearance in
+        let dark = appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        var accent = NSColor.controlAccentColor
+        appearance.performAsCurrentDrawingAppearance { accent = NSColor.controlAccentColor }
+        let target: NSColor = dark ? .white : .black
+        let fraction: CGFloat = dark ? 0.35 : 0.25
+        guard let blended = accent.blended(withFraction: fraction, of: target) else { return accent }
+        return blended
+    })
 }
 
-/// The soft neutral pill under the selected surface row.
+/// The accent pill under the selected surface row.
 private struct QuietSelectionPillView: View {
     @Environment(\.colorScheme) private var colorScheme
 
+    /// Sessions sit a clear step in from the column edge; a pill that still
+    /// starts at that edge paints tens of points of colour to the left of
+    /// anything it is marking, which reads as a bar rather than a selected row.
+    var leadingInset: CGFloat = QuietSelectionPill.horizontalInset
+
     var body: some View {
         RoundedRectangle(cornerRadius: QuietSelectionPill.cornerRadius, style: .continuous)
-            .fill(fill)
-            .padding(.horizontal, QuietSelectionPill.horizontalInset)
+            .fill(Color.accentColor.opacity(QuietSelectionPill.fillOpacity(dark: colorScheme == .dark)))
+            .padding(.leading, leadingInset)
+            .padding(.trailing, QuietSelectionPill.horizontalInset)
             .accessibilityHidden(true)
-    }
-
-    private var fill: Color {
-        let dark = colorScheme == .dark
-        let base: Color = dark ? .white : .primary
-        return base.opacity(QuietSelectionPill.fillOpacity(dark: dark))
     }
 }
 
@@ -1476,7 +1538,7 @@ private struct QuietRowBody: View {
         // charged the title for four gaps, three of which sat inside the
         // trailing lane where they bought nothing.
         HStack(spacing: 0) {
-            QuietIdentityMarkView(identity: identity)
+            QuietIdentityMarkView(identity: identity, tint: isSelected ? QuietSelectionPill.ink : nil)
                 .padding(.trailing, QuietRailMetrics.markGap)
             Text(label.text)
                 .font(.system(size: QuietRailMetrics.titleText, weight: QuietRowEmphasis.weight(isSelected: isSelected)))
@@ -1509,9 +1571,10 @@ private struct QuietRowBody: View {
         // for the row you are typing in, a quiet fill for the one beside it.
         .background {
             if isSelected {
-                QuietSelectionPillView()
+                QuietSelectionPillView(leadingInset: pillLeadingInset)
             } else if isOnScreen {
-                QuietSelectionPillView().opacity(QuietSelectionPill.companionOpacity)
+                QuietSelectionPillView(leadingInset: pillLeadingInset)
+                    .opacity(QuietSelectionPill.companionOpacity)
             }
         }
         // Deliberately NOT `.accessibilityElement(children: .combine)` here:
@@ -1522,17 +1585,29 @@ private struct QuietRowBody: View {
         // descends into. The combine + label live on the Button itself.
     }
 
+    /// Where this row's pill starts. A session's ink begins at the indent, so
+    /// its pill begins just before the identity mark rather than at the column
+    /// edge.
+    private var pillLeadingInset: CGFloat {
+        QuietRailMetrics.sessionIndent - QuietRailMetrics.pillMarkLead
+    }
+
     /// Selection outranks dimming: an ended session you are still looking at is
     /// the row the sidebar is pointing at, and greying it would leave the pill
     /// under a title that reads as inactive.
+    ///
+    /// The resting case is `.primary`, not `.secondary`. Sessions are what the
+    /// column exists to point at, and drawing them in secondary ink under
+    /// primary-ink project headings inverted the hierarchy: the folder names
+    /// out-inked the surfaces inside them. The headings gave up the primary ink
+    /// instead — see `QuietRailMetrics.headerText`.
     private var titleStyle: AnyShapeStyle {
-        if isSelected { return AnyShapeStyle(Color.accentColor) }
-        // A companion pane is on screen, so it reads at full strength — but in
-        // the primary ink rather than the accent, which stays the mark of the
-        // one row you are typing in.
-        if isOnScreen { return AnyShapeStyle(HierarchicalShapeStyle.primary) }
+        if isSelected { return AnyShapeStyle(QuietSelectionPill.ink) }
         if status.isDimmed { return AnyShapeStyle(Color.kaisolaTertiary) }
-        return AnyShapeStyle(HierarchicalShapeStyle.secondary)
+        // A companion pane needs no separate ink: its own faint pill already
+        // says it is on screen, and a third text weight was one more thing to
+        // decode in a column that should read at a glance.
+        return AnyShapeStyle(HierarchicalShapeStyle.primary)
     }
 
     /// Reveal, time-in-state and dot travel as ONE `fixedSize` lane.
@@ -1651,6 +1726,12 @@ private struct QuietSurfaceRowView: View {
                 timeLabel: timeInState.compactLabel,
                 status: status,
                 isSelected: isSelected,
+                // Forwarded, which it was not: every caller computes
+                // `onScreen.contains(id)` and sets this on the row, and the row
+                // then dropped it instead of handing it down. The companion pill
+                // the split-pane work added has therefore never drawn once — the
+                // second pane of a split looked closed.
+                isOnScreen: isOnScreen,
                 showsReveal: hovering,
                 reveal: reveal
             )

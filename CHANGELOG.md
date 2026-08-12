@@ -14,6 +14,48 @@
 - Terminals you had open before updating can be typed into again. When a broker from the previous version was still running as 0.1.114 arrived, every restored terminal came back read-only and at the wrong size: the app asked that older broker a question it had no way to answer, then read the silence as a refusal. It now only asks brokers that can answer, and a terminal that comes back owned gets resized to its pane the way it always did.
 - Showing agent output costs the machine much less. A CLI agent redrawing a spinner had the broker building every terminal's output twice — one copy went to a reader that threw it away — and handing the other over a few hundred times a second. It now builds it once and sends it a frame at a time.
 
+## 0.1.113 — 2026-08-08
+
+- Every side pane now hides from its own minus button at its top-right — the file tree's old accent toggle and the preview's tab-less close are gone. While a pane is hidden, its show button floats quietly over the open terminal or chat at the top-right corner, and disappears entirely when everything is open.
+- Hiding the document column is non-destructive: your tabs and the open file come back exactly as they were, and unsaved edits still get the save prompt first.
+
+## 0.1.112 — 2026-08-07
+
+- Fixed the evening's stuck typing for real: the app had been quietly tearing down and rebuilding its terminal streams every ten seconds whenever an emptied-out old terminal service stayed registered. Typing kept going mute mid-word; now the poll loop treats a deliberately-disconnected empty service as what it is, and old services actually get retired instead of waiting behind a busy one forever.
+- Keystrokes that arrive while a terminal's ownership is mid-handoff now show the "connection is recovering" notice instead of vanishing silently.
+
+## 0.1.111 — 2026-08-07
+
+- A terminal that cannot accept input says so — a notice with a reload hint instead of silently eating keystrokes — and input now heals itself within seconds once the blocker releases, announcing when typing is back.
+- Signing in shares one authentication context across the keychain, so unlocking once is enough.
+
+## 0.1.110 — 2026-08-07
+
+- Fixed a crash that hit about twenty seconds into a usage refresh.
+- Sign-in works again on installed builds: the account store now falls back to the classic keychain when the system store refuses it.
+
+## 0.1.109 — 2026-08-07
+
+- Settings reorganized into grouped categories, with honest update status and live usage inside.
+- A serious memory diet: terminal scrollback keeps a sensible default depth, parked surfaces trim themselves, and the app responds to system memory pressure instead of hoarding.
+- The serif reading face gets a proper measure — long Markdown reads like a page, not a terminal.
+
+## 0.1.108 — 2026-08-07
+
+- Closed things stay closed: a terminal or project you close can never flicker back after a restart, a quit mid-close, or a reconnect.
+- Terminal history is continuous across app updates — scrollback from before a restart pages in seamlessly, and ended terminals still serve their history without respawning.
+- Markdown gains a serif reading face. Sign-in moved to the modern protected keychain.
+
+## 0.1.107 — 2026-08-06
+
+- Terminals survive reboots: after a restart they return as dormant panes that respawn in place — shells automatically, agent CLIs with a resume chip so a paid session never restarts itself.
+- Live Preview renders Markdown as you edit, and scrollback recovered from disk pages in cleanly.
+
+## 0.1.106 — 2026-08-05
+
+- Builds are Apple Silicon-only now, which cut release times roughly in half; a canary lane installs locally-signed builds in one minute.
+- Reading old transcript pages no longer re-renders everything already on screen — scrolling deep history is smooth.
+
 ## 0.1.105 — 2026-08-04
 
 - The glass is a quarter less saturated everywhere — the wallpaper's colour arrives calmer while its texture and detail stay exactly as they were. The idle canvas keeps its transparency but reads as glass over the picture rather than the picture at full strength.

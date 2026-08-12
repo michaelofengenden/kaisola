@@ -59,9 +59,25 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  # The iPhone lane. Split from the macOS lane in 2026-08: the two were one
+  # serial job — a Companion simulator run followed by the macOS tests, 26
+  # minutes end to end — sharing nothing but the checkout. They have no ordering
+  # relationship, so side by side costs one extra runner and returns the wall
+  # clock of the slower half instead of their sum.
+  #
+  # Declared before `verify` on purpose. `companionContractReceipt.test.cjs`
+  # reads a step by slicing to the next step, so the final step of whichever job
+  # sits above `optimized-macos-pdf` runs on into that job's `if:` — and the
+  # test asserts this lane is never conditional. Keeping a plain job header
+  # underneath is what makes that reading honest.
+  #
+  # The receipt upload stays here: `release.yml` refuses to promote without the
+  # companion contract receipt from this run, and artifacts belong to the run
+  # rather than the job, so splitting does not move where promotion looks.
+  companion:
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 45
+    env:
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
       KAISOLA_COMPANION_XCODE_VERSION: '16.4'
@@ -115,25 +131,6 @@ jobs:
         run: node --test tests/node/workflowSecurity.test.cjs
       - name: Download checksum-pinned Node runtime
         run: node scripts/download-native-node-runtime.cjs arm64
-      - name: Test broker runtime durability manifest
-        run: node tests/node/brokerRuntimeManifest.cjs
-      - name: Test native packaging, compatibility, and resource policies
-        run: >-
-          node --test
-          tests/node/swiftContractsPaths.test.cjs
-          tests/node/brokerCompatibility.test.cjs
-          tests/node/companionContractReceipt.test.cjs
-          tests/node/companionCITestGate.test.cjs
-          tests/node/companionProtocolTables.test.cjs
-          tests/node/nativeAppcast.test.cjs
-          tests/node/nativeBrokerPackage.test.cjs
-          tests/node/nativeReleaseCandidate.test.cjs
-          tests/node/nativeReleasePreflight.test.cjs
-          tests/node/nativeResourceGate.test.cjs
-          tests/node/nativeResourceFixtureGate.test.cjs
-          tests/node/nativePdfPreviewBudget.test.cjs
-      - name: Test shared Swift contracts
-        run: swift test --package-path native/KaisolaCore
       - name: Resolve exact Companion simulator
         id: companion-simulator
         shell: bash
@@ -404,6 +401,48 @@ jobs:
           path: ${{ runner.temp }}/companion-contract/companion-contract.json
           if-no-files-found: error
           retention-days: 90
+
+  # The macOS and shared-contract lane, in parallel with `companion`.
+  verify:
+    runs-on: macos-15
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install exact Node helper dependencies
+        run: npm ci --prefer-offline --no-audit --no-fund
+        env:
+          KAISOLA_SKIP_NATIVE_REBUILD: '1'
+      - name: Lint security-sensitive workflow checkouts
+        run: node --test tests/node/workflowSecurity.test.cjs
+      - name: Download checksum-pinned Node runtime
+        run: node scripts/download-native-node-runtime.cjs arm64
+      - name: Test broker runtime durability manifest
+        run: node tests/node/brokerRuntimeManifest.cjs
+      - name: Test native packaging, compatibility, and resource policies
+        run: >-
+          node --test
+          tests/node/swiftContractsPaths.test.cjs
+          tests/node/brokerCompatibility.test.cjs
+          tests/node/companionContractReceipt.test.cjs
+          tests/node/companionCITestGate.test.cjs
+          tests/node/companionProtocolTables.test.cjs
+          tests/node/nativeAppcast.test.cjs
+          tests/node/nativeBrokerPackage.test.cjs
+          tests/node/nativeReleaseCandidate.test.cjs
+          tests/node/nativeReleasePreflight.test.cjs
+          tests/node/nativeResourceGate.test.cjs
+          tests/node/nativeResourceFixtureGate.test.cjs
+          tests/node/nativePdfPreviewBudget.test.cjs
+      - name: Test shared Swift contracts
+        run: swift test --package-path native/KaisolaCore
       - name: Compile Kaisola macOS test bundle
         run: >-
           xcodebuild
@@ -424,6 +463,7 @@ jobs:
           -derivedDataPath "$RUNNER_TEMP/kaisola-mac-tests"
           CODE_SIGNING_ALLOWED=NO
           test-without-building
+
 
   # The installed optimized-PDF receipt is a performance contract. Give it a
   # fresh runner with no booted simulator, CoreSimulator services, or iPhone

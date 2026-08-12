@@ -16,23 +16,23 @@ on:
         default: false
         required: false
   workflow_dispatch:
-  # Deliberately NO `push: branches: [main]` trigger.
-  #
-  # `release-candidate.yml` runs on *every* push to main, with no path filter,
-  # and its first job calls this workflow. A push trigger here therefore ran the
-  # whole thing a second time on the same commit: two macos-15 runners, and
-  # `verify` is a 26-minute job. Measured on the 0.1.117 merge, the same commit
-  # had `verify` running concurrently in run 31571950271 (standalone) and run
-  # 31571950435 (inside the candidate) — the duplicate bought nothing and it is
-  # the single largest source of CI wall clock in this repo.
-  #
-  # Coverage is unchanged where it matters. `verify` still runs on main, once,
-  # inside the candidate, and promotion still reads the companion receipt from
-  # that run. `optimized-macos-pdf` is skipped inside the candidate (the
-  # candidate job builds and preflights the real Developer ID bytes itself), so
-  # it no longer runs post-merge — but it runs on every pull request, which is
-  # where a gate belongs. Re-running it after the merge only re-litigated a
-  # decision already made, at eleven minutes a go, on a job that flakes.
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-candidate.yml'
+      - '.github/workflows/release.yml'
+      - '.github/workflows/swift-contracts.yml'
+      - 'native/**'
+      - 'mobile/KaisolaCompanion/**'
+      - 'protocol/broker/**'
+      - 'runtime/**'
+      - 'tests/**'
+      - 'scripts/companion-*.cjs'
+      - 'scripts/download-native-node-runtime.cjs'
+      - 'scripts/native-*.cjs'
+      - 'scripts/release-fast.cjs'
+      - 'package.json'
+      - 'package-lock.json'
   pull_request:
     paths:
       - '.github/workflows/release-candidate.yml'

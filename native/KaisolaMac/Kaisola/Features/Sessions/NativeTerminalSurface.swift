@@ -1251,6 +1251,28 @@ class ReadOnlyTerminalView: TerminalView {
         updateSemanticDecorations()
     }
 
+    /// Follow the newest output without cancelling a gesture still in flight.
+    ///
+    /// Sticky-scroll runs the pin after every output batch, and `scrollToLiveBottom`
+    /// routes through `prepareForDiscreteScrollInput`, which drops the continuous
+    /// scroll state outright. That is right for the jump pill and the menu
+    /// command, where the user asked to leave their position, and wrong for
+    /// streamed output, where they may be holding a rubber band past the newest
+    /// row. Collapsing it on every batch while the next trackpad sample rebuilt
+    /// it from nothing is what a terminal running an agent showed as vibration.
+    ///
+    /// Rows underneath the band still advance: the band is displacement past the
+    /// live bottom, so following that bottom is what keeps it meaningful.
+    func followLiveBottomForStreamedOutput() {
+        guard continuousScrollState?.projection.isRubberBanding == true else {
+            scrollToLiveBottom()
+            return
+        }
+        scroll(toPosition: 1)
+        reconcileContinuousViewportAfterBufferChange()
+        updateSemanticDecorations()
+    }
+
     /// Erase the live renderer without touching the broker's retained history
     /// or the PTY. See `TerminalClearCommand` for why that is the only honest
     /// meaning "Clear Terminal" can have on a broker-backed surface.

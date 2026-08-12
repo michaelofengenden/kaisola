@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.117 — 2026-08-11
+
+- A terminal running an agent no longer shakes when you pull past the newest line. Overscrolling at the bottom is meant to give a little and spring back. Instead, every batch of output the agent produced cancelled the gesture and snapped the view flat, and your next movement pushed it out again, so the pane vibrated in time with the output. The stretch now stays where you put it while the rows keep scrolling underneath it.
+
 ## 0.1.116 — 2026-08-11
 
 - Agent output is cheaper to show, again. Repairing damaged Unicode used to rebuild every chunk of every terminal one character at a time, even when there was nothing to repair — which is nearly always. It now checks first and rebuilds only when a chunk really was split mid-character, about five times faster on a chunk of agent output.

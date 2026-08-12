@@ -13,13 +13,24 @@
 //   simply tagged once its candidate is green. If the candidate finished
 //   earlier in the day, the release is live in about a minute.
 // - SLOW PATH: when <version> differs, the classic bump commit is created and
-//   pushed first, then the script waits for that commit's candidate before
+//   landed first, then the script waits for that commit's candidate before
 //   tagging. One-time cost per adoption or renumbering.
 //
 // Either way the script ends by pre-bumping package.json to the next patch
 // version ("Start vX.Y.Z+1"), so the next release takes the fast path.
 // The tag is only ever pushed after the candidate is green, so release.yml
 // never fires before its input exists.
+//
+// Commits reach main through a pull request, not a push. `main` is protected
+// ("Changes must be made through a pull request", plus a required `landing`
+// check), so the old `git push origin HEAD:refs/heads/main` was rejected with
+// GH013 and left the release commit stranded locally. `landOnMain` opens the
+// pull request, merges it as soon as the required checks go green, and adopts
+// the merge commit — which is the sha that gets tagged, since that is the one
+// the candidate builds. Tags are not covered by the branch rule, so the tag
+// itself is still pushed directly and release.yml fires as designed.
+// Nothing here needs to know *which* checks are required: GitHub's own
+// mergeStateStatus answers that, so the repo stays the source of truth.
 //
 // Flags: --no-wait (fail instead of polling for the candidate),
 //        --no-next-bump (skip the trailing pre-bump commit),
@@ -115,9 +126,96 @@ if (current === requested) {
     fail('there is nothing staged to release')
   }
   command('git', ['commit', '-m', message])
-  command('git', ['push', 'origin', 'HEAD:refs/heads/main'])
-  releaseSha = output('git', ['rev-parse', 'HEAD'])
-  console.log(`release-fast: slow path: pushed release commit ${releaseSha.slice(0, 10)}; its candidate must build before the tag`)
+  releaseSha = landOnMain(
+    `chore/release-${requested}`,
+    message,
+    `Version bump to ${requested} so the work already on main can be tagged and promoted.\n\n`
+      + '`release.yml` requires the tag to equal `package.json` at the tagged commit, so the bump '
+      + 'has to land before the tag exists. Opened by `npm run release:fast`, which merges this '
+      + 'itself once the required checks are green and then tags the merge commit.'
+  )
+  console.log(`release-fast: slow path: release commit landed as ${releaseSha.slice(0, 10)}; its candidate must build before the tag`)
+}
+
+// Land a commit on main through a pull request, and return the sha main
+// actually ends up at.
+//
+// `main` is protected: "Changes must be made through a pull request", plus a
+// required `landing` check. A direct `git push origin HEAD:refs/heads/main`
+// is rejected with GH013, which is where this script used to stop dead with the
+// release commit already made locally.
+//
+// The returned sha matters as much as the landing. A merged PR puts a *merge
+// commit* on main whose sha is not the local commit's, and the candidate builds
+// for that merge commit — so the tag has to name it. Tagging the local commit
+// would tag something that was never on main and has no candidate.
+//
+// Tags themselves are not covered by the branch rule, so the tag lane below
+// still pushes directly and `release.yml` fires exactly as designed.
+function landOnMain(branch, title, body) {
+  if (command('gh', ['--version'], { capture: true, allowFailure: true }).status !== 0) {
+    fail('the GitHub CLI (gh) is required to land a release commit through a pull request')
+  }
+  const head = output('git', ['rev-parse', 'HEAD'])
+  command('git', ['push', '--force-with-lease', 'origin', `HEAD:refs/heads/${branch}`])
+  const existing = output('gh', ['pr', 'list', '--head', branch, '--state', 'open',
+    '--json', 'number', '--jq', '.[0].number // empty'])
+  if (!existing) {
+    command('gh', ['pr', 'create', '--base', 'main', '--head', branch,
+      '--title', title, '--body', body])
+  }
+  const number = existing || output('gh', ['pr', 'list', '--head', branch, '--state', 'open',
+    '--json', 'number', '--jq', '.[0].number // empty'])
+  if (!number) fail(`could not find or open a pull request for ${branch}`)
+  console.log(`release-fast: landing ${head.slice(0, 10)} through pull request #${number}`)
+
+  // Poll until GitHub says the PR can merge. `mergeStateStatus` folds the
+  // required checks and the branch rules into one answer, so this does not have
+  // to know which checks are required — the repo decides that.
+  const deadline = Date.now() + 45 * 60 * 1000
+  for (;;) {
+    const raw = output('gh', ['pr', 'view', number, '--json', 'mergeStateStatus,state'])
+    const { mergeStateStatus: state, state: prState } = JSON.parse(raw)
+    if (prState === 'MERGED') break
+    if (state === 'CLEAN' || state === 'UNSTABLE' || state === 'HAS_HOOKS') {
+      // UNSTABLE means a non-required check is failing or still running. The
+      // required set is green, so the merge is allowed and waiting for the
+      // optional ones is exactly the waiting this script exists to remove.
+      command('gh', ['pr', 'merge', number, '--merge', '--delete-branch'])
+      break
+    }
+    if (state === 'DIRTY') fail(`pull request #${number} has conflicts with main; resolve them and re-run`)
+    if (state === 'BLOCKED') {
+      // BLOCKED is not only "a check is still red". This repo also requires
+      // review threads to be resolved, and an automated reviewer comments on
+      // most pull requests, so the usual cause is a thread nobody has answered
+      // — which no amount of waiting will clear. Say which it is rather than
+      // spending forty-five minutes finding out.
+      const unresolved = Number(output('gh', ['pr', 'view', number, '--json', 'reviewThreads',
+        '--jq', '[.reviewThreads[]? | select(.isResolved == false)] | length']) || '0')
+      if (unresolved > 0) {
+        fail(`pull request #${number} has ${unresolved} unresolved review thread(s); `
+          + 'address them and re-run — the release resumes from here')
+      }
+    }
+    if (Date.now() > deadline) {
+      fail(`gave up waiting for pull request #${number} after 45 minutes (${state}); `
+        + 'check its required checks, then re-run — the release resumes from here')
+    }
+    console.log(`release-fast: pull request #${number} is ${state}, waiting…`)
+    sleep(20)
+  }
+
+  // Adopt whatever main became. The local commit is a parent of the merge, so
+  // this is always a fast-forward; anything else means main moved underneath us
+  // and the release should stop rather than guess.
+  command('git', ['fetch', '--quiet', 'origin', 'main'])
+  if (command('git', ['merge', '--ff-only', 'origin/main'], { allowFailure: true }).status !== 0) {
+    fail('local main could not fast-forward to origin/main after the merge; reconcile it and re-run')
+  }
+  const landed = output('git', ['rev-parse', 'HEAD'])
+  console.log(`release-fast: landed on main as ${landed.slice(0, 10)}`)
+  return landed
 }
 
 // The tag is pushed only after the candidate for releaseSha is green, so the
@@ -172,6 +270,11 @@ if (!flags.has('--no-next-bump')) {
   command('npm', ['version', nextVersion, '--no-git-tag-version', '--ignore-scripts'])
   command('git', ['add', 'package.json', 'package-lock.json'])
   command('git', ['commit', '-m', `Start v${nextVersion}`])
-  command('git', ['push', 'origin', 'HEAD:refs/heads/main'])
+  landOnMain(
+    `chore/start-v${nextVersion}`,
+    `Start v${nextVersion}`,
+    `Pre-bump so every commit after ${tag} carries the next version and the next release is a `
+      + 'tag-only, roughly one-minute affair. Opened and merged by `npm run release:fast`.'
+  )
   console.log(`Pre-bumped to ${nextVersion}; the next release of it will promote in about a minute.`)
 }

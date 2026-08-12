@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.120 — 2026-08-12
+
+- Solid and Tinted have a white canvas. The middle of the window was grey in both of them while the sidebar right beside it was white, and those two are meant to be the same surface. The panel holding your terminals and chats was laying a frosted layer over the background no matter which theme you picked, and a frosted layer over white comes out grey. That layer only earns its place over Glass, the one theme that really does show your desktop, so Glass is now the only theme that gets it. Glass itself is a little clearer than it was, for the same reason.
+
 ## 0.1.119 — 2026-08-12
 
 - Terminals come back after an update that did not finish announcing itself. Every session broker writes itself down twice, once in the shared list of brokers and once in a file of its own, and one that is interrupted between the two leaves the newest entry in that list with no file beside it. The app read that single missing file as proof the whole list was corrupt. It threw away the healthy brokers named further down the same list, and because a corrupt list is not something it is willing to overwrite, it would not start a fresh broker either. Every terminal you had open went unreachable and relaunching changed nothing. An entry with no file written for it is now read as a broker that never finished starting, which the app already knows how to replace, and the working brokers listed beside it stay available to reconnect to. A file that exists but describes a different broker is still refused, exactly as before.

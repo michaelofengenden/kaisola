@@ -658,6 +658,7 @@ private struct KaisolaChromePanelModifier: ViewModifier {
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var settings = NativePreviewSettings.shared
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(
@@ -690,17 +691,44 @@ private struct KaisolaChromePanelModifier: ViewModifier {
     /// thinner material, so the surface moves down instead of up and the backdrop
     /// still shows through. Light appearance is unchanged: there `.thinMaterial`
     /// already moves the surface the way it should go.
+    /// The panel isolates content from the backdrop, so what it should lay down
+    /// depends on what the backdrop actually is. It used to lay a material down
+    /// unconditionally, which is why Solid was never white: `windowBackgroundColor`
+    /// really does resolve to #FFFFFF in light appearance, and then this covered
+    /// it with a translucent grey. Solid promises "a flat opaque surface with no
+    /// wallpaper in it at all" and Tinted promises the desktop's hue over that
+    /// surface. Neither has a backdrop to be isolated from, so neither gets a
+    /// material; only Glass, which genuinely shows the desktop, still needs one.
     @ViewBuilder
     private func panelFill(_ shape: RoundedRectangle) -> some View {
         if reduceTransparency {
             shape.fill(Color(nsColor: .controlBackgroundColor))
-        } else if colorScheme == .dark {
-            ZStack {
-                shape.fill(.ultraThinMaterial)
-                shape.fill(Color.black.opacity(Self.darkPanelCoverage))
-            }
         } else {
-            shape.fill(.thinMaterial)
+            switch settings.workspaceBackdrop {
+            case .system:
+                // The white solid, stated here rather than left to show through,
+                // so the panel keeps its own opacity contract.
+                shape.fill(Color(nsColor: .windowBackgroundColor))
+            case .tinted:
+                // `WorkspaceBackdropView` already composites the solid surface
+                // and the desktop's hue over it. Anything added here would only
+                // grey down the tint this theme exists to show.
+                Color.clear
+            case .glass:
+                if colorScheme == .dark {
+                    ZStack {
+                        shape.fill(.ultraThinMaterial)
+                        shape.fill(Color.black.opacity(Self.darkPanelCoverage))
+                    }
+                } else {
+                    // Light glass reads greyer than dark glass does, because
+                    // `.thinMaterial` lifts toward white over a backdrop that is
+                    // already bright, so the desktop showing through arrives
+                    // flattened. The thinner material keeps the same isolating
+                    // job while letting more of the actual desktop reach the eye.
+                    shape.fill(.ultraThinMaterial)
+                }
+            }
         }
     }
 

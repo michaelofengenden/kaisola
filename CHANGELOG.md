@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.119 — 2026-08-12
+
+- Terminals come back after an update that did not finish announcing itself. Every session broker writes itself down twice, once in the shared list of brokers and once in a file of its own, and one that is interrupted between the two leaves the newest entry in that list with no file beside it. The app read that single missing file as proof the whole list was corrupt. It threw away the healthy brokers named further down the same list, and because a corrupt list is not something it is willing to overwrite, it would not start a fresh broker either. Every terminal you had open went unreachable and relaunching changed nothing. An entry with no file written for it is now read as a broker that never finished starting, which the app already knows how to replace, and the working brokers listed beside it stay available to reconnect to. A file that exists but describes a different broker is still refused, exactly as before.
+- The account menu at the bottom of the sidebar reads as a menu. Your email, the version and the connection status sat among the buttons as plain rows, and since a menu row that does nothing is drawn greyed out, all three looked like commands somebody had disabled. They are headings now: sign-out sits under your name, settings and usage go together, reconnect sits with the retained terminal versions, and the build details sit under the version.
+- Settings has a third theme, Tinted. Glass shows what is actually behind the window and Solid shows none of it. Tinted sits between the two, taking the colour of your desktop and carrying it across the canvas and both side panels, so the window picks up the hue of the picture behind it without going transparent.
+
 ## 0.1.118 — 2026-08-12
 
 - The sidebar highlights the tab you are on in blue. It used to paint a grey bar behind it and put the colour in the text, which is backwards from every other sidebar on the Mac, and the grey ran the full width of the column while the row it was marking started well to the right of it. The fill is now the accent colour, the name and the little mark beside it match, and the highlight starts where the row does.

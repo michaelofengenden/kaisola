@@ -78,7 +78,6 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 45
     env:
-    env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
       KAISOLA_COMPANION_XCODE_VERSION: '16.4'
       KAISOLA_COMPANION_XCODE_BUILD: 16F6

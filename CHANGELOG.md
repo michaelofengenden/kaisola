@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.118 — 2026-08-12
+
+- The sidebar highlights the tab you are on in blue. It used to paint a grey bar behind it and put the colour in the text, which is backwards from every other sidebar on the Mac, and the grey ran the full width of the column while the row it was marking started well to the right of it. The fill is now the accent colour, the name and the little mark beside it match, and the highlight starts where the row does.
+- Project names read as headings again. They were the largest, darkest, heaviest text in the column, which meant the folder names shouted over the sessions inside them. They are smaller and quieter now, with a little air above each one so you can see where one project ends and the next begins.
+- Opening a second surface beside the first marks both of them. The row for the pane you were not typing in has never been marked at all, so half of a split always looked closed.
+- Scrolling the sidebar when there is nothing below the fold no longer makes it jitter. The list was being yanked back into place on every frame of its own bounce, so it fought your finger the whole way.
+- Settings has one theme control — Glass or Solid — instead of seven separate glass menus. The recipe behind Glass is now fixed, and it is a better one: the surface shows what is genuinely behind the window, live, rather than a blurred copy of a wallpaper file the app had to go looking for and could not find at all on a rotating or dynamic desktop. Dark mode is properly dark, which it was not, because the panel covering most of the window had been lightening everything under it.
+- The notification bell stops moving. It appeared only when something needed you, which shoved the settings gear and the usage percentage sideways every time an agent finished a turn. It now keeps its place and only changes colour. Passing notices no longer land in the middle of the window on top of whatever you are typing into.
+
 ## 0.1.117 — 2026-08-11
 
 - A terminal running an agent no longer shakes when you pull past the newest line. Overscrolling at the bottom is meant to give a little and spring back. Instead, every batch of output the agent produced cancelled the gesture and snapped the view flat, and your next movement pushed it out again, so the pane vibrated in time with the output. The stretch now stays where you put it while the rows keep scrolling underneath it.

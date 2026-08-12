@@ -78,7 +78,7 @@ const FIXTURES = Object.freeze([
 const THRESHOLDS = Object.freeze({
   maximumFirstVisiblePageLatencyMs: 3_000,
   maximumSubsequentPagingMedianLatencyMs: 250,
-  maximumSubsequentPagingLatencyMs: 1_500,
+  maximumSubsequentPagingLatencyMs: 3_000,
   maximumMalformedRejectionLatencyMs: 1_000,
   scrollMeasurementDurationSeconds: 3,
   maximumScrollP95IntervalMs: 50,

@@ -227,9 +227,10 @@ final class PDFPreviewBudgetTests: XCTestCase {
 
     /// The gate exists to catch paging getting slower, not to relitigate one
     /// page turn that is inherently expensive. Jumping to the last page of the
-    /// image-heavy fixture measured 479, 512, 600, 632, 747, 771 and 880ms over
-    /// seven CI runs while every other sample stayed under 150ms, so a single
-    /// slow sample must not fail the job and a whole run that slows down must.
+    /// image-heavy fixture measured 479, 512, 600, 632, 747, 771, 880 and
+    /// 1698ms across eight CI runs while every other sample in those runs stayed
+    /// under 150ms. A single slow sample must not fail the job; a run that slows
+    /// down as a whole must.
     func testOneInherentlySlowPageTurnPassesWhileAWholeSlowRunFails() throws {
         let specification = try XCTUnwrap(
             PDFPreviewBudgetFixtureCatalog.specification(id: "image-heavy")
@@ -257,11 +258,19 @@ final class PDFPreviewBudgetTests: XCTestCase {
             )
         }
 
-        // The worst run actually observed, which the old p95-of-five gate failed.
+        // A run the old p95-of-five gate failed.
         let observed = evaluate([91, 33.1, 62, 27.6, 880.5])
         XCTAssertTrue(observed.pass)
         XCTAssertEqual(observed.subsequentPagingMedianLatencyMs, 62)
         XCTAssertEqual(observed.subsequentPagingMaximumLatencyMs, 880.5)
+
+        // The heaviest tail measured, which failed a first attempt at a 1500ms
+        // ceiling. Its median is 64ms, inside the band every other run reports,
+        // so the run is healthy and the ceiling was the thing that was wrong.
+        let heavyTail = evaluate([96.8, 60.2, 64, 34.2, 1_698.5])
+        XCTAssertTrue(heavyTail.pass)
+        XCTAssertEqual(heavyTail.subsequentPagingMedianLatencyMs, 64)
+        XCTAssertEqual(heavyTail.subsequentPagingMaximumLatencyMs, 1_698.5)
 
         // Every sample five times slower is a real regression, and the median
         // catches it even though no single turn reaches the outright ceiling.
@@ -272,8 +281,9 @@ final class PDFPreviewBudgetTests: XCTestCase {
             ["subsequentPagingMedianLatencyMs.maximum"]
         )
 
-        // A stall that clears the ceiling still fails on its own.
-        let stalled = evaluate([91, 33.1, 62, 27.6, 1_600])
+        // A page turn that costs as much as opening the document cold is a
+        // pathology rather than a slow sample, and still fails on its own.
+        let stalled = evaluate([91, 33.1, 62, 27.6, 3_100])
         XCTAssertFalse(stalled.pass)
         XCTAssertEqual(
             stalled.diagnostics.map(\.threshold),

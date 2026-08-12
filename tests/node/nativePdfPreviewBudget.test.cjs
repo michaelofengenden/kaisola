@@ -135,7 +135,7 @@ test('fixture catalog and thresholds are exact, deterministic, and bounded', () 
   assert.deepEqual(THRESHOLDS, {
     maximumFirstVisiblePageLatencyMs: 3_000,
     maximumSubsequentPagingMedianLatencyMs: 250,
-    maximumSubsequentPagingLatencyMs: 1_500,
+    maximumSubsequentPagingLatencyMs: 3_000,
     maximumMalformedRejectionLatencyMs: 1_000,
     scrollMeasurementDurationSeconds: 3,
     maximumScrollP95IntervalMs: 50,

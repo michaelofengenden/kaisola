@@ -493,13 +493,24 @@ struct PDFPreviewBudgetThresholds: Codable, Equatable, Sendable {
     //
     // The median is the stable statistic: over the same runs it stayed within
     // 22-87ms for both paging fixtures, so 250ms leaves roughly 3x of room and
-    // still catches any regression that moves paging as a whole. The ceiling
-    // catches a true stall, and 1500ms clears the worst observed sample by
-    // about 1.7x while still failing if that last-page cost doubles.
+    // still catches any regression that moves paging as a whole.
+    //
+    // The ceiling is deliberately not "a bit above the worst sample we have
+    // seen". A first attempt set it at 1500ms on seven runs topping out at
+    // 880ms, and the very next CI run turned that last page in 1698ms while its
+    // median sat at 64ms — nothing had regressed, the tail is simply that heavy
+    // on a shared runner. Chasing the tail with a slightly larger number just
+    // repeats the mistake the p95 gate made.
+    //
+    // So the ceiling is anchored to something with a meaning instead: a page
+    // turn must never cost as much as opening the document cold, which is
+    // `maximumFirstVisiblePageLatencyMs`. That is a real pathology rather than a
+    // percentile, it clears the worst sample yet observed by about 1.8x, and it
+    // leaves the median as the gate that actually detects regressions.
     static let standard = PDFPreviewBudgetThresholds(
         maximumFirstVisiblePageLatencyMs: 3_000,
         maximumSubsequentPagingMedianLatencyMs: 250,
-        maximumSubsequentPagingLatencyMs: 1_500,
+        maximumSubsequentPagingLatencyMs: 3_000,
         maximumMalformedRejectionLatencyMs: 1_000,
         scrollMeasurementDurationSeconds: 3,
         maximumScrollP95IntervalMs: 50,

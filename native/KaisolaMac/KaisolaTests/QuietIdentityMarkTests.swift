@@ -1080,11 +1080,20 @@ final class QuietIdentityMarkTests: XCTestCase {
     /// leave the rail with no "which project am I in" signal at all.
     func testTheActiveProjectIsSignalledByWeightAlone() {
         XCTAssertNotEqual(QuietProjectEmphasis.activeWeight, QuietProjectEmphasis.restingWeight)
-        XCTAssertEqual(QuietProjectEmphasis.weight(isActive: true), .bold)
+        XCTAssertEqual(QuietProjectEmphasis.weight(isActive: true), .semibold)
         XCTAssertEqual(QuietProjectEmphasis.weight(isActive: false), .regular)
-        // Bolder than the selected *session*: a heading outranks a row, and the
-        // two signals have to stay legible in the same column.
-        XCTAssertNotEqual(QuietProjectEmphasis.activeWeight, QuietRowEmphasis.selectedWeight)
+        // The heading no longer outranks the row it contains, and must not: a
+        // project name is 11pt secondary while a session title is 13pt primary,
+        // so the two are separated by size and ink instead of by weight. That is
+        // the correction — the folder names used to be the loudest text in a
+        // column whose job is to point at what is inside them.
+        XCTAssertLessThan(
+            QuietRailMetrics.headerText,
+            QuietRailMetrics.titleText,
+            "a project heading must read below the surfaces inside it"
+        )
+        // The weights are now allowed to match: size and ink carry the
+        // heading/row distinction, so this no longer has to.
     }
 
     /// Exactly one row wears the pill, and which one is a rule rather than a
@@ -1140,8 +1149,7 @@ final class QuietIdentityMarkTests: XCTestCase {
     func testAccountNameGetsMoreThanTheOldFixedChipAtTheDefaultWidth() {
         let width = FooterAccountBudget.nameWidth(
             footerWidth: NativeWorkspaceChrome.projectSidebarIdealWidth,
-            usageChipWidth: usageChipWidth,
-            attentionWidth: 0
+            usageChipWidth: usageChipWidth
         )
         // The old chip framed avatar + name into 118pt total.
         XCTAssertGreaterThan(width, 118 - FooterAccountBudget.avatarSlot)
@@ -1184,26 +1192,26 @@ final class QuietIdentityMarkTests: XCTestCase {
 
     /// The fix is in the slots and gaps shared by every control, not a
     /// special case for the quiet footer: charging for the attention bell too
-    /// (its `attentionWidth` stands for the badge's own footprint) still has
+    /// (its reserved control slot stands for the badge’s old footprint) still has
     /// to recover at least the same 18pt the quiet case does, compared against
     /// what the pre-fix arithmetic gave the name in that same busy state.
     func testTheRecoveryHoldsWithTheAttentionBellShowingToo() {
         let chip = usageChipWidth
-        let bellWidth: CGFloat = 30
 
         let width = FooterAccountBudget.nameWidth(
             footerWidth: NativeWorkspaceChrome.projectSidebarIdealWidth,
-            usageChipWidth: chip,
-            attentionWidth: bellWidth
+            usageChipWidth: chip
         )
 
         // Pre-fix arithmetic (controlSlot 22, gap 5) for this same busy state,
-        // written out rather than re-derived so the comparison can't drift
-        // with the constants under test.
+        // written out rather than re-derived so the comparison can't drift with
+        // the constants under test. The bell was a 30pt badge then; it is a
+        // fixed control slot now, charged whether or not it is lit.
+        let bellWidthBeforeTheFix: CGFloat = 30
         let brokenWidthWithBell: CGFloat = NativeWorkspaceChrome.projectSidebarIdealWidth
             - FooterAccountBudget.horizontalPadding
             - FooterAccountBudget.avatarSlot
-            - (22 * 2 + 5 * 2 + (chip + 5) + (bellWidth + 5))
+            - (22 * 2 + 5 * 2 + (chip + 5) + (bellWidthBeforeTheFix + 5))
 
         XCTAssertGreaterThanOrEqual(
             width - brokenWidthWithBell, 18,
@@ -1211,11 +1219,36 @@ final class QuietIdentityMarkTests: XCTestCase {
         )
     }
 
+    /// The bell's lane is constant, so nothing in the footer moves when the
+    /// inbox fills or empties.
+    ///
+    /// This is the whole point of the change: the cluster is right-aligned as a
+    /// unit, so a conditionally-present control slid the gear and the usage
+    /// percentage sideways every time an agent finished a turn — a button that
+    /// appeared from nowhere in the middle of the row and shoved its neighbours.
+    /// There is now only ONE name width, whatever the inbox is doing.
+    func testTheAttentionBellNeverMovesTheRestOfTheFooter() {
+        let ideal = NativeWorkspaceChrome.projectSidebarIdealWidth
+        // The signature no longer admits an "attention showing" variant, which is
+        // the structural form of the guarantee: there is no second answer.
+        let quiet = FooterAccountBudget.nameWidth(footerWidth: ideal, usageChipWidth: 0)
+        let twoControlEquivalent = ideal
+            - FooterAccountBudget.horizontalPadding
+            - FooterAccountBudget.avatarSlot
+            - (FooterAccountBudget.controlSlot * 2 + FooterAccountBudget.gap * 2)
+        XCTAssertEqual(
+            twoControlEquivalent - quiet,
+            FooterAccountBudget.controlSlot + FooterAccountBudget.gap,
+            accuracy: 0.001,
+            "the reserved bell lane must be charged against the name"
+        )
+    }
+
     /// …and it really is a function of the footer: widening the sidebar has to
     /// move the number, which is precisely what the fixed frame prevented.
     func testAccountNameWidthGrowsWithTheSidebar() {
         func width(_ sidebar: CGFloat) -> CGFloat {
-            FooterAccountBudget.nameWidth(footerWidth: sidebar, usageChipWidth: 34, attentionWidth: 0)
+            FooterAccountBudget.nameWidth(footerWidth: sidebar, usageChipWidth: 34)
         }
         let ideal = NativeWorkspaceChrome.projectSidebarIdealWidth
         XCTAssertGreaterThan(width(NativeWorkspaceChrome.projectSidebarMaximumWidth), width(ideal))
@@ -1226,42 +1259,59 @@ final class QuietIdentityMarkTests: XCTestCase {
     /// way the layout does rather than only describing the quiet case.
     func testOptionalFooterControlsAreChargedAgainstTheName() {
         let ideal = NativeWorkspaceChrome.projectSidebarIdealWidth
-        let quiet = FooterAccountBudget.nameWidth(footerWidth: ideal, usageChipWidth: 0, attentionWidth: 0)
-        let withChip = FooterAccountBudget.nameWidth(footerWidth: ideal, usageChipWidth: 34, attentionWidth: 0)
-        let withBoth = FooterAccountBudget.nameWidth(footerWidth: ideal, usageChipWidth: 34, attentionWidth: 30)
+        let quiet = FooterAccountBudget.nameWidth(footerWidth: ideal, usageChipWidth: 0)
+        let withChip = FooterAccountBudget.nameWidth(footerWidth: ideal, usageChipWidth: 34)
+        // The usage chip is the only control left that is charged only when it is
+        // showing — and it sits at the cluster's leading edge, so its arrival
+        // moves nothing to its right. The bell used to be charged this way too,
+        // which is exactly why it jumped.
         XCTAssertEqual(quiet - withChip, 34 + FooterAccountBudget.gap, accuracy: 0.001)
-        XCTAssertEqual(withChip - withBoth, 30 + FooterAccountBudget.gap, accuracy: 0.001)
     }
 
     // MARK: - Selected row pill
 
-    /// The tinted glass capsule is deleted, not relocated: the pill under the
-    /// selected surface row is NEUTRAL, and the only colour in the row is the
-    /// label, in the user's own accent. A tinted pill under tinted text is the
-    /// coloured chip v1.1.7 was right to remove.
-    func testTheSelectionPillStaysANeutralWhisper() {
-        XCTAssertGreaterThan(QuietSelectionPill.lightFillOpacity, 0)
+    /// The pill is the rail's one fill, and it is the ACCENT — not grey.
+    ///
+    /// It was neutral (black at 6%, white at 10%) with the accent reserved for
+    /// the label, which put the column's only colour on one line of 13pt type and
+    /// its loudest painted object on a grey bar. Michael: "only highlight tabs
+    /// with blue, get rid of the gray highlighting when tab is on." That is also
+    /// Safari's grammar, which the v1.1.9 pass named and then applied backwards.
+    ///
+    /// The ceiling stays: above roughly 0.30 in light this stops being a tint and
+    /// becomes the saturated chip v1.1.7 was right to delete.
+    func testTheSelectionPillIsAccentAtLowCoverage() {
+        XCTAssertGreaterThan(
+            QuietSelectionPill.lightFillOpacity, 0.10,
+            "below this the accent does not read as colour on white"
+        )
         XCTAssertLessThan(
-            QuietSelectionPill.lightFillOpacity, 0.12,
+            QuietSelectionPill.lightFillOpacity, 0.30,
             "a pill this strong is a chip, and it will out-shout the label sitting on it"
         )
-        // Dark mode swallows the same recipe, so it gets more — but still less
-        // than a chip's worth.
+        // Dark mode swallows the same coverage, so it gets more — still short of
+        // a chip's worth.
         XCTAssertGreaterThan(
             QuietSelectionPill.fillOpacity(dark: true),
             QuietSelectionPill.fillOpacity(dark: false)
         )
-        XCTAssertLessThan(QuietSelectionPill.fillOpacity(dark: true), 0.16)
+        XCTAssertLessThan(QuietSelectionPill.fillOpacity(dark: true), 0.35)
 
-        // Same corner as every other rounded surface in the window, and inset
-        // from the column edge rather than reaching it.
-        XCTAssertEqual(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.insetRadius)
+        // One rung tighter than the app's inset radius: the pill is nested inside
+        // the sidebar's own chrome corner, so the ladder stays strictly
+        // increasing outward.
+        XCTAssertEqual(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.controlRadius)
+        XCTAssertLessThan(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.insetRadius)
         XCTAssertGreaterThan(QuietSelectionPill.horizontalInset, 0)
         XCTAssertLessThan(
             QuietSelectionPill.horizontalInset,
             QuietRowBudget.projectIndent,
             "the pill must stay inside the row's own leading inset"
         )
+        // A session's pill starts just before its identity mark rather than at
+        // the column edge, so it cannot paint colour under nothing.
+        XCTAssertGreaterThan(QuietRailMetrics.pillMarkLead, 0)
+        XCTAssertLessThan(QuietRailMetrics.pillMarkLead, QuietRailMetrics.sessionIndent)
     }
 
     // MARK: - Project drag mapping

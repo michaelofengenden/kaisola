@@ -664,6 +664,16 @@ struct RootShellView: View {
                 // At the 200pt default width those 31pt were the difference
                 // between a title showing 7 characters and 15.
                 .listStyle(.plain)
+                // A rail shorter than its column has nowhere to go, and letting
+                // it rubber-band anyway is what made the sidebar "recoil
+                // spazztically" with no projects below the fold: every elastic
+                // frame put the clip view outside its own scrollable range, and
+                // `SidebarScrollTopPin` — which clamps to that range — yanked it
+                // back mid-bounce, so the two fought at frame rate. Bouncing only
+                // when there is something to bounce *to* removes the fight at its
+                // source; the pin is taught to stand down during a gesture too,
+                // for the case where the rail genuinely does overflow.
+                .scrollBounceBehavior(.basedOnSize)
                 .scrollContentBackground(.hidden)
                 .accessibilityLabel("Projects, chats, and terminal sessions")
                 // NavigationSplitView exposes only the one-pixel AppKit divider.
@@ -3283,6 +3293,11 @@ struct SidebarScrollTopPin: NSViewRepresentable {
 
         private weak var scrollView: NSScrollView?
         private var pinDeadline: Date?
+        private var liveScrolling = false
+        private var liveScrollGraceUntil: Date?
+        /// How long past a gesture's end the offset still belongs to AppKit.
+        /// Covers momentum and the elastic snap-back that follows it.
+        private static let liveScrollGrace: TimeInterval = 0.5
         private var attempts = 0
         private var correcting = false
         /// Same settling shape the width applier uses: the list is not backed by
@@ -3325,19 +3340,52 @@ struct SidebarScrollTopPin: NSViewRepresentable {
             // window can never be felt as the list refusing to move.
             center.addObserver(
                 self,
-                selector: #selector(releasePin),
+                selector: #selector(beginLiveScroll),
                 name: NSScrollView.willStartLiveScrollNotification,
+                object: found
+            )
+            center.addObserver(
+                self,
+                selector: #selector(endLiveScroll),
+                name: NSScrollView.didEndLiveScrollNotification,
                 object: found
             )
             correct()
         }
 
-        @objc private func releasePin() { pinDeadline = nil }
+        @objc private func beginLiveScroll() {
+            pinDeadline = nil
+            liveScrolling = true
+        }
+
+        /// Momentum keeps moving the clip view after the fingers leave, and the
+        /// elastic snap-back is the last thing to run, so corrections stay
+        /// suspended for a short tail past the gesture's own end.
+        @objc private func endLiveScroll() {
+            liveScrolling = false
+            liveScrollGraceUntil = Date().addingTimeInterval(Self.liveScrollGrace)
+        }
 
         @objc private func clipBoundsChanged() { correct() }
 
+        /// Whether AppKit currently owns the offset and will settle it itself.
+        private var scrollIsUserOwned: Bool {
+            if liveScrolling { return true }
+            guard let until = liveScrollGraceUntil else { return false }
+            if Date() < until { return true }
+            liveScrollGraceUntil = nil
+            return false
+        }
+
         private func correct() {
             guard !correcting, let scrollView, let document = scrollView.documentView else { return }
+            // Never clamp underneath a live gesture. Elastic overscroll puts the
+            // clip view outside its scrollable range *by design*, and AppKit
+            // returns it on its own when the gesture ends; clamping each elastic
+            // frame instead is what made the rail "recoil spazztically" under the
+            // pointer. The clamp exists for the offset AppKit leaves behind after
+            // a row diff, which is not a gesture and is unaffected here.
+            guard !scrollIsUserOwned else { return }
             let clip = scrollView.contentView
             let pinned = pinDeadline.map { Date() < $0 } ?? false
             guard let target = SidebarScrollPin.correction(
@@ -4875,29 +4923,46 @@ enum FooterAccountBudget {
     /// being reserved as layout width. Every point bought back here is a
     /// point the account name keeps — see `FooterAccountBudget` callers and
     /// the test that pins the name's width at the default sidebar.
-    static let controlSlot: CGFloat = 16
+    /// 16 → 14 when the attention bell took a permanent lane.
+    ///
+    /// Reserving that lane so the footer stops rearranging itself costs the
+    /// account name 16pt, which would have pushed it back under the 118pt fixed
+    /// chip the v1.1.8 ladder was built to escape. Rather than pay for a stable
+    /// footer with the regression that ladder exists to prevent, the three
+    /// trailing controls give up a point each side: their glyphs are 12pt and
+    /// never needed a 16pt frame, and `tapTargetExpansion` keeps the hit target
+    /// where it was.
+    static let controlSlot: CGFloat = 14
     /// How far a control's *hit* region extends past its visual
     /// `controlSlot` frame, on every side. `contentShape` grows into the
     /// row's own gaps rather than the frame growing into the name's width, so
     /// the tap target stays ≥20pt (16 + 2×2) without costing the name a
     /// single point.
-    static let tapTargetExpansion: CGFloat = 2
+    static let tapTargetExpansion: CGFloat = 3
     /// Padding inside the usage chip, on each side. 2 → 1 in v1.1.8, the third
     /// and last rung: the chip is text with no capsule behind it, so its padding
     /// only separates four characters from the `gap` already on either side.
     static let usageChipHorizontalPadding: CGFloat = 1
 
     /// - Returns: points the account *name* can use before it must truncate.
+    /// The attention bell is charged **unconditionally**, unlike the usage chip.
+    ///
+    /// It used to be charged only while it was showing, which is what made it the
+    /// "bizarre button in the middle": the control cluster is right-aligned as a
+    /// unit, so a bell that came and went slid the gear and the usage percentage
+    /// about 32pt sideways every time an agent finished a turn, and it landed in
+    /// the empty middle of the row as the only saturated colour among 12pt grey
+    /// glyphs. Reserving its lane buys a footer whose controls never move.
     static func nameWidth(
         footerWidth: CGFloat,
-        usageChipWidth: CGFloat,
-        attentionWidth: CGFloat
+        usageChipWidth: CGFloat
     ) -> CGFloat {
-        // gear + overflow are always present; the usage chip and the attention
-        // button are present only when they have something to say.
-        var trailing = controlSlot * 2 + gap * 2
+        // gear + attention + overflow all hold their slots always; the usage chip
+        // is the one control still present only when it has something to say, and
+        // it sits at the cluster's leading edge where its arrival moves nothing
+        // to its right.
+        var trailing = controlSlot * 3 + gap * 3
         if usageChipWidth > 0 { trailing += usageChipWidth + gap }
-        if attentionWidth > 0 { trailing += attentionWidth + gap }
         return footerWidth - horizontalPadding - avatarSlot - trailing
     }
 }
@@ -5669,30 +5734,45 @@ private struct ConnectionFooter: View {
 
     @ViewBuilder
     private var attentionButton: some View {
-        // A storage problem keeps the bell reachable on its own: the notice
-        // explaining lost or unsaved work would otherwise have nowhere to live
-        // once the inbox reads empty.
-        if attention.count > 0 || !attention.storageNotices.isEmpty {
-            Button {
-                showInbox.toggle()
-            } label: {
-                KaisolaStatusBadge(
-                    text: attention.count > 0 ? "\(attention.count)" : "!",
-                    systemImage: "bell.fill",
-                    tone: .needsYou
+        // A storage problem keeps the bell lit on its own: the notice explaining
+        // lost or unsaved work would otherwise have nowhere to live once the
+        // inbox reads empty.
+        let needsYou = attention.count > 0 || !attention.storageNotices.isEmpty
+        return Button {
+            showInbox.toggle()
+        } label: {
+            Image(systemName: needsYou ? "bell.badge.fill" : "bell")
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(needsYou ? KaisolaStatusTone.needsYou.foregroundColor : Color.secondary)
+                .frame(
+                    width: FooterAccountBudget.controlSlot,
+                    height: FooterAccountBudget.controlSlot
                 )
-            }
-            .buttonStyle(.borderless)
-            .help("Needs you — permission asks and finished agents")
-            .accessibilityLabel(
-                attention.count > 0
-                    ? "Attention inbox, \(attention.count) items"
-                    : "Attention inbox, saved inbox needs attention"
-            )
-            .accessibilityIdentifier("footer.attention")
-            .popover(isPresented: $showInbox, arrowEdge: .top) {
-                attentionInbox
-            }
+                .contentShape(
+                    Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion)
+                )
+        }
+        .buttonStyle(.plain)
+        .fixedSize()
+        .help(
+            attention.count > 0
+                ? "Needs you — \(attention.count) permission asks and finished agents"
+                : (needsYou ? "Saved inbox needs attention" : "Nothing needs you")
+        )
+        .accessibilityLabel(
+            attention.count > 0
+                ? "Attention inbox, \(attention.count) items"
+                : (needsYou ? "Attention inbox, saved inbox needs attention" : "Attention inbox, empty")
+        )
+        .accessibilityIdentifier("footer.attention")
+        .popover(isPresented: $showInbox, arrowEdge: .top) {
+            attentionInbox
+        }
+        // Every path that empties the inbox — this popover, the Companion, a
+        // notification click, focusing the surface — now closes the popover with
+        // it, rather than leaving an anchored empty sheet behind.
+        .onChange(of: needsYou) { _, stillNeeded in
+            if !stillNeeded { showInbox = false }
         }
     }
 

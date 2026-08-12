@@ -79,9 +79,19 @@ enum AppearanceMode: String, CaseIterable, Identifiable, Sendable {
 enum SidebarAppearance: String, CaseIterable, Identifiable, Sendable {
     case glass
     case solid
+    /// The desktop's *hue* laid into the solid surface — the same recipe the
+    /// canvas has had, now available to the two rails so a tinted workspace is
+    /// tinted all the way across instead of only in the middle.
+    case tinted
 
     var id: String { rawValue }
-    var title: String { self == .glass ? "Glass" : "Solid" }
+    var title: String {
+        switch self {
+        case .glass: "Glass"
+        case .solid: "Solid"
+        case .tinted: "Tinted"
+        }
+    }
 }
 
 /// Where the glass surfaces get the desktop they show through themselves.
@@ -125,12 +135,41 @@ enum GlassBackdropSource: String, CaseIterable, Identifiable, Sendable {
 enum KaisolaTheme: String, CaseIterable, Identifiable, Sendable {
     case glass
     case solid
+    /// Opaque like Solid, but carrying the desktop's colour across the canvas
+    /// and both rails. Michael: "a tinted theme to the settings that makes the
+    /// background and lhs and rhs tinted in a nice but slick manner."
+    ///
+    /// The canvas half already existed and was already measured — see
+    /// `WorkspaceBackdropMode.tinted` — but it was reachable only from a picker
+    /// this round deleted, and it tinted the middle of the window while the two
+    /// rails stayed neutral grey, which is what made it read as a half-applied
+    /// setting rather than a theme. Both surfaces move together now.
+    case tinted
 
     var id: String { rawValue }
-    var title: String { self == .glass ? "Glass" : "Solid" }
+    var title: String {
+        switch self {
+        case .glass: "Glass"
+        case .solid: "Solid"
+        case .tinted: "Tinted"
+        }
+    }
 
-    var sidebarAppearance: SidebarAppearance { self == .glass ? .glass : .solid }
-    var workspaceBackdrop: WorkspaceBackdropMode { self == .glass ? .glass : .system }
+    var sidebarAppearance: SidebarAppearance {
+        switch self {
+        case .glass: .glass
+        case .solid: .solid
+        case .tinted: .tinted
+        }
+    }
+
+    var workspaceBackdrop: WorkspaceBackdropMode {
+        switch self {
+        case .glass: .glass
+        case .solid: .system
+        case .tinted: .tinted
+        }
+    }
 }
 
 /// The one glass recipe: **soft, muted, and live** — and deliberately NOT
@@ -750,7 +789,11 @@ final class NativePreviewSettings: ObservableObject {
     /// only half in. Writing sets both, which is the point: they were separate
     /// rows nobody wanted to reason about independently.
     var theme: KaisolaTheme {
-        get { sidebarAppearance == .glass && workspaceBackdrop == .glass ? .glass : .solid }
+        get {
+            if sidebarAppearance == .glass && workspaceBackdrop == .glass { return .glass }
+            if sidebarAppearance == .tinted || workspaceBackdrop == .tinted { return .tinted }
+            return .solid
+        }
         set {
             sidebarAppearance = newValue.sidebarAppearance
             workspaceBackdrop = newValue.workspaceBackdrop

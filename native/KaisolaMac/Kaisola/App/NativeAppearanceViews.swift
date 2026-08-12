@@ -531,6 +531,9 @@ struct SidebarBackdropView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @ObservedObject private var settings = NativePreviewSettings.shared
+    /// The glass path reads the desktop through `DesktopGlassLayer`; the tinted
+    /// path samples it directly, so the provider is observed here too.
+    @ObservedObject private var desktop = DesktopBackdropProvider.shared
     let appearance: SidebarAppearance
 
     @ViewBuilder
@@ -556,8 +559,56 @@ struct SidebarBackdropView: View {
             }
         case .solid:
             Color(nsColor: .controlBackgroundColor)
+        case .tinted:
+            // The same recipe the canvas uses, on the rails: the desktop's hue
+            // re-valued to a declared peak and laid over the solid surface at a
+            // declared coverage, so the only chroma in the stack is the sampled
+            // desktop's and a grey desktop stays grey.
+            //
+            // The rails take a *lighter* coverage than the canvas. They are
+            // narrow columns of small text sitting next to a wide field of it,
+            // and matching the canvas exactly made them read as the louder
+            // surface — the same mistake the sidebar's selection pill made. This
+            // keeps the tint continuous across the window while leaving the
+            // canvas the surface that carries it.
+            let isDark = colorScheme == .dark
+            let tint = DesktopTintSampler.revalued(
+                desktop.painting.tint,
+                peak: DesktopTintSampler.canvasTintPeak(isDark: isDark)
+            )
+            let coverage = DesktopTintSampler.canvasTintCoverage(isDark: isDark)
+            let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
+            ZStack {
+                Color(nsColor: .controlBackgroundColor)
+                // Same top-to-bottom fall as the canvas, so a rail and the
+                // canvas beside it are lit from the same direction rather than
+                // meeting as two flat panels of slightly different colour.
+                LinearGradient(
+                    colors: [
+                        color.opacity(coverage.top * Self.railTintShare),
+                        color.opacity(coverage.bottom * Self.railTintShare),
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                if accessibilityContrast == .increased {
+                    Color(nsColor: .controlBackgroundColor)
+                        .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
+                }
+            }
+            .onAppear { desktop.refresh(isDark: colorScheme == .dark) }
+            .onChange(of: colorScheme) { desktop.refresh(isDark: colorScheme == .dark) }
         }
     }
+
+    /// How much of the canvas's tint coverage the rails take.
+    ///
+    /// Three quarters. At parity the two narrow columns read louder than the
+    /// wide canvas between them, because the same coverage over a small area
+    /// next to a large one is the one the eye lands on. Below about half the
+    /// rails stop looking related to the canvas at all, which is the
+    /// half-applied look this theme exists to fix.
+    static let railTintShare: Double = 0.75
 }
 
 struct WorkspaceBackdropView: View {

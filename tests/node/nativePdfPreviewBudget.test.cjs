@@ -43,6 +43,12 @@ function workflowJobSource(source, job) {
   return lines.slice(start, end).join('\n')
 }
 
+function sampleMedian(values) {
+  const sorted = [...values].sort((left, right) => left - right)
+  const middle = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle]
+}
+
 function passingReceipt(fixture = FIXTURES[0]) {
   const pagingLatencies = fixture.pagingPageIndexes.map((_, index) => 50 + index)
   const scroll = fixture.measuresSustainedScroll ? {
@@ -54,7 +60,7 @@ function passingReceipt(fixture = FIXTURES[0]) {
     callbackCoverage: 0.96,
   } : null
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     workload: 'bounded-pdf-preview-v2',
     phase: 'render',
     fixture: fixture.id,
@@ -77,7 +83,12 @@ function passingReceipt(fixture = FIXTURES[0]) {
       outcome: fixture.expectedOutcome,
       firstVisiblePageLatencyMs: fixture.expectedOutcome === 'rendered' ? 200 : null,
       subsequentPagingLatenciesMs: pagingLatencies,
-      subsequentPagingP95LatencyMs: pagingLatencies.at(-1) ?? null,
+      subsequentPagingMedianLatencyMs: pagingLatencies.length
+        ? sampleMedian(pagingLatencies)
+        : null,
+      subsequentPagingMaximumLatencyMs: pagingLatencies.length
+        ? Math.max(...pagingLatencies)
+        : null,
       malformedRejectionLatencyMs: fixture.expectedOutcome === 'rejected' ? 20 : null,
       scroll,
       diagnostics: [],
@@ -88,7 +99,7 @@ function passingReceipt(fixture = FIXTURES[0]) {
 
 function passingGenerationReceipt(fixture, artifact, appPid = 122) {
   return {
-    schemaVersion: 2,
+    schemaVersion: 3,
     workload: 'bounded-pdf-preview-v2',
     phase: 'generate',
     fixture: fixture.id,
@@ -123,7 +134,8 @@ test('fixture catalog and thresholds are exact, deterministic, and bounded', () 
   assert.equal(FIXTURES.find((fixture) => fixture.id === 'large-page').pageWidthPoints, 14_400)
   assert.deepEqual(THRESHOLDS, {
     maximumFirstVisiblePageLatencyMs: 3_000,
-    maximumSubsequentPagingP95LatencyMs: 750,
+    maximumSubsequentPagingMedianLatencyMs: 250,
+    maximumSubsequentPagingLatencyMs: 1_500,
     maximumMalformedRejectionLatencyMs: 1_000,
     scrollMeasurementDurationSeconds: 3,
     maximumScrollP95IntervalMs: 50,

@@ -712,7 +712,7 @@ extension NativeTerminalSurface {
             view.observeSemanticPromptCursor(refreshDecorations: false)
             view.allowMouseReporting = restoresMouseReporting
             if scrollAfter, !userUnpinned {
-                view.scrollToLiveBottom()
+                view.followLiveBottomForStreamedOutput()
             } else {
                 view.updateSemanticDecorations()
             }
@@ -747,7 +747,7 @@ extension NativeTerminalSurface {
             view.observeSemanticPromptCursor(refreshDecorations: false)
             view.allowMouseReporting = restoresMouseReporting
             if scrollAfter, !userUnpinned {
-                view.scrollToLiveBottom()
+                view.followLiveBottomForStreamedOutput()
             } else {
                 view.updateSemanticDecorations()
             }
@@ -931,7 +931,10 @@ extension NativeTerminalSurface {
             DispatchQueue.main.async { [weak self, weak view] in
                 guard let self, let view, !self.userUnpinned else { return }
                 self.isFeeding = true
-                view.scrollToLiveBottom()
+                // `layout()` fires this on every usable pass, so it is as
+                // automatic as the output pin and must respect a gesture in
+                // flight for the same reason.
+                view.followLiveBottomForStreamedOutput()
                 self.isFeeding = false
             }
         }

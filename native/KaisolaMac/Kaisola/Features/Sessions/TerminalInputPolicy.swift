@@ -159,6 +159,13 @@ struct TerminalContinuousScrollState: Equatable, Sendable {
         viewportExtent newViewportExtent: CGFloat
     ) {
         let oldProjection = projection
+        // Displacement past an edge is not a position within a row, so it is
+        // carried across the rebase in points rather than as a fraction. This
+        // is exactly zero unless a band is active, so a normal rebase is
+        // unchanged. Streamed output moves the live bottom on every batch, and
+        // dropping the band each time is what made an overscrolled terminal
+        // vibrate under a running agent instead of resting under the finger.
+        let overshoot = rawPosition - oldProjection.boundedPosition
         let oldFraction = oldProjection.isRubberBanding
             ? 0
             : max(0, min(1, oldProjection.offsetWithinAnchor / rowHeight))
@@ -166,7 +173,7 @@ struct TerminalContinuousScrollState: Equatable, Sendable {
         maximumRow = max(0, newMaximumRow)
         viewportExtent = max(1, newViewportExtent)
         let row = max(0, min(anchorRow, maximumRow))
-        rawPosition = CGFloat(row) * rowHeight + oldFraction * rowHeight
+        rawPosition = CGFloat(row) * rowHeight + oldFraction * rowHeight + overshoot
     }
 
     /// Advance a deterministic critically-damped-looking edge return. Returns

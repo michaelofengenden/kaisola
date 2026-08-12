@@ -93,6 +93,21 @@ final class TerminalScrollPinTests: XCTestCase {
         )
     }
 
+    /// One batch of ordinary streamed output, appended the way the broker
+    /// delivers it: same epoch, extended byte range, incremental feed.
+    private func appendStreamedLine(
+        _ index: Int,
+        to fixture: inout ScrollFixture
+    ) {
+        fixture.output += "claude-history-\(index)\r\n"
+        fixture.coordinator.apply(
+            output: fixture.output,
+            epoch: "scroll-pin-epoch",
+            endOffset: Int64(fixture.output.utf8.count),
+            to: fixture.view
+        )
+    }
+
     /// Reset from inside the test body rather than `setUp`/`tearDown`.
     /// Those are nonisolated overrides, so calling a main-actor method from them
     /// is only accepted by some toolchains; a test method on a `@MainActor`
@@ -251,6 +266,126 @@ final class TerminalScrollPinTests: XCTestCase {
         RunLoop.main.run(until: Date().addingTimeInterval(0.3))
         XCTAssertFalse(fixture.view.continuousScrollSnapshot?.isRubberBanding == true)
         XCTAssertEqual(fixture.view.bounds.origin.y, 0, accuracy: 0.000_001)
+    }
+
+    /// Streamed output moves the live bottom. A rubber band measured against
+    /// that edge must move with it, not be discarded: `reconfigure` treated the
+    /// band as a sub-row fraction, and dropping fractions while banding zeroed
+    /// the whole displacement on every batch an agent emitted.
+    func testReconfigureCarriesRubberBandDisplacementAcrossStreamedGrowth() {
+        var state = TerminalContinuousScrollState(
+            anchorRow: 100,
+            fractionalOffset: 0,
+            rowHeight: 20,
+            maximumRow: 100,
+            viewportExtent: 320
+        )
+        state.apply(scrollingDeltaY: -120)
+        let band = state.projection.presentedPosition - 100 * 20
+        XCTAssertTrue(state.projection.isRubberBanding)
+        XCTAssertGreaterThan(band, 0)
+
+        // One more line of agent output: the live bottom is now a row lower.
+        state.reconfigure(
+            anchorRow: 101,
+            rowHeight: 20,
+            maximumRow: 101,
+            viewportExtent: 320
+        )
+
+        XCTAssertTrue(
+            state.projection.isRubberBanding,
+            "Output growth collapsed a band the user is still holding."
+        )
+        XCTAssertEqual(
+            state.projection.presentedPosition - 101 * 20,
+            band,
+            accuracy: 0.000_001,
+            "The band must follow the edge it is measured against."
+        )
+    }
+
+    /// The shake: an agent streaming output while the user holds an overscroll
+    /// past the newest row. Every batch ran the live-bottom pin, which routed
+    /// through `prepareForDiscreteScrollInput` and dropped the continuous state
+    /// outright, snapping the viewport back to zero; the next trackpad sample
+    /// rebuilt it from nothing and pushed it out again. At an agent's output
+    /// rate that reads as vibration rather than a rubber band.
+    func testStreamedOutputDoesNotCollapseAnOverscrollHeldPastTheLiveBottom() {
+        var fixture = scrollFixture()
+        fixture.view.scroll(toPosition: 1)
+        XCTAssertTrue(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: -32,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: [],
+            routesToNativeScrollback: true
+        ))
+        XCTAssertTrue(fixture.view.continuousScrollSnapshot?.isRubberBanding == true)
+        let held = fixture.view.bounds.origin.y
+        XCTAssertLessThan(held, -1, "The overscroll must displace the viewport.")
+
+        appendStreamedLine(240, to: &fixture)
+
+        XCTAssertTrue(
+            fixture.view.continuousScrollSnapshot?.isRubberBanding == true,
+            "An output batch cancelled a gesture the user is still holding."
+        )
+        XCTAssertEqual(
+            fixture.view.bounds.origin.y,
+            held,
+            accuracy: 0.000_001,
+            "The held overscroll must not snap back while output streams."
+        )
+    }
+
+    /// The same batch must still follow the newest output. Preserving the band
+    /// is only correct if the rows underneath it keep advancing.
+    func testStreamedOutputStillFollowsTheLiveBottomUnderneathAHeldOverscroll() {
+        var fixture = scrollFixture()
+        fixture.view.scroll(toPosition: 1)
+        XCTAssertTrue(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: -32,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: [],
+            routesToNativeScrollback: true
+        ))
+        let anchorBefore = fixture.view.getTerminal().getTopVisibleRow()
+
+        appendStreamedLine(240, to: &fixture)
+
+        XCTAssertGreaterThan(
+            fixture.view.getTerminal().getTopVisibleRow(),
+            anchorBefore,
+            "Holding an overscroll must not stop the terminal following output."
+        )
+    }
+
+    /// `layout()` re-pins on every usable pass, so a shell redraw landing mid
+    /// gesture was a second route to the same collapse as a streamed batch.
+    func testLayoutRepinDoesNotCollapseAnOverscrollHeldPastTheLiveBottom() {
+        let fixture = scrollFixture()
+        fixture.view.scroll(toPosition: 1)
+        XCTAssertTrue(fixture.view.handleContinuousScroll(
+            scrollingDeltaY: -32,
+            hasPreciseScrollingDeltas: true,
+            phase: .changed,
+            momentumPhase: [],
+            routesToNativeScrollback: true
+        ))
+        let held = fixture.view.bounds.origin.y
+        XCTAssertLessThan(held, -1)
+
+        fixture.coordinator.repinAfterLayout(fixture.view)
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+
+        XCTAssertEqual(
+            fixture.view.bounds.origin.y,
+            held,
+            accuracy: 0.000_001,
+            "A layout pass cancelled a gesture the user is still holding."
+        )
     }
 
     func testPreciseTrackpadSamplesMoveRealViewportContinuouslyAndUpdateScroller() throws {

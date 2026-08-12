@@ -304,15 +304,42 @@ struct BrokerInfoLocator: BrokerTopologyLocating, Sendable {
                 throw BrokerDiscoveryError.invalidRegistry
             }
             var socketPaths = Set<String>()
+            var publishedDraining: [BrokerGenerationRecord] = []
             for generation in topology.all {
+                let metadataURL = store.metadataURL(for: generation)
+                // An *absent* identity file is not the same as a wrong one.
+                //
+                // The registry is written after generation metadata, so a record
+                // whose metadata does not exist describes a generation that never
+                // finished announcing itself — unpublished, not tampered with. It
+                // used to be treated as tampering, and that made one missing file
+                // unrecoverable: `locateTopology` refused the whole registry, and
+                // `BrokerStartupCoordinator` rethrows `invalidRegistry` instead of
+                // relaunching, so every terminal became unreachable — including
+                // the healthy generations in the same registry — with Reconnect
+                // reporting "the saved terminal-generation registry is invalid"
+                // forever. Seen in the wild on 0.1.118: five draining generations
+                // published and matching, the current one's metadata gone while
+                // its broker process was still alive.
+                //
+                // Absent metadata for a *draining* generation drops that
+                // generation; absent metadata for the *current* one means there is
+                // nothing adoptable, which is exactly `notRunning` — the one error
+                // the coordinator recovers from by launching a fresh broker.
+                var metadataStat = stat()
+                if lstat(metadataURL.path, &metadataStat) != 0, errno == ENOENT {
+                    if generation.id == topology.current.id {
+                        throw BrokerDiscoveryError.notRunning
+                    }
+                    continue
+                }
                 let published: BrokerInfo
                 do {
-                    published = try readMetadata(at: store.metadataURL(for: generation))
+                    published = try readMetadata(at: metadataURL)
                 } catch {
-                    // The registry is published only after generation metadata.
-                    // A missing, swapped, or unreadable identity therefore
-                    // represents an incomplete/tampered topology, not a
-                    // discoverable broker that callers may safely adopt.
+                    // Present but unreadable, or readable and disagreeing with the
+                    // registry, still means a swapped or tampered identity, and is
+                    // still never adopted.
                     throw BrokerDiscoveryError.invalidRegistry
                 }
                 guard published == generation.info,
@@ -325,8 +352,17 @@ struct BrokerInfoLocator: BrokerTopologyLocating, Sendable {
                         expectedKind: S_IFSOCK
                     )
                 }
+                if generation.id != topology.current.id {
+                    publishedDraining.append(generation)
+                }
             }
-            return topology
+            // Rebuilt rather than returned as-is, so a dropped draining
+            // generation cannot be handed to a caller as still discoverable.
+            return BrokerGenerationTopology(
+                current: topology.current,
+                draining: publishedDraining,
+                registryTopologyVersion: topology.registryTopologyVersion
+            )
         }
         guard errno == ENOENT else { throw BrokerDiscoveryError.invalidRegistry }
 

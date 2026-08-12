@@ -74,7 +74,10 @@ final class AppModel: ObservableObject {
     /// Sealed helper parity is separate from socket health. A broker can be
     /// healthy but intentionally pending an update because it still owns a PTY.
     @Published private(set) var brokerUpgradeState: BrokerUpgradeState = .unknown
-    @Published private(set) var brokerGenerationDetail: String = "Broker generations have not been inspected yet."
+    /// Named rather than repeated, so chrome can tell "nothing to report yet"
+    /// apart from an actual finding instead of matching on the sentence.
+    static let brokerGenerationsUninspected = "Broker generations have not been inspected yet."
+    @Published private(set) var brokerGenerationDetail: String = AppModel.brokerGenerationsUninspected
     @Published private(set) var brokerRollbackCandidates: [BrokerRollbackCandidate] = []
     @Published private(set) var sessions: [BrokerTerminalRecord] = []
     @Published var selectedSessionID: String?
@@ -7364,7 +7367,7 @@ final class AppModel: ObservableObject {
         activeBrokerUpgradeMonitor = nil
         activeBrokerRollbackController = nil
         brokerUpgradeState = .unknown
-        brokerGenerationDetail = "Broker generations have not been inspected yet."
+        brokerGenerationDetail = AppModel.brokerGenerationsUninspected
         brokerRollbackCandidates = []
     }
 

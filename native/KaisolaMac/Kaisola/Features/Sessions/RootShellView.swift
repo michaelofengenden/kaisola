@@ -5599,15 +5599,30 @@ private struct ConnectionFooter: View {
         .accessibilityLabel("More project actions")
     }
 
+    /// Identity, then the two doors, then recovery, then status — each in its
+    /// own section.
+    ///
+    /// It used to be one flat list where the account name, the email, and five
+    /// diagnostic lines were bare `Text` items. SwiftUI renders those as
+    /// *disabled menu rows*, so the top of the menu looked like two commands
+    /// that had been greyed out and the bottom like four more. Michael: "make
+    /// this drop-up menu easier and more clear to read."
+    ///
+    /// Sections fix that at the root: a section header is typographically a
+    /// caption rather than a dead command, so the version becomes a heading for
+    /// the status beneath it and the account name a heading for the identity
+    /// actions. The lines that say nothing are also no longer said — a
+    /// placeholder like "Broker generations have not been inspected yet." is
+    /// noise in a menu opened to find out what is wrong.
     private var accountMenu: some View {
         Menu {
             if let account = auth.account {
-                Text(account.displayName ?? account.email)
-                Text(account.email)
-                Button {
-                    Task { await auth.signOut() }
-                } label: {
-                    Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+                Section(account.displayName ?? account.email) {
+                    Button {
+                        Task { await auth.signOut() }
+                    } label: {
+                        Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+                    }
                 }
             } else {
                 Button {
@@ -5617,45 +5632,51 @@ private struct ConnectionFooter: View {
                 }
                 .disabled(accountSignInIsRunning)
             }
-            Divider()
-            Button(action: showSettings) {
-                Label("Settings…", systemImage: "gearshape")
+            Section {
+                Button(action: showSettings) {
+                    Label("Settings…", systemImage: "gearshape")
+                }
+                Button(action: showUsage) {
+                    Label("Usage…", systemImage: "gauge.with.dots.needle.bottom.50percent")
+                }
             }
-            Button(action: showUsage) {
-                Label("Usage…", systemImage: "gauge.with.dots.needle.bottom.50percent")
-            }
-            Divider()
-            Button(action: reload) {
-                Label("Reconnect", systemImage: "arrow.clockwise")
-            }
-            Text("Kaisola v\(Self.appVersion)")
-            Text(state.detail ?? state.title)
-            Text(brokerGenerationDetail)
-            if !brokerRollbackCandidates.isEmpty {
-                Menu("Use Retained Terminal Version") {
-                    ForEach(brokerRollbackCandidates) { candidate in
-                        Button {
-                            rollbackBrokerGeneration(candidate.id)
-                        } label: {
-                            Text(
-                                "\(candidate.brokerVersion) · package \(candidate.packageVersion) · PID \(candidate.pid)"
-                            )
+            Section {
+                Button(action: reload) {
+                    Label("Reconnect", systemImage: "arrow.clockwise")
+                }
+                if !brokerRollbackCandidates.isEmpty {
+                    Menu("Use Retained Terminal Version") {
+                        ForEach(brokerRollbackCandidates) { candidate in
+                            Button {
+                                rollbackBrokerGeneration(candidate.id)
+                            } label: {
+                                Text(
+                                    "\(candidate.brokerVersion) · package \(candidate.packageVersion) · PID \(candidate.pid)"
+                                )
+                            }
                         }
                     }
                 }
             }
-            if case .current = brokerUpgradeState {
-                Text("Terminal continuity is up to date")
-            } else if case .unknown = brokerUpgradeState {
-                EmptyView()
-            } else {
-                Text(brokerUpgradeState.detail)
-            }
-            if let brokerUpdateGateBlockedDetail {
-                Text(brokerUpdateGateBlockedDetail)
-            }
-            if usage.totalPeakTokens > 0 {
-                Text("Usage: \(usage.totalPeakTokens / 1000)k tokens · \(Int((usage.contextPressure * 100).rounded()))% context")
+            Section("Kaisola v\(Self.appVersion)") {
+                Text(state.detail.flatMap { $0.isEmpty ? nil : $0 } ?? state.title)
+                // Only once it has actually looked.
+                if brokerGenerationDetail != AppModel.brokerGenerationsUninspected {
+                    Text(brokerGenerationDetail)
+                }
+                if case .current = brokerUpgradeState {
+                    Text("Terminal continuity is up to date")
+                } else if case .unknown = brokerUpgradeState {
+                    EmptyView()
+                } else {
+                    Text(brokerUpgradeState.detail)
+                }
+                if let brokerUpdateGateBlockedDetail {
+                    Text(brokerUpdateGateBlockedDetail)
+                }
+                if usage.totalPeakTokens > 0 {
+                    Text("Usage: \(usage.totalPeakTokens / 1000)k tokens · \(Int((usage.contextPressure * 100).rounded()))% context")
+                }
             }
         } label: {
             HStack(spacing: FooterAccountBudget.avatarGap) {

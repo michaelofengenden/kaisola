@@ -135,7 +135,20 @@ final class BrokerGenerationRegistryTests: XCTestCase {
         XCTAssertEqual(try store.load(), saved)
     }
 
-    func testMissingOrIdentitySwappedGenerationMetadataFailsClosed() throws {
+    /// Absent metadata and *wrong* metadata are different failures, and the
+    /// difference decides whether the app can ever recover.
+    ///
+    /// Both used to raise `invalidRegistry`, which made one missing file
+    /// terminal: `BrokerStartupCoordinator` relaunches on `notRunning` but
+    /// rethrows `invalidRegistry`, so every terminal became permanently
+    /// unreachable — including the healthy generations in the same registry —
+    /// with Reconnect reporting "the saved terminal-generation registry is
+    /// invalid" forever. Observed on 0.1.118 with five draining generations
+    /// published and matching and the current one's metadata gone.
+    ///
+    /// The registry is written *after* generation metadata, so a record with no
+    /// metadata never finished announcing itself. Unpublished is not tampered.
+    func testUnpublishedGenerationsAreDroppedWhileSwappedIdentitiesFailClosed() throws {
         let profile = try makePrivateProfile()
         let store = BrokerGenerationRegistryStore(profileRoot: profile)
         let current = generation(
@@ -159,18 +172,61 @@ final class BrokerGenerationRegistryTests: XCTestCase {
             now: 1
         )
         let locator = BrokerInfoLocator(userDataCandidates: [profile])
-        XCTAssertThrowsError(try locator.locateTopology()) { error in
-            XCTAssertEqual(error as? BrokerDiscoveryError, .invalidRegistry)
-        }
 
+        // The draining generation was never published. It is dropped, and the
+        // current generation — which *is* published — stays discoverable.
+        let topology = try locator.locateTopology()
+        XCTAssertEqual(topology.current.id, current.id)
+        XCTAssertTrue(topology.draining.isEmpty, "an unpublished generation must not be vended")
+
+        // Present but disagreeing with the registry is a swapped identity, and
+        // is still never adopted.
         let drainMetadata = store.metadataURL(for: drain)
         try JSONEncoder().encode(current.info).write(to: drainMetadata)
         _ = chmod(drainMetadata.path, 0o600)
         XCTAssertThrowsError(try locator.locateTopology()) { error in
             XCTAssertEqual(error as? BrokerDiscoveryError, .invalidRegistry)
         }
+
         XCTAssertTrue(current.info.isProcessAlive)
         XCTAssertTrue(drain.info.isProcessAlive)
+    }
+
+    /// The case that actually stranded a user: the *current* generation has no
+    /// metadata. Nothing is adoptable, which is what `notRunning` means — and it
+    /// is the one error `BrokerStartupCoordinator` recovers from by launching a
+    /// fresh broker instead of rethrowing.
+    func testAnUnpublishedCurrentGenerationReadsAsNotRunning() throws {
+        let profile = try makePrivateProfile()
+        let store = BrokerGenerationRegistryStore(profileRoot: profile)
+        let current = generation(
+            digest: String(repeating: "c", count: 64),
+            role: .current,
+            profile: profile,
+            package: true
+        )
+        let drain = generation(
+            digest: String(repeating: "d", count: 64),
+            role: .draining,
+            profile: profile,
+            package: true
+        )
+        // Only the draining generation is published; the current one is not.
+        try publish(drain, store: store)
+        try bindSocket(at: URL(fileURLWithPath: current.info.socketPath))
+        _ = try store.save(
+            currentGenerationID: current.id,
+            generations: [current, drain],
+            expectedRevision: nil,
+            now: 1
+        )
+        let locator = BrokerInfoLocator(userDataCandidates: [profile])
+        XCTAssertThrowsError(try locator.locateTopology()) { error in
+            XCTAssertEqual(
+                error as? BrokerDiscoveryError, .notRunning,
+                "an unpublished current generation must stay recoverable"
+            )
+        }
     }
 
     func testInterruptedTemporaryRegistryWriteCannotShadowPublishedRegistry() throws {

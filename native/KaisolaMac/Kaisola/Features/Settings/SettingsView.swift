@@ -695,100 +695,26 @@ struct SettingsView: View {
                         .accessibilityLabel("Appearance")
                     }
                     SettingsDivider()
-                    SettingsRow(title: "Project glass", detail: "Translucent navigation surface", symbol: "sparkles.rectangle.stack") {
-                        Menu {
-                            ForEach(SidebarAppearance.allCases) { mode in
-                                Button(mode.title) { settings.sidebarAppearance = mode }
-                            }
-                        } label: { SettingsChoiceLabel(settings.sidebarAppearance.title) }
-                        .menuIndicator(.hidden)
-                        .accessibilityLabel("Project glass")
-                    }
-                    SettingsDivider()
                     SettingsRow(
-                        title: "Glass shows",
-                        detail: "Your desktop picture, or whatever is behind the window",
-                        symbol: "photo.on.rectangle.angled"
+                        title: "Theme",
+                        detail: "Glass shows your desktop through the window; Solid is opaque",
+                        symbol: "sparkles.rectangle.stack"
                     ) {
+                        // One row where there were seven.
+                        //
+                        // Sidebar treatment, glass source, pinned wallpaper,
+                        // clarity, blur, colour and canvas each had their own
+                        // menu — twenty-seven combinations of the middle three
+                        // alone, all measured, none of them a decision worth
+                        // asking for. The recipe is `GlassPreset` now and the
+                        // only choice left is whether the window is see-through.
                         Menu {
-                            ForEach(GlassBackdropSource.allCases) { source in
-                                Button(source.title) { settings.glassBackdropSource = source }
+                            ForEach(KaisolaTheme.allCases) { theme in
+                                Button(theme.title) { settings.theme = theme }
                             }
-                        } label: { SettingsChoiceLabel(settings.glassBackdropSource.title) }
+                        } label: { SettingsChoiceLabel(settings.theme.title) }
                         .menuIndicator(.hidden)
-                        .accessibilityLabel("Glass source")
-                    }
-                    SettingsDivider()
-                    SettingsRow(
-                        title: "Glass wallpaper",
-                        detail: settings.glassWallpaper.isEmpty
-                            ? "Follows the desktop"
-                            : (settings.glassWallpaper as NSString).lastPathComponent,
-                        symbol: "photo"
-                    ) {
-                        HStack(spacing: 8) {
-                            if !settings.glassWallpaper.isEmpty {
-                                Button("Clear") { settings.glassWallpaper = "" }
-                                    .controlSize(.small)
-                            }
-                            Button(settings.glassWallpaper.isEmpty ? "Choose…" : "Change…") {
-                                chooseGlassWallpaper()
-                            }
-                            .controlSize(.small)
-                        }
-                        .help("Pin a picture for the glass. A rotating desktop keeps rotating; the glass stops chasing it.")
-                    }
-                    SettingsDivider()
-                    SettingsRow(
-                        title: "Glass clarity",
-                        detail: "How much of the desktop comes through",
-                        symbol: "drop.halffull"
-                    ) {
-                        Menu {
-                            ForEach(GlassClarity.allCases) { clarity in
-                                Button(clarity.title) { settings.glassClarity = clarity }
-                            }
-                        } label: { SettingsChoiceLabel(settings.glassClarity.title) }
-                        .menuIndicator(.hidden)
-                        .accessibilityLabel("Glass clarity")
-                    }
-                    SettingsDivider()
-                    SettingsRow(
-                        title: "Glass blur",
-                        detail: "How far the wallpaper is softened behind the glass",
-                        symbol: "circle.hexagongrid"
-                    ) {
-                        Menu {
-                            ForEach(GlassTexture.allCases) { texture in
-                                Button(texture.title) { settings.glassTexture = texture }
-                            }
-                        } label: { SettingsChoiceLabel(settings.glassTexture.title) }
-                        .menuIndicator(.hidden)
-                        .accessibilityLabel("Glass blur")
-                    }
-                    SettingsDivider()
-                    SettingsRow(
-                        title: "Glass colour",
-                        detail: "How much of the wallpaper's colour the glass carries",
-                        symbol: "paintpalette"
-                    ) {
-                        Menu {
-                            ForEach(GlassColour.allCases) { colour in
-                                Button(colour.title) { settings.glassColour = colour }
-                            }
-                        } label: { SettingsChoiceLabel(settings.glassColour.title) }
-                        .menuIndicator(.hidden)
-                        .accessibilityLabel("Glass colour")
-                    }
-                    SettingsDivider()
-                    SettingsRow(title: "Canvas", detail: "Backdrop behind chats and tools", symbol: "square.on.square") {
-                        Menu {
-                            ForEach(WorkspaceBackdropMode.allCases) { mode in
-                                Button(mode.title) { settings.workspaceBackdrop = mode }
-                            }
-                        } label: { SettingsChoiceLabel(settings.workspaceBackdrop.title) }
-                        .menuIndicator(.hidden)
-                        .accessibilityLabel("Canvas backdrop")
+                        .accessibilityLabel("Theme")
                     }
                     SettingsDivider()
                     SettingsRow(

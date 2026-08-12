@@ -74,6 +74,14 @@ enum QuietIdentity: Equatable {
 struct QuietIdentityMarkView: View {
     let identity: QuietIdentity
     var size: CGFloat = QuietIdentityMarkView.slot
+    /// Ink for the monoline marks, so a selected row's mark joins its title in
+    /// the accent instead of staying secondary grey beside it. Selection was
+    /// otherwise speaking two unrelated languages in the same row.
+    ///
+    /// The two brand marks deliberately ignore this: the coral burst and the
+    /// knot carry *brand* colour, not state, and recolouring them by selection
+    /// would make Claude's mark change colour depending on which row you look at.
+    var tint: Color?
 
     /// `nonisolated` so the rail's (nonisolated) metrics table can name the one
     /// slot size instead of repeating the literal.

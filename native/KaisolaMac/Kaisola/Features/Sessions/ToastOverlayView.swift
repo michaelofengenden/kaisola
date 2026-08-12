@@ -1,7 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// The in-window toast strip: a bottom-center stack of auto-dismissing capsules
+/// The in-window toast strip: a bottom-**trailing** stack of auto-dismissing capsules
 /// driven by `ToastCenter.shared`. Layered into `RootShellView` with `.overlay`,
 /// the same way the command palette is presented. The stack is click-through
 /// everywhere except the capsules themselves — an empty layout frame draws
@@ -55,7 +55,15 @@ struct ToastOverlayView: View {
         }
         .safeAreaPadding(.horizontal, 16)
         .safeAreaPadding(.bottom, 28)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
+        // Bottom-trailing, not bottom-centre.
+        //
+        // The strip was centred on the whole window, sidebar included, while the
+        // chat composer is centred on the *detail pane* — two centres about
+        // 105pt apart. So a toast landed off-axis directly on top of the card the
+        // user was typing into, which is both the worst place to cover and the
+        // worst place to put a click target. The corner is clear of every centred
+        // surface in the app and is where macOS puts transient status anyway.
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
         .animation(
             reduceMotion
                 ? .easeOut(duration: KaisolaVisualSystem.stateDuration)

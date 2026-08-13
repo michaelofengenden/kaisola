@@ -433,14 +433,7 @@ struct GlassBackdropWash: Equatable, Sendable {
     private static func sidebarBase(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
-            // Light went 0.51/0.45/0.41 → 0.58/0.52/0.48 by request: glass read
-            // grey rather than white, and the veil is the only white in the
-            // stack. Transmission falls 0.55 → 0.48, still well clear of the
-            // 0.30 floor in `desktopTransmissionBand`, so the desktop survives
-            // and the surface stays translucent — it is simply whiter while it
-            // does. Contrast moves the safe way: this is a light surface, its
-            // worst patch is its darkest, and more white veil lifts that patch.
-            : light(top: 0.58, base: 0.52, bottom: 0.48)
+            : light(top: 0.51, base: 0.45, bottom: 0.41)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour
@@ -468,10 +461,7 @@ struct GlassBackdropWash: Equatable, Sendable {
     private static func workspaceBase(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.30, base: 0.37, bottom: 0.46)
-            // Light moves with the sidebar, +0.07 across the gradient, keeping
-            // the five points of separation that make the canvas read as the
-            // deeper surface. Transmission 0.60 → 0.53, above the 0.30 floor.
-            : light(top: 0.53, base: 0.47, bottom: 0.43)
+            : light(top: 0.46, base: 0.40, bottom: 0.36)
     }
 
     /// How much of the workspace veil an **idle** canvas keeps.

@@ -115,11 +115,25 @@ function workflow(name) {
   return fs.readFileSync(path.join(root, '.github', 'workflows', name), 'utf8')
 }
 
+// A step ends at the next step **or at the end of its job**, whichever comes
+// first. Slicing only to the next step read straight through the job boundary,
+// so the last step of a job absorbed the header of the job declared beneath it
+// — including that job's `if:`. The assertions here that a companion step "must
+// never be conditional" therefore fired on conditions belonging to a different
+// job entirely, and the workflow carried a comment telling future readers to
+// keep a plain job header underneath to keep the reading honest. Ending the
+// slice at the job boundary is what actually makes it honest, and it lets the
+// macOS lane be gated without weakening anything this file guards.
 function step(contents, name) {
   const start = contents.indexOf(`- name: ${name}`)
   assert.ok(start >= 0, `${name} must exist`)
-  const next = contents.indexOf('\n      - ', start)
-  return contents.slice(start, next < 0 ? contents.length : next)
+  const nextStep = contents.indexOf('\n      - ', start)
+  const nextJob = contents.slice(start).search(/\n {2}[A-Za-z0-9_-]+:\n/u)
+  const bounds = [
+    nextStep < 0 ? contents.length : nextStep,
+    nextJob < 0 ? contents.length : start + nextJob,
+  ]
+  return contents.slice(start, Math.min(...bounds))
 }
 
 test('companion receipt seals the executed test count, toolchain, and simulator', (t) => {

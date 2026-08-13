@@ -15,6 +15,22 @@ on:
         type: boolean
         default: false
         required: false
+      # Set only by `release-candidate.yml`, which runs on *every* push to main
+      # with no path filter and calls this workflow for that same commit. The
+      # standalone push run was therefore always a duplicate: `companion` and
+      # `verify` are ~10 and ~12 minutes each, and running them twice per push
+      # spent four of the five concurrent macOS jobs a personal plan allows, so
+      # the second copy queued behind the first and everything waited.
+      #
+      # This is keyed on being *called* rather than on the branch because a
+      # reusable workflow inherits its caller's event context: a job guarded
+      # with `github.ref != 'refs/heads/main'` skips inside release-candidate
+      # too, which is how an earlier attempt at this removed the coverage it
+      # meant to keep and had to be reverted.
+      called-by-release-candidate:
+        type: boolean
+        default: false
+        required: false
   workflow_dispatch:
   push:
     branches: [main]
@@ -65,11 +81,17 @@ jobs:
   # relationship, so side by side costs one extra runner and returns the wall
   # clock of the slower half instead of their sum.
   #
-  # Declared before `verify` on purpose. `companionContractReceipt.test.cjs`
-  # reads a step by slicing to the next step, so the final step of whichever job
-  # sits above `optimized-macos-pdf` runs on into that job's `if:` — and the
-  # test asserts this lane is never conditional. Keeping a plain job header
-  # underneath is what makes that reading honest.
+  # This lane is never conditional, and `companionContractReceipt.test.cjs`
+  # holds that: promotion refuses to ship without the receipt these steps
+  # upload, so any switch able to skip them is a promotion bypass. That is why
+  # `called-by-release-candidate` gates only `verify` and the PDF lane, and this
+  # job runs on the standalone push as well — a duplicate iPhone run is a price
+  # worth paying for a proof that cannot be turned off.
+  #
+  # That test used to slice a step to the *next step*, which read straight
+  # through into the following job's `if:`, so it fired on conditions belonging
+  # to another job and the fix was to keep a plain job header underneath. The
+  # slice now ends at the job boundary, so job order here is free again.
   #
   # The receipt upload stays here: `release.yml` refuses to promote without the
   # companion contract receipt from this run, and artifacts belong to the run
@@ -403,6 +425,7 @@ jobs:
 
   # The macOS and shared-contract lane, in parallel with `companion`.
   verify:
+    if: ${{ inputs.called-by-release-candidate || github.event_name != 'push' }}
     runs-on: macos-15
     timeout-minutes: 45
     env:
@@ -470,7 +493,7 @@ jobs:
   # packaged macOS app. Release-candidate callers already prove their signed
   # candidate bytes and retain the existing skip behavior here.
   optimized-macos-pdf:
-    if: ${{ !inputs.skip-macos-release-build }}
+    if: ${{ !inputs.skip-macos-release-build && (inputs.called-by-release-candidate || github.event_name != 'push') }}
     runs-on: macos-15
     timeout-minutes: 60
     env:

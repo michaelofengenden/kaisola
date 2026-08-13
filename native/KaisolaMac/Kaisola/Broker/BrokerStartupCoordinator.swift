@@ -87,7 +87,7 @@ enum BrokerUpgradeState: Equatable, Sendable {
         case .checking:
             "Checking for a terminal update"
         case let .pending(_, _, .liveWork(blockers)):
-            "Terminal update waiting on \(blockers.liveTerminalCount) live terminal\(blockers.liveTerminalCount == 1 ? "" : "s")"
+            Self.liveWorkSummary(blockers)
         case .pending(_, _, .activityChanged):
             "Terminal update retrying after activity changed"
         case .pending(_, _, .companionLeaseChanged):
@@ -105,6 +105,35 @@ enum BrokerUpgradeState: Equatable, Sendable {
         case .updating:
             "Terminal continuity is updating, without interrupting anything"
         }
+    }
+
+    /// Names only the blockers that are actually holding the update.
+    ///
+    /// A rolling-capable broker retains ordinary live terminals rather than
+    /// waiting on them — `rollingUpdateReadiness()` in the node broker keys off
+    /// busy agents — so "waiting on N live terminals" was both the wrong reason
+    /// and, when an exited terminal still had an open agent turn, capable of
+    /// reading "waiting on 0 live terminals". Working agents and child tasks
+    /// come first because those are what defer the update; a live-terminal count
+    /// is reported only when it is the sole thing left to name.
+    static func liveWorkSummary(_ blockers: BrokerUpgradeBlockers) -> String {
+        func plural(_ count: Int, _ noun: String) -> String {
+            "\(count) \(noun)\(count == 1 ? "" : "s")"
+        }
+        var parts: [String] = []
+        if blockers.busyAgentCount > 0 {
+            parts.append(plural(blockers.busyAgentCount, "working agent"))
+        }
+        if blockers.childTaskCount > 0 {
+            parts.append(plural(blockers.childTaskCount, "child task"))
+        }
+        if parts.isEmpty, blockers.liveTerminalCount > 0 {
+            parts.append(plural(blockers.liveTerminalCount, "live terminal"))
+        }
+        guard !parts.isEmpty else {
+            return "Terminal update waiting for work in progress to finish"
+        }
+        return "Terminal update waiting on " + parts.joined(separator: " and ")
     }
 
     private static func transition(_ from: String?, _ target: String) -> String {

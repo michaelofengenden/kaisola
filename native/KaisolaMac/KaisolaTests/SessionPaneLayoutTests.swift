@@ -291,5 +291,55 @@ final class SessionPaneLayoutTests: XCTestCase {
             .init(sessionIDs: ["terminal:a", "chat:b"]),
         ])
         XCTAssertTrue(stacked.marksFocus("chat:b", focusedID: "chat:b"))
+
+        // A maximized pane is drawn alone, so the layout having siblings is
+        // beside the point: the window is showing exactly one card, and ringing
+        // it is the same lone accent rectangle reached by another route.
+        XCTAssertFalse(
+            split.marksFocus("terminal:a", focusedID: "terminal:a", maximizedID: "terminal:a")
+        )
+        XCTAssertFalse(
+            stacked.marksFocus("chat:b", focusedID: "chat:b", maximizedID: "chat:b")
+        )
+        // A stale maximized id for some other project's pane must not silently
+        // suppress the ring on a genuine split.
+        XCTAssertTrue(
+            split.marksFocus("terminal:a", focusedID: "terminal:a", maximizedID: "terminal:zz")
+        )
+    }
+
+    /// A rolling-capable broker retains ordinary live terminals rather than
+    /// waiting on them, so naming them as the reason was wrong, and an exited
+    /// terminal holding an open agent turn could make it read "0 live
+    /// terminals". The summary names what is actually deferring the update.
+    func testTheUpdateSummaryNamesTheBlockersThatActuallyDeferIt() {
+        func blockers(live: Int, agents: Int, tasks: Int) -> BrokerUpgradeBlockers {
+            BrokerUpgradeBlockers(
+                liveTerminalCount: live,
+                liveTerminalIDs: [],
+                busyAgentCount: agents,
+                busyTerminalIDs: [],
+                childTaskCount: tasks
+            )
+        }
+
+        XCTAssertEqual(
+            BrokerUpgradeState.liveWorkSummary(blockers(live: 4, agents: 1, tasks: 0)),
+            "Terminal update waiting on 1 working agent"
+        )
+        XCTAssertEqual(
+            BrokerUpgradeState.liveWorkSummary(blockers(live: 0, agents: 2, tasks: 3)),
+            "Terminal update waiting on 2 working agents and 3 child tasks"
+        )
+        // Live terminals are named only when nothing else is left to name.
+        XCTAssertEqual(
+            BrokerUpgradeState.liveWorkSummary(blockers(live: 2, agents: 0, tasks: 0)),
+            "Terminal update waiting on 2 live terminals"
+        )
+        // And the all-zero state says something true rather than "0 of them".
+        XCTAssertEqual(
+            BrokerUpgradeState.liveWorkSummary(blockers(live: 0, agents: 0, tasks: 0)),
+            "Terminal update waiting for work in progress to finish"
+        )
     }
 }

@@ -2151,7 +2151,11 @@ struct RootShellView: View {
             let cardRadius = KaisolaVisualSystem.paneRadius
             let terminalChrome = terminalPaneChrome(for: id)
             let marksFocus = model.paneLayout(for: activeProjectID)
-                .marksFocus(id, focusedID: model.focusedPaneID)
+                .marksFocus(
+                    id,
+                    focusedID: model.focusedPaneID,
+                    maximizedID: model.maximizedPaneID
+                )
             VStack(spacing: 0) {
                 unifiedSessionHeader(id, paneWidth: geometry.size.width)
                 unifiedSessionContent(id)

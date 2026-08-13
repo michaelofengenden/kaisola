@@ -78,7 +78,12 @@ struct SessionPaneLayout: Codable, Equatable, Sendable {
     ///
     /// With two or more panes the ring earns its place again, because then it
     /// is answering a question the window genuinely poses.
-    func marksFocus(_ sessionID: String, focusedID: String?) -> Bool {
+    /// `maximizedID` matters because a maximized pane is rendered *alone* — see
+    /// the grid, which draws only that card — so counting the layout's panes
+    /// would say "you have siblings" about a window that is showing exactly one.
+    /// That is the same lone accent rectangle by another route.
+    func marksFocus(_ sessionID: String, focusedID: String?, maximizedID: String? = nil) -> Bool {
+        if let maximizedID, contains(maximizedID) { return false }
         guard sessionIDs.count > 1 else { return false }
         return focusedID == sessionID
     }

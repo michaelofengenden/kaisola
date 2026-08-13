@@ -56,10 +56,8 @@ enum KaisolaVisualSystem {
 /// desktop and `GlassBackdropWash`. The previous light recipe preserved the
 /// sampled desktop's RGB ratios, so a blue wallpaper was guaranteed to make a
 /// blue pane even though every declared veil constant was white. The carrier
-/// keeps blurred light and movement while making sampled desktop colour a
-/// property of the explicit Tinted theme, not of light Glass. The two
-/// navigation rails may add `LightRailTint` after this neutral stack; that
-/// named decorative veil is deliberately too faint to replace the material.
+/// keeps blurred light and movement while making colour a property of the
+/// explicit Tinted theme, not of light Glass.
 enum LightGlassFrost {
     /// Neutral luminance of a painted wallpaper before the white veil.
     static let backdropLuminance: Double = 0.80
@@ -84,69 +82,6 @@ enum LightGlassFrost {
         let carried = carrierWhiteCoverage
             + (1 - carrierWhiteCoverage) * backdropLuminance
         return wash.baseOpacity + wash.desktopTransmission * carried
-    }
-}
-
-/// Which window edge a navigation rail belongs to.
-///
-/// The Safari reference is coolest beside the outside edge of the window and
-/// nearly neutral beside the page. Mirroring the light direction keeps that
-/// relationship true for both the project rail and the Files rail.
-enum SidebarRailPlacement: Equatable, Sendable {
-    case leading
-    case trailing
-
-    var tintStartPoint: UnitPoint {
-        self == .leading ? .leading : .trailing
-    }
-
-    var tintEndPoint: UnitPoint {
-        self == .leading ? .trailing : .leading
-    }
-}
-
-/// The slight cool-to-pearl colour carried by light navigation glass.
-///
-/// This is intentionally separate from `GlassBackdropWash`, whose achromatic
-/// contract protects every large glass surface. At no point does this veil
-/// cover more than 6.5% of the real AppKit material beneath it. When the
-/// window resigns active state, Safari lets almost all of this colour fall
-/// away; the neutral frost remains and the hierarchy stays legible.
-enum LightRailTint {
-    struct Stop: Equatable, Sendable {
-        let red: Double
-        let green: Double
-        let blue: Double
-        let opacity: Double
-        let location: Double
-    }
-
-    private static let sharedStops = [
-        Stop(red: 90.0 / 255, green: 169.0 / 255, blue: 1, opacity: 0.065, location: 0),
-        Stop(red: 1, green: 1, blue: 1, opacity: 0.015, location: 0.62),
-        Stop(red: 1, green: 201.0 / 255, blue: 133.0 / 255, opacity: 0.018, location: 1),
-    ]
-
-    static func stops(for _: SidebarRailPlacement) -> [Stop] {
-        sharedStops
-    }
-
-    static func visibility(isWindowActive: Bool) -> Double {
-        isWindowActive ? 1 : 0.15
-    }
-
-    static func gradient(for placement: SidebarRailPlacement) -> LinearGradient {
-        LinearGradient(
-            gradient: Gradient(stops: stops(for: placement).map { stop in
-                Gradient.Stop(
-                    color: Color(red: stop.red, green: stop.green, blue: stop.blue)
-                        .opacity(stop.opacity),
-                    location: CGFloat(stop.location)
-                )
-            }),
-            startPoint: placement.tintStartPoint,
-            endPoint: placement.tintEndPoint
-        )
     }
 }
 

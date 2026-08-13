@@ -293,10 +293,7 @@ struct WorkspaceRailView: View {
         // shell may temporarily compress Files to 150 pt at minimum window size.
         .frame(minWidth: 150, maxWidth: .infinity, maxHeight: .infinity)
         .background {
-            SidebarBackdropView(
-                appearance: settings.sidebarAppearance,
-                placement: .trailing
-            )
+            SidebarBackdropView(appearance: settings.sidebarAppearance)
         }
         .clipShape(RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius, style: .continuous))
         .overlay {

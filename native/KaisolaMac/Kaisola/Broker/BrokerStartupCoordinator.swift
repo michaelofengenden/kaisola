@@ -147,6 +147,7 @@ enum BrokerUpgradeDecision: Equatable, Sendable {
     case deferred(BrokerUpgradeBlockers)
     case activityChanged(BrokerUpgradeBlockers)
     case companionLeaseChanged(BrokerUpgradeBlockers)
+    case preparedForOtherTarget(targetContentDigest: String)
     case identityChanged
 }
 
@@ -422,7 +423,12 @@ actor BrokerStartupCoordinator:
 
     func prepare() async throws -> BrokerInfo {
         let package = try await launcher.packageManifest()
-        var staleRegisteredTopology: BrokerGenerationTopology?
+        let handoffClaim = try await acquireHandoffClaim()
+        defer { handoffClaim.release() }
+        return try await prepare(package: package)
+    }
+
+    private func prepare(package: BrokerHelperManifest) async throws -> BrokerInfo {
         do {
             let topology = try locator.locateTopology()
             let info = topology.current.info
@@ -432,25 +438,14 @@ actor BrokerStartupCoordinator:
             guard !info.isProcessAlive else {
                 return try await reconcileLiveBroker(topology, package: package)
             }
-            staleRegisteredTopology = try registeredTopologySnapshot(matching: topology)
             try removeStaleRendezvous(topology.current)
         } catch let error as BrokerDiscoveryError {
             switch error {
             case .notRunning:
-                // A registry whose current identity file disappeared resolves
-                // as `notRunning`, but the registry (and every draining
-                // generation in it) is still authoritative state. Capture that
-                // exact CAS revision before launching so fresh publication can
-                // preserve it instead of treating the profile as empty.
-                staleRegisteredTopology = try registeredTopologySnapshotIfPresent()
-                if let staleRegisteredTopology,
-                   staleRegisteredTopology.current.info.isProcessAlive {
-                    throw BrokerStartupError.liveBrokerRefused
-                }
+                break
             case .privateEndpointUnavailable:
                 let topology = try locator.locateTopology(validateSockets: false)
                 guard !topology.current.info.isProcessAlive else { throw error }
-                staleRegisteredTopology = try registeredTopologySnapshot(matching: topology)
                 try removeStaleRendezvous(topology.current)
             default:
                 // A live or ambiguous incompatible broker is never replaced.
@@ -458,12 +453,23 @@ actor BrokerStartupCoordinator:
             }
         }
 
-        let launched = try await launchPackagedBroker(
-            package,
-            replacing: staleRegisteredTopology
-        )
+        let launched = try await launchPackagedBroker(package)
         currentTopology = try locator.locateTopology()
         return launched
+    }
+
+    private func acquireHandoffClaim() async throws -> BrokerGenerationHandoffClaim {
+        let store = BrokerGenerationRegistryStore(
+            profileRoot: locator.preferredUserDataRoot.standardizedFileURL
+        )
+        let started = DispatchTime.now().uptimeNanoseconds
+        while DispatchTime.now().uptimeNanoseconds - started < Self.startupTimeoutNanoseconds {
+            if let claim = try store.tryAcquireHandoffClaim(expectedRevision: nil) {
+                return claim
+            }
+            try await sleep(60_000_000)
+        }
+        throw BrokerStartupError.timedOut(nil)
     }
 
     func upgradeState() -> BrokerUpgradeState {
@@ -580,7 +586,7 @@ actor BrokerStartupCoordinator:
         }
         guard decision == .accepted else {
             switch decision {
-            case .identityChanged:
+            case .identityChanged, .preparedForOtherTarget:
                 throw BrokerRollbackError.identityChanged
             default:
                 throw BrokerRollbackError.quiescenceDeferred
@@ -677,26 +683,26 @@ actor BrokerStartupCoordinator:
             return currentUpgradeState
         }
         do {
+            let handoffClaim = try await acquireHandoffClaim()
+            defer { handoffClaim.release() }
             let topology = try locator.locateTopology()
-            guard topology.current.info == pendingUpgrade.info else {
-                self.pendingUpgrade = nil
-                currentUpgradeState = .pending(
-                    fromContentDigest: pendingUpgrade.info.contentDigest,
-                    targetContentDigest: pendingUpgrade.package.contentDigest,
-                    reason: .identityChanged
-                )
-                return currentUpgradeState
-            }
+            // Another window, including v0.1.120 which does not honor our
+            // claim, may have completed the handoff we observed earlier.
+            // Reconcile the authoritative current instead of stranding this
+            // window on the old generation or cancelling the winner.
+            currentTopology = topology
             _ = try await reconcileLiveBroker(topology, package: pendingUpgrade.package)
         } catch BrokerStartupError.timedOut(_) {
             currentUpgradeState = .pending(
-                fromContentDigest: pendingUpgrade.info.contentDigest,
+                fromContentDigest: currentTopology?.current.info.contentDigest
+                    ?? pendingUpgrade.info.contentDigest,
                 targetContentDigest: pendingUpgrade.package.contentDigest,
                 reason: .shutdownTimedOut
             )
         } catch {
             currentUpgradeState = .pending(
-                fromContentDigest: pendingUpgrade.info.contentDigest,
+                fromContentDigest: currentTopology?.current.info.contentDigest
+                    ?? pendingUpgrade.info.contentDigest,
                 targetContentDigest: pendingUpgrade.package.contentDigest,
                 reason: .launchFailed
             )
@@ -712,6 +718,13 @@ actor BrokerStartupCoordinator:
         guard rollingUpdatesEnabled,
               let rolling = upgradeRequester as? any BrokerRollingUpdateRequesting,
               let topology = currentTopology ?? (try? locator.locateTopology()) else { return }
+        let handoffStore = BrokerGenerationRegistryStore(
+            profileRoot: locator.preferredUserDataRoot.standardizedFileURL
+        )
+        guard let handoffClaim = try? handoffStore.tryAcquireHandoffClaim(
+            expectedRevision: nil
+        ) else { return }
+        defer { handoffClaim.release() }
         let store = BrokerGenerationRegistryStore(profileRoot: locator.preferredUserDataRoot)
         guard let registry = exactRetirementRegistry(matching: topology, store: store) else {
             return
@@ -930,6 +943,10 @@ actor BrokerStartupCoordinator:
         _ topology: BrokerGenerationTopology,
         package: BrokerHelperManifest
     ) async throws -> BrokerInfo {
+        // Discovery already authenticated this complete topology. Publish it
+        // to routing consumers even when the following upgrade decision waits
+        // or fails, so retained terminal IDs never lose their drain routes.
+        currentTopology = topology
         let info = topology.current.info
         let exactPackageIdentity = info.contentDigest == package.contentDigest
             && info.packageVersion == package.packageVersion
@@ -1018,7 +1035,20 @@ actor BrokerStartupCoordinator:
             )
             return info
         case .identityChanged:
-            pendingUpgrade = nil
+            // Identity can change after status but before the lifecycle
+            // mutation when an older coordinator prepares or publishes. Keep
+            // retrying discovery so this window follows the authoritative
+            // registry instead of remaining connected to a draining broker.
+            currentUpgradeState = .pending(
+                fromContentDigest: runningDigest,
+                targetContentDigest: package.contentDigest,
+                reason: .identityChanged
+            )
+            return info
+        case .preparedForOtherTarget:
+            // A previous-version window may still own this handoff. Preserve
+            // our retry so the heartbeat can follow its eventual registry
+            // publication without mutating the prepared target.
             currentUpgradeState = .pending(
                 fromContentDigest: runningDigest,
                 targetContentDigest: package.contentDigest,
@@ -1051,13 +1081,21 @@ actor BrokerStartupCoordinator:
                     currentTopology = try locator.locateTopology()
                     return replacement
                 } catch {
-                    if let rolling = upgradeRequester as? any BrokerRollingUpdateRequesting {
-                        try? await rolling.cancelRollingUpdate(
-                            from: info,
-                            targetContentDigest: package.contentDigest,
-                            authorization: authorization
-                        )
+                    // A window from the previous app version does not know the
+                    // handoff claim. If it published this exact candidate while
+                    // we were launching it, the registry CAS legitimately
+                    // loses. Adopt that winner and never cancel its handoff.
+                    if let winner = await verifiedPublishedWinner(matching: package) {
+                        pendingUpgrade = nil
+                        currentUpgradeState = .current(contentDigest: package.contentDigest)
+                        currentTopology = winner
+                        return winner.current.info
                     }
+                    // An older coordinator does not honor our handoff claim
+                    // and can prepare this same digest between status and our
+                    // request. Without a broker-issued owner nonce, registry
+                    // equality cannot prove the accepted prepare was ours, so
+                    // launch failure must remain fail-closed and never cancel.
                     currentUpgradeState = .pending(
                         fromContentDigest: runningDigest,
                         targetContentDigest: package.contentDigest,
@@ -1092,16 +1130,9 @@ actor BrokerStartupCoordinator:
         throw BrokerStartupError.timedOut(nil)
     }
 
-    private func launchPackagedBroker(
-        _ package: BrokerHelperManifest,
-        replacing staleTopology: BrokerGenerationTopology?
-    ) async throws -> BrokerInfo {
+    private func launchPackagedBroker(_ package: BrokerHelperManifest) async throws -> BrokerInfo {
         let generation = try await launchGeneration(package)
-        return try publishFreshGeneration(
-            generation,
-            package: package,
-            replacing: staleTopology
-        )
+        return try publishFreshGeneration(generation, package: package)
     }
 
     /// Starts or adopts one exact staged generation without changing which
@@ -1123,7 +1154,9 @@ actor BrokerStartupCoordinator:
             // Another Kaisola window may win the empty-broker launch race. Its
             // exact sealed digest is safe to adopt; any other identity is not.
             if let adopted = try? locator.locate(),
-               adopted.contentDigest == package.contentDigest {
+               adopted.contentDigest == package.contentDigest,
+               adopted.isProcessAlive {
+                try await verifyStagedPackage(package)
                 return adopted
             }
             // The competing generation can publish its own metadata before it
@@ -1167,6 +1200,23 @@ actor BrokerStartupCoordinator:
             at: root,
             expected: package
         )
+    }
+
+    private func verifiedPublishedWinner(
+        matching package: BrokerHelperManifest
+    ) async -> BrokerGenerationTopology? {
+        guard let winner = try? locator.locateTopology(),
+              winner.current.id == package.contentDigest,
+              winner.current.info.contentDigest == package.contentDigest,
+              winner.current.info.packageVersion == package.packageVersion,
+              winner.current.info.packageSchema == package.schemaVersion,
+              winner.current.info.implementationVersion
+                == package.brokerImplementationVersion,
+              winner.current.info.isProcessAlive,
+              (try? await verifyStagedPackage(package)) != nil else {
+            return nil
+        }
+        return winner
     }
 
     private func honorsExplicitSelection(
@@ -1298,8 +1348,7 @@ actor BrokerStartupCoordinator:
 
     private func publishFreshGeneration(
         _ info: BrokerInfo,
-        package: BrokerHelperManifest,
-        replacing staleTopology: BrokerGenerationTopology?
+        package: BrokerHelperManifest
     ) throws -> BrokerInfo {
         guard info.contentDigest == package.contentDigest,
               info.packageVersion == package.packageVersion,
@@ -1317,40 +1366,27 @@ actor BrokerStartupCoordinator:
                 .appendingPathComponent("broker-generations", isDirectory: true)
                 .appendingPathComponent(package.contentDigest, isDirectory: true)
                 .path,
-            registeredAt: staleTopology?.draining.first(where: {
-                $0.id == package.contentDigest
-            })?.registeredAt ?? max(1, info.startedAt)
+            registeredAt: max(1, info.startedAt)
         )
         let store = BrokerGenerationRegistryStore(profileRoot: userData)
         do {
-            if let staleTopology {
-                // A topology captured before launch is never an empty-profile
-                // publication. Bind replacement directly to that exact CAS
-                // revision so disappearance of the registry cannot turn a
-                // stale launch into a drain-dropping nil-revision write.
-                guard !staleTopology.current.info.isProcessAlive else {
-                    throw BrokerStartupError.liveBrokerRefused
-                }
-                let retained = staleTopology.draining.filter { $0.id != record.id }
-                _ = try store.save(
-                    currentGenerationID: record.id,
-                    generations: [record] + retained,
-                    expectedRevision: staleTopology.registryTopologyVersion,
-                    selection: nil
-                )
-            } else {
+            _ = try store.save(
+                currentGenerationID: record.id,
+                generations: [record],
+                expectedRevision: nil
+            )
+        } catch BrokerGenerationRegistryError.revisionChanged {
+            let existing = try store.load()
+            if existing.topology?.current == record {
+                // A second app window published the same launched generation.
+            } else if let topology = existing.topology,
+                      topology.draining.isEmpty,
+                      !topology.current.info.isProcessAlive {
                 _ = try store.save(
                     currentGenerationID: record.id,
                     generations: [record],
-                    expectedRevision: nil
+                    expectedRevision: existing.revision
                 )
-            }
-        } catch BrokerGenerationRegistryError.revisionChanged {
-            guard let existing = try? store.load() else {
-                throw BrokerStartupError.rendezvousChanged
-            }
-            if existing.topology?.current == record {
-                // A second app window published the same launched generation.
             } else {
                 throw BrokerStartupError.rendezvousChanged
             }
@@ -1360,45 +1396,6 @@ actor BrokerStartupCoordinator:
         pendingUpgrade = nil
         currentUpgradeState = .current(contentDigest: package.contentDigest)
         return adopted
-    }
-
-    /// Load the complete registry topology behind a located current. Discovery
-    /// intentionally drops drains whose independent metadata is absent; startup
-    /// publication must not turn that routing choice into registry data loss.
-    private func registeredTopologySnapshot(
-        matching located: BrokerGenerationTopology
-    ) throws -> BrokerGenerationTopology? {
-        guard located.current.packageRoot != nil else { return nil }
-        let store = BrokerGenerationRegistryStore(
-            profileRoot: locator.preferredUserDataRoot.standardizedFileURL
-        )
-        let registry = try store.load()
-        guard registry.revision == located.registryTopologyVersion,
-              registry.topology?.current == located.current,
-              let topology = registry.topology else {
-            throw BrokerStartupError.rendezvousChanged
-        }
-        return topology
-    }
-
-    /// `locateTopology` reports `notRunning` when registry-backed current
-    /// metadata is absent. Distinguish that recoverable stale snapshot from a
-    /// genuinely empty profile without weakening registry validation.
-    private func registeredTopologySnapshotIfPresent() throws -> BrokerGenerationTopology? {
-        let store = BrokerGenerationRegistryStore(
-            profileRoot: locator.preferredUserDataRoot.standardizedFileURL
-        )
-        var metadata = stat()
-        guard lstat(store.registryURL.path, &metadata) == 0 else {
-            if errno == ENOENT { return nil }
-            throw BrokerStartupError.unsafeStaleRendezvous
-        }
-        let registry = try store.load()
-        guard let topology = registry.topology,
-              topology.registryTopologyVersion == registry.revision else {
-            throw BrokerStartupError.rendezvousChanged
-        }
-        return topology
     }
 
     private func publishCutover(

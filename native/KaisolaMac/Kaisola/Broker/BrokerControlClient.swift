@@ -586,26 +586,14 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                     status,
                     runningContentDigest: runningDigest
                 )
-                if case let .draining(staleTargetContentDigest) = lifecycle,
-                   staleTargetContentDigest != targetContentDigest {
-                    // A durable implementation-v2 broker can outlive the app
-                    // which committed its prior handoff. Recover only from the
-                    // exact target reported by the authenticated status
-                    // snapshot, and keep cancellation plus replacement prepare
-                    // on this already-verified administrative lane.
-                    let cancellation = try await requestMutation(
-                        "broker.cancelRollingUpdate",
-                        params: .object([
-                            "ownerId": .string("0"),
-                            "expectedPid": .integer(Int64(info.pid)),
-                            "expectedStartedAt": .integer(info.startedAt),
-                            "expectedContentDigest": .string(runningDigest),
-                            "targetContentDigest": .string(staleTargetContentDigest),
-                        ])
-                    )
-                    try Self.validateRollingUpdateCancellation(
-                        cancellation,
-                        expectedContentDigest: runningDigest
+                if case let .draining(preparedTargetContentDigest) = lifecycle,
+                   preparedTargetContentDigest != targetContentDigest {
+                    // Status proves another handoff exists, but this client has
+                    // no registry ownership claim. Report it to the coordinator
+                    // instead of cancelling work another window may still own.
+                    await disconnect()
+                    return .preparedForOtherTarget(
+                        targetContentDigest: preparedTargetContentDigest
                     )
                 }
             }

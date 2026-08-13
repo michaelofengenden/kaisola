@@ -54,13 +54,12 @@ final class TerminalThemeRegistryTests: XCTestCase {
     }
 
     /// The shipped Kaisola light palette owns the terminal canvas. The
-    /// historical #E9EBEF canvas and #EEF0F4 ANSI paper both render visibly
-    /// grey, and the pane chrome repeats the canvas around SwiftTerm. Keep all
-    /// three literal white.
-    func testShippedKaisolaLightTerminalCanvasAndPaperAreExactWhite() {
+    /// historical #E9EBEF canvas rendered visibly grey, and the pane chrome
+    /// repeats the canvas around SwiftTerm. Keep both literal white without
+    /// conflating the ANSI black text role with the canvas.
+    func testShippedKaisolaLightTerminalCanvasAndChromeAreExactWhite() {
         let colors = [
             TerminalTheme.light.background,
-            TerminalTheme.light.ansiColor(0),
             TerminalTheme.paneChrome(light: true, themeID: "kaisola").background,
         ]
 

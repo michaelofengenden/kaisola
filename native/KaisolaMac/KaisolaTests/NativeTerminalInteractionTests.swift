@@ -894,12 +894,11 @@ final class NativeTerminalInteractionTests: XCTestCase {
                 "native light ANSI slot \(index) falls below readable text contrast"
             )
         }
-        // Kaisola light treats ANSI black as paper so reverse-video blocks do
-        // not reintroduce the old grey canvas. Every text-bearing role still
-        // has to clear the same contrast floor against that white paper.
-        for index in 1..<kaisolaLight.count {
+        // ANSI black is still a text-bearing role: explicit SGR 30 output must
+        // remain readable after the terminal canvas becomes exact white.
+        for (index, color) in kaisolaLight.enumerated() {
             XCTAssertGreaterThanOrEqual(
-                contrastRatio(kaisolaLight[index], background: (1, 1, 1)),
+                contrastRatio(color, background: (1, 1, 1)),
                 4.5,
                 "Kaisola light ANSI slot \(index) falls below readable text contrast"
             )

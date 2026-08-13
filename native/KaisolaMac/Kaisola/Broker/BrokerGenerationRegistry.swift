@@ -153,6 +153,41 @@ struct BrokerGenerationRegistry: Codable, Equatable, Sendable {
     }
 }
 
+/// An advisory, profile-scoped ownership claim for the complete rolling
+/// handoff transaction. The registry's ordinary lock protects one atomic file
+/// replacement; this claim stays held while a coordinator prepares a broker,
+/// launches its target, and publishes the matching registry revision.
+final class BrokerGenerationHandoffClaim: @unchecked Sendable {
+    private let descriptor: Int32
+    private let stateLock = NSLock()
+    private var released = false
+
+    fileprivate init(descriptor: Int32) {
+        self.descriptor = descriptor
+    }
+
+    var isHeld: Bool {
+        stateLock.withLock { !released }
+    }
+
+    var closesOnExec: Bool {
+        stateLock.withLock {
+            !released && fcntl(descriptor, F_GETFD) & FD_CLOEXEC != 0
+        }
+    }
+
+    func release() {
+        stateLock.withLock {
+            guard !released else { return }
+            released = true
+            _ = flock(descriptor, LOCK_UN)
+            Darwin.close(descriptor)
+        }
+    }
+
+    deinit { release() }
+}
+
 /// Atomic, compare-and-swap registry writer. A process-scoped lock closes the
 /// race between two app windows reading the same revision and both attempting
 /// a cutover; readers need no lock because rename publishes one complete file.
@@ -191,10 +226,59 @@ struct BrokerGenerationRegistryStore: Sendable {
         brokerDirectory.appendingPathComponent("registry-v1.lock", isDirectory: false)
     }
 
+    private var handoffLockURL: URL {
+        brokerDirectory.appendingPathComponent("registry-v1.handoff.lock", isDirectory: false)
+    }
+
     func load() throws -> BrokerGenerationRegistry {
         let registry = try readRegistry(at: registryURL)
         try registry.validate(profileRoot: profileRoot)
         return registry
+    }
+
+    /// Claims the lifecycle transaction without waiting. A second coordinator
+    /// defers while the owner is between broker preparation and registry
+    /// publication. The kernel releases the claim if its process exits; a
+    /// later coordinator can retry discovery but does not mutate an unclaimed
+    /// prepared handoff from an older app version.
+    func tryAcquireHandoffClaim(
+        expectedRevision: Int64?
+    ) throws -> BrokerGenerationHandoffClaim? {
+        try preparePrivateDirectory(brokerDirectory)
+        let descriptor = open(
+            handoffLockURL.path,
+            O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC,
+            0o600
+        )
+        guard descriptor >= 0 else { throw BrokerGenerationRegistryError.couldNotLock }
+        var ownsDescriptor = true
+        defer {
+            if ownsDescriptor { Darwin.close(descriptor) }
+        }
+        do {
+            try validatePrivateDescriptor(descriptor, expectedKind: S_IFREG)
+            guard fcntl(descriptor, F_GETFD) & FD_CLOEXEC != 0 else {
+                throw BrokerGenerationRegistryError.couldNotLock
+            }
+            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+                let lockError = errno
+                if lockError == EWOULDBLOCK || lockError == EAGAIN { return nil }
+                throw BrokerGenerationRegistryError.couldNotLock
+            }
+            var ownsLock = true
+            defer {
+                if ownsLock { _ = flock(descriptor, LOCK_UN) }
+            }
+            if let expectedRevision {
+                let registry = try load()
+                guard registry.revision == expectedRevision else {
+                    throw BrokerGenerationRegistryError.revisionChanged
+                }
+            }
+            ownsLock = false
+            ownsDescriptor = false
+            return BrokerGenerationHandoffClaim(descriptor: descriptor)
+        }
     }
 
     /// Publish one canonical topology only if the caller still holds the

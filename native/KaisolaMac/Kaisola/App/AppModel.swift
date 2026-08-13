@@ -2937,24 +2937,27 @@ final class AppModel: ObservableObject {
         let restorableProjects = restoration.projects.filter {
             !sessionStore.isProjectClosed($0.projectID)
         }
-        recentlyClosedPanes = restorableProjects.flatMap { project in
-            project.panes.filter(\.isRecentlyClosed)
-        }
         // A crash can land after the transcript tombstone but before the
         // workspace descriptor is removed. Prune every descriptor while its
         // tombstone still proves deletion intent; reclaiming tombstones first
         // would turn that stale descriptor back into an apparently live chat.
         var canVacuumTranscriptTombstones = true
+        var blockedRestoredChatIDs = Set<String>()
         // Deletion also applies to projects that are currently closed. Their
         // archived panes are not restored today, but leaving a stale
         // descriptor there would revive it when the project is reopened.
         for projectState in restoration.projects {
             for pane in projectState.panes {
-                guard !pane.isRecentlyClosed,
-                      let descriptor = pane.surface.agentChatDescriptor,
-                      chats.contains(where: { $0.id == descriptor.id }) == false else { continue }
+                guard let descriptor = pane.surface.agentChatDescriptor else { continue }
                 switch await transcriptStore.tombstoneState(chatID: descriptor.id) {
                 case .present:
+                    blockedRestoredChatIDs.insert(descriptor.id)
+                    if chats.contains(where: { $0.id == descriptor.id }) {
+                        // A restoration retry can run after live state exists.
+                        // That handle may write another descriptor on teardown,
+                        // so keep the deletion fence for a later clean launch.
+                        canVacuumTranscriptTombstones = false
+                    }
                     do {
                         _ = try await workspaceStateStore.removeAgentChatState(
                             projectID: projectState.projectID,
@@ -2968,13 +2971,30 @@ final class AppModel: ObservableObject {
                     }
                     continue
                 case .unknown:
+                    blockedRestoredChatIDs.insert(descriptor.id)
                     // A failed probe is not evidence that deletion never
                     // happened. Keep both stores untouched and try next time.
                     canVacuumTranscriptTombstones = false
                     continue
                 case .absent:
-                    break
+                    continue
                 }
+            }
+        }
+        recentlyClosedPanes = restorableProjects.flatMap { project in
+            project.panes.filter { pane in
+                guard pane.isRecentlyClosed else { return false }
+                guard let descriptor = pane.surface.agentChatDescriptor else { return true }
+                return !blockedRestoredChatIDs.contains(descriptor.id)
+            }
+        }
+
+        for projectState in restorableProjects {
+            for pane in projectState.panes {
+                guard !pane.isRecentlyClosed,
+                      let descriptor = pane.surface.agentChatDescriptor,
+                      !blockedRestoredChatIDs.contains(descriptor.id),
+                      chats.contains(where: { $0.id == descriptor.id }) == false else { continue }
                 guard let agent = AgentRegistry.profile(id: descriptor.agentID) else { continue }
                 let directory = URL(fileURLWithPath: descriptor.workspacePath, isDirectory: true)
                     .standardizedFileURL
@@ -3101,6 +3121,9 @@ final class AppModel: ObservableObject {
             }
 
             var layout = projectState.layout
+            for blockedChatID in blockedRestoredChatIDs {
+                layout.remove(blockedChatID)
+            }
             if connectionState.isConnected {
                 // Dormant terminals (persisted records the broker no longer
                 // holds — a reboot killed their PTYs) stay in the layout so a

@@ -325,7 +325,7 @@ final class BrokerControlClientTests: XCTestCase {
         }
     }
 
-    func testVerifiedLegacyUpgradeReplacesExactStatusReportedStaleTargetBeforePreparing() async throws {
+    func testUpgradeWithoutRegistryClaimNeverCancelsStatusReportedOtherTarget() async throws {
         let staleTargetDigest = String(repeating: "e", count: 64)
         let requestedTargetDigest = String(repeating: "d", count: 64)
         let runningDigest = try XCTUnwrap(primaryControlBrokerInfo.contentDigest)
@@ -349,7 +349,10 @@ final class BrokerControlClientTests: XCTestCase {
             authorization: .sealedLegacyFallback
         )
 
-        XCTAssertEqual(decision, .accepted)
+        XCTAssertEqual(
+            decision,
+            .preparedForOtherTarget(targetContentDigest: staleTargetDigest)
+        )
         let frames = await transport.sentFrames()
         XCTAssertEqual(frames.compactMap { frame -> String? in
             guard frame.objectValue?["type"]?.stringValue == "hello" else { return nil }
@@ -359,19 +362,7 @@ final class BrokerControlClientTests: XCTestCase {
             guard frame.objectValue?["type"]?.stringValue == "request" else { return nil }
             return frame.objectValue
         }
-        XCTAssertEqual(requests.compactMap { $0["method"]?.stringValue }, [
-            "broker.status",
-            "broker.cancelRollingUpdate",
-            "broker.prepareRollingUpdate",
-        ])
-        XCTAssertEqual(
-            requests[1]["params"]?.objectValue?["targetContentDigest"]?.stringValue,
-            staleTargetDigest
-        )
-        XCTAssertEqual(
-            requests[2]["params"]?.objectValue?["targetContentDigest"]?.stringValue,
-            requestedTargetDigest
-        )
+        XCTAssertEqual(requests.compactMap { $0["method"]?.stringValue }, ["broker.status"])
     }
 
     func testRollingUpgradeRejectsMalformedOrMismatchedLifecycleBeforeMutation() async throws {
@@ -410,7 +401,7 @@ final class BrokerControlClientTests: XCTestCase {
         }
     }
 
-    func testRollingUpgradeStopsWhenStaleCancellationAcknowledgesDifferentIdentity() async throws {
+    func testRollingUpgradeReportsOtherPreparedTargetWithoutAttemptingCancellation() async throws {
         let transport = LegacyAdministrationControlBrokerTransport(
             generationState: "draining",
             drainingTargetContentDigest: .string(String(repeating: "e", count: 64)),
@@ -425,20 +416,17 @@ final class BrokerControlClientTests: XCTestCase {
             operationTimeoutNanoseconds: 100_000_000
         )
 
-        do {
-            _ = try await client.requestUpgrade(
-                from: primaryControlBrokerInfo,
-                targetContentDigest: String(repeating: "d", count: 64),
-                authorization: .sealedLegacyFallback
-            )
-            XCTFail("A mismatched cancellation acknowledgement must not prepare a replacement.")
-        } catch {
-            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
-        }
+        let staleTarget = String(repeating: "e", count: 64)
+        let decision = try await client.requestUpgrade(
+            from: primaryControlBrokerInfo,
+            targetContentDigest: String(repeating: "d", count: 64),
+            authorization: .sealedLegacyFallback
+        )
+        XCTAssertEqual(decision, .preparedForOtherTarget(targetContentDigest: staleTarget))
         let methods = await transport.sentFrames().compactMap {
             $0.objectValue?["method"]?.stringValue
         }
-        XCTAssertEqual(methods, ["broker.status", "broker.cancelRollingUpdate"])
+        XCTAssertEqual(methods, ["broker.status"])
     }
 
     func testUnverifiedBrokerNeverFallsBackToLegacyAdministrativeLane() async throws {

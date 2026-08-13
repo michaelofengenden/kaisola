@@ -68,8 +68,9 @@ enum TerminalTheme {
     /// LIGHT_THEME (paper). The old #E9EBEF background was the visible grey
     /// left after the surrounding Glass became neutral white. This shipped
     /// palette owns both SwiftTerm's canvas and its pane chrome, so its paper
-    /// is literal white as well. ANSI black inverts to that same paper, while
-    /// every text-bearing ANSI role clears 4.5:1 against it.
+    /// is literal white as well. ANSI black remains readable ink for explicit
+    /// SGR 30 output, while every text-bearing ANSI role clears 4.5:1 against
+    /// the white canvas.
     static var light: Palette {
         Palette(
             background: color(0xFFFFFF),
@@ -77,7 +78,7 @@ enum TerminalTheme {
             cursor: color(0x21242B),
             selection: color(0x5E7030, alpha: 0.18),
             ansi: [
-                term(0xFFFFFF), term(0xC43D3D), term(0x1A7F37), term(0x7D4E00),
+                term(0x21242B), term(0xC43D3D), term(0x1A7F37), term(0x7D4E00),
                 term(0x0550AE), term(0x8A713A), term(0x007A73), term(0x3B3F48),
                 term(0x6E7781), term(0xB42318), term(0x1A7F37), term(0x8A6100),
                 term(0x0969DA), term(0x8A713A), term(0x007A73), term(0x16181D),

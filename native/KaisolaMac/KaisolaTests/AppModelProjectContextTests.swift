@@ -985,6 +985,10 @@ final class AppModelProjectContextTests: XCTestCase {
         await model.restoreWorkspaceStateIfNeeded()
 
         XCTAssertTrue(model.chats.isEmpty)
+        XCTAssertTrue(
+            model.paneLayout(for: projectID).isEmpty,
+            "a pruned chat descriptor must not leave a dead card in the restored layout"
+        )
         await workspaceStore.invalidateCache()
         let pruned = try await workspaceStore.projectState(for: projectID)
         XCTAssertFalse(pruned?.panes.contains { $0.id == chatID } == true)
@@ -993,6 +997,282 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertNil(removedTranscript)
         XCTAssertEqual(reclaimedTombstone, .absent)
         await model.teardown()
+    }
+
+    /// Closing a project hides its complete archived workspace until an
+    /// explicit reopen. Relaunch cleanup must still visit that archive to
+    /// finish an interrupted permanent chat deletion, but it must not turn the
+    /// project's other chats, Meshes, layout, files, or Recently Closed rows
+    /// back into live window state.
+    @MainActor
+    func testClosedProjectRelaunchOnlyPrunesTombstonesWithoutRestoringWorkspaceState() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        let projectDirectory = root.appendingPathComponent(
+            "closed-project-restoration",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        let document = projectDirectory.appendingPathComponent("notes.md")
+        try "kept on disk".write(to: document, atomically: true, encoding: .utf8)
+
+        let projectID = NativeSessionStore.projectID(forDirectory: projectDirectory.path)
+        let activeChatID = "closed-project-active-chat"
+        let deletedChatID = "closed-project-deleted-chat"
+        let recentlyClosedChatID = "closed-project-recent-chat"
+        let deletedRecentlyClosedChatID = "closed-project-deleted-recent-chat"
+        func chatPane(
+            id: String,
+            recentlyClosed: Bool = false
+        ) -> NativeRestorablePaneState {
+            NativeRestorablePaneState(
+                id: id,
+                surface: NativeRestorableSurfaceState(agentChat: .init(
+                    id: id,
+                    projectID: projectID,
+                    agentID: "codex",
+                    workspacePath: projectDirectory.path,
+                    acpSessionID: "provider-\(id)",
+                    title: id
+                )),
+                isRecentlyClosed: recentlyClosed,
+                closedAt: recentlyClosed ? 42 : nil
+            )
+        }
+        let activeChat = chatPane(id: activeChatID)
+        let deletedChat = chatPane(id: deletedChatID)
+        let recentlyClosedChat = chatPane(id: recentlyClosedChatID, recentlyClosed: true)
+        let deletedRecentlyClosedChat = chatPane(
+            id: deletedRecentlyClosedChatID,
+            recentlyClosed: true
+        )
+        let mesh = Self.meshPane(id: "closed-project-mesh", basePath: projectDirectory.path)
+
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-state-v1.json"),
+            meshWorktreeRoot: root.appendingPathComponent("mesh-worktrees", isDirectory: true)
+        )
+        try await workspaceStore.saveRestorationState(NativeWorkspaceRestorationState(
+            selectedProjectID: projectID,
+            projects: [NativeProjectWorkspaceState(
+                projectID: projectID,
+                layout: SessionPaneLayout(columns: [
+                    .init(sessionIDs: [activeChat.id, mesh.id, deletedChat.id]),
+                ]),
+                panes: [
+                    activeChat,
+                    mesh,
+                    deletedChat,
+                    recentlyClosedChat,
+                    deletedRecentlyClosedChat,
+                ],
+                focusedPaneID: activeChat.id,
+                fileTabs: [.init(relativePath: "notes.md", isPinned: true, line: 3)],
+                selectedFilePath: "notes.md"
+            )]
+        ))
+
+        let transcriptStore = AcpTranscriptStore(
+            fileURL: root.appendingPathComponent("transcripts.json")
+        )
+        await transcriptStore.scheduleSave(
+            [.message(id: "row-1", text: "must stay deleted")],
+            for: deletedChatID,
+            now: 1
+        )
+        await transcriptStore.scheduleSave(
+            [.message(id: "row-2", text: "closed row must stay deleted")],
+            for: deletedRecentlyClosedChatID,
+            now: 2
+        )
+        await transcriptStore.flush()
+        let tombstoneResult = await transcriptStore.tombstone(chatID: deletedChatID)
+        XCTAssertEqual(tombstoneResult, .recorded)
+        let recentlyClosedTombstoneResult = await transcriptStore.tombstone(
+            chatID: deletedRecentlyClosedChatID
+        )
+        XCTAssertEqual(recentlyClosedTombstoneResult, .recorded)
+
+        let sessionStore = NativeSessionStore(fileURL: storeFile)
+        _ = sessionStore.openProject(directory: projectDirectory.path)
+        sessionStore.closeProject(id: projectID)
+        XCTAssertTrue(sessionStore.isProjectClosed(projectID))
+
+        let model = AppModel(
+            sessionStore: sessionStore,
+            workspaceStateStore: workspaceStore,
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore)
+        )
+        await model.restoreWorkspaceStateIfNeeded()
+
+        XCTAssertTrue(model.chats.isEmpty)
+        XCTAssertTrue(model.meshes.isEmpty)
+        XCTAssertTrue(model.paneLayout(for: projectID).isEmpty)
+        XCTAssertTrue(model.fileTabs(for: projectID).isEmpty)
+        XCTAssertTrue(model.recentlyClosedSurfaces(in: projectID).isEmpty)
+
+        await workspaceStore.invalidateCache()
+        let restoredProjectState = try await workspaceStore.projectState(for: projectID)
+        let pruned = try XCTUnwrap(restoredProjectState)
+        XCTAssertEqual(
+            Set(pruned.panes.map(\.id)),
+            Set([activeChat.id, mesh.id, recentlyClosedChat.id])
+        )
+        let reclaimedTombstone = await transcriptStore.tombstoneState(chatID: deletedChatID)
+        XCTAssertEqual(reclaimedTombstone, .absent)
+        let reclaimedRecentlyClosedTombstone = await transcriptStore.tombstoneState(
+            chatID: deletedRecentlyClosedChatID
+        )
+        XCTAssertEqual(reclaimedRecentlyClosedTombstone, .absent)
+        await model.teardown()
+    }
+
+    /// Recently Closed is a recovery surface, not an exception to permanent
+    /// deletion. A retained entry still returns after relaunch, while a
+    /// tombstoned neighbor is pruned before either the in-memory recovery list
+    /// or the durable workspace can expose it.
+    @MainActor
+    func testOpenProjectRelaunchKeepsOnlyNonTombstonedRecentlyClosedChat() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        let projectDirectory = root.appendingPathComponent(
+            "open-project-recent-chat-pruning",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        let projectID = NativeSessionStore.projectID(forDirectory: projectDirectory.path)
+        func recentlyClosedChat(id: String, closedAt: Int64) -> NativeRestorablePaneState {
+            NativeRestorablePaneState(
+                id: id,
+                surface: NativeRestorableSurfaceState(agentChat: .init(
+                    id: id,
+                    projectID: projectID,
+                    agentID: "codex",
+                    workspacePath: projectDirectory.path,
+                    acpSessionID: "provider-\(id)",
+                    title: id
+                )),
+                isRecentlyClosed: true,
+                closedAt: closedAt
+            )
+        }
+        let retained = recentlyClosedChat(id: "retained-recent-chat", closedAt: 1)
+        let deleted = recentlyClosedChat(id: "deleted-recent-chat", closedAt: 2)
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-state-v1.json")
+        )
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: projectID,
+            panes: [retained, deleted]
+        ))
+        let transcriptStore = AcpTranscriptStore(
+            fileURL: root.appendingPathComponent("transcripts.json")
+        )
+        await transcriptStore.scheduleSave(
+            [.message(id: "row-1", text: "must stay deleted")],
+            for: deleted.id,
+            now: 1
+        )
+        await transcriptStore.flush()
+        let tombstoneResult = await transcriptStore.tombstone(chatID: deleted.id)
+        XCTAssertEqual(tombstoneResult, .recorded)
+
+        let sessionStore = NativeSessionStore(fileURL: storeFile)
+        _ = sessionStore.openProject(directory: projectDirectory.path)
+        let model = AppModel(
+            sessionStore: sessionStore,
+            workspaceStateStore: workspaceStore,
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore)
+        )
+        await model.restoreWorkspaceStateIfNeeded()
+
+        XCTAssertEqual(
+            model.recentlyClosedSurfaces(in: projectID).map(\.id),
+            [retained.id]
+        )
+        await workspaceStore.invalidateCache()
+        let restoredProjectState = try await workspaceStore.projectState(for: projectID)
+        XCTAssertEqual(restoredProjectState?.panes.map(\.id), [retained.id])
+        let reclaimedTombstone = await transcriptStore.tombstoneState(chatID: deleted.id)
+        XCTAssertEqual(reclaimedTombstone, .absent)
+        await model.teardown()
+    }
+
+    /// A restoration retry can run after this window already has live chats.
+    /// Pruning a matching stale descriptor is still required, but the global
+    /// vacuum cannot reclaim its tombstone while that live handle could write
+    /// a fresh descriptor during teardown.
+    @MainActor
+    func testRestorationKeepsDeletionFenceForTombstonedChatAlreadyInMemory() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        let projectDirectory = root.appendingPathComponent(
+            "in-memory-chat-tombstone",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-state-v1.json")
+        )
+        let transcriptStore = AcpTranscriptStore(
+            fileURL: root.appendingPathComponent("transcripts.json")
+        )
+        let sessionStore = NativeSessionStore(fileURL: storeFile)
+        let model = AppModel(
+            sessionStore: sessionStore,
+            workspaceStateStore: workspaceStore,
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore)
+        )
+        let agent = try XCTUnwrap(AgentRegistry.profile(id: "codex"))
+        model.openChat(agent, inDirectory: projectDirectory)
+        let chat = try XCTUnwrap(model.chats.first)
+        let descriptor = NativeRestorableAgentChatDescriptor(
+            id: chat.id,
+            projectID: chat.projectID,
+            agentID: chat.agentID,
+            workspacePath: chat.workspaceDirectory.path,
+            acpSessionID: nil,
+            title: "Must remain fenced"
+        )
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: chat.projectID,
+            layout: SessionPaneLayout(sessionID: chat.id),
+            panes: [NativeRestorablePaneState(
+                id: chat.id,
+                surface: NativeRestorableSurfaceState(agentChat: descriptor)
+            )],
+            focusedPaneID: chat.id
+        ))
+        await transcriptStore.scheduleSave(
+            [.message(id: "row-1", text: "must stay deleted")],
+            for: chat.id,
+            now: 1
+        )
+        await transcriptStore.flush()
+        let tombstoneResult = await transcriptStore.tombstone(chatID: chat.id)
+        XCTAssertEqual(tombstoneResult, .recorded)
+
+        await model.restoreWorkspaceStateIfNeeded()
+
+        await workspaceStore.invalidateCache()
+        let prunedState = try await workspaceStore.projectState(for: chat.projectID)
+        XCTAssertFalse(prunedState?.panes.contains(where: { $0.id == chat.id }) == true)
+        XCTAssertTrue(model.paneLayout(for: chat.projectID).isEmpty)
+        let retainedTombstone = await transcriptStore.tombstoneState(chatID: chat.id)
+        XCTAssertEqual(retainedTombstone, .present)
+
+        await model.teardown()
+        let retainedAfterTeardown = await transcriptStore.tombstoneState(chatID: chat.id)
+        XCTAssertEqual(retainedAfterTeardown, .present)
     }
 
     @MainActor

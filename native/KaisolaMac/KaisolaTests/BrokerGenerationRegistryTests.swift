@@ -68,6 +68,61 @@ final class BrokerGenerationRegistryTests: XCTestCase {
         XCTAssertEqual(second.topology?.draining.map(\.role), [.draining])
     }
 
+    func testHandoffClaimIsExclusiveUntilItsOwnerReleasesIt() throws {
+        let profile = try makePrivateProfile()
+        let store = BrokerGenerationRegistryStore(profileRoot: profile)
+        let current = generation(
+            digest: String(repeating: "a", count: 64),
+            role: .current,
+            profile: profile,
+            package: true
+        )
+        let registry = try store.save(
+            currentGenerationID: current.id,
+            generations: [current],
+            expectedRevision: nil,
+            now: 1
+        )
+
+        let first = try XCTUnwrap(store.tryAcquireHandoffClaim(expectedRevision: registry.revision))
+        XCTAssertTrue(first.isHeld)
+        XCTAssertTrue(first.closesOnExec)
+        XCTAssertNil(try store.tryAcquireHandoffClaim(expectedRevision: registry.revision))
+
+        first.release()
+        XCTAssertFalse(first.isHeld)
+        XCTAssertThrowsError(try store.tryAcquireHandoffClaim(expectedRevision: registry.revision + 1)) {
+            XCTAssertEqual($0 as? BrokerGenerationRegistryError, .revisionChanged)
+        }
+        let successor = try XCTUnwrap(store.tryAcquireHandoffClaim(expectedRevision: registry.revision))
+        XCTAssertTrue(successor.isHeld)
+        successor.release()
+    }
+
+    func testHandoffClaimRejectsNonPrivateAndSymlinkLockFiles() throws {
+        let profile = try makePrivateProfile()
+        let store = BrokerGenerationRegistryStore(profileRoot: profile)
+        try FileManager.default.createDirectory(
+            at: store.brokerDirectory,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let claimURL = store.brokerDirectory.appendingPathComponent("registry-v1.handoff.lock")
+        try Data().write(to: claimURL)
+        _ = chmod(claimURL.path, 0o644)
+        XCTAssertThrowsError(try store.tryAcquireHandoffClaim(expectedRevision: nil)) {
+            XCTAssertEqual($0 as? BrokerGenerationRegistryError, .unsafeRegistry)
+        }
+
+        try FileManager.default.removeItem(at: claimURL)
+        let target = profile.appendingPathComponent("outside.lock")
+        try Data().write(to: target)
+        try FileManager.default.createSymbolicLink(at: claimURL, withDestinationURL: target)
+        XCTAssertThrowsError(try store.tryAcquireHandoffClaim(expectedRevision: nil)) {
+            XCTAssertEqual($0 as? BrokerGenerationRegistryError, .couldNotLock)
+        }
+    }
+
     func testRegistryRejectsTamperedIdentityAndSymlinkLeaves() throws {
         let profile = try makePrivateProfile()
         let store = BrokerGenerationRegistryStore(profileRoot: profile)

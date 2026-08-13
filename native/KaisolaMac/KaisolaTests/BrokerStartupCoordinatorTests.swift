@@ -206,116 +206,11 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
-    func testDeadRegisteredCurrentIsReplacedWithoutDiscardingLiveDrainsOrRelaunching() async throws {
-        let home = try privateTemporaryDirectory()
-        let profile = home.appendingPathComponent("Kaisola", isDirectory: true)
-        let broker = profile.appendingPathComponent("session-broker", isDirectory: true)
-        let metadataDirectory = broker.appendingPathComponent(
-            BrokerLaunchConfiguration.generationMetadataDirectoryName,
-            isDirectory: true
-        )
-        for directory in [profile, broker, metadataDirectory] {
-            try FileManager.default.createDirectory(
-                at: directory,
-                withIntermediateDirectories: false,
-                attributes: [.posixPermissions: 0o700]
-            )
-            _ = chmod(directory.path, 0o700)
-        }
-
-        let deadDigest = String(repeating: "e", count: 64)
-        let deadSocket = broker.appendingPathComponent(
-            BrokerLaunchConfiguration.generationSocketLeaf(
-                userData: profile,
-                contentDigest: deadDigest
-            )
-        )
-        let staleDescriptor = try bindUnixSocket(at: deadSocket)
-        Darwin.close(staleDescriptor)
-        let deadInfo = BrokerInfo(
-            protocolVersion: 2,
-            securityEpoch: 1,
-            implementationVersion: 1,
-            packageSchema: 1,
-            packageVersion: "old-package",
-            contentDigest: deadDigest,
-            pid: Int32.max,
-            socketPath: deadSocket.path,
-            token: String(repeating: "c", count: 64),
-            startedAt: 1,
-            version: "stale-native"
-        )
-        let deadMetadataURL = metadataDirectory.appendingPathComponent("\(deadDigest).json")
-        try JSONEncoder().encode(deadInfo).write(to: deadMetadataURL)
-        _ = chmod(deadMetadataURL.path, 0o600)
-        let dead = BrokerGenerationRecord(
-            id: deadDigest,
-            role: .current,
-            info: deadInfo,
-            packageRoot: profile
-                .appendingPathComponent("broker-generations", isDirectory: true)
-                .appendingPathComponent(deadDigest, isDirectory: true)
-                .path,
-            registeredAt: 1
-        )
-        let drainA = try makeLiveDrainingGeneration(
-            profile: profile,
-            template: dead,
-            contentDigest: String(repeating: "a", count: 64)
-        )
-        let drainB = try makeLiveDrainingGeneration(
-            profile: profile,
-            template: dead,
-            contentDigest: String(repeating: "b", count: 64)
-        )
-        defer {
-            Darwin.close(drainA.descriptor)
-            Darwin.close(drainB.descriptor)
-        }
-        let store = BrokerGenerationRegistryStore(profileRoot: profile)
-        _ = try store.save(
-            currentGenerationID: dead.id,
-            generations: [dead, drainB.generation, drainA.generation],
-            expectedRevision: nil,
-            now: 1
-        )
-
-        let launcher = FakeBrokerHelperLauncher()
-        let coordinator = BrokerStartupCoordinator(
-            locator: BrokerInfoLocator(userDataCandidates: [profile]),
-            launcher: launcher,
-            homeDirectory: home,
-            appVersion: "native-test"
-        )
-
-        let replacement = try await coordinator.prepare()
-        let afterFirstPrepare = try store.load()
-        let adoptedAgain = try await coordinator.prepare()
-        let afterSecondPrepare = try store.load()
-        let launchCount = await launcher.launchCount
-        let expectedDrains = [drainA.generation, drainB.generation]
-
-        XCTAssertEqual(replacement.contentDigest, String(repeating: "d", count: 64))
-        XCTAssertEqual(adoptedAgain, replacement)
-        XCTAssertEqual(afterFirstPrepare.revision, 2)
-        XCTAssertEqual(afterFirstPrepare.topology?.current.info, replacement)
-        XCTAssertEqual(afterFirstPrepare.topology?.draining, expectedDrains)
-        XCTAssertEqual(afterSecondPrepare, afterFirstPrepare)
-        XCTAssertEqual(launchCount, 1, "a published replacement must be adopted, not relaunched")
-        await launcher.close()
-    }
-
-    func testDeadCurrentPromotesAnAlreadyDrainingTargetWithoutDuplicatingIt() async throws {
+    func testDeadCurrentNeverPromotesAnAlreadyDrainingTarget() async throws {
         let fixture = try makeDeadCurrentWithDrains(
             drainDigests: [String(repeating: "d", count: 64), String(repeating: "a", count: 64)]
         )
         defer { fixture.drains.forEach { Darwin.close($0.descriptor) } }
-        let targetBefore = try XCTUnwrap(fixture.drains.first(where: {
-            $0.generation.id == String(repeating: "d", count: 64)
-        }))
-        let unrelated = try XCTUnwrap(fixture.drains.first(where: {
-            $0.generation.id == String(repeating: "a", count: 64)
-        }))
         let launcher = FakeBrokerHelperLauncher()
         let coordinator = BrokerStartupCoordinator(
             locator: BrokerInfoLocator(userDataCandidates: [fixture.profile]),
@@ -324,106 +219,282 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             appVersion: "native-test"
         )
 
+        do {
+            _ = try await coordinator.prepare()
+            XCTFail("an internally draining generation must never be exposed as current")
+        } catch {
+            XCTAssertEqual(error as? BrokerStartupError, .rendezvousChanged)
+        }
+        let registry = try fixture.store.load()
+        XCTAssertEqual(registry.currentGenerationID, fixture.dead.id)
+        XCTAssertEqual(registry.revision, 1)
+        await launcher.close()
+    }
+
+    func testTwoCoordinatorsTargetingSamePackageSerializeThroughPublication() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let targetDigest = String(repeating: "d", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+
+        let requester = InterleavingRollingBrokerUpgradeRequester(initialLifecycle: .current)
+        let firstLaunchGate = AsyncBrokerTestGate()
+        let secondClaimWaitGate = AsyncBrokerTestGate()
+        let firstLauncher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            contentDigest: targetDigest,
+            onLaunch: { try await firstLaunchGate.enterAndWait() }
+        )
+        let secondLauncher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            contentDigest: targetDigest
+        )
+        let firstCoordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: firstLauncher,
+            homeDirectory: home,
+            appVersion: "native-test-a",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+        let secondCoordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: secondLauncher,
+            homeDirectory: home,
+            appVersion: "native-test-b",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true,
+            sleep: { _ in try await secondClaimWaitGate.enterAndWait() }
+        )
+
+        let first = Task { try await firstCoordinator.prepare() }
+        await firstLaunchGate.waitUntilEntered()
+        let second = Task { try await secondCoordinator.prepare() }
+        await secondClaimWaitGate.waitUntilEntered()
+        await firstLaunchGate.release()
+        let firstResult = try await first.value
+        await secondClaimWaitGate.release()
+        let secondResult = try await second.value
+
+        let registry = try BrokerGenerationRegistryStore(profileRoot: live.profile).load()
+        let secondLaunchCount = await secondLauncher.launchCount
+        let cancelledTargets = await requester.cancelledTargets()
+        let lifecycle = await requester.lifecycleState()
+        XCTAssertEqual(firstResult.contentDigest, targetDigest)
+        XCTAssertEqual(secondResult, firstResult)
+        XCTAssertEqual(registry.currentGenerationID, targetDigest)
+        XCTAssertEqual(secondLaunchCount, 0)
+        XCTAssertEqual(cancelledTargets, [])
+        XCTAssertEqual(
+            lifecycle,
+            .draining(targetContentDigest: targetDigest),
+            "the old registered drain must still name the generation that won the registry CAS"
+        )
+        await firstLauncher.close()
+        await secondLauncher.close()
+    }
+
+    func testLegacySameTargetCASWinnerIsAdoptedWithoutCancellingItsHandoff() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let targetDigest = String(repeating: "d", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let locator = BrokerInfoLocator(userDataCandidates: [live.profile])
+        let requester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            contentDigest: targetDigest,
+            afterLaunch: {
+                let prior = try store.load()
+                let targetInfo = try locator.locateGenerationMetadata(
+                    contentDigest: targetDigest
+                )
+                let target = BrokerGenerationRecord(
+                    id: targetDigest,
+                    role: .current,
+                    info: targetInfo,
+                    packageRoot: live.profile
+                        .appendingPathComponent("broker-generations", isDirectory: true)
+                        .appendingPathComponent(targetDigest, isDirectory: true)
+                        .path,
+                    registeredAt: max(1, targetInfo.startedAt)
+                )
+                let old = BrokerGenerationRecord(
+                    id: prior.topology!.current.id,
+                    role: .draining,
+                    info: prior.topology!.current.info,
+                    packageRoot: prior.topology!.current.packageRoot,
+                    registeredAt: prior.topology!.current.registeredAt
+                )
+                _ = try store.save(
+                    currentGenerationID: targetDigest,
+                    generations: [target, old],
+                    expectedRevision: prior.revision,
+                    now: 2
+                )
+            }
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
         let replacement = try await coordinator.prepare()
-        let registry = try fixture.store.load()
-        let topology = try XCTUnwrap(registry.topology)
+        let registry = try store.load()
+        let cancelCallCount = await requester.cancelCallCount()
 
-        XCTAssertEqual(topology.current.info, replacement)
-        XCTAssertEqual(topology.current.id, targetBefore.generation.id)
-        XCTAssertEqual(topology.current.registeredAt, targetBefore.generation.registeredAt)
-        XCTAssertEqual(topology.draining, [unrelated.generation])
-        XCTAssertEqual(Set(registry.generations.map(\.id)).count, registry.generations.count)
+        XCTAssertEqual(replacement.contentDigest, targetDigest)
+        XCTAssertEqual(registry.currentGenerationID, targetDigest)
+        XCTAssertEqual(cancelCallCount, 0)
         await launcher.close()
     }
 
-    func testDeadCurrentReplacementFailsClosedWhenRegistryRevisionChangesDuringLaunch() async throws {
-        let fixture = try makeDeadCurrentWithDrains(
-            drainDigests: [String(repeating: "a", count: 64)]
+    func testDeadSameTargetRegistryWinnerIsNeverAdoptedAsCurrent() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let targetDigest = String(repeating: "d", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let prior = try XCTUnwrap(try store.load().topology)
+        let deadTargetFixture = try makeLiveDrainingGeneration(
+            profile: live.profile,
+            template: prior.current,
+            contentDigest: targetDigest
         )
-        defer { fixture.drains.forEach { Darwin.close($0.descriptor) } }
-        let winnerDigest = String(repeating: "f", count: 64)
-        let winner = try makeLiveDrainingGeneration(
-            profile: fixture.profile,
-            template: fixture.dead,
-            contentDigest: winnerDigest
+        defer { Darwin.close(deadTargetFixture.descriptor) }
+        let deadInfo = BrokerInfo(
+            protocolVersion: deadTargetFixture.generation.info.protocolVersion,
+            securityEpoch: deadTargetFixture.generation.info.securityEpoch,
+            implementationVersion: 2,
+            packageSchema: 1,
+            packageVersion: "test-package",
+            contentDigest: targetDigest,
+            pid: Int32.max,
+            socketPath: deadTargetFixture.generation.info.socketPath,
+            token: deadTargetFixture.generation.info.token,
+            startedAt: deadTargetFixture.generation.info.startedAt,
+            version: deadTargetFixture.generation.info.version
         )
-        defer { Darwin.close(winner.descriptor) }
-        let winnerCurrent = BrokerGenerationRecord(
-            id: winner.generation.id,
+        try JSONEncoder().encode(deadInfo).write(to: deadTargetFixture.metadataURL)
+        _ = chmod(deadTargetFixture.metadataURL.path, 0o600)
+        let deadTarget = BrokerGenerationRecord(
+            id: targetDigest,
             role: .current,
-            info: winner.generation.info,
-            packageRoot: winner.generation.packageRoot,
-            registeredAt: winner.generation.registeredAt
+            info: deadInfo,
+            packageRoot: deadTargetFixture.generation.packageRoot,
+            registeredAt: deadTargetFixture.generation.registeredAt
         )
-        let selection = BrokerGenerationSelection(
-            generationID: winnerDigest,
-            selectingAppContentDigest: String(repeating: "9", count: 64),
-            selectedAt: 9
+        let oldDrain = BrokerGenerationRecord(
+            id: prior.current.id,
+            role: .draining,
+            info: prior.current.info,
+            packageRoot: prior.current.packageRoot,
+            registeredAt: prior.current.registeredAt
         )
-        let originalDrain = try XCTUnwrap(fixture.drains.first?.generation)
-        let launcher = FakeBrokerHelperLauncher(onLaunch: {
-            _ = try fixture.store.save(
-                currentGenerationID: winnerDigest,
-                generations: [winnerCurrent, originalDrain],
-                expectedRevision: 1,
-                selection: selection,
-                now: 2
-            )
-        })
+        let requester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            contentDigest: targetDigest,
+            failLaunch: true,
+            onLaunch: {
+                _ = try store.save(
+                    currentGenerationID: targetDigest,
+                    generations: [deadTarget, oldDrain],
+                    expectedRevision: prior.registryTopologyVersion,
+                    now: 2
+                )
+            }
+        )
         let coordinator = BrokerStartupCoordinator(
-            locator: BrokerInfoLocator(userDataCandidates: [fixture.profile]),
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
             launcher: launcher,
-            homeDirectory: fixture.home,
-            appVersion: "native-test"
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
         )
 
-        do {
-            _ = try await coordinator.prepare()
-            XCTFail("a stale launcher must not overwrite a concurrent registry winner")
-        } catch {
-            XCTAssertEqual(error as? BrokerStartupError, .rendezvousChanged)
-        }
-        let registry = try fixture.store.load()
-        XCTAssertEqual(registry.revision, 2)
-        XCTAssertEqual(registry.currentGenerationID, winnerDigest)
-        XCTAssertEqual(registry.topology?.current, winnerCurrent)
-        XCTAssertEqual(registry.topology?.draining, [originalDrain])
-        XCTAssertEqual(registry.selection, selection)
-        let launchCount = await launcher.launchCount
-        XCTAssertEqual(launchCount, 1)
+        let adopted = try await coordinator.prepare()
+        let state = await coordinator.upgradeState()
+
+        XCTAssertEqual(adopted, live.info)
+        XCTAssertEqual(state, .pending(
+            fromContentDigest: oldDigest,
+            targetContentDigest: targetDigest,
+            reason: .launchFailed
+        ))
         await launcher.close()
     }
 
-    func testDeadCurrentReplacementFailsClosedWhenRegistryDisappearsDuringLaunch() async throws {
-        let fixture = try makeDeadCurrentWithDrains(
-            drainDigests: [String(repeating: "a", count: 64), String(repeating: "b", count: 64)]
+    func testTamperedSameTargetRegistryWinnerIsNeverAdoptedAsCurrent() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let targetDigest = String(repeating: "d", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let locator = BrokerInfoLocator(userDataCandidates: [live.profile])
+        let requester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            contentDigest: targetDigest,
+            rejectedStagedDigests: [targetDigest],
+            afterLaunch: {
+                let prior = try store.load()
+                let targetInfo = try locator.locateGenerationMetadata(
+                    contentDigest: targetDigest
+                )
+                let target = BrokerGenerationRecord(
+                    id: targetDigest,
+                    role: .current,
+                    info: targetInfo,
+                    packageRoot: live.profile
+                        .appendingPathComponent("broker-generations", isDirectory: true)
+                        .appendingPathComponent(targetDigest, isDirectory: true)
+                        .path,
+                    registeredAt: max(1, targetInfo.startedAt)
+                )
+                let old = BrokerGenerationRecord(
+                    id: prior.topology!.current.id,
+                    role: .draining,
+                    info: prior.topology!.current.info,
+                    packageRoot: prior.topology!.current.packageRoot,
+                    registeredAt: prior.topology!.current.registeredAt
+                )
+                _ = try store.save(
+                    currentGenerationID: targetDigest,
+                    generations: [target, old],
+                    expectedRevision: prior.revision,
+                    now: 2
+                )
+            }
         )
-        defer { fixture.drains.forEach { Darwin.close($0.descriptor) } }
-        let drainMetadata = try fixture.drains.map { try Data(contentsOf: $0.metadataURL) }
-        let launcher = FakeBrokerHelperLauncher(onLaunch: {
-            try FileManager.default.removeItem(at: fixture.store.registryURL)
-        })
         let coordinator = BrokerStartupCoordinator(
-            locator: BrokerInfoLocator(userDataCandidates: [fixture.profile]),
+            locator: locator,
             launcher: launcher,
-            homeDirectory: fixture.home,
-            appVersion: "native-test"
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
         )
 
-        do {
-            _ = try await coordinator.prepare()
-            XCTFail("a vanished captured registry must not be recreated without its drains")
-        } catch {
-            XCTAssertEqual(error as? BrokerStartupError, .rendezvousChanged)
-        }
+        let adopted = try await coordinator.prepare()
+        let state = await coordinator.upgradeState()
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.store.registryURL.path))
-        for (index, drain) in fixture.drains.enumerated() {
-            XCTAssertEqual(try Data(contentsOf: drain.metadataURL), drainMetadata[index])
-            XCTAssertTrue(FileManager.default.fileExists(atPath: drain.generation.info.socketPath))
-        }
-        let launchCount = await launcher.launchCount
-        XCTAssertEqual(launchCount, 1)
+        XCTAssertEqual(adopted, live.info)
+        XCTAssertEqual(state, .pending(
+            fromContentDigest: oldDigest,
+            targetContentDigest: targetDigest,
+            reason: .launchFailed
+        ))
         await launcher.close()
     }
 
@@ -533,6 +604,332 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
+    func testClaimOwnerDoesNotCancelOtherPreparedTargetFromMixedVersionWindow() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let staleTarget = String(repeating: "f", count: 64)
+        let bundledTarget = String(repeating: "d", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let prior = try XCTUnwrap(try store.load().topology)
+        let retained = try makeLiveDrainingGeneration(
+            profile: live.profile,
+            template: prior.current,
+            contentDigest: String(repeating: "a", count: 64)
+        )
+        defer { Darwin.close(retained.descriptor) }
+        _ = try store.save(
+            currentGenerationID: oldDigest,
+            generations: [prior.current, retained.generation],
+            expectedRevision: prior.registryTopologyVersion,
+            now: 2
+        )
+        let requester = ClaimedStaleHandoffRequester(staleTarget: staleTarget)
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            contentDigest: bundledTarget
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        let replacement = try await coordinator.prepare()
+        let cancelled = await requester.cancelledTargets()
+        let requests = await requester.upgradeTargets()
+        let launchCount = await launcher.launchCount
+        let registry = try store.load()
+
+        XCTAssertEqual(replacement, live.info)
+        XCTAssertEqual(registry.currentGenerationID, oldDigest)
+        XCTAssertEqual(cancelled, [])
+        XCTAssertEqual(requests, [bundledTarget])
+        XCTAssertEqual(launchCount, 0)
+        let topology = await coordinator.generationTopology()
+        XCTAssertEqual(topology?.current.id, oldDigest)
+        XCTAssertEqual(topology?.draining.map(\.id), [retained.generation.id])
+        await launcher.close()
+    }
+
+    func testPendingOtherHandoffFollowsPublishedCurrentAndCompletesBundledUpgrade() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let publishedDigest = String(repeating: "f", count: 64)
+        let bundledDigest = String(repeating: "d", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let requester = ClaimedStaleHandoffRequester(staleTarget: publishedDigest)
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            contentDigest: bundledDigest
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        let initiallyAdopted = try await coordinator.prepare()
+        XCTAssertEqual(initiallyAdopted, live.info)
+        let prior = try XCTUnwrap(try store.load().topology)
+        let published = try makeLiveDrainingGeneration(
+            profile: live.profile,
+            template: prior.current,
+            contentDigest: publishedDigest
+        )
+        defer { Darwin.close(published.descriptor) }
+        let publishedCurrent = BrokerGenerationRecord(
+            id: publishedDigest,
+            role: .current,
+            info: published.generation.info,
+            packageRoot: published.generation.packageRoot,
+            registeredAt: published.generation.registeredAt
+        )
+        let oldDrain = BrokerGenerationRecord(
+            id: prior.current.id,
+            role: .draining,
+            info: prior.current.info,
+            packageRoot: prior.current.packageRoot,
+            registeredAt: prior.current.registeredAt
+        )
+        _ = try store.save(
+            currentGenerationID: publishedDigest,
+            generations: [publishedCurrent, oldDrain],
+            expectedRevision: prior.registryTopologyVersion,
+            now: 2
+        )
+        await requester.markPublished()
+
+        let state = await coordinator.attemptUpgradeIfNeeded()
+        let topology = await coordinator.generationTopology()
+        let cancelled = await requester.cancelledTargets()
+
+        XCTAssertEqual(state, .current(contentDigest: bundledDigest))
+        XCTAssertEqual(topology?.current.id, bundledDigest)
+        XCTAssertEqual(cancelled, [])
+        await launcher.close()
+    }
+
+    func testMutationTimeIdentityChangeKeepsRetryAndFollowsPublishedCurrent() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let publishedDigest = String(repeating: "f", count: 64)
+        let bundledDigest = String(repeating: "d", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let requester = ClaimedStaleHandoffRequester(
+            staleTarget: publishedDigest,
+            firstDecision: .identityChanged
+        )
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            contentDigest: bundledDigest
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        let initiallyAdopted = try await coordinator.prepare()
+        XCTAssertEqual(initiallyAdopted, live.info)
+        let prior = try XCTUnwrap(try store.load().topology)
+        let published = try makeLiveDrainingGeneration(
+            profile: live.profile,
+            template: prior.current,
+            contentDigest: publishedDigest
+        )
+        defer { Darwin.close(published.descriptor) }
+        let publishedCurrent = BrokerGenerationRecord(
+            id: publishedDigest,
+            role: .current,
+            info: published.generation.info,
+            packageRoot: published.generation.packageRoot,
+            registeredAt: published.generation.registeredAt
+        )
+        let oldDrain = BrokerGenerationRecord(
+            id: prior.current.id,
+            role: .draining,
+            info: prior.current.info,
+            packageRoot: prior.current.packageRoot,
+            registeredAt: prior.current.registeredAt
+        )
+        _ = try store.save(
+            currentGenerationID: publishedDigest,
+            generations: [publishedCurrent, oldDrain],
+            expectedRevision: prior.registryTopologyVersion,
+            now: 2
+        )
+        await requester.markPublished()
+
+        let state = await coordinator.attemptUpgradeIfNeeded()
+        let topology = await coordinator.generationTopology()
+
+        XCTAssertEqual(state, .current(contentDigest: bundledDigest))
+        XCTAssertEqual(topology?.current.id, bundledDigest)
+        await launcher.close()
+    }
+
+    func testPublishedOtherCurrentReroutesEvenWhenItsNextUpgradeDefers() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let publishedDigest = String(repeating: "f", count: 64)
+        let bundledDigest = String(repeating: "d", count: 64)
+        let blockers = BrokerUpgradeBlockers(
+            liveTerminalCount: 1,
+            liveTerminalIDs: ["retained"],
+            busyAgentCount: 1,
+            busyTerminalIDs: ["retained"],
+            childTaskCount: 0
+        )
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let requester = ClaimedStaleHandoffRequester(
+            staleTarget: publishedDigest,
+            publishedDecision: .deferred(blockers)
+        )
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            contentDigest: bundledDigest
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        _ = try await coordinator.prepare()
+        let prior = try XCTUnwrap(try store.load().topology)
+        let published = try makeLiveDrainingGeneration(
+            profile: live.profile,
+            template: prior.current,
+            contentDigest: publishedDigest
+        )
+        defer { Darwin.close(published.descriptor) }
+        let publishedCurrent = BrokerGenerationRecord(
+            id: publishedDigest,
+            role: .current,
+            info: published.generation.info,
+            packageRoot: published.generation.packageRoot,
+            registeredAt: published.generation.registeredAt
+        )
+        let oldDrain = BrokerGenerationRecord(
+            id: prior.current.id,
+            role: .draining,
+            info: prior.current.info,
+            packageRoot: prior.current.packageRoot,
+            registeredAt: prior.current.registeredAt
+        )
+        _ = try store.save(
+            currentGenerationID: publishedDigest,
+            generations: [publishedCurrent, oldDrain],
+            expectedRevision: prior.registryTopologyVersion,
+            now: 2
+        )
+        await requester.markPublished()
+
+        let state = await coordinator.attemptUpgradeIfNeeded()
+        let topology = await coordinator.generationTopology()
+
+        XCTAssertEqual(state, .pending(
+            fromContentDigest: publishedDigest,
+            targetContentDigest: bundledDigest,
+            reason: .liveWork(blockers)
+        ))
+        XCTAssertEqual(
+            topology?.current.id,
+            publishedDigest,
+            "the app must reconnect to the newly authoritative current even if its next upgrade waits"
+        )
+        await launcher.close()
+    }
+
+    func testPublishedOtherCurrentUsesNewDigestWhenReconciliationThrows() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let publishedDigest = String(repeating: "f", count: 64)
+        let bundledDigest = String(repeating: "d", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let requester = ClaimedStaleHandoffRequester(staleTarget: publishedDigest)
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            contentDigest: bundledDigest,
+            rejectedStagedDigests: [publishedDigest]
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        _ = try await coordinator.prepare()
+        let prior = try XCTUnwrap(try store.load().topology)
+        let published = try makeLiveDrainingGeneration(
+            profile: live.profile,
+            template: prior.current,
+            contentDigest: publishedDigest
+        )
+        defer { Darwin.close(published.descriptor) }
+        let publishedCurrent = BrokerGenerationRecord(
+            id: publishedDigest,
+            role: .current,
+            info: published.generation.info,
+            packageRoot: published.generation.packageRoot,
+            registeredAt: published.generation.registeredAt
+        )
+        let oldDrain = BrokerGenerationRecord(
+            id: prior.current.id,
+            role: .draining,
+            info: prior.current.info,
+            packageRoot: prior.current.packageRoot,
+            registeredAt: prior.current.registeredAt
+        )
+        _ = try store.save(
+            currentGenerationID: publishedDigest,
+            generations: [publishedCurrent, oldDrain],
+            expectedRevision: prior.registryTopologyVersion,
+            selection: BrokerGenerationSelection(
+                generationID: publishedDigest,
+                selectingAppContentDigest: bundledDigest,
+                selectedAt: 2
+            ),
+            now: 2
+        )
+
+        let state = await coordinator.attemptUpgradeIfNeeded()
+        let topology = await coordinator.generationTopology()
+
+        XCTAssertEqual(state, .pending(
+            fromContentDigest: publishedDigest,
+            targetContentDigest: bundledDigest,
+            reason: .launchFailed
+        ))
+        XCTAssertEqual(topology?.current.id, publishedDigest)
+        await launcher.close()
+    }
+
     func testRollingCutoverDoesNotAuthorizeLegacyAdministrationForTamperedPriorPackage() async throws {
         let home = try privateTemporaryDirectory()
         let oldDigest = String(repeating: "e", count: 64)
@@ -572,7 +969,7 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
-    func testAcceptedRollingHandoffCancelsDeterministicallyWhenTargetLaunchFails() async throws {
+    func testAcceptedRollingHandoffNeverCancelsUnprovablyOwnedPrepareWhenLaunchFails() async throws {
         let home = try privateTemporaryDirectory()
         let oldDigest = String(repeating: "e", count: 64)
         let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
@@ -602,12 +999,43 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         XCTAssertEqual(registry.currentGenerationID, oldDigest)
         XCTAssertTrue(registry.topology?.draining.isEmpty == true)
         XCTAssertEqual(launchCount, 1)
-        XCTAssertEqual(cancelCount, 1)
-        XCTAssertEqual(cancelAuthorizations, [.sealedLegacyFallback])
+        XCTAssertEqual(cancelCount, 0)
+        XCTAssertEqual(cancelAuthorizations, [])
         XCTAssertEqual(state, .pending(
             fromContentDigest: oldDigest,
             targetContentDigest: String(repeating: "d", count: 64),
             reason: .launchFailed
+        ))
+        await launcher.close()
+    }
+
+    func testLegacyRollingHandoffNeverCancelsUnprovablyOwnedPrepareWhenLaunchFails() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let live = try makeLiveBroker(
+            home: home,
+            contentDigest: oldDigest,
+            implementationVersion: 2
+        )
+        defer { Darwin.close(live.descriptor) }
+        let requester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(implementationVersion: 2, failLaunch: true)
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        let adopted = try await coordinator.prepare()
+        let cancelCount = await requester.cancelCallCount()
+
+        XCTAssertEqual(adopted.contentDigest, oldDigest)
+        XCTAssertEqual(cancelCount, 0)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: BrokerGenerationRegistryStore(profileRoot: live.profile).registryURL.path
         ))
         await launcher.close()
     }
@@ -1290,7 +1718,8 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
 
     private func makeLiveBroker(
         home: URL,
-        contentDigest: String?
+        contentDigest: String?,
+        implementationVersion: Int = 1
     ) throws -> (profile: URL, descriptor: Int32) {
         let profile = home.appendingPathComponent("Kaisola", isDirectory: true)
         let broker = profile.appendingPathComponent("session-broker", isDirectory: true)
@@ -1306,7 +1735,7 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         var metadata: [String: Any] = [
             "protocol": 2,
             "securityEpoch": 1,
-            "implementationVersion": 1,
+            "implementationVersion": implementationVersion,
             "packageSchema": 1,
             "packageVersion": "old-package",
             "pid": getpid(),
@@ -1383,7 +1812,8 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
     }
 
     private func makeDeadCurrentWithDrains(
-        drainDigests: [String]
+        drainDigests: [String],
+        implementationVersion: Int = 1
     ) throws -> (
         home: URL,
         profile: URL,
@@ -1418,7 +1848,7 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         let info = BrokerInfo(
             protocolVersion: 2,
             securityEpoch: 1,
-            implementationVersion: 1,
+            implementationVersion: implementationVersion,
             packageSchema: 1,
             packageVersion: "old-package",
             contentDigest: digest,
@@ -1452,7 +1882,7 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
                 publishedInfo = BrokerInfo(
                     protocolVersion: drain.generation.info.protocolVersion,
                     securityEpoch: drain.generation.info.securityEpoch,
-                    implementationVersion: 1,
+                    implementationVersion: implementationVersion,
                     packageSchema: 1,
                     packageVersion: "test-package",
                     contentDigest: digest,
@@ -1654,32 +2084,177 @@ private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
     }
 }
 
+private actor InterleavingRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
+    enum Lifecycle: Equatable, Sendable {
+        case current
+        case draining(targetContentDigest: String)
+    }
+
+    private var lifecycle: Lifecycle
+    private var cancellations: [String] = []
+    init(initialLifecycle: Lifecycle) {
+        lifecycle = initialLifecycle
+    }
+
+    func requestUpgrade(
+        from info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws -> BrokerUpgradeDecision {
+        switch lifecycle {
+        case .current:
+            lifecycle = .draining(targetContentDigest: targetContentDigest)
+        case .draining(let preparedTarget) where preparedTarget == targetContentDigest:
+            break
+        case .draining(let preparedTarget):
+            // Models the unsafe implementation being regressed: it cancels a
+            // different coordinator's prepared target and immediately replaces
+            // it before either caller publishes the registry CAS.
+            cancellations.append(preparedTarget)
+            lifecycle = .draining(targetContentDigest: targetContentDigest)
+        }
+        return .accepted
+    }
+
+    func cancelRollingUpdate(
+        from info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws {
+        guard lifecycle == .draining(targetContentDigest: targetContentDigest) else {
+            throw BrokerClientError.identityChanged
+        }
+        cancellations.append(targetContentDigest)
+        lifecycle = .current
+    }
+
+    func requestRetirement(
+        of info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws -> BrokerRetirementDecision {
+        .identityChanged
+    }
+
+    func lifecycleState() -> Lifecycle { lifecycle }
+    func cancelledTargets() -> [String] { cancellations }
+}
+
+private actor ClaimedStaleHandoffRequester: BrokerRollingUpdateRequesting {
+    private let staleTarget: String
+    private let firstDecision: BrokerUpgradeDecision?
+    private let publishedDecision: BrokerUpgradeDecision
+    private var staleHandoffPresent = true
+    private var upgrades: [String] = []
+    private var cancellations: [String] = []
+
+    init(
+        staleTarget: String,
+        firstDecision: BrokerUpgradeDecision? = nil,
+        publishedDecision: BrokerUpgradeDecision = .accepted
+    ) {
+        self.staleTarget = staleTarget
+        self.firstDecision = firstDecision
+        self.publishedDecision = publishedDecision
+    }
+
+    func requestUpgrade(
+        from info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws -> BrokerUpgradeDecision {
+        upgrades.append(targetContentDigest)
+        if upgrades.count == 1, let firstDecision { return firstDecision }
+        return staleHandoffPresent
+            ? .preparedForOtherTarget(targetContentDigest: staleTarget)
+            : publishedDecision
+    }
+
+    func cancelRollingUpdate(
+        from info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws {
+        guard staleHandoffPresent, targetContentDigest == staleTarget else {
+            throw BrokerClientError.identityChanged
+        }
+        cancellations.append(targetContentDigest)
+        staleHandoffPresent = false
+    }
+
+    func requestRetirement(
+        of info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws -> BrokerRetirementDecision {
+        .identityChanged
+    }
+
+    func cancelledTargets() -> [String] { cancellations }
+    func upgradeTargets() -> [String] { upgrades }
+    func markPublished() { staleHandoffPresent = false }
+}
+
+private actor AsyncBrokerTestGate {
+    private var entered = false
+    private var released = false
+    private var enteredWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enterAndWait() async throws {
+        entered = true
+        let waiters = enteredWaiters
+        enteredWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+        if released { return }
+        await withCheckedContinuation { releaseWaiters.append($0) }
+    }
+
+    func waitUntilEntered() async {
+        if entered { return }
+        await withCheckedContinuation { enteredWaiters.append($0) }
+    }
+
+    func release() {
+        released = true
+        let waiters = releaseWaiters
+        releaseWaiters.removeAll()
+        waiters.forEach { $0.resume() }
+    }
+}
+
 private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
     private let implementationVersion: Int
+    private let contentDigest: String
     private let rejectedStagedDigests: Set<String>
     private let failLaunch: Bool
-    private let onLaunch: @Sendable () throws -> Void
+    private let onLaunch: @Sendable () async throws -> Void
+    private let afterLaunch: @Sendable () async throws -> Void
     private(set) var launchCount = 0
     private var descriptor: Int32 = -1
     private var socketURL: URL?
 
     init(
         implementationVersion: Int = 1,
+        contentDigest: String = String(repeating: "d", count: 64),
         rejectedStagedDigests: Set<String> = [],
         failLaunch: Bool = false,
-        onLaunch: @escaping @Sendable () throws -> Void = {}
+        onLaunch: @escaping @Sendable () async throws -> Void = {},
+        afterLaunch: @escaping @Sendable () async throws -> Void = {}
     ) {
         self.implementationVersion = implementationVersion
+        self.contentDigest = contentDigest
         self.rejectedStagedDigests = rejectedStagedDigests
         self.failLaunch = failLaunch
         self.onLaunch = onLaunch
+        self.afterLaunch = afterLaunch
     }
 
     func packageManifest() async throws -> BrokerHelperManifest {
         BrokerHelperManifest(
             schemaVersion: 1,
             packageVersion: "test-package",
-            contentDigest: String(repeating: "d", count: 64),
+            contentDigest: contentDigest,
             brokerImplementationVersion: implementationVersion,
             brokerProtocol: .init(minimum: 2, maximum: 2, securityEpoch: 1),
             node: .init(version: "22.23.1", abi: "127", architectures: ["arm64"]),
@@ -1691,14 +2266,18 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
     func validateStagedPackage(
         at root: URL,
         expected manifest: BrokerHelperManifest
-    ) async throws {}
+    ) async throws {
+        guard !rejectedStagedDigests.contains(manifest.contentDigest) else {
+            throw BrokerHelperPackageError.stagedPackageMismatch
+        }
+    }
 
     func verifiedStagedPackage(at root: URL) async throws -> VerifiedBrokerHelperPackage {
         let digest = root.lastPathComponent
         guard !rejectedStagedDigests.contains(digest) else {
             throw BrokerHelperPackageError.stagedPackageMismatch
         }
-        let packageVersion = digest == String(repeating: "d", count: 64)
+        let packageVersion = digest == contentDigest
             ? "test-package"
             : "old-package"
         let manifest = BrokerHelperManifest(
@@ -1716,7 +2295,7 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
 
     func launch(configurationURL: URL) async throws -> Int32 {
         launchCount += 1
-        try onLaunch()
+        try await onLaunch()
         if failLaunch {
             throw BrokerBootstrapError.launchRejected("focused test")
         }
@@ -1743,6 +2322,7 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
         let infoURL = URL(fileURLWithPath: configuration.infoFile)
         try JSONSerialization.data(withJSONObject: metadata, options: [.sortedKeys]).write(to: infoURL)
         _ = chmod(infoURL.path, 0o600)
+        try await afterLaunch()
         return getpid()
     }
 

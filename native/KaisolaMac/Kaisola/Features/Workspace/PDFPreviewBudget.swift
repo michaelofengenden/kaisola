@@ -478,9 +478,39 @@ struct PDFPreviewBudgetConfiguration: Equatable, Sendable {
 }
 
 struct PDFPreviewBudgetThresholds: Codable, Equatable, Sendable {
+    // Paging is gated twice, because one gate over these sample counts cannot
+    // do both jobs. A fixture turns 5 or 6 pages, and a 95th percentile over 5
+    // samples is arithmetically just the slowest one, so the old single
+    // `maximumSubsequentPagingP95LatencyMs: 750` was really "no page turn may
+    // ever exceed 750ms" wearing a percentile's name.
+    //
+    // That mattered because one page turn is legitimately far slower than the
+    // rest. Across seven CI runs the slowest `image-heavy` sample was the jump
+    // to the last page every single time, never another index, at 479, 512,
+    // 600, 632, 747, 771 and 880ms. The limit sat about 1.2x above a genuine
+    // recurring cost, so ordinary runner variance failed the job on two of
+    // those seven runs while nothing had regressed.
+    //
+    // The median is the stable statistic: over the same runs it stayed within
+    // 22-87ms for both paging fixtures, so 250ms leaves roughly 3x of room and
+    // still catches any regression that moves paging as a whole.
+    //
+    // The ceiling is deliberately not "a bit above the worst sample we have
+    // seen". A first attempt set it at 1500ms on seven runs topping out at
+    // 880ms, and the very next CI run turned that last page in 1698ms while its
+    // median sat at 64ms — nothing had regressed, the tail is simply that heavy
+    // on a shared runner. Chasing the tail with a slightly larger number just
+    // repeats the mistake the p95 gate made.
+    //
+    // So the ceiling is anchored to something with a meaning instead: a page
+    // turn must never cost as much as opening the document cold, which is
+    // `maximumFirstVisiblePageLatencyMs`. That is a real pathology rather than a
+    // percentile, it clears the worst sample yet observed by about 1.8x, and it
+    // leaves the median as the gate that actually detects regressions.
     static let standard = PDFPreviewBudgetThresholds(
         maximumFirstVisiblePageLatencyMs: 3_000,
-        maximumSubsequentPagingP95LatencyMs: 750,
+        maximumSubsequentPagingMedianLatencyMs: 250,
+        maximumSubsequentPagingLatencyMs: 3_000,
         maximumMalformedRejectionLatencyMs: 1_000,
         scrollMeasurementDurationSeconds: 3,
         maximumScrollP95IntervalMs: 50,
@@ -490,7 +520,8 @@ struct PDFPreviewBudgetThresholds: Codable, Equatable, Sendable {
     )
 
     let maximumFirstVisiblePageLatencyMs: Double
-    let maximumSubsequentPagingP95LatencyMs: Double
+    let maximumSubsequentPagingMedianLatencyMs: Double
+    let maximumSubsequentPagingLatencyMs: Double
     let maximumMalformedRejectionLatencyMs: Double
     let scrollMeasurementDurationSeconds: Double
     let maximumScrollP95IntervalMs: Double
@@ -558,7 +589,8 @@ struct PDFPreviewBudgetFixtureResult: Codable, Equatable, Sendable {
     let outcome: String
     let firstVisiblePageLatencyMs: Double?
     let subsequentPagingLatenciesMs: [Double]
-    let subsequentPagingP95LatencyMs: Double?
+    let subsequentPagingMedianLatencyMs: Double?
+    let subsequentPagingMaximumLatencyMs: Double?
     let malformedRejectionLatencyMs: Double?
     let scroll: PDFPreviewScrollMetrics?
     let diagnostics: [PDFPreviewBudgetDiagnostic]
@@ -613,7 +645,8 @@ struct PDFPreviewBudgetFixtureResult: Codable, Equatable, Sendable {
             ))
         }
 
-        var pagingP95: Double?
+        var pagingMedian: Double?
+        var pagingMaximum: Double?
         if specification.expectedOutcome == "rendered" {
             maximum(
                 "firstVisiblePageLatencyMs.maximum",
@@ -630,11 +663,19 @@ struct PDFPreviewBudgetFixtureResult: Codable, Equatable, Sendable {
                     limit: Double(specification.pagingPageIndexes.count)
                 )
                 if !measurements.subsequentPagingLatenciesMs.isEmpty {
-                    pagingP95 = percentile(measurements.subsequentPagingLatenciesMs, fraction: 0.95)
+                    let typical = median(of: measurements.subsequentPagingLatenciesMs)
+                    let slowest = measurements.subsequentPagingLatenciesMs.max() ?? 0
+                    pagingMedian = typical
+                    pagingMaximum = slowest
                     maximum(
-                        "subsequentPagingP95LatencyMs.maximum",
-                        observed: pagingP95!,
-                        limit: thresholds.maximumSubsequentPagingP95LatencyMs
+                        "subsequentPagingMedianLatencyMs.maximum",
+                        observed: typical,
+                        limit: thresholds.maximumSubsequentPagingMedianLatencyMs
+                    )
+                    maximum(
+                        "subsequentPagingMaximumLatencyMs.maximum",
+                        observed: slowest,
+                        limit: thresholds.maximumSubsequentPagingLatencyMs
                     )
                 }
             }
@@ -648,7 +689,8 @@ struct PDFPreviewBudgetFixtureResult: Codable, Equatable, Sendable {
                         outcome: outcome,
                         firstVisiblePageLatencyMs: measurements.firstVisiblePageLatencyMs,
                         subsequentPagingLatenciesMs: measurements.subsequentPagingLatenciesMs,
-                        subsequentPagingP95LatencyMs: pagingP95,
+                        subsequentPagingMedianLatencyMs: pagingMedian,
+                        subsequentPagingMaximumLatencyMs: pagingMaximum,
                         malformedRejectionLatencyMs: measurements.malformedRejectionLatencyMs,
                         scroll: nil,
                         diagnostics: diagnostics,
@@ -695,7 +737,8 @@ struct PDFPreviewBudgetFixtureResult: Codable, Equatable, Sendable {
             outcome: outcome,
             firstVisiblePageLatencyMs: measurements.firstVisiblePageLatencyMs,
             subsequentPagingLatenciesMs: measurements.subsequentPagingLatenciesMs,
-            subsequentPagingP95LatencyMs: pagingP95,
+            subsequentPagingMedianLatencyMs: pagingMedian,
+            subsequentPagingMaximumLatencyMs: pagingMaximum,
             malformedRejectionLatencyMs: measurements.malformedRejectionLatencyMs,
             scroll: measurements.scroll,
             diagnostics: diagnostics,
@@ -720,7 +763,8 @@ struct PDFPreviewBudgetFixtureResult: Codable, Equatable, Sendable {
             outcome: "harness-failed-\(message.prefix(80))",
             firstVisiblePageLatencyMs: nil,
             subsequentPagingLatenciesMs: [],
-            subsequentPagingP95LatencyMs: nil,
+            subsequentPagingMedianLatencyMs: nil,
+            subsequentPagingMaximumLatencyMs: nil,
             malformedRejectionLatencyMs: nil,
             scroll: nil,
             diagnostics: [diagnostic],
@@ -953,7 +997,7 @@ final class PDFPreviewBudgetRunner {
                 try PDFPreviewBudgetFixtureArtifact.capture(generated)
             }.value
             emit(PDFPreviewBudgetGenerationReceipt(
-                schemaVersion: 2,
+                schemaVersion: 3,
                 workload: Self.workload,
                 phase: .generate,
                 fixture: specification.id,
@@ -991,7 +1035,7 @@ final class PDFPreviewBudgetRunner {
             )
         }
         emit(PDFPreviewBudgetAppReceipt(
-            schemaVersion: 2,
+            schemaVersion: 3,
             workload: Self.workload,
             phase: .render,
             fixture: configuration.fixture.id,
@@ -1149,6 +1193,19 @@ final class PDFPreviewBudgetRunner {
         print("\(Self.receiptPrefix)FAIL \(reason)")
         try? FileHandle.standardOutput.synchronize()
     }
+}
+
+/// The middle sample, averaging the two middle ones for an even count. Paging
+/// fixtures produce 5 or 6 samples, too few for a percentile to mean anything,
+/// and one of them is reliably an order of magnitude slower than the rest.
+private func median(of values: [Double]) -> Double {
+    guard !values.isEmpty else { return 0 }
+    let sorted = values.sorted()
+    let middle = sorted.count / 2
+    if sorted.count.isMultiple(of: 2) {
+        return (sorted[middle - 1] + sorted[middle]) / 2
+    }
+    return sorted[middle]
 }
 
 private func percentile(_ values: [Double], fraction: Double) -> Double {

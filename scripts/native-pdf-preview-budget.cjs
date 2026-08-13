@@ -11,7 +11,7 @@ const { takeSample } = require('./native-resource-gate.cjs')
 
 const APP_RECEIPT_PREFIX = 'KAISOLA_NATIVE_PDF_PREVIEW_BUDGET_RECEIPT='
 const WORKLOAD = 'bounded-pdf-preview-v2'
-const SCHEMA_VERSION = 2
+const SCHEMA_VERSION = 3
 const MAX_CAPTURE_BYTES = 64 * 1024
 const LAUNCH_ARGUMENTS = ['-ApplePersistenceIgnoreState', 'YES']
 const PERSISTENCE_NOTICE = /^(?:\d{4}-\d{2}-\d{2} [^\r\n]+ )?ApplePersistenceIgnoreState: Existing state will not be touched\. New state will be written to [^\r\n]*\/[^\r\n]+\.savedState$/
@@ -72,9 +72,13 @@ const FIXTURES = Object.freeze([
   }),
 ])
 
+// Mirrors PDFPreviewBudgetThresholds.standard, which carries the measurements
+// these two paging limits come from. Both sides are compared exactly, so a
+// change here without the matching Swift change fails as threshold drift.
 const THRESHOLDS = Object.freeze({
   maximumFirstVisiblePageLatencyMs: 3_000,
-  maximumSubsequentPagingP95LatencyMs: 750,
+  maximumSubsequentPagingMedianLatencyMs: 250,
+  maximumSubsequentPagingLatencyMs: 3_000,
   maximumMalformedRejectionLatencyMs: 1_000,
   scrollMeasurementDurationSeconds: 3,
   maximumScrollP95IntervalMs: 50,
@@ -201,6 +205,14 @@ function percentile(values, fraction) {
   return sorted[Math.min(sorted.length - 1, Math.ceil((sorted.length - 1) * fraction))]
 }
 
+// Mirrors median(of:) in PDFPreviewBudget.swift.
+function median(values) {
+  if (!values.length) return 0
+  const sorted = [...values].sort((left, right) => left - right)
+  const middle = Math.floor(sorted.length / 2)
+  return sorted.length % 2 === 0 ? (sorted[middle - 1] + sorted[middle]) / 2 : sorted[middle]
+}
+
 function exactObject(actual, expected, label) {
   if (!isDeepStrictEqual(actual, expected)) fail(`${label} drifted`)
 }
@@ -314,15 +326,23 @@ function validateAppReceipt(receipt, expectedFixture, expectedPID) {
     finiteNumber(latency, 'paging latency')
   }
   if (fixture.pagingPageIndexes.length) {
-    const calculatedP95 = percentile(result.subsequentPagingLatenciesMs, 0.95)
-    if (Math.abs(calculatedP95 - result.subsequentPagingP95LatencyMs) > 0.001) {
-      fail('paging p95 is inconsistent with samples')
+    const calculatedMedian = median(result.subsequentPagingLatenciesMs)
+    const calculatedMaximum = Math.max(...result.subsequentPagingLatenciesMs)
+    if (Math.abs(calculatedMedian - result.subsequentPagingMedianLatencyMs) > 0.001) {
+      fail('paging median is inconsistent with samples')
     }
-    if (calculatedP95 > THRESHOLDS.maximumSubsequentPagingP95LatencyMs) {
-      fail('false-green paging latency')
+    if (Math.abs(calculatedMaximum - result.subsequentPagingMaximumLatencyMs) > 0.001) {
+      fail('paging maximum is inconsistent with samples')
     }
-  } else if (result.subsequentPagingP95LatencyMs != null) {
-    fail('non-paging fixture emitted a paging p95')
+    if (calculatedMedian > THRESHOLDS.maximumSubsequentPagingMedianLatencyMs) {
+      fail('false-green paging median latency')
+    }
+    if (calculatedMaximum > THRESHOLDS.maximumSubsequentPagingLatencyMs) {
+      fail('false-green paging maximum latency')
+    }
+  } else if (result.subsequentPagingMedianLatencyMs != null
+      || result.subsequentPagingMaximumLatencyMs != null) {
+    fail('non-paging fixture emitted paging statistics')
   }
 
   if (fixture.measuresSustainedScroll) {

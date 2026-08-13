@@ -66,6 +66,28 @@ struct SessionPaneLayout: Codable, Equatable, Sendable {
     var sessionIDs: [String] { columns.flatMap(\.sessionIDs) }
     var isEmpty: Bool { columns.isEmpty }
 
+    /// Whether a focus ring drawn on `sessionID` would carry any information.
+    ///
+    /// A focus ring means "this one, not the others". With a single pane there
+    /// are no others, so the ring stops distinguishing anything and becomes a
+    /// saturated accent rectangle drawn around the entire workspace — which is
+    /// how it read: a blue border framing the terminal at all times, for no
+    /// reason a reader could recover. The sidebar already marks which session
+    /// you are in, and marks it in the same accent, so the ring was not even
+    /// the only thing saying it.
+    ///
+    /// With two or more panes the ring earns its place again, because then it
+    /// is answering a question the window genuinely poses.
+    /// `maximizedID` matters because a maximized pane is rendered *alone* — see
+    /// the grid, which draws only that card — so counting the layout's panes
+    /// would say "you have siblings" about a window that is showing exactly one.
+    /// That is the same lone accent rectangle by another route.
+    func marksFocus(_ sessionID: String, focusedID: String?, maximizedID: String? = nil) -> Bool {
+        if let maximizedID, contains(maximizedID) { return false }
+        guard sessionIDs.count > 1 else { return false }
+        return focusedID == sessionID
+    }
+
     func contains(_ sessionID: String) -> Bool {
         columns.contains { $0.sessionIDs.contains(sessionID) }
     }

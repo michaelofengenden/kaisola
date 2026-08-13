@@ -1151,12 +1151,10 @@ final class QuietIdentityMarkTests: XCTestCase {
             footerWidth: NativeWorkspaceChrome.projectSidebarIdealWidth,
             usageChipWidth: usageChipWidth
         )
-        // The old chip framed avatar + name into 118pt total.
-        XCTAssertGreaterThan(width, 118 - FooterAccountBudget.avatarSlot)
 
         // v1.1.8 intentionally uses the first name at every width. The 210pt
-        // rail must give that stable label ample room even with usage visible;
-        // the whole display name remains in help text and the account menu.
+        // rail must give that stable label room even with usage visible; the
+        // whole display name remains in help text and the account menu.
         let full = "michael ofengenden"
         let displayed = FooterAccountName.displayed(full)
         XCTAssertEqual(displayed, "michael")
@@ -1164,14 +1162,34 @@ final class QuietIdentityMarkTests: XCTestCase {
             width, footerNameRenders(displayed),
             "the first-name label takes an ellipsis at the default width"
         )
-        XCTAssertGreaterThan(width - footerNameRenders(displayed), 50)
 
-        // The ladder still has to have been climbed. These are the three rungs;
-        // pinned so a later pass cannot restore the points it took and leave the
-        // rail narrow anyway.
+        // The margin is stated rather than assumed, because the footer was
+        // deliberately enlarged after this test was written: the avatar went
+        // 18 → 24, the three control slots 14 → 18, and the label 12 → 13pt,
+        // which together spend 18pt of this lane and 3.3pt on the label.
+        //
+        // That trade is only affordable because the label is the *first name*.
+        // Measured at the 210pt rail with the usage chip showing, the lane is
+        // 80.0pt and "michael" needs 48.2pt. The contract this test exists to
+        // defend is the one directly above — that the label never truncates at
+        // the default width — so the margin below is a comfort floor, not the
+        // contract, and it is asserted at a value the current sizes clear by
+        // more than 10pt rather than at whatever they happen to produce.
+        XCTAssertGreaterThan(width - footerNameRenders(displayed), 20)
+
+        // The rungs that are still load-free to keep, pinned so a later pass
+        // cannot quietly take these points back as well.
         XCTAssertEqual(FooterAccountBudget.leadingPadding, 6)
-        XCTAssertEqual(FooterAccountBudget.avatarSize, 18)
         XCTAssertEqual(FooterAccountBudget.usageChipHorizontalPadding, 1)
+
+        // And the lane must remain a *function* of the footer, which is the
+        // original regression: the old chip was framed to a fixed 118pt and
+        // then fixedSize'd, so dragging the sidebar wider changed nothing.
+        let wider = FooterAccountBudget.nameWidth(
+            footerWidth: NativeWorkspaceChrome.projectSidebarIdealWidth + 60,
+            usageChipWidth: usageChipWidth
+        )
+        XCTAssertEqual(wider - width, 60, accuracy: 0.001)
     }
 
     /// The label is stable across sidebar widths: first token, account casing

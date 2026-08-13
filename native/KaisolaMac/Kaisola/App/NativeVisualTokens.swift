@@ -165,6 +165,14 @@ enum KaisolaInk {
 }
 
 extension ShapeStyle where Self == Color {
+    /// Primary label ink. The top rung, and the one the footer's icon-only
+    /// controls take: the gear, the bell and the overflow sit level with a
+    /// column of session names, and in secondary grey at 12pt they were the
+    /// quietest things in the window while being three of the few that are
+    /// actually clickable. Icon-only controls are held to 3:1 as a floor, not
+    /// as a target.
+    static var kaisolaPrimary: Color { KaisolaInk.color(.primary) }
+
     /// Secondary label ink. The glass value, because one view tree spans both
     /// kinds of surface and glass is the safe superset: α 0.60 on an opaque
     /// white surface is 5.7:1, still unmistakably junior to primary's 15:1.
@@ -425,7 +433,14 @@ struct GlassBackdropWash: Equatable, Sendable {
     private static func sidebarBase(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
-            : light(top: 0.51, base: 0.45, bottom: 0.41)
+            // Light went 0.51/0.45/0.41 → 0.58/0.52/0.48 by request: glass read
+            // grey rather than white, and the veil is the only white in the
+            // stack. Transmission falls 0.55 → 0.48, still well clear of the
+            // 0.30 floor in `desktopTransmissionBand`, so the desktop survives
+            // and the surface stays translucent — it is simply whiter while it
+            // does. Contrast moves the safe way: this is a light surface, its
+            // worst patch is its darkest, and more white veil lifts that patch.
+            : light(top: 0.58, base: 0.52, bottom: 0.48)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour
@@ -453,7 +468,10 @@ struct GlassBackdropWash: Equatable, Sendable {
     private static func workspaceBase(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.30, base: 0.37, bottom: 0.46)
-            : light(top: 0.46, base: 0.40, bottom: 0.36)
+            // Light moves with the sidebar, +0.07 across the gradient, keeping
+            // the five points of separation that make the canvas read as the
+            // deeper surface. Transmission 0.60 → 0.53, above the 0.30 floor.
+            : light(top: 0.53, base: 0.47, bottom: 0.43)
     }
 
     /// How much of the workspace veil an **idle** canvas keeps.
@@ -658,6 +676,7 @@ private struct KaisolaChromePanelModifier: ViewModifier {
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
+    @ObservedObject private var settings = NativePreviewSettings.shared
 
     func body(content: Content) -> some View {
         let shape = RoundedRectangle(
@@ -690,17 +709,44 @@ private struct KaisolaChromePanelModifier: ViewModifier {
     /// thinner material, so the surface moves down instead of up and the backdrop
     /// still shows through. Light appearance is unchanged: there `.thinMaterial`
     /// already moves the surface the way it should go.
+    /// The panel isolates content from the backdrop, so what it should lay down
+    /// depends on what the backdrop actually is. It used to lay a material down
+    /// unconditionally, which is why Solid was never white: `windowBackgroundColor`
+    /// really does resolve to #FFFFFF in light appearance, and then this covered
+    /// it with a translucent grey. Solid promises "a flat opaque surface with no
+    /// wallpaper in it at all" and Tinted promises the desktop's hue over that
+    /// surface. Neither has a backdrop to be isolated from, so neither gets a
+    /// material; only Glass, which genuinely shows the desktop, still needs one.
     @ViewBuilder
     private func panelFill(_ shape: RoundedRectangle) -> some View {
         if reduceTransparency {
             shape.fill(Color(nsColor: .controlBackgroundColor))
-        } else if colorScheme == .dark {
-            ZStack {
-                shape.fill(.ultraThinMaterial)
-                shape.fill(Color.black.opacity(Self.darkPanelCoverage))
-            }
         } else {
-            shape.fill(.thinMaterial)
+            switch settings.workspaceBackdrop {
+            case .system:
+                // The white solid, stated here rather than left to show through,
+                // so the panel keeps its own opacity contract.
+                shape.fill(Color(nsColor: .windowBackgroundColor))
+            case .tinted:
+                // `WorkspaceBackdropView` already composites the solid surface
+                // and the desktop's hue over it. Anything added here would only
+                // grey down the tint this theme exists to show.
+                Color.clear
+            case .glass:
+                if colorScheme == .dark {
+                    ZStack {
+                        shape.fill(.ultraThinMaterial)
+                        shape.fill(Color.black.opacity(Self.darkPanelCoverage))
+                    }
+                } else {
+                    // Light glass reads greyer than dark glass does, because
+                    // `.thinMaterial` lifts toward white over a backdrop that is
+                    // already bright, so the desktop showing through arrives
+                    // flattened. The thinner material keeps the same isolating
+                    // job while letting more of the actual desktop reach the eye.
+                    shape.fill(.ultraThinMaterial)
+                }
+            }
         }
     }
 

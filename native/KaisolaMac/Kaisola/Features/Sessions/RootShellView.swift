@@ -72,6 +72,9 @@ struct RootShellView: View {
     @State private var showOnboarding = false
     @State private var showSettings = false
     @State private var settingsSectionID: String?
+    /// One unfinished chooser tab per project, owned by this window only. It
+    /// never enters AppModel or any durable session and process state.
+    @State private var newSessionDrafts = NewSessionDraftState()
     /// Opt-in, window-local follow mode. It is deliberately off at launch so a
     /// background tool call can never steal the user's document unexpectedly.
     @State private var followsSelectedAgentFiles = false
@@ -285,6 +288,9 @@ struct RootShellView: View {
                       ) else { return }
                 model.openFilePreview(activity.fileURL, pinned: false)
             }
+            .onChange(of: model.projects.map(\.id)) { _, projectIDs in
+                newSessionDrafts.retainProjects(Set(projectIDs))
+            }
             .onAppear {
                 let environment = ProcessInfo.processInfo.environment
                 if Self.shouldPresentReadinessReopenFixture(environment: environment) {
@@ -300,6 +306,15 @@ struct RootShellView: View {
                     }
                 } else if Self.shouldPresentOnboarding(environment: environment) {
                     showOnboarding = true
+                }
+                if environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1",
+                   ["new-session", "new-session-topbar"].contains(
+                    environment["KAISOLA_NATIVE_VISUAL_SURFACE"] ?? ""
+                   ) {
+                    DispatchQueue.main.async {
+                        guard let project = model.projects.first else { return }
+                        beginNewSession(in: project)
+                    }
                 }
             }
             .task(id: model.currentProjectDirectory?.standardizedFileURL.path) {
@@ -573,7 +588,8 @@ struct RootShellView: View {
                 for folder in folders { model.openProject(directory: folder) }
                 return true
             },
-            openProject: { runCommand(.openProject) },
+            beginNewSession: { beginNewSession(in: $0) },
+            selectRealSurface: { selectRealSurface() },
             useLeftTreeNavigation: { runCommand(.navigationLayout(.leftTree)) },
             moveProject: { model.moveProject(id: $0, toIndex: $1) },
             runQuickAction: { action, directory in
@@ -590,7 +606,6 @@ struct RootShellView: View {
                 ) else { return }
                 Task { await model.focusSurface(session.id) }
             },
-            projectLaunchMenu: { AnyView(projectLaunchMenu($0)) },
             projectContextMenu: { AnyView(projectContextMenu($0)) },
             sessionContextMenu: { AnyView(sessionContextMenuContent($0)) },
             chatContextMenu: { AnyView(chatContextMenuContent($0)) },
@@ -629,7 +644,12 @@ struct RootShellView: View {
                         // whose sessions are expanded.
                         isActiveProject: { activeProjectID == $0 },
                         selectSession: actions.selectSession,
-                        launchMenu: actions.projectLaunchMenu,
+                        beginNewSession: actions.beginNewSession,
+                        draftForProject: { newSessionDrafts.draft(for: $0) },
+                        selectedDraftID: newSessionDrafts.selectedDraftID,
+                        selectDraft: selectNewSessionDraft,
+                        selectRealSurface: actions.selectRealSurface,
+                        cancelDraft: cancelNewSession,
                         contextMenu: actions.projectContextMenu,
                         sessionContextMenu: actions.sessionContextMenu,
                         chatContextMenu: actions.chatContextMenu,
@@ -1190,7 +1210,7 @@ struct RootShellView: View {
                 projects: model.projects,
                 selected: activeProjectBinding,
                 menu: actions.projectContextMenu,
-                openFolder: actions.openProject,
+                newSession: actions.beginNewSession,
                 useSidebar: actions.useLeftTreeNavigation,
                 reorder: actions.moveProject
             )
@@ -1206,6 +1226,11 @@ struct RootShellView: View {
             SessionStrip(
                 model: model,
                 projectID: activeProjectID,
+                draft: activeProjectID.flatMap { newSessionDrafts.draft(for: $0) },
+                selectedDraftID: newSessionDrafts.selectedDraftID,
+                selectDraft: selectNewSessionDraft,
+                selectRealSurface: actions.selectRealSurface,
+                cancelDraft: cancelNewSession,
                 rename: actions.renameSurface,
                 closeChat: actions.closeChat,
                 deleteChat: actions.deleteChat,
@@ -1228,6 +1253,61 @@ struct RootShellView: View {
 
     private var activeProjectBinding: Binding<String?> {
         Binding(get: { activeProjectID }, set: { model.activateProject(id: $0) })
+    }
+
+    private var selectedNewSessionDraft: NewSessionDraft? {
+        guard let draft = newSessionDrafts.selectedDraft,
+              draft.projectID == activeProjectID else { return nil }
+        return draft
+    }
+
+    private func beginNewSession(in project: AppModel.ProjectGroup) {
+        guard project.directory != nil else {
+            ToastCenter.shared.show(
+                "Locate \(project.name) before starting a session.",
+                style: .info
+            )
+            return
+        }
+        model.activateProject(id: project.id)
+        newSessionDrafts.begin(projectID: project.id)
+    }
+
+    private func selectNewSessionDraft(_ id: String) {
+        guard let draft = newSessionDrafts.draftsByProject.values.first(where: { $0.id == id }),
+              model.projects.contains(where: { $0.id == draft.projectID && $0.directory != nil }) else {
+            return
+        }
+        model.activateProject(id: draft.projectID)
+        newSessionDrafts.selectDraft(id)
+    }
+
+    private func selectRealSurface() {
+        newSessionDrafts.selectRealSurface()
+    }
+
+    private func cancelNewSession(_ projectID: String) {
+        newSessionDrafts.cancel(projectID: projectID)
+    }
+
+    private func chooseNewSession(_ choice: NewSessionChoice, draft: NewSessionDraft) {
+        guard model.projects.contains(where: { $0.id == draft.projectID && $0.directory != nil }) else {
+            newSessionDrafts.cancel(projectID: draft.projectID)
+            ToastCenter.shared.show("This project folder is no longer available.", style: .info)
+            return
+        }
+        model.activateProject(id: draft.projectID)
+        newSessionDrafts.complete(projectID: draft.projectID)
+        switch choice {
+        case .terminal:
+            runCommand(.newTerminal)
+        case let .agentTerminal(agentID):
+            runCommand(.newAgent(agentID))
+        case let .chat(agentID):
+            runCommand(.newChat(agentID))
+        case .mesh:
+            runCommand(.newMesh)
+        }
     }
 
     /// Projects the user explicitly expanded. Absent from this set, a
@@ -1319,6 +1399,7 @@ struct RootShellView: View {
         if project.directory != nil {
             Button {
                 model.activateProject(id: project.id)
+                selectRealSurface()
                 runCommand(.newTerminal)
             } label: {
                 Label("New Terminal", systemImage: "terminal")
@@ -1326,6 +1407,7 @@ struct RootShellView: View {
             ForEach(AgentRegistry.all) { agent in
                 Button {
                     model.activateProject(id: project.id)
+                    selectRealSurface()
                     runCommand(.newAgent(agent.id))
                 } label: {
                     Label("New \(agent.name) Terminal", systemImage: agent.symbol)
@@ -1335,6 +1417,7 @@ struct RootShellView: View {
             ForEach(AgentRegistry.all.filter { AcpAdapter.forAgent($0.id) != nil }) { agent in
                 Button {
                     model.activateProject(id: project.id)
+                    selectRealSurface()
                     runCommand(.newChat(agent.id))
                 } label: {
                     Label("Chat with \(agent.name)", systemImage: "bubble.left.and.bubble.right")
@@ -1342,6 +1425,7 @@ struct RootShellView: View {
             }
             Button {
                 model.activateProject(id: project.id)
+                selectRealSurface()
                 runCommand(.newMesh)
             } label: {
                 Label("New Mesh", systemImage: "circle.hexagongrid.fill")
@@ -1572,7 +1656,26 @@ struct RootShellView: View {
     }
 
     private var detailContent: some View {
-        unifiedSessionPaneGrid
+        ZStack {
+            // Keep every real pane mounted while the draft chooser is in
+            // front. Live terminals and chats retain their view state, and the
+            // pane layout returns exactly as it was when the draft closes.
+            unifiedSessionPaneGrid
+            if let draft = selectedNewSessionDraft,
+               let project = model.projects.first(where: { $0.id == draft.projectID }) {
+                Color(nsColor: .windowBackgroundColor)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                NewSessionChooserView(
+                    projectName: project.name,
+                    catalog: .live,
+                    terminalControlAvailable: model.controlAvailable,
+                    choose: { chooseNewSession($0, draft: draft) },
+                    cancel: { cancelNewSession(draft.projectID) }
+                )
+                .padding(32)
+                .accessibilityIdentifier("new-session-chooser")
+            }
+        }
         .transaction { $0.animation = nil }
     }
 
@@ -4564,6 +4667,11 @@ enum TerminalPaneMinimizeAction: Equatable {
 private struct SessionStrip: View {
     @ObservedObject var model: AppModel
     let projectID: String?
+    let draft: NewSessionDraft?
+    let selectedDraftID: String?
+    let selectDraft: (String) -> Void
+    let selectRealSurface: () -> Void
+    let cancelDraft: (String) -> Void
     let rename: (String) -> Void
     let closeChat: (AcpChatHandle) -> Void
     let deleteChat: (AcpChatHandle) -> Void
@@ -4576,7 +4684,8 @@ private struct SessionStrip: View {
     }
 
     private var selectedSurfaceID: String? {
-        model.selectedChatID ?? model.selectedMeshID ?? model.selectedSessionID
+        if let draft, draft.id == selectedDraftID { return draft.id }
+        return model.selectedChatID ?? model.selectedMeshID ?? model.selectedSessionID
     }
 
     var body: some View {
@@ -4596,17 +4705,45 @@ private struct SessionStrip: View {
         let chats = project.map { model.chats(in: $0.id) } ?? []
         let meshes = project.map { model.meshes(in: $0.id) } ?? []
         let recentlyClosed = project.map { model.recentlyClosedSurfaces(in: $0.id) } ?? []
+        let draftSelected = draft?.id == selectedDraftID
         return ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
-                if sessions.isEmpty, chats.isEmpty, meshes.isEmpty, recentlyClosed.isEmpty {
+                if sessions.isEmpty, chats.isEmpty, meshes.isEmpty, recentlyClosed.isEmpty, draft == nil {
                     Text("No activity in this project")
                         .font(.caption)
                         .foregroundStyle(.kaisolaSecondary)
                         .padding(.horizontal, 8)
                 }
+                if let draft {
+                    Button { selectDraft(draft.id) } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "plus")
+                            Text("New Session")
+                        }
+                        .font(.callout.weight(draftSelected ? .semibold : .regular))
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background {
+                            surfaceTabBackground(
+                                selected: draftSelected,
+                                tint: WorkspacePalette.project
+                            )
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("New Session")
+                    .accessibilityAddTraits(draftSelected ? .isSelected : [])
+                    .contextMenu {
+                        Button("Cancel New Session") { cancelDraft(draft.projectID) }
+                    }
+                    .id(draft.id)
+                }
                 ForEach(chats) { chat in
-                    Button { model.selectChat(chat.id) } label: {
+                    Button {
+                        selectRealSurface()
+                        model.selectChat(chat.id)
+                    } label: {
                         HStack(spacing: 6) {
                             Image(systemName: "bubble.left.and.text.bubble.right")
                             Text(chat.conversation.title).lineLimit(1)
@@ -4629,7 +4766,7 @@ private struct SessionStrip: View {
                         .padding(.vertical, 5)
                         .background {
                             surfaceTabBackground(
-                                selected: model.selectedChatID == chat.id,
+                                selected: !draftSelected && model.selectedChatID == chat.id,
                                 tint: WorkspacePalette.chat
                             )
                         }
@@ -4645,7 +4782,10 @@ private struct SessionStrip: View {
                     .id(chat.id)
                 }
                 ForEach(meshes) { mesh in
-                    Button { model.selectMesh(mesh.id) } label: {
+                    Button {
+                        selectRealSurface()
+                        model.selectMesh(mesh.id)
+                    } label: {
                         HStack(spacing: 6) {
                             Image(systemName: "circle.hexagongrid.fill")
                                 .foregroundStyle(WorkspacePalette.mesh)
@@ -4661,7 +4801,7 @@ private struct SessionStrip: View {
                         .padding(.vertical, 5)
                         .background {
                             surfaceTabBackground(
-                                selected: model.selectedMeshID == mesh.id,
+                                selected: !draftSelected && model.selectedMeshID == mesh.id,
                                 tint: WorkspacePalette.mesh
                             )
                         }
@@ -4708,6 +4848,7 @@ private struct SessionStrip: View {
                         return false
                     }()
                     Button {
+                        selectRealSurface()
                         Task { await model.select(session.id) }
                     } label: {
                         HStack(spacing: 6) {
@@ -4730,7 +4871,7 @@ private struct SessionStrip: View {
                         .padding(.vertical, 5)
                         .background {
                             surfaceTabBackground(
-                                selected: model.selectedSessionID == session.id,
+                                selected: !draftSelected && model.selectedSessionID == session.id,
                                 tint: WorkspacePalette.terminal
                             )
                         }

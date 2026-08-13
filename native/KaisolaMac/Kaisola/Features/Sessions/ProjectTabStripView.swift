@@ -58,7 +58,7 @@ struct ProjectTabStripView: View {
     let projects: [AppModel.ProjectGroup]
     @Binding var selected: String?
     let menu: (AppModel.ProjectGroup) -> AnyView
-    let openFolder: () -> Void
+    let newSession: (AppModel.ProjectGroup) -> Void
     let useSidebar: () -> Void
     /// Persist a pointer drag-reorder: move project `id` to absolute `toIndex`
     /// in the project order. Wired to `AppModel.moveProject(id:toIndex:)`.
@@ -71,6 +71,7 @@ struct ProjectTabStripView: View {
     @State private var draggingID: String? = nil
 
     var body: some View {
+        let selectedProject = projects.first { $0.id == selected }
         ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 6) {
@@ -117,7 +118,10 @@ struct ProjectTabStripView: View {
                         )
                         .id(project.id)
                     }
-                    Button(action: openFolder) {
+                    Button {
+                        guard let selectedProject, selectedProject.directory != nil else { return }
+                        newSession(selectedProject)
+                    } label: {
                         Image(systemName: "plus")
                             .font(.caption.weight(.semibold))
                             .frame(width: 26, height: 26)
@@ -128,7 +132,23 @@ struct ProjectTabStripView: View {
                             }
                     }
                     .buttonStyle(.plain)
-                    .help("Open a folder as a project (⌘O)")
+                    .disabled(selectedProject?.directory == nil)
+                    .help(
+                        selectedProject.map { project in
+                            project.directory == nil
+                                ? "Locate this project before starting a session"
+                                : "New session in \(project.name)"
+                        } ?? "Open a project before starting a session"
+                    )
+                    .accessibilityLabel(
+                        selectedProject.map { "New session in \($0.name)" }
+                            ?? "New session"
+                    )
+                    .accessibilityHint(
+                        selectedProject?.directory == nil
+                            ? "A project with an available folder is required."
+                            : "Opens a temporary tab for choosing a session type."
+                    )
                     Button(action: useSidebar) {
                         Image(systemName: "sidebar.left")
                             .font(.caption.weight(.semibold))

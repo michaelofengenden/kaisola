@@ -101,6 +101,7 @@
 		45BDB67E55C8E0C6B1F2FF3E /* AcpComposerModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28FFC42BA9783C68516FA31C /* AcpComposerModel.swift */; };
 		461796BC63E29B3BAD8CAB8D /* BrokerBootstrapMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6647914275EC9AD4E4A1C04B /* BrokerBootstrapMain.swift */; };
 		46E02CD62E68B411ADECE3D9 /* UsageMeterPaletteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12E9F413AC35E693709288A /* UsageMeterPaletteTests.swift */; };
+		4A0D957608380D5A77E8C001 /* NewSessionChooserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7372202EE0749274E875CC59 /* NewSessionChooserView.swift */; };
 		4AEED15A504F6575273F165A /* AcpAdapterResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC20168C86DDDBA7D70222F3 /* AcpAdapterResolver.swift */; };
 		4B4670EA43E862CC87D986E2 /* AcpTranscriptPagingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B9366DA57DF29F48E569785 /* AcpTranscriptPagingTests.swift */; };
 		4BDC5B5AB5EC929E37C0181B /* NativePreviewSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */; };
@@ -160,6 +161,7 @@
 		768806706220AA2FBF980582 /* TranscriptSearchBudgetTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D77D695C72611E34382FDF10 /* TranscriptSearchBudgetTests.swift */; };
 		77A3BE106C196A76FF285F1F /* AgentFileFollow.swift in Sources */ = {isa = PBXBuildFile; fileRef = 856354DE0BB8187DD641F300 /* AgentFileFollow.swift */; };
 		798DE8FD51B9FFE7D6F9706F /* BrokerLaunchConfiguration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58663742F2D4497A3D234BF7 /* BrokerLaunchConfiguration.swift */; };
+		7A0EA1291D2559FF2EED0F00 /* NewSessionChooserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 578ABCFAF2467405A0B82B92 /* NewSessionChooserTests.swift */; };
 		7B168B0E70A7503AD02FF74D /* DetachedBrokerProcess.swift in Sources */ = {isa = PBXBuildFile; fileRef = A8C8F92A50B6817748440EAE /* DetachedBrokerProcess.swift */; };
 		7BC7DA25DFE3CD7C27BF3EBD /* ExtensionsSettingsModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 09871A17CA3466F16953DC55 /* ExtensionsSettingsModel.swift */; };
 		7D7BE0BDADEA2A4373D66096 /* CommandPaletteView.swift in Sources */ = {isa = PBXBuildFile; fileRef = DAF1B7984AA5A644F1BA5BB3 /* CommandPaletteView.swift */; };
@@ -485,6 +487,7 @@
 		54C430C9213147C88D3B98F9 /* CompanionHostFoundationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CompanionHostFoundationTests.swift; sourceTree = "<group>"; };
 		5531DF3E35ADBE7EBBA1054E /* BrokerGenerationRegistryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerGenerationRegistryTests.swift; sourceTree = "<group>"; };
 		5661F60153A30E55C8217B2A /* ApiKeyStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ApiKeyStoreTests.swift; sourceTree = "<group>"; };
+		578ABCFAF2467405A0B82B92 /* NewSessionChooserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewSessionChooserTests.swift; sourceTree = "<group>"; };
 		58663742F2D4497A3D234BF7 /* BrokerLaunchConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerLaunchConfiguration.swift; sourceTree = "<group>"; };
 		58E98EB49F192C275F6621D9 /* BrokerGenerationRouting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerGenerationRouting.swift; sourceTree = "<group>"; };
 		59057824C59D8B945BB9D032 /* OnboardingView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingView.swift; sourceTree = "<group>"; };
@@ -514,6 +517,7 @@
 		715B03F60293662C778FCB2C /* GlobalHotkeyCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalHotkeyCenter.swift; sourceTree = "<group>"; };
 		723801032158344A02236DFE /* UnifiedSessionCardStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedSessionCardStateTests.swift; sourceTree = "<group>"; };
 		732793D0CFBFD121B1D4146D /* SessionOrderStoreTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionOrderStoreTests.swift; sourceTree = "<group>"; };
+		7372202EE0749274E875CC59 /* NewSessionChooserView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewSessionChooserView.swift; sourceTree = "<group>"; };
 		73C156565BA4025A74960AD9 /* GitServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitServiceTests.swift; sourceTree = "<group>"; };
 		73DA2DC376948BFD21915726 /* MeshStagedTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MeshStagedTests.swift; sourceTree = "<group>"; };
 		757C6A4EEAF0C23D949EF4A5 /* AcpPermissionRulesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpPermissionRulesTests.swift; sourceTree = "<group>"; };
@@ -906,6 +910,7 @@
 				055F15AB1B998161AD252189 /* DetailShowDoors.swift */,
 				0E326DD35DF6CC17C6784988 /* NativeTerminalCoordinator.swift */,
 				E66C339455BFF598A81C41DE /* NativeTerminalSurface.swift */,
+				7372202EE0749274E875CC59 /* NewSessionChooserView.swift */,
 				C795387421EFBF56F0594EE7 /* NewSessionDraft.swift */,
 				9BBE0412CE376DD5EA36FC81 /* ProjectTabStripView.swift */,
 				DD0520C7CA820BC9B9798C98 /* ProjectTint.swift */,
@@ -1115,6 +1120,7 @@
 				BF12007D0734A61652801B2B /* NativeUpdateCheckRaceTests.swift */,
 				FA616801D125F0ACE1E5A177 /* NativeUpdateConfigurationTests.swift */,
 				E5076882199B6B8FFA0A323A /* NativeVisualLayoutAuditTests.swift */,
+				578ABCFAF2467405A0B82B92 /* NewSessionChooserTests.swift */,
 				F60291E350621AED42329A3B /* NewSessionDraftTests.swift */,
 				AF52791E7FB87F94AF30DBD2 /* NoBoardBoundaryTests.swift */,
 				8779132DE0F6325D261D6DEE /* NotificationBridgeBoundaryTests.swift */,
@@ -1531,6 +1537,7 @@
 				445679CA685A335A1E58CC6E /* NativeVisualLayoutAudit.swift in Sources */,
 				E8ECC0EF46B7927129A02CDB /* NativeVisualLayoutProbe.swift in Sources */,
 				10103B070FD91B46E781A884 /* NativeVisualTokens.swift in Sources */,
+				4A0D957608380D5A77E8C001 /* NewSessionChooserView.swift in Sources */,
 				4E06416BC6CCF27195FE969D /* NewSessionDraft.swift in Sources */,
 				D067393E0B5AB8131238FAC4 /* NotificationBridge.swift in Sources */,
 				00D9F73664C48755B2B541E7 /* ObserveOnlyBrokerClient.swift in Sources */,
@@ -1695,6 +1702,7 @@
 				DD85F3B3C80646A550454B5B /* NativeUpdateCheckRaceTests.swift in Sources */,
 				595E74C762DF125BE0076FEF /* NativeUpdateConfigurationTests.swift in Sources */,
 				9C3E6C7EFE9AB39FC8360B0D /* NativeVisualLayoutAuditTests.swift in Sources */,
+				7A0EA1291D2559FF2EED0F00 /* NewSessionChooserTests.swift in Sources */,
 				DC05BE1CBCE56C8201C23F11 /* NewSessionDraftTests.swift in Sources */,
 				73910D5FC9C8AF9C95A06F93 /* NoBoardBoundaryTests.swift in Sources */,
 				6966243948430FA43F69B729 /* NotificationBridgeBoundaryTests.swift in Sources */,

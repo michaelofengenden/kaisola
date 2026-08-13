@@ -1030,6 +1030,24 @@ final class QuietIdentityMarkTests: XCTestCase {
         )
     }
 
+    func testNewSessionDraftRowUsesItsDraftIdentityAndSelection() {
+        let draft = NewSessionDraft(id: "new-session-123", projectID: "project-a")
+
+        let selected = QuietNewSessionRowPresentation(
+            draft: draft,
+            selectedDraftID: draft.id
+        )
+        let resting = QuietNewSessionRowPresentation(
+            draft: draft,
+            selectedDraftID: nil
+        )
+
+        XCTAssertEqual(selected.accessibilityIdentifier, "new-session-123")
+        XCTAssertEqual(selected.accessibilityLabel, "New Session")
+        XCTAssertTrue(selected.isSelected)
+        XCTAssertFalse(resting.isSelected)
+    }
+
     /// …and the rail does not become a toolbar to do it. Exactly one project is
     /// active, so exactly one `+` rests in the column; every other project's
     /// stays behind the pointer.

@@ -5,12 +5,12 @@ import SwiftUI
 /// a second copy of session, project, or quick-action behavior.
 struct RootShellActionModel {
     let openDroppedProjects: ([URL]) -> Bool
-    let openProject: () -> Void
+    let beginNewSession: (AppModel.ProjectGroup) -> Void
+    let selectRealSurface: () -> Void
     let useLeftTreeNavigation: () -> Void
     let moveProject: (String, Int) -> Void
     let runQuickAction: (QuickAction, URL) -> Void
     let selectSession: (BrokerTerminalRecord) -> Void
-    let projectLaunchMenu: (AppModel.ProjectGroup) -> AnyView
     let projectContextMenu: (AppModel.ProjectGroup) -> AnyView
     let sessionContextMenu: (BrokerTerminalRecord) -> AnyView
     let chatContextMenu: (AcpChatHandle) -> AnyView

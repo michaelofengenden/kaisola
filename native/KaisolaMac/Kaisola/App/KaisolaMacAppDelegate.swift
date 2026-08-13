@@ -1187,7 +1187,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             try? NativePreviewPaths.prepareApplicationSupport()
         }
         if visualFixture {
-            settings.navigationLayout = ["topbar", "topbar-attention"].contains(visualSurface)
+            settings.navigationLayout = ["topbar", "topbar-attention", "new-session-topbar"].contains(visualSurface)
                 ? .topBar
                 : .leftTree
             settings.appearance = visualAppearance == "dark" ? .dark : .light
@@ -1196,7 +1196,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             // `empty-workspace` is the *idle* canvas — nothing mounted is its
             // whole definition, and a visible Files rail is a mounted surface.
             settings.workspaceRailVisible = visualSurface != "topbar" && visualSurface != "terminal-solo"
-                && visualSurface != "empty-workspace"
+                && visualSurface != "empty-workspace" && visualSurface != "new-session"
+                && visualSurface != "new-session-topbar"
             settings.workspaceRailWidth = 196
             // Pin both ordinary and failure-boundary document widths. The
             // fixture settings object is non-persistent, so these values can

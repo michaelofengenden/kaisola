@@ -51,11 +51,15 @@ struct QuietProjectRail: View {
     /// Terminal selection carries a focus policy the rail must not own (window
     /// hand-off, focused-pane and cross-project guards), so the host supplies it.
     private let selectSession: (BrokerTerminalRecord) -> Void
-    /// The active header's `+` offers creation only; destructive project actions
-    /// stay in the row's context menu. Its contents (New Terminal, the agent
-    /// terminals, Chat, Mesh) are the host's — the rail only decides where the
-    /// control sits and when it is drawn.
-    private let launchMenu: (AppModel.ProjectGroup) -> AnyView
+    /// Both navigation layouts open the same temporary chooser. The rail owns
+    /// only where the button and draft row are drawn; RootShellView owns the
+    /// draft state and creation command dispatch.
+    private let beginNewSession: (AppModel.ProjectGroup) -> Void
+    private let draftForProject: (String) -> NewSessionDraft?
+    private let selectedDraftID: String?
+    private let selectDraft: (String) -> Void
+    private let selectRealSurface: () -> Void
+    private let cancelDraft: (String) -> Void
     private let projectMenu: (AppModel.ProjectGroup) -> AnyView
     private let sessionMenu: (BrokerTerminalRecord) -> AnyView
     private let chatMenu: (AcpChatHandle) -> AnyView
@@ -79,7 +83,12 @@ struct QuietProjectRail: View {
         expansion: @escaping (String) -> Binding<Bool>,
         isActiveProject: @escaping (String) -> Bool,
         selectSession: @escaping (BrokerTerminalRecord) -> Void,
-        launchMenu: @escaping (AppModel.ProjectGroup) -> AnyView,
+        beginNewSession: @escaping (AppModel.ProjectGroup) -> Void,
+        draftForProject: @escaping (String) -> NewSessionDraft?,
+        selectedDraftID: String?,
+        selectDraft: @escaping (String) -> Void,
+        selectRealSurface: @escaping () -> Void,
+        cancelDraft: @escaping (String) -> Void,
         contextMenu: @escaping (AppModel.ProjectGroup) -> AnyView,
         sessionContextMenu: @escaping (BrokerTerminalRecord) -> AnyView,
         chatContextMenu: @escaping (AcpChatHandle) -> AnyView,
@@ -91,7 +100,12 @@ struct QuietProjectRail: View {
         self.expansion = expansion
         self.isActiveProject = isActiveProject
         self.selectSession = selectSession
-        self.launchMenu = launchMenu
+        self.beginNewSession = beginNewSession
+        self.draftForProject = draftForProject
+        self.selectedDraftID = selectedDraftID
+        self.selectDraft = selectDraft
+        self.selectRealSurface = selectRealSurface
+        self.cancelDraft = cancelDraft
         self.projectMenu = contextMenu
         self.sessionMenu = sessionContextMenu
         self.chatMenu = chatContextMenu
@@ -150,7 +164,12 @@ struct QuietProjectRail: View {
                 clock.note(id: id, status: status, at: observedAt)
             },
             selectSession: selectSession,
-            launchMenu: launchMenu,
+            beginNewSession: beginNewSession,
+            draft: draftForProject(project.id),
+            selectedDraftID: selectedDraftID,
+            selectDraft: selectDraft,
+            selectRealSurface: selectRealSurface,
+            cancelDraft: cancelDraft,
             projectMenu: projectMenu,
             sessionMenu: sessionMenu,
             chatMenu: chatMenu,
@@ -578,7 +597,12 @@ private struct QuietProjectGroup: View {
     let clockEntry: (String) -> QuietStatusClock.Entry?
     let note: (String, QuietSessionStatus) -> Void
     let selectSession: (BrokerTerminalRecord) -> Void
-    let launchMenu: (AppModel.ProjectGroup) -> AnyView
+    let beginNewSession: (AppModel.ProjectGroup) -> Void
+    let draft: NewSessionDraft?
+    let selectedDraftID: String?
+    let selectDraft: (String) -> Void
+    let selectRealSurface: () -> Void
+    let cancelDraft: (String) -> Void
     let projectMenu: (AppModel.ProjectGroup) -> AnyView
     let sessionMenu: (BrokerTerminalRecord) -> AnyView
     let chatMenu: (AcpChatHandle) -> AnyView
@@ -645,10 +669,13 @@ private struct QuietProjectGroup: View {
         // multiple tabs." The rail already knew the whole visible set; it was
         // collapsing it to a single id before drawing.
         let onScreen = onScreenSurfaceIDs(chats: chats, meshes: meshes, sessions: sessions)
-        let selected = QuietRowSelection.selectedID(
-            visibleIDs: onScreen,
-            focusedPaneID: model.focusedPaneID
-        )
+        let draftSelected = isActive && draft?.id == selectedDraftID
+        let selected = draftSelected
+            ? nil
+            : QuietRowSelection.selectedID(
+                visibleIDs: onScreen,
+                focusedPaneID: model.focusedPaneID
+            )
         // What each row actually draws. A title is only ambiguous relative to
         // the titles beside it, so this is decided once for the whole group
         // rather than per row — and only while the group is showing its rows.
@@ -657,6 +684,17 @@ private struct QuietProjectGroup: View {
         Group {
             header(statuses: statuses)
             if isExpanded {
+                if let draft {
+                    QuietNewSessionRowView(
+                        presentation: QuietNewSessionRowPresentation(
+                            draft: draft,
+                            selectedDraftID: selectedDraftID
+                        ),
+                        select: { selectDraft(draft.id) },
+                        cancel: { cancelDraft(draft.projectID) },
+                        groupHover: setHover
+                    )
+                }
                 ForEach(chats) { chat in
                     chatRow(
                         chat,
@@ -861,8 +899,8 @@ private struct QuietProjectGroup: View {
                     isActive: isActive,
                     hovering: hovering
                 ) {
-                    Menu {
-                        launchMenu(project)
+                    Button {
+                        beginNewSession(project)
                     } label: {
                         Image(systemName: "plus")
                             .font(.system(size: QuietRailMetrics.plusText, weight: .semibold))
@@ -871,8 +909,7 @@ private struct QuietProjectGroup: View {
                             // name beside it, which is the row's actual subject.
                             .foregroundStyle(.kaisolaSecondary)
                     }
-                    .menuStyle(.borderlessButton)
-                    .menuIndicator(.hidden)
+                    .buttonStyle(.plain)
                     .fixedSize()
                     .help("New session in \(project.name)")
                     .accessibilityLabel("New session in \(project.name)")
@@ -1152,7 +1189,10 @@ private struct QuietProjectGroup: View {
             isOnScreen: onScreen.contains(record.id),
             tooltip: tooltip(for: record),
             groupHover: setHover,
-            select: { selectSession(record) },
+            select: {
+                selectRealSurface()
+                selectSession(record)
+            },
             reveal: { model.revealSurfaceBeside(record.id) },
             menu: { sessionMenu(record) }
         )
@@ -1177,7 +1217,10 @@ private struct QuietProjectGroup: View {
             isOnScreen: onScreen.contains(chat.id),
             tooltip: chatTooltip(chat),
             groupHover: setHover,
-            select: { model.selectChat(chat.id) },
+            select: {
+                selectRealSurface()
+                model.selectChat(chat.id)
+            },
             reveal: { model.revealSurfaceBeside(chat.id) },
             menu: { chatMenu(chat) }
         )
@@ -1202,7 +1245,10 @@ private struct QuietProjectGroup: View {
             isOnScreen: onScreen.contains(mesh.id),
             tooltip: mesh.stage == "Idle" ? "Mesh · Ready" : "Mesh · \(mesh.stage)",
             groupHover: setHover,
-            select: { model.selectMesh(mesh.id) },
+            select: {
+                selectRealSurface()
+                model.selectMesh(mesh.id)
+            },
             reveal: { model.revealSurfaceBeside(mesh.id) },
             menu: { meshMenu(mesh) }
         )
@@ -1677,6 +1723,81 @@ private struct QuietStatusDot: View {
         .onAppear { pulsing = shouldPulse }
         .onChange(of: shouldPulse) { _, pulse in pulsing = pulse }
         .accessibilityHidden(true)
+    }
+}
+
+struct QuietNewSessionRowPresentation: Equatable, Sendable {
+    let accessibilityIdentifier: String
+    let accessibilityLabel = "New Session"
+    let isSelected: Bool
+
+    init(draft: NewSessionDraft, selectedDraftID: String?) {
+        accessibilityIdentifier = draft.id
+        isSelected = draft.id == selectedDraftID
+    }
+}
+
+/// The temporary chooser uses the exact hierarchy and selection grammar of a
+/// real surface row, but it has no running state, order entry, or destructive
+/// session actions because it does not represent durable work yet.
+private struct QuietNewSessionRowView: View {
+    let presentation: QuietNewSessionRowPresentation
+    let select: () -> Void
+    let cancel: () -> Void
+    let groupHover: (Bool) -> Void
+
+    var body: some View {
+        Button(action: select) {
+            HStack(spacing: 0) {
+                Image(systemName: "plus")
+                    .font(.system(size: QuietIdentityMarkView.symbolSize, weight: .regular))
+                    .foregroundStyle(
+                        presentation.isSelected ? QuietSelectionPill.ink : Color.kaisolaSecondary
+                    )
+                    .frame(width: QuietRailMetrics.mark, height: QuietRailMetrics.mark)
+                    .padding(.trailing, QuietRailMetrics.markGap)
+                Text("New Session")
+                    .font(.system(
+                        size: QuietRailMetrics.titleText,
+                        weight: QuietRowEmphasis.weight(isSelected: presentation.isSelected)
+                    ))
+                    .foregroundStyle(
+                        presentation.isSelected
+                            ? AnyShapeStyle(QuietSelectionPill.ink)
+                            : AnyShapeStyle(HierarchicalShapeStyle.primary)
+                    )
+                Spacer(minLength: QuietRailMetrics.laneGap)
+            }
+            .padding(.leading, QuietRailMetrics.sessionIndent)
+            .padding(.trailing, QuietRailMetrics.trailingInset)
+            .frame(height: QuietRailMetrics.rowHeight)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background {
+                if presentation.isSelected {
+                    QuietSelectionPillView(
+                        leadingInset: QuietRailMetrics.sessionIndent - QuietRailMetrics.pillMarkLead
+                    )
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(presentation.accessibilityLabel)
+        .accessibilityAddTraits(
+            presentation.isSelected ? [.isButton, .isSelected] : .isButton
+        )
+        .accessibilityIdentifier(presentation.accessibilityIdentifier)
+        .accessibilityAction { select() }
+        .accessibilityAction(named: Text("Cancel New Session")) { cancel() }
+        .onHover(perform: groupHover)
+        .help("Choose a session type")
+        .contextMenu {
+            Button("Cancel New Session", action: cancel)
+        }
+        .listRowInsets(QuietRailMetrics.listRowBleed)
+        .listRowSeparator(.hidden)
+        .listRowBackground(Color.clear)
     }
 }
 

@@ -28,6 +28,12 @@ jobs:
       # and probes the sealed helper itself, so the verify job's own app
       # compile would duplicate a weaker version of the same checks.
       skip-macos-release-build: true
+      # This workflow fires on every push to main with no path filter, so it
+      # calls the shared lane for every main commit. Saying so lets the shared
+      # workflow skip its own standalone push run, which was building the same
+      # commit twice and holding two of the five concurrent macOS jobs a
+      # personal plan allows.
+      called-by-release-candidate: true
 
   # Runs in parallel with swift-contracts: the candidate never consumes its
   # artifacts, and promotion (release.yml) requires this whole run — both

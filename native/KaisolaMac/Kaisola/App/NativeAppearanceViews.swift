@@ -578,7 +578,6 @@ struct SidebarBackdropView: View {
     static let liveTint = (dark: 0.15, light: 0.0)
 
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.controlActiveState) private var controlActiveState
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @ObservedObject private var settings = NativePreviewSettings.shared
@@ -586,7 +585,6 @@ struct SidebarBackdropView: View {
     /// path samples it directly, so the provider is observed here too.
     @ObservedObject private var desktop = DesktopBackdropProvider.shared
     let appearance: SidebarAppearance
-    let placement: SidebarRailPlacement
 
     @ViewBuilder
     var body: some View {
@@ -603,12 +601,6 @@ struct SidebarBackdropView: View {
                             reduceTransparency: reduceTransparency
                         ))
                         .veil
-                    if colorScheme == .light {
-                        LightRailTint.gradient(for: placement)
-                            .opacity(LightRailTint.visibility(
-                                isWindowActive: controlActiveState != .inactive
-                            ))
-                    }
                     if accessibilityContrast == .increased {
                         Color(nsColor: .controlBackgroundColor)
                             .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))

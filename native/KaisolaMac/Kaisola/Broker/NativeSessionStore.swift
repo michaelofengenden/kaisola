@@ -1546,6 +1546,10 @@ struct NativeRestorableMeshDescriptor: Codable, Equatable, Hashable, Identifiabl
     let purpose: MeshPurpose
     let lifecycle: NativeMeshLifecycle
     let columns: [NativeRestorableMeshColumnDescriptor]
+    /// Exact transcript identities retained after destructive worktree cleanup
+    /// empties `columns`. This is the durable bridge from a completed Mesh
+    /// lifecycle transaction to the per-column SQLite cleanup receipts.
+    let deletionColumnIDs: [String]
     /// Waiting staged-build prompts in dispatch order. The currently active
     /// scout/executor handoff is deliberately not replayed after a crash: only
     /// work that has not yet been dispatched is safe to resume automatically.
@@ -1560,6 +1564,7 @@ struct NativeRestorableMeshDescriptor: Codable, Equatable, Hashable, Identifiabl
         purpose: MeshPurpose,
         lifecycle: NativeMeshLifecycle,
         columns: [NativeRestorableMeshColumnDescriptor],
+        deletionColumnIDs: [String] = [],
         stagedPrompts: [String] = []
     ) {
         self.id = id
@@ -1570,6 +1575,7 @@ struct NativeRestorableMeshDescriptor: Codable, Equatable, Hashable, Identifiabl
         self.purpose = purpose
         self.lifecycle = lifecycle
         self.columns = columns
+        self.deletionColumnIDs = deletionColumnIDs
         self.stagedPrompts = stagedPrompts
     }
 
@@ -1582,6 +1588,7 @@ struct NativeRestorableMeshDescriptor: Codable, Equatable, Hashable, Identifiabl
         case purpose
         case lifecycle
         case columns
+        case deletionColumnIDs
         case stagedPrompts
     }
 
@@ -1595,6 +1602,10 @@ struct NativeRestorableMeshDescriptor: Codable, Equatable, Hashable, Identifiabl
         purpose = try container.decode(MeshPurpose.self, forKey: .purpose)
         lifecycle = try container.decode(NativeMeshLifecycle.self, forKey: .lifecycle)
         columns = try container.decode([NativeRestorableMeshColumnDescriptor].self, forKey: .columns)
+        deletionColumnIDs = try container.decodeIfPresent(
+            [String].self,
+            forKey: .deletionColumnIDs
+        ) ?? []
         stagedPrompts = try container.decodeIfPresent([String].self, forKey: .stagedPrompts) ?? []
     }
 
@@ -1608,7 +1619,23 @@ struct NativeRestorableMeshDescriptor: Codable, Equatable, Hashable, Identifiabl
         try container.encode(purpose, forKey: .purpose)
         try container.encode(lifecycle, forKey: .lifecycle)
         try container.encode(columns, forKey: .columns)
+        try container.encode(deletionColumnIDs, forKey: .deletionColumnIDs)
         try container.encode(stagedPrompts, forKey: .stagedPrompts)
+    }
+
+    func withDeletionColumnIDs(_ ids: [String]) -> NativeRestorableMeshDescriptor {
+        NativeRestorableMeshDescriptor(
+            id: id,
+            projectID: projectID,
+            basePath: basePath,
+            title: title,
+            mode: mode,
+            purpose: purpose,
+            lifecycle: lifecycle,
+            columns: columns,
+            deletionColumnIDs: ids,
+            stagedPrompts: stagedPrompts
+        )
     }
 }
 
@@ -2026,10 +2053,11 @@ actor NativeWorkspaceStateStore {
         case unsafePath
     }
 
-    /// Schema 2 adds durable Mesh manifests. Readers still decode schema 1 and
-    /// migrate it in memory, while older app versions reject schema 2 before
-    /// decoding and therefore cannot overwrite Mesh state on downgrade.
-    static let schemaVersion = 2
+    /// Schema 2 adds durable Mesh manifests. Schema 3 is emitted only while an
+    /// exact Mesh-column deletion bridge is present. Older app versions then
+    /// reject the archive before decoding, so a downgrade cannot erase an
+    /// in-flight cleanup receipt; ordinary archives remain schema 2.
+    static let schemaVersion = 3
     static let minimumReadableSchemaVersion = 1
     static let maximumProjects = 64
     static let maximumPanesPerProject = 8
@@ -2082,21 +2110,29 @@ actor NativeWorkspaceStateStore {
     private let encoder: JSONEncoder
     private let decoder: JSONDecoder
     private let meshWorktreeRoot: URL
+    private let injectedAgentChatRemovalFailureProjectIDs: Set<String>
     private var cachedArchive: Archive?
     /// A permanent chat deletion is process-global, while ordinary snapshots
     /// are window-local and can be stale. Fence stale windows after the
     /// explicit removal has committed so they cannot reinsert the descriptor
     /// before this process exits. Relaunch reads the already-pruned archive.
     private var removedAgentChatIDs: Set<String> = []
+    /// Mesh deletion has the same stale-window problem as chat deletion. The
+    /// archive is durable across relaunch; this process-local set prevents a
+    /// window that sampled the old descriptor from reinserting it meanwhile.
+    private var removedMeshIDs: Set<String> = []
 
     init(
         fileURL: URL = NativeWorkspaceStateStore.defaultArchiveURL,
         fileManager: FileManager = .default,
-        meshWorktreeRoot: URL = NativePreviewPaths.meshWorktreesDirectory
+        meshWorktreeRoot: URL = NativePreviewPaths.meshWorktreesDirectory,
+        injectedAgentChatRemovalFailureProjectIDs: Set<String> = []
     ) {
         self.fileURL = fileURL.standardizedFileURL
         self.fileManager = fileManager
         self.meshWorktreeRoot = meshWorktreeRoot.standardizedFileURL
+        self.injectedAgentChatRemovalFailureProjectIDs =
+            injectedAgentChatRemovalFailureProjectIDs
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -2230,7 +2266,8 @@ actor NativeWorkspaceStateStore {
             Self.preservingExistingDurablePanes(
                 from: archive.restoration,
                 in: state,
-                excludingAgentChatIDs: removedAgentChatIDs
+                excludingAgentChatIDs: removedAgentChatIDs,
+                excludingMeshIDs: removedMeshIDs
             ),
             meshWorktreeRoot: meshWorktreeRoot
         )
@@ -2249,7 +2286,8 @@ actor NativeWorkspaceStateStore {
         restoration.projects.append(Self.preservingExistingDurablePanes(
             from: existing,
             in: state,
-            excludingAgentChatIDs: removedAgentChatIDs
+            excludingAgentChatIDs: removedAgentChatIDs,
+            excludingMeshIDs: removedMeshIDs
         ))
         if makeSelected {
             restoration.selectedProjectID = state.projectID
@@ -2272,7 +2310,7 @@ actor NativeWorkspaceStateStore {
         var archive = try loadArchive()
         if let existing = archive.restoration.projects.first(where: { $0.projectID == projectID }) {
             let durablePanes = existing.panes.filter {
-                $0.surface.kind == .mesh
+                ($0.surface.kind == .mesh && !removedMeshIDs.contains($0.id))
                     || ($0.surface.kind == .agentChat
                         && !removedAgentChatIDs.contains($0.id))
                     || $0.isRecentlyClosed
@@ -2302,17 +2340,95 @@ actor NativeWorkspaceStateStore {
         guard Self.isValidIdentifier(projectID), Self.isValidIdentifier(meshID) else {
             throw StoreError.invalidIdentifier
         }
-        var archive = try loadArchive()
-        guard let index = archive.restoration.projects.firstIndex(where: { $0.projectID == projectID }) else {
-            return
+        if injectedAgentChatRemovalFailureProjectIDs.contains(projectID) {
+            throw StoreError.criticalDescriptorNotPersisted
         }
-        var project = archive.restoration.projects[index]
-        project.panes.removeAll { $0.surface.kind == .mesh && $0.id == meshID }
-        project.layout.remove(meshID)
-        if project.focusedPaneID == meshID { project.focusedPaneID = nil }
-        project.updatedAt = Int64(Date().timeIntervalSince1970 * 1_000)
-        archive.restoration.projects[index] = project
+        _ = try removeMeshStateEverywhere(meshID: meshID)
+    }
+
+    /// Persist the exact column set before Mesh destruction can empty its
+    /// manifest. Ordinary descriptor snapshots carry this marker forward
+    /// until the explicit archive-wide removal commits.
+    func prepareMeshTranscriptDeletion(
+        projectID: String,
+        meshID: String,
+        columnIDs: [String]
+    ) throws {
+        let normalizedColumnIDs = Array(Set(columnIDs)).sorted()
+        guard Self.isValidIdentifier(projectID), Self.isValidIdentifier(meshID),
+              !normalizedColumnIDs.isEmpty,
+              normalizedColumnIDs.count == columnIDs.count,
+              normalizedColumnIDs.count <= 256,
+              normalizedColumnIDs.allSatisfy(Self.isValidIdentifier) else {
+            throw StoreError.invalidIdentifier
+        }
+        cachedArchive = nil
+        var archive = try loadArchive()
+        guard let projectIndex = archive.restoration.projects.firstIndex(where: {
+            $0.projectID == projectID
+        }), let paneIndex = archive.restoration.projects[projectIndex].panes.firstIndex(where: {
+            $0.id == meshID && $0.surface.kind == .mesh
+        }), let descriptor = archive.restoration.projects[projectIndex]
+            .panes[paneIndex].surface.meshDescriptor else {
+            throw StoreError.criticalDescriptorNotPersisted
+        }
+        let existing = archive.restoration.projects[projectIndex].panes[paneIndex]
+        archive.restoration.projects[projectIndex].panes[paneIndex] = NativeRestorablePaneState(
+            id: existing.id,
+            surface: NativeRestorableSurfaceState(
+                mesh: descriptor.withDeletionColumnIDs(normalizedColumnIDs)
+            ),
+            sizeWeight: existing.sizeWeight,
+            isMinimized: existing.isMinimized,
+            isRecentlyClosed: existing.isRecentlyClosed,
+            closedAt: existing.closedAt
+        )
+        archive.restoration.projects[projectIndex].updatedAt = Int64(
+            Date().timeIntervalSince1970 * 1_000
+        )
         try persist(archive)
+    }
+
+    /// Archive-wide Mesh deletion is one atomic replacement: every duplicate
+    /// descriptor, its layout/focus references, and its workspace draft leave
+    /// together before any transcript receipt is allowed to advance.
+    @discardableResult
+    func removeMeshStateEverywhere(meshID: String) throws -> Bool {
+        guard Self.isValidIdentifier(meshID) else { throw StoreError.invalidIdentifier }
+        cachedArchive = nil
+        var archive = try loadArchive()
+        let matchingProjectIDs = Set(archive.restoration.projects.compactMap { project in
+            project.panes.contains {
+                $0.id == meshID && $0.surface.kind == .mesh
+            } ? project.projectID : nil
+        })
+        if !matchingProjectIDs.isDisjoint(with: injectedAgentChatRemovalFailureProjectIDs) {
+            throw StoreError.criticalDescriptorNotPersisted
+        }
+        var removed = false
+        let updatedAt = Int64(Date().timeIntervalSince1970 * 1_000)
+        for index in archive.restoration.projects.indices {
+            var project = archive.restoration.projects[index]
+            let previousCount = project.panes.count
+            let layoutContainedMesh = project.layout.contains(meshID)
+            let focusedMesh = project.focusedPaneID == meshID
+            project.panes.removeAll { $0.id == meshID && $0.surface.kind == .mesh }
+            project.layout.remove(meshID)
+            if focusedMesh { project.focusedPaneID = nil }
+            guard project.panes.count < previousCount || layoutContainedMesh || focusedMesh else {
+                continue
+            }
+            removed = true
+            project.updatedAt = updatedAt
+            archive.restoration.projects[index] = project
+        }
+        let draftID = Self.storageID(for: "mesh|\(meshID)")
+        let previousDraftCount = archive.drafts.count
+        archive.drafts.removeAll { $0.id == draftID }
+        if archive.drafts.count < previousDraftCount { removed = true }
+        if removed { try persist(archive) }
+        removedMeshIDs.insert(meshID)
+        return removed
     }
 
     /// Explicit permanent-delete boundary for an active or archived chat.
@@ -2323,6 +2439,9 @@ actor NativeWorkspaceStateStore {
     func removeAgentChatState(projectID: String, chatID: String) throws -> Bool {
         guard Self.isValidIdentifier(projectID), Self.isValidIdentifier(chatID) else {
             throw StoreError.invalidIdentifier
+        }
+        if injectedAgentChatRemovalFailureProjectIDs.contains(projectID) {
+            throw StoreError.criticalDescriptorNotPersisted
         }
         var archive = try loadArchive()
         guard let index = archive.restoration.projects.firstIndex(where: {
@@ -2350,6 +2469,137 @@ actor NativeWorkspaceStateStore {
         return removed
     }
 
+    /// Receipt-authorizing permanent-delete boundary. Chat identifiers are
+    /// globally unique at runtime, but damaged or stale multi-window archives
+    /// can contain the same identifier under more than one project. Remove
+    /// every matching descriptor, layout reference, and focus atomically so an
+    /// exact transcript receipt is never released while a duplicate survives.
+    @discardableResult
+    func removeAgentChatStateEverywhere(chatID: String) throws -> Bool {
+        guard Self.isValidIdentifier(chatID) else {
+            throw StoreError.invalidIdentifier
+        }
+        // This is an exact deletion authorization, not an ordinary window
+        // snapshot. Re-read the canonical archive so a duplicate inserted by a
+        // sibling window after restoration was sampled is included in the same
+        // atomic replacement instead of surviving under an unseen project.
+        cachedArchive = nil
+        var archive = try loadArchive()
+        let matchingProjectIDs = Set(archive.restoration.projects.compactMap { project in
+            project.panes.contains {
+                $0.id == chatID && $0.surface.kind == .agentChat
+            } ? project.projectID : nil
+        })
+        if !matchingProjectIDs.isDisjoint(
+            with: injectedAgentChatRemovalFailureProjectIDs
+        ) {
+            throw StoreError.criticalDescriptorNotPersisted
+        }
+
+        var removed = false
+        let updatedAt = Int64(Date().timeIntervalSince1970 * 1_000)
+        for index in archive.restoration.projects.indices {
+            var project = archive.restoration.projects[index]
+            let previousCount = project.panes.count
+            let layoutContainedChat = project.layout.contains(chatID)
+            let focusedChat = project.focusedPaneID == chatID
+            project.panes.removeAll {
+                $0.id == chatID && $0.surface.kind == .agentChat
+            }
+            project.layout.remove(chatID)
+            if focusedChat { project.focusedPaneID = nil }
+            guard project.panes.count < previousCount
+                    || layoutContainedChat
+                    || focusedChat else { continue }
+            removed = true
+            project.updatedAt = updatedAt
+            archive.restoration.projects[index] = project
+        }
+        let draftID = Self.storageID(for: "chat|\(chatID)")
+        let previousDraftCount = archive.drafts.count
+        archive.drafts.removeAll { $0.id == draftID }
+        if archive.drafts.count < previousDraftCount { removed = true }
+        if removed {
+            // One replacement is the authorization boundary: either every
+            // duplicate and the workspace plaintext draft are absent durably,
+            // or the operation throws and the transcript tombstone remains
+            // descriptor-blocked.
+            try persist(archive)
+        }
+        // Even an already-absent archive needs the in-process fence because a
+        // stale window can still submit a descriptor later in this process.
+        removedAgentChatIDs.insert(chatID)
+        return removed
+    }
+
+    /// Launch-time authorization for an exact transcript receipt whose owner
+    /// may be either a standalone chat or a Mesh column. Re-read the latest
+    /// archive, then remove every matching chat and every Mesh whose live or
+    /// deletion manifest names this transcript in one atomic replacement.
+    @discardableResult
+    func removeTranscriptStateEverywhere(chatID: String) throws -> Bool {
+        guard Self.isValidIdentifier(chatID) else { throw StoreError.invalidIdentifier }
+        cachedArchive = nil
+        var archive = try loadArchive()
+        var matchingMeshIDs = Set<String>()
+        var matchingProjectIDs = Set<String>()
+        for project in archive.restoration.projects {
+            var projectMatches = false
+            for pane in project.panes {
+                if pane.id == chatID && pane.surface.kind == .agentChat {
+                    projectMatches = true
+                }
+                guard let descriptor = pane.surface.meshDescriptor else { continue }
+                if descriptor.columns.contains(where: { $0.id == chatID })
+                    || descriptor.deletionColumnIDs.contains(chatID) {
+                    matchingMeshIDs.insert(descriptor.id)
+                    projectMatches = true
+                }
+            }
+            if projectMatches { matchingProjectIDs.insert(project.projectID) }
+        }
+        if !matchingProjectIDs.isDisjoint(with: injectedAgentChatRemovalFailureProjectIDs) {
+            throw StoreError.criticalDescriptorNotPersisted
+        }
+
+        var removed = false
+        let updatedAt = Int64(Date().timeIntervalSince1970 * 1_000)
+        for index in archive.restoration.projects.indices {
+            var project = archive.restoration.projects[index]
+            let previousCount = project.panes.count
+            let removedLayoutIDs = matchingMeshIDs.union([chatID]).filter {
+                project.layout.contains($0)
+            }
+            let focusedRemoval = project.focusedPaneID.map {
+                $0 == chatID || matchingMeshIDs.contains($0)
+            } ?? false
+            project.panes.removeAll { pane in
+                (pane.id == chatID && pane.surface.kind == .agentChat)
+                    || (pane.surface.kind == .mesh && matchingMeshIDs.contains(pane.id))
+            }
+            for id in matchingMeshIDs { project.layout.remove(id) }
+            project.layout.remove(chatID)
+            if focusedRemoval { project.focusedPaneID = nil }
+            guard project.panes.count < previousCount
+                    || !removedLayoutIDs.isEmpty
+                    || focusedRemoval else { continue }
+            removed = true
+            project.updatedAt = updatedAt
+            archive.restoration.projects[index] = project
+        }
+        let draftIDs = Set(
+            [Self.storageID(for: "chat|\(chatID)")]
+                + matchingMeshIDs.map { Self.storageID(for: "mesh|\($0)") }
+        )
+        let previousDraftCount = archive.drafts.count
+        archive.drafts.removeAll { draftIDs.contains($0.id) }
+        if archive.drafts.count < previousDraftCount { removed = true }
+        if removed { try persist(archive) }
+        removedAgentChatIDs.insert(chatID)
+        removedMeshIDs.formUnion(matchingMeshIDs)
+        return removed
+    }
+
     /// Explicit permanent deletion is the only path allowed to tombstone a
     /// recently closed descriptor. Ordinary partial-window snapshots preserve
     /// these entries so another window cannot silently resurrect or erase one.
@@ -2357,6 +2607,9 @@ actor NativeWorkspaceStateStore {
     func removeRecentlyClosedSurfaceState(projectID: String, surfaceID: String) throws -> Bool {
         guard Self.isValidIdentifier(projectID), Self.isValidIdentifier(surfaceID) else {
             throw StoreError.invalidIdentifier
+        }
+        if injectedAgentChatRemovalFailureProjectIDs.contains(projectID) {
+            throw StoreError.criticalDescriptorNotPersisted
         }
         var archive = try loadArchive()
         guard let index = archive.restoration.projects.firstIndex(where: { $0.projectID == projectID }) else {
@@ -2472,9 +2725,10 @@ actor NativeWorkspaceStateStore {
         do {
             header = try decoder.decode(ArchiveHeader.self, from: data)
         } catch {
-            // Schema 2 contains the only durable path/branch identity for
-            // potentially unintegrated Mesh work. Never reinterpret corruption
-            // as an empty archive that a later save may overwrite.
+            // Schema 2+ contains the only durable path/branch identity for
+            // potentially unintegrated Mesh work and schema 3 adds deletion
+            // cleanup receipts. Never reinterpret corruption as an empty
+            // archive that a later save may overwrite.
             throw StoreError.corruptArchive
         }
         guard header.schemaVersion >= Self.minimumReadableSchemaVersion,
@@ -2500,9 +2754,13 @@ actor NativeWorkspaceStateStore {
 
     private func persist(_ candidate: Archive) throws {
         var archive = candidate
-        archive.schemaVersion = Self.schemaVersion
         archive.restoration = Self.normalized(candidate.restoration, meshWorktreeRoot: meshWorktreeRoot)
         archive.drafts = Self.boundedDrafts(candidate.drafts, preservingID: nil)
+        archive.schemaVersion = archive.restoration.projects.contains { project in
+            project.panes.contains {
+                $0.surface.meshDescriptor?.deletionColumnIDs.isEmpty == false
+            }
+        } ? Self.schemaVersion : 2
 
         let data = try encoder.encode(archive)
         guard data.count <= Self.maximumArchiveBytes else {
@@ -2528,7 +2786,25 @@ actor NativeWorkspaceStateStore {
             if chmod(temporaryURL.path, mode_t(0o600)) != 0 {
                 throw CocoaError(.fileWriteNoPermission)
             }
+            let temporaryDescriptor = open(temporaryURL.path, O_RDONLY | O_CLOEXEC)
+            guard temporaryDescriptor >= 0 else { throw CocoaError(.fileWriteUnknown) }
+            defer { close(temporaryDescriptor) }
+            guard fsync(temporaryDescriptor) == 0 else {
+                throw CocoaError(.fileWriteUnknown)
+            }
             if rename(temporaryURL.path, fileURL.path) != 0 {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            // From this point the canonical bytes changed even if the directory
+            // durability sync reports failure. Never retain the pre-rename cache.
+            cachedArchive = nil
+            let directoryDescriptor = open(
+                fileURL.deletingLastPathComponent().path,
+                O_RDONLY | O_DIRECTORY | O_CLOEXEC
+            )
+            guard directoryDescriptor >= 0 else { throw CocoaError(.fileWriteUnknown) }
+            defer { close(directoryDescriptor) }
+            guard fsync(directoryDescriptor) == 0 else {
                 throw CocoaError(.fileWriteUnknown)
             }
             cachedArchive = archive
@@ -2620,11 +2896,24 @@ actor NativeWorkspaceStateStore {
     private static func preservingExistingDurablePanes(
         from existing: NativeProjectWorkspaceState?,
         in incoming: NativeProjectWorkspaceState,
-        excludingAgentChatIDs removedAgentChatIDs: Set<String>
+        excludingAgentChatIDs removedAgentChatIDs: Set<String>,
+        excludingMeshIDs removedMeshIDs: Set<String>
     ) -> NativeProjectWorkspaceState {
         var merged = incoming
+        if let existing {
+            let existingPanesByID = Dictionary(
+                uniqueKeysWithValues: existing.panes.map { ($0.id, $0) }
+            )
+            merged.panes = merged.panes.map { pane in
+                carryMeshDeletionColumns(
+                    from: existingPanesByID[pane.id],
+                    into: pane
+                )
+            }
+        }
         merged.panes.removeAll {
-            $0.surface.kind == .agentChat && removedAgentChatIDs.contains($0.id)
+            ($0.surface.kind == .agentChat && removedAgentChatIDs.contains($0.id))
+                || ($0.surface.kind == .mesh && removedMeshIDs.contains($0.id))
         }
         guard let existing else { return merged }
         var known = Set(merged.panes.map(\.id))
@@ -2634,6 +2923,8 @@ actor NativeWorkspaceStateStore {
             || oldPane.isRecentlyClosed)
             && !(oldPane.surface.kind == .agentChat
                 && removedAgentChatIDs.contains(oldPane.id))
+            && !(oldPane.surface.kind == .mesh
+                && removedMeshIDs.contains(oldPane.id))
             && known.insert(oldPane.id).inserted {
             var preserved = oldPane
             preserved.isMinimized = true
@@ -2645,12 +2936,25 @@ actor NativeWorkspaceStateStore {
     private static func preservingExistingDurablePanes(
         from existing: NativeWorkspaceRestorationState,
         in incoming: NativeWorkspaceRestorationState,
-        excludingAgentChatIDs removedAgentChatIDs: Set<String>
+        excludingAgentChatIDs removedAgentChatIDs: Set<String>,
+        excludingMeshIDs removedMeshIDs: Set<String>
     ) -> NativeWorkspaceRestorationState {
         var merged = incoming
         for index in merged.projects.indices {
+            let existingPanesByID = Dictionary(uniqueKeysWithValues:
+                (existing.projects.first {
+                    $0.projectID == merged.projects[index].projectID
+                }?.panes ?? []).map { ($0.id, $0) }
+            )
+            merged.projects[index].panes = merged.projects[index].panes.map { pane in
+                carryMeshDeletionColumns(
+                    from: existingPanesByID[pane.id],
+                    into: pane
+                )
+            }
             merged.projects[index].panes.removeAll {
-                $0.surface.kind == .agentChat && removedAgentChatIDs.contains($0.id)
+                ($0.surface.kind == .agentChat && removedAgentChatIDs.contains($0.id))
+                    || ($0.surface.kind == .mesh && removedMeshIDs.contains($0.id))
             }
         }
         var incomingDurableIDs = Set(
@@ -2663,6 +2967,8 @@ actor NativeWorkspaceStateStore {
                     || $0.isRecentlyClosed)
                     && !($0.surface.kind == .agentChat
                         && removedAgentChatIDs.contains($0.id))
+                    && !($0.surface.kind == .mesh
+                        && removedMeshIDs.contains($0.id))
                     && incomingDurableIDs.insert($0.id).inserted
             }
             guard !missing.isEmpty else { continue }
@@ -2684,6 +2990,30 @@ actor NativeWorkspaceStateStore {
             }
         }
         return merged
+    }
+
+    private static func carryMeshDeletionColumns(
+        from existing: NativeRestorablePaneState?,
+        into incoming: NativeRestorablePaneState
+    ) -> NativeRestorablePaneState {
+        guard let existingDescriptor = existing?.surface.meshDescriptor,
+              !existingDescriptor.deletionColumnIDs.isEmpty,
+              let incomingDescriptor = incoming.surface.meshDescriptor else {
+            return incoming
+        }
+        let ids = Array(Set(
+            existingDescriptor.deletionColumnIDs + incomingDescriptor.deletionColumnIDs
+        )).sorted()
+        return NativeRestorablePaneState(
+            id: incoming.id,
+            surface: NativeRestorableSurfaceState(
+                mesh: incomingDescriptor.withDeletionColumnIDs(ids)
+            ),
+            sizeWeight: incoming.sizeWeight,
+            isMinimized: incoming.isMinimized,
+            isRecentlyClosed: incoming.isRecentlyClosed,
+            closedAt: incoming.closedAt
+        )
     }
 
     private static func normalizedProject(
@@ -2961,6 +3291,9 @@ actor NativeWorkspaceStateStore {
                 purpose: descriptor.purpose,
                 lifecycle: descriptor.lifecycle,
                 columns: columns,
+                deletionColumnIDs: Array(Set(
+                    descriptor.deletionColumnIDs.filter(isValidIdentifier)
+                )).sorted().prefix(256).map { $0 },
                 stagedPrompts: descriptor.stagedPrompts
             )
             return NativeRestorableSurfaceState(mesh: normalizedDescriptor)

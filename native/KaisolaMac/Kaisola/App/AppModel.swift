@@ -8,6 +8,40 @@ struct TerminalPasteProgress: Equatable, Sendable {
     let totalBytes: Int
 }
 
+/// Foundation documents UserDefaults as thread-safe, but its Objective-C type
+/// does not yet carry a Sendable annotation. This narrow box crosses executors
+/// only for synchronous remove/synchronize/read-back operations while SQLite
+/// holds the exact deletion receipt transaction.
+private final class ChatDraftDefaultsCleanupContext: @unchecked Sendable {
+    private let current: UserDefaults
+    private let migrated: UserDefaults?
+
+    init(current: UserDefaults, migrated: UserDefaults?) {
+        self.current = current
+        self.migrated = migrated
+    }
+
+    func erase(keys: [String]) throws {
+        for key in keys {
+            current.removeObject(forKey: key)
+            migrated?.removeObject(forKey: key)
+        }
+        guard current.synchronize(), migrated?.synchronize() ?? true else {
+            throw AcpTranscriptStore.StoreError.database(
+                "deleted chat preferences could not be synchronized"
+            )
+        }
+        guard keys.allSatisfy({ key in
+            current.object(forKey: key) == nil
+                && migrated?.object(forKey: key) == nil
+        }) else {
+            throw AcpTranscriptStore.StoreError.database(
+                "deleted chat preferences could not be erased"
+            )
+        }
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     struct MissingSessionRecovery: Equatable, Sendable {
@@ -290,6 +324,22 @@ final class AppModel: ObservableObject {
     private let reconnectBackoff: BrokerReconnectBackoff
     private let sleep: @Sendable (UInt64) async throws -> Void
     private let jitter: @Sendable () -> Double
+    /// Optional suspension used by deterministic lifecycle tests. Production
+    /// passes nil; the hook runs only after the first deletion probe and
+    /// before the final probe immediately preceding chat materialization.
+    private let beforeRecentlyClosedChatMaterialization: (@Sendable (String) async -> Void)?
+    /// Optional deterministic race seam after the complete workspace archive
+    /// has been read but before its deletion receipts are reconciled. Nil in
+    /// production; tests use it to coordinate another window's exact delete.
+    private let afterWorkspaceRestorationRead: (@Sendable () async -> Void)?
+    /// Optional deterministic suspension after an active archived chat has
+    /// finished its fallible reads but before the final deletion authorization
+    /// and materialization boundary. Production passes nil.
+    private let beforeRestoredChatMaterialization: (@Sendable (String) async -> Void)?
+    /// Optional deterministic suspension after a Recently Closed chat's legacy
+    /// draft has been read but before any migration write is allowed. Nil in
+    /// production; tests use it to place deletion on that exact boundary.
+    private let beforeRecentlyClosedLegacyDraftMigration: (@Sendable (String) async -> Void)?
     private var selectedSession: BrokerTerminalRecord?
     private var activeBrokerIdentity: String?
     private var activeBrokerTopology: BrokerGenerationTopology?
@@ -384,6 +434,12 @@ final class AppModel: ObservableObject {
     private var restoredWorkspaceState = false
     private var isRestoringWorkspaceState = false
     private var workspaceSaveTasks: [String: Task<Void, Never>] = [:]
+    private var pendingNewTranscriptChatIDs: Set<String> = []
+    private var failedNewTranscriptChatIDs: Set<String> = []
+    /// New Mesh manifests can briefly contain provisioning columns before the
+    /// ACP object exists. Track the exact incarnation ids already established
+    /// so a later failed provisioning step can abandon only its empty debris.
+    private var provisionedTranscriptIDsByMeshID: [String: Set<String>] = [:]
     private let observerOwnerID = "kaisola-native"
 
     /// Disk-backed navigation state is cached in memory. `projects` is read by
@@ -435,7 +491,11 @@ final class AppModel: ObservableObject {
         },
         jitter: @escaping @Sendable () -> Double = {
             Double.random(in: -1...1)
-        }
+        },
+        beforeRecentlyClosedChatMaterialization: (@Sendable (String) async -> Void)? = nil,
+        afterWorkspaceRestorationRead: (@Sendable () async -> Void)? = nil,
+        beforeRestoredChatMaterialization: (@Sendable (String) async -> Void)? = nil,
+        beforeRecentlyClosedLegacyDraftMigration: (@Sendable (String) async -> Void)? = nil
     ) {
         self.brokerPreparer = brokerPreparer
         self.fallbackPreparer = fallbackPreparer
@@ -458,6 +518,11 @@ final class AppModel: ObservableObject {
         self.reconnectBackoff = reconnectBackoff
         self.sleep = sleep
         self.jitter = jitter
+        self.beforeRecentlyClosedChatMaterialization = beforeRecentlyClosedChatMaterialization
+        self.afterWorkspaceRestorationRead = afterWorkspaceRestorationRead
+        self.beforeRestoredChatMaterialization = beforeRestoredChatMaterialization
+        self.beforeRecentlyClosedLegacyDraftMigration =
+            beforeRecentlyClosedLegacyDraftMigration
         let transientTitleRepairs = Dictionary(uniqueKeysWithValues: sessionStore
             .sessions()
             .compactMap { stored -> (String, String)? in
@@ -2227,6 +2292,11 @@ final class AppModel: ObservableObject {
         workspaceSaveTasks[projectID] = Task { [weak self] in
             try? await Task.sleep(for: .milliseconds(220))
             guard !Task.isCancelled, let self else { return }
+            // A newly generated chat's durable incarnation is queued before
+            // appendChat. Never persist its restorable descriptor ahead of
+            // that first identity write.
+            await self.transcriptPersistenceTask?.value
+            guard !Task.isCancelled else { return }
             let snapshot = self.workspaceSnapshot(projectID: projectID)
             if let snapshot {
                 try? await self.workspaceStateStore.saveProjectState(snapshot, makeSelected: false)
@@ -2239,6 +2309,7 @@ final class AppModel: ObservableObject {
     private func persistWorkspaceStateImmediately(projectID: String) async {
         workspaceSaveTasks[projectID]?.cancel()
         workspaceSaveTasks[projectID] = nil
+        await transcriptPersistenceTask?.value
         if let snapshot = workspaceSnapshot(projectID: projectID) {
             try? await workspaceStateStore.saveProjectState(snapshot, makeSelected: false)
         } else {
@@ -2301,7 +2372,10 @@ final class AppModel: ObservableObject {
 
         // A hidden chat remains a restorable sidebar session; closing it is the
         // explicit destructive action that removes transcript and descriptor.
-        for chat in chats(in: projectID) where seen.insert(chat.id).inserted {
+        for chat in chats(in: projectID)
+        where !pendingNewTranscriptChatIDs.contains(chat.id)
+            && !failedNewTranscriptChatIDs.contains(chat.id)
+            && seen.insert(chat.id).inserted {
             let descriptor = NativeRestorableAgentChatDescriptor(
                 id: chat.id,
                 projectID: projectID,
@@ -2399,6 +2473,10 @@ final class AppModel: ObservableObject {
         return recentlyClosedPanes.remove(at: index)
     }
 
+    private func removeAllRecentlyClosedPanes(id: String) {
+        recentlyClosedPanes.removeAll { $0.id == id }
+    }
+
     private func updateRecentlyClosedMeshDescriptor(_ descriptor: NativeRestorableMeshDescriptor) {
         guard let index = recentlyClosedPanes.firstIndex(where: {
             $0.id == descriptor.id && $0.isRecentlyClosed
@@ -2427,6 +2505,7 @@ final class AppModel: ObservableObject {
     private func persistWorkspaceStateNow() async {
         for task in workspaceSaveTasks.values { task.cancel() }
         workspaceSaveTasks.removeAll()
+        await transcriptPersistenceTask?.value
         let explicitlyOpenProjectIDs = Set(persistedOpenProjects.map(\.id))
         var projectIDs = Set(paneLayouts.keys)
         projectIDs.formUnion(chats.map(\.projectID))
@@ -2518,6 +2597,26 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func enqueueNewTranscriptChatIncarnation(chatID: String) {
+        pendingNewTranscriptChatIDs.insert(chatID)
+        failedNewTranscriptChatIDs.remove(chatID)
+        let previous = transcriptPersistenceTask
+        let transcriptStore = transcriptStore
+        transcriptPersistenceTask = Task { [weak self] in
+            await previous?.value
+            let began = await transcriptStore.beginNewChatID(chatID)
+            guard let self else { return }
+            self.pendingNewTranscriptChatIDs.remove(chatID)
+            if !began {
+                self.failedNewTranscriptChatIDs.insert(chatID)
+                ToastCenter.shared.show(
+                    "The chat opened, but its saved identity could not be created.",
+                    style: .error
+                )
+            }
+        }
+    }
+
     /// Queue the durable transcript deletion behind the writes already in
     /// flight. The returned task carries the committed outcome, so a caller
     /// standing in front of a permanent-delete confirmation can wait for it
@@ -2525,7 +2624,7 @@ final class AppModel: ObservableObject {
     @discardableResult
     func enqueueTranscriptRemoval(
         chatID: String,
-        retainTombstone: Bool = false
+        verifiedDescriptorPruning: AcpTranscriptStore.TombstoneSnapshot? = nil
     ) -> Task<AcpTranscriptStore.Removal, Never> {
         explicitlyClosedChatIDs.insert(chatID)
         let previous = transcriptPersistenceTask
@@ -2539,7 +2638,7 @@ final class AppModel: ObservableObject {
             await usageCenter.flushPersistence()
             return await transcriptStore.remove(
                 chatID: chatID,
-                retainTombstone: retainTombstone
+                verifiedDescriptorPruning: verifiedDescriptorPruning
             )
         }
         transcriptPersistenceTask = Task { _ = await removal.value }
@@ -2603,7 +2702,11 @@ final class AppModel: ObservableObject {
         return outcome.restoration
     }
 
-    private func wireMeshPersistence(_ mesh: MeshSession, recentlyClosed: Bool = false) {
+    private func wireMeshPersistence(
+        _ mesh: MeshSession,
+        recentlyClosed: Bool = false,
+        creatingNewColumns: Bool = false
+    ) {
         let projectID = mesh.projectID
         mesh.onDescriptorChanged = { [weak self, weak mesh] in
             if recentlyClosed, let mesh {
@@ -2614,6 +2717,21 @@ final class AppModel: ObservableObject {
         mesh.persistDescriptor = { [weak self, weak mesh] in
             guard let self, let mesh else {
                 throw CancellationError()
+            }
+            if creatingNewColumns {
+                let desiredIDs = Set(mesh.durableColumnIDs)
+                let establishedIDs = self.provisionedTranscriptIDsByMeshID[mesh.id, default: []]
+                for chatID in desiredIDs.subtracting(establishedIDs).sorted() {
+                    guard await self.transcriptStore.beginNewChatID(chatID) else {
+                        throw NativeWorkspaceStateStore.StoreError.criticalDescriptorNotPersisted
+                    }
+                }
+                for chatID in establishedIDs.subtracting(desiredIDs).sorted() {
+                    guard await self.transcriptStore.abandonNewChatID(chatID) else {
+                        throw NativeWorkspaceStateStore.StoreError.criticalDescriptorNotPersisted
+                    }
+                }
+                self.provisionedTranscriptIDsByMeshID[mesh.id] = desiredIDs
             }
             if recentlyClosed {
                 self.updateRecentlyClosedMeshDescriptor(mesh.restorationDescriptor)
@@ -2682,6 +2800,7 @@ final class AppModel: ObservableObject {
         agentID: String,
         workspacePath: String
     ) {
+        guard !explicitlyClosedChatIDs.contains(chatID) else { return }
         enqueueTranscriptDraft(text, chatID: chatID)
         enqueueDraftSave(
             text,
@@ -2734,13 +2853,88 @@ final class AppModel: ObservableObject {
     /// Serialize the workspace removal behind older saves, and synchronously
     /// clear AcpConversation's current and migrated UserDefaults copies so no
     /// superseded location can restore plaintext on relaunch.
-    private func removeChatDraftsAfterDeletionCommit(chatID: String) async {
-        AcpConversation.removePersistedDraft(
-            for: chatID,
-            currentDefaults: chatDraftDefaults,
-            migratedDefaults: migratedChatDraftDefaults
+    private func completeChatExternalCleanup(
+        chatID: String,
+        tombstone: AcpTranscriptStore.TombstoneSnapshot
+    ) async -> AcpTranscriptStore.Removal {
+        let cleanup = ChatDraftDefaultsCleanupContext(
+            current: chatDraftDefaults,
+            migrated: migratedChatDraftDefaults
         )
-        await enqueueDraftRemoval(chatID: chatID).value
+        let defaultsKeys = AcpConversation.persistedDraftDefaultsKeys(for: chatID)
+            + AcpConversation.persistedBooleanConfigDefaultsKeys(for: chatID)
+        return await transcriptStore.completeExternalCleanup(
+            tombstone,
+            performExternalCleanup: {
+                try cleanup.erase(keys: defaultsKeys)
+            }
+        )
+    }
+
+    /// Mesh columns use the same transcript/defaults stores as standalone
+    /// chats, so their exact receipts complete through the same synchronous,
+    /// non-reentrant plaintext boundary. Enqueue every physical deletion
+    /// first, then attempt every cleanup even when one column reports failure.
+    private func completeMeshColumnDeletion(
+        _ tombstones: [AcpTranscriptStore.TombstoneSnapshot]
+    ) async -> String? {
+        let ordered = tombstones.sorted {
+            $0.chatID == $1.chatID
+                ? $0.generation < $1.generation
+                : $0.chatID < $1.chatID
+        }
+        let removals = ordered.map { tombstone in
+            (
+                tombstone,
+                enqueueTranscriptRemoval(
+                    chatID: tombstone.chatID,
+                    verifiedDescriptorPruning: tombstone
+                )
+            )
+        }
+        var firstFailure: String?
+        for (tombstone, removalTask) in removals {
+            let removal = await removalTask.value
+            guard removal.isRemoved else {
+                if firstFailure == nil { firstFailure = removal.failureMessage }
+                continue
+            }
+            usageCenter.remove(chatID: tombstone.chatID)
+            let cleanup = await completeChatExternalCleanup(
+                chatID: tombstone.chatID,
+                tombstone: tombstone
+            )
+            if firstFailure == nil { firstFailure = cleanup.failureMessage }
+        }
+        return firstFailure
+    }
+
+    private func fenceDestroyedMeshPersistence(_ mesh: MeshSession) {
+        mesh.onDescriptorChanged = nil
+        mesh.persistDescriptor = nil
+        mesh.onTranscriptChanged = nil
+        mesh.loadEarlierTranscript = nil
+        mesh.onColumnDraftChanged = nil
+        mesh.onColumnAttachmentsChanged = nil
+        mesh.onColumnSessionIDChanged = nil
+        mesh.onFileActivity = nil
+        mesh.onDraftChanged = nil
+    }
+
+    /// A safe Mesh destroy empties its live manifest before transcript cleanup.
+    /// Union the live ids with the archive-owned deletion bridge so a retry of
+    /// that already-destroyed surface still tombstones the original columns.
+    private func meshDeletionColumnIDs(
+        meshID: String,
+        projectID: String,
+        liveColumnIDs: [String]
+    ) async -> [String] {
+        await workspaceSaveTasks[projectID]?.value
+        let persisted = try? await workspaceStateStore.projectState(for: projectID)
+        let bridged = persisted?.panes.first {
+            $0.id == meshID && $0.surface.kind == .mesh
+        }?.surface.meshDescriptor?.deletionColumnIDs ?? []
+        return Array(Set(liveColumnIDs + bridged)).sorted()
     }
 
     /// Await the serialized draft queue so the durable store reflects every
@@ -2923,6 +3117,11 @@ final class AppModel: ObservableObject {
         workspaceSaveTasks.removeAll()
         defer { isRestoringWorkspaceState = false }
 
+        // Capture deletion generations before the full archive read. A member
+        // that is absent from that later complete archive represents a crash
+        // after descriptor pruning but before receipt release; it can be
+        // reclaimed without guessing from a partial/window-owned snapshot.
+        let tombstonesBeforeArchive = await transcriptStore.tombstoneSnapshots()
         let restoration: NativeWorkspaceRestorationState
         do {
             restoration = try await workspaceStateStore.restorationState()
@@ -2931,6 +3130,7 @@ final class AppModel: ObservableObject {
             await raiseWorkspaceRestorationNotice(for: error)
             return
         }
+        await afterWorkspaceRestorationRead?()
         // Closed projects sit out of restoration entirely (§4d): their
         // archived state stays on disk for ⌘⇧T reopen, but no chats, meshes,
         // layouts, or Recently Closed rows materialize for them at launch.
@@ -2941,51 +3141,245 @@ final class AppModel: ObservableObject {
         // workspace descriptor is removed. Prune every descriptor while its
         // tombstone still proves deletion intent; reclaiming tombstones first
         // would turn that stale descriptor back into an apparently live chat.
-        var canVacuumTranscriptTombstones = true
         var blockedRestoredChatIDs = Set<String>()
+        var blockedRestoredMeshIDs = Set<String>()
         // Deletion also applies to projects that are currently closed. Their
         // archived panes are not restored today, but leaving a stale
         // descriptor there would revive it when the project is reopened.
+        var descriptorProjectsByChatID: [String: Set<String>] = [:]
+        var restorableTranscriptIDs = Set<String>()
+        var meshIDsByTranscriptID: [String: Set<String>] = [:]
+        var durableTranscriptIDsByMeshID: [String: Set<String>] = [:]
         for projectState in restoration.projects {
             for pane in projectState.panes {
-                guard let descriptor = pane.surface.agentChatDescriptor else { continue }
-                switch await transcriptStore.tombstoneState(chatID: descriptor.id) {
-                case .present:
-                    blockedRestoredChatIDs.insert(descriptor.id)
-                    if chats.contains(where: { $0.id == descriptor.id }) {
-                        // A restoration retry can run after live state exists.
-                        // That handle may write another descriptor on teardown,
-                        // so keep the deletion fence for a later clean launch.
-                        canVacuumTranscriptTombstones = false
+                if let descriptor = pane.surface.agentChatDescriptor {
+                    descriptorProjectsByChatID[descriptor.id, default: []].insert(
+                        projectState.projectID
+                    )
+                    restorableTranscriptIDs.insert(descriptor.id)
+                }
+                if let descriptor = pane.surface.meshDescriptor {
+                    let durableColumnIDs = Set(
+                        descriptor.columns.map(\.id) + descriptor.deletionColumnIDs
+                    )
+                    durableTranscriptIDsByMeshID[descriptor.id, default: []].formUnion(
+                        durableColumnIDs
+                    )
+                    for column in descriptor.columns {
+                        restorableTranscriptIDs.insert(column.id)
                     }
-                    do {
-                        _ = try await workspaceStateStore.removeAgentChatState(
-                            projectID: projectState.projectID,
-                            chatID: descriptor.id
-                        )
-                    } catch {
-                        // Keep the tombstone until a later launch can prove the
-                        // stale descriptor is gone. Reclaiming it now would
-                        // authorize resurrection on the next restart.
-                        canVacuumTranscriptTombstones = false
+                    for columnID in durableColumnIDs {
+                        meshIDsByTranscriptID[columnID, default: []].insert(descriptor.id)
                     }
-                    continue
-                case .unknown:
-                    blockedRestoredChatIDs.insert(descriptor.id)
-                    // A failed probe is not evidence that deletion never
-                    // happened. Keep both stores untouched and try next time.
-                    canVacuumTranscriptTombstones = false
-                    continue
-                case .absent:
-                    continue
                 }
             }
+        }
+        let liveTranscriptIDs = Set(chats.map(\.id)).union(
+            meshes.flatMap(\.durableColumnIDs)
+        )
+        var verifiedDescriptorPruning = Set<AcpTranscriptStore.TombstoneSnapshot>()
+
+        // v0.1.121 and earlier could crash between sequential Mesh-column
+        // tombstones. A receipt for any archived member therefore owns the
+        // complete durable descriptor, including deletion-bridge ids and any
+        // duplicate/overlapping Mesh descriptors captured by this full scan.
+        // Bind the connected set in one SQLite transaction before removing a
+        // single archive row. A failed probe or batch leaves the whole set
+        // descriptor-blocked and retryable; the generic per-chat path below
+        // must not turn the partial receipt into authority to erase the Mesh.
+        let preArchiveTombstoneIDs = Set(
+            (tombstonesBeforeArchive ?? []).map(\.chatID)
+        )
+        var pendingLegacyMeshIDs = Set(preArchiveTombstoneIDs.flatMap {
+            meshIDsByTranscriptID[$0, default: []]
+        })
+        var legacyHandledMeshIDs = Set<String>()
+        var legacyHandledTranscriptIDs = Set<String>()
+        while let seedMeshID = pendingLegacyMeshIDs.sorted().first {
+            var componentMeshIDs = Set<String>()
+            var componentTranscriptIDs = Set<String>()
+            var frontier = [seedMeshID]
+            while let meshID = frontier.popLast() {
+                guard componentMeshIDs.insert(meshID).inserted else { continue }
+                let columnIDs = durableTranscriptIDsByMeshID[meshID, default: []]
+                componentTranscriptIDs.formUnion(columnIDs)
+                for columnID in columnIDs {
+                    for linkedMeshID in meshIDsByTranscriptID[columnID, default: []]
+                    where !componentMeshIDs.contains(linkedMeshID) {
+                        frontier.append(linkedMeshID)
+                    }
+                }
+            }
+            pendingLegacyMeshIDs.subtract(componentMeshIDs)
+            legacyHandledMeshIDs.formUnion(componentMeshIDs)
+            legacyHandledTranscriptIDs.formUnion(componentTranscriptIDs)
+            blockedRestoredMeshIDs.formUnion(componentMeshIDs)
+
+            let orderedColumnIDs = componentTranscriptIDs.sorted()
+            guard !orderedColumnIDs.isEmpty,
+                  componentTranscriptIDs.isDisjoint(with: liveTranscriptIDs) else {
+                continue
+            }
+            var probeFailed = false
+            for columnID in orderedColumnIDs {
+                if case .unknown = await transcriptStore.tombstoneSnapshot(chatID: columnID) {
+                    probeFailed = true
+                }
+            }
+            guard !probeFailed else { continue }
+            let batch = await transcriptStore.tombstone(chatIDs: orderedColumnIDs)
+            guard case let .recorded(receipts) = batch else { continue }
+            do {
+                // Mesh descriptors/layout/focus and Mesh drafts leave first,
+                // archive-wide. Re-read the latest archive for every column
+                // afterward so standalone duplicates, column drafts, and a
+                // Mesh inserted by a sibling window after our snapshot are all
+                // gone before any exact receipt is released.
+                for meshID in componentMeshIDs.sorted() {
+                    _ = try await workspaceStateStore.removeMeshStateEverywhere(
+                        meshID: meshID
+                    )
+                }
+                for columnID in orderedColumnIDs {
+                    _ = try await workspaceStateStore.removeTranscriptStateEverywhere(
+                        chatID: columnID
+                    )
+                }
+                verifiedDescriptorPruning.formUnion(receipts)
+            } catch {
+                // The all-column receipts stay descriptor-blocked. Even if an
+                // earlier archive replacement committed, the next complete
+                // scan can safely resume without resurrecting any member.
+            }
+        }
+
+        // Mesh destruction deliberately persists its exact column ids before
+        // Git cleanup can empty the ordinary manifest. If the app crashed
+        // after that safe lifecycle boundary but before SQLite tombstoning,
+        // establish the whole batch now and continue through the same exact
+        // archive/defaults reconciliation as an uninterrupted delete.
+        var preparedMeshDeletionColumns: [String: Set<String>] = [:]
+        for project in restoration.projects {
+            for pane in project.panes {
+                guard let descriptor = pane.surface.meshDescriptor,
+                      descriptor.lifecycle == .pendingDeletion,
+                      descriptor.columns.isEmpty,
+                      !descriptor.deletionColumnIDs.isEmpty else { continue }
+                preparedMeshDeletionColumns[descriptor.id, default: []].formUnion(
+                    descriptor.deletionColumnIDs
+                )
+            }
+        }
+        for meshID in preparedMeshDeletionColumns.keys.sorted() {
+            guard !legacyHandledMeshIDs.contains(meshID) else { continue }
+            let columnIDs = Array(preparedMeshDeletionColumns[meshID, default: []]).sorted()
+            blockedRestoredMeshIDs.insert(meshID)
+            var existingReceipts: [AcpTranscriptStore.TombstoneSnapshot] = []
+            var probeFailed = false
+            for columnID in columnIDs {
+                switch await transcriptStore.tombstoneSnapshot(chatID: columnID) {
+                case let .present(receipt): existingReceipts.append(receipt)
+                case .absent: break
+                case .unknown: probeFailed = true
+                }
+            }
+            guard !probeFailed else { continue }
+            let receipts: [AcpTranscriptStore.TombstoneSnapshot]
+            if existingReceipts.count == columnIDs.count {
+                receipts = existingReceipts
+            } else {
+                let result = await transcriptStore.tombstone(chatIDs: columnIDs)
+                guard case let .recorded(recorded) = result else { continue }
+                receipts = recorded
+            }
+            do {
+                _ = try await workspaceStateStore.removeMeshStateEverywhere(meshID: meshID)
+                verifiedDescriptorPruning.formUnion(receipts)
+            } catch {
+                // Every receipt remains descriptor-blocked and the prepared
+                // marker remains retryable in the latest archive.
+            }
+        }
+
+        // Only a receipt captured before the archive read may authorize
+        // descriptor pruning/reclamation. A deletion created later belongs to
+        // the next complete scan, even if its identifier happens to match.
+        for tombstone in (tombstonesBeforeArchive ?? []).sorted(by: {
+            $0.chatID == $1.chatID
+                ? $0.generation < $1.generation
+                : $0.chatID < $1.chatID
+        }) {
+            let chatID = tombstone.chatID
+            if !descriptorProjectsByChatID[chatID, default: []].isEmpty {
+                // This receipt existed before the archive read, so every
+                // matching descriptor in that captured value was already
+                // deleted. Even if another window prunes the descriptor and
+                // exact-vacuums the receipt before our later probe, this stale
+                // in-memory archive is never allowed to materialize it.
+                blockedRestoredChatIDs.insert(chatID)
+            }
+            blockedRestoredMeshIDs.formUnion(meshIDsByTranscriptID[chatID, default: []])
+            guard !legacyHandledTranscriptIDs.contains(chatID) else { continue }
+            guard !liveTranscriptIDs.contains(chatID) else { continue }
+            do {
+                // Authorize against the latest complete archive, not the stale
+                // project-id set derived from `restoration`: a sibling window
+                // may have inserted another duplicate after that snapshot.
+                _ = try await workspaceStateStore.removeAgentChatStateEverywhere(
+                    chatID: chatID
+                )
+                _ = try await workspaceStateStore.removeTranscriptStateEverywhere(
+                    chatID: chatID
+                )
+                // An already-absent descriptor is meaningful: the complete
+                // archive proves a prior crash landed after descriptor removal
+                // but before this exact receipt was released.
+                verifiedDescriptorPruning.insert(tombstone)
+            } catch {
+                // Keep this exact receipt descriptor-blocked for a later launch.
+            }
+        }
+
+        // Probe every archived descriptor separately so tombstones committed
+        // during/after the initial snapshot still suppress materialization.
+        // Those newer receipts remain blocked for the next full archive scan.
+        for chatID in descriptorProjectsByChatID.keys.sorted() {
+            switch await transcriptStore.tombstoneSnapshot(chatID: chatID) {
+            case .present:
+                blockedRestoredChatIDs.insert(chatID)
+            case .unknown:
+                blockedRestoredChatIDs.insert(chatID)
+                // A failed probe is not evidence that deletion never
+                // happened. Keep both stores untouched and try next time.
+            case .absent:
+                continue
+            }
+        }
+        // Before the first watermark compaction, grandfather legacy workspace
+        // descriptors (including legitimately empty chats that have no SQLite
+        // payload). Once compaction has happened, this API fails closed for an
+        // unknown id; restore never invokes the new-chat incarnation path.
+        for chatID in restorableTranscriptIDs.sorted()
+        where !blockedRestoredChatIDs.contains(chatID) {
+            guard await transcriptStore.establishRestorableChatID(chatID) else {
+                blockedRestoredChatIDs.insert(chatID)
+                blockedRestoredMeshIDs.formUnion(meshIDsByTranscriptID[chatID, default: []])
+                continue
+            }
+        }
+        for chatID in blockedRestoredChatIDs {
+            blockedRestoredMeshIDs.formUnion(meshIDsByTranscriptID[chatID, default: []])
         }
         recentlyClosedPanes = restorableProjects.flatMap { project in
             project.panes.filter { pane in
                 guard pane.isRecentlyClosed else { return false }
-                guard let descriptor = pane.surface.agentChatDescriptor else { return true }
-                return !blockedRestoredChatIDs.contains(descriptor.id)
+                if let descriptor = pane.surface.agentChatDescriptor {
+                    return !blockedRestoredChatIDs.contains(descriptor.id)
+                }
+                if let descriptor = pane.surface.meshDescriptor {
+                    return !blockedRestoredMeshIDs.contains(descriptor.id)
+                }
+                return true
             }
         }
 
@@ -3004,10 +3398,43 @@ final class AppModel: ObservableObject {
                 let transcript = await restoredTranscript(for: descriptor.id)
                 let legacyDraft = try? await workspaceStateStore.draft(for: "chat|\(descriptor.id)")
                 let draft = transcript?.draft ?? legacyDraft
-                if transcript?.draft == nil, let legacyDraft, !legacyDraft.isEmpty {
-                    await transcriptStore.scheduleDraft(legacyDraft, for: descriptor.id)
+                await beforeRestoredChatMaterialization?(descriptor.id)
+                // The archive-wide probe above is only a snapshot. Re-check
+                // after every restoration await and immediately before the
+                // synchronous append boundary, so a deletion committed by a
+                // different window cannot materialize a writable chat here.
+                switch await transcriptStore.tombstoneSnapshot(chatID: descriptor.id) {
+                case .unknown:
+                    blockedRestoredChatIDs.insert(descriptor.id)
+                    continue
+                case .present(let tombstone):
+                    blockedRestoredChatIDs.insert(descriptor.id)
+                    do {
+                        _ = try await workspaceStateStore.removeAgentChatStateEverywhere(
+                            chatID: descriptor.id
+                        )
+                    } catch {
+                        // Keep the exact receipt blocked. The stale descriptor
+                        // and transcript will be retried on the next healthy
+                        // full archive scan, but neither is restored now.
+                        continue
+                    }
+                    let removal = await enqueueTranscriptRemoval(
+                        chatID: descriptor.id,
+                        verifiedDescriptorPruning: tombstone
+                    ).value
+                    if removal.isRemoved {
+                        usageCenter.remove(chatID: descriptor.id)
+                        _ = await completeChatExternalCleanup(
+                            chatID: descriptor.id,
+                            tombstone: tombstone
+                        )
+                    }
+                    continue
+                case .absent:
+                    break
                 }
-                _ = appendChat(
+                guard appendChat(
                     id: descriptor.id,
                     agent: agent,
                     directory: directory,
@@ -3021,14 +3448,54 @@ final class AppModel: ObservableObject {
                     initialTranscript: transcript,
                     initialDraft: draft,
                     initialQueuedPrompts: descriptor.queuedPrompts
-                )
+                ) != nil else { continue }
+                // Legacy migration is a write. It is deliberately after the
+                // final deletion authorization and synchronous append, never
+                // between the final probe and materialization.
+                if transcript?.draft == nil, let legacyDraft, !legacyDraft.isEmpty {
+                    await transcriptStore.scheduleDraft(legacyDraft, for: descriptor.id)
+                }
             }
 
             for pane in projectState.panes {
                 guard !pane.isRecentlyClosed,
                       let descriptor = pane.surface.meshDescriptor,
+                      !blockedRestoredMeshIDs.contains(descriptor.id),
                       meshes.contains(where: { $0.id == descriptor.id }) == false,
                       NativeSessionStore.projectID(forDirectory: descriptor.basePath) == descriptor.projectID else {
+                    continue
+                }
+                var finalColumnReceipts: [AcpTranscriptStore.TombstoneSnapshot] = []
+                var finalColumnProbeFailed = false
+                for column in descriptor.columns {
+                    switch await transcriptStore.tombstoneSnapshot(chatID: column.id) {
+                    case let .present(receipt): finalColumnReceipts.append(receipt)
+                    case .absent: break
+                    case .unknown: finalColumnProbeFailed = true
+                    }
+                }
+                if finalColumnProbeFailed || !finalColumnReceipts.isEmpty {
+                    blockedRestoredMeshIDs.insert(descriptor.id)
+                    // Batch deletion is all-or-nothing. A partial receipt set
+                    // is not authority to erase the rest of a Mesh; retain its
+                    // descriptor and every receipt fail-closed for diagnosis.
+                    guard !finalColumnProbeFailed,
+                          finalColumnReceipts.count == descriptor.columns.count else {
+                        continue
+                    }
+                    do {
+                        for receipt in finalColumnReceipts {
+                            _ = try await workspaceStateStore.removeAgentChatStateEverywhere(
+                                chatID: receipt.chatID
+                            )
+                            _ = try await workspaceStateStore.removeTranscriptStateEverywhere(
+                                chatID: receipt.chatID
+                            )
+                        }
+                    } catch {
+                        continue
+                    }
+                    _ = await completeMeshColumnDeletion(finalColumnReceipts)
                     continue
                 }
                 if Self.claimedRestoredMeshIDs.contains(descriptor.id) {
@@ -3102,9 +3569,23 @@ final class AppModel: ObservableObject {
                 }
                 if mesh.lifecycle == .pendingDeletion,
                    mesh.restorationDescriptor.columns.isEmpty {
+                    let columnIDs = Array(Set(
+                        descriptor.deletionColumnIDs + descriptor.columns.map(\.id)
+                    )).sorted()
                     do {
-                        try await workspaceStateStore.removeMeshState(
-                            projectID: descriptor.projectID,
+                        let tombstones: [AcpTranscriptStore.TombstoneSnapshot]
+                        if columnIDs.isEmpty {
+                            tombstones = []
+                        } else {
+                            let result = await transcriptStore.tombstone(chatIDs: columnIDs)
+                            guard case let .recorded(recorded) = result else {
+                                throw NativeWorkspaceStateStore.StoreError
+                                    .criticalDescriptorNotPersisted
+                            }
+                            tombstones = recorded
+                        }
+                        fenceDestroyedMeshPersistence(mesh)
+                        _ = try await workspaceStateStore.removeMeshStateEverywhere(
                             meshID: mesh.id
                         )
                         meshes.removeAll { $0.id == mesh.id }
@@ -3112,6 +3593,8 @@ final class AppModel: ObservableObject {
                         surfaceObservers.removeValue(forKey: mesh.id)?.cancel()
                         meshLifecycleCoordinator.forget(meshID: mesh.id)
                         await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
+                        provisionedTranscriptIDsByMeshID.removeValue(forKey: mesh.id)
+                        _ = await completeMeshColumnDeletion(tombstones)
                     } catch {
                         // Keep the empty pending-deletion recovery surface. A
                         // later explicit retry can complete its tombstone;
@@ -3123,6 +3606,9 @@ final class AppModel: ObservableObject {
             var layout = projectState.layout
             for blockedChatID in blockedRestoredChatIDs {
                 layout.remove(blockedChatID)
+            }
+            for blockedMeshID in blockedRestoredMeshIDs {
+                layout.remove(blockedMeshID)
             }
             if connectionState.isConnected {
                 // Dormant terminals (persisted records the broker no longer
@@ -3142,11 +3628,24 @@ final class AppModel: ObservableObject {
             restoreFileTabs(from: projectState)
         }
 
-        if canVacuumTranscriptTombstones {
-            // Descriptors are now either known absent or durably pruned, so
-            // interrupted transcript deletion can safely finish and reclaim
-            // its one-shot tombstone.
-            await transcriptStore.vacuumTombstones(descriptorPruningVerified: true)
+        for tombstone in verifiedDescriptorPruning.sorted(by: {
+            $0.chatID == $1.chatID
+                ? $0.generation < $1.generation
+                : $0.chatID < $1.chatID
+        }) {
+            // Resume every boundary independently: transcript deletion can have
+            // committed before a crash while the exact receipt still retains
+            // the external-plaintext fence for this launch to finish.
+            let removal = await enqueueTranscriptRemoval(
+                chatID: tombstone.chatID,
+                verifiedDescriptorPruning: tombstone
+            ).value
+            guard removal.isRemoved else { continue }
+            usageCenter.remove(chatID: tombstone.chatID)
+            _ = await completeChatExternalCleanup(
+                chatID: tombstone.chatID,
+                tombstone: tombstone
+            )
         }
 
         if let projectID = restoration.selectedProjectID,
@@ -3338,7 +3837,7 @@ final class AppModel: ObservableObject {
             Self.staleInstructionNudgesShown.insert(project.id)
             ToastCenter.shared.show(nudge, style: .info, duration: 6)
         }
-        let chatID = "chat-\(UUID().uuidString.lowercased().prefix(8))"
+        let chatID = "chat-\(UUID().uuidString.lowercased())"
         guard let projectOverlay = projectAccountOverlay(forProject: project.id) else { return }
         let effectiveAccountEnvironment = ProcessInfo.processInfo.environment
             .merging(projectOverlay) { _, configured in configured }
@@ -3371,6 +3870,11 @@ final class AppModel: ObservableObject {
             ToastCenter.shared.show(warning, style: .info, duration: 5)
         }
         let runProfile = runProfile ?? AcpRunProfileStore().defaultProfile
+        // This is the sole product call that establishes a new incarnation,
+        // immediately after generating a fresh UUID and before the descriptor
+        // can enter the workspace archive. Restore/reconnect paths only verify
+        // an already durable incarnation.
+        enqueueNewTranscriptChatIncarnation(chatID: chatID)
         guard appendChat(
             id: chatID,
             agent: agent,
@@ -3688,39 +4192,28 @@ final class AppModel: ObservableObject {
     /// The explicit permanent-delete boundary for a live chat.
     @discardableResult
     func deleteChat(_ chatID: String) async -> AcpTranscriptStore.Removal {
+        let closingChat = chats.first(where: { $0.id == chatID })
         // Tombstone FIRST (§4e): the durable record of intent that every
         // later phase — and every other window sharing the database —
         // converges on, even across a crash. A failed write aborts the
         // delete instead of reporting success. If the app dies before this
         // lands, the delete simply didn't happen — never half-happened.
         let tombstoneResult = await transcriptStore.tombstone(chatID: chatID)
-        if case let .failed(error) = tombstoneResult {
+        guard case let .recorded(tombstone) = tombstoneResult else {
+            guard case let .failed(error) = tombstoneResult else {
+                return .failed(.database("transcript deletion intent was not recorded"))
+            }
             ToastCenter.shared.show(
                 "Couldn't delete the chat: \(error.message)",
                 style: .error
             )
             return .failed(error)
         }
-        let closingChat = chats.first(where: { $0.id == chatID })
-        var descriptorRemovalFailure: String?
-        if let projectID = closingChat?.projectID {
-            do {
-                _ = try await workspaceStateStore.removeAgentChatState(
-                    projectID: projectID,
-                    chatID: chatID
-                )
-            } catch {
-                // Transcript tombstoning is already durable, so restoration
-                // stays fail-closed even if the stale descriptor remains. Keep
-                // the live surface in place for an explicit retry; launch-time
-                // recovery also prunes it before reclaiming the tombstone.
-                descriptorRemovalFailure = error.localizedDescription
-            }
-        }
+        // Fence every callback synchronously before the next await. A draft
+        // already queued before the tombstone is drained below; anything that
+        // arrives afterward is refused by `enqueueDraftSave(chatID:)`.
+        explicitlyClosedChatIDs.insert(chatID)
         if let closingChat {
-            // Quiesce persistence synchronously on MainActor before stop()
-            // yields and lets already-buffered ACP events drain.
-            explicitlyClosedChatIDs.insert(chatID)
             closingChat.conversation.onTranscriptChanged = nil
             closingChat.conversation.onFileActivity = nil
             closingChat.conversation.onDraftChanged = nil
@@ -3732,6 +4225,23 @@ final class AppModel: ObservableObject {
             chatShutdownTasks.start(chatID) {
                 _ = await closingChat.conversation.stop()
             }
+        }
+        // The archive-wide removal is the durable proof that workspace
+        // plaintext is gone. Let every older queued save finish first so none
+        // can land after that proof and outlive the exact cleanup receipt.
+        await draftPersistenceTask?.value
+        var descriptorRemovalFailure: String?
+        var descriptorPruningReceipt: AcpTranscriptStore.TombstoneSnapshot?
+        do {
+            _ = try await workspaceStateStore.removeAgentChatStateEverywhere(
+                chatID: chatID
+            )
+            descriptorPruningReceipt = tombstone
+        } catch {
+            // Transcript tombstoning is already durable, so restoration stays
+            // fail-closed if any duplicate descriptor cannot be removed. Keep
+            // the exact receipt blocked for launch-time recovery.
+            descriptorRemovalFailure = error.localizedDescription
         }
         chats.removeAll { $0.id == chatID }
         usageObservers.removeValue(forKey: chatID)?.forEach { $0.cancel() }
@@ -3756,9 +4266,8 @@ final class AppModel: ObservableObject {
         // restoring on the next launch.
         let removalResult = await enqueueTranscriptRemoval(
             chatID: chatID,
-            retainTombstone: descriptorRemovalFailure != nil
+            verifiedDescriptorPruning: descriptorPruningReceipt
         ).value
-        await removeChatDraftsAfterDeletionCommit(chatID: chatID)
         // The workspace archive must reflect the deletion durably NOW, not
         // after a 220 ms debounce a crash can beat (§4e).
         // The descriptor was removed synchronously above. Do not route this
@@ -3785,6 +4294,17 @@ final class AppModel: ObservableObject {
                 style: .error
             )
             return .failed(.database(descriptorRemovalFailure))
+        }
+        let cleanupResult = await completeChatExternalCleanup(
+            chatID: chatID,
+            tombstone: tombstone
+        )
+        if let failure = cleanupResult.failureMessage {
+            ToastCenter.shared.show(
+                "The chat is closed, but its saved draft cleanup is incomplete: \(failure)",
+                style: .error
+            )
+            return cleanupResult
         }
         return .removed
     }
@@ -4273,12 +4793,13 @@ final class AppModel: ObservableObject {
         let environment = ProcessInfo.processInfo.environment
             .merging(projectOverlay) { _, custom in custom }
         let mesh = MeshSession(
+            id: "mesh-\(UUID().uuidString.lowercased())",
             baseDirectory: directory,
             mode: staged ? .staged : .flat,
             purpose: idea ? .idea : .build,
             usageCenter: usageCenter
         )
-        wireMeshPersistence(mesh)
+        wireMeshPersistence(mesh, creatingNewColumns: true)
         surfaceObservers[mesh.id] = mesh.objectWillChange.sink { [weak self] _ in
             self?.scheduleSurfaceSummaryCheck()
         }
@@ -4333,7 +4854,37 @@ final class AppModel: ObservableObject {
     /// `allowRecoverableWork`. Window/app/update teardown never enters here.
     func requestDeleteMesh(_ meshID: String, allowRecoverableWork: Bool) async -> MeshDeleteResult {
         guard let mesh = meshes.first(where: { $0.id == meshID }) else { return .unavailable }
-        let columnIDs = mesh.durableColumnIDs
+        let columnIDs = await meshDeletionColumnIDs(
+            meshID: meshID,
+            projectID: mesh.projectID,
+            liveColumnIDs: mesh.durableColumnIDs
+        )
+        let columnConversations = mesh.columns.map(\.conversation)
+        let initialAssessment = await mesh.discardAssessment()
+        switch initialAssessment {
+        case .safe:
+            break
+        case let .recoverableWork(columns) where !allowRecoverableWork:
+            return .needsConfirmation(columns: columns)
+        case .recoverableWork:
+            break
+        case let .blocked(message):
+            return .blocked(message)
+        }
+        if !columnIDs.isEmpty {
+            await workspaceSaveTasks[mesh.projectID]?.value
+            do {
+                try await workspaceStateStore.prepareMeshTranscriptDeletion(
+                    projectID: mesh.projectID,
+                    meshID: meshID,
+                    columnIDs: columnIDs
+                )
+            } catch {
+                return .blocked(
+                    "The Mesh deletion receipt could not be saved, so nothing was deleted: \(error.localizedDescription)"
+                )
+            }
+        }
         let outcome = await meshLifecycleCoordinator.destroy(
             mesh,
             allowRecoverableWork: allowRecoverableWork
@@ -4342,8 +4893,28 @@ final class AppModel: ObservableObject {
         switch result {
         case .safe:
             let projectID = mesh.projectID
+            for conversation in columnConversations {
+                conversation.forgetPersistentDraft()
+            }
+            fenceDestroyedMeshPersistence(mesh)
+            await draftPersistenceTask?.value
+            let tombstones: [AcpTranscriptStore.TombstoneSnapshot]
+            if columnIDs.isEmpty {
+                tombstones = []
+            } else {
+                let result = await transcriptStore.tombstone(chatIDs: columnIDs)
+                guard case let .recorded(recorded) = result else {
+                    guard case let .failed(error) = result else {
+                        return .blocked("Mesh column deletion intent could not be recorded.")
+                    }
+                    return .blocked(
+                        "Mesh work was cleaned up, but its column deletion receipt could not be saved: \(error.message)"
+                    )
+                }
+                tombstones = recorded
+            }
             do {
-                try await workspaceStateStore.removeMeshState(projectID: projectID, meshID: meshID)
+                _ = try await workspaceStateStore.removeMeshStateEverywhere(meshID: meshID)
             } catch {
                 return .blocked("Mesh work was cleaned up, but the close tombstone could not be saved: \(error.localizedDescription)")
             }
@@ -4353,21 +4924,11 @@ final class AppModel: ObservableObject {
             if selectedMeshID == meshID { selectedMeshID = nil }
             unifiedSessionCards.remove(meshID, from: projectID)
             meshLifecycleCoordinator.forget(meshID: meshID)
-            let removals = enqueueTranscriptRemovals(chatIDs: columnIDs)
-            // Columns also have legacy composer-defaults copies. The Mesh's
-            // workspace draft removal never reaches those per-column keys.
-            for columnID in columnIDs {
-                AcpConversation.removePersistedDraft(
-                    for: columnID,
-                    currentDefaults: chatDraftDefaults,
-                    migratedDefaults: migratedChatDraftDefaults
-                )
-            }
-            enqueueDraftRemoval(stableKey: "mesh|\(meshID)")
             await persistWorkspaceStateImmediately(projectID: projectID)
-            if let failure = await firstTranscriptRemovalFailure(removals) {
+            provisionedTranscriptIDsByMeshID.removeValue(forKey: meshID)
+            if let failure = await completeMeshColumnDeletion(tombstones) {
                 return .blocked(
-                    "Mesh work was cleaned up, but a column transcript could not be erased: \(failure)"
+                    "Mesh work was cleaned up, but a column's saved data could not be erased: \(failure)"
                 )
             }
             return .closed
@@ -4396,6 +4957,62 @@ final class AppModel: ObservableObject {
     /// Restore a specific archived surface. Closed adapters never overlap a
     /// replacement: Chat waits for its stop task, while Mesh reconstructs its
     /// exact manifest without creating new worktrees or dispatching prompts.
+    private func deletedRecentlyClosedChatResult(
+        surfaceID: String,
+        descriptor: NativeRestorableAgentChatDescriptor
+    ) async -> RecentlyClosedActionResult? {
+        switch await transcriptStore.tombstoneSnapshot(chatID: descriptor.id) {
+        case .absent:
+            return nil
+        case .unknown:
+            // Hide an action we cannot safely authorize, but retain both
+            // durable stores so a later healthy launch can reconcile them.
+            removeAllRecentlyClosedPanes(id: surfaceID)
+            return .blocked(
+                "Recently Closed deletion state could not be verified. The saved entry was retained for a later retry."
+            )
+        case .present(let tombstone):
+            removeAllRecentlyClosedPanes(id: surfaceID)
+            do {
+                _ = try await workspaceStateStore.removeAgentChatStateEverywhere(
+                    chatID: descriptor.id
+                )
+            } catch {
+                // The exact tombstone remains descriptor-blocked. This window
+                // must not expose restore, and the durable row stays available
+                // for the next reconciliation attempt.
+                return .blocked(
+                    "The deleted chat could not be removed from Recently Closed: \(error.localizedDescription)"
+                )
+            }
+            // Finish through the same serialized exact-receipt transaction as
+            // an active delete. Unlike vacuum alone, remove() clears a pending
+            // migration queued by this actor before releasing the fence.
+            let removal = await enqueueTranscriptRemoval(
+                chatID: descriptor.id,
+                verifiedDescriptorPruning: tombstone
+            ).value
+            guard removal.isRemoved else {
+                return .blocked(
+                    "The deleted chat transcript could not be erased: "
+                        + (removal.failureMessage ?? "the deletion receipt changed")
+                )
+            }
+            usageCenter.remove(chatID: descriptor.id)
+            let cleanup = await completeChatExternalCleanup(
+                chatID: descriptor.id,
+                tombstone: tombstone
+            )
+            guard cleanup.isRemoved else {
+                return .blocked(
+                    "The deleted chat draft cleanup could not be completed: "
+                        + (cleanup.failureMessage ?? "the deletion receipt changed")
+                )
+            }
+            return .unavailable
+        }
+    }
+
     func restoreRecentlyClosedSurface(_ surfaceID: String) async -> RecentlyClosedActionResult {
         guard let pane = recentlyClosedPane(id: surfaceID) else { return .unavailable }
         guard Self.claimedRecentlyClosedSurfaceIDs.insert(surfaceID).inserted else {
@@ -4412,6 +5029,12 @@ final class AppModel: ObservableObject {
         }
 
         if let descriptor = pane.surface.agentChatDescriptor {
+            if let deleted = await deletedRecentlyClosedChatResult(
+                surfaceID: surfaceID,
+                descriptor: descriptor
+            ) {
+                return deleted
+            }
             await chatShutdownTasks.wait(for: surfaceID)
             await draftPersistenceTask?.value
             await flushTranscriptPersistence()
@@ -4429,8 +5052,16 @@ final class AppModel: ObservableObject {
             let transcript = await restoredTranscript(for: descriptor.id)
             let legacyDraft = try? await workspaceStateStore.draft(for: "chat|\(descriptor.id)")
             let draft = transcript?.draft ?? legacyDraft
-            if transcript?.draft == nil, let legacyDraft, !legacyDraft.isEmpty {
-                await transcriptStore.scheduleDraft(legacyDraft, for: descriptor.id)
+            await beforeRecentlyClosedLegacyDraftMigration?(descriptor.id)
+            await beforeRecentlyClosedChatMaterialization?(descriptor.id)
+            // Every await above is a race boundary: another window may commit
+            // deletion after the initial check. Re-probe immediately before
+            // appendChat is allowed to materialize a writable surface.
+            if let deleted = await deletedRecentlyClosedChatResult(
+                surfaceID: surfaceID,
+                descriptor: descriptor
+            ) {
+                return deleted
             }
             guard appendChat(
                 id: descriptor.id,
@@ -4447,6 +5078,12 @@ final class AppModel: ObservableObject {
                 initialQueuedPrompts: descriptor.queuedPrompts
             ) != nil else {
                 return .blocked("The chat adapter is unavailable. The Recently Closed entry was preserved.")
+            }
+            // Do not enqueue the legacy migration before the final deletion
+            // probe. A write that captures a just-created deletion generation
+            // could otherwise outlive a vacuum and recreate the deleted row.
+            if transcript?.draft == nil, let legacyDraft, !legacyDraft.isEmpty {
+                await transcriptStore.scheduleDraft(legacyDraft, for: descriptor.id)
             }
             _ = removeRecentlyClosedPane(id: surfaceID)
             selectChat(surfaceID)
@@ -4488,9 +5125,10 @@ final class AppModel: ObservableObject {
         return await restoreRecentlyClosedSurface(newest.id)
     }
 
-    /// Permanent deletion of an archived surface. Chat data is tombstoned only
-    /// after the archive entry is removed. Mesh uses its transactional destroy
-    /// path so partial Git cleanup remains represented by a retryable manifest.
+    /// Permanent deletion of an archived surface. Chat records durable intent
+    /// before touching the archive, exactly like active-chat deletion. Mesh
+    /// uses its transactional destroy path so partial Git cleanup remains
+    /// represented by a retryable manifest.
     func deleteRecentlyClosedSurface(
         _ surfaceID: String,
         allowRecoverableWork: Bool
@@ -4510,28 +5148,76 @@ final class AppModel: ObservableObject {
         }
         if let descriptor = pane.surface.agentChatDescriptor {
             await chatShutdownTasks.wait(for: surfaceID)
+            let tombstoneResult = await transcriptStore.tombstone(chatID: surfaceID)
+            guard case let .recorded(tombstone) = tombstoneResult else {
+                guard case let .failed(error) = tombstoneResult else {
+                    return .blocked("The permanent-delete intent could not be recorded.")
+                }
+                return .blocked(
+                    "The permanent-delete intent could not be recorded: \(error.message)"
+                )
+            }
             do {
-                let removed = try await workspaceStateStore.removeRecentlyClosedSurfaceState(
-                    projectID: descriptor.projectID,
-                    surfaceID: surfaceID
+                let removed = try await workspaceStateStore.removeAgentChatStateEverywhere(
+                    chatID: surfaceID
                 )
                 guard removed else {
-                    _ = removeRecentlyClosedPane(id: surfaceID)
+                    removeAllRecentlyClosedPanes(id: surfaceID)
+                    // The descriptor was already absent. That is the same
+                    // verified state a crash-recovery launch uses; this exact
+                    // generation may finish physical transcript deletion.
+                    explicitlyClosedChatIDs.insert(surfaceID)
+                    usageCenter.remove(chatID: surfaceID)
+                    let removal = await enqueueTranscriptRemoval(
+                        chatID: surfaceID,
+                        verifiedDescriptorPruning: tombstone
+                    ).value
+                    if let failure = removal.failureMessage {
+                        return .blocked(
+                            "The chat left Recently Closed, but its transcript could not be erased: \(failure)"
+                        )
+                    }
+                    let cleanup = await completeChatExternalCleanup(
+                        chatID: surfaceID,
+                        tombstone: tombstone
+                    )
+                    if let failure = cleanup.failureMessage {
+                        return .blocked(
+                            "The chat left Recently Closed, but its saved drafts could not be erased: \(failure)"
+                        )
+                    }
                     return .unavailable
                 }
             } catch {
-                return .blocked("The permanent-delete tombstone could not be saved: \(error.localizedDescription)")
+                // Deletion intent is already durable. Suppress this cached
+                // restore action and retain the descriptor-blocked tombstone
+                // for a later launch/retry to prune safely.
+                removeAllRecentlyClosedPanes(id: surfaceID)
+                return .blocked(
+                    "The deleted chat could not be removed from Recently Closed: \(error.localizedDescription)"
+                )
             }
-            _ = removeRecentlyClosedPane(id: surfaceID)
+            removeAllRecentlyClosedPanes(id: surfaceID)
             explicitlyClosedChatIDs.insert(surfaceID)
             usageCenter.remove(chatID: surfaceID)
-            let removalResult = await enqueueTranscriptRemoval(chatID: surfaceID).value
-            await removeChatDraftsAfterDeletionCommit(chatID: surfaceID)
+            let removalResult = await enqueueTranscriptRemoval(
+                chatID: surfaceID,
+                verifiedDescriptorPruning: tombstone
+            ).value
             await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
             // "Permanently deleted" is only true once the DELETE commits.
             if let failure = removalResult.failureMessage {
                 return .blocked(
                     "The chat left Recently Closed, but its transcript could not be erased: \(failure)"
+                )
+            }
+            let cleanup = await completeChatExternalCleanup(
+                chatID: surfaceID,
+                tombstone: tombstone
+            )
+            if let failure = cleanup.failureMessage {
+                return .blocked(
+                    "The chat left Recently Closed, but its saved drafts could not be erased: \(failure)"
                 )
             }
             ToastCenter.shared.show("Permanently deleted chat", style: .success)
@@ -4547,7 +5233,37 @@ final class AppModel: ObservableObject {
         guard let mesh = await materializeRecentlyClosedMesh(descriptor) else {
             return .blocked("The Mesh project folder is unavailable. Its worktrees were preserved.")
         }
-        let columnIDs = mesh.durableColumnIDs
+        let columnIDs = await meshDeletionColumnIDs(
+            meshID: surfaceID,
+            projectID: descriptor.projectID,
+            liveColumnIDs: mesh.durableColumnIDs + descriptor.deletionColumnIDs
+        )
+        let columnConversations = mesh.columns.map(\.conversation)
+        let initialAssessment = await mesh.discardAssessment()
+        switch initialAssessment {
+        case .safe:
+            break
+        case let .recoverableWork(columns) where !allowRecoverableWork:
+            return .needsConfirmation(columns: columns)
+        case .recoverableWork:
+            break
+        case let .blocked(message):
+            return .blocked(message)
+        }
+        if !columnIDs.isEmpty {
+            await workspaceSaveTasks[descriptor.projectID]?.value
+            do {
+                try await workspaceStateStore.prepareMeshTranscriptDeletion(
+                    projectID: descriptor.projectID,
+                    meshID: surfaceID,
+                    columnIDs: columnIDs
+                )
+            } catch {
+                return .blocked(
+                    "The Mesh deletion receipt could not be saved, so nothing was deleted: \(error.localizedDescription)"
+                )
+            }
+        }
         let outcome = await meshLifecycleCoordinator.destroy(
             mesh,
             allowRecoverableWork: allowRecoverableWork
@@ -4555,33 +5271,38 @@ final class AppModel: ObservableObject {
         guard case let .completed(result) = outcome else { return .unavailable }
         switch result {
         case .safe:
-            // The user crossed the permanent-delete boundary. Remove column
-            // data even if writing the final archive tombstone needs a retry.
-            let removals = enqueueTranscriptRemovals(chatIDs: columnIDs)
-            // A permanent Mesh deletion also clears every per-column legacy
-            // composer-defaults copy after the destroy transaction is safe.
-            for columnID in columnIDs {
-                AcpConversation.removePersistedDraft(
-                    for: columnID,
-                    currentDefaults: chatDraftDefaults,
-                    migratedDefaults: migratedChatDraftDefaults
-                )
+            for conversation in columnConversations {
+                conversation.forgetPersistentDraft()
             }
-            enqueueDraftRemoval(stableKey: "mesh|\(surfaceID)")
+            fenceDestroyedMeshPersistence(mesh)
+            await draftPersistenceTask?.value
+            let tombstones: [AcpTranscriptStore.TombstoneSnapshot]
+            if columnIDs.isEmpty {
+                tombstones = []
+            } else {
+                let result = await transcriptStore.tombstone(chatIDs: columnIDs)
+                guard case let .recorded(recorded) = result else {
+                    guard case let .failed(error) = result else {
+                        return .blocked("Mesh column deletion intent could not be recorded.")
+                    }
+                    return .blocked(
+                        "Mesh work was cleaned up, but its column deletion receipt could not be saved: \(error.message)"
+                    )
+                }
+                tombstones = recorded
+            }
             do {
-                try await workspaceStateStore.removeMeshState(
-                    projectID: descriptor.projectID,
-                    meshID: surfaceID
-                )
+                _ = try await workspaceStateStore.removeMeshStateEverywhere(meshID: surfaceID)
             } catch {
                 return .blocked("Mesh work was cleaned up, but the delete tombstone could not be saved: \(error.localizedDescription)")
             }
             _ = removeRecentlyClosedPane(id: surfaceID)
             meshLifecycleCoordinator.forget(meshID: surfaceID)
             await persistWorkspaceStateImmediately(projectID: descriptor.projectID)
-            if let failure = await firstTranscriptRemovalFailure(removals) {
+            provisionedTranscriptIDsByMeshID.removeValue(forKey: surfaceID)
+            if let failure = await completeMeshColumnDeletion(tombstones) {
                 return .blocked(
-                    "Mesh work was cleaned up, but a column transcript could not be erased: \(failure)"
+                    "Mesh work was cleaned up, but a column's saved data could not be erased: \(failure)"
                 )
             }
             ToastCenter.shared.show("Permanently deleted Mesh", style: .success)

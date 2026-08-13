@@ -884,12 +884,11 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(TerminalThemeRegistry.shipped.first?.title, "macOS Terminal")
     }
 
-    /// The Safari reference starts with one white frost across the whole
-    /// window, not a white sidebar beside a grey canvas. Rails and canvas keep
-    /// their existing (different) transmission, but the normalized carrier
-    /// makes both land on the same near-white ground before AppKit's live
-    /// material and the named rail-only tint are involved.
-    func testSharedLightGlassCarrierIsWhiteAndCoherentBeforeRailTint() {
+    /// The Safari reference is a white frost across the whole window, not a
+    /// white sidebar beside a grey canvas. Rails and canvas keep their existing
+    /// (different) transmission, but the normalized carrier makes both land on
+    /// the same near-white ground before AppKit's live material is involved.
+    func testLightGlassIsWhiteAndCoherentAcrossRailsCanvasAndPanel() {
         let rail = GlassBackdropWash.sidebar(isDark: false)
         let canvas = GlassBackdropWash.workspace(isDark: false)
         let railLuminance = LightGlassFrost.modeledBackdropLuminance(rail)
@@ -926,30 +925,42 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(KaisolaTheme.glass.workspaceBackdrop, .glass)
     }
 
-    func testLightRailTintIsDelicateCoolToPearlAndMirrorsAtWindowEdges() throws {
-        XCTAssertEqual(SidebarRailPlacement.leading.tintStartPoint, .leading)
-        XCTAssertEqual(SidebarRailPlacement.leading.tintEndPoint, .trailing)
-        XCTAssertEqual(SidebarRailPlacement.trailing.tintStartPoint, .trailing)
-        XCTAssertEqual(SidebarRailPlacement.trailing.tintEndPoint, .leading)
+    /// User-facing Glass means neutral white outer chrome. This boundary test
+    /// deliberately guards the mounted rail sources as well as the color
+    /// arithmetic: PRs #819 and #821 both reintroduced the same blue/amber
+    /// post-frost overlay while leaving the shared white carrier untouched.
+    func testLightGlassRailsMountNoDecorativeChromaticOverlay() throws {
+        XCTAssertEqual(
+            LightGlassFrost.navigationChromaCoverage,
+            0,
+            "light Glass rail chroma belongs only to the explicit Tinted theme"
+        )
 
-        let leading = LightRailTint.stops(for: .leading)
-        let trailing = LightRailTint.stops(for: .trailing)
-        XCTAssertEqual(leading, trailing, "placement should mirror direction, not recolor a rail")
-        XCTAssertEqual(leading.count, 3)
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let mountedRailSources = [
+            "native/KaisolaMac/Kaisola/App/NativeAppearanceViews.swift",
+            "native/KaisolaMac/Kaisola/App/NativeVisualTokens.swift",
+            "native/KaisolaMac/Kaisola/Features/Sessions/RootShellView.swift",
+            "native/KaisolaMac/Kaisola/Features/Workspace/WorkspaceRailView.swift",
+        ]
+        let forbiddenDecorativeLayers = ["LightRailTint", "kaisolaLightRailTint"]
 
-        let cool = try XCTUnwrap(leading.first)
-        XCTAssertGreaterThan(cool.blue, cool.green)
-        XCTAssertGreaterThan(cool.green, cool.red)
-
-        let pearl = try XCTUnwrap(leading.last)
-        XCTAssertGreaterThan(pearl.red, pearl.green)
-        XCTAssertGreaterThan(pearl.green, pearl.blue)
-
-        let maximumCoverage = try XCTUnwrap(leading.map(\.opacity).max())
-        XCTAssertLessThanOrEqual(maximumCoverage, 0.07)
-        XCTAssertGreaterThanOrEqual(1 - maximumCoverage, 0.93)
-        XCTAssertEqual(LightRailTint.visibility(isWindowActive: true), 1)
-        XCTAssertEqual(LightRailTint.visibility(isWindowActive: false), 0.15)
+        for relativePath in mountedRailSources {
+            let source = try String(
+                contentsOf: repositoryRoot.appendingPathComponent(relativePath),
+                encoding: .utf8
+            )
+            for forbidden in forbiddenDecorativeLayers {
+                XCTAssertFalse(
+                    source.contains(forbidden),
+                    "\(relativePath) reintroduced the chromatic rail layer \(forbidden)"
+                )
+            }
+        }
     }
 
     /// Live vibrancy cannot be pixel-tested offline because its input is the

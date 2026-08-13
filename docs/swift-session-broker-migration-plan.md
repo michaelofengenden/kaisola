@@ -1,6 +1,7 @@
 # Swift session broker migration plan
 
-**Status:** Approved arm64 design; implementation is phased and not yet complete
+**Status:** Approved arm64 design; implementation begins after the corrective
+v0.1.122 continuity release
 
 **Date:** 2026-08-13
 
@@ -662,24 +663,28 @@ qualify is still building.
 
 The approved arm64 release train is:
 
-1. **v0.1.121** — publish the already-implemented session persistence,
-   continuity-handoff, and white-Glass fixes. It contains no claim that the
-   Swift broker migration is implemented.
-2. **v0.1.122** — Phase 0 plus schema-2 decoding/verification and
+1. **v0.1.121** — the already-published initial continuity and neutral-white
+   Glass release. Final multi-window persistence fencing and adversarial broker
+   handoff hardening were not complete when this tag was cut, so this release
+   is not claimed as the migration baseline.
+2. **v0.1.122** — corrective session persistence and broker-continuity release.
+   It preserves the schema-1 Node broker and contains no claim that the Swift
+   broker migration is implemented.
+3. **v0.1.123** — Phase 0 plus schema-2 decoding/verification and
    `BrokerLaunchPayload`; production still launches the schema-1 Node broker.
-3. **v0.1.123** — complete runtime-neutral launch packaging and ship the Phase-2
+4. **v0.1.124** — complete runtime-neutral launch packaging and ship the Phase-2
    Swift broker in non-publishable shadow mode.
-4. **v0.1.124** — ship the arm64 Swift PTY engine behind explicit development
+5. **v0.1.125** — ship the arm64 Swift PTY engine behind explicit development
    selection while Node remains stable current.
-5. **v0.1.125** — ship history/observer parity and the mixed-generation canary
+6. **v0.1.126** — ship history/observer parity and the mixed-generation canary
    machinery while the stable default remains Node.
-6. **`swift-broker-canary-0.2.0-rc.N`** — signed GitHub prereleases from a
+7. **`swift-broker-canary-0.2.0-rc.N`** — signed GitHub prereleases from a
    separate workflow and feed, used for Node↔Swift rollback and update soak.
    These tags never match the stable `v*` release workflow.
-7. **v0.2.0** — Swift becomes default current with one sealed Node fallback.
-8. **v0.2.1** — complete the required real update cycle with the fallback still
+8. **v0.2.0** — Swift becomes default current with one sealed Node fallback.
+9. **v0.2.1** — complete the required real update cycle with the fallback still
    present and prove clean Node retirement.
-9. **v0.2.2 or later** — remove bundled production Node only after the declared
+10. **v0.2.2 or later** — remove bundled production Node only after the declared
    support horizon, usage-service migration, and absence of live Node drains.
 
 This sequence avoids the repository's historical `v0.1.135` collision and
@@ -687,8 +692,8 @@ uses the minor-version boundary to make the default-runtime switch visible.
 
 ## First implementation slice
 
-The first code change after this plan should be **Phase 0 plus the decoding
-half of Phase 1**, not PTY creation:
+The first migration code change after the corrective v0.1.122 release should
+be **Phase 0 plus the decoding half of Phase 1**, not PTY creation:
 
 1. Capture one shared complete feature inventory and normalized protocol-2
    scenario corpus, including the Node compatibility behavior named above.
@@ -709,9 +714,10 @@ the trust and compatibility seam required by every later phase.
 
 ## Parallel-work ownership
 
-The v0.1.121 continuity release lands before migration implementation. Every
-migration branch starts from that exact merged commit. The first slice must not
-edit `BrokerControlClient.swift`, `BrokerStartupCoordinator.swift`, or their
+The corrective v0.1.122 continuity release lands before migration
+implementation. Every migration branch starts from that exact merged commit.
+The first slice must not edit `BrokerControlClient.swift`,
+`BrokerStartupCoordinator.swift`, or their
 tests; the safe prepare-before-launch ordering, authenticated legacy bridge,
 stale-target cancellation, exact registry CAS, drain preservation, and
 target-promotion behavior are frozen by Phase 0. Initial work is confined to

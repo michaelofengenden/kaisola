@@ -325,6 +325,122 @@ final class BrokerControlClientTests: XCTestCase {
         }
     }
 
+    func testVerifiedLegacyUpgradeReplacesExactStatusReportedStaleTargetBeforePreparing() async throws {
+        let staleTargetDigest = String(repeating: "e", count: 64)
+        let requestedTargetDigest = String(repeating: "d", count: 64)
+        let runningDigest = try XCTUnwrap(primaryControlBrokerInfo.contentDigest)
+        let transport = LegacyAdministrationControlBrokerTransport(
+            generationState: "draining",
+            drainingTargetContentDigest: .string(staleTargetDigest),
+            cancellationResult: .object([
+                "ok": .bool(true),
+                "state": .string("current"),
+                "contentDigest": .string(runningDigest),
+            ])
+        )
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+
+        let decision = try await client.requestUpgrade(
+            from: primaryControlBrokerInfo,
+            targetContentDigest: requestedTargetDigest,
+            authorization: .sealedLegacyFallback
+        )
+
+        XCTAssertEqual(decision, .accepted)
+        let frames = await transport.sentFrames()
+        XCTAssertEqual(frames.compactMap { frame -> String? in
+            guard frame.objectValue?["type"]?.stringValue == "hello" else { return nil }
+            return frame.objectValue?["access"]?.stringValue
+        }, ["administrator", "controller"])
+        let requests = frames.compactMap { frame -> [String: JSONValue]? in
+            guard frame.objectValue?["type"]?.stringValue == "request" else { return nil }
+            return frame.objectValue
+        }
+        XCTAssertEqual(requests.compactMap { $0["method"]?.stringValue }, [
+            "broker.status",
+            "broker.cancelRollingUpdate",
+            "broker.prepareRollingUpdate",
+        ])
+        XCTAssertEqual(
+            requests[1]["params"]?.objectValue?["targetContentDigest"]?.stringValue,
+            staleTargetDigest
+        )
+        XCTAssertEqual(
+            requests[2]["params"]?.objectValue?["targetContentDigest"]?.stringValue,
+            requestedTargetDigest
+        )
+    }
+
+    func testRollingUpgradeRejectsMalformedOrMismatchedLifecycleBeforeMutation() async throws {
+        let runningDigest = try XCTUnwrap(primaryControlBrokerInfo.contentDigest)
+        let malformedStates: [(String, JSONValue)] = [
+            ("draining", .null),
+            ("draining", .string("not-a-sha256")),
+            ("draining", .string(runningDigest)),
+            ("current", .string(String(repeating: "e", count: 64))),
+            ("unknown", .null),
+        ]
+
+        for (generationState, drainingTargetContentDigest) in malformedStates {
+            let transport = LegacyAdministrationControlBrokerTransport(
+                generationState: generationState,
+                drainingTargetContentDigest: drainingTargetContentDigest
+            )
+            let client = BrokerControlClient(
+                transport: transport,
+                operationTimeoutNanoseconds: 100_000_000
+            )
+            do {
+                _ = try await client.requestUpgrade(
+                    from: primaryControlBrokerInfo,
+                    targetContentDigest: String(repeating: "d", count: 64),
+                    authorization: .sealedLegacyFallback
+                )
+                XCTFail("A malformed generation lifecycle must fail closed.")
+            } catch {
+                XCTAssertEqual(error as? BrokerClientError, .malformedResponse)
+            }
+            let methods = await transport.sentFrames().compactMap {
+                $0.objectValue?["method"]?.stringValue
+            }
+            XCTAssertEqual(methods, ["broker.status"])
+        }
+    }
+
+    func testRollingUpgradeStopsWhenStaleCancellationAcknowledgesDifferentIdentity() async throws {
+        let transport = LegacyAdministrationControlBrokerTransport(
+            generationState: "draining",
+            drainingTargetContentDigest: .string(String(repeating: "e", count: 64)),
+            cancellationResult: .object([
+                "ok": .bool(true),
+                "state": .string("current"),
+                "contentDigest": .string(String(repeating: "f", count: 64)),
+            ])
+        )
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+
+        do {
+            _ = try await client.requestUpgrade(
+                from: primaryControlBrokerInfo,
+                targetContentDigest: String(repeating: "d", count: 64),
+                authorization: .sealedLegacyFallback
+            )
+            XCTFail("A mismatched cancellation acknowledgement must not prepare a replacement.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .identityChanged)
+        }
+        let methods = await transport.sentFrames().compactMap {
+            $0.objectValue?["method"]?.stringValue
+        }
+        XCTAssertEqual(methods, ["broker.status", "broker.cancelRollingUpdate"])
+    }
+
     func testUnverifiedBrokerNeverFallsBackToLegacyAdministrativeLane() async throws {
         let transport = LegacyAdministrationControlBrokerTransport()
         let client = BrokerControlClient(
@@ -1627,12 +1743,27 @@ private actor DisconnectSignal {
 /// to their historical controller owner-zero lane.
 private actor LegacyAdministrationControlBrokerTransport: BrokerByteTransport {
     private let fallbackAdvertisesModernAdministration: Bool
+    private let generationState: String
+    private let drainingTargetContentDigest: JSONValue
+    private let cancellationResult: JSONValue
     private var frames: [JSONValue] = []
     private var incoming: [Data?] = []
     private var waiter: CheckedContinuation<Data?, Never>?
 
-    init(fallbackAdvertisesModernAdministration: Bool = false) {
+    init(
+        fallbackAdvertisesModernAdministration: Bool = false,
+        generationState: String = "current",
+        drainingTargetContentDigest: JSONValue = .null,
+        cancellationResult: JSONValue = .object([
+            "ok": .bool(true),
+            "state": .string("current"),
+            "contentDigest": .string(primaryControlBrokerInfo.contentDigest ?? ""),
+        ])
+    ) {
         self.fallbackAdvertisesModernAdministration = fallbackAdvertisesModernAdministration
+        self.generationState = generationState
+        self.drainingTargetContentDigest = drainingTargetContentDigest
+        self.cancellationResult = cancellationResult
     }
 
     func connect(path: String) async throws {
@@ -1681,7 +1812,11 @@ private actor LegacyAdministrationControlBrokerTransport: BrokerByteTransport {
                 "packageSchema": .integer(Int64(primaryControlBrokerInfo.packageSchema ?? 1)),
                 "packageVersion": .string(primaryControlBrokerInfo.packageVersion ?? ""),
                 "features": .array([.string(BrokerWire.brokerUpdateFeature)]),
+                "generationState": .string(generationState),
+                "drainingTargetContentDigest": drainingTargetContentDigest,
             ])
+        case "broker.cancelRollingUpdate":
+            result = cancellationResult
         case "broker.prepareRollingUpdate":
             result = .object(["ok": .bool(true), "state": .string("rolling")])
         default:
@@ -2048,7 +2183,11 @@ private actor TimeoutReconcilingControlBrokerTransport: BrokerByteTransport {
         case "broker.prepareRollingUpdate":
             .object(["ok": .bool(true), "state": .string("rolling")])
         case "broker.cancelRollingUpdate":
-            .object(["ok": .bool(true), "state": .string("current")])
+            .object([
+                "ok": .bool(true),
+                "state": .string("current"),
+                "contentDigest": .string(primaryControlBrokerInfo.contentDigest ?? ""),
+            ])
         case "broker.retireDraining":
             .object(["ok": .bool(true), "state": .string("retiring")])
         default:
@@ -2066,6 +2205,8 @@ private actor TimeoutReconcilingControlBrokerTransport: BrokerByteTransport {
             "packageSchema": .integer(Int64(primaryControlBrokerInfo.packageSchema ?? 1)),
             "packageVersion": .string(primaryControlBrokerInfo.packageVersion ?? ""),
             "features": .array([.string(BrokerWire.brokerUpdateFeature)]),
+            "generationState": .string("current"),
+            "drainingTargetContentDigest": .null,
         ])
     }
 

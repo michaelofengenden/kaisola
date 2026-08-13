@@ -150,6 +150,11 @@ extension BrokerControlServing {
 /// stays the final authority on every mutation.
 actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     typealias DisconnectHandler = @Sendable (any Error) -> Void
+    enum UpgradeLifecycleState: Equatable, Sendable {
+        case current
+        case draining(targetContentDigest: String)
+    }
+
     private enum ConnectionAccess: Equatable {
         case controller
         case administrator
@@ -576,6 +581,34 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                !connectedFeatures.contains(BrokerWire.brokerRollingUpdateFeature) {
                 throw BrokerClientError.requestFailed("broker rolling update capability")
             }
+            if rolling {
+                let lifecycle = try Self.upgradeLifecycleState(
+                    status,
+                    runningContentDigest: runningDigest
+                )
+                if case let .draining(staleTargetContentDigest) = lifecycle,
+                   staleTargetContentDigest != targetContentDigest {
+                    // A durable implementation-v2 broker can outlive the app
+                    // which committed its prior handoff. Recover only from the
+                    // exact target reported by the authenticated status
+                    // snapshot, and keep cancellation plus replacement prepare
+                    // on this already-verified administrative lane.
+                    let cancellation = try await requestMutation(
+                        "broker.cancelRollingUpdate",
+                        params: .object([
+                            "ownerId": .string("0"),
+                            "expectedPid": .integer(Int64(info.pid)),
+                            "expectedStartedAt": .integer(info.startedAt),
+                            "expectedContentDigest": .string(runningDigest),
+                            "targetContentDigest": .string(staleTargetContentDigest),
+                        ])
+                    )
+                    try Self.validateRollingUpdateCancellation(
+                        cancellation,
+                        expectedContentDigest: runningDigest
+                    )
+                }
+            }
             let result = try await requestMutation(
                 rolling ? "broker.prepareRollingUpdate" : "broker.shutdownForUpdate",
                 params: .object([
@@ -601,7 +634,9 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         targetContentDigest: String,
         authorization: BrokerUpgradeAuthorization
     ) async throws {
-        guard let runningDigest = info.contentDigest else {
+        guard let runningDigest = info.contentDigest,
+              BrokerHelperPackageVerification.isLowercaseSHA256(runningDigest),
+              BrokerHelperPackageVerification.isLowercaseSHA256(targetContentDigest) else {
             throw BrokerClientError.requestFailed("broker helper identity")
         }
         do {
@@ -619,10 +654,10 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                     "targetContentDigest": .string(targetContentDigest),
                 ])
             )
-            guard result.objectValue?["ok"]?.boolValue == true,
-                  result.objectValue?["state"]?.stringValue == "current" else {
-                throw BrokerClientError.identityChanged
-            }
+            try Self.validateRollingUpdateCancellation(
+                result,
+                expectedContentDigest: runningDigest
+            )
             await disconnect()
         } catch {
             await disconnect()
@@ -833,6 +868,56 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
               object["packageVersion"]?.stringValue == info.packageVersion,
               Set(object["features"]?.arrayValue?.compactMap(\.stringValue) ?? [])
                 .contains(BrokerWire.brokerUpdateFeature) else {
+            throw BrokerClientError.identityChanged
+        }
+    }
+
+    nonisolated static func upgradeLifecycleState(
+        _ value: JSONValue,
+        runningContentDigest: String
+    ) throws -> UpgradeLifecycleState {
+        guard let object = value.objectValue,
+              let state = object["generationState"]?.stringValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        switch state {
+        case "current":
+            guard object["drainingTargetContentDigest"] == nil
+                    || object["drainingTargetContentDigest"] == .null else {
+                throw BrokerClientError.malformedResponse
+            }
+            return .current
+        case "draining":
+            guard let targetContentDigest = object["drainingTargetContentDigest"]?.stringValue,
+                  BrokerHelperPackageVerification.isLowercaseSHA256(targetContentDigest),
+                  targetContentDigest != runningContentDigest else {
+                throw BrokerClientError.malformedResponse
+            }
+            return .draining(targetContentDigest: targetContentDigest)
+        default:
+            throw BrokerClientError.malformedResponse
+        }
+    }
+
+    nonisolated static func validateRollingUpdateCancellation(
+        _ value: JSONValue,
+        expectedContentDigest: String
+    ) throws {
+        guard let object = value.objectValue,
+              let ok = object["ok"]?.boolValue,
+              let state = object["state"]?.stringValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        if ok == false, state == "identity_changed" {
+            throw BrokerClientError.identityChanged
+        }
+        guard ok == true,
+              state == "current",
+              let contentDigest = object["contentDigest"]?.stringValue else {
+            throw BrokerClientError.malformedResponse
+        }
+        guard BrokerHelperPackageVerification.isLowercaseSHA256(contentDigest),
+              contentDigest == expectedContentDigest else {
             throw BrokerClientError.identityChanged
         }
     }

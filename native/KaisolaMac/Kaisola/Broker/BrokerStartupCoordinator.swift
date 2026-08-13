@@ -150,11 +150,38 @@ enum BrokerUpgradeDecision: Equatable, Sendable {
     case identityChanged
 }
 
+/// Administrative authentication used for a broker-generation lifecycle RPC.
+///
+/// Brokers shipped before `broker-administration-v1` authenticated their
+/// lifecycle lane as controller owner `0`. That shape is safe to reuse only
+/// when the coordinator has independently re-verified the exact staged package
+/// which owns the authenticated socket. Modern brokers always use their
+/// dedicated administrator role; this value merely permits the client to try
+/// the sealed legacy bridge after that stronger handshake is unavailable.
+enum BrokerUpgradeAuthorization: Equatable, Sendable {
+    case dedicatedOnly
+    case sealedLegacyFallback
+}
+
 protocol BrokerUpgradeRequesting: Sendable {
     func requestUpgrade(
         from info: BrokerInfo,
-        targetContentDigest: String
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
     ) async throws -> BrokerUpgradeDecision
+}
+
+extension BrokerUpgradeRequesting {
+    func requestUpgrade(
+        from info: BrokerInfo,
+        targetContentDigest: String
+    ) async throws -> BrokerUpgradeDecision {
+        try await requestUpgrade(
+            from: info,
+            targetContentDigest: targetContentDigest,
+            authorization: .dedicatedOnly
+        )
+    }
 }
 
 enum BrokerRetirementDecision: Equatable, Sendable {
@@ -164,11 +191,40 @@ enum BrokerRetirementDecision: Equatable, Sendable {
 }
 
 protocol BrokerRollingUpdateRequesting: BrokerUpgradeRequesting {
-    func cancelRollingUpdate(from info: BrokerInfo, targetContentDigest: String) async throws
+    func cancelRollingUpdate(
+        from info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws
+    func requestRetirement(
+        of info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws -> BrokerRetirementDecision
+}
+
+extension BrokerRollingUpdateRequesting {
+    func cancelRollingUpdate(
+        from info: BrokerInfo,
+        targetContentDigest: String
+    ) async throws {
+        try await cancelRollingUpdate(
+            from: info,
+            targetContentDigest: targetContentDigest,
+            authorization: .dedicatedOnly
+        )
+    }
+
     func requestRetirement(
         of info: BrokerInfo,
         targetContentDigest: String
-    ) async throws -> BrokerRetirementDecision
+    ) async throws -> BrokerRetirementDecision {
+        try await requestRetirement(
+            of: info,
+            targetContentDigest: targetContentDigest,
+            authorization: .dedicatedOnly
+        )
+    }
 }
 
 protocol BrokerUpgradeMonitoring: Sendable {
@@ -306,6 +362,11 @@ actor BrokerStartupCoordinator:
     private var retirementSweepInFlight = false
     private var retirementSweepNumber: UInt64 = 0
     private var retirementQuarantines: [String: RetirementQuarantine] = [:]
+    /// Exact generation identities whose staged packages were re-verified in
+    /// this coordinator lifetime. Package verification hashes the complete
+    /// helper (including Node), so retain the result for an unchanged broker
+    /// identity instead of re-reading it on every inventory heartbeat.
+    private var sealedLegacyAuthorizations: [String: BrokerInfo] = [:]
 
     private struct PendingUpgrade: Sendable {
         let info: BrokerInfo
@@ -486,12 +547,18 @@ actor BrokerStartupCoordinator:
         let selectingAppPackage: BrokerHelperManifest
         do { selectingAppPackage = try await launcher.packageManifest() }
         catch { throw BrokerRollbackError.unavailable }
+        let currentAuthorization = await upgradeAuthorization(for: topology.current)
+        // `target` was re-verified immediately above, including its complete
+        // staged file inventory and exact manifest-to-generation binding.
+        sealedLegacyAuthorizations[target.id] = target.info
+        let targetAuthorization = BrokerUpgradeAuthorization.sealedLegacyFallback
 
         let decision: BrokerUpgradeDecision
         do {
             decision = try await rolling.requestUpgrade(
                 from: topology.current.info,
-                targetContentDigest: target.id
+                targetContentDigest: target.id,
+                authorization: currentAuthorization
             )
         } catch {
             throw BrokerRollbackError.unavailable
@@ -543,7 +610,8 @@ actor BrokerStartupCoordinator:
             do {
                 try await rolling.cancelRollingUpdate(
                     from: target.info,
-                    targetContentDigest: topology.current.id
+                    targetContentDigest: topology.current.id,
+                    authorization: targetAuthorization
                 )
             } catch {
                 throw BrokerRollbackError.activationFailed
@@ -572,7 +640,8 @@ actor BrokerStartupCoordinator:
             if registryRestored {
                 try? await rolling.cancelRollingUpdate(
                     from: topology.current.info,
-                    targetContentDigest: target.id
+                    targetContentDigest: target.id,
+                    authorization: currentAuthorization
                 )
                 currentTopology = topology
             }
@@ -653,11 +722,13 @@ actor BrokerStartupCoordinator:
                retirementSweepNumber < quarantine.nextEligibleSweep {
                 continue
             }
+            let authorization = await upgradeAuthorization(for: draining)
             let decision: BrokerRetirementDecision
             do {
                 decision = try await rolling.requestRetirement(
                     of: draining.info,
-                    targetContentDigest: topology.current.id
+                    targetContentDigest: topology.current.id,
+                    authorization: authorization
                 )
             } catch {
                 if error is CancellationError { return }
@@ -887,26 +958,14 @@ actor BrokerStartupCoordinator:
         )
         let supportsRolling = rollingUpdatesEnabled
             && (info.implementationVersion ?? 1) >= 2
-        let preparedReplacement: BrokerInfo?
-        if supportsRolling {
-            do { preparedReplacement = try await launchGeneration(package) }
-            catch {
-                currentUpgradeState = .pending(
-                    fromContentDigest: runningDigest,
-                    targetContentDigest: package.contentDigest,
-                    reason: .launchFailed
-                )
-                return info
-            }
-        } else {
-            preparedReplacement = nil
-        }
 
         let decision: BrokerUpgradeDecision
+        let authorization = await upgradeAuthorization(for: topology.current)
         do {
             decision = try await upgradeRequester.requestUpgrade(
                 from: info,
-                targetContentDigest: package.contentDigest
+                targetContentDigest: package.contentDigest,
+                authorization: authorization
             )
         } catch {
             currentUpgradeState = .pending(
@@ -956,8 +1015,16 @@ actor BrokerStartupCoordinator:
                 fromContentDigest: runningDigest,
                 targetContentDigest: package.contentDigest
             )
-            if supportsRolling, let preparedReplacement {
+            if supportsRolling {
                 do {
+                    // Commit the old generation's authenticated stability
+                    // window before starting a candidate. Besides avoiding
+                    // useless detached-process churn when administration is
+                    // incompatible, that means every launched target has a
+                    // verified old-generation handoff waiting for it. The old
+                    // broker rejects only *new* creates while this short launch
+                    // completes; its PTYs and existing routes stay live.
+                    let preparedReplacement = try await launchGeneration(package)
                     let replacement = try await publishCutover(
                         replacement: preparedReplacement,
                         package: package,
@@ -972,7 +1039,8 @@ actor BrokerStartupCoordinator:
                     if let rolling = upgradeRequester as? any BrokerRollingUpdateRequesting {
                         try? await rolling.cancelRollingUpdate(
                             from: info,
-                            targetContentDigest: package.contentDigest
+                            targetContentDigest: package.contentDigest,
+                            authorization: authorization
                         )
                     }
                     currentUpgradeState = .pending(
@@ -1114,6 +1182,29 @@ actor BrokerStartupCoordinator:
             && manifest.brokerProtocol.minimum <= BrokerWire.protocolVersion
             && manifest.brokerProtocol.maximum >= BrokerWire.protocolVersion
             && manifest.brokerProtocol.securityEpoch == BrokerWire.securityEpoch
+    }
+
+    /// A pre-administrator broker may use its legacy lifecycle lane only after
+    /// its complete staged helper package independently matches the exact live
+    /// generation selected from the private registry. Unsealed legacy
+    /// rendezvous and tampered/missing generation packages remain dedicated-
+    /// role only and therefore fail closed on old peers.
+    private func upgradeAuthorization(
+        for generation: BrokerGenerationRecord
+    ) async -> BrokerUpgradeAuthorization {
+        if sealedLegacyAuthorizations[generation.id] == generation.info {
+            return .sealedLegacyFallback
+        }
+        guard let packageRoot = generation.packageRoot,
+              let verified = try? await launcher.verifiedStagedPackage(
+                  at: URL(fileURLWithPath: packageRoot, isDirectory: true)
+              ),
+              Self.packageManifest(verified.manifest, exactlyMatches: generation) else {
+            sealedLegacyAuthorizations.removeValue(forKey: generation.id)
+            return .dedicatedOnly
+        }
+        sealedLegacyAuthorizations[generation.id] = generation.info
+        return .sealedLegacyFallback
     }
 
     private func writeLaunchConfiguration(package: BrokerHelperManifest) throws -> URL {

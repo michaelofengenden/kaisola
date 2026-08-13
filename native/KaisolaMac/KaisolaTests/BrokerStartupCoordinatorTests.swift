@@ -293,6 +293,7 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         let registry = try BrokerGenerationRegistryStore(profileRoot: live.profile).load()
         let topology = try XCTUnwrap(registry.topology)
         let upgradeCalls = await requester.upgradeCallCount()
+        let upgradeAuthorizations = await requester.recordedUpgradeAuthorizations()
         let cancelCalls = await requester.cancelCallCount()
         let launchCalls = await launcher.launchCount
 
@@ -305,8 +306,88 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         XCTAssertTrue(live.info.isProcessAlive)
         XCTAssertTrue(FileManager.default.fileExists(atPath: live.info.socketPath))
         XCTAssertEqual(upgradeCalls, 1)
+        XCTAssertEqual(upgradeAuthorizations, [.sealedLegacyFallback])
         XCTAssertEqual(cancelCalls, 0)
         XCTAssertEqual(launchCalls, 1)
+        await launcher.close()
+    }
+
+    func testRollingCutoverDoesNotAuthorizeLegacyAdministrationForTamperedPriorPackage() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let requester = FakeRollingBrokerUpgradeRequester(
+            upgradeDecision: .accepted,
+            requiredUpgradeAuthorization: .sealedLegacyFallback
+        )
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            rejectedStagedDigests: [oldDigest]
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        let adopted = try await coordinator.prepare()
+        let registry = try BrokerGenerationRegistryStore(profileRoot: live.profile).load()
+        let state = await coordinator.upgradeState()
+        let authorizations = await requester.recordedUpgradeAuthorizations()
+
+        XCTAssertEqual(adopted, live.info)
+        XCTAssertEqual(registry.currentGenerationID, oldDigest)
+        XCTAssertTrue(registry.topology?.draining.isEmpty == true)
+        XCTAssertEqual(authorizations, [.dedicatedOnly])
+        XCTAssertEqual(state, .pending(
+            fromContentDigest: oldDigest,
+            targetContentDigest: String(repeating: "d", count: 64),
+            reason: .requestUnavailable
+        ))
+        await launcher.close()
+    }
+
+    func testAcceptedRollingHandoffCancelsDeterministicallyWhenTargetLaunchFails() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let requester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            failLaunch: true
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        let adopted = try await coordinator.prepare()
+        let registry = try BrokerGenerationRegistryStore(profileRoot: live.profile).load()
+        let state = await coordinator.upgradeState()
+        let launchCount = await launcher.launchCount
+        let cancelCount = await requester.cancelCallCount()
+        let cancelAuthorizations = await requester.recordedCancelAuthorizations()
+
+        XCTAssertEqual(adopted, live.info)
+        XCTAssertEqual(registry.currentGenerationID, oldDigest)
+        XCTAssertTrue(registry.topology?.draining.isEmpty == true)
+        XCTAssertEqual(launchCount, 1)
+        XCTAssertEqual(cancelCount, 1)
+        XCTAssertEqual(cancelAuthorizations, [.sealedLegacyFallback])
+        XCTAssertEqual(state, .pending(
+            fromContentDigest: oldDigest,
+            targetContentDigest: String(repeating: "d", count: 64),
+            reason: .launchFailed
+        ))
         await launcher.close()
     }
 
@@ -963,7 +1044,11 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             ))
             XCTAssertEqual(upgradeCalls, 1)
             XCTAssertEqual(cancelCalls, 0)
-            XCTAssertEqual(launchCalls, 1)
+            XCTAssertEqual(
+                launchCalls,
+                0,
+                "A deferred handoff must not churn an unused target process."
+            )
             await launcher.close()
             Darwin.close(live.descriptor)
         }
@@ -1133,6 +1218,7 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
 private actor FakeBrokerUpgradeRequester: BrokerUpgradeRequesting {
     let decision: BrokerUpgradeDecision
     private(set) var callCount = 0
+    private(set) var authorizations: [BrokerUpgradeAuthorization] = []
 
     init(decision: BrokerUpgradeDecision) {
         self.decision = decision
@@ -1140,15 +1226,18 @@ private actor FakeBrokerUpgradeRequester: BrokerUpgradeRequesting {
 
     func requestUpgrade(
         from info: BrokerInfo,
-        targetContentDigest: String
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
     ) async throws -> BrokerUpgradeDecision {
         callCount += 1
+        authorizations.append(authorization)
         return decision
     }
 }
 
 private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
     private let upgradeDecision: BrokerUpgradeDecision
+    private let requiredUpgradeAuthorization: BrokerUpgradeAuthorization?
     private let retirementDecision: BrokerRetirementDecision
     /// Per-generation overrides so one fake can play a populated drain
     /// (pending) and an empty one (accepted) in the same heartbeat.
@@ -1158,9 +1247,13 @@ private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
     private var cancels = 0
     private var retirements = 0
     private var retirementDigests: [String] = []
+    private var upgradeAuthorizations: [BrokerUpgradeAuthorization] = []
+    private var cancelAuthorizations: [BrokerUpgradeAuthorization] = []
+    private var retirementAuthorizations: [BrokerUpgradeAuthorization] = []
 
     init(
         upgradeDecision: BrokerUpgradeDecision,
+        requiredUpgradeAuthorization: BrokerUpgradeAuthorization? = nil,
         retirementDecision: BrokerRetirementDecision = .deferred(
             BrokerUpgradeBlockers(
                 liveTerminalCount: 1,
@@ -1175,6 +1268,7 @@ private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
         onRetirement: @escaping @Sendable () -> Void = {}
     ) {
         self.upgradeDecision = upgradeDecision
+        self.requiredUpgradeAuthorization = requiredUpgradeAuthorization
         self.retirementDecision = retirementDecision
         self.retirementDecisionsByDigest = retirementDecisionsByDigest
         self.onRetirement = onRetirement
@@ -1182,21 +1276,34 @@ private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
 
     func requestUpgrade(
         from info: BrokerInfo,
-        targetContentDigest: String
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
     ) async throws -> BrokerUpgradeDecision {
         upgrades += 1
+        upgradeAuthorizations.append(authorization)
+        if let requiredUpgradeAuthorization,
+           authorization != requiredUpgradeAuthorization {
+            throw BrokerClientError.authenticationRejected
+        }
         return upgradeDecision
     }
 
-    func cancelRollingUpdate(from info: BrokerInfo, targetContentDigest: String) async throws {
+    func cancelRollingUpdate(
+        from info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws {
         cancels += 1
+        cancelAuthorizations.append(authorization)
     }
 
     func requestRetirement(
         of info: BrokerInfo,
-        targetContentDigest: String
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
     ) async throws -> BrokerRetirementDecision {
         retirements += 1
+        retirementAuthorizations.append(authorization)
         retirementDigests.append(info.contentDigest ?? "legacy")
         let decision = info.contentDigest.flatMap { retirementDecisionsByDigest[$0] }
             ?? retirementDecision
@@ -1208,21 +1315,33 @@ private actor FakeRollingBrokerUpgradeRequester: BrokerRollingUpdateRequesting {
     func cancelCallCount() -> Int { cancels }
     func retirementCallCount() -> Int { retirements }
     func retirementContentDigests() -> [String] { retirementDigests }
+    func recordedUpgradeAuthorizations() -> [BrokerUpgradeAuthorization] {
+        upgradeAuthorizations
+    }
+    func recordedCancelAuthorizations() -> [BrokerUpgradeAuthorization] {
+        cancelAuthorizations
+    }
+    func recordedRetirementAuthorizations() -> [BrokerUpgradeAuthorization] {
+        retirementAuthorizations
+    }
 }
 
 private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
     private let implementationVersion: Int
     private let rejectedStagedDigests: Set<String>
+    private let failLaunch: Bool
     private(set) var launchCount = 0
     private var descriptor: Int32 = -1
     private var socketURL: URL?
 
     init(
         implementationVersion: Int = 1,
-        rejectedStagedDigests: Set<String> = []
+        rejectedStagedDigests: Set<String> = [],
+        failLaunch: Bool = false
     ) {
         self.implementationVersion = implementationVersion
         self.rejectedStagedDigests = rejectedStagedDigests
+        self.failLaunch = failLaunch
     }
 
     func packageManifest() async throws -> BrokerHelperManifest {
@@ -1266,6 +1385,9 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
 
     func launch(configurationURL: URL) async throws -> Int32 {
         launchCount += 1
+        if failLaunch {
+            throw BrokerBootstrapError.launchRejected("focused test")
+        }
         let configuration = try JSONDecoder().decode(
             BrokerLaunchConfiguration.self,
             from: Data(contentsOf: configurationURL)

@@ -150,9 +150,20 @@ extension BrokerControlServing {
 /// stays the final authority on every mutation.
 actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
     typealias DisconnectHandler = @Sendable (any Error) -> Void
-    private enum ConnectionAccess: String, Equatable {
+    private enum ConnectionAccess: Equatable {
         case controller
         case administrator
+        /// Compatibility lane for a re-verified broker package which predates
+        /// `broker-administration-v1`. It uses the old controller/owner-0 wire
+        /// shape but is never exposed through `BrokerControlServing`.
+        case sealedLegacyAdministrator
+
+        var wireValue: String {
+            switch self {
+            case .controller, .sealedLegacyAdministrator: "controller"
+            case .administrator: "administrator"
+            }
+        }
     }
 
     private struct PendingRequest {
@@ -236,15 +247,45 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         try await connect(to: info, ownerID: "0", access: .administrator)
     }
 
+    /// Prefer the dedicated administrative role. A sealed package from before
+    /// that role existed may retry with its historical controller/owner-0
+    /// shape, but the hello verifier below refuses that fallback as soon as the
+    /// peer advertises the modern capability.
+    private func connectForUpgradeAdministration(
+        to info: BrokerInfo,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws {
+        do {
+            try await connectForAdministration(to: info)
+            return
+        } catch {
+            if error is CancellationError { throw error }
+            let dedicatedError = error
+            await disconnect()
+            guard authorization == .sealedLegacyFallback else {
+                throw dedicatedError
+            }
+        }
+        try await connect(
+            to: info,
+            ownerID: "0",
+            access: .sealedLegacyAdministrator
+        )
+    }
+
     private func connect(
         to info: BrokerInfo,
         ownerID: String,
         access: ConnectionAccess
     ) async throws {
         try info.validate()
-        let ownerIDIsValid = access == .administrator
-            ? ownerID == "0"
-            : !ownerID.isEmpty && ownerID != "0"
+        let ownerIDIsValid: Bool
+        switch access {
+        case .administrator, .sealedLegacyAdministrator:
+            ownerIDIsValid = ownerID == "0"
+        case .controller:
+            ownerIDIsValid = !ownerID.isEmpty && ownerID != "0"
+        }
         guard ownerIDIsValid else {
             throw BrokerClientError.requestFailed("controller owner id")
         }
@@ -292,7 +333,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                 // is authorized by project capability rather than instance.
                 "instanceId": .string(connectionInstanceID),
                 "appVersion": .string(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "kaisola-native"),
-                "access": .string(access.rawValue),
+                "access": .string(access.wireValue),
                 "features": .array(requestedFeatures),
             ])
             encoded = try encode(frame, purpose: .hello)
@@ -508,7 +549,8 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
 
     func requestUpgrade(
         from info: BrokerInfo,
-        targetContentDigest: String
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
     ) async throws -> BrokerUpgradeDecision {
         guard let runningDigest = info.contentDigest,
               BrokerHelperPackageVerification.isLowercaseSHA256(runningDigest),
@@ -516,7 +558,10 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             throw BrokerClientError.requestFailed("broker helper identity")
         }
         do {
-            try await connectForAdministration(to: info)
+            try await connectForUpgradeAdministration(
+                to: info,
+                authorization: authorization
+            )
             guard connectedFeatures.contains(BrokerWire.brokerUpdateFeature) else {
                 throw BrokerClientError.requestFailed("broker sealed update capability")
             }
@@ -553,13 +598,17 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
 
     func cancelRollingUpdate(
         from info: BrokerInfo,
-        targetContentDigest: String
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
     ) async throws {
         guard let runningDigest = info.contentDigest else {
             throw BrokerClientError.requestFailed("broker helper identity")
         }
         do {
-            try await connectForAdministration(to: info)
+            try await connectForUpgradeAdministration(
+                to: info,
+                authorization: authorization
+            )
             let result = try await requestMutation(
                 "broker.cancelRollingUpdate",
                 params: .object([
@@ -583,13 +632,17 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
 
     func requestRetirement(
         of info: BrokerInfo,
-        targetContentDigest: String
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
     ) async throws -> BrokerRetirementDecision {
         guard let runningDigest = info.contentDigest else {
             throw BrokerClientError.requestFailed("broker helper identity")
         }
         do {
-            try await connectForAdministration(to: info)
+            try await connectForUpgradeAdministration(
+                to: info,
+                authorization: authorization
+            )
             let status = try await request(
                 "broker.status",
                 params: .object(["ownerId": .string("0")])
@@ -871,7 +924,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                 throw BrokerClientError.observeFeatureMissing
             }
             guard let expectedIdentity = connectInFlight ?? connectedIdentity,
-                  object["access"]?.stringValue == expectedIdentity.access.rawValue else {
+                  object["access"]?.stringValue == expectedIdentity.access.wireValue else {
                 throw BrokerClientError.authenticationRejected
             }
             let negotiatedFeatures = Set(
@@ -882,8 +935,17 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                       negotiatedFeatures.contains(BrokerWire.brokerAdministrationFeature) else {
                     throw BrokerClientError.authenticationRejected
                 }
-            } else if negotiatedFeatures.contains(BrokerWire.brokerAdministrationFeature) {
-                throw BrokerClientError.authenticationRejected
+            } else {
+                guard !negotiatedFeatures.contains(BrokerWire.brokerAdministrationFeature) else {
+                    throw BrokerClientError.authenticationRejected
+                }
+                if expectedIdentity.access == .sealedLegacyAdministrator,
+                   features.contains(BrokerWire.brokerAdministrationFeature) {
+                    // A modern broker must never be downgraded to the historical
+                    // controller/owner-0 authority shape, even when the caller
+                    // has permission to bridge a genuinely old sealed package.
+                    throw BrokerClientError.authenticationRejected
+                }
             }
             connected = true
             connectedFeatures = features

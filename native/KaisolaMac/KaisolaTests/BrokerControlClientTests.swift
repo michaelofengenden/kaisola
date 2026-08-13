@@ -295,6 +295,92 @@ final class BrokerControlClientTests: XCTestCase {
         }
     }
 
+    func testVerifiedPreAdministrationBrokerCanCompleteRollingHandoffThroughLegacyLane() async throws {
+        let transport = LegacyAdministrationControlBrokerTransport()
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        let targetDigest = String(repeating: "d", count: 64)
+
+        let decision = try await client.requestUpgrade(
+            from: primaryControlBrokerInfo,
+            targetContentDigest: targetDigest,
+            authorization: .sealedLegacyFallback
+        )
+
+        XCTAssertEqual(decision, .accepted)
+        let frames = await transport.sentFrames()
+        let accesses = frames.compactMap { frame -> String? in
+            guard frame.objectValue?["type"]?.stringValue == "hello" else { return nil }
+            return frame.objectValue?["access"]?.stringValue
+        }
+        let methods = frames.compactMap { frame in
+            frame.objectValue?["method"]?.stringValue
+        }
+        XCTAssertEqual(accesses, ["administrator", "controller"])
+        XCTAssertEqual(methods, ["broker.status", "broker.prepareRollingUpdate"])
+        for frame in frames where frame.objectValue?["type"]?.stringValue == "request" {
+            XCTAssertEqual(frame.objectValue?["params"]?.objectValue?["ownerId"]?.stringValue, "0")
+        }
+    }
+
+    func testUnverifiedBrokerNeverFallsBackToLegacyAdministrativeLane() async throws {
+        let transport = LegacyAdministrationControlBrokerTransport()
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+
+        do {
+            _ = try await client.requestUpgrade(
+                from: primaryControlBrokerInfo,
+                targetContentDigest: String(repeating: "d", count: 64),
+                authorization: .dedicatedOnly
+            )
+            XCTFail("An unverified generation must not reuse controller owner zero.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .authenticationRejected)
+        }
+
+        let frames = await transport.sentFrames()
+        let accesses = frames.compactMap { frame -> String? in
+            guard frame.objectValue?["type"]?.stringValue == "hello" else { return nil }
+            return frame.objectValue?["access"]?.stringValue
+        }
+        XCTAssertEqual(accesses, ["administrator"])
+        XCTAssertFalse(frames.contains { $0.objectValue?["type"]?.stringValue == "request" })
+    }
+
+    func testVerifiedFallbackRefusesModernBrokerAdministrativeDowngrade() async throws {
+        let transport = LegacyAdministrationControlBrokerTransport(
+            fallbackAdvertisesModernAdministration: true
+        )
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+
+        do {
+            _ = try await client.requestUpgrade(
+                from: primaryControlBrokerInfo,
+                targetContentDigest: String(repeating: "d", count: 64),
+                authorization: .sealedLegacyFallback
+            )
+            XCTFail("A modern peer must not accept controller owner-zero downgrade.")
+        } catch {
+            XCTAssertEqual(error as? BrokerClientError, .authenticationRejected)
+        }
+
+        let frames = await transport.sentFrames()
+        let accesses = frames.compactMap { frame -> String? in
+            guard frame.objectValue?["type"]?.stringValue == "hello" else { return nil }
+            return frame.objectValue?["access"]?.stringValue
+        }
+        XCTAssertEqual(accesses, ["administrator", "controller"])
+        XCTAssertFalse(frames.contains { $0.objectValue?["type"]?.stringValue == "request" })
+    }
+
     func testOrdinaryHandshakeDoesNotRequestAdministrativeCapability() async throws {
         let transport = ScriptedControlBrokerTransport(resizeAccepted: true)
         let client = BrokerControlClient(
@@ -1533,6 +1619,129 @@ private actor DisconnectSignal {
     func record(_ error: any Error) {
         count += 1
         lastDescription = error.localizedDescription
+    }
+}
+
+/// Models implementation-v2 brokers from before `broker-administration-v1`:
+/// they reject the dedicated access string but expose the sealed update RPCs
+/// to their historical controller owner-zero lane.
+private actor LegacyAdministrationControlBrokerTransport: BrokerByteTransport {
+    private let fallbackAdvertisesModernAdministration: Bool
+    private var frames: [JSONValue] = []
+    private var incoming: [Data?] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+
+    init(fallbackAdvertisesModernAdministration: Bool = false) {
+        self.fallbackAdvertisesModernAdministration = fallbackAdvertisesModernAdministration
+    }
+
+    func connect(path: String) async throws {
+        // The real Unix transport discards EOF from the failed first socket
+        // when it opens the fallback connection. This actor has one in-memory
+        // queue, so explicitly model that per-connection reset.
+        incoming.removeAll()
+    }
+
+    func send(_ data: Data) async throws {
+        guard let newline = data.firstIndex(of: 0x0A) else {
+            throw BrokerClientError.malformedResponse
+        }
+        let frame = try JSONDecoder().decode(JSONValue.self, from: data[..<newline])
+        frames.append(frame)
+        guard let object = frame.objectValue,
+              let type = object["type"]?.stringValue else { return }
+        if type == "hello" {
+            let requestedAccess = object["access"]?.stringValue ?? "controller"
+            if requestedAccess == "administrator" {
+                // A pre-capability broker does not understand this role. A
+                // mismatched hello makes the failure deterministic without a
+                // test timeout; production observes the equivalent EOF.
+                deliver(try encoded(scriptedControlHello(
+                    for: frame,
+                    accessOverride: "controller",
+                    grantAdministratorFeature: false
+                )))
+            } else {
+                deliver(try encoded(legacyHello()))
+            }
+            return
+        }
+        guard type == "request",
+              let id = object["id"]?.stringValue,
+              let method = object["method"]?.stringValue else { return }
+        let result: JSONValue
+        switch method {
+        case "broker.status":
+            result = .object([
+                "ok": .bool(true),
+                "pid": .integer(Int64(primaryControlBrokerInfo.pid)),
+                "startedAt": .integer(primaryControlBrokerInfo.startedAt),
+                "contentDigest": .string(primaryControlBrokerInfo.contentDigest ?? ""),
+                "implementationVersion": .integer(Int64(primaryControlBrokerInfo.implementationVersion ?? 1)),
+                "packageSchema": .integer(Int64(primaryControlBrokerInfo.packageSchema ?? 1)),
+                "packageVersion": .string(primaryControlBrokerInfo.packageVersion ?? ""),
+                "features": .array([.string(BrokerWire.brokerUpdateFeature)]),
+            ])
+        case "broker.prepareRollingUpdate":
+            result = .object(["ok": .bool(true), "state": .string("rolling")])
+        default:
+            throw BrokerClientError.requestFailed(method)
+        }
+        deliver(try encoded(.object([
+            "type": .string("response"),
+            "id": .string(id),
+            "ok": .bool(true),
+            "result": result,
+        ])))
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !incoming.isEmpty { return incoming.removeFirst() }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func close() async { deliver(nil) }
+
+    func sentFrames() -> [JSONValue] { frames }
+
+    private func legacyHello() -> JSONValue {
+        let administration: [JSONValue] = fallbackAdvertisesModernAdministration
+            ? [.string(BrokerWire.brokerAdministrationFeature)]
+            : []
+        return .object([
+            "type": .string("hello"),
+            "ok": .bool(true),
+            "protocol": .integer(Int64(primaryControlBrokerInfo.protocolVersion)),
+            "securityEpoch": .integer(Int64(primaryControlBrokerInfo.securityEpoch)),
+            "implementationVersion": .integer(Int64(primaryControlBrokerInfo.implementationVersion ?? 1)),
+            "packageSchema": .integer(Int64(primaryControlBrokerInfo.packageSchema ?? 1)),
+            "packageVersion": .string(primaryControlBrokerInfo.packageVersion ?? ""),
+            "contentDigest": .string(primaryControlBrokerInfo.contentDigest ?? ""),
+            "pid": .integer(Int64(primaryControlBrokerInfo.pid)),
+            "startedAt": .integer(primaryControlBrokerInfo.startedAt),
+            "version": .string(primaryControlBrokerInfo.version),
+            "features": .array([
+                .string(BrokerWire.terminalObserveFeature),
+                .string(BrokerWire.brokerUpdateFeature),
+                .string(BrokerWire.brokerRollingUpdateFeature),
+            ] + administration),
+            "access": .string("controller"),
+        ])
+    }
+
+    private func encoded(_ frame: JSONValue) throws -> Data {
+        var data = try JSONEncoder().encode(frame)
+        data.append(0x0A)
+        return data
+    }
+
+    private func deliver(_ data: Data?) {
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            incoming.append(data)
+        }
     }
 }
 

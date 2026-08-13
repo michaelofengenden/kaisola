@@ -2246,6 +2246,29 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 )
             }
 
+            // The chooser covers a still-mounted terminal so the terminal can
+            // retain its buffer and viewport. The keyboard must nevertheless
+            // belong to the chooser before capture; otherwise ordinary typing
+            // is delivered to the hidden shell underneath it.
+            if ["new-session", "new-session-topbar"].contains(visualSurface) {
+                let responder = captureWindow.firstResponder
+                guard let responder,
+                      !(responder is ReadOnlyTerminalView),
+                      responder !== captureWindow else {
+                    let name = responder.map { String(describing: type(of: $0)) } ?? "nil"
+                    let receipt = "KAISOLA_NATIVE_VISUAL_NEW_SESSION_FOCUS=FAIL "
+                        + "surface=\(visualSurface) responder=\(name)\n"
+                    FileHandle.standardOutput.write(Data(receipt.utf8))
+                    try? FileHandle.standardOutput.synchronize()
+                    requestVisualFixtureTermination()
+                    return
+                }
+                let receipt = "KAISOLA_NATIVE_VISUAL_NEW_SESSION_FOCUS=PASS "
+                    + "surface=\(visualSurface) responder=\(type(of: responder))\n"
+                FileHandle.standardOutput.write(Data(receipt.utf8))
+                try? FileHandle.standardOutput.synchronize()
+            }
+
             let terminalAccessibilityMarkers = NativeVisualTerminalAccessibilityGate.expectedMarkers(
                 for: visualSurface
             )

@@ -176,6 +176,7 @@ struct NewSessionChooserView: View {
                 }
                 .buttonStyle(NewSessionChoiceButtonStyle())
                 .disabled(!option.isEnabled)
+                .focusable()
                 .focused($focusedPrimaryChoice, equals: option.choice)
                 .help(option.disabledReason ?? option.detail)
                 .accessibilityLabel(option.title)

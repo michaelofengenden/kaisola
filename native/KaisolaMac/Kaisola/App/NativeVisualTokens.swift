@@ -41,6 +41,43 @@ enum KaisolaVisualSystem {
     static let stateDuration = 0.14
     static let layoutDuration = 0.22
 }
+
+/// The light-appearance recipe shared by the two navigation rails, the
+/// workspace canvas, and the inset detail panel.
+///
+/// The Safari reference is a white pane with the desktop present as softened
+/// colour and movement, not a desktop-coloured pane with a little white haze.
+/// Those are different materials. The old light bake normalized its underlay
+/// to 0.72, then let 55–60% of that underlay through; before AppKit added its
+/// own material the two large surfaces therefore landed at only 0.846 and
+/// 0.832 luminance. That is grey by construction.
+///
+/// Whiteness is bought here by lifting the *underlay* rather than thickening
+/// `GlassBackdropWash`. The wash keeps exactly the transmission previous work
+/// measured, so wallpaper colour and motion still reach the eye. Live glass
+/// uses the same idea by re-valuing its sampled hue onto a bright carrier, and
+/// the detail panel gets one small white frost over its semantic material so it
+/// cannot turn the otherwise-matched canvas grey again.
+enum LightGlassFrost {
+    /// Neutral luminance of a painted wallpaper before the white veil.
+    static let backdropLuminance: Double = 0.80
+
+    /// Value of the sampled desktop hue laid over live AppKit vibrancy. Hue is
+    /// preserved; only the grey-making low value of the raw average is lifted.
+    static let liveTintPeak: Double = 0.94
+
+    /// White over the inset panel's ultra-thin material. Kept below a quarter
+    /// so the panel still moves with the shared glass beneath it.
+    static let panelWhiteCoverage: Double = 0.18
+
+    /// The deterministic painted-source composite used by the visual tests.
+    /// Live vibrancy has no stable pixels to measure offline, but it consumes
+    /// the same wash and the bright tint carrier above.
+    static func modeledBackdropLuminance(_ wash: GlassBackdropWash) -> Double {
+        wash.baseOpacity + wash.desktopTransmission * backdropLuminance
+    }
+}
+
 /// Kaisola's own text inks, and the one place a label's weight is decided.
 ///
 /// **Why the app does not use `secondaryLabelColor`.** In Aqua that colour is
@@ -729,12 +766,13 @@ private struct KaisolaChromePanelModifier: ViewModifier {
                         shape.fill(Color.black.opacity(Self.darkPanelCoverage))
                     }
                 } else {
-                    // Light glass reads greyer than dark glass does, because
-                    // `.thinMaterial` lifts toward white over a backdrop that is
-                    // already bright, so the desktop showing through arrives
-                    // flattened. The thinner material keeps the same isolating
-                    // job while letting more of the actual desktop reach the eye.
-                    shape.fill(.ultraThinMaterial)
+                    // The semantic material provides blur and isolation; the
+                    // shared white frost prevents it from turning the raised
+                    // sidebar/canvas underlay back into a neutral-grey card.
+                    ZStack {
+                        shape.fill(.ultraThinMaterial)
+                        shape.fill(Color.white.opacity(LightGlassFrost.panelWhiteCoverage))
+                    }
                 }
             }
         }

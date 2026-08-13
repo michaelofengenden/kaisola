@@ -884,6 +884,68 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(TerminalThemeRegistry.shipped.first?.title, "macOS Terminal")
     }
 
+    /// The Safari reference is a white frost across the whole window, not a
+    /// white sidebar beside a grey canvas. Rails and canvas keep their existing
+    /// (different) transmission, but the normalized carrier makes both land on
+    /// the same near-white ground before AppKit's live material is involved.
+    func testLightGlassIsWhiteAndCoherentAcrossRailsCanvasAndPanel() {
+        let rail = GlassBackdropWash.sidebar(isDark: false)
+        let canvas = GlassBackdropWash.workspace(isDark: false)
+        let railLuminance = LightGlassFrost.modeledBackdropLuminance(rail)
+        let canvasLuminance = LightGlassFrost.modeledBackdropLuminance(canvas)
+
+        XCTAssertEqual(
+            DesktopBackdropRenderer.targetLuminance(isDark: false),
+            LightGlassFrost.backdropLuminance,
+            accuracy: 0.0001
+        )
+        XCTAssertGreaterThanOrEqual(railLuminance, 0.88, "the LHS/RHS rails still read grey")
+        XCTAssertGreaterThanOrEqual(canvasLuminance, 0.88, "the background canvas still reads grey")
+        XCTAssertLessThan(
+            abs(railLuminance - canvasLuminance),
+            0.011,
+            "rails and canvas are no longer one white-glass family"
+        )
+
+        // The detail panel is the last layer over the canvas. Its white frost
+        // must be visible but must not become an opaque white card.
+        XCTAssertGreaterThan(LightGlassFrost.panelWhiteCoverage, 0.1)
+        XCTAssertLessThan(LightGlassFrost.panelWhiteCoverage, 0.25)
+
+        // One theme choice moves both surface families together. The RHS file
+        // rail consumes `SidebarBackdropView` just like the LHS project rail.
+        XCTAssertEqual(KaisolaTheme.glass.sidebarAppearance, .glass)
+        XCTAssertEqual(KaisolaTheme.glass.workspaceBackdrop, .glass)
+    }
+
+    /// Live vibrancy cannot be pixel-tested offline because its input is the
+    /// actual desktop behind the test window. Its deterministic choices can be:
+    /// light rails and canvas share the Safari-like material, and the sampled
+    /// hue is lifted to a white carrier without changing its channel ratios.
+    func testLiveLightGlassUsesTheSharedWhiteCarrier() {
+        XCTAssertEqual(
+            DesktopGlassLayer.resolvedLiveMaterial(.sidebar, isDark: false),
+            .sidebar
+        )
+        XCTAssertEqual(
+            DesktopGlassLayer.resolvedLiveMaterial(.underWindowBackground, isDark: false),
+            .sidebar,
+            "the light canvas is using a greyer material than the rails"
+        )
+        XCTAssertEqual(
+            DesktopGlassLayer.resolvedLiveMaterial(.underWindowBackground, isDark: true),
+            .underWindowBackground,
+            "the light-only correction changed dark glass"
+        )
+
+        let sampled = DesktopTintComponents(red: 0.3152, green: 0.4646, blue: 0.5343)
+        let light = DesktopGlassLayer.resolvedLiveTint(sampled, isDark: false)
+        XCTAssertEqual(max(light.red, max(light.green, light.blue)), LightGlassFrost.liveTintPeak)
+        XCTAssertEqual(light.red / light.blue, sampled.red / sampled.blue, accuracy: 0.0001)
+        XCTAssertEqual(light.green / light.blue, sampled.green / sampled.blue, accuracy: 0.0001)
+        XCTAssertEqual(DesktopGlassLayer.resolvedLiveTint(sampled, isDark: true), sampled)
+    }
+
     func testGlassBackdropWashIsWhiteLedInLightAndNearBlackInDark() {
         let lightRecipes = [
             GlassBackdropWash.sidebar(isDark: false),
@@ -4180,10 +4242,9 @@ final class NativePreviewSettingsTests: XCTestCase {
     }
 
     /// The warmth is derived per appearance now, and the derivation is the
-    /// point: a fixed 4% of a 0.738-luminance amber is a nineteen-times larger
-    /// relative perturbation on a still normalized to 0.16 than on one
-    /// normalized to 0.72, in a hue opposite the cool cast — which is how
-    /// "blue" became "purple".
+    /// point: fixed amber coverage is a much larger relative perturbation on a
+    /// near-black still than on the bright light still, in a hue opposite the
+    /// cool cast — which is how "blue" became "purple".
     func testGlassWarmthCoverageTracksTheSurfaceItLandsOn() {
         XCTAssertEqual(GlassWarmth.opacity(isDark: false), GlassWarmth.opacity, accuracy: 0.0001)
         let ratio = DesktopBackdropRenderer.targetLuminance(isDark: true)
@@ -4446,10 +4507,9 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The *invariance* is what this test is for and it is exact (spread < 0.001
     /// across every possible wallpaper mean). The two brightness bounds under it
     /// are a much weaker "and the result is still frost" sanity check, and the
-    /// light one moves with the veil: at 0.60 coverage the light composite sat
-    /// at 0.888, at 0.45 it sits at 0.846. That is the translucency Michael
-    /// asked for arriving, not a surface going grey — 0.846 is still 45% of the
-    /// way from the still to pure white, and the composite is 0.774/0.860/0.897.
+    /// light one moves with both the veil and the normalized carrier. At 0.45
+    /// coverage over the white-frost carrier it now sits at 0.89 — the desktop
+    /// still supplies colour and structure without turning the surface grey.
     /// The legibility this bound was standing in for is held directly, on
     /// rendered pixels, by `testLightGlassStaysLegibleOnTheWorstPatchOfEveryWallpaper`,
     /// so it does not need a proxy here as well.

@@ -685,9 +685,10 @@ enum DesktopBackdropRenderer {
     /// function of the user's desktop picture — a white wallpaper in dark mode
     /// put tertiary text on a pale surface. Normalizing here makes the veil's
     /// coverage arithmetic land on known ground for *any* desktop: the still
-    /// always arrives at these luminances, so the composite always lands near
-    /// 0.60·1.0 + 0.40·0.72 ≈ 0.89 in light and 0.60·0.05 + 0.40·0.16 ≈ 0.09 in
-    /// dark. The wallpaper still supplies hue and its large-scale gradient; it
+    /// always arrives at these luminances, so today's sidebar composite lands
+    /// near 0.45·1.0 + 0.55·0.80 ≈ 0.89 in light and
+    /// 0.34·0.05 + 0.66·0.12 ≈ 0.10 in dark. The wallpaper still supplies hue
+    /// and its large-scale gradient; it
     /// no longer supplies brightness.
     ///
     /// Dark went 0.16 → 0.12 for "glass settings by default should be darker".
@@ -707,7 +708,14 @@ enum DesktopBackdropRenderer {
     /// bake's own guard allows at most 2% of a dim wallpaper's still to clamp to
     /// black while keeping its spread above 0.05, and a dim fixture is pushed
     /// straight at that bound by this constant.
-    static func targetLuminance(isDark: Bool) -> Double { isDark ? 0.12 : 0.72 }
+    /// Light went 0.72 → 0.80 after the shipped surface was reported grey.
+    /// The veil is deliberately unchanged: raising the normalized underlay is
+    /// the way to make the pane white without spending wallpaper transmission.
+    /// `LightGlassFrost` is shared with the live and panel paths so this is one
+    /// material decision rather than a wallpaper-only correction.
+    static func targetLuminance(isDark: Bool) -> Double {
+        isDark ? 0.12 : LightGlassFrost.backdropLuminance
+    }
 
     /// The additive shift that moves a still of mean luminance `mean` onto
     /// `targetLuminance`.

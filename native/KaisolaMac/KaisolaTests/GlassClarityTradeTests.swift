@@ -73,62 +73,67 @@ final class GlassClarityTradeTests: XCTestCase {
 
     // MARK: - The idle canvas
 
-    /// An idle canvas keeps a whisper of veil — enough to seat the picture in
+    /// A dark idle canvas keeps a whisper of veil — enough to seat the picture in
     /// the app's appearance, and nowhere near enough to be a wash. The floor
     /// side matters too: at every clarity the idle veil must be a real
     /// reduction against the full one, or "translucent when nothing is
     /// mounted" quietly stops being true the way "Clear" once did.
-    func testTheIdleVeilIsAWhisperButStillAVeil() {
-        for isDark in [true, false] {
-            for clarity in GlassClarity.allCases {
-                let idle = GlassBackdropWash.workspaceIdle(isDark: isDark, clarity: clarity)
-                let full = GlassBackdropWash.workspace(isDark: isDark, clarity: clarity)
-                XCTAssertLessThan(
-                    idle.baseOpacity, full.baseOpacity * 0.5,
-                    "idle (\(clarity), isDark: \(isDark)) must be a real reduction"
-                )
-                XCTAssertGreaterThan(idle.baseOpacity, 0, "…and still a veil, not nothing")
-            }
-            let balanced = GlassBackdropWash.workspaceIdle(isDark: isDark, clarity: .balanced)
-            XCTAssertGreaterThanOrEqual(
-                balanced.desktopTransmission, 0.85,
-                "an idle balanced canvas (isDark: \(isDark)) must pass at least 85% of the desktop"
+    func testTheDarkIdleVeilIsAWhisperButStillAVeil() {
+        for clarity in GlassClarity.allCases {
+            let idle = GlassBackdropWash.workspaceIdle(isDark: true, clarity: clarity)
+            let full = GlassBackdropWash.workspace(isDark: true, clarity: clarity)
+            XCTAssertLessThan(
+                idle.baseOpacity, full.baseOpacity * 0.5,
+                "dark idle \(clarity) must be a real reduction"
             )
+            XCTAssertGreaterThan(idle.baseOpacity, 0, "…and still a veil, not nothing")
         }
+        let balanced = GlassBackdropWash.workspaceIdle(isDark: true, clarity: .balanced)
+        XCTAssertGreaterThanOrEqual(
+            balanced.desktopTransmission, 0.85,
+            "an idle balanced dark canvas must pass at least 85% of the desktop"
+        )
     }
 
     /// Accessibility outranks idleness, and the painted source must wait for
     /// its clear still rather than show a washed one under a whisper veil.
     func testIdleGlassNeverReachesAccessibilityUsers() {
         XCTAssertFalse(WorkspaceBackdropView.idleGlassEngages(
-            idle: true, reduceTransparency: true, increasedContrast: false,
+            idle: true, isDark: true, reduceTransparency: true, increasedContrast: false,
             paintedSource: true, clearStillAvailable: true
         ))
         XCTAssertFalse(WorkspaceBackdropView.idleGlassEngages(
-            idle: true, reduceTransparency: false, increasedContrast: true,
+            idle: true, isDark: true, reduceTransparency: false, increasedContrast: true,
             paintedSource: true, clearStillAvailable: true
         ))
         XCTAssertFalse(WorkspaceBackdropView.idleGlassEngages(
-            idle: false, reduceTransparency: false, increasedContrast: false,
+            idle: false, isDark: true, reduceTransparency: false, increasedContrast: false,
             paintedSource: true, clearStillAvailable: true
         ))
         XCTAssertFalse(
             WorkspaceBackdropView.idleGlassEngages(
-                idle: true, reduceTransparency: false, increasedContrast: false,
+                idle: true, isDark: true, reduceTransparency: false, increasedContrast: false,
                 paintedSource: true, clearStillAvailable: false
             ),
             "no clear still yet — the washed branch must mount so its glass layer triggers the bake"
         )
         XCTAssertTrue(WorkspaceBackdropView.idleGlassEngages(
-            idle: true, reduceTransparency: false, increasedContrast: false,
+            idle: true, isDark: true, reduceTransparency: false, increasedContrast: false,
             paintedSource: true, clearStillAvailable: true
         ))
         XCTAssertTrue(
             WorkspaceBackdropView.idleGlassEngages(
-                idle: true, reduceTransparency: false, increasedContrast: false,
+                idle: true, isDark: true, reduceTransparency: false, increasedContrast: false,
                 paintedSource: false, clearStillAvailable: false
             ),
             "the live source has no still to wait for"
+        )
+        XCTAssertFalse(
+            WorkspaceBackdropView.idleGlassEngages(
+                idle: true, isDark: false, reduceTransparency: false, increasedContrast: false,
+                paintedSource: false, clearStillAvailable: false
+            ),
+            "light idle canvas must keep the same white frost as the occupied canvas"
         )
     }
 

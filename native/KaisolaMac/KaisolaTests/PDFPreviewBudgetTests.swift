@@ -221,7 +221,74 @@ final class PDFPreviewBudgetTests: XCTestCase {
 
         XCTAssertTrue(result.pass)
         XCTAssertTrue(result.diagnostics.isEmpty)
-        XCTAssertEqual(result.subsequentPagingP95LatencyMs, 180)
+        XCTAssertEqual(result.subsequentPagingMedianLatencyMs, 130)
+        XCTAssertEqual(result.subsequentPagingMaximumLatencyMs, 180)
+    }
+
+    /// The gate exists to catch paging getting slower, not to relitigate one
+    /// page turn that is inherently expensive. Jumping to the last page of the
+    /// image-heavy fixture measured 479, 512, 600, 632, 747, 771, 880 and
+    /// 1698ms across eight CI runs while every other sample in those runs stayed
+    /// under 150ms. A single slow sample must not fail the job; a run that slows
+    /// down as a whole must.
+    func testOneInherentlySlowPageTurnPassesWhileAWholeSlowRunFails() throws {
+        let specification = try XCTUnwrap(
+            PDFPreviewBudgetFixtureCatalog.specification(id: "image-heavy")
+        )
+        let scroll = PDFPreviewScrollMetrics(
+            callbackCount: 175,
+            measurementDurationSeconds: 3,
+            nominalFrameDurationMs: 16.67,
+            p95IntervalMs: 22,
+            maximumIntervalMs: 55,
+            callbackCoverage: 0.97
+        )
+        func evaluate(_ latencies: [Double]) -> PDFPreviewBudgetFixtureResult {
+            PDFPreviewBudgetFixtureResult.evaluate(
+                specification: specification,
+                byteCount: specification.minimumBytes,
+                actualPageCount: specification.expectedPageCount,
+                outcome: "rendered",
+                measurements: PDFPreviewBudgetMeasurements(
+                    firstVisiblePageLatencyMs: 120,
+                    subsequentPagingLatenciesMs: latencies,
+                    malformedRejectionLatencyMs: nil,
+                    scroll: scroll
+                )
+            )
+        }
+
+        // A run the old p95-of-five gate failed.
+        let observed = evaluate([91, 33.1, 62, 27.6, 880.5])
+        XCTAssertTrue(observed.pass)
+        XCTAssertEqual(observed.subsequentPagingMedianLatencyMs, 62)
+        XCTAssertEqual(observed.subsequentPagingMaximumLatencyMs, 880.5)
+
+        // The heaviest tail measured, which failed a first attempt at a 1500ms
+        // ceiling. Its median is 64ms, inside the band every other run reports,
+        // so the run is healthy and the ceiling was the thing that was wrong.
+        let heavyTail = evaluate([96.8, 60.2, 64, 34.2, 1_698.5])
+        XCTAssertTrue(heavyTail.pass)
+        XCTAssertEqual(heavyTail.subsequentPagingMedianLatencyMs, 64)
+        XCTAssertEqual(heavyTail.subsequentPagingMaximumLatencyMs, 1_698.5)
+
+        // Every sample five times slower is a real regression, and the median
+        // catches it even though no single turn reaches the outright ceiling.
+        let regressed = evaluate([455, 165.5, 310, 138, 500])
+        XCTAssertFalse(regressed.pass)
+        XCTAssertEqual(
+            regressed.diagnostics.map(\.threshold),
+            ["subsequentPagingMedianLatencyMs.maximum"]
+        )
+
+        // A page turn that costs as much as opening the document cold is a
+        // pathology rather than a slow sample, and still fails on its own.
+        let stalled = evaluate([91, 33.1, 62, 27.6, 3_100])
+        XCTAssertFalse(stalled.pass)
+        XCTAssertEqual(
+            stalled.diagnostics.map(\.threshold),
+            ["subsequentPagingMaximumLatencyMs.maximum"]
+        )
     }
 
     func testEveryViolatedThresholdNamesTheFixtureAndExactLimit() throws {
@@ -235,7 +302,7 @@ final class PDFPreviewBudgetTests: XCTestCase {
             measurements: PDFPreviewBudgetMeasurements(
                 firstVisiblePageLatencyMs: thresholds.maximumFirstVisiblePageLatencyMs + 1,
                 subsequentPagingLatenciesMs: Array(
-                    repeating: thresholds.maximumSubsequentPagingP95LatencyMs + 1,
+                    repeating: thresholds.maximumSubsequentPagingLatencyMs + 1,
                     count: specification.pagingPageIndexes.count
                 ),
                 malformedRejectionLatencyMs: nil,
@@ -256,7 +323,8 @@ final class PDFPreviewBudgetTests: XCTestCase {
             "generatedBytes.maximum",
             "pageCount.exact",
             "firstVisiblePageLatencyMs.maximum",
-            "subsequentPagingP95LatencyMs.maximum",
+            "subsequentPagingMedianLatencyMs.maximum",
+            "subsequentPagingMaximumLatencyMs.maximum",
             "scroll.p95IntervalMs.maximum",
             "scroll.maximumIntervalMs.maximum",
             "scroll.callbackCoverage.minimum",

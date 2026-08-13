@@ -858,6 +858,71 @@ final class NativeSessionStoreTests: XCTestCase {
         XCTAssertTrue(tombstoned?.panes.isEmpty == true)
     }
 
+    func testFullSnapshotFromAnotherWindowPreservesActiveChatUntilExplicitRemoval() async throws {
+        let stateURL = fileURL.deletingLastPathComponent()
+            .appendingPathComponent("workspace-state-v1.json")
+        let workspaceStore = NativeWorkspaceStateStore(fileURL: stateURL)
+        let basePath = "/tmp/active-chat-window-merge"
+        let projectID = NativeSessionStore.projectID(forDirectory: basePath)
+        let descriptor = NativeRestorableAgentChatDescriptor(
+            id: "chat-owned-by-first-window",
+            projectID: projectID,
+            agentID: "codex",
+            workspacePath: basePath,
+            acpSessionID: "provider-session",
+            title: "Keep active chat"
+        )
+        let activePane = NativeRestorablePaneState(
+            id: descriptor.id,
+            surface: NativeRestorableSurfaceState(agentChat: descriptor)
+        )
+        try await workspaceStore.saveRestorationState(NativeWorkspaceRestorationState(
+            selectedProjectID: projectID,
+            projects: [NativeProjectWorkspaceState(
+                projectID: projectID,
+                layout: SessionPaneLayout(sessionID: descriptor.id),
+                panes: [activePane],
+                focusedPaneID: descriptor.id
+            )]
+        ))
+
+        // A second AppModel may have restored before the first window opened
+        // this chat. Its full teardown snapshot must not erase work it never
+        // owned or even knew existed.
+        try await workspaceStore.saveRestorationState(NativeWorkspaceRestorationState(
+            selectedProjectID: nil,
+            projects: []
+        ))
+        let preserved = try await workspaceStore.projectState(for: projectID)
+        let preservedChat = try XCTUnwrap(
+            preserved?.panes.first { $0.id == descriptor.id }
+        )
+        XCTAssertEqual(preservedChat.surface.agentChatDescriptor, descriptor)
+        XCTAssertTrue(preservedChat.isMinimized)
+        XCTAssertFalse(preserved?.layout.contains(descriptor.id) == true)
+
+        let explicitRemoval = try await workspaceStore.removeAgentChatState(
+            projectID: projectID,
+            chatID: descriptor.id
+        )
+        XCTAssertTrue(explicitRemoval)
+
+        // A stale window that still carries the old descriptor cannot revive
+        // it after the explicit permanent-delete boundary in this process.
+        try await workspaceStore.saveProjectState(NativeProjectWorkspaceState(
+            projectID: projectID,
+            layout: SessionPaneLayout(sessionID: descriptor.id),
+            panes: [activePane],
+            focusedPaneID: descriptor.id
+        ))
+        let removed = try await workspaceStore.projectState(for: projectID)
+        XCTAssertFalse(removed?.panes.contains { $0.id == descriptor.id } == true)
+
+        let reopened = NativeWorkspaceStateStore(fileURL: stateURL)
+        let relaunched = try await reopened.projectState(for: projectID)
+        XCTAssertFalse(relaunched?.panes.contains { $0.id == descriptor.id } == true)
+    }
+
     func testStaleRecentlyClosedDeleteCannotRemoveEntryRestoredByAnotherWindow() async throws {
         let workspaceStore = NativeWorkspaceStateStore(
             fileURL: fileURL.deletingLastPathComponent()

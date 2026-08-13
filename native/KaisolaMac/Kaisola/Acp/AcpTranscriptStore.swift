@@ -1082,7 +1082,7 @@ actor AcpTranscriptStore {
     }
 
     @discardableResult
-    func remove(chatID: String) -> Removal {
+    func remove(chatID: String, retainTombstone: Bool = false) -> Removal {
         guard Self.validChatID(chatID) else {
             return .failed(.database("invalid transcript chat identifier"))
         }
@@ -1094,6 +1094,20 @@ actor AcpTranscriptStore {
                 database,
                 beforeCommit: { try self.consumeRemovalFailure(.commit) }
             ) {
+                // Descriptor persistence and transcript persistence are two
+                // stores. If catalog pruning failed, pin the already-durable
+                // tombstone in the same transaction that erases transcript
+                // bytes. No other window may reclaim that resurrection fence
+                // between these two operations or during a later flush.
+                if retainTombstone {
+                    try withStatement(
+                        "UPDATE deleted_chats SET descriptor_reclaim_blocked = 1 WHERE chat_id = ?",
+                        database: database
+                    ) {
+                        try bind(chatID, at: 1, statement: $0, database: database)
+                        try stepDone($0, database: database)
+                    }
+                }
                 try consumeRemovalFailure(.delete)
                 try withStatement("DELETE FROM chats WHERE chat_id = ?", database: database) {
                     try bind(chatID, at: 1, statement: $0, database: database)
@@ -1147,8 +1161,11 @@ actor AcpTranscriptStore {
                 deletionGeneration = try nextDeletionGeneration(database)
                 try withStatement(
                     """
-                    INSERT OR REPLACE INTO deleted_chats(chat_id, deleted_at, generation)
+                    INSERT INTO deleted_chats(chat_id, deleted_at, generation)
                     VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        deleted_at = excluded.deleted_at,
+                        generation = excluded.generation
                     """,
                     database: database
                 ) {
@@ -1221,11 +1238,25 @@ actor AcpTranscriptStore {
     /// then drain tombstones whose chat rows are fully gone. Both statements
     /// share one transaction so a failed launch cleanup retains the fence for
     /// the next retry instead of stranding transcript bytes without intent.
-    func vacuumTombstones(now: Int64? = nil) {
+    func vacuumTombstones(
+        now: Int64? = nil,
+        descriptorPruningVerified: Bool = false
+    ) {
         guard let database = try? openDatabase(),
               (try? tableExists("deleted_chats", database: database)) == true else { return }
         try? transaction(database) {
             try expireWriterLeases(now: Self.timestamp(now), database: database)
+            // Launch restoration passes this only after it has read the full
+            // workspace archive and durably pruned every descriptor proven
+            // stale. Releasing and reclaiming in one transaction means a
+            // crash can leave either the protective fence or the completed
+            // cleanup, never an unprotected stale descriptor.
+            if descriptorPruningVerified {
+                try execute(
+                    "UPDATE deleted_chats SET descriptor_reclaim_blocked = 0",
+                    database: database
+                )
+            }
             // `transcript_rows` follows through its ON DELETE CASCADE. This is
             // the idempotent restart path for a crash before remove(chatID:).
             try execute(
@@ -1446,7 +1477,8 @@ actor AcpTranscriptStore {
         }
         try migrateRetentionSchemaIfNeeded(database)
         try migrateDeletedChatsGenerationIfNeeded(database)
-        try execute("PRAGMA user_version = 4", database: database)
+        try migrateDeletedChatsDescriptorFenceIfNeeded(database)
+        try execute("PRAGMA user_version = 5", database: database)
     }
 
     private func migrateRetentionSchemaIfNeeded(_ database: SQLiteHandle) throws {
@@ -1502,7 +1534,9 @@ actor AcpTranscriptStore {
             CREATE TABLE IF NOT EXISTS deleted_chats (
                 chat_id TEXT PRIMARY KEY NOT NULL,
                 deleted_at INTEGER NOT NULL,
-                generation INTEGER NOT NULL CHECK (generation >= 0)
+                generation INTEGER NOT NULL CHECK (generation >= 0),
+                descriptor_reclaim_blocked INTEGER NOT NULL DEFAULT 0
+                    CHECK (descriptor_reclaim_blocked IN (0, 1))
             ) WITHOUT ROWID
             """,
             database: database
@@ -1539,6 +1573,23 @@ actor AcpTranscriptStore {
 
     private func deletedChatsHaveGenerationColumn(_ database: SQLiteHandle) throws -> Bool {
         try tableHasColumn("deleted_chats", column: "generation", database: database)
+    }
+
+    private func migrateDeletedChatsDescriptorFenceIfNeeded(_ database: SQLiteHandle) throws {
+        guard try tableExists("deleted_chats", database: database),
+              try !tableHasColumn(
+                  "deleted_chats",
+                  column: "descriptor_reclaim_blocked",
+                  database: database
+              ) else { return }
+        try execute(
+            """
+            ALTER TABLE deleted_chats
+            ADD COLUMN descriptor_reclaim_blocked INTEGER NOT NULL DEFAULT 0
+                CHECK (descriptor_reclaim_blocked IN (0, 1))
+            """,
+            database: database
+        )
     }
 
     private func tableHasColumn(
@@ -2373,6 +2424,7 @@ actor AcpTranscriptStore {
             """
             DELETE FROM deleted_chats
             WHERE chat_id NOT IN (SELECT chat_id FROM chats)
+              AND descriptor_reclaim_blocked = 0
               AND NOT EXISTS (
                   SELECT 1 FROM transcript_writers
                   WHERE acknowledged_generation < deleted_chats.generation

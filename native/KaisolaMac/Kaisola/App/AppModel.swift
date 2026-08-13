@@ -2523,7 +2523,10 @@ final class AppModel: ObservableObject {
     /// standing in front of a permanent-delete confirmation can wait for it
     /// rather than announce a deletion the store never finished.
     @discardableResult
-    func enqueueTranscriptRemoval(chatID: String) -> Task<AcpTranscriptStore.Removal, Never> {
+    func enqueueTranscriptRemoval(
+        chatID: String,
+        retainTombstone: Bool = false
+    ) -> Task<AcpTranscriptStore.Removal, Never> {
         explicitlyClosedChatIDs.insert(chatID)
         let previous = transcriptPersistenceTask
         let transcriptStore = transcriptStore
@@ -2534,7 +2537,10 @@ final class AppModel: ObservableObject {
             // normal streaming. On explicit close, drain usage first and make
             // the full transcript deletion the final actor operation.
             await usageCenter.flushPersistence()
-            return await transcriptStore.remove(chatID: chatID)
+            return await transcriptStore.remove(
+                chatID: chatID,
+                retainTombstone: retainTombstone
+            )
         }
         transcriptPersistenceTask = Task { _ = await removal.value }
         return removal
@@ -2931,23 +2937,65 @@ final class AppModel: ObservableObject {
         let restorableProjects = restoration.projects.filter {
             !sessionStore.isProjectClosed($0.projectID)
         }
-        recentlyClosedPanes = restorableProjects.flatMap { project in
-            project.panes.filter(\.isRecentlyClosed)
+        // A crash can land after the transcript tombstone but before the
+        // workspace descriptor is removed. Prune every descriptor while its
+        // tombstone still proves deletion intent; reclaiming tombstones first
+        // would turn that stale descriptor back into an apparently live chat.
+        var canVacuumTranscriptTombstones = true
+        var blockedRestoredChatIDs = Set<String>()
+        // Deletion also applies to projects that are currently closed. Their
+        // archived panes are not restored today, but leaving a stale
+        // descriptor there would revive it when the project is reopened.
+        for projectState in restoration.projects {
+            for pane in projectState.panes {
+                guard let descriptor = pane.surface.agentChatDescriptor else { continue }
+                switch await transcriptStore.tombstoneState(chatID: descriptor.id) {
+                case .present:
+                    blockedRestoredChatIDs.insert(descriptor.id)
+                    if chats.contains(where: { $0.id == descriptor.id }) {
+                        // A restoration retry can run after live state exists.
+                        // That handle may write another descriptor on teardown,
+                        // so keep the deletion fence for a later clean launch.
+                        canVacuumTranscriptTombstones = false
+                    }
+                    do {
+                        _ = try await workspaceStateStore.removeAgentChatState(
+                            projectID: projectState.projectID,
+                            chatID: descriptor.id
+                        )
+                    } catch {
+                        // Keep the tombstone until a later launch can prove the
+                        // stale descriptor is gone. Reclaiming it now would
+                        // authorize resurrection on the next restart.
+                        canVacuumTranscriptTombstones = false
+                    }
+                    continue
+                case .unknown:
+                    blockedRestoredChatIDs.insert(descriptor.id)
+                    // A failed probe is not evidence that deletion never
+                    // happened. Keep both stores untouched and try next time.
+                    canVacuumTranscriptTombstones = false
+                    continue
+                case .absent:
+                    continue
+                }
+            }
         }
-        // Deleted chats whose rows are fully gone can drain their tombstones.
-        await transcriptStore.vacuumTombstones()
+        recentlyClosedPanes = restorableProjects.flatMap { project in
+            project.panes.filter { pane in
+                guard pane.isRecentlyClosed else { return false }
+                guard let descriptor = pane.surface.agentChatDescriptor else { return true }
+                return !blockedRestoredChatIDs.contains(descriptor.id)
+            }
+        }
+
         for projectState in restorableProjects {
             for pane in projectState.panes {
                 guard !pane.isRecentlyClosed,
                       let descriptor = pane.surface.agentChatDescriptor,
-                      chats.contains(where: { $0.id == descriptor.id }) == false,
-                      // A tombstoned chat was deleted; a stale archived pane
-                      // (crash between phases, another window) must not
-                      // revive it (§4e). Only a proven `.absent` restores, so a
-                      // lookup the store cannot complete on a busy, corrupt, or
-                      // unreadable database leaves the pane out instead.
-                      await transcriptStore.tombstoneState(chatID: descriptor.id) == .absent,
-                      let agent = AgentRegistry.profile(id: descriptor.agentID) else { continue }
+                      !blockedRestoredChatIDs.contains(descriptor.id),
+                      chats.contains(where: { $0.id == descriptor.id }) == false else { continue }
+                guard let agent = AgentRegistry.profile(id: descriptor.agentID) else { continue }
                 let directory = URL(fileURLWithPath: descriptor.workspacePath, isDirectory: true)
                     .standardizedFileURL
                 var isDirectory: ObjCBool = false
@@ -3073,6 +3121,9 @@ final class AppModel: ObservableObject {
             }
 
             var layout = projectState.layout
+            for blockedChatID in blockedRestoredChatIDs {
+                layout.remove(blockedChatID)
+            }
             if connectionState.isConnected {
                 // Dormant terminals (persisted records the broker no longer
                 // holds — a reboot killed their PTYs) stay in the layout so a
@@ -3089,6 +3140,13 @@ final class AppModel: ObservableObject {
             }
             unifiedSessionCards.install(layout, for: projectState.projectID)
             restoreFileTabs(from: projectState)
+        }
+
+        if canVacuumTranscriptTombstones {
+            // Descriptors are now either known absent or durably pruned, so
+            // interrupted transcript deletion can safely finish and reclaim
+            // its one-shot tombstone.
+            await transcriptStore.vacuumTombstones(descriptorPruningVerified: true)
         }
 
         if let projectID = restoration.selectedProjectID,
@@ -3644,6 +3702,21 @@ final class AppModel: ObservableObject {
             return .failed(error)
         }
         let closingChat = chats.first(where: { $0.id == chatID })
+        var descriptorRemovalFailure: String?
+        if let projectID = closingChat?.projectID {
+            do {
+                _ = try await workspaceStateStore.removeAgentChatState(
+                    projectID: projectID,
+                    chatID: chatID
+                )
+            } catch {
+                // Transcript tombstoning is already durable, so restoration
+                // stays fail-closed even if the stale descriptor remains. Keep
+                // the live surface in place for an explicit retry; launch-time
+                // recovery also prunes it before reclaiming the tombstone.
+                descriptorRemovalFailure = error.localizedDescription
+            }
+        }
         if let closingChat {
             // Quiesce persistence synchronously on MainActor before stop()
             // yields and lets already-buffered ACP events drain.
@@ -3672,19 +3745,26 @@ final class AppModel: ObservableObject {
         if selectedChatID == chatID { selectedChatID = nil }
         if let projectID = closingChat?.projectID {
             unifiedSessionCards.remove(chatID, from: projectID)
-            scheduleWorkspaceStateSave(projectID: projectID)
         }
         // Unconditional (§4e): the user deleted the chat, so its transcript
         // goes — the old forgetDurableChat gate could leave tombstoned
         // content on disk forever when usage bookkeeping said "shared".
         _ = forgetDurableChat
-        let removalResult = await enqueueTranscriptRemoval(chatID: chatID).value
+        // If catalog pruning failed, transcript erasure must retain its
+        // tombstone atomically. Otherwise remove() could erase the chat row
+        // and reclaim the only fence that keeps this stale descriptor from
+        // restoring on the next launch.
+        let removalResult = await enqueueTranscriptRemoval(
+            chatID: chatID,
+            retainTombstone: descriptorRemovalFailure != nil
+        ).value
         await removeChatDraftsAfterDeletionCommit(chatID: chatID)
         // The workspace archive must reflect the deletion durably NOW, not
         // after a 220 ms debounce a crash can beat (§4e).
-        if let projectID = closingChat?.projectID {
-            Task { await persistWorkspaceStateImmediately(projectID: projectID) }
-        }
+        // The descriptor was removed synchronously above. Do not route this
+        // through the ordinary merge-preserving snapshot path: another window
+        // may legitimately omit this chat, while only this explicit store
+        // operation is allowed to prove deletion intent.
         // The tombstone already keeps the chat closed, but a DELETE that never
         // committed left its bytes on disk. Say that instead of letting the
         // silent close read as a finished permanent delete.
@@ -3693,8 +3773,20 @@ final class AppModel: ObservableObject {
                 "The chat is closed, but its transcript could not be erased from disk: \(failure)",
                 style: .error
             )
+            return removalResult
         }
-        return removalResult
+        if let descriptorRemovalFailure {
+            // The transcript tombstone is durable and every callback capable
+            // of submitting new chat work was fenced before the surface was
+            // removed above. Report the incomplete catalog cleanup without
+            // leaving a writable UI attached to a tombstoned transcript.
+            ToastCenter.shared.show(
+                "The chat is closed, but its workspace descriptor could not be erased: \(descriptorRemovalFailure)",
+                style: .error
+            )
+            return .failed(.database(descriptorRemovalFailure))
+        }
+        return .removed
     }
 
     /// Keep restored chat startup and live-account invalidation on the same
@@ -4594,15 +4686,18 @@ final class AppModel: ObservableObject {
         usageObservers.removeAll()
         await draftPersistenceTask?.value
         await persistWorkspaceStateNow()
-        chats.removeAll()
         meshLifecycleCoordinator.cancelAll()
         for mesh in meshes {
             _ = await meshLifecycleCoordinator.suspend(mesh)
         }
         // `suspend` updates lifecycle and can fence a worktree provision that
         // was already in flight. Flush that final safe manifest before the
-        // window model releases its claim.
+        // window model releases its claim. Stopped chats deliberately remain
+        // in `chats` through this last snapshot: their transcript rows live in
+        // SQLite, but this descriptor is the only durable route back to them
+        // after a relaunch or app update.
         await persistWorkspaceStateNow()
+        chats.removeAll()
         for mesh in meshes {
             Self.claimedRestoredMeshIDs.remove(mesh.id)
             meshLifecycleCoordinator.forget(meshID: mesh.id)

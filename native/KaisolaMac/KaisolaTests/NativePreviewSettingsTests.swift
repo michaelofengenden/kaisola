@@ -884,6 +884,101 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(TerminalThemeRegistry.shipped.first?.title, "macOS Terminal")
     }
 
+    /// The Safari reference is a white frost across the whole window, not a
+    /// white sidebar beside a grey canvas. Rails and canvas keep their existing
+    /// (different) transmission, but the normalized carrier makes both land on
+    /// the same near-white ground before AppKit's live material is involved.
+    func testLightGlassIsWhiteAndCoherentAcrossRailsCanvasAndPanel() {
+        let rail = GlassBackdropWash.sidebar(isDark: false)
+        let canvas = GlassBackdropWash.workspace(isDark: false)
+        let railLuminance = LightGlassFrost.modeledBackdropLuminance(rail)
+        let canvasLuminance = LightGlassFrost.modeledBackdropLuminance(canvas)
+
+        XCTAssertEqual(
+            DesktopBackdropRenderer.targetLuminance(isDark: false),
+            LightGlassFrost.backdropLuminance,
+            accuracy: 0.0001
+        )
+        XCTAssertGreaterThanOrEqual(railLuminance, 0.96, "the LHS/RHS rails still read grey")
+        XCTAssertGreaterThanOrEqual(canvasLuminance, 0.96, "the background canvas still reads grey")
+        XCTAssertLessThan(
+            abs(railLuminance - canvasLuminance),
+            0.011,
+            "rails and canvas are no longer one white-glass family"
+        )
+
+        // The detail panel is the last layer over the canvas. Its white frost
+        // must be visible but must not become an opaque white card.
+        XCTAssertGreaterThanOrEqual(LightGlassFrost.carrierWhiteCoverage, 0.65)
+        XCTAssertLessThan(LightGlassFrost.carrierWhiteCoverage, 0.80)
+        XCTAssertGreaterThanOrEqual(LightGlassFrost.panelWhiteCoverage, 0.35)
+        XCTAssertLessThan(LightGlassFrost.panelWhiteCoverage, 0.50)
+        XCTAssertGreaterThanOrEqual(
+            LightGlassFrost.panelDesktopTransmission,
+            0.50,
+            "the inset panel became an opaque white card"
+        )
+
+        // One theme choice moves both surface families together. The RHS file
+        // rail consumes `SidebarBackdropView` just like the LHS project rail.
+        XCTAssertEqual(KaisolaTheme.glass.sidebarAppearance, .glass)
+        XCTAssertEqual(KaisolaTheme.glass.workspaceBackdrop, .glass)
+    }
+
+    /// Live vibrancy cannot be pixel-tested offline because its input is the
+    /// actual desktop behind the test window. Its deterministic choices can be:
+    /// light rails and canvas share the Safari-like material, and sampled hue
+    /// is excluded rather than merely brightened.
+    func testLiveLightGlassUsesTheSharedWhiteCarrier() {
+        XCTAssertEqual(
+            DesktopGlassLayer.resolvedLiveMaterial(.sidebar, isDark: false),
+            .sidebar
+        )
+        XCTAssertEqual(
+            DesktopGlassLayer.resolvedLiveMaterial(.underWindowBackground, isDark: false),
+            .sidebar,
+            "the light canvas is using a greyer material than the rails"
+        )
+        XCTAssertEqual(
+            DesktopGlassLayer.resolvedLiveMaterial(.underWindowBackground, isDark: true),
+            .underWindowBackground,
+            "the light-only correction changed dark glass"
+        )
+
+        let sampled = DesktopTintComponents(red: 0.3152, green: 0.4646, blue: 0.5343)
+        let light = DesktopGlassLayer.resolvedLiveTint(sampled, isDark: false)
+        XCTAssertEqual(light.red, 1)
+        XCTAssertEqual(light.green, 1)
+        XCTAssertEqual(light.blue, 1)
+        XCTAssertEqual(
+            NativeVisualEffectView.resolvedSaturation(neutralizesChroma: true),
+            0,
+            "live light vibrancy can still transmit a coloured backdrop"
+        )
+        XCTAssertEqual(NativeVisualEffectView.resolvedSaturation(neutralizesChroma: false), 1)
+        XCTAssertFalse(DesktopGlassLayer.appliesSampledLiveTint(isDark: false))
+        XCTAssertTrue(DesktopGlassLayer.appliesSampledLiveTint(isDark: true))
+        XCTAssertEqual(DesktopGlassLayer.resolvedLiveTint(sampled, isDark: true), sampled)
+
+        let fallback = DesktopGlassLayer.flatTintCoverage(isDark: false)
+        XCTAssertEqual(fallback.top, 0)
+        XCTAssertEqual(fallback.bottom, 0)
+        XCTAssertEqual(DesktopGlassLayer.flatTintCoverage(isDark: true).top, 0.42)
+
+        for requested in [GlassColour.muted, .balanced, .vivid].map(\.chromaScale) {
+            XCTAssertEqual(
+                DesktopBackdropRenderer.resolvedGlassChromaScale(requested, isDark: false),
+                0,
+                "a painted light wallpaper can reintroduce a colour cast"
+            )
+            XCTAssertEqual(
+                DesktopBackdropRenderer.resolvedGlassChromaScale(requested, isDark: true),
+                requested,
+                "the light-only correction changed dark Glass"
+            )
+        }
+    }
+
     func testGlassBackdropWashIsWhiteLedInLightAndNearBlackInDark() {
         let lightRecipes = [
             GlassBackdropWash.sidebar(isDark: false),
@@ -1869,9 +1964,9 @@ final class NativePreviewSettingsTests: XCTestCase {
     }
 
     /// The shipped glass stack, rendered: the baked still stretched over the
-    /// surface, `GlassWarmth` over it, the veil gradient over that. Exactly the
-    /// three layers `DesktopGlassLayer` + `SidebarBackdropView` compose, in the
-    /// same order, with the same constants.
+    /// surface, appearance-specific warmth, the light white carrier, then the
+    /// veil gradient. Exactly the layers `DesktopGlassLayer` and the backdrop
+    /// views compose, in the same order, with the same constants.
     private func renderGlassSurface(
         still: CGImage,
         wash: GlassBackdropWash,
@@ -1910,6 +2005,13 @@ final class NativePreviewSettingsTests: XCTestCase {
                 alpha: warmth ?? GlassWarmth.opacity(isDark: isDark)
             )
             context.fill(rect)
+            if !isDark {
+                context.setFillColor(
+                    red: 1, green: 1, blue: 1,
+                    alpha: LightGlassFrost.carrierWhiteCoverage
+                )
+                context.fill(rect)
+            }
 
             let space = CGColorSpaceCreateDeviceRGB()
             var stops: [CGColor] = []
@@ -3558,48 +3660,40 @@ final class NativePreviewSettingsTests: XCTestCase {
                 "the baked still's perceived lightness still depends on hue: \(stillLightness)"
             )
             XCTAssertLessThan(
-                spread(stillSaturation), 1.01,
-                "the baked still's colourfulness still depends on hue: \(stillSaturation)"
-            )
-            // The finished surface: the residual is `GlassWarmth`, which is a
-            // fixed amber *vector* and so adds to a red surface and cancels a
-            // blue one. The next assertion proves that is all it is.
-            XCTAssertLessThan(
                 spread(surfaceLightness), 1.01,
                 "the surface's perceived lightness depends on hue: \(surfaceLightness)"
             )
-            XCTAssertLessThan(
-                spread(surfaceSaturation), 1.12,
-                "the surface's colourfulness depends on hue: \(surfaceSaturation)"
-            )
-            // 1.09, was 1.04, was 1.03. Each step is the same residual in the
-            // veil-compositing step being exposed by a deeper chroma cut: the
-            // 2026-08-04 cut took it to ~1.031, and shipping `GlassColour.muted`
-            // (chromaScale 0.45 against balanced's 1.0) takes it to ~1.078.
-            // Measured, the three coloured fixtures land at 0.0900, 0.0863 and
-            // 0.0930 — an 8% disagreement between hues on a quantity that is
-            // itself under a tenth. The regressions this assertion exists to
-            // catch measured 1.156-1.20×, so the band it guards is unchanged.
-            //
-            // It is also a bound on a path that is no longer the default:
-            // `GlassColour` feeds the *bake*, and the shipped source is
-            // behind-window vibrancy (`GlassPreset.source`), which never bakes.
-            // The painted still is now reached only under Reduce Transparency.
-            XCTAssertLessThan(
-                spread(bareSaturation), 1.09,
-                """
-                with the declared amber removed the surfaces still disagree by \
-                \(spread(bareSaturation)) — the residual is no longer GlassWarmth \
-                and something else has become hue-dependent: \(bareSaturation)
-                """
-            )
-
-            // The wallpaper's colour does still reach the glass — otherwise a
-            // pipeline that painted grey would pass everything above.
-            XCTAssertGreaterThan(
-                surfaceSaturation.prefix(3).min()!, neutralSurface * 4,
-                "the glass no longer carries the desktop's hue at all"
-            )
+            if isDark {
+                XCTAssertLessThan(
+                    spread(stillSaturation), 1.01,
+                    "the dark baked still's colourfulness depends on hue: \(stillSaturation)"
+                )
+                XCTAssertLessThan(
+                    spread(surfaceSaturation), 1.12,
+                    "the dark surface's colourfulness depends on hue: \(surfaceSaturation)"
+                )
+                XCTAssertLessThan(
+                    spread(bareSaturation), 1.09,
+                    "dark surfaces no longer share one hue-neutral material: \(bareSaturation)"
+                )
+                // Dark Glass still carries muted desktop colour.
+                XCTAssertGreaterThan(
+                    surfaceSaturation.prefix(3).min()!, neutralSurface * 4,
+                    "dark Glass no longer carries the desktop's hue at all"
+                )
+            } else {
+                // Light Glass is now explicitly white. Every coloured member
+                // must collapse to the same achromatic material while retaining
+                // the luminance structure checked above.
+                XCTAssertLessThan(
+                    stillSaturation.max()!, 0.002,
+                    "the painted light carrier retained wallpaper hue: \(stillSaturation)"
+                )
+                XCTAssertLessThan(
+                    surfaceSaturation.max()!, 0.002,
+                    "the finished light Glass retained wallpaper hue: \(surfaceSaturation)"
+                )
+            }
 
             // And the pipeline this replaces fails the same bound, loudly. If
             // this ever stops failing, the fixture has stopped exercising the
@@ -3830,20 +3924,10 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(now.desktopTransmission, before.desktopTransmission * 1.3)
     }
 
-    /// The same claim for light, and stated in the currency light's retune is
-    /// actually paid in.
-    ///
-    /// Dark's headline was luminance spread. Light's is **chroma**: across the
-    /// whole change (old bake + old veil → new bake + new veil) the composite's
-    /// luminance spread comes out level, 0.0805 → 0.0803 on Michael's own
-    /// desktop, because the range cap gives back what the thinner veil takes;
-    /// what actually rises is colour, 0.0501 → 0.0696. Asserting spread alone
-    /// would therefore report "no change" on a retune that moved a great deal.
-    ///
-    /// Like its dark sibling this holds the **veil** to account with the bake
-    /// fixed — both surfaces are rendered from the same still — so what it
-    /// measures is exactly the veil's contribution, and there both figures rise.
-    func testTheLightVeilLetsThroughMoreWallpaperThanItUsedTo() throws {
+    /// Light Glass retains the wallpaper's light and shade, never its hue.
+    /// The carrier makes the result white; the remaining luminance spread is
+    /// the depth cue that keeps it recognisably glass rather than a flat fill.
+    func testLightGlassPreservesWallpaperStructureWithoutColour() throws {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "kaisola-lighttrans-\(UUID().uuidString)", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -3894,16 +3978,13 @@ final class NativePreviewSettingsTests: XCTestCase {
             luminanceSpread(beforePixels), luminanceSpread(nowPixels),
             before.desktopTransmission, now.desktopTransmission
         ))
+        XCTAssertLessThanOrEqual(chroma(nowPixels), 1.0 / 255)
+        // The white carrier does not flatten the wallpaper's structure away.
         XCTAssertGreaterThan(
-            chroma(nowPixels), chroma(beforePixels) * 1.25,
-            "the thinner light veil did not put appreciably more of the desktop's colour in the surface"
+            luminanceSpread(nowPixels), 0.02,
+            "white Glass became a flat opaque fill"
         )
-        // And it did not pay for that by flattening the surface.
-        XCTAssertGreaterThan(
-            luminanceSpread(nowPixels), luminanceSpread(beforePixels),
-            "light traded its wallpaper's light and shade for its colour"
-        )
-        XCTAssertGreaterThan(now.desktopTransmission, before.desktopTransmission * 1.3)
+        XCTAssertGreaterThan(now.desktopTransmission, 0.5)
     }
 
     /// Live glass is the other half of "especially on live and wallpaper". There
@@ -3920,21 +4001,15 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(before, 0.336, accuracy: 0.001)
         XCTAssertGreaterThan(after, before * 1.6, "live dark barely moved")
 
-        // The light *tint* is untouched, and deliberately: the tint exists for
-        // light in the first place — AppKit's light materials are near-white and
-        // pass almost no desktop colour, which a dark material does not do — so
-        // cutting it would take away the layer that is carrying the hue.
-        XCTAssertEqual(SidebarBackdropView.liveTint.light, 0.26, accuracy: 0.0001)
-        XCTAssertLessThan(SidebarBackdropView.liveTint.dark, SidebarBackdropView.liveTint.light)
-        // Light's own translucency ask reaches Live through the veil instead,
-        // and by the same factor the painted source gained.
-        let lightBefore = transmission(tint: 0.26, veil: 0.60)
-        let lightAfter = transmission(
+        // Light has no sampled-colour tint. Its remaining material contribution
+        // is achromatically bounded by the shared white carrier and veil.
+        XCTAssertEqual(SidebarBackdropView.liveTint.light, 0, accuracy: 0.0001)
+        let lightAfterCarrier = transmission(
             tint: SidebarBackdropView.liveTint.light,
             veil: GlassBackdropWash.sidebar(isDark: false).baseOpacity
-        )
-        XCTAssertEqual(lightBefore, 0.296, accuracy: 0.001)
-        XCTAssertGreaterThan(lightAfter, lightBefore * 1.3, "live light barely moved")
+        ) * (1 - LightGlassFrost.carrierWhiteCoverage)
+        XCTAssertGreaterThan(lightAfterCarrier, 0.12, "white Glass became opaque")
+        XCTAssertLessThan(lightAfterCarrier, 0.20, "too much live colour can reach light Glass")
     }
 
     /// The bake bounds the wallpaper's dynamic range, not only its mean — the
@@ -4180,12 +4255,11 @@ final class NativePreviewSettingsTests: XCTestCase {
     }
 
     /// The warmth is derived per appearance now, and the derivation is the
-    /// point: a fixed 4% of a 0.738-luminance amber is a nineteen-times larger
-    /// relative perturbation on a still normalized to 0.16 than on one
-    /// normalized to 0.72, in a hue opposite the cool cast — which is how
-    /// "blue" became "purple".
+    /// point: fixed amber coverage is a much larger relative perturbation on a
+    /// near-black still than on the bright light still, in a hue opposite the
+    /// cool cast — which is how "blue" became "purple".
     func testGlassWarmthCoverageTracksTheSurfaceItLandsOn() {
-        XCTAssertEqual(GlassWarmth.opacity(isDark: false), GlassWarmth.opacity, accuracy: 0.0001)
+        XCTAssertEqual(GlassWarmth.opacity(isDark: false), 0, accuracy: 0.0001)
         let ratio = DesktopBackdropRenderer.targetLuminance(isDark: true)
             / DesktopBackdropRenderer.targetLuminance(isDark: false)
         XCTAssertEqual(
@@ -4203,7 +4277,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         // here). The floor exists to catch a layer scaled to nothing, not to pin
         // the target; it moves with the target and stays far above zero.
         XCTAssertGreaterThan(GlassWarmth.opacity(isDark: true), 0.004)
-        XCTAssertLessThan(GlassWarmth.opacity(isDark: true), GlassWarmth.opacity(isDark: false))
+        XCTAssertLessThan(GlassWarmth.opacity(isDark: true), GlassWarmth.opacity)
     }
 
     // MARK: - The three workspace canvases
@@ -4331,8 +4405,8 @@ final class NativePreviewSettingsTests: XCTestCase {
 
         // And it stays a hint. The ceiling is the whole safety argument — at 8%
         // this stops being warmth and starts being a tint, which is the thing
-        // the neutrality invariant exists to prevent. Stated on the light
-        // coverage, which is the number the dark one is derived from; see
+        // the neutrality invariant exists to prevent. Stated on the reference
+        // coverage from which the dark one is derived; see
         // `testGlassWarmthCoverageTracksTheSurfaceItLandsOn`.
         XCTAssertEqual(GlassWarmth.opacity, 0.029, accuracy: 0.0001)
         XCTAssertLessThan(GlassWarmth.opacity, 0.08)
@@ -4446,10 +4520,9 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The *invariance* is what this test is for and it is exact (spread < 0.001
     /// across every possible wallpaper mean). The two brightness bounds under it
     /// are a much weaker "and the result is still frost" sanity check, and the
-    /// light one moves with the veil: at 0.60 coverage the light composite sat
-    /// at 0.888, at 0.45 it sits at 0.846. That is the translucency Michael
-    /// asked for arriving, not a surface going grey — 0.846 is still 45% of the
-    /// way from the still to pure white, and the composite is 0.774/0.860/0.897.
+    /// light one moves with both the veil and the normalized carrier. At 0.45
+    /// coverage over the white-frost carrier it now sits at 0.89 — the desktop
+    /// still supplies colour and structure without turning the surface grey.
     /// The legibility this bound was standing in for is held directly, on
     /// rendered pixels, by `testLightGlassStaysLegibleOnTheWorstPatchOfEveryWallpaper`,
     /// so it does not need a proxy here as well.

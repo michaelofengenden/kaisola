@@ -685,9 +685,10 @@ enum DesktopBackdropRenderer {
     /// function of the user's desktop picture — a white wallpaper in dark mode
     /// put tertiary text on a pale surface. Normalizing here makes the veil's
     /// coverage arithmetic land on known ground for *any* desktop: the still
-    /// always arrives at these luminances, so the composite always lands near
-    /// 0.60·1.0 + 0.40·0.72 ≈ 0.89 in light and 0.60·0.05 + 0.40·0.16 ≈ 0.09 in
-    /// dark. The wallpaper still supplies hue and its large-scale gradient; it
+    /// always arrives at these luminances, so today's sidebar composite lands
+    /// near 0.45·1.0 + 0.55·0.80 ≈ 0.89 in light and
+    /// 0.34·0.05 + 0.66·0.12 ≈ 0.10 in dark. The wallpaper still supplies hue
+    /// and its large-scale gradient; it
     /// no longer supplies brightness.
     ///
     /// Dark went 0.16 → 0.12 for "glass settings by default should be darker".
@@ -707,7 +708,22 @@ enum DesktopBackdropRenderer {
     /// bake's own guard allows at most 2% of a dim wallpaper's still to clamp to
     /// black while keeping its spread above 0.05, and a dim fixture is pushed
     /// straight at that bound by this constant.
-    static func targetLuminance(isDark: Bool) -> Double { isDark ? 0.12 : 0.72 }
+    /// Light went 0.72 → 0.80 after the shipped surface was reported grey.
+    /// The veil is deliberately unchanged: raising the normalized underlay is
+    /// the way to make the pane white without spending wallpaper transmission.
+    /// `LightGlassFrost` is shared with the live and panel paths so this is one
+    /// material decision rather than a wallpaper-only correction.
+    static func targetLuminance(isDark: Bool) -> Double {
+        isDark ? 0.12 : LightGlassFrost.backdropLuminance
+    }
+
+    /// The painted Glass bake keeps colour in dark appearance. Light keeps the
+    /// same blurred luminance structure but resolves its chroma to zero, so the
+    /// material is white on every wallpaper. Tinted uses the raw desktop sample
+    /// elsewhere and is intentionally unaffected.
+    static func resolvedGlassChromaScale(_ requested: Double, isDark: Bool) -> Double {
+        isDark ? requested : 0
+    }
 
     /// The additive shift that moves a still of mean luminance `mean` onto
     /// `targetLuminance`.
@@ -952,7 +968,15 @@ enum DesktopBackdropRenderer {
         // what it did. All three still ride **one** filter pass — see
         // `BakeToneMap` for the map and `solveToneMap` for why it is solved by
         // measurement rather than by formula.
-        let map = solveToneMap(probe: sampled, isDark: isDark, chromaScale: colour.chromaScale)
+        // Light Glass is a white material: preserve the wallpaper's blurred
+        // luminance structure, but not its hue. Dark Glass still carries muted
+        // wallpaper colour, and the separate Tinted theme continues to use the
+        // raw sampled tint.
+        let map = solveToneMap(
+            probe: sampled,
+            isDark: isDark,
+            chromaScale: resolvedGlassChromaScale(colour.chromaScale, isDark: isDark)
+        )
         let vectors = map.matrix
         let matrix = CIFilter.colorMatrix()
         matrix.inputImage = structured

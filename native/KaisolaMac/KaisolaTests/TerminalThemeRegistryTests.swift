@@ -1,3 +1,4 @@
+import AppKit
 import Darwin
 import XCTest
 @testable import Kaisola
@@ -7,6 +8,11 @@ import XCTest
 /// and every failure must degrade to a disabled row rather than a broken
 /// terminal.
 final class TerminalThemeRegistryTests: XCTestCase {
+    private func sRGB(_ color: NSColor) -> (red: CGFloat, green: CGFloat, blue: CGFloat) {
+        let resolved = color.usingColorSpace(.sRGB) ?? color
+        return (resolved.redComponent, resolved.greenComponent, resolved.blueComponent)
+    }
+
     private func temporaryStore() throws -> CustomThemeStore {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "kaisola-themes-\(UUID().uuidString)", directoryHint: .isDirectory)
@@ -45,6 +51,51 @@ final class TerminalThemeRegistryTests: XCTestCase {
         XCTAssertTrue(kaisola.dark.background.isEqual(TerminalTheme.dark.background))
         XCTAssertTrue(kaisola.light.background.isEqual(TerminalTheme.light.background))
         XCTAssertEqual(kaisola.dark.ansi.count, 16)
+    }
+
+    /// The shipped Kaisola light palette owns the terminal canvas. The
+    /// historical #E9EBEF canvas rendered visibly grey, and the pane chrome
+    /// repeats the canvas around SwiftTerm. Keep both literal white without
+    /// conflating the ANSI black text role with the canvas.
+    func testShippedKaisolaLightTerminalCanvasAndChromeAreExactWhite() {
+        let colors = [
+            TerminalTheme.light.background,
+            TerminalTheme.paneChrome(light: true, themeID: "kaisola").background,
+        ]
+
+        for color in colors {
+            let channels = sRGB(color)
+            XCTAssertEqual(channels.red, 1, accuracy: 0.0001)
+            XCTAssertEqual(channels.green, 1, accuracy: 0.0001)
+            XCTAssertEqual(channels.blue, 1, accuracy: 0.0001)
+        }
+    }
+
+    /// The white-canvas rule belongs to the two shipped themes only. A user
+    /// theme's light background is authored content and must not be normalized.
+    func testCustomLightTerminalCanvasKeepsItsAuthoredColor() throws {
+        let store = try temporaryStore()
+        XCTAssertNil(try store.upsert(validSpec()))
+        let custom = TerminalThemeRegistry.definition(id: "midnight", store: store)
+        let channels = sRGB(custom.light.background)
+
+        XCTAssertEqual(channels.red, CGFloat(0x10) / 255, accuracy: 0.0001)
+        XCTAssertEqual(channels.green, CGFloat(0x14) / 255, accuracy: 0.0001)
+        XCTAssertEqual(channels.blue, CGFloat(0x18) / 255, accuracy: 0.0001)
+    }
+
+    /// This is a light-only correction. The dark canvases remain the shipped
+    /// near-black values rather than being routed through the white contract.
+    func testDarkTerminalCanvasesRemainUnchanged() {
+        let native = sRGB(TerminalTheme.nativeDark.background)
+        XCTAssertEqual(native.red, CGFloat(0x1E) / 255, accuracy: 0.0001)
+        XCTAssertEqual(native.green, CGFloat(0x1E) / 255, accuracy: 0.0001)
+        XCTAssertEqual(native.blue, CGFloat(0x1E) / 255, accuracy: 0.0001)
+
+        let kaisola = sRGB(TerminalTheme.dark.background)
+        XCTAssertEqual(kaisola.red, CGFloat(0x0D) / 255, accuracy: 0.0001)
+        XCTAssertEqual(kaisola.green, CGFloat(0x0F) / 255, accuracy: 0.0001)
+        XCTAssertEqual(kaisola.blue, CGFloat(0x13) / 255, accuracy: 0.0001)
     }
 
     /// An unknown or removed id falls back to the shipped default — a stale

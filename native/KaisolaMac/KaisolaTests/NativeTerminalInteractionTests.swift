@@ -874,22 +874,33 @@ final class NativeTerminalInteractionTests: XCTestCase {
     }
 
     func testHighContrastANSIRolesRemainReadableOnTerminalSurfaces() {
-        let light = TerminalTheme.nativeLight.ansi
+        let nativeLight = TerminalTheme.nativeLight.ansi
+        let kaisolaLight = TerminalTheme.light.ansi
         let dark = TerminalTheme.nativeDark.ansi
-        XCTAssertEqual(light.count, 16)
+        XCTAssertEqual(nativeLight.count, 16)
+        XCTAssertEqual(kaisolaLight.count, 16)
         XCTAssertEqual(dark.count, 16)
 
         // ANSI cyan is the conventional role used by Codex/Claude for links
         // and file citations. On a light surface it is intentionally blue.
-        XCTAssertEqual(light[6].red, 0x00 * 257)
-        XCTAssertEqual(light[6].green, 0x77 * 257)
-        XCTAssertEqual(light[6].blue, 0xB6 * 257)
+        XCTAssertEqual(nativeLight[6].red, 0x00 * 257)
+        XCTAssertEqual(nativeLight[6].green, 0x77 * 257)
+        XCTAssertEqual(nativeLight[6].blue, 0xB6 * 257)
 
-        for (index, color) in light.enumerated() {
+        for (index, color) in nativeLight.enumerated() {
             XCTAssertGreaterThanOrEqual(
                 contrastRatio(color, background: (1, 1, 1)),
                 4.5,
-                "light ANSI slot \(index) falls below readable text contrast"
+                "native light ANSI slot \(index) falls below readable text contrast"
+            )
+        }
+        // ANSI black is still a text-bearing role: explicit SGR 30 output must
+        // remain readable after the terminal canvas becomes exact white.
+        for (index, color) in kaisolaLight.enumerated() {
+            XCTAssertGreaterThanOrEqual(
+                contrastRatio(color, background: (1, 1, 1)),
+                4.5,
+                "Kaisola light ANSI slot \(index) falls below readable text contrast"
             )
         }
         // Slot zero is intentionally true black for terminal background/block

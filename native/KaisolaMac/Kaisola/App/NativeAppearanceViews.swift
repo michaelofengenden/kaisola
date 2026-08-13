@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage
 import SwiftUI
 
 /// AppKit's real behind-window vibrancy. SwiftUI's Material samples only the
@@ -7,23 +8,42 @@ import SwiftUI
 struct NativeVisualEffectView: NSViewRepresentable {
     let material: NSVisualEffectView.Material
     var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
+    /// Light Glass must carry luminance and movement, not the hue of the window
+    /// behind it. Core Animation evaluates this after AppKit's vibrancy layer,
+    /// so even a saturated live backdrop reaches the white carrier as neutral
+    /// light and shade. Dark and explicitly Tinted surfaces leave it disabled.
+    var neutralizesChroma = false
 
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let view = NSVisualEffectView()
+    @MainActor
+    private func configure(_ view: NSVisualEffectView) {
         view.state = .followsWindowActiveState
         view.material = material
         view.blendingMode = blendingMode
+        view.wantsLayer = true
+        if neutralizesChroma, let filter = CIFilter(name: "CIColorControls") {
+            filter.setValue(0, forKey: kCIInputSaturationKey)
+            view.layer?.filters = [filter]
+        } else {
+            view.layer?.filters = []
+        }
+    }
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let view = NSVisualEffectView()
+        configure(view)
         return view
     }
 
     func updateNSView(_ view: NSVisualEffectView, context: Context) {
-        view.state = .followsWindowActiveState
-        view.material = material
-        view.blendingMode = blendingMode
+        configure(view)
+    }
+
+    nonisolated static func resolvedSaturation(neutralizesChroma: Bool) -> Double {
+        neutralizesChroma ? 0 : 1
     }
 }
 
-/// The one **deliberately non-neutral** layer in the glass stack.
+/// The one **deliberately non-neutral** layer in the dark glass stack.
 ///
 /// Everything else the app declares as a backdrop constant is achromatic, and
 /// `testDeclaredNeutralConstantsAreAchromatic` enforces that per-channel — that
@@ -33,12 +53,10 @@ struct NativeVisualEffectView: NSViewRepresentable {
 /// pinning its hue and its coverage. Anything that wants to be warm has to say
 /// so here; anything that claims to be neutral still has to prove it there.
 ///
-/// One flat amber laid over the baked still, before the veil. It is not a
-/// gradient and not appearance-dependent: the veil above already carries the
-/// light direction and the light/dark balance, and a second gradient under it
-/// only muddies both. At 4% over a luminance-normalized still it moves the
-/// composite by roughly one step of chroma — the surface reads *slightly
-/// warmer*, the way a warm-white room does, rather than orange.
+/// One flat amber laid over the dark baked still, before the veil. It is not a
+/// gradient: the veil above already carries the light direction and a second
+/// gradient under it only muddies both. The declared 2.9% reference is scaled
+/// down to the dark carrier's luminance; light coverage is exactly zero.
 enum GlassWarmth {
     /// `#FFB070`. A high-value amber rather than a saturated orange: the layer
     /// is applied at a few percent, so what matters is the direction it pulls
@@ -48,30 +66,32 @@ enum GlassWarmth {
     static let green = 176.0 / 255
     static let blue = 112.0 / 255
 
-    /// Coverage in light, and the number the dark one is derived from.
+    /// Reference coverage from which the dark value is derived.
     /// 0.029 (was 0.04): scaled down with the 2026-08-04 chroma cut so the
     /// declared amber stays the same *proportion* of the surface's colour —
     /// the ratio the hue-invariance correction depends on.
     static let opacity = 0.029
 
-    /// Coverage per appearance.
+    /// Coverage per appearance. Light Glass is explicitly neutral white, so
+    /// the amber is absent there; dark keeps the scaled warmth that prevents a
+    /// cool near-black surface from turning purple.
     ///
     /// This used to be one number, on the argument that the still underneath is
     /// luminance-normalized so the same coverage lands on comparable ground in
     /// both appearances. That argument is wrong, and in the same way the
-    /// saturation constant was wrong: the still is normalized to 0.72 in light
-    /// and 0.16 in dark, a 4.5× difference, and this amber's own luminance is
-    /// 0.738. At 4% it lifts a light still by ~0.001 of its luminance and a
-    /// dark still by ~0.019 — nineteen times the relative perturbation, in a
-    /// hue directly opposite the cool cast the dark surface already had, which
-    /// is what turned "blue" into "purple". Coverage therefore scales with the
-    /// luminance of the surface it lands on: 4% at 0.72, 0.89% at 0.16.
+    /// saturation constant was wrong: the still is normalized onto very
+    /// different light and dark grounds. The same amber coverage would be a
+    /// much larger relative perturbation near black, in a hue directly opposite
+    /// the cool cast the dark surface already had — which is what turned
+    /// "blue" into "purple". Coverage therefore scales with the luminance of
+    /// the surface it lands on rather than being copied between appearances.
     ///
-    /// It is still a declared amber and still not zero — a warm hint that
-    /// survives its own neutrality audit rather than a layer quietly deleted.
+    /// It is still a declared amber in dark and still not zero there — a warm
+    /// hint that survives its own audit rather than a layer quietly deleted.
     static func opacity(isDark: Bool) -> Double {
+        guard isDark else { return 0 }
         let light = DesktopBackdropRenderer.targetLuminance(isDark: false)
-        let target = DesktopBackdropRenderer.targetLuminance(isDark: isDark)
+        let target = DesktopBackdropRenderer.targetLuminance(isDark: true)
         return opacity * (target / light)
     }
 
@@ -85,10 +105,9 @@ enum GlassWarmth {
 /// never appear inside Kaisola's glass.
 struct DesktopGlassLayer: View {
     let liveMaterial: NSVisualEffectView.Material
-    /// Tint coverage (dark, light) laid over *live* vibrancy only. In light
-    /// appearance AppKit's materials are near-white and pass almost no desktop
-    /// colour through, so live mode needs the sampled average to carry the hue.
-    /// The painted wallpaper already is the hue and must not be tinted twice.
+    /// Tint coverage (dark, light) laid over *live* vibrancy only. Light Glass
+    /// is neutral by contract, so only the dark half is ever rendered. The
+    /// painted wallpaper already is the hue and must not be tinted twice.
     ///
     /// See `SidebarBackdropView` for why the dark half of the pair is so much
     /// smaller than the light one.
@@ -108,6 +127,39 @@ struct DesktopGlassLayer: View {
         self.settings = settings
     }
 
+    /// `.underWindowBackground` is intentionally neutral and makes a large
+    /// light canvas read grey. Safari's white navigation frost comes from the
+    /// light `.sidebar` material, so every light Glass surface resolves to that
+    /// same carrier; dark keeps the material selected by its surface.
+    nonisolated static func resolvedLiveMaterial(
+        _ requested: NSVisualEffectView.Material,
+        isDark: Bool
+    ) -> NSVisualEffectView.Material {
+        isDark ? requested : .sidebar
+    }
+
+    /// Light Glass never carries the sampled RGB hue. Returning exact white is
+    /// a fail-closed contract for callers; the live overlay is also omitted in
+    /// light so this does not become a second, redundant whitening layer.
+    nonisolated static func resolvedLiveTint(
+        _ tint: DesktopTintComponents,
+        isDark: Bool
+    ) -> DesktopTintComponents {
+        isDark ? tint : DesktopTintComponents(red: 1, green: 1, blue: 1)
+    }
+
+    /// Sampled colour belongs to dark Glass and to the explicit Tinted theme,
+    /// never to light Glass.
+    nonisolated static func appliesSampledLiveTint(isDark: Bool) -> Bool {
+        isDark
+    }
+
+    /// Coverage for the no-wallpaper fallback. Zero in light makes a failed
+    /// decode fail to neutral white instead of reviving the sampled cast.
+    nonisolated static func flatTintCoverage(isDark: Bool) -> (top: Double, bottom: Double) {
+        isDark ? (0.42, 0.26) : (0, 0)
+    }
+
     var body: some View {
         layer
             .onAppear { desktop.refresh(isDark: colorScheme == .dark) }
@@ -121,24 +173,32 @@ struct DesktopGlassLayer: View {
 
     @ViewBuilder
     private var layer: some View {
-        switch settings.glassBackdropSource {
-        case .wallpaper:
-            paintedDesktop
-        case .behindWindow:
-            ZStack {
-                NativeVisualEffectView(material: liveMaterial)
-                if let liveTint {
+        let isDark = colorScheme == .dark
+        ZStack {
+            switch settings.glassBackdropSource {
+            case .wallpaper:
+                paintedDesktop
+            case .behindWindow:
+                NativeVisualEffectView(
+                    material: Self.resolvedLiveMaterial(liveMaterial, isDark: isDark),
+                    neutralizesChroma: !isDark
+                )
+                if let liveTint, Self.appliesSampledLiveTint(isDark: isDark) {
+                    let tint = Self.resolvedLiveTint(desktop.painting.tint, isDark: isDark)
+                    let tintColor = Color(red: tint.red, green: tint.green, blue: tint.blue)
                     LinearGradient(
                         colors: [
-                            desktop.tintColor.opacity(colorScheme == .dark ? liveTint.dark : liveTint.light),
-                            desktop.tintColor.opacity(
-                                (colorScheme == .dark ? liveTint.dark : liveTint.light) * 0.55
-                            ),
+                            tintColor.opacity(liveTint.dark),
+                            tintColor.opacity(liveTint.dark * 0.55),
                         ],
                         startPoint: .top,
                         endPoint: .bottom
                     )
                 }
+            }
+            if !isDark {
+                Color.white.opacity(LightGlassFrost.carrierWhiteCoverage)
+                    .allowsHitTesting(false)
             }
         }
     }
@@ -169,19 +229,18 @@ struct DesktopGlassLayer: View {
                 .overlay(GlassWarmth.color.opacity(GlassWarmth.opacity(isDark: colorScheme == .dark)))
                 .allowsHitTesting(false)
         case let .flat(tint):
+            let isDark = colorScheme == .dark
             let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
+            let coverage = Self.flatTintCoverage(isDark: isDark)
             LinearGradient(
-                colors: [
-                    color.opacity(colorScheme == .dark ? 0.42 : 0.34),
-                    color.opacity(colorScheme == .dark ? 0.26 : 0.20),
-                ],
+                colors: [color.opacity(coverage.top), color.opacity(coverage.bottom)],
                 startPoint: .top,
                 endPoint: .bottom
             )
             .background(Color(nsColor: .windowBackgroundColor))
-            // The no-wallpaper rung gets the same warmth, so the two paths do
-            // not read as two different materials.
-            .overlay(GlassWarmth.color.opacity(GlassWarmth.opacity(isDark: colorScheme == .dark)))
+            // Light coverage and light warmth are both zero. A failed decode
+            // therefore falls back to neutral white, not a sampled colour.
+            .overlay(GlassWarmth.color.opacity(GlassWarmth.opacity(isDark: isDark)))
         }
     }
 }
@@ -508,24 +567,15 @@ struct SidebarBackdropView: View {
     /// takes that to 0.462, and halving the dark tint takes it to **0.561** —
     /// the material behind the window contributes 67% more than it did.
     ///
-    /// Halving *dark* specifically, and leaving light at 0.26, is the same
-    /// argument this layer was introduced with rather than a new one: the tint
-    /// exists because AppKit's light materials are near-white and eat the
-    /// desktop's hue, which is a light-appearance problem. A dark `.sidebar`
-    /// material is already dark and already carries the desktop's colour, so
-    /// most of what a 0.30 tint did there was dim it — the very complaint.
-    ///
-    /// Light's own translucency ask is answered by the veil rather than here,
-    /// and it reaches Live for free: `(1 - 0.26) · (1 - 0.60) = 0.296` of the
-    /// material before, `(1 - 0.26) · (1 - 0.45) = 0.407` after — **+38%**,
-    /// the same factor the painted source gained, without cutting the one layer
-    /// that is carrying the desktop's hue into a near-white material.
+    /// Dark keeps the sampled tint at 0.15. Light is exactly zero: preserving
+    /// sampled RGB ratios was the source of the blue cast, so light gets its
+    /// depth from AppKit vibrancy beneath the achromatic white carrier instead.
     ///
     /// (Unlike the wallpaper source, this cannot be measured offline: it lands
     /// on live vibrancy, whose input is whatever is behind the window. The
     /// numbers above are compositing algebra over the two declared coverages,
     /// which is exactly as much as is knowable without a screenshot.)
-    static let liveTint = (dark: 0.15, light: 0.26)
+    static let liveTint = (dark: 0.15, light: 0.0)
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
@@ -639,12 +689,18 @@ struct WorkspaceBackdropView: View {
     /// idleness is just the thinner veil over the same material.
     nonisolated static func idleGlassEngages(
         idle: Bool,
+        isDark: Bool,
         reduceTransparency: Bool,
         increasedContrast: Bool,
         paintedSource: Bool,
         clearStillAvailable: Bool
     ) -> Bool {
-        guard idle, !reduceTransparency, !increasedContrast else { return false }
+        // The clear idle canvas was the one light surface outside the white
+        // recipe: it bypassed the normalized underlay and reduced the veil to a
+        // whisper, so the background became the grey/coloured desktop again.
+        // Keep that intentional transparency in dark appearance only. Light
+        // uses the same white frost whether content is mounted or not.
+        guard isDark, idle, !reduceTransparency, !increasedContrast else { return false }
         return paintedSource ? clearStillAvailable : true
     }
 
@@ -689,6 +745,7 @@ struct WorkspaceBackdropView: View {
                 let paintedSource = settings.glassBackdropSource == .wallpaper
                 let idleActive = Self.idleGlassEngages(
                     idle: idle,
+                    isDark: colorScheme == .dark,
                     reduceTransparency: reduceTransparency,
                     increasedContrast: accessibilityContrast == .increased,
                     paintedSource: paintedSource,

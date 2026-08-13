@@ -209,8 +209,9 @@ struct ProjectTabStripView: View {
                     RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
                         .stroke(
                             selected == project.id
-                                ? (ProjectTint.color(project.colorHex) ?? WorkspacePalette.project).opacity(0.32)
-                                : Color.primary.opacity(0.075),
+                                ? (ProjectTint.color(project.colorHex) ?? WorkspacePalette.project)
+                                    .opacity(SurfaceTabChrome.projectSelectedStrokeOpacity)
+                                : Color.primary.opacity(SurfaceTabChrome.inactiveStrokeOpacity),
                             lineWidth: KaisolaVisualSystem.hairline
                         )
                 }

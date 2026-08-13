@@ -105,8 +105,9 @@ enum GlassWarmth {
 /// never appear inside Kaisola's glass.
 struct DesktopGlassLayer: View {
     let liveMaterial: NSVisualEffectView.Material
-    /// Tint coverage (dark, light) laid over *live* vibrancy only. Light Glass
-    /// is neutral by contract, so only the dark half is ever rendered. The
+    let carrierWhiteCoverage: Double
+    /// Tint coverage (dark, light) laid over *live* vibrancy only. The light
+    /// sampled tint is absent, so only the dark half is ever rendered. The
     /// painted wallpaper already is the hue and must not be tinted twice.
     ///
     /// See `SidebarBackdropView` for why the dark half of the pair is so much
@@ -120,10 +121,12 @@ struct DesktopGlassLayer: View {
     init(
         liveMaterial: NSVisualEffectView.Material,
         liveTint: (dark: Double, light: Double)? = nil,
+        carrierWhiteCoverage: Double = LightGlassFrost.carrierWhiteCoverage,
         settings: NativePreviewSettings = .shared
     ) {
         self.liveMaterial = liveMaterial
         self.liveTint = liveTint
+        self.carrierWhiteCoverage = carrierWhiteCoverage
         self.settings = settings
     }
 
@@ -197,7 +200,7 @@ struct DesktopGlassLayer: View {
                 }
             }
             if !isDark {
-                Color.white.opacity(LightGlassFrost.carrierWhiteCoverage)
+                Color.white.opacity(carrierWhiteCoverage)
                     .allowsHitTesting(false)
             }
         }
@@ -578,6 +581,7 @@ struct SidebarBackdropView: View {
     static let liveTint = (dark: 0.15, light: 0.0)
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.controlActiveState) private var controlActiveState
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @ObservedObject private var settings = NativePreviewSettings.shared
@@ -585,6 +589,7 @@ struct SidebarBackdropView: View {
     /// path samples it directly, so the provider is observed here too.
     @ObservedObject private var desktop = DesktopBackdropProvider.shared
     let appearance: SidebarAppearance
+    let placement: SidebarRailPlacement
 
     @ViewBuilder
     var body: some View {
@@ -594,13 +599,47 @@ struct SidebarBackdropView: View {
                 Color(nsColor: .controlBackgroundColor)
             } else {
                 ZStack {
-                    DesktopGlassLayer(liveMaterial: .sidebar, liveTint: Self.liveTint)
+                    DesktopGlassLayer(
+                        liveMaterial: .sidebar,
+                        liveTint: Self.liveTint,
+                        carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
+                    )
                     GlassBackdropWash
                         .sidebar(isDark: colorScheme == .dark, clarity: settings.glassClarity.resolved(
                             increasedContrast: accessibilityContrast == .increased,
                             reduceTransparency: reduceTransparency
                         ))
                         .veil
+                    if colorScheme == .light {
+                        let visibility = controlActiveState == .key
+                            ? 1.0
+                            : LightRailTint.inactiveMultiplier
+                        LinearGradient(
+                            gradient: Gradient(stops: [
+                                .init(
+                                    color: LightRailTint.coolColor.opacity(
+                                        LightRailTint.coolCoverage * visibility
+                                    ),
+                                    location: 0
+                                ),
+                                .init(
+                                    color: Color.white.opacity(
+                                        LightRailTint.midpointCoverage * visibility
+                                    ),
+                                    location: LightRailTint.midpointLocation
+                                ),
+                                .init(
+                                    color: LightRailTint.pearlColor.opacity(
+                                        LightRailTint.pearlCoverage * visibility
+                                    ),
+                                    location: 1
+                                ),
+                            ]),
+                            startPoint: placement.tintStartPoint,
+                            endPoint: placement.tintEndPoint
+                        )
+                        .allowsHitTesting(false)
+                    }
                     if accessibilityContrast == .increased {
                         Color(nsColor: .controlBackgroundColor)
                             .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))

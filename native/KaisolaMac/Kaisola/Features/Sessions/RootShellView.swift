@@ -761,7 +761,7 @@ struct RootShellView: View {
                 )
             }
             .background {
-                SidebarBackdropView(appearance: settings.sidebarAppearance)
+                SidebarBackdropView(appearance: settings.sidebarAppearance, placement: .leading)
                     .ignoresSafeArea()
             }
             // `ideal:` below is honoured for the double-click reset but not for
@@ -4921,7 +4921,9 @@ private struct SessionStrip: View {
             .overlay {
                 RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
                     .stroke(
-                        selected ? tint.opacity(0.22) : Color.primary.opacity(0.075),
+                        selected
+                            ? tint.opacity(SurfaceTabChrome.sessionSelectedStrokeOpacity)
+                            : Color.primary.opacity(SurfaceTabChrome.inactiveStrokeOpacity),
                         lineWidth: KaisolaVisualSystem.hairline
                     )
             }

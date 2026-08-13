@@ -42,6 +42,13 @@ enum KaisolaVisualSystem {
     static let layoutDuration = 0.22
 }
 
+/// Stroke coverage shared by the two horizontal tab families.
+enum SurfaceTabChrome {
+    static let projectSelectedStrokeOpacity = 0.38
+    static let sessionSelectedStrokeOpacity = 0.30
+    static let inactiveStrokeOpacity = 0.11
+}
+
 /// The light-appearance recipe shared by the two navigation rails, the
 /// workspace canvas, and the inset detail panel.
 ///
@@ -56,14 +63,10 @@ enum KaisolaVisualSystem {
 /// desktop and `GlassBackdropWash`. The previous light recipe preserved the
 /// sampled desktop's RGB ratios, so a blue wallpaper was guaranteed to make a
 /// blue pane even though every declared veil constant was white. The carrier
-/// keeps blurred light and movement while making colour a property of the
-/// explicit Tinted theme, not of light Glass.
+/// keeps blurred light and movement without inheriting the wallpaper's hue.
+/// The rails add their own named, tightly bounded cool-to-pearl edge tint;
+/// the canvas stays neutral white.
 enum LightGlassFrost {
-    /// Light Glass navigation rails are part of the same achromatic outer
-    /// chrome as the workspace canvas. Decorative colour belongs exclusively
-    /// to the explicit Tinted theme, never to a post-frost rail overlay.
-    static let navigationChromaCoverage: Double = 0
-
     /// Neutral luminance of a painted wallpaper before the white veil.
     static let backdropLuminance: Double = 0.80
 
@@ -72,6 +75,10 @@ enum LightGlassFrost {
     /// underlying luminance variation visible and lands both surfaces near
     /// sRGB 247 rather than grey. It is deliberately achromatic.
     static let carrierWhiteCoverage: Double = 0.70
+
+    /// The rails use a thinner carrier than the canvas so the wallpaper can
+    /// move through them while the center remains a white working surface.
+    static let railCarrierWhiteCoverage: Double = 0.58
 
     /// White over the already-frosted workspace canvas. Light deliberately
     /// gets no second semantic material: that layer re-greyed the canvas and
@@ -87,6 +94,50 @@ enum LightGlassFrost {
         let carried = carrierWhiteCoverage
             + (1 - carrierWhiteCoverage) * backdropLuminance
         return wash.baseOpacity + wash.desktopTransmission * carried
+    }
+
+    static func modeledRailLuminance(_ wash: GlassBackdropWash) -> Double {
+        let carried = railCarrierWhiteCoverage
+            + (1 - railCarrierWhiteCoverage) * backdropLuminance
+        return wash.baseOpacity + wash.desktopTransmission * carried
+    }
+
+    static func modeledRailDesktopContribution(_ wash: GlassBackdropWash) -> Double {
+        (1 - railCarrierWhiteCoverage) * wash.desktopTransmission
+    }
+}
+
+enum SidebarRailPlacement: Equatable, Sendable {
+    case leading
+    case trailing
+
+    var tintStartPoint: UnitPoint {
+        self == .leading ? .topLeading : .topTrailing
+    }
+
+    var tintEndPoint: UnitPoint {
+        self == .leading ? .bottomTrailing : .bottomLeading
+    }
+}
+
+/// A restrained cool-to-pearl cast at the two outside window edges.
+enum LightRailTint {
+    static let cool = (red: 90.0 / 255, green: 169.0 / 255, blue: 1.0)
+    static let pearl = (red: 1.0, green: 201.0 / 255, blue: 133.0 / 255)
+    static let coolCoverage = 0.035
+    static let midpointCoverage = 0.008
+    static let pearlCoverage = 0.010
+    static let midpointLocation = 0.62
+    static let inactiveMultiplier = 0.12
+    static let maximumCoverage = max(coolCoverage, midpointCoverage, pearlCoverage)
+    static let minimumTransmission = 1 - maximumCoverage
+
+    static var coolColor: Color {
+        Color(red: cool.red, green: cool.green, blue: cool.blue)
+    }
+
+    static var pearlColor: Color {
+        Color(red: pearl.red, green: pearl.green, blue: pearl.blue)
     }
 }
 
@@ -482,7 +533,7 @@ struct GlassBackdropWash: Equatable, Sendable {
     private static func sidebarBase(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
-            : light(top: 0.51, base: 0.45, bottom: 0.41)
+            : light(top: 0.42, base: 0.36, bottom: 0.32)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour

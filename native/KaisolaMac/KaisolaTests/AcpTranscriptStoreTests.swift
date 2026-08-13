@@ -591,8 +591,11 @@ final class AcpTranscriptStoreTests: XCTestCase {
             XCTAssertEqual(preserved?.draft, "newest draft \(failure)", "failed at \(failure)")
 
             let retry = await store.tombstone(chatID: chatID)
-            XCTAssertEqual(retry, .recorded)
-            let removal = await store.remove(chatID: chatID)
+            let snapshot = try XCTUnwrap(retry.snapshot)
+            let removal = await store.remove(
+                chatID: chatID,
+                verifiedDescriptorPruning: snapshot
+            )
             XCTAssertEqual(removal, .removed)
             let deletedRelaunch = AcpTranscriptStore(databaseURL: databaseURL)
             let deleted = await deletedRelaunch.entry(for: chatID)
@@ -609,6 +612,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
         let secretMarker = "KAISOLA_TRANSCRIPT_SECRET_499_E7C6B3A1"
         let secretMarkerData = Data(secretMarker.utf8)
         let databaseURL: URL
+        var crashReceipt: AcpTranscriptStore.TombstoneSnapshot?
 
         do {
             let store = AcpTranscriptStore(fileURL: legacyURL)
@@ -631,7 +635,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
             // Crash injection point: the durable intent landed, but the
             // normal queued remove(chatID:) phase never ran.
             let tombstoneResult = await store.tombstone(chatID: chatID)
-            XCTAssertEqual(tombstoneResult, .recorded)
+            crashReceipt = try XCTUnwrap(tombstoneResult.snapshot)
             XCTAssertEqual(
                 try sqliteCount("SELECT COUNT(*) FROM transcript_rows", databaseURL: databaseURL),
                 2
@@ -643,7 +647,9 @@ final class AcpTranscriptStoreTests: XCTestCase {
         }
 
         let relaunched = AcpTranscriptStore(fileURL: legacyURL)
-        await relaunched.vacuumTombstones()
+        await relaunched.vacuumTombstones(
+            descriptorPruningVerified: [try XCTUnwrap(crashReceipt)]
+        )
 
         XCTAssertEqual(
             try sqliteCount("SELECT COUNT(*) FROM transcript_rows", databaseURL: databaseURL),
@@ -657,8 +663,8 @@ final class AcpTranscriptStoreTests: XCTestCase {
         )
         XCTAssertEqual(
             try sqliteCount("SELECT COUNT(*) FROM deleted_chats", databaseURL: databaseURL),
-            0,
-            "Only a completed physical deletion may vacuum its tombstone"
+            1,
+            "Physical deletion alone must retain the exact receipt until external plaintext cleanup"
         )
         XCTAssertNil(
             try Data(contentsOf: databaseURL).range(of: secretMarkerData),
@@ -666,6 +672,15 @@ final class AcpTranscriptStoreTests: XCTestCase {
         )
         let restored = await relaunched.entry(for: chatID)
         XCTAssertNil(restored)
+        let launchCleanup = await relaunched.completeExternalCleanup(
+            try XCTUnwrap(crashReceipt)
+        )
+        XCTAssertEqual(launchCleanup, .removed)
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM deleted_chats", databaseURL: databaseURL),
+            0,
+            "Only verified external cleanup may release the final receipt fence"
+        )
     }
 
     func testRetainedTombstoneSurvivesOtherWriterReclamationUntilDescriptorPruningIsVerified() async throws {
@@ -695,11 +710,8 @@ final class AcpTranscriptStoreTests: XCTestCase {
         )
         await deletingWindow.flush()
         let tombstone = await deletingWindow.tombstone(chatID: deletedChatID)
-        let removal = await deletingWindow.remove(
-            chatID: deletedChatID,
-            retainTombstone: true
-        )
-        XCTAssertEqual(tombstone, .recorded)
+        let removal = await deletingWindow.remove(chatID: deletedChatID)
+        XCTAssertNotNil(tombstone.snapshot)
         XCTAssertEqual(removal, .removed)
 
         // A different window's ordinary write and vacuum both run the global
@@ -715,11 +727,169 @@ final class AcpTranscriptStoreTests: XCTestCase {
         let retained = await otherWindow.tombstoneState(chatID: deletedChatID)
         XCTAssertEqual(retained, .present)
 
-        await otherWindow.vacuumTombstones(descriptorPruningVerified: true)
+        let verified = await otherWindow.tombstoneSnapshot(chatID: deletedChatID)
+        guard case let .present(snapshot) = verified else {
+            return XCTFail("expected retained tombstone snapshot, got \(verified)")
+        }
+        await otherWindow.vacuumTombstones(descriptorPruningVerified: [snapshot])
+        let externallyBlocked = await otherWindow.tombstoneState(chatID: deletedChatID)
+        XCTAssertEqual(externallyBlocked, .present)
+        let externalCleanup = await otherWindow.completeExternalCleanup(snapshot)
+        XCTAssertEqual(externalCleanup, .removed)
         let reclaimed = await otherWindow.tombstoneState(chatID: deletedChatID)
         XCTAssertEqual(reclaimed, .absent)
         let restored = await otherWindow.entry(for: deletedChatID)
         XCTAssertNil(restored)
+    }
+
+    func testVerifiedVacuumCannotReclaimTombstoneCreatedAfterTheDescriptorScan() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "kaisola-transcript-vacuum-snapshot-race-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        let scanningWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "scanning-window",
+            schedulesAutomaticFlush: false
+        )
+        let deletingWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "deleting-window",
+            schedulesAutomaticFlush: false
+        )
+        let scannedChatID = "descriptor-was-pruned"
+        let racedChatID = "tombstoned-after-scan"
+
+        for chatID in [scannedChatID, racedChatID] {
+            await scanningWindow.scheduleSave(
+                [.message(id: "row-\(chatID)", text: chatID)],
+                for: chatID,
+                now: 1
+            )
+        }
+        await scanningWindow.flush()
+        let scannedTombstone = await deletingWindow.tombstone(chatID: scannedChatID)
+        XCTAssertNotNil(scannedTombstone.snapshot)
+        let verified = await scanningWindow.tombstoneSnapshot(chatID: scannedChatID)
+        guard case let .present(verifiedTombstone) = verified else {
+            return XCTFail("expected a tombstone snapshot, got \(verified)")
+        }
+
+        // Deterministic TOCTOU: this deletion commits only after the scanning
+        // window has captured the exact tombstone it is authorized to reclaim.
+        let racedTombstone = await deletingWindow.tombstone(chatID: racedChatID)
+        XCTAssertNotNil(racedTombstone.snapshot)
+
+        await scanningWindow.vacuumTombstones(
+            descriptorPruningVerified: [verifiedTombstone]
+        )
+        let externalCleanup = await scanningWindow.completeExternalCleanup(verifiedTombstone)
+        XCTAssertEqual(externalCleanup, .removed)
+
+        let scannedState = await scanningWindow.tombstoneState(chatID: scannedChatID)
+        let racedState = await scanningWindow.tombstoneState(chatID: racedChatID)
+        XCTAssertEqual(scannedState, .absent)
+        XCTAssertEqual(
+            racedState,
+            .present,
+            "a tombstone outside the verified snapshot must retain its descriptor fence"
+        )
+    }
+
+    func testG1RemovalReceiptCannotAuthorizeRetombstonedG2() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let chatID = "retombstoned-remove-generation"
+        await store.scheduleSave(
+            [.message(id: "1", text: "sensitive durable row")],
+            for: chatID,
+            now: 1
+        )
+        await store.flush()
+
+        let g1Result = await store.tombstone(chatID: chatID)
+        let g1 = try XCTUnwrap(g1Result.snapshot)
+        let g2Result = await store.tombstone(chatID: chatID)
+        let g2 = try XCTUnwrap(g2Result.snapshot)
+        XCTAssertGreaterThan(g2.generation, g1.generation)
+
+        let staleRemoval = await store.remove(
+            chatID: chatID,
+            verifiedDescriptorPruning: g1
+        )
+        XCTAssertEqual(
+            staleRemoval,
+            .failed(.database("transcript deletion receipt is stale or no longer present"))
+        )
+        let retainedG2 = await store.tombstoneSnapshot(chatID: chatID)
+        XCTAssertEqual(retainedG2, .present(g2))
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM chats", databaseURL: store.databaseURL),
+            1,
+            "a stale receipt must roll back before transcript deletion"
+        )
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT descriptor_reclaim_blocked FROM deleted_chats WHERE chat_id = '\(chatID)'",
+                databaseURL: store.databaseURL
+            ),
+            1
+        )
+
+        let currentRemoval = await store.remove(
+            chatID: chatID,
+            verifiedDescriptorPruning: g2
+        )
+        XCTAssertEqual(currentRemoval, .removed)
+        let externalCleanup = await store.completeExternalCleanup(g2)
+        XCTAssertEqual(externalCleanup, .removed)
+        let removedState = await store.tombstoneState(chatID: chatID)
+        XCTAssertEqual(removedState, .absent)
+    }
+
+    func testG1VacuumReceiptCannotAuthorizeRetombstonedG2() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let chatID = "retombstoned-vacuum-generation"
+        await store.scheduleSave(
+            [.message(id: "1", text: "sensitive durable row")],
+            for: chatID,
+            now: 1
+        )
+        await store.flush()
+
+        let g1Result = await store.tombstone(chatID: chatID)
+        let g1 = try XCTUnwrap(g1Result.snapshot)
+        let g2Result = await store.tombstone(chatID: chatID)
+        let g2 = try XCTUnwrap(g2Result.snapshot)
+        await store.vacuumTombstones(descriptorPruningVerified: [g1])
+
+        let retainedG2 = await store.tombstoneSnapshot(chatID: chatID)
+        XCTAssertEqual(retainedG2, .present(g2))
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM chats", databaseURL: store.databaseURL),
+            1
+        )
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT descriptor_reclaim_blocked FROM deleted_chats WHERE chat_id = '\(chatID)'",
+                databaseURL: store.databaseURL
+            ),
+            1
+        )
+
+        await store.vacuumTombstones(descriptorPruningVerified: [g2])
+        let externalCleanup = await store.completeExternalCleanup(g2)
+        XCTAssertEqual(externalCleanup, .removed)
+        let removedState = await store.tombstoneState(chatID: chatID)
+        XCTAssertEqual(removedState, .absent)
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM chats", databaseURL: store.databaseURL),
+            0
+        )
     }
 
     func testTombstoneVacuumWaitsForBufferedWriterAcknowledgement() async throws {
@@ -757,8 +927,13 @@ final class AcpTranscriptStoreTests: XCTestCase {
         )
 
         let tombstoneResult = await writerA.tombstone(chatID: chatID)
-        XCTAssertEqual(tombstoneResult, .recorded)
-        await writerA.remove(chatID: chatID)
+        let tombstone = try XCTUnwrap(tombstoneResult.snapshot)
+        await writerA.remove(
+            chatID: chatID,
+            verifiedDescriptorPruning: tombstone
+        )
+        let externalCleanup = await writerA.completeExternalCleanup(tombstone)
+        XCTAssertEqual(externalCleanup, .removed)
         await writerA.vacuumTombstones()
         XCTAssertEqual(
             try sqliteCount("SELECT COUNT(*) FROM chats", databaseURL: databaseURL),
@@ -814,8 +989,13 @@ final class AcpTranscriptStoreTests: XCTestCase {
             now: 2
         )
         let tombstoneResult = await writerA.tombstone(chatID: chatID)
-        XCTAssertEqual(tombstoneResult, .recorded)
-        await writerA.remove(chatID: chatID)
+        let tombstone = try XCTUnwrap(tombstoneResult.snapshot)
+        await writerA.remove(
+            chatID: chatID,
+            verifiedDescriptorPruning: tombstone
+        )
+        let externalCleanup = await writerA.completeExternalCleanup(tombstone)
+        XCTAssertEqual(externalCleanup, .removed)
 
         // Deterministic crash/suspension simulation: advance reclamation past
         // every bounded lease without sleeping in the test process.
@@ -840,6 +1020,668 @@ final class AcpTranscriptStoreTests: XCTestCase {
             try sqliteCount("SELECT COUNT(*) FROM transcript_rows", databaseURL: databaseURL),
             0
         )
+    }
+
+    func testWriterScheduledAfterTombstoneCannotRecreateAnyChatPayloadAfterExactReclamation() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "kaisola-transcript-post-tombstone-writer-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        let deletingWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "deleting-window",
+            schedulesAutomaticFlush: false
+        )
+        let delayedWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "delayed-window",
+            schedulesAutomaticFlush: false
+        )
+        let chatID = "post-tombstone-delayed-writer"
+        await deletingWindow.scheduleSave(
+            [.message(id: "1", text: "original")],
+            for: chatID,
+            now: 1
+        )
+        await deletingWindow.flush()
+        let deletion = await deletingWindow.tombstone(chatID: chatID)
+        let receipt = try XCTUnwrap(deletion.snapshot)
+
+        // Window B has never registered a writer generation. Its first writes
+        // therefore land strictly after g1 and used to acknowledge g1 itself,
+        // allowing the exact removal below to reclaim the only deletion fence.
+        await delayedWindow.scheduleSave(
+            [.message(id: "late-row", text: "must never return")],
+            for: chatID,
+            now: 2
+        )
+        await delayedWindow.scheduleDraft("late plaintext draft", for: chatID, now: 3)
+        await delayedWindow.scheduleAttachments(
+            [.textFile(path: "/tmp/late.txt", contents: "late attachment", name: "late.txt")],
+            for: chatID,
+            now: 4
+        )
+        await delayedWindow.scheduleSessionID("late-provider-session", for: chatID, now: 5)
+
+        let removal = await deletingWindow.remove(
+            chatID: chatID,
+            verifiedDescriptorPruning: receipt
+        )
+        XCTAssertEqual(removal, .removed)
+        let externalCleanup = await deletingWindow.completeExternalCleanup(receipt)
+        XCTAssertEqual(externalCleanup, .removed)
+        await deletingWindow.vacuumTombstones()
+        let reclaimed = await deletingWindow.tombstoneState(chatID: chatID)
+        XCTAssertEqual(reclaimed, .absent)
+
+        await delayedWindow.flush()
+        let delayedEntry = await delayedWindow.entry(for: chatID)
+        XCTAssertNil(
+            delayedEntry,
+            "rows, drafts, attachments, and provider identity must all stay missing"
+        )
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM chats WHERE chat_id = '\(chatID)'", databaseURL: databaseURL),
+            0
+        )
+    }
+
+    func testMeshColumnBatchTombstoneIsAtomicAndRejectsAnOldWriterAfterExplicitReuse() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "kaisola-transcript-mesh-batch-delete-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        let creatingWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "mesh-creating-window",
+            schedulesAutomaticFlush: false
+        )
+        let delayedOldWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "mesh-delayed-old-window",
+            schedulesAutomaticFlush: false
+        )
+        let deletingWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "mesh-deleting-window",
+            schedulesAutomaticFlush: false
+        )
+        let columnIDs = ["mesh-column-a", "mesh-column-b"]
+        for columnID in columnIDs {
+            let began = await creatingWindow.beginNewChatID(columnID)
+            XCTAssertTrue(began)
+            await creatingWindow.scheduleSave(
+                [.message(id: "initial", text: "initial \(columnID)")],
+                for: columnID,
+                now: 1
+            )
+        }
+        await creatingWindow.flush()
+        for columnID in columnIDs {
+            let established = await delayedOldWindow.establishRestorableChatID(columnID)
+            XCTAssertTrue(established)
+        }
+        await delayedOldWindow.scheduleSave(
+            [.message(id: "old", text: "old incarnation must never reach reuse")],
+            for: columnIDs[0],
+            now: 2
+        )
+
+        let invalidBatch = await deletingWindow.tombstone(chatIDs: [columnIDs[0], ""])
+        guard case .failed = invalidBatch else {
+            return XCTFail("one invalid column must reject the whole batch")
+        }
+        let stateAfterInvalidBatch = await deletingWindow.tombstoneState(chatID: columnIDs[0])
+        XCTAssertEqual(
+            stateAfterInvalidBatch,
+            .absent,
+            "a rejected batch must not leave a partial Mesh deletion"
+        )
+
+        let deletion = await deletingWindow.tombstone(chatIDs: columnIDs)
+        guard case let .recorded(receipts) = deletion else {
+            return XCTFail("expected an atomic Mesh tombstone batch, got \(deletion)")
+        }
+        XCTAssertEqual(Set(receipts.map(\.chatID)), Set(columnIDs))
+        for receipt in receipts {
+            let removal = await deletingWindow.remove(
+                chatID: receipt.chatID,
+                verifiedDescriptorPruning: receipt
+            )
+            XCTAssertEqual(
+                removal,
+                .removed
+            )
+            let cleanup = await deletingWindow.completeExternalCleanup(receipt)
+            XCTAssertEqual(cleanup, .removed)
+        }
+        await deletingWindow.vacuumTombstones(now: Int64.max)
+
+        let reusedWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "mesh-reused-window",
+            schedulesAutomaticFlush: false
+        )
+        let reusedIdentity = await reusedWindow.beginNewChatID(columnIDs[0])
+        XCTAssertTrue(reusedIdentity)
+        await reusedWindow.scheduleSave(
+            [.message(id: "new", text: "new incarnation wins")],
+            for: columnIDs[0],
+            now: 3
+        )
+        await reusedWindow.flush()
+        await delayedOldWindow.flush()
+
+        let reusedEntry = await reusedWindow.entry(for: columnIDs[0])
+        let reused = try XCTUnwrap(reusedEntry)
+        XCTAssertEqual(reused.rows, [.message(id: "new", text: "new incarnation wins")])
+        let deletedSecondColumn = await reusedWindow.entry(for: columnIDs[1])
+        XCTAssertNil(deletedSecondColumn)
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM chat_incarnations", databaseURL: databaseURL),
+            1,
+            "permanently deleted Mesh columns must not leak inactive incarnation rows"
+        )
+    }
+
+    func testPhysicalTranscriptRemovalRetainsExactReceiptUntilExternalCleanupCompletes() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let chatID = "external-cleanup-receipt"
+        await store.scheduleSave(
+            [.message(id: "row", text: "sensitive")],
+            for: chatID,
+            now: 1
+        )
+        await store.flush()
+        let deletion = await store.tombstone(chatID: chatID)
+        let g1 = try XCTUnwrap(deletion.snapshot)
+
+        let removal = await store.remove(
+            chatID: chatID,
+            verifiedDescriptorPruning: g1
+        )
+        XCTAssertEqual(removal, .removed)
+        let transcriptAfterRemoval = await store.entry(for: chatID)
+        let receiptAfterRemoval = await store.tombstoneSnapshot(chatID: chatID)
+        XCTAssertNil(transcriptAfterRemoval)
+        XCTAssertEqual(
+            receiptAfterRemoval,
+            .present(g1),
+            "the exact receipt must survive the transcript-only crash boundary"
+        )
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT external_cleanup_blocked FROM deleted_chats WHERE chat_id = '\(chatID)'",
+                databaseURL: store.databaseURL
+            ),
+            1
+        )
+
+        let g2Result = await store.tombstone(chatID: chatID)
+        let g2 = try XCTUnwrap(g2Result.snapshot)
+        let defaultsName = "kaisola.stale-cleanup.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: defaultsName))
+        defer { defaults.removePersistentDomain(forName: defaultsName) }
+        let defaultsKey = "chatDraft.\(chatID)"
+        defaults.set("g2 plaintext", forKey: defaultsKey)
+        let staleCleanup = await store.completeExternalCleanup(
+            g1,
+            performExternalCleanup: {
+                UserDefaults(suiteName: defaultsName)?.removeObject(forKey: defaultsKey)
+            }
+        )
+        XCTAssertEqual(
+            staleCleanup,
+            .failed(.database("transcript deletion cleanup receipt is stale or no longer present"))
+        )
+        XCTAssertEqual(
+            defaults.string(forKey: defaultsKey),
+            "g2 plaintext",
+            "a stale g1 receipt must not execute cleanup against a later incarnation"
+        )
+        let retainedG2 = await store.tombstoneSnapshot(chatID: chatID)
+        XCTAssertEqual(retainedG2, .present(g2))
+
+        let partialFailureKey = "chatBooleanConfig.\(chatID)"
+        defaults.set("still needs cleanup", forKey: partialFailureKey)
+        let partialFailure = await store.completeExternalCleanup(
+            g2,
+            performExternalCleanup: {
+                UserDefaults(suiteName: defaultsName)?.removeObject(forKey: defaultsKey)
+                throw AcpTranscriptStore.StoreError.database("injected partial cleanup failure")
+            }
+        )
+        XCTAssertEqual(
+            partialFailure,
+            .failed(.database("injected partial cleanup failure"))
+        )
+        let retainedAfterPartialFailure = await store.tombstoneSnapshot(chatID: chatID)
+        XCTAssertEqual(
+            retainedAfterPartialFailure,
+            .present(g2),
+            "a throwing synchronous cleanup must leave the exact receipt retryable"
+        )
+        XCTAssertEqual(defaults.string(forKey: partialFailureKey), "still needs cleanup")
+
+        // Complete g2's descriptor/transcript phase and then the separately
+        // verified external plaintext phase. Only the latter may reclaim it.
+        let g2Removal = await store.remove(
+            chatID: chatID,
+            verifiedDescriptorPruning: g2
+        )
+        XCTAssertEqual(g2Removal, .removed)
+        let completed = await store.completeExternalCleanup(
+            g2,
+            performExternalCleanup: {
+                UserDefaults(suiteName: defaultsName)?.removeObject(forKey: defaultsKey)
+                UserDefaults(suiteName: defaultsName)?.removeObject(forKey: partialFailureKey)
+            }
+        )
+        XCTAssertEqual(completed, .removed)
+        XCTAssertNil(defaults.object(forKey: defaultsKey))
+        let finalState = await store.tombstoneState(chatID: chatID)
+        XCTAssertEqual(finalState, .absent)
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT COUNT(*) FROM deletion_watermarks WHERE chat_id = '\(chatID)'",
+                databaseURL: store.databaseURL
+            ),
+            1,
+            "the anti-resurrection watermark outlives the one-shot cleanup receipt"
+        )
+    }
+
+    func testWatermarkCompactionStaysBoundedAndRequiresDurableHigherIncarnationForReuse() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-watermark-compaction-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        let deletingWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "compaction-deleter",
+            schedulesAutomaticFlush: false
+        )
+        let delayedWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "compaction-delayed",
+            schedulesAutomaticFlush: false
+        )
+        let deletedChatID = "compacted-old-snapshot"
+        await delayedWindow.scheduleSave(
+            [.message(id: "late", text: "old incarnation")],
+            for: deletedChatID,
+            now: 1
+        )
+        let deletion = await deletingWindow.tombstone(chatID: deletedChatID)
+        let g1 = try XCTUnwrap(deletion.snapshot)
+        let removal = await deletingWindow.remove(
+            chatID: deletedChatID,
+            verifiedDescriptorPruning: g1
+        )
+        XCTAssertEqual(removal, .removed)
+        let cleanup = await deletingWindow.completeExternalCleanup(g1)
+        XCTAssertEqual(cleanup, .removed)
+
+        // Seed more exact, already-finished watermarks than the hard bound.
+        // All share a valid generation and have no chat/writer references.
+        try TranscriptDatabaseProbe.execute(
+            """
+            WITH RECURSIVE sequence(value) AS (
+                SELECT 0
+                UNION ALL SELECT value + 1 FROM sequence WHERE value < 4096
+            )
+            INSERT INTO deletion_watermarks(chat_id, generation, deleted_at)
+            SELECT printf('old-watermark-%04d', value), 1, value FROM sequence;
+            """,
+            at: databaseURL
+        )
+        await deletingWindow.vacuumTombstones(now: Int64.max)
+        XCTAssertLessThanOrEqual(
+            try sqliteCount("SELECT COUNT(*) FROM deletion_watermarks", databaseURL: databaseURL),
+            AcpTranscriptStore.maximumDeletionWatermarks
+        )
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT value FROM store_meta WHERE key = 'deletion_watermarks_require_explicit_creation'",
+                databaseURL: databaseURL
+            ),
+            1
+        )
+
+        await delayedWindow.flush()
+        let delayedResult = await delayedWindow.entry(for: deletedChatID)
+        XCTAssertNil(delayedResult, "an old buffered incarnation must stay rejected after compaction")
+
+        let unapproved = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "compaction-unapproved",
+            schedulesAutomaticFlush: false
+        )
+        await unapproved.scheduleDraft("must not land", for: "unknown-after-compaction", now: 2)
+        await unapproved.flush()
+        let unapprovedEntry = await unapproved.entry(for: "unknown-after-compaction")
+        XCTAssertNil(unapprovedEntry)
+
+        // Reuse is explicit and durable: authorization survives this actor going
+        // away, and its generation is strictly newer than the old deletion.
+        do {
+            let authorizer = AcpTranscriptStore(
+                databaseURL: databaseURL,
+                writerID: "compaction-authorizer",
+                schedulesAutomaticFlush: false
+            )
+            let authorized = await authorizer.beginNewChatID(deletedChatID)
+            XCTAssertTrue(authorized)
+        }
+        let reused = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "compaction-reused",
+            schedulesAutomaticFlush: false
+        )
+        let joinedReuse = await reused.establishRestorableChatID(deletedChatID)
+        XCTAssertTrue(joinedReuse)
+        await reused.scheduleDraft("intentional new incarnation", for: deletedChatID, now: 3)
+        await reused.flush()
+        let reusedEntry = await reused.entry(for: deletedChatID)
+        XCTAssertEqual(reusedEntry?.draft, "intentional new incarnation")
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT COUNT(*) FROM chat_incarnations WHERE chat_id = '\(deletedChatID)'",
+                databaseURL: databaseURL
+            ),
+            1,
+            "the durable incarnation must outlive transcript pruning and later writers"
+        )
+        XCTAssertGreaterThan(
+            try sqliteCount(
+                "SELECT generation FROM deletion_watermarks WHERE chat_id = '\(deletedChatID)'",
+                databaseURL: databaseURL
+            ),
+            0
+        )
+
+        // The independent incarnation bound rejects new identities; it never
+        // compacts or evicts a still-active identity to make room.
+        try TranscriptDatabaseProbe.execute(
+            """
+            WITH RECURSIVE sequence(value) AS (
+                SELECT 0
+                UNION ALL SELECT value + 1 FROM sequence WHERE value < 32766
+            )
+            INSERT INTO chat_incarnations(chat_id, generation, created_at)
+            SELECT printf('active-incarnation-%05d', value), 2, value FROM sequence;
+            """,
+            at: databaseURL
+        )
+        XCTAssertEqual(
+            try sqliteCount("SELECT COUNT(*) FROM chat_incarnations", databaseURL: databaseURL),
+            AcpTranscriptStore.maximumChatIncarnations
+        )
+        let overflow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "compaction-overflow",
+            schedulesAutomaticFlush: false
+        )
+        let overflowBegan = await overflow.beginNewChatID("must-not-evict-active")
+        XCTAssertFalse(overflowBegan)
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT COUNT(*) FROM chat_incarnations WHERE chat_id = '\(deletedChatID)'",
+                databaseURL: databaseURL
+            ),
+            1
+        )
+    }
+
+    func testOldWindowIncarnationCannotWriteIntoIntentionalReuseOfSameChatID() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-incarnation-reuse-fence-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        let chatID = "explicit-reuse-fence"
+        let oldWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "reuse-old-window",
+            schedulesAutomaticFlush: false
+        )
+        let oldIncarnationBegan = await oldWindow.beginNewChatID(chatID)
+        XCTAssertTrue(oldIncarnationBegan)
+        await oldWindow.scheduleSave(
+            [.message(id: "old-row", text: "old incarnation")],
+            for: chatID,
+            now: 1
+        )
+        await oldWindow.scheduleDraft("old draft", for: chatID, now: 1)
+        await oldWindow.scheduleAttachments(
+            [.textFile(path: "/tmp/old.txt", contents: "old", name: "old.txt")],
+            for: chatID,
+            now: 1
+        )
+        await oldWindow.scheduleSessionID("old-session", for: chatID, now: 1)
+
+        let deletingWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "reuse-deleting-window",
+            schedulesAutomaticFlush: false
+        )
+        let deletion = await deletingWindow.tombstone(chatID: chatID)
+        let g1 = try XCTUnwrap(deletion.snapshot)
+        let removal = await deletingWindow.remove(
+            chatID: chatID,
+            verifiedDescriptorPruning: g1
+        )
+        XCTAssertEqual(removal, .removed)
+        let externalCleanup = await deletingWindow.completeExternalCleanup(g1)
+        XCTAssertEqual(externalCleanup, .removed)
+        await deletingWindow.vacuumTombstones(now: Int64.max)
+        let tombstoneState = await deletingWindow.tombstoneState(chatID: chatID)
+        XCTAssertEqual(tombstoneState, .absent)
+
+        let newWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "reuse-new-window",
+            schedulesAutomaticFlush: false
+        )
+        let newIncarnationBegan = await newWindow.beginNewChatID(chatID)
+        XCTAssertTrue(newIncarnationBegan)
+        await newWindow.scheduleSave(
+            [.message(id: "new-row", text: "new incarnation")],
+            for: chatID,
+            now: 2
+        )
+        await newWindow.scheduleDraft("new draft", for: chatID, now: 2)
+        await newWindow.scheduleAttachments(
+            [.textFile(path: "/tmp/new.txt", contents: "new", name: "new.txt")],
+            for: chatID,
+            now: 2
+        )
+        await newWindow.scheduleSessionID("new-session", for: chatID, now: 2)
+        await newWindow.flush()
+
+        // Window A still owns its immutable pre-delete token. Its delayed
+        // snapshot must not mutate any field of the explicitly reused chat.
+        await oldWindow.flush()
+        let restored = await newWindow.entry(for: chatID)
+        XCTAssertEqual(restored?.rows, [.message(id: "new-row", text: "new incarnation")])
+        XCTAssertEqual(restored?.draft, "new draft")
+        XCTAssertEqual(restored?.attachments.map(\.name), ["new.txt"])
+        XCTAssertEqual(restored?.sessionID, "new-session")
+    }
+
+    func testFailedNewChatProvisioningCanAbandonOnlyItsEmptyExactIncarnation() async throws {
+        let (store, directory) = temporaryStore()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let abandonedID = "failed-provisioning-incarnation"
+        let retainedID = "payload-bearing-incarnation"
+
+        let beganAbandoned = await store.beginNewChatID(abandonedID)
+        XCTAssertTrue(beganAbandoned)
+        let abandoned = await store.abandonNewChatID(abandonedID)
+        XCTAssertTrue(abandoned)
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT COUNT(*) FROM chat_incarnations WHERE chat_id = '\(abandonedID)'",
+                databaseURL: store.databaseURL
+            ),
+            0
+        )
+
+        let beganRetained = await store.beginNewChatID(retainedID)
+        XCTAssertTrue(beganRetained)
+        await store.scheduleDraft("durable payload", for: retainedID, now: 1)
+        await store.flush()
+        let refused = await store.abandonNewChatID(retainedID)
+        XCTAssertFalse(refused, "an incarnation with durable payload is never provisioning debris")
+        let restored = await store.entry(for: retainedID)
+        XCTAssertEqual(restored?.draft, "durable payload")
+    }
+
+    func testNewChatAuthorizationCannotAdoptAnotherActorsExistingIncarnation() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-incarnation-collision-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        let first = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "collision-first",
+            schedulesAutomaticFlush: false
+        )
+        let second = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "collision-second",
+            schedulesAutomaticFlush: false
+        )
+        let chatID = "fresh-generated-id-collision"
+
+        let firstBegan = await first.beginNewChatID(chatID)
+        XCTAssertTrue(firstBegan)
+        let secondBegan = await second.beginNewChatID(chatID)
+        XCTAssertFalse(
+            secondBegan,
+            "a generated-new collision must fail instead of adopting another actor's identity"
+        )
+        await second.scheduleDraft("must not attach", for: chatID, now: 1)
+        await second.flush()
+        let secondEntry = await second.entry(for: chatID)
+        XCTAssertNil(secondEntry)
+
+        await first.scheduleDraft("first incarnation", for: chatID, now: 2)
+        await first.flush()
+        let firstEntry = await first.entry(for: chatID)
+        XCTAssertEqual(firstEntry?.draft, "first incarnation")
+    }
+
+    func testV6TombstonesMigrateToDurableWatermarksAndExternalCleanupReceipts() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-v6-watermark-migration-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        do {
+            let original = AcpTranscriptStore(databaseURL: databaseURL)
+            let deletion = await original.tombstone(chatID: "installed-v6-delete")
+            XCTAssertNotNil(deletion.snapshot)
+        }
+        try TranscriptDatabaseProbe.execute(
+            """
+            DROP TABLE deletion_watermarks;
+            DROP TABLE chat_incarnations;
+            DELETE FROM store_meta WHERE key = 'chat_incarnation_backfill_complete';
+            PRAGMA user_version = 6;
+            """,
+            at: databaseURL
+        )
+
+        let migrated = AcpTranscriptStore(databaseURL: databaseURL)
+        let migratedState = await migrated.tombstoneState(chatID: "installed-v6-delete")
+        XCTAssertEqual(migratedState, .present)
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT COUNT(*) FROM deletion_watermarks WHERE chat_id = 'installed-v6-delete'",
+                databaseURL: databaseURL
+            ),
+            1
+        )
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT external_cleanup_blocked FROM deleted_chats WHERE chat_id = 'installed-v6-delete'",
+                databaseURL: databaseURL
+            ),
+            1
+        )
+        XCTAssertEqual(try sqliteCount("PRAGMA user_version", databaseURL: databaseURL), 9)
+    }
+
+    func testInstalledDatabaseBackfillsLiveChatsBeforeUnknownIDsFailClosed() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-incarnation-installed-migration-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        let liveChatID = "installed-live-chat"
+        do {
+            let installed = AcpTranscriptStore(
+                databaseURL: databaseURL,
+                schedulesAutomaticFlush: false
+            )
+            await installed.scheduleSave(
+                [.message(id: "installed", text: "existing history")],
+                for: liveChatID,
+                now: 1
+            )
+            await installed.flush()
+        }
+        try TranscriptDatabaseProbe.execute(
+            """
+            DROP TABLE chat_incarnations;
+            DELETE FROM store_meta WHERE key = 'chat_incarnation_backfill_complete';
+            INSERT INTO store_meta(key, value)
+            VALUES ('deletion_watermarks_require_explicit_creation', '1')
+            ON CONFLICT(key) DO UPDATE SET value = '1';
+            PRAGMA user_version = 6;
+            """,
+            at: databaseURL
+        )
+
+        let migrated = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            schedulesAutomaticFlush: false
+        )
+        let joinedLiveChat = await migrated.establishRestorableChatID(liveChatID)
+        XCTAssertTrue(joinedLiveChat)
+        await migrated.scheduleDraft("post-migration draft", for: liveChatID, now: 2)
+        await migrated.flush()
+        let restored = await migrated.entry(for: liveChatID)
+        XCTAssertEqual(restored?.rows, [.message(id: "installed", text: "existing history")])
+        XCTAssertEqual(restored?.draft, "post-migration draft")
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT COUNT(*) FROM chat_incarnations WHERE chat_id = '\(liveChatID)'",
+                databaseURL: databaseURL
+            ),
+            1
+        )
+
+        let unknownRestore = await migrated.establishRestorableChatID(
+            "unknown-installed-descriptor"
+        )
+        XCTAssertFalse(unknownRestore)
+        XCTAssertEqual(try sqliteCount("PRAGMA user_version", databaseURL: databaseURL), 9)
     }
 
     func testUsagePersistsBesideRowsAndSurvivesLaterTranscriptSave() async throws {
@@ -1069,7 +1911,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
         XCTAssertEqual(beforeDelete, .absent)
 
         let tombstoneResult = await store.tombstone(chatID: "chat-live")
-        XCTAssertEqual(tombstoneResult, .recorded)
+        XCTAssertNotNil(tombstoneResult.snapshot)
         let afterDelete = await store.tombstoneState(chatID: "chat-live")
         XCTAssertEqual(afterDelete, .present)
         let neverSeen = await store.tombstoneState(chatID: "chat-never-seen")
@@ -1099,7 +1941,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
         let (store, directory) = temporaryStore()
         defer { try? FileManager.default.removeItem(at: directory) }
         let tombstoneResult = await store.tombstone(chatID: "chat-denied")
-        XCTAssertEqual(tombstoneResult, .recorded)
+        XCTAssertNotNil(tombstoneResult.snapshot)
         let readable = await store.tombstoneState(chatID: "chat-denied")
         XCTAssertEqual(readable, .present)
 
@@ -1124,7 +1966,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
         let (store, directory) = temporaryStore()
         defer { try? FileManager.default.removeItem(at: directory) }
         let tombstoneResult = await store.tombstone(chatID: "chat-busy")
-        XCTAssertEqual(tombstoneResult, .recorded)
+        XCTAssertNotNil(tombstoneResult.snapshot)
 
         let blocker = try openSideConnection(to: store.databaseURL)
         defer { sqlite3_close_v2(blocker) }
@@ -1149,6 +1991,16 @@ final class AcpTranscriptStoreTests: XCTestCase {
         XCTAssertEqual(
             sqlite3_exec(
                 side,
+                "ALTER TABLE deleted_chats RENAME TO deleted_chats_valid",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+        XCTAssertEqual(
+            sqlite3_exec(
+                side,
                 "CREATE TABLE deleted_chats (id TEXT PRIMARY KEY NOT NULL)",
                 nil,
                 nil,
@@ -1168,6 +2020,16 @@ final class AcpTranscriptStoreTests: XCTestCase {
         // Withheld, not lost: the coalesced snapshot lands once the probe can
         // answer again.
         XCTAssertEqual(sqlite3_exec(side, "DROP TABLE deleted_chats", nil, nil, nil), SQLITE_OK)
+        XCTAssertEqual(
+            sqlite3_exec(
+                side,
+                "ALTER TABLE deleted_chats_valid RENAME TO deleted_chats",
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
         sqlite3_close_v2(side)
         await store.flush()
         let restored = await store.rows(for: "chat-probe")
@@ -1221,6 +2083,98 @@ final class AcpTranscriptStoreTests: XCTestCase {
                 databaseURL: store.databaseURL
             ),
             0
+        )
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT descriptor_reclaim_blocked FROM deleted_chats WHERE chat_id = 'legacy-deleted'",
+                databaseURL: store.databaseURL
+            ),
+            1
+        )
+        XCTAssertEqual(
+            try sqliteCount("PRAGMA user_version", databaseURL: store.databaseURL),
+            9
+        )
+    }
+
+    func testV5MigrationReblocksExistingDescriptorFencesExactlyOnce() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "kaisola-transcript-v5-descriptor-fence-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        var setup: OpaquePointer?
+        XCTAssertEqual(
+            sqlite3_open_v2(databaseURL.path, &setup, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil),
+            SQLITE_OK
+        )
+        let database = try XCTUnwrap(setup)
+        XCTAssertEqual(
+            sqlite3_exec(
+                database,
+                """
+                CREATE TABLE store_meta (
+                    key TEXT PRIMARY KEY NOT NULL,
+                    value TEXT NOT NULL
+                ) WITHOUT ROWID;
+                INSERT INTO store_meta(key, value) VALUES ('deletion_generation', '7');
+                CREATE TABLE deleted_chats (
+                    chat_id TEXT PRIMARY KEY NOT NULL,
+                    deleted_at INTEGER NOT NULL,
+                    generation INTEGER NOT NULL,
+                    descriptor_reclaim_blocked INTEGER NOT NULL DEFAULT 0
+                ) WITHOUT ROWID;
+                INSERT INTO deleted_chats(
+                    chat_id, deleted_at, generation, descriptor_reclaim_blocked
+                ) VALUES ('installed-v5-delete', 1, 7, 0);
+                PRAGMA user_version = 5;
+                """,
+                nil,
+                nil,
+                nil
+            ),
+            SQLITE_OK
+        )
+        sqlite3_close_v2(database)
+
+        let migrated = AcpTranscriptStore(databaseURL: databaseURL)
+        let migratedState = await migrated.tombstoneState(chatID: "installed-v5-delete")
+        XCTAssertEqual(migratedState, .present)
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT descriptor_reclaim_blocked FROM deleted_chats WHERE chat_id = 'installed-v5-delete'",
+                databaseURL: databaseURL
+            ),
+            1,
+            "installed v5 rows whose old default was zero must be conservatively re-fenced"
+        )
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT COUNT(*) FROM store_meta WHERE key = 'descriptor_fences_blocked' AND value = '1'",
+                databaseURL: databaseURL
+            ),
+            1
+        )
+        XCTAssertEqual(try sqliteCount("PRAGMA user_version", databaseURL: databaseURL), 9)
+
+        // The marker is one-shot. Zero is a legitimate state only after an
+        // exact receipt release, and reopening v8 must not overwrite it.
+        try TranscriptDatabaseProbe.execute(
+            "UPDATE deleted_chats SET descriptor_reclaim_blocked = 0",
+            at: databaseURL
+        )
+        let reopened = AcpTranscriptStore(databaseURL: databaseURL)
+        let reopenedState = await reopened.tombstoneState(chatID: "installed-v5-delete")
+        XCTAssertEqual(reopenedState, .present)
+        XCTAssertEqual(
+            try sqliteCount(
+                "SELECT descriptor_reclaim_blocked FROM deleted_chats WHERE chat_id = 'installed-v5-delete'",
+                databaseURL: databaseURL
+            ),
+            0,
+            "the completed migration marker must preserve a later exact release"
         )
     }
 
@@ -1289,6 +2243,11 @@ final class AcpTranscriptStoreTests: XCTestCase {
         let restoration = await store.restoration(for: "retry-chat", tailLimit: 120).restoration
         let restored = try XCTUnwrap(restoration)
         XCTAssertEqual(restored.page.rows, rows)
+        let established = await store.establishRestorableChatID("retry-chat")
+        XCTAssertTrue(
+            established,
+            "A migrated legacy descriptor must bind its durable incarnation before writing"
+        )
 
         // The write refusal lifts with the fault: a chat that reads back is
         // durable again.
@@ -1413,7 +2372,7 @@ final class AcpTranscriptStoreTests: XCTestCase {
             now: 2
         )
         let outcome = await store.tombstone(chatID: "chat-deleted")
-        XCTAssertEqual(outcome, .recorded)
+        XCTAssertNotNil(outcome.snapshot)
         await store.flush()
 
         let reopened = AcpTranscriptStore(databaseURL: databaseURL)

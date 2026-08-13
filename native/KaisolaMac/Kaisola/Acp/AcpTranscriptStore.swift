@@ -413,6 +413,17 @@ actor AcpTranscriptStore {
         case unknown
     }
 
+    struct TombstoneSnapshot: Equatable, Hashable, Sendable {
+        var chatID: String
+        var generation: Int64
+    }
+
+    enum TombstoneSnapshotState: Equatable, Sendable {
+        case absent
+        case present(TombstoneSnapshot)
+        case unknown
+    }
+
     enum StoreError: Error, Equatable, Sendable {
         case database(String)
         /// Stored bytes that exist but cannot be decoded back into a row or a
@@ -457,8 +468,26 @@ actor AcpTranscriptStore {
     }
 
     enum TombstoneResult: Equatable, Sendable {
-        case recorded
+        case recorded(TombstoneSnapshot)
         case failed(StoreError)
+
+        var snapshot: TombstoneSnapshot? {
+            guard case let .recorded(snapshot) = self else { return nil }
+            return snapshot
+        }
+    }
+
+    /// A Mesh owns several transcript identities, but permanent deletion is
+    /// one user action. Recording the whole set in one SQLite transaction
+    /// prevents a crash from leaving an unreferenced half of the Mesh writable.
+    enum TombstoneBatchResult: Equatable, Sendable {
+        case recorded([TombstoneSnapshot])
+        case failed(StoreError)
+
+        var snapshots: [TombstoneSnapshot]? {
+            guard case let .recorded(snapshots) = self else { return nil }
+            return snapshots
+        }
     }
 
     /// Deterministic single-use failure seams for the removal transaction.
@@ -488,6 +517,17 @@ actor AcpTranscriptStore {
     /// bounded interval. Resuming after expiry is still safe: buffered writes
     /// retain their captured deletion generation and fail closed if it moved.
     static let writerLeaseDurationMilliseconds: Int64 = 5 * 60 * 1_000
+    /// Exact deletion watermarks survive one-shot cleanup receipts so a writer
+    /// that first appears after deletion cannot acknowledge that same generation
+    /// and recreate the chat. Old, fully-deleted identifiers are compacted only
+    /// after their writers retire; compaction switches unknown identifiers to an
+    /// explicit-creation regime instead of turning absence back into authority.
+    static let maximumDeletionWatermarks = 4_096
+    /// The workspace archive is itself bounded to 64 projects with at most
+    /// 256 live and 256 recently-closed chats in each. Keeping the durable
+    /// incarnation registry at that same hard ceiling prevents failed
+    /// pre-descriptor creations from growing an authorization log forever.
+    static let maximumChatIncarnations = 32_768
     static let live: AcpTranscriptStore = {
         let environment = ProcessInfo.processInfo.environment
         let isXCTest = environment["XCTestConfigurationFilePath"] != nil
@@ -536,11 +576,20 @@ actor AcpTranscriptStore {
         var sessionID: FieldChange<String> = .unchanged
         var updatedAt: Int64
         var writerGeneration: Int64
+        /// Immutable identity captured when this store actor joined the chat.
+        /// A later delete-and-reuse of the same string has a different token.
+        var incarnationGeneration: Int64?
         var heldContinuousFence: Bool
 
-        init(updatedAt: Int64, writerGeneration: Int64, heldContinuousFence: Bool) {
+        init(
+            updatedAt: Int64,
+            writerGeneration: Int64,
+            incarnationGeneration: Int64?,
+            heldContinuousFence: Bool
+        ) {
             self.updatedAt = updatedAt
             self.writerGeneration = writerGeneration
+            self.incarnationGeneration = incarnationGeneration
             self.heldContinuousFence = heldContinuousFence
         }
     }
@@ -598,6 +647,12 @@ actor AcpTranscriptStore {
     private let schedulesAutomaticFlush: Bool
     private let retentionPolicy: RetentionPolicy
     private var writerGeneration: Int64?
+    /// Per-actor immutable bindings prevent a window that survived deletion
+    /// from adopting a later intentional reuse merely because the id matches.
+    private var boundChatIncarnations: [String: Int64] = [:]
+    /// Once a caller explicitly asks to create/bind an incarnation, a failed
+    /// attempt must not fall back to legacy implicit-write compatibility.
+    private var explicitlyRejectedChatIDs: Set<String> = []
     private var writerLeaseExpiresAt: Int64 = 0
     private var injectedRemovalFailure: RemovalFailurePoint?
     private var injectedTombstoneFailure: TombstoneFailurePoint?
@@ -905,15 +960,17 @@ actor AcpTranscriptStore {
               startOrdinal <= Int64.max - Int64(rows.count),
               !unreadableChatIDs.contains(chatID) else { return }
         let timestamp = Self.timestamp(now)
-        let fence = captureWriterFence()
+        guard let fence = captureWriterFence(chatID: chatID) else { return }
         var write = pending[chatID] ?? PendingWrite(
             updatedAt: timestamp,
             writerGeneration: fence.generation,
+            incarnationGeneration: fence.incarnationGeneration,
             heldContinuousFence: fence.continuous
         )
         write.rows = RowWrite(rows: rows, startOrdinal: startOrdinal)
         write.updatedAt = max(write.updatedAt, timestamp)
         write.writerGeneration = min(write.writerGeneration, fence.generation)
+        guard write.incarnationGeneration == fence.incarnationGeneration else { return }
         write.heldContinuousFence = write.heldContinuousFence && fence.continuous
         pending[chatID] = write
         scheduleFlush()
@@ -922,15 +979,17 @@ actor AcpTranscriptStore {
     func scheduleUsage(_ usage: AcpPersistedUsage, for chatID: String, now: Int64? = nil) {
         guard Self.validChatID(chatID), !unreadableChatIDs.contains(chatID) else { return }
         let timestamp = Self.timestamp(now)
-        let fence = captureWriterFence()
+        guard let fence = captureWriterFence(chatID: chatID) else { return }
         var write = pending[chatID] ?? PendingWrite(
             updatedAt: timestamp,
             writerGeneration: fence.generation,
+            incarnationGeneration: fence.incarnationGeneration,
             heldContinuousFence: fence.continuous
         )
         write.usage = .set(usage)
         write.updatedAt = max(write.updatedAt, timestamp)
         write.writerGeneration = min(write.writerGeneration, fence.generation)
+        guard write.incarnationGeneration == fence.incarnationGeneration else { return }
         write.heldContinuousFence = write.heldContinuousFence && fence.continuous
         pending[chatID] = write
         scheduleFlush()
@@ -940,15 +999,17 @@ actor AcpTranscriptStore {
         guard Self.validChatID(chatID), !unreadableChatIDs.contains(chatID),
               draft.lengthOfBytes(using: .utf8) <= Self.maximumDraftBytes else { return }
         let timestamp = Self.timestamp(now)
-        let fence = captureWriterFence()
+        guard let fence = captureWriterFence(chatID: chatID) else { return }
         var write = pending[chatID] ?? PendingWrite(
             updatedAt: timestamp,
             writerGeneration: fence.generation,
+            incarnationGeneration: fence.incarnationGeneration,
             heldContinuousFence: fence.continuous
         )
         write.draft = .set(draft.isEmpty ? nil : draft)
         write.updatedAt = max(write.updatedAt, timestamp)
         write.writerGeneration = min(write.writerGeneration, fence.generation)
+        guard write.incarnationGeneration == fence.incarnationGeneration else { return }
         write.heldContinuousFence = write.heldContinuousFence && fence.continuous
         pending[chatID] = write
         scheduleFlush()
@@ -962,15 +1023,17 @@ actor AcpTranscriptStore {
         guard Self.validChatID(chatID), !unreadableChatIDs.contains(chatID),
               Self.attachmentsAreBounded(attachments) else { return }
         let timestamp = Self.timestamp(now)
-        let fence = captureWriterFence()
+        guard let fence = captureWriterFence(chatID: chatID) else { return }
         var write = pending[chatID] ?? PendingWrite(
             updatedAt: timestamp,
             writerGeneration: fence.generation,
+            incarnationGeneration: fence.incarnationGeneration,
             heldContinuousFence: fence.continuous
         )
         write.attachments = .set(attachments.isEmpty ? nil : attachments)
         write.updatedAt = max(write.updatedAt, timestamp)
         write.writerGeneration = min(write.writerGeneration, fence.generation)
+        guard write.incarnationGeneration == fence.incarnationGeneration else { return }
         write.heldContinuousFence = write.heldContinuousFence && fence.continuous
         pending[chatID] = write
         scheduleFlush()
@@ -981,15 +1044,17 @@ actor AcpTranscriptStore {
         let normalized = sessionID?.trimmingCharacters(in: .whitespacesAndNewlines)
         guard normalized?.lengthOfBytes(using: .utf8) ?? 0 <= 4_096 else { return }
         let timestamp = Self.timestamp(now)
-        let fence = captureWriterFence()
+        guard let fence = captureWriterFence(chatID: chatID) else { return }
         var write = pending[chatID] ?? PendingWrite(
             updatedAt: timestamp,
             writerGeneration: fence.generation,
+            incarnationGeneration: fence.incarnationGeneration,
             heldContinuousFence: fence.continuous
         )
         write.sessionID = .set(normalized?.isEmpty == false ? normalized : nil)
         write.updatedAt = max(write.updatedAt, timestamp)
         write.writerGeneration = min(write.writerGeneration, fence.generation)
+        guard write.incarnationGeneration == fence.incarnationGeneration else { return }
         write.heldContinuousFence = write.heldContinuousFence && fence.continuous
         pending[chatID] = write
         scheduleFlush()
@@ -1047,25 +1112,50 @@ actor AcpTranscriptStore {
     /// Capture the generation under a durable lease before any snapshot enters
     /// the in-memory coalescing queue. If the database cannot establish that
     /// fence, generation -1 makes the eventual flush fail closed.
-    private func captureWriterFence() -> (generation: Int64, continuous: Bool) {
+    private func captureWriterFence(
+        chatID: String
+    ) -> (generation: Int64, incarnationGeneration: Int64?, continuous: Bool)? {
+        guard !explicitlyRejectedChatIDs.contains(chatID) else { return nil }
         let now = Self.timestamp(nil)
-        if let writerGeneration, writerLeaseExpiresAt > now {
-            return (writerGeneration, true)
-        }
         do {
             let database = try openDatabase()
-            let generation: Int64
-            if let writerGeneration {
-                generation = writerGeneration
-            } else {
-                generation = try currentDeletionGeneration(database)
-            }
+            var generation: Int64 = -1
+            var incarnationGeneration: Int64?
             var wasLive = false
+            var authorized = false
             try transaction(database) {
                 let current = try currentDeletionGeneration(database)
+                generation = writerGeneration ?? current
                 wasLive = try writerLeaseIsLive(now: now, database: database)
+                let watermark = try deletionWatermarkGeneration(
+                    chatID: chatID,
+                    database: database
+                )
+                let durableIncarnation = try chatIncarnationGeneration(
+                    chatID: chatID,
+                    database: database
+                )
+                if let bound = boundChatIncarnations[chatID] {
+                    guard durableIncarnation == bound else { return }
+                    incarnationGeneration = bound
+                } else if durableIncarnation != nil {
+                    // A durable identity is not permission for an arbitrary
+                    // actor to adopt it. Product creation and restoration bind
+                    // this actor explicitly through begin/establish first.
+                    return
+                } else {
+                    guard try !requiresExplicitChatCreation(database) else { return }
+                }
+                if let incarnationGeneration {
+                    guard watermark.map({ incarnationGeneration > $0 }) ?? true else { return }
+                } else {
+                    guard watermark.map({ generation > $0 }) ?? true else { return }
+                }
+                let acknowledgedGeneration = pending.values.reduce(generation) {
+                    min($0, $1.writerGeneration)
+                }
                 try upsertWriterLease(
-                    acknowledgedGeneration: generation,
+                    acknowledgedGeneration: acknowledgedGeneration,
                     now: now,
                     database: database
                 )
@@ -1073,18 +1163,198 @@ actor AcpTranscriptStore {
                 // A newly registered writer starts a continuous fence only
                 // when no deletion generation elapsed while it was absent.
                 if generation == current { wasLive = true }
+                authorized = true
             }
+            guard authorized else { return nil }
             writerGeneration = generation
-            return (generation, wasLive)
+            return (generation, incarnationGeneration, wasLive)
         } catch {
-            return (-1, false)
+            return nil
+        }
+    }
+
+    /// Atomically establish the durable identity of an intentionally new chat.
+    /// Normal product calls supply a freshly generated UUID; the same operation
+    /// is the only supported way to deliberately reuse an id after deletion,
+    /// in which case its generation is strictly advanced. This registry row is
+    /// the first persisted chat write, not a token consumed by a later flush,
+    /// so a crash cannot separate authorization from the authorized identity.
+    func beginNewChatID(_ chatID: String) -> Bool {
+        guard Self.validChatID(chatID) else { return false }
+        explicitlyRejectedChatIDs.insert(chatID)
+        do {
+            let database = try openDatabase()
+            var generation: Int64 = -1
+            try transaction(database) {
+                guard try !hasTombstone(chatID: chatID, database: database) else {
+                    throw StoreError.database(
+                        "a transcript deletion is still being reconciled for this chat"
+                    )
+                }
+                let current = try currentDeletionGeneration(database)
+                let existingIncarnation = try chatIncarnationGeneration(
+                    chatID: chatID,
+                    database: database
+                )
+                if let bound = boundChatIncarnations[chatID],
+                   let existingIncarnation,
+                   bound != existingIncarnation {
+                    throw StoreError.database(
+                        "this transcript writer belongs to an older chat incarnation"
+                    )
+                }
+                if let existing = existingIncarnation {
+                    guard boundChatIncarnations[chatID] == existing else {
+                        throw StoreError.database(
+                            "a different transcript actor already owns this chat incarnation"
+                        )
+                    }
+                    generation = existing
+                } else if let watermark = try deletionWatermarkGeneration(
+                    chatID: chatID,
+                    database: database
+                ), current <= watermark {
+                    generation = try nextDeletionGeneration(database)
+                } else if try requiresExplicitChatCreation(database) {
+                    generation = try nextDeletionGeneration(database)
+                } else {
+                    generation = current
+                }
+                if existingIncarnation == nil {
+                    guard try chatIncarnationCount(database) < Self.maximumChatIncarnations else {
+                        throw StoreError.database("transcript chat incarnation capacity is exhausted")
+                    }
+                }
+                try withStatement(
+                    """
+                    INSERT INTO chat_incarnations(chat_id, generation, created_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(chat_id) DO UPDATE SET
+                        generation = MAX(chat_incarnations.generation, excluded.generation)
+                    """,
+                    database: database
+                ) {
+                    try bind(chatID, at: 1, statement: $0, database: database)
+                    try bind(generation, at: 2, statement: $0, database: database)
+                    try bind(Self.timestamp(nil), at: 3, statement: $0, database: database)
+                    try stepDone($0, database: database)
+                }
+                try setMetadataValue("1", for: "v2_has_written", database: database)
+            }
+            if let previous = boundChatIncarnations[chatID], previous != generation {
+                pending.removeValue(forKey: chatID)
+            }
+            boundChatIncarnations[chatID] = generation
+            explicitlyRejectedChatIDs.remove(chatID)
+            writerGeneration = generation
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    /// Grandfather a workspace descriptor only before watermark compaction has
+    /// ever discarded exact ids. This migrates legitimately old empty chats to
+    /// durable incarnation rows; after compaction, an unknown missing id remains
+    /// fail-closed and cannot be authorized by a possibly stale descriptor.
+    func establishRestorableChatID(_ chatID: String) -> Bool {
+        guard Self.validChatID(chatID) else { return false }
+        explicitlyRejectedChatIDs.insert(chatID)
+        do {
+            let database = try openDatabase()
+            var established = false
+            var establishedGeneration: Int64?
+            try transaction(database) {
+                if let existing = try chatIncarnationGeneration(
+                    chatID: chatID,
+                    database: database
+                ) {
+                    establishedGeneration = existing
+                    established = true
+                    return
+                }
+                guard try !requiresExplicitChatCreation(database),
+                      try !hasTombstone(chatID: chatID, database: database),
+                      try deletionWatermarkGeneration(
+                        chatID: chatID,
+                        database: database
+                      ) == nil else { return }
+                guard try chatIncarnationCount(database) < Self.maximumChatIncarnations else {
+                    throw StoreError.database("transcript chat incarnation capacity is exhausted")
+                }
+                let generation = try currentDeletionGeneration(database)
+                try withStatement(
+                    """
+                    INSERT INTO chat_incarnations(chat_id, generation, created_at)
+                    VALUES (?, ?, ?)
+                    """,
+                    database: database
+                ) {
+                    try bind(chatID, at: 1, statement: $0, database: database)
+                    try bind(generation, at: 2, statement: $0, database: database)
+                    try bind(Self.timestamp(nil), at: 3, statement: $0, database: database)
+                    try stepDone($0, database: database)
+                }
+                establishedGeneration = generation
+                established = true
+            }
+            if established, let generation = establishedGeneration {
+                if let bound = boundChatIncarnations[chatID], bound != generation {
+                    return false
+                }
+                boundChatIncarnations[chatID] = generation
+                explicitlyRejectedChatIDs.remove(chatID)
+            }
+            return established
+        } catch {
+            return false
+        }
+    }
+
+    /// Roll back a newly provisioned identity that never acquired transcript
+    /// payload or a workspace descriptor (for example, a Mesh column whose
+    /// worktree provisioning failed). Exact generation matching means this
+    /// actor cannot abandon a later reuse established by another window.
+    func abandonNewChatID(_ chatID: String) -> Bool {
+        guard Self.validChatID(chatID),
+              let generation = boundChatIncarnations[chatID],
+              pending[chatID] == nil else { return false }
+        do {
+            let database = try openDatabase()
+            var abandoned = false
+            try transaction(database) {
+                guard try !hasTombstone(chatID: chatID, database: database),
+                      try !chatExists(chatID: chatID, database: database) else { return }
+                try withStatement(
+                    "DELETE FROM chat_incarnations WHERE chat_id = ? AND generation = ?",
+                    database: database
+                ) {
+                    try bind(chatID, at: 1, statement: $0, database: database)
+                    try bind(generation, at: 2, statement: $0, database: database)
+                    try stepDone($0, database: database)
+                }
+                abandoned = sqlite3_changes(database.pointer) == 1
+            }
+            if abandoned {
+                boundChatIncarnations.removeValue(forKey: chatID)
+                explicitlyRejectedChatIDs.insert(chatID)
+            }
+            return abandoned
+        } catch {
+            return false
         }
     }
 
     @discardableResult
-    func remove(chatID: String, retainTombstone: Bool = false) -> Removal {
+    func remove(
+        chatID: String,
+        verifiedDescriptorPruning tombstone: TombstoneSnapshot? = nil
+    ) -> Removal {
         guard Self.validChatID(chatID) else {
             return .failed(.database("invalid transcript chat identifier"))
+        }
+        if let tombstone, tombstone.chatID != chatID {
+            return .failed(.database("transcript deletion receipt did not match the chat"))
         }
         let removedPending = pending.removeValue(forKey: chatID)
         do {
@@ -1094,19 +1364,13 @@ actor AcpTranscriptStore {
                 database,
                 beforeCommit: { try self.consumeRemovalFailure(.commit) }
             ) {
-                // Descriptor persistence and transcript persistence are two
-                // stores. If catalog pruning failed, pin the already-durable
-                // tombstone in the same transaction that erases transcript
-                // bytes. No other window may reclaim that resurrection fence
-                // between these two operations or during a later flush.
-                if retainTombstone {
-                    try withStatement(
-                        "UPDATE deleted_chats SET descriptor_reclaim_blocked = 1 WHERE chat_id = ?",
-                        database: database
-                    ) {
-                        try bind(chatID, at: 1, statement: $0, database: database)
-                        try stepDone($0, database: database)
-                    }
+                // A tombstone begins descriptor-blocked. Only the exact
+                // generation returned by tombstone(chatID:) can release that
+                // fence after catalog pruning succeeds. A nil receipt still
+                // erases transcript bytes, but deliberately retains the
+                // tombstone so a stale workspace descriptor cannot restore.
+                if let tombstone {
+                    try releaseDescriptorFence(tombstone, database: database)
                 }
                 try consumeRemovalFailure(.delete)
                 try withStatement("DELETE FROM chats WHERE chat_id = ?", database: database) {
@@ -1144,12 +1408,39 @@ actor AcpTranscriptStore {
     /// callers from reporting success for an intent SQLite did not persist.
     @discardableResult
     func tombstone(chatID: String) -> TombstoneResult {
-        guard Self.validChatID(chatID) else {
+        switch recordTombstones(chatIDs: [chatID]) {
+        case let .recorded(snapshots):
+            guard let snapshot = snapshots.first else {
+                return .failed(.database("transcript deletion intent was not recorded"))
+            }
+            return .recorded(snapshot)
+        case let .failed(error):
+            return .failed(error)
+        }
+    }
+
+    /// Atomically record every transcript identity owned by one Mesh. The
+    /// sorted, deduplicated result gives callers an exact receipt per column;
+    /// any invalid member or transaction failure records none of them.
+    @discardableResult
+    func tombstone(chatIDs: [String]) -> TombstoneBatchResult {
+        recordTombstones(chatIDs: chatIDs)
+    }
+
+    private func recordTombstones(chatIDs: [String]) -> TombstoneBatchResult {
+        let normalizedChatIDs = Array(Set(chatIDs)).sorted()
+        guard normalizedChatIDs.count == chatIDs.count,
+              normalizedChatIDs.count <= 256,
+              normalizedChatIDs.allSatisfy(Self.validChatID) else {
             return .failed(.database("invalid transcript chat identifier"))
         }
-        let hasOtherPendingWrites = pending.keys.contains { $0 != chatID }
+        guard !normalizedChatIDs.isEmpty else { return .recorded([]) }
+        let deletedChatIDs = Set(normalizedChatIDs)
+        let hasOtherPendingWrites = pending.keys.contains {
+            !deletedChatIDs.contains($0)
+        }
         let now = Self.timestamp(nil)
-        var deletionGeneration: Int64 = 0
+        var snapshots: [TombstoneSnapshot] = []
         do {
             try consumeTombstoneFailure(.open)
             let database = try openDatabase()
@@ -1158,25 +1449,58 @@ actor AcpTranscriptStore {
                 beforeCommit: { try self.consumeTombstoneFailure(.commit) }
             ) {
                 try ensureDeletedChatsTable(database)
-                deletionGeneration = try nextDeletionGeneration(database)
-                try withStatement(
-                    """
-                    INSERT INTO deleted_chats(chat_id, deleted_at, generation)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(chat_id) DO UPDATE SET
-                        deleted_at = excluded.deleted_at,
-                        generation = excluded.generation
-                    """,
-                    database: database
-                ) {
-                    try bind(chatID, at: 1, statement: $0, database: database)
-                    try bind(now, at: 2, statement: $0, database: database)
-                    try bind(deletionGeneration, at: 3, statement: $0, database: database)
-                    try stepDone($0, database: database)
+                for chatID in normalizedChatIDs {
+                    let deletionGeneration = try nextDeletionGeneration(database)
+                    try withStatement(
+                        """
+                        INSERT INTO deleted_chats(
+                            chat_id, deleted_at, generation, descriptor_reclaim_blocked,
+                            external_cleanup_blocked
+                        )
+                        VALUES (?, ?, ?, 1, 1)
+                        ON CONFLICT(chat_id) DO UPDATE SET
+                            deleted_at = excluded.deleted_at,
+                            generation = excluded.generation,
+                            descriptor_reclaim_blocked = 1,
+                            external_cleanup_blocked = 1
+                        """,
+                        database: database
+                    ) {
+                        try bind(chatID, at: 1, statement: $0, database: database)
+                        try bind(now, at: 2, statement: $0, database: database)
+                        try bind(deletionGeneration, at: 3, statement: $0, database: database)
+                        try stepDone($0, database: database)
+                    }
+                    try withStatement(
+                        "DELETE FROM chat_incarnations WHERE chat_id = ?",
+                        database: database
+                    ) {
+                        try bind(chatID, at: 1, statement: $0, database: database)
+                        try stepDone($0, database: database)
+                    }
+                    try withStatement(
+                        """
+                        INSERT INTO deletion_watermarks(chat_id, generation, deleted_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(chat_id) DO UPDATE SET
+                            generation = excluded.generation,
+                            deleted_at = excluded.deleted_at
+                        """,
+                        database: database
+                    ) {
+                        try bind(chatID, at: 1, statement: $0, database: database)
+                        try bind(deletionGeneration, at: 2, statement: $0, database: database)
+                        try bind(now, at: 3, statement: $0, database: database)
+                        try stepDone($0, database: database)
+                    }
+                    snapshots.append(TombstoneSnapshot(
+                        chatID: chatID,
+                        generation: deletionGeneration
+                    ))
                 }
                 if hasOtherPendingWrites {
                     try upsertWriterLease(
-                        acknowledgedGeneration: deletionGeneration,
+                        acknowledgedGeneration: snapshots.last?.generation ?? 0,
                         now: now,
                         database: database
                     )
@@ -1184,11 +1508,16 @@ actor AcpTranscriptStore {
                     try retireWriter(database)
                 }
             }
-            // This is the commit boundary: only now may the target's exact
-            // pending entry disappear from memory.
-            pending.removeValue(forKey: chatID)
-            unreadableChatIDs.remove(chatID)
-            clearPersistenceHealth(chatID: chatID)
+            // This is the commit boundary: only now may each target's exact
+            // pending entry and immutable incarnation binding disappear.
+            for chatID in normalizedChatIDs {
+                pending.removeValue(forKey: chatID)
+                boundChatIncarnations.removeValue(forKey: chatID)
+                explicitlyRejectedChatIDs.insert(chatID)
+                unreadableChatIDs.remove(chatID)
+                clearPersistenceHealth(chatID: chatID)
+            }
+            let deletionGeneration = snapshots.last?.generation ?? 0
             writerGeneration = deletionGeneration
             writerLeaseExpiresAt = hasOtherPendingWrites
                 ? Self.writerLeaseDeadline(after: now)
@@ -1197,7 +1526,7 @@ actor AcpTranscriptStore {
                 pending[pendingChatID]?.writerGeneration = deletionGeneration
                 pending[pendingChatID]?.heldContinuousFence = true
             }
-            return .recorded
+            return .recorded(snapshots)
         } catch {
             return .failed(Self.storeError(error))
         }
@@ -1207,14 +1536,68 @@ actor AcpTranscriptStore {
     /// `.absent`, so a lookup the store cannot complete fails closed instead
     /// of authorizing content the user permanently deleted.
     func tombstoneState(chatID: String) -> TombstoneState {
+        switch tombstoneSnapshot(chatID: chatID) {
+        case .absent: return .absent
+        case .present: return .present
+        case .unknown: return .unknown
+        }
+    }
+
+    /// Capture both identity and generation so descriptor verification can be
+    /// consumed later without authorizing a different deletion that raced the
+    /// workspace scan.
+    func tombstoneSnapshot(chatID: String) -> TombstoneSnapshotState {
         // A malformed id is unanswerable rather than provably undeleted; the
         // store never wrote one, so nothing legitimate is refused here.
         guard Self.validChatID(chatID) else { return .unknown }
         do {
             let database = try openDatabase()
-            return try hasTombstone(chatID: chatID, database: database) ? .present : .absent
+            guard try tableExists("deleted_chats", database: database) else { return .absent }
+            var generation: Int64?
+            try withStatement(
+                "SELECT generation FROM deleted_chats WHERE chat_id = ? LIMIT 1",
+                database: database
+            ) {
+                try bind(chatID, at: 1, statement: $0, database: database)
+                if try stepRow($0, database: database) {
+                    generation = sqlite3_column_int64($0, 0)
+                }
+            }
+            guard let generation else { return .absent }
+            return .present(TombstoneSnapshot(chatID: chatID, generation: generation))
         } catch {
             return .unknown
+        }
+    }
+
+    /// Snapshot every tombstone generation that existed before a later full
+    /// workspace archive read. Callers may release only members of this set
+    /// that the later archive proves have no descriptor. `nil` means the scan
+    /// could not be completed and therefore authorizes no reclamation.
+    func tombstoneSnapshots() -> Set<TombstoneSnapshot>? {
+        do {
+            let database = try openDatabase()
+            guard try tableExists("deleted_chats", database: database) else { return [] }
+            var snapshots = Set<TombstoneSnapshot>()
+            try withStatement(
+                "SELECT chat_id, generation FROM deleted_chats",
+                database: database
+            ) { statement in
+                while try stepRow(statement, database: database) {
+                    guard let chatID = Self.columnString(statement, column: 0) else {
+                        throw StoreError.corruptRecord(
+                            "stored transcript deletion identifier could not be read"
+                        )
+                    }
+                    snapshots.insert(TombstoneSnapshot(
+                        chatID: chatID,
+                        generation: sqlite3_column_int64(statement, 1)
+                    ))
+                }
+            }
+            return snapshots
+        } catch {
+            return nil
         }
     }
 
@@ -1240,33 +1623,91 @@ actor AcpTranscriptStore {
     /// the next retry instead of stranding transcript bytes without intent.
     func vacuumTombstones(
         now: Int64? = nil,
-        descriptorPruningVerified: Bool = false
+        descriptorPruningVerified: Set<TombstoneSnapshot> = []
     ) {
         guard let database = try? openDatabase(),
               (try? tableExists("deleted_chats", database: database)) == true else { return }
         try? transaction(database) {
             try expireWriterLeases(now: Self.timestamp(now), database: database)
-            // Launch restoration passes this only after it has read the full
-            // workspace archive and durably pruned every descriptor proven
-            // stale. Releasing and reclaiming in one transaction means a
-            // crash can leave either the protective fence or the completed
-            // cleanup, never an unprotected stale descriptor.
-            if descriptorPruningVerified {
-                try execute(
-                    "UPDATE deleted_chats SET descriptor_reclaim_blocked = 0",
-                    database: database
-                )
+        }
+        // Isolate receipts transactionally. One generation that became stale
+        // must not roll back independent, still-current verified deletions.
+        for snapshot in descriptorPruningVerified {
+            try? transaction(database) {
+                try releaseDescriptorFence(snapshot, database: database)
+                // `transcript_rows` follows through ON DELETE CASCADE. Limit
+                // both physical deletion and tombstone reclamation to the
+                // exact generation whose descriptor was verified; a newer
+                // deletion for the same chat remains blocked and untouched.
+                try deleteChat(forReleased: snapshot, database: database)
+                try reclaimEligibleTombstone(snapshot, database: database)
             }
-            // `transcript_rows` follows through its ON DELETE CASCADE. This is
-            // the idempotent restart path for a crash before remove(chatID:).
-            try execute(
-                """
-                DELETE FROM chats
-                WHERE chat_id IN (SELECT chat_id FROM deleted_chats)
-                """,
-                database: database
-            )
+        }
+        try? transaction(database) {
+            // A prior exact transaction may have left an unblocked tombstone
+            // waiting only for an older writer lease to retire. Global
+            // reclamation is safe because creation/upsert and the v6 migration
+            // make every unverified tombstone blocked by default.
             try reclaimEligibleTombstones(database)
+        }
+    }
+
+    /// Release the last exact-generation cleanup fence only after callers have
+    /// removed every non-SQLite plaintext copy (the workspace draft plus both
+    /// current and migrated UserDefaults keys). Keeping this independent from
+    /// `remove` makes a crash after transcript deletion retryable on launch.
+    @discardableResult
+    func completeExternalCleanup(
+        _ snapshot: TombstoneSnapshot,
+        performExternalCleanup: @Sendable () throws -> Void = {}
+    ) -> Removal {
+        guard Self.validChatID(snapshot.chatID) else {
+            return .failed(.database("invalid transcript chat identifier"))
+        }
+        do {
+            let database = try openDatabase()
+            try transaction(database) {
+                let currentReceipt = try withStatement(
+                    "SELECT 1 FROM deleted_chats WHERE chat_id = ? AND generation = ? LIMIT 1",
+                    database: database
+                ) { statement in
+                    try bind(snapshot.chatID, at: 1, statement: statement, database: database)
+                    try bind(snapshot.generation, at: 2, statement: statement, database: database)
+                    return try stepRow(statement, database: database)
+                }
+                guard currentReceipt else {
+                    throw StoreError.database(
+                        "transcript deletion cleanup receipt is stale or no longer present"
+                    )
+                }
+                // Run synchronous external cleanup while this exact receipt's
+                // SQLite write transaction excludes a retombstone or id reuse.
+                // A delayed g1 caller therefore cannot touch g2 plaintext.
+                try performExternalCleanup()
+                try withStatement(
+                    """
+                    UPDATE deleted_chats
+                    SET external_cleanup_blocked = 0
+                    WHERE chat_id = ? AND generation = ?
+                    """,
+                    database: database
+                ) {
+                    try bind(snapshot.chatID, at: 1, statement: $0, database: database)
+                    try bind(snapshot.generation, at: 2, statement: $0, database: database)
+                    try stepDone($0, database: database)
+                }
+                guard sqlite3_changes(database.pointer) == 1 else {
+                    throw StoreError.database(
+                        "transcript deletion cleanup receipt is stale or no longer present"
+                    )
+                }
+                try expireWriterLeases(now: Self.timestamp(nil), database: database)
+                try reclaimEligibleTombstone(snapshot, database: database)
+                try reclaimEligibleTombstones(database)
+            }
+            return .removed
+        } catch {
+            return .failed(Self.storeError(error))
         }
     }
 
@@ -1301,22 +1742,24 @@ actor AcpTranscriptStore {
             var completedGeneration: Int64 = 0
             try transaction(database) {
                 completedGeneration = try currentDeletionGeneration(database)
-                let writerFenceIsContinuous = try writerLeaseIsLive(now: now, database: database)
+                let acknowledgedGeneration = writes.values.reduce(
+                    writerGeneration ?? completedGeneration
+                ) { min($0, $1.writerGeneration) }
                 try upsertWriterLease(
-                    acknowledgedGeneration: writerGeneration ?? completedGeneration,
+                    acknowledgedGeneration: acknowledgedGeneration,
                     now: now,
                     database: database
                 )
                 for chatID in writes.keys.sorted() {
                     guard let write = writes[chatID] else { continue }
-                    // If this writer's durable lease expired and the global
-                    // deletion generation advanced, the relevant tombstone may
-                    // already have been reclaimed. Drop that stale snapshot
-                    // rather than guessing that the chat survived.
-                    guard write.writerGeneration == completedGeneration
-                            || (write.heldContinuousFence && writerFenceIsContinuous) else {
-                        continue
-                    }
+                    // Exact per-chat watermarks and durable incarnation rows
+                    // are the authority. An unrelated deletion may advance the
+                    // global counter without invalidating this live chat.
+                    guard try writeIsAuthorized(
+                        write,
+                        chatID: chatID,
+                        database: database
+                    ) else { continue }
                     // A buffered write racing a deletion (a final stream chunk
                     // landing as the user hits delete) must not re-materialize
                     // tombstoned content 350ms later (§4e). A probe that cannot
@@ -1412,6 +1855,7 @@ actor AcpTranscriptStore {
             try transaction(database) {
                 try createSchema(database)
                 try migrateLegacyArchiveIfNeeded(database)
+                try migrateChatIncarnationsIfNeeded(database)
             }
             try secureDatabaseFile()
             databaseHandle = database
@@ -1476,9 +1920,12 @@ actor AcpTranscriptStore {
             try setMetadataValue("0", for: "deletion_generation", database: database)
         }
         try migrateRetentionSchemaIfNeeded(database)
+        try ensureDeletedChatsTable(database)
         try migrateDeletedChatsGenerationIfNeeded(database)
         try migrateDeletedChatsDescriptorFenceIfNeeded(database)
-        try execute("PRAGMA user_version = 5", database: database)
+        try migrateDeletedChatsExternalCleanupFenceIfNeeded(database)
+        try ensureDeletionWatermarksTable(database)
+        try execute("PRAGMA user_version = 9", database: database)
     }
 
     private func migrateRetentionSchemaIfNeeded(_ database: SQLiteHandle) throws {
@@ -1535,10 +1982,135 @@ actor AcpTranscriptStore {
                 chat_id TEXT PRIMARY KEY NOT NULL,
                 deleted_at INTEGER NOT NULL,
                 generation INTEGER NOT NULL CHECK (generation >= 0),
-                descriptor_reclaim_blocked INTEGER NOT NULL DEFAULT 0
-                    CHECK (descriptor_reclaim_blocked IN (0, 1))
+                descriptor_reclaim_blocked INTEGER NOT NULL DEFAULT 1
+                    CHECK (descriptor_reclaim_blocked IN (0, 1)),
+                external_cleanup_blocked INTEGER NOT NULL DEFAULT 1
+                    CHECK (external_cleanup_blocked IN (0, 1))
             ) WITHOUT ROWID
             """,
+            database: database
+        )
+        // A database created before its first deletion has no migration marker
+        // yet. Establish it before the first INSERT so a later reopen never
+        // mistakes an intentionally released row for an installed-v5 row.
+        try migrateDeletedChatsDescriptorFenceIfNeeded(database)
+        try migrateDeletedChatsExternalCleanupFenceIfNeeded(database)
+        try ensureDeletionWatermarksTable(database)
+    }
+
+    private func ensureDeletionWatermarksTable(_ database: SQLiteHandle) throws {
+        try execute(
+            """
+            CREATE TABLE IF NOT EXISTS deletion_watermarks (
+                chat_id TEXT PRIMARY KEY NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 0),
+                deleted_at INTEGER NOT NULL
+            ) WITHOUT ROWID
+            """,
+            database: database
+        )
+        try execute(
+            "CREATE INDEX IF NOT EXISTS deletion_watermarks_by_age ON deletion_watermarks(deleted_at ASC, generation ASC)",
+            database: database
+        )
+        try execute(
+            """
+            CREATE TABLE IF NOT EXISTS chat_incarnations (
+                chat_id TEXT PRIMARY KEY NOT NULL,
+                generation INTEGER NOT NULL CHECK (generation >= 0),
+                created_at INTEGER NOT NULL
+            ) WITHOUT ROWID
+            """,
+            database: database
+        )
+        if try tableExists("deleted_chats", database: database),
+           try deletedChatsHaveGenerationColumn(database) {
+            try execute(
+                """
+                INSERT INTO deletion_watermarks(chat_id, generation, deleted_at)
+                SELECT chat_id, generation, deleted_at FROM deleted_chats
+                WHERE 1
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    generation = MAX(deletion_watermarks.generation, excluded.generation),
+                    deleted_at = MAX(deletion_watermarks.deleted_at, excluded.deleted_at)
+                """,
+                database: database
+            )
+        }
+        if try metadataValue(
+            for: "deletion_watermarks_require_explicit_creation",
+            database: database
+        ) == nil {
+            try setMetadataValue(
+                "0",
+                for: "deletion_watermarks_require_explicit_creation",
+                database: database
+            )
+        }
+    }
+
+    /// Install durable live-incarnation evidence exactly once. Repeating this
+    /// backfill after watermark compaction would let a stale writer-created
+    /// `chats` row become authority, so the completion marker is part of the
+    /// anti-resurrection contract rather than just a migration optimization.
+    private func migrateChatIncarnationsIfNeeded(_ database: SQLiteHandle) throws {
+        guard try metadataValue(
+            for: "chat_incarnation_backfill_complete",
+            database: database
+        ) != "1" else { return }
+
+        if try tableExists("chat_creation_authorizations", database: database) {
+            try execute(
+                """
+                INSERT INTO chat_incarnations(chat_id, generation, created_at)
+                SELECT authorization.chat_id,
+                       authorization.generation,
+                       authorization.authorized_at
+                FROM chat_creation_authorizations AS authorization
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM deleted_chats
+                    WHERE deleted_chats.chat_id = authorization.chat_id
+                )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM deletion_watermarks AS watermark
+                    WHERE watermark.chat_id = authorization.chat_id
+                      AND watermark.generation >= authorization.generation
+                )
+                ON CONFLICT(chat_id) DO UPDATE SET
+                    generation = MAX(chat_incarnations.generation, excluded.generation)
+                """,
+                database: database
+            )
+            try execute("DROP TABLE chat_creation_authorizations", database: database)
+        }
+
+        let generation = try currentDeletionGeneration(database)
+        try withStatement(
+            """
+            INSERT INTO chat_incarnations(chat_id, generation, created_at)
+            SELECT chats.chat_id, ?, chats.updated_at
+            FROM chats
+            WHERE NOT EXISTS (
+                SELECT 1 FROM deleted_chats
+                WHERE deleted_chats.chat_id = chats.chat_id
+            )
+              AND NOT EXISTS (
+                SELECT 1 FROM deletion_watermarks
+                WHERE deletion_watermarks.chat_id = chats.chat_id
+            )
+            ON CONFLICT(chat_id) DO NOTHING
+            """,
+            database: database
+        ) { statement in
+            try bind(generation, at: 1, statement: statement, database: database)
+            try stepDone(statement, database: database)
+        }
+        guard try chatIncarnationCount(database) <= Self.maximumChatIncarnations else {
+            throw StoreError.database("installed transcript chat incarnations exceed the safe bound")
+        }
+        try setMetadataValue(
+            "1",
+            for: "chat_incarnation_backfill_complete",
             database: database
         )
     }
@@ -1576,18 +2148,61 @@ actor AcpTranscriptStore {
     }
 
     private func migrateDeletedChatsDescriptorFenceIfNeeded(_ database: SQLiteHandle) throws {
-        guard try tableExists("deleted_chats", database: database),
-              try !tableHasColumn(
-                  "deleted_chats",
-                  column: "descriptor_reclaim_blocked",
-                  database: database
-              ) else { return }
+        guard try tableExists("deleted_chats", database: database) else { return }
+        if try !tableHasColumn(
+            "deleted_chats",
+            column: "descriptor_reclaim_blocked",
+            database: database
+        ) {
+            try execute(
+                """
+                ALTER TABLE deleted_chats
+                ADD COLUMN descriptor_reclaim_blocked INTEGER NOT NULL DEFAULT 1
+                    CHECK (descriptor_reclaim_blocked IN (0, 1))
+                """,
+                database: database
+            )
+        }
+        guard try metadataValue(
+            for: "descriptor_fences_blocked",
+            database: database
+        ) != "1" else { return }
         try execute(
-            """
-            ALTER TABLE deleted_chats
-            ADD COLUMN descriptor_reclaim_blocked INTEGER NOT NULL DEFAULT 0
-                CHECK (descriptor_reclaim_blocked IN (0, 1))
-            """,
+            "UPDATE deleted_chats SET descriptor_reclaim_blocked = 1",
+            database: database
+        )
+        try setMetadataValue("1", for: "descriptor_fences_blocked", database: database)
+    }
+
+    private func migrateDeletedChatsExternalCleanupFenceIfNeeded(
+        _ database: SQLiteHandle
+    ) throws {
+        guard try tableExists("deleted_chats", database: database) else { return }
+        if try !tableHasColumn(
+            "deleted_chats",
+            column: "external_cleanup_blocked",
+            database: database
+        ) {
+            try execute(
+                """
+                ALTER TABLE deleted_chats
+                ADD COLUMN external_cleanup_blocked INTEGER NOT NULL DEFAULT 1
+                    CHECK (external_cleanup_blocked IN (0, 1))
+                """,
+                database: database
+            )
+        }
+        guard try metadataValue(
+            for: "external_cleanup_fences_blocked",
+            database: database
+        ) != "1" else { return }
+        try execute(
+            "UPDATE deleted_chats SET external_cleanup_blocked = 1",
+            database: database
+        )
+        try setMetadataValue(
+            "1",
+            for: "external_cleanup_fences_blocked",
             database: database
         )
     }
@@ -2362,6 +2977,87 @@ actor AcpTranscriptStore {
         return next
     }
 
+    private func deletionWatermarkGeneration(
+        chatID: String,
+        database: SQLiteHandle
+    ) throws -> Int64? {
+        guard try tableExists("deletion_watermarks", database: database) else { return nil }
+        return try withStatement(
+            "SELECT generation FROM deletion_watermarks WHERE chat_id = ? LIMIT 1",
+            database: database
+        ) { statement in
+            try bind(chatID, at: 1, statement: statement, database: database)
+            guard try stepRow(statement, database: database) else { return nil }
+            return sqlite3_column_int64(statement, 0)
+        }
+    }
+
+    private func chatIncarnationGeneration(
+        chatID: String,
+        database: SQLiteHandle
+    ) throws -> Int64? {
+        guard try tableExists("chat_incarnations", database: database) else {
+            return nil
+        }
+        return try withStatement(
+            "SELECT generation FROM chat_incarnations WHERE chat_id = ? LIMIT 1",
+            database: database
+        ) { statement in
+            try bind(chatID, at: 1, statement: statement, database: database)
+            guard try stepRow(statement, database: database) else { return nil }
+            return sqlite3_column_int64(statement, 0)
+        }
+    }
+
+    private func chatIncarnationCount(_ database: SQLiteHandle) throws -> Int {
+        try withStatement(
+            "SELECT COUNT(*) FROM chat_incarnations",
+            database: database
+        ) { statement in
+            guard try stepRow(statement, database: database) else { return 0 }
+            return Int(sqlite3_column_int64(statement, 0))
+        }
+    }
+
+    private func requiresExplicitChatCreation(_ database: SQLiteHandle) throws -> Bool {
+        try metadataValue(
+            for: "deletion_watermarks_require_explicit_creation",
+            database: database
+        ) == "1"
+    }
+
+    private func chatExists(chatID: String, database: SQLiteHandle) throws -> Bool {
+        try withStatement(
+            "SELECT 1 FROM chats WHERE chat_id = ? LIMIT 1",
+            database: database
+        ) { statement in
+            try bind(chatID, at: 1, statement: statement, database: database)
+            return try stepRow(statement, database: database)
+        }
+    }
+
+    private func writeIsAuthorized(
+        _ write: PendingWrite,
+        chatID: String,
+        database: SQLiteHandle
+    ) throws -> Bool {
+        let watermark = try deletionWatermarkGeneration(
+            chatID: chatID,
+            database: database
+        )
+        if let capturedIncarnation = write.incarnationGeneration {
+            guard try chatIncarnationGeneration(
+                chatID: chatID,
+                database: database
+            ) == capturedIncarnation else { return false }
+            return watermark.map({ capturedIncarnation > $0 }) ?? true
+        }
+        guard watermark.map({ write.writerGeneration > $0 }) ?? true else {
+            return false
+        }
+        return try !requiresExplicitChatCreation(database)
+    }
+
     private func writerLeaseIsLive(now: Int64, database: SQLiteHandle) throws -> Bool {
         try withStatement(
             "SELECT lease_expires_at FROM transcript_writers WHERE writer_id = ?",
@@ -2425,6 +3121,7 @@ actor AcpTranscriptStore {
             DELETE FROM deleted_chats
             WHERE chat_id NOT IN (SELECT chat_id FROM chats)
               AND descriptor_reclaim_blocked = 0
+              AND external_cleanup_blocked = 0
               AND NOT EXISTS (
                   SELECT 1 FROM transcript_writers
                   WHERE acknowledged_generation < deleted_chats.generation
@@ -2432,6 +3129,144 @@ actor AcpTranscriptStore {
             """,
             database: database
         )
+        try pruneDeletionWatermarks(database)
+    }
+
+    private func deleteChat(
+        forReleased snapshot: TombstoneSnapshot,
+        database: SQLiteHandle
+    ) throws {
+        try withStatement(
+            """
+            DELETE FROM chats
+            WHERE chat_id = ?
+              AND EXISTS (
+                  SELECT 1 FROM deleted_chats
+                  WHERE chat_id = ?
+                    AND generation = ?
+                    AND descriptor_reclaim_blocked = 0
+              )
+            """,
+            database: database
+        ) {
+            try bind(snapshot.chatID, at: 1, statement: $0, database: database)
+            try bind(snapshot.chatID, at: 2, statement: $0, database: database)
+            try bind(snapshot.generation, at: 3, statement: $0, database: database)
+            try stepDone($0, database: database)
+        }
+        try pruneDeletionWatermarks(database)
+    }
+
+    private func pruneDeletionWatermarks(_ database: SQLiteHandle) throws {
+        guard try tableExists("deletion_watermarks", database: database) else { return }
+        let count = try withStatement(
+            "SELECT COUNT(*) FROM deletion_watermarks",
+            database: database
+        ) { statement -> Int in
+            guard try stepRow(statement, database: database) else { return 0 }
+            return Int(sqlite3_column_int64(statement, 0))
+        }
+        let excess = count - Self.maximumDeletionWatermarks
+        guard excess > 0 else { return }
+
+        var candidates: [String] = []
+        try withStatement(
+            """
+            SELECT watermark.chat_id
+            FROM deletion_watermarks AS watermark
+            WHERE (
+                watermark.chat_id NOT IN (SELECT chat_id FROM chats)
+                OR EXISTS (
+                    SELECT 1 FROM chat_incarnations AS incarnation
+                    WHERE incarnation.chat_id = watermark.chat_id
+                      AND incarnation.generation > watermark.generation
+                )
+            )
+              AND NOT EXISTS (
+                  SELECT 1 FROM transcript_writers
+                  WHERE acknowledged_generation <= watermark.generation
+              )
+            ORDER BY watermark.deleted_at ASC, watermark.generation ASC, watermark.chat_id ASC
+            LIMIT ?
+            """,
+            database: database
+        ) { statement in
+            try bind(Int64(excess), at: 1, statement: statement, database: database)
+            while try stepRow(statement, database: database) {
+                guard let chatID = Self.columnString(statement, column: 0) else {
+                    throw StoreError.corruptRecord(
+                        "stored transcript deletion watermark identifier could not be read"
+                    )
+                }
+                candidates.append(chatID)
+            }
+        }
+        guard !candidates.isEmpty else { return }
+        // Once any exact id is compacted, a missing unknown chat is never an
+        // implicit creation authorization. Product creation explicitly opts in
+        // through `beginNewChatID`, including deliberate future id reuse.
+        try setMetadataValue(
+            "1",
+            for: "deletion_watermarks_require_explicit_creation",
+            database: database
+        )
+        for chatID in candidates {
+            try withStatement(
+                "DELETE FROM deletion_watermarks WHERE chat_id = ?",
+                database: database
+            ) { statement in
+                try bind(chatID, at: 1, statement: statement, database: database)
+                try stepDone(statement, database: database)
+            }
+        }
+    }
+
+    private func reclaimEligibleTombstone(
+        _ snapshot: TombstoneSnapshot,
+        database: SQLiteHandle
+    ) throws {
+        try withStatement(
+            """
+            DELETE FROM deleted_chats
+            WHERE chat_id = ?
+              AND generation = ?
+              AND descriptor_reclaim_blocked = 0
+              AND external_cleanup_blocked = 0
+              AND chat_id NOT IN (SELECT chat_id FROM chats)
+              AND NOT EXISTS (
+                  SELECT 1 FROM transcript_writers
+                  WHERE acknowledged_generation < deleted_chats.generation
+              )
+            """,
+            database: database
+        ) {
+            try bind(snapshot.chatID, at: 1, statement: $0, database: database)
+            try bind(snapshot.generation, at: 2, statement: $0, database: database)
+            try stepDone($0, database: database)
+        }
+    }
+
+    private func releaseDescriptorFence(
+        _ snapshot: TombstoneSnapshot,
+        database: SQLiteHandle
+    ) throws {
+        try withStatement(
+            """
+            UPDATE deleted_chats
+            SET descriptor_reclaim_blocked = 0
+            WHERE chat_id = ? AND generation = ?
+            """,
+            database: database
+        ) {
+            try bind(snapshot.chatID, at: 1, statement: $0, database: database)
+            try bind(snapshot.generation, at: 2, statement: $0, database: database)
+            try stepDone($0, database: database)
+        }
+        guard sqlite3_changes(database.pointer) == 1 else {
+            throw StoreError.database(
+                "transcript deletion receipt is stale or no longer present"
+            )
+        }
     }
 
     private func consumeRemovalFailure(_ point: RemovalFailurePoint) throws {

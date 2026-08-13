@@ -838,6 +838,96 @@ final class AppModelProjectContextTests: XCTestCase {
         XCTAssertFalse(afterTeardown?.panes.contains { $0.id == chat.id } == true)
     }
 
+    /// The transcript row and the workspace descriptor are two independent
+    /// durable records. If the descriptor write fails after deletion intent is
+    /// tombstoned, physically erasing the transcript must not also erase that
+    /// fence: the stale descriptor would otherwise look undeleted and reopen on
+    /// the next launch.
+    @MainActor
+    func testDescriptorWriteFailureKeepsTombstoneUntilRelaunchPrunesStaleChat() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        let projectDirectory = root.appendingPathComponent(
+            "descriptor-delete-failure-project",
+            isDirectory: true
+        )
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        let workspaceURL = root.appendingPathComponent("workspace-state-v1.json")
+        let parkedWorkspaceURL = root.appendingPathComponent("workspace-state-before-delete.json")
+        let workspaceStore = NativeWorkspaceStateStore(fileURL: workspaceURL)
+        let transcriptURL = root.appendingPathComponent("transcripts.json")
+        let transcriptStore = AcpTranscriptStore(fileURL: transcriptURL)
+        let sessionStore = NativeSessionStore(fileURL: storeFile)
+        let model = AppModel(
+            sessionStore: sessionStore,
+            workspaceStateStore: workspaceStore,
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore)
+        )
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        model.openChat(agent, inDirectory: projectDirectory)
+        let chat = try XCTUnwrap(model.chats.first)
+        let snapshot = try XCTUnwrap(model.workspaceSnapshotForTesting(projectID: chat.projectID))
+        try await workspaceStore.saveProjectState(snapshot)
+        await transcriptStore.scheduleSave(
+            [.message(id: "row-1", text: "must remain deleted")],
+            for: chat.id,
+            now: 1
+        )
+        await transcriptStore.flush()
+
+        // Keep the exact stale archive bytes but make the canonical path a
+        // symlink. The store rejects that unsafe target before replacing it,
+        // deterministically reproducing descriptor persistence failure without
+        // mocking any of the write or validation behavior.
+        try FileManager.default.moveItem(at: workspaceURL, to: parkedWorkspaceURL)
+        try FileManager.default.createSymbolicLink(
+            at: workspaceURL,
+            withDestinationURL: parkedWorkspaceURL
+        )
+
+        let deletion = await model.deleteChat(chat.id)
+        guard case .failed = deletion else {
+            return XCTFail("descriptor persistence failure reported \(deletion)")
+        }
+        XCTAssertTrue(model.chats.isEmpty)
+        let removedEntry = await transcriptStore.entry(for: chat.id)
+        let retainedTombstone = await transcriptStore.tombstoneState(chatID: chat.id)
+        XCTAssertNil(removedEntry)
+        XCTAssertEqual(
+            retainedTombstone,
+            .present,
+            "a stale workspace descriptor still exists, so its deletion fence is not reclaimable"
+        )
+
+        // Simulate the next launch after the workspace volume becomes writable
+        // again. Recovery must use the retained fence to prune the stale
+        // descriptor, then and only then reclaim the tombstone.
+        try FileManager.default.removeItem(at: workspaceURL)
+        try FileManager.default.moveItem(at: parkedWorkspaceURL, to: workspaceURL)
+        let reopenedSessionStore = NativeSessionStore(fileURL: storeFile)
+        _ = reopenedSessionStore.openProject(directory: projectDirectory.path)
+        let reopenedTranscriptStore = AcpTranscriptStore(fileURL: transcriptURL)
+        let reopenedWorkspaceStore = NativeWorkspaceStateStore(fileURL: workspaceURL)
+        let reopened = AppModel(
+            sessionStore: reopenedSessionStore,
+            workspaceStateStore: reopenedWorkspaceStore,
+            transcriptStore: reopenedTranscriptStore,
+            usageCenter: UsageCenter(persistenceStore: reopenedTranscriptStore)
+        )
+        await reopened.restoreWorkspaceStateIfNeeded()
+
+        XCTAssertFalse(reopened.chats.contains { $0.id == chat.id })
+        await reopenedWorkspaceStore.invalidateCache()
+        let recoveredState = try await reopenedWorkspaceStore.projectState(for: chat.projectID)
+        XCTAssertFalse(recoveredState?.panes.contains { $0.id == chat.id } == true)
+        let reclaimedTombstone = await reopenedTranscriptStore.tombstoneState(chatID: chat.id)
+        XCTAssertEqual(reclaimedTombstone, .absent)
+        await reopened.teardown()
+    }
+
     @MainActor
     func testRelaunchPrunesTombstonedDescriptorBeforeReclaimingTranscript() async throws {
         let root = storeFile.deletingLastPathComponent()

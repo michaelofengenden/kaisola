@@ -668,6 +668,60 @@ final class AcpTranscriptStoreTests: XCTestCase {
         XCTAssertNil(restored)
     }
 
+    func testRetainedTombstoneSurvivesOtherWriterReclamationUntilDescriptorPruningIsVerified() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "kaisola-transcript-descriptor-fence-\(UUID().uuidString)",
+                isDirectory: true
+            )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let databaseURL = directory.appendingPathComponent("transcripts.sqlite3")
+        let deletingWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "deleting-window",
+            schedulesAutomaticFlush: false
+        )
+        let otherWindow = AcpTranscriptStore(
+            databaseURL: databaseURL,
+            writerID: "other-window",
+            schedulesAutomaticFlush: false
+        )
+        let deletedChatID = "descriptor-prune-failed"
+
+        await deletingWindow.scheduleSave(
+            [.message(id: "1", text: "must remain deleted")],
+            for: deletedChatID,
+            now: 1
+        )
+        await deletingWindow.flush()
+        let tombstone = await deletingWindow.tombstone(chatID: deletedChatID)
+        let removal = await deletingWindow.remove(
+            chatID: deletedChatID,
+            retainTombstone: true
+        )
+        XCTAssertEqual(tombstone, .recorded)
+        XCTAssertEqual(removal, .removed)
+
+        // A different window's ordinary write and vacuum both run the global
+        // reclamation query. Neither is allowed to erase a fence whose stale
+        // workspace descriptor has not yet been pruned.
+        await otherWindow.scheduleSave(
+            [.message(id: "1", text: "unrelated")],
+            for: "unrelated-chat",
+            now: 2
+        )
+        await otherWindow.flush()
+        await otherWindow.vacuumTombstones()
+        let retained = await otherWindow.tombstoneState(chatID: deletedChatID)
+        XCTAssertEqual(retained, .present)
+
+        await otherWindow.vacuumTombstones(descriptorPruningVerified: true)
+        let reclaimed = await otherWindow.tombstoneState(chatID: deletedChatID)
+        XCTAssertEqual(reclaimed, .absent)
+        let restored = await otherWindow.entry(for: deletedChatID)
+        XCTAssertNil(restored)
+    }
+
     func testTombstoneVacuumWaitsForBufferedWriterAcknowledgement() async throws {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-transcript-writer-fence-\(UUID().uuidString)", isDirectory: true)

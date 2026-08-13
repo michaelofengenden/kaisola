@@ -422,6 +422,7 @@ actor BrokerStartupCoordinator:
 
     func prepare() async throws -> BrokerInfo {
         let package = try await launcher.packageManifest()
+        var staleRegisteredTopology: BrokerGenerationTopology?
         do {
             let topology = try locator.locateTopology()
             let info = topology.current.info
@@ -431,14 +432,25 @@ actor BrokerStartupCoordinator:
             guard !info.isProcessAlive else {
                 return try await reconcileLiveBroker(topology, package: package)
             }
+            staleRegisteredTopology = try registeredTopologySnapshot(matching: topology)
             try removeStaleRendezvous(topology.current)
         } catch let error as BrokerDiscoveryError {
             switch error {
             case .notRunning:
-                break
+                // A registry whose current identity file disappeared resolves
+                // as `notRunning`, but the registry (and every draining
+                // generation in it) is still authoritative state. Capture that
+                // exact CAS revision before launching so fresh publication can
+                // preserve it instead of treating the profile as empty.
+                staleRegisteredTopology = try registeredTopologySnapshotIfPresent()
+                if let staleRegisteredTopology,
+                   staleRegisteredTopology.current.info.isProcessAlive {
+                    throw BrokerStartupError.liveBrokerRefused
+                }
             case .privateEndpointUnavailable:
                 let topology = try locator.locateTopology(validateSockets: false)
                 guard !topology.current.info.isProcessAlive else { throw error }
+                staleRegisteredTopology = try registeredTopologySnapshot(matching: topology)
                 try removeStaleRendezvous(topology.current)
             default:
                 // A live or ambiguous incompatible broker is never replaced.
@@ -446,7 +458,10 @@ actor BrokerStartupCoordinator:
             }
         }
 
-        let launched = try await launchPackagedBroker(package)
+        let launched = try await launchPackagedBroker(
+            package,
+            replacing: staleRegisteredTopology
+        )
         currentTopology = try locator.locateTopology()
         return launched
     }
@@ -1077,9 +1092,16 @@ actor BrokerStartupCoordinator:
         throw BrokerStartupError.timedOut(nil)
     }
 
-    private func launchPackagedBroker(_ package: BrokerHelperManifest) async throws -> BrokerInfo {
+    private func launchPackagedBroker(
+        _ package: BrokerHelperManifest,
+        replacing staleTopology: BrokerGenerationTopology?
+    ) async throws -> BrokerInfo {
         let generation = try await launchGeneration(package)
-        return try publishFreshGeneration(generation, package: package)
+        return try publishFreshGeneration(
+            generation,
+            package: package,
+            replacing: staleTopology
+        )
     }
 
     /// Starts or adopts one exact staged generation without changing which
@@ -1276,7 +1298,8 @@ actor BrokerStartupCoordinator:
 
     private func publishFreshGeneration(
         _ info: BrokerInfo,
-        package: BrokerHelperManifest
+        package: BrokerHelperManifest,
+        replacing staleTopology: BrokerGenerationTopology?
     ) throws -> BrokerInfo {
         guard info.contentDigest == package.contentDigest,
               info.packageVersion == package.packageVersion,
@@ -1294,27 +1317,40 @@ actor BrokerStartupCoordinator:
                 .appendingPathComponent("broker-generations", isDirectory: true)
                 .appendingPathComponent(package.contentDigest, isDirectory: true)
                 .path,
-            registeredAt: max(1, info.startedAt)
+            registeredAt: staleTopology?.draining.first(where: {
+                $0.id == package.contentDigest
+            })?.registeredAt ?? max(1, info.startedAt)
         )
         let store = BrokerGenerationRegistryStore(profileRoot: userData)
         do {
-            _ = try store.save(
-                currentGenerationID: record.id,
-                generations: [record],
-                expectedRevision: nil
-            )
-        } catch BrokerGenerationRegistryError.revisionChanged {
-            let existing = try store.load()
-            if existing.topology?.current == record {
-                // A second app window published the same launched generation.
-            } else if let topology = existing.topology,
-                      topology.draining.isEmpty,
-                      !topology.current.info.isProcessAlive {
+            if let staleTopology {
+                // A topology captured before launch is never an empty-profile
+                // publication. Bind replacement directly to that exact CAS
+                // revision so disappearance of the registry cannot turn a
+                // stale launch into a drain-dropping nil-revision write.
+                guard !staleTopology.current.info.isProcessAlive else {
+                    throw BrokerStartupError.liveBrokerRefused
+                }
+                let retained = staleTopology.draining.filter { $0.id != record.id }
+                _ = try store.save(
+                    currentGenerationID: record.id,
+                    generations: [record] + retained,
+                    expectedRevision: staleTopology.registryTopologyVersion,
+                    selection: nil
+                )
+            } else {
                 _ = try store.save(
                     currentGenerationID: record.id,
                     generations: [record],
-                    expectedRevision: existing.revision
+                    expectedRevision: nil
                 )
+            }
+        } catch BrokerGenerationRegistryError.revisionChanged {
+            guard let existing = try? store.load() else {
+                throw BrokerStartupError.rendezvousChanged
+            }
+            if existing.topology?.current == record {
+                // A second app window published the same launched generation.
             } else {
                 throw BrokerStartupError.rendezvousChanged
             }
@@ -1324,6 +1360,45 @@ actor BrokerStartupCoordinator:
         pendingUpgrade = nil
         currentUpgradeState = .current(contentDigest: package.contentDigest)
         return adopted
+    }
+
+    /// Load the complete registry topology behind a located current. Discovery
+    /// intentionally drops drains whose independent metadata is absent; startup
+    /// publication must not turn that routing choice into registry data loss.
+    private func registeredTopologySnapshot(
+        matching located: BrokerGenerationTopology
+    ) throws -> BrokerGenerationTopology? {
+        guard located.current.packageRoot != nil else { return nil }
+        let store = BrokerGenerationRegistryStore(
+            profileRoot: locator.preferredUserDataRoot.standardizedFileURL
+        )
+        let registry = try store.load()
+        guard registry.revision == located.registryTopologyVersion,
+              registry.topology?.current == located.current,
+              let topology = registry.topology else {
+            throw BrokerStartupError.rendezvousChanged
+        }
+        return topology
+    }
+
+    /// `locateTopology` reports `notRunning` when registry-backed current
+    /// metadata is absent. Distinguish that recoverable stale snapshot from a
+    /// genuinely empty profile without weakening registry validation.
+    private func registeredTopologySnapshotIfPresent() throws -> BrokerGenerationTopology? {
+        let store = BrokerGenerationRegistryStore(
+            profileRoot: locator.preferredUserDataRoot.standardizedFileURL
+        )
+        var metadata = stat()
+        guard lstat(store.registryURL.path, &metadata) == 0 else {
+            if errno == ENOENT { return nil }
+            throw BrokerStartupError.unsafeStaleRendezvous
+        }
+        let registry = try store.load()
+        guard let topology = registry.topology,
+              topology.registryTopologyVersion == registry.revision else {
+            throw BrokerStartupError.rendezvousChanged
+        }
+        return topology
     }
 
     private func publishCutover(

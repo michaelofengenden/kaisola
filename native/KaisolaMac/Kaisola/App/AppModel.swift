@@ -2523,7 +2523,10 @@ final class AppModel: ObservableObject {
     /// standing in front of a permanent-delete confirmation can wait for it
     /// rather than announce a deletion the store never finished.
     @discardableResult
-    func enqueueTranscriptRemoval(chatID: String) -> Task<AcpTranscriptStore.Removal, Never> {
+    func enqueueTranscriptRemoval(
+        chatID: String,
+        retainTombstone: Bool = false
+    ) -> Task<AcpTranscriptStore.Removal, Never> {
         explicitlyClosedChatIDs.insert(chatID)
         let previous = transcriptPersistenceTask
         let transcriptStore = transcriptStore
@@ -2534,7 +2537,10 @@ final class AppModel: ObservableObject {
             // normal streaming. On explicit close, drain usage first and make
             // the full transcript deletion the final actor operation.
             await usageCenter.flushPersistence()
-            return await transcriptStore.remove(chatID: chatID)
+            return await transcriptStore.remove(
+                chatID: chatID,
+                retainTombstone: retainTombstone
+            )
         }
         transcriptPersistenceTask = Task { _ = await removal.value }
         return removal
@@ -2939,7 +2945,10 @@ final class AppModel: ObservableObject {
         // tombstone still proves deletion intent; reclaiming tombstones first
         // would turn that stale descriptor back into an apparently live chat.
         var canVacuumTranscriptTombstones = true
-        for projectState in restorableProjects {
+        // Deletion also applies to projects that are currently closed. Their
+        // archived panes are not restored today, but leaving a stale
+        // descriptor there would revive it when the project is reopened.
+        for projectState in restoration.projects {
             for pane in projectState.panes {
                 guard !pane.isRecentlyClosed,
                       let descriptor = pane.surface.agentChatDescriptor,
@@ -2948,7 +2957,7 @@ final class AppModel: ObservableObject {
                 case .present:
                     do {
                         _ = try await workspaceStateStore.removeAgentChatState(
-                            projectID: descriptor.projectID,
+                            projectID: projectState.projectID,
                             chatID: descriptor.id
                         )
                     } catch {
@@ -3114,7 +3123,7 @@ final class AppModel: ObservableObject {
             // Descriptors are now either known absent or durably pruned, so
             // interrupted transcript deletion can safely finish and reclaim
             // its one-shot tombstone.
-            await transcriptStore.vacuumTombstones()
+            await transcriptStore.vacuumTombstones(descriptorPruningVerified: true)
         }
 
         if let projectID = restoration.selectedProjectID,
@@ -3718,7 +3727,14 @@ final class AppModel: ObservableObject {
         // goes — the old forgetDurableChat gate could leave tombstoned
         // content on disk forever when usage bookkeeping said "shared".
         _ = forgetDurableChat
-        let removalResult = await enqueueTranscriptRemoval(chatID: chatID).value
+        // If catalog pruning failed, transcript erasure must retain its
+        // tombstone atomically. Otherwise remove() could erase the chat row
+        // and reclaim the only fence that keeps this stale descriptor from
+        // restoring on the next launch.
+        let removalResult = await enqueueTranscriptRemoval(
+            chatID: chatID,
+            retainTombstone: descriptorRemovalFailure != nil
+        ).value
         await removeChatDraftsAfterDeletionCommit(chatID: chatID)
         // The workspace archive must reflect the deletion durably NOW, not
         // after a 220 ms debounce a crash can beat (§4e).

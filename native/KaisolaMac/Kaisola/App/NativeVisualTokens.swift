@@ -52,29 +52,36 @@ enum KaisolaVisualSystem {
 /// own material the two large surfaces therefore landed at only 0.846 and
 /// 0.832 luminance. That is grey by construction.
 ///
-/// Whiteness is bought here by lifting the *underlay* rather than thickening
-/// `GlassBackdropWash`. The wash keeps exactly the transmission previous work
-/// measured, so wallpaper colour and motion still reach the eye. Live glass
-/// uses the same idea by re-valuing its sampled hue onto a bright carrier, and
-/// the detail panel gets one small white frost over its semantic material so it
-/// cannot turn the otherwise-matched canvas grey again.
+/// Whiteness is bought with one explicit, achromatic carrier between the
+/// desktop and `GlassBackdropWash`. The previous light recipe preserved the
+/// sampled desktop's RGB ratios, so a blue wallpaper was guaranteed to make a
+/// blue pane even though every declared veil constant was white. The carrier
+/// keeps blurred light and movement while making colour a property of the
+/// explicit Tinted theme, not of light Glass.
 enum LightGlassFrost {
     /// Neutral luminance of a painted wallpaper before the white veil.
     static let backdropLuminance: Double = 0.80
 
-    /// Value of the sampled desktop hue laid over live AppKit vibrancy. Hue is
-    /// preserved; only the grey-making low value of the raw average is lifted.
-    static let liveTintPeak: Double = 0.94
+    /// White laid over the live or painted desktop before the surface veil.
+    /// With the existing rail/canvas veils this leaves roughly 16-18% of the
+    /// underlying luminance variation visible and lands both surfaces near
+    /// sRGB 247 rather than grey. It is deliberately achromatic.
+    static let carrierWhiteCoverage: Double = 0.70
 
-    /// White over the inset panel's ultra-thin material. Kept below a quarter
-    /// so the panel still moves with the shared glass beneath it.
-    static let panelWhiteCoverage: Double = 0.18
+    /// White over the already-frosted workspace canvas. Light deliberately
+    /// gets no second semantic material: that layer re-greyed the canvas and
+    /// attenuated the desktop twice. Forty percent keeps the inset plane bright
+    /// while still passing sixty percent of the neutral glass below it.
+    static let panelWhiteCoverage: Double = 0.40
+    static var panelDesktopTransmission: Double { 1 - panelWhiteCoverage }
 
     /// The deterministic painted-source composite used by the visual tests.
     /// Live vibrancy has no stable pixels to measure offline, but it consumes
-    /// the same wash and the bright tint carrier above.
+    /// the same achromatic carrier and wash.
     static func modeledBackdropLuminance(_ wash: GlassBackdropWash) -> Double {
-        wash.baseOpacity + wash.desktopTransmission * backdropLuminance
+        let carried = carrierWhiteCoverage
+            + (1 - carrierWhiteCoverage) * backdropLuminance
+        return wash.baseOpacity + wash.desktopTransmission * carried
     }
 }
 
@@ -766,13 +773,11 @@ private struct KaisolaChromePanelModifier: ViewModifier {
                         shape.fill(Color.black.opacity(Self.darkPanelCoverage))
                     }
                 } else {
-                    // The semantic material provides blur and isolation; the
-                    // shared white frost prevents it from turning the raised
-                    // sidebar/canvas underlay back into a neutral-grey card.
-                    ZStack {
-                        shape.fill(.ultraThinMaterial)
-                        shape.fill(Color.white.opacity(LightGlassFrost.panelWhiteCoverage))
-                    }
+                    // The global workspace layer already owns the blur. A
+                    // second material here turned the otherwise-white canvas
+                    // grey and nearly erased its remaining depth, so the panel
+                    // is only an achromatic frost over that shared glass.
+                    shape.fill(Color.white.opacity(LightGlassFrost.panelWhiteCoverage))
                 }
             }
         }

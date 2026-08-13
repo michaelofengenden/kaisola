@@ -165,6 +165,14 @@ enum KaisolaInk {
 }
 
 extension ShapeStyle where Self == Color {
+    /// Primary label ink. The top rung, and the one the footer's icon-only
+    /// controls take: the gear, the bell and the overflow sit level with a
+    /// column of session names, and in secondary grey at 12pt they were the
+    /// quietest things in the window while being three of the few that are
+    /// actually clickable. Icon-only controls are held to 3:1 as a floor, not
+    /// as a target.
+    static var kaisolaPrimary: Color { KaisolaInk.color(.primary) }
+
     /// Secondary label ink. The glass value, because one view tree spans both
     /// kinds of surface and glass is the safe superset: α 0.60 on an opaque
     /// white surface is 5.7:1, still unmistakably junior to primary's 15:1.

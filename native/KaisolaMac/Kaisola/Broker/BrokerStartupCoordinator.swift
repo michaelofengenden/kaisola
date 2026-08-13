@@ -70,6 +70,43 @@ enum BrokerUpgradeState: Equatable, Sendable {
         }
     }
 
+    /// The same state in one short sentence, with no content digests in it.
+    ///
+    /// `detail` is diagnostic text: every case names the digests it moved
+    /// between, which is exactly what you want when reading a bug report and
+    /// exactly what you do not want in the account menu, where two 64-character
+    /// hashes stretched the menu across the whole window and buried the one
+    /// clause that meant anything. Nil where there is genuinely nothing to say,
+    /// so the menu shows a line only when a line is warranted.
+    var summary: String? {
+        switch self {
+        case .unknown:
+            nil
+        case .current:
+            nil
+        case .checking:
+            "Checking for a terminal update"
+        case let .pending(_, _, .liveWork(blockers)):
+            "Terminal update waiting on \(blockers.liveTerminalCount) live terminal\(blockers.liveTerminalCount == 1 ? "" : "s")"
+        case .pending(_, _, .activityChanged):
+            "Terminal update retrying after activity changed"
+        case .pending(_, _, .companionLeaseChanged):
+            "Terminal update retrying after Companion control changed"
+        case .pending(_, _, .legacyIdentityUnavailable):
+            "Terminal update waiting: this older version cannot prove a safe handoff"
+        case .pending(_, _, .identityChanged):
+            "Terminal update waiting: the running service changed"
+        case .pending(_, _, .requestUnavailable):
+            "Terminal update waiting: the running version cannot verify a handoff"
+        case .pending(_, _, .shutdownTimedOut):
+            "Terminal update waiting: the old version did not finish its handoff"
+        case .pending(_, _, .launchFailed):
+            "Terminal update waiting: the replacement could not start"
+        case .updating:
+            "Terminal continuity is updating, without interrupting anything"
+        }
+    }
+
     private static func transition(_ from: String?, _ target: String) -> String {
         "content \(from ?? "legacy-unsealed") → \(target)"
     }

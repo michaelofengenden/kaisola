@@ -3,6 +3,9 @@
 ## 0.1.120 — 2026-08-12
 
 - Solid and Tinted have a white canvas. The middle of the window was grey in both of them while the sidebar right beside it was white, and those two are meant to be the same surface. The panel holding your terminals and chats was laying a frosted layer over the background no matter which theme you picked, and a frosted layer over white comes out grey. That layer only earns its place over Glass, the one theme that really does show your desktop, so Glass is now the only theme that gets it. Glass itself is a little clearer than it was, for the same reason.
+- The account menu is readable. Under your name it was printing four or five lines of engineering detail, several of them carrying a sixty-four character fingerprint and a process number, which is what stretched the menu across the whole window and buried the one clause that meant anything at the end of the longest line. It now says the version, whether you are connected, and one plain sentence if a terminal update is waiting on something. None of the detail is gone: "Copy Diagnostics" puts all of it on the clipboard, in full, which is the form it was wanted in anyway.
+- The bottom of the sidebar is bigger. Your picture, your name, and the settings, usage and notification buttons had all been shrunk a point at a time to buy room for a name that no longer needs it, and the three buttons were the faintest things in the window despite being among the few you can actually click. They are larger now and drawn in the same ink as the text beside them.
+- A single terminal is no longer framed in blue. The accent border marks which pane you are typing in, which tells you nothing when there is only one pane, so it sat around the terminal all day distinguishing it from nothing while the sidebar was already marking that same session in that same colour. It appears now only when you have a split, which is the only time it answers a question.
 
 ## 0.1.119 — 2026-08-12
 

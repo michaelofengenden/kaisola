@@ -267,4 +267,29 @@ final class SessionPaneLayoutTests: XCTestCase {
         XCTAssertNotEqual(first, repeated)
         XCTAssertEqual(repeated.targetID, first.targetID)
     }
+
+    /// A focus ring means "this one, not the others", so a lone pane must not
+    /// draw one. It used to: the single terminal that most windows show all day
+    /// was permanently framed in accent blue, distinguishing it from nothing,
+    /// while the sidebar was already marking the same session in the same
+    /// colour.
+    func testALonePaneIsNotMarkedAsFocusedButSiblingsAre() {
+        let alone = SessionPaneLayout(sessionID: "terminal:a")
+        XCTAssertFalse(alone.marksFocus("terminal:a", focusedID: "terminal:a"))
+        XCTAssertFalse(alone.marksFocus("terminal:a", focusedID: nil))
+
+        let split = SessionPaneLayout(columns: [
+            .init(sessionIDs: ["terminal:a"]),
+            .init(sessionIDs: ["terminal:b"]),
+        ])
+        XCTAssertTrue(split.marksFocus("terminal:a", focusedID: "terminal:a"))
+        XCTAssertFalse(split.marksFocus("terminal:b", focusedID: "terminal:a"))
+        XCTAssertFalse(split.marksFocus("terminal:a", focusedID: nil))
+
+        // Stacked rows in one column are siblings too.
+        let stacked = SessionPaneLayout(columns: [
+            .init(sessionIDs: ["terminal:a", "chat:b"]),
+        ])
+        XCTAssertTrue(stacked.marksFocus("chat:b", focusedID: "chat:b"))
+    }
 }

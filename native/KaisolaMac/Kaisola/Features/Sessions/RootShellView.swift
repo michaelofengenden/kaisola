@@ -2150,6 +2150,8 @@ struct RootShellView: View {
             // and so sat outside every relation the rest of the chrome holds.
             let cardRadius = KaisolaVisualSystem.paneRadius
             let terminalChrome = terminalPaneChrome(for: id)
+            let marksFocus = model.paneLayout(for: activeProjectID)
+                .marksFocus(id, focusedID: model.focusedPaneID)
             VStack(spacing: 0) {
                 unifiedSessionHeader(id, paneWidth: geometry.size.width)
                 unifiedSessionContent(id)
@@ -2161,12 +2163,12 @@ struct RootShellView: View {
             .overlay {
                 RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
                     .stroke(
-                        model.focusedPaneID == id
-                            ? Color.accentColor.opacity(0.38)
+                        marksFocus
+                            ? Color.accentColor.opacity(0.30)
                             : terminalChrome.map {
                                 Color(nsColor: $0.foreground).opacity($0.ruleOpacity)
                             } ?? Color(nsColor: .separatorColor).opacity(0.55),
-                        lineWidth: model.focusedPaneID == id
+                        lineWidth: marksFocus
                             ? KaisolaVisualSystem.focusStroke
                             : KaisolaVisualSystem.hairline
                     )
@@ -4914,7 +4916,12 @@ enum FooterAccountBudget {
     /// portrait; at 18 it is still comfortably above the ~16pt where a circular
     /// photo stops resolving as a face, and the 4pt goes straight to the name.
     static let avatarGap: CGFloat = 6
-    static let avatarSize: CGFloat = 18
+    /// 18 → 24 by request: at 18 the avatar was an identity cue and not much
+    /// else, and the footer as a whole read smaller than the thing it
+    /// represents. This spends 6pt of the name lane, which the lane can afford
+    /// only because v1.1.8 also made the label the *first name* — see
+    /// `nameWidth` for the measured budget that decision leaves behind.
+    static let avatarSize: CGFloat = 24
     static var avatarSlot: CGFloat { avatarSize + avatarGap }
     /// A square footer control (gear, overflow). Shrank from 22 to 16 for the
     /// same reason `gap` did: the glyphs inside are 12pt and were never what
@@ -4932,7 +4939,11 @@ enum FooterAccountBudget {
     /// trailing controls give up a point each side: their glyphs are 12pt and
     /// never needed a 16pt frame, and `tapTargetExpansion` keeps the hit target
     /// where it was.
-    static let controlSlot: CGFloat = 14
+    /// 14 → 18 by request, alongside the avatar. The glyphs inside grow with it
+    /// (12 → 14) and take a heavier ink, because at 12pt in secondary grey the
+    /// gear and the bell were the quietest things in a column of names they are
+    /// meant to sit level with.
+    static let controlSlot: CGFloat = 18
     /// How far a control's *hit* region extends past its visual
     /// `controlSlot` frame, on every side. `contentShape` grows into the
     /// row's own gaps rather than the frame growing into the name's width, so
@@ -5462,8 +5473,8 @@ private struct ConnectionFooter: View {
     private var settingsButton: some View {
         Button(action: showSettings) {
             Image(systemName: "gearshape")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(.kaisolaSecondary)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(.kaisolaPrimary)
                 .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
                 .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
         }
@@ -5587,8 +5598,8 @@ private struct ConnectionFooter: View {
             }
         } label: {
             Image(systemName: "ellipsis")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.kaisolaSecondary)
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(.kaisolaPrimary)
                 .frame(width: FooterAccountBudget.controlSlot, height: FooterAccountBudget.controlSlot)
                 .contentShape(Rectangle().inset(by: -FooterAccountBudget.tapTargetExpansion))
         }
@@ -5614,6 +5625,35 @@ private struct ConnectionFooter: View {
     /// actions. The lines that say nothing are also no longer said — a
     /// placeholder like "Broker generations have not been inspected yet." is
     /// noise in a menu opened to find out what is wrong.
+    /// Everything the menu used to print, on the clipboard instead.
+    ///
+    /// The digests, pids and package versions are genuinely useful — they are
+    /// the first thing anyone asks for when terminals misbehave — they were
+    /// just useful in the wrong place. One item collects them in a form that
+    /// can be pasted into an issue, which the menu rows never could.
+    private func copyDiagnostics() {
+        var lines = ["Kaisola \(Self.appVersion)", "Connection: \(state.title)"]
+        if let detail = state.detail, !detail.isEmpty {
+            lines.append("  \(detail)")
+        }
+        if brokerGenerationDetail != AppModel.brokerGenerationsUninspected {
+            lines.append("Generations: \(brokerGenerationDetail)")
+        }
+        lines.append("Terminal continuity: \(brokerUpgradeState.detail)")
+        if let brokerUpdateGateBlockedDetail {
+            lines.append("Update gate: \(brokerUpdateGateBlockedDetail)")
+        }
+        if usage.totalPeakTokens > 0 {
+            lines.append(
+                "Usage: \(usage.totalPeakTokens / 1000)k tokens · "
+                + "\(Int((usage.contextPressure * 100).rounded()))% context"
+            )
+        }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(lines.joined(separator: "\n"), forType: .string)
+    }
+
     private var accountMenu: some View {
         Menu {
             if let account = auth.account {
@@ -5658,24 +5698,24 @@ private struct ConnectionFooter: View {
                     }
                 }
             }
+            // Status, in at most two short sentences, and a way to get the rest.
+            //
+            // This section used to print the connection detail, the generation
+            // inventory, the upgrade detail, the update-gate reason and a usage
+            // tally — four or five lines, several of them carrying 64-character
+            // content digests and process ids. Two hashes are enough to stretch
+            // a menu across the entire window, and the clause that actually
+            // meant something was the last few words of the longest line. None
+            // of it is lost: `copyDiagnostics` puts every one of those strings
+            // on the clipboard, in full, which is the form anyone reporting a
+            // bug wanted anyway.
             Section("Kaisola v\(Self.appVersion)") {
-                Text(state.detail.flatMap { $0.isEmpty ? nil : $0 } ?? state.title)
-                // Only once it has actually looked.
-                if brokerGenerationDetail != AppModel.brokerGenerationsUninspected {
-                    Text(brokerGenerationDetail)
+                Text(state.title)
+                if let summary = brokerUpgradeState.summary {
+                    Text(summary)
                 }
-                if case .current = brokerUpgradeState {
-                    Text("Terminal continuity is up to date")
-                } else if case .unknown = brokerUpgradeState {
-                    EmptyView()
-                } else {
-                    Text(brokerUpgradeState.detail)
-                }
-                if let brokerUpdateGateBlockedDetail {
-                    Text(brokerUpdateGateBlockedDetail)
-                }
-                if usage.totalPeakTokens > 0 {
-                    Text("Usage: \(usage.totalPeakTokens / 1000)k tokens · \(Int((usage.contextPressure * 100).rounded()))% context")
+                Button(action: copyDiagnostics) {
+                    Label("Copy Diagnostics", systemImage: "doc.on.doc")
                 }
             }
         } label: {
@@ -5685,7 +5725,8 @@ private struct ConnectionFooter: View {
                 Color.clear
                     .frame(width: FooterAccountBudget.avatarSize, height: FooterAccountBudget.avatarSize)
                 Text(displayedAccountName)
-                    .font(.system(size: 12, weight: .medium))
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(.kaisolaPrimary)
                     .lineLimit(1)
                     .truncationMode(.tail)
             }
@@ -5763,8 +5804,8 @@ private struct ConnectionFooter: View {
             showInbox.toggle()
         } label: {
             Image(systemName: needsYou ? "bell.badge.fill" : "bell")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(needsYou ? KaisolaStatusTone.needsYou.foregroundColor : Color.secondary)
+                .font(.system(size: 14, weight: .medium))
+                .foregroundStyle(needsYou ? KaisolaStatusTone.needsYou.foregroundColor : Color.kaisolaPrimary)
                 .frame(
                     width: FooterAccountBudget.controlSlot,
                     height: FooterAccountBudget.controlSlot

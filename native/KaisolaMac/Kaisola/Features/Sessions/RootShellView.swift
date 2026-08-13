@@ -741,7 +741,10 @@ struct RootShellView: View {
                 )
             }
             .background {
-                SidebarBackdropView(appearance: settings.sidebarAppearance)
+                SidebarBackdropView(
+                    appearance: settings.sidebarAppearance,
+                    placement: .leading
+                )
                     .ignoresSafeArea()
             }
             // `ideal:` below is honoured for the double-click reset but not for

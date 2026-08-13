@@ -2934,20 +2934,39 @@ final class AppModel: ObservableObject {
         recentlyClosedPanes = restorableProjects.flatMap { project in
             project.panes.filter(\.isRecentlyClosed)
         }
-        // Deleted chats whose rows are fully gone can drain their tombstones.
-        await transcriptStore.vacuumTombstones()
+        // A crash can land after the transcript tombstone but before the
+        // workspace descriptor is removed. Prune every descriptor while its
+        // tombstone still proves deletion intent; reclaiming tombstones first
+        // would turn that stale descriptor back into an apparently live chat.
+        var canVacuumTranscriptTombstones = true
         for projectState in restorableProjects {
             for pane in projectState.panes {
                 guard !pane.isRecentlyClosed,
                       let descriptor = pane.surface.agentChatDescriptor,
-                      chats.contains(where: { $0.id == descriptor.id }) == false,
-                      // A tombstoned chat was deleted; a stale archived pane
-                      // (crash between phases, another window) must not
-                      // revive it (§4e). Only a proven `.absent` restores, so a
-                      // lookup the store cannot complete on a busy, corrupt, or
-                      // unreadable database leaves the pane out instead.
-                      await transcriptStore.tombstoneState(chatID: descriptor.id) == .absent,
-                      let agent = AgentRegistry.profile(id: descriptor.agentID) else { continue }
+                      chats.contains(where: { $0.id == descriptor.id }) == false else { continue }
+                switch await transcriptStore.tombstoneState(chatID: descriptor.id) {
+                case .present:
+                    do {
+                        _ = try await workspaceStateStore.removeAgentChatState(
+                            projectID: descriptor.projectID,
+                            chatID: descriptor.id
+                        )
+                    } catch {
+                        // Keep the tombstone until a later launch can prove the
+                        // stale descriptor is gone. Reclaiming it now would
+                        // authorize resurrection on the next restart.
+                        canVacuumTranscriptTombstones = false
+                    }
+                    continue
+                case .unknown:
+                    // A failed probe is not evidence that deletion never
+                    // happened. Keep both stores untouched and try next time.
+                    canVacuumTranscriptTombstones = false
+                    continue
+                case .absent:
+                    break
+                }
+                guard let agent = AgentRegistry.profile(id: descriptor.agentID) else { continue }
                 let directory = URL(fileURLWithPath: descriptor.workspacePath, isDirectory: true)
                     .standardizedFileURL
                 var isDirectory: ObjCBool = false
@@ -3089,6 +3108,13 @@ final class AppModel: ObservableObject {
             }
             unifiedSessionCards.install(layout, for: projectState.projectID)
             restoreFileTabs(from: projectState)
+        }
+
+        if canVacuumTranscriptTombstones {
+            // Descriptors are now either known absent or durably pruned, so
+            // interrupted transcript deletion can safely finish and reclaim
+            // its one-shot tombstone.
+            await transcriptStore.vacuumTombstones()
         }
 
         if let projectID = restoration.selectedProjectID,
@@ -3644,6 +3670,21 @@ final class AppModel: ObservableObject {
             return .failed(error)
         }
         let closingChat = chats.first(where: { $0.id == chatID })
+        var descriptorRemovalFailure: String?
+        if let projectID = closingChat?.projectID {
+            do {
+                _ = try await workspaceStateStore.removeAgentChatState(
+                    projectID: projectID,
+                    chatID: chatID
+                )
+            } catch {
+                // Transcript tombstoning is already durable, so restoration
+                // stays fail-closed even if the stale descriptor remains. Keep
+                // the live surface in place for an explicit retry; launch-time
+                // recovery also prunes it before reclaiming the tombstone.
+                descriptorRemovalFailure = error.localizedDescription
+            }
+        }
         if let closingChat {
             // Quiesce persistence synchronously on MainActor before stop()
             // yields and lets already-buffered ACP events drain.
@@ -3672,7 +3713,6 @@ final class AppModel: ObservableObject {
         if selectedChatID == chatID { selectedChatID = nil }
         if let projectID = closingChat?.projectID {
             unifiedSessionCards.remove(chatID, from: projectID)
-            scheduleWorkspaceStateSave(projectID: projectID)
         }
         // Unconditional (§4e): the user deleted the chat, so its transcript
         // goes — the old forgetDurableChat gate could leave tombstoned
@@ -3682,9 +3722,10 @@ final class AppModel: ObservableObject {
         await removeChatDraftsAfterDeletionCommit(chatID: chatID)
         // The workspace archive must reflect the deletion durably NOW, not
         // after a 220 ms debounce a crash can beat (§4e).
-        if let projectID = closingChat?.projectID {
-            Task { await persistWorkspaceStateImmediately(projectID: projectID) }
-        }
+        // The descriptor was removed synchronously above. Do not route this
+        // through the ordinary merge-preserving snapshot path: another window
+        // may legitimately omit this chat, while only this explicit store
+        // operation is allowed to prove deletion intent.
         // The tombstone already keeps the chat closed, but a DELETE that never
         // committed left its bytes on disk. Say that instead of letting the
         // silent close read as a finished permanent delete.
@@ -3693,8 +3734,20 @@ final class AppModel: ObservableObject {
                 "The chat is closed, but its transcript could not be erased from disk: \(failure)",
                 style: .error
             )
+            return removalResult
         }
-        return removalResult
+        if let descriptorRemovalFailure {
+            // The transcript tombstone is durable and every callback capable
+            // of submitting new chat work was fenced before the surface was
+            // removed above. Report the incomplete catalog cleanup without
+            // leaving a writable UI attached to a tombstoned transcript.
+            ToastCenter.shared.show(
+                "The chat is closed, but its workspace descriptor could not be erased: \(descriptorRemovalFailure)",
+                style: .error
+            )
+            return .failed(.database(descriptorRemovalFailure))
+        }
+        return .removed
     }
 
     /// Keep restored chat startup and live-account invalidation on the same
@@ -4594,15 +4647,18 @@ final class AppModel: ObservableObject {
         usageObservers.removeAll()
         await draftPersistenceTask?.value
         await persistWorkspaceStateNow()
-        chats.removeAll()
         meshLifecycleCoordinator.cancelAll()
         for mesh in meshes {
             _ = await meshLifecycleCoordinator.suspend(mesh)
         }
         // `suspend` updates lifecycle and can fence a worktree provision that
         // was already in flight. Flush that final safe manifest before the
-        // window model releases its claim.
+        // window model releases its claim. Stopped chats deliberately remain
+        // in `chats` through this last snapshot: their transcript rows live in
+        // SQLite, but this descriptor is the only durable route back to them
+        // after a relaunch or app update.
         await persistWorkspaceStateNow()
+        chats.removeAll()
         for mesh in meshes {
             Self.claimedRestoredMeshIDs.remove(mesh.id)
             meshLifecycleCoordinator.forget(meshID: mesh.id)

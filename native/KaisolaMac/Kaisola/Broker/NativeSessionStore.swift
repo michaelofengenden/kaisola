@@ -2033,6 +2033,10 @@ actor NativeWorkspaceStateStore {
     static let minimumReadableSchemaVersion = 1
     static let maximumProjects = 64
     static let maximumPanesPerProject = 8
+    /// Chats are durable work, not disposable layout slots. A project may
+    /// retain more hidden chats than the eight simultaneously visible ordinary
+    /// panes, and a stale second window must never crowd their descriptors out.
+    static let maximumActiveChatsPerProject = 256
     static let maximumRecentlyClosedChatsPerProject = 256
     static let maximumFileTabsPerProject = 24
     static let maximumDrafts = 128
@@ -2079,6 +2083,11 @@ actor NativeWorkspaceStateStore {
     private let decoder: JSONDecoder
     private let meshWorktreeRoot: URL
     private var cachedArchive: Archive?
+    /// A permanent chat deletion is process-global, while ordinary snapshots
+    /// are window-local and can be stale. Fence stale windows after the
+    /// explicit removal has committed so they cannot reinsert the descriptor
+    /// before this process exits. Relaunch reads the already-pruned archive.
+    private var removedAgentChatIDs: Set<String> = []
 
     init(
         fileURL: URL = NativeWorkspaceStateStore.defaultArchiveURL,
@@ -2218,7 +2227,11 @@ actor NativeWorkspaceStateStore {
     func saveRestorationState(_ state: NativeWorkspaceRestorationState) throws {
         var archive = try loadArchive()
         archive.restoration = Self.normalized(
-            Self.preservingExistingMeshes(from: archive.restoration, in: state),
+            Self.preservingExistingDurablePanes(
+                from: archive.restoration,
+                in: state,
+                excludingAgentChatIDs: removedAgentChatIDs
+            ),
             meshWorktreeRoot: meshWorktreeRoot
         )
         try persist(archive)
@@ -2233,7 +2246,11 @@ actor NativeWorkspaceStateStore {
         var restoration = archive.restoration
         let existing = restoration.projects.first { $0.projectID == state.projectID }
         restoration.projects.removeAll { $0.projectID == state.projectID }
-        restoration.projects.append(Self.preservingExistingMeshes(from: existing, in: state))
+        restoration.projects.append(Self.preservingExistingDurablePanes(
+            from: existing,
+            in: state,
+            excludingAgentChatIDs: removedAgentChatIDs
+        ))
         if makeSelected {
             restoration.selectedProjectID = state.projectID
         }
@@ -2255,7 +2272,10 @@ actor NativeWorkspaceStateStore {
         var archive = try loadArchive()
         if let existing = archive.restoration.projects.first(where: { $0.projectID == projectID }) {
             let durablePanes = existing.panes.filter {
-                $0.surface.kind == .mesh || $0.isRecentlyClosed
+                $0.surface.kind == .mesh
+                    || ($0.surface.kind == .agentChat
+                        && !removedAgentChatIDs.contains($0.id))
+                    || $0.isRecentlyClosed
             }
             archive.restoration.projects.removeAll { $0.projectID == projectID }
             if !durablePanes.isEmpty {
@@ -2295,6 +2315,41 @@ actor NativeWorkspaceStateStore {
         try persist(archive)
     }
 
+    /// Explicit permanent-delete boundary for an active or archived chat.
+    /// Ordinary per-window snapshots merge missing chats because absence only
+    /// proves that one window did not own them; this operation is the matching
+    /// process-wide proof that a descriptor is intentionally gone.
+    @discardableResult
+    func removeAgentChatState(projectID: String, chatID: String) throws -> Bool {
+        guard Self.isValidIdentifier(projectID), Self.isValidIdentifier(chatID) else {
+            throw StoreError.invalidIdentifier
+        }
+        var archive = try loadArchive()
+        guard let index = archive.restoration.projects.firstIndex(where: {
+            $0.projectID == projectID
+        }) else {
+            // Even an already-absent descriptor needs the in-process fence:
+            // another window can still hold and later submit a stale copy.
+            removedAgentChatIDs.insert(chatID)
+            return false
+        }
+        var project = archive.restoration.projects[index]
+        let previousCount = project.panes.count
+        project.panes.removeAll {
+            $0.id == chatID && $0.surface.kind == .agentChat
+        }
+        let removed = project.panes.count < previousCount
+        if removed {
+            project.layout.remove(chatID)
+            if project.focusedPaneID == chatID { project.focusedPaneID = nil }
+            project.updatedAt = Int64(Date().timeIntervalSince1970 * 1_000)
+            archive.restoration.projects[index] = project
+            try persist(archive)
+        }
+        removedAgentChatIDs.insert(chatID)
+        return removed
+    }
+
     /// Explicit permanent deletion is the only path allowed to tombstone a
     /// recently closed descriptor. Ordinary partial-window snapshots preserve
     /// these entries so another window cannot silently resurrect or erase one.
@@ -2308,6 +2363,9 @@ actor NativeWorkspaceStateStore {
             return false
         }
         var project = archive.restoration.projects[index]
+        let removedAgentChat = project.panes.contains {
+            $0.id == surfaceID && $0.isRecentlyClosed && $0.surface.kind == .agentChat
+        }
         let previousCount = project.panes.count
         project.panes.removeAll { $0.id == surfaceID && $0.isRecentlyClosed }
         guard project.panes.count < previousCount else { return false }
@@ -2316,6 +2374,7 @@ actor NativeWorkspaceStateStore {
         project.updatedAt = Int64(Date().timeIntervalSince1970 * 1_000)
         archive.restoration.projects[index] = project
         try persist(archive)
+        if removedAgentChat { removedAgentChatIDs.insert(surfaceID) }
         return true
     }
 
@@ -2555,17 +2614,26 @@ actor NativeWorkspaceStateStore {
     }
 
     /// Merge crash-safe panes by identity, preferring the incoming descriptor
-    /// when its owning window supplied one. Mesh manifests and Recently Closed
-    /// entries survive partial snapshots from other windows.
-    private static func preservingExistingMeshes(
+    /// when its owning window supplied one. Chats, Mesh manifests, and Recently
+    /// Closed entries survive partial snapshots from other windows; only an
+    /// explicit store removal may prove a chat is intentionally absent.
+    private static func preservingExistingDurablePanes(
         from existing: NativeProjectWorkspaceState?,
-        in incoming: NativeProjectWorkspaceState
+        in incoming: NativeProjectWorkspaceState,
+        excludingAgentChatIDs removedAgentChatIDs: Set<String>
     ) -> NativeProjectWorkspaceState {
-        guard let existing else { return incoming }
         var merged = incoming
+        merged.panes.removeAll {
+            $0.surface.kind == .agentChat && removedAgentChatIDs.contains($0.id)
+        }
+        guard let existing else { return merged }
         var known = Set(merged.panes.map(\.id))
         for oldPane in existing.panes
-        where (oldPane.surface.kind == .mesh || oldPane.isRecentlyClosed)
+        where (oldPane.surface.kind == .mesh
+            || oldPane.surface.kind == .agentChat
+            || oldPane.isRecentlyClosed)
+            && !(oldPane.surface.kind == .agentChat
+                && removedAgentChatIDs.contains(oldPane.id))
             && known.insert(oldPane.id).inserted {
             var preserved = oldPane
             preserved.isMinimized = true
@@ -2574,17 +2642,27 @@ actor NativeWorkspaceStateStore {
         return merged
     }
 
-    private static func preservingExistingMeshes(
+    private static func preservingExistingDurablePanes(
         from existing: NativeWorkspaceRestorationState,
-        in incoming: NativeWorkspaceRestorationState
+        in incoming: NativeWorkspaceRestorationState,
+        excludingAgentChatIDs removedAgentChatIDs: Set<String>
     ) -> NativeWorkspaceRestorationState {
         var merged = incoming
+        for index in merged.projects.indices {
+            merged.projects[index].panes.removeAll {
+                $0.surface.kind == .agentChat && removedAgentChatIDs.contains($0.id)
+            }
+        }
         var incomingDurableIDs = Set(
             merged.projects.flatMap { project in project.panes.map(\.id) }
         )
         for oldProject in existing.projects {
             let missing = oldProject.panes.filter {
-                ($0.surface.kind == .mesh || $0.isRecentlyClosed)
+                ($0.surface.kind == .mesh
+                    || $0.surface.kind == .agentChat
+                    || $0.isRecentlyClosed)
+                    && !($0.surface.kind == .agentChat
+                        && removedAgentChatIDs.contains($0.id))
                     && incomingDurableIDs.insert($0.id).inserted
             }
             guard !missing.isEmpty else { continue }
@@ -2618,6 +2696,7 @@ actor NativeWorkspaceStateStore {
         var panes: [NativeRestorablePaneState] = []
 
         var ordinaryPaneCount = 0
+        var activeChatCount = 0
         var recentlyClosedChatCount = 0
         // Mesh first: an ordinary window snapshot at its visual pane cap must
         // never push a preserved recovery manifest out of the archive.
@@ -2629,10 +2708,13 @@ actor NativeWorkspaceStateStore {
             + state.panes.filter { $0.surface.kind != .mesh && $0.isRecentlyClosed }
         for pane in orderedPanes {
             let isMesh = pane.surface.kind == .mesh
+            let isActiveChat = pane.surface.kind == .agentChat && !pane.isRecentlyClosed
             let hasCapacity = isMesh
                 || (pane.isRecentlyClosed
                     ? recentlyClosedChatCount < maximumRecentlyClosedChatsPerProject
-                    : ordinaryPaneCount < maximumPanesPerProject)
+                    : isActiveChat
+                        ? activeChatCount < maximumActiveChatsPerProject
+                        : ordinaryPaneCount < maximumPanesPerProject)
             guard hasCapacity,
                   isValidIdentifier(pane.id),
                   pane.surface.projectID == state.projectID,
@@ -2668,6 +2750,8 @@ actor NativeWorkspaceStateStore {
             if !isMesh {
                 if pane.isRecentlyClosed {
                     recentlyClosedChatCount += 1
+                } else if isActiveChat {
+                    activeChatCount += 1
                 } else {
                     ordinaryPaneCount += 1
                 }

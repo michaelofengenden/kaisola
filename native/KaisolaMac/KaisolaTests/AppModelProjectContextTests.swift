@@ -713,6 +713,198 @@ final class AppModelProjectContextTests: XCTestCase {
         if let chatID = model.chats.first?.id { await model.deleteChat(chatID) }
     }
 
+    /// Quit/update teardown persists more than once: first before stopping ACP
+    /// children, then once more after Mesh suspension. That last snapshot must
+    /// still contain stopped chats, or their SQLite transcript survives while
+    /// the only descriptor capable of reopening it is erased.
+    @MainActor
+    func testCleanTeardownKeepsActiveChatDescriptorForRelaunch() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        let projectDirectory = root.appendingPathComponent("chat-relaunch-project", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-state-v1.json")
+        )
+        let transcriptURL = root.appendingPathComponent("transcripts.json")
+        let transcriptStore = AcpTranscriptStore(fileURL: transcriptURL)
+        let sessionStore = NativeSessionStore(fileURL: storeFile)
+        let model = AppModel(
+            brokerPreparer: ProjectContextBrokerPreparer(),
+            fallbackPreparer: nil,
+            client: ProjectContextBrokerClient(),
+            sessionStore: sessionStore,
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
+            workspaceStateStore: workspaceStore,
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore),
+            reconnectBackoff: BrokerReconnectBackoff(
+                baseNanoseconds: 1,
+                maximumNanoseconds: 2,
+                jitterFraction: 0
+            ),
+            sleep: { _ in await Task.yield() },
+            jitter: { 0 }
+        )
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        model.openChat(agent, inDirectory: projectDirectory)
+        let original = try XCTUnwrap(model.chats.first)
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "user-1", text: "survive the update", failed: false),
+            .message(id: "assistant-1", text: "still here"),
+        ]
+        original.conversation.seedRowsForTesting(rows)
+        original.conversation.onTranscriptChanged?(rows, 0)
+
+        await model.teardown()
+        await workspaceStore.invalidateCache()
+
+        let persisted = try await workspaceStore.projectState(for: original.projectID)
+        XCTAssertEqual(
+            persisted?.panes.compactMap(\.surface.agentChatDescriptor).map(\.id),
+            [original.id]
+        )
+
+        let reopenedTranscriptStore = AcpTranscriptStore(fileURL: transcriptURL)
+        let reopened = AppModel(
+            brokerPreparer: ProjectContextBrokerPreparer(),
+            fallbackPreparer: nil,
+            client: ProjectContextBrokerClient(),
+            sessionStore: NativeSessionStore(fileURL: storeFile),
+            cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("reopened-cursors.json")),
+            workspaceStateStore: NativeWorkspaceStateStore(
+                fileURL: root.appendingPathComponent("workspace-state-v1.json")
+            ),
+            transcriptStore: reopenedTranscriptStore,
+            usageCenter: UsageCenter(persistenceStore: reopenedTranscriptStore),
+            reconnectBackoff: BrokerReconnectBackoff(
+                baseNanoseconds: 1,
+                maximumNanoseconds: 2,
+                jitterFraction: 0
+            ),
+            sleep: { _ in await Task.yield() },
+            jitter: { 0 }
+        )
+        await reopened.restoreWorkspaceStateIfNeeded()
+
+        let restored = try XCTUnwrap(reopened.chats.first { $0.id == original.id })
+        XCTAssertEqual(restored.conversation.rows, rows)
+        await reopened.teardown()
+    }
+
+    @MainActor
+    func testPermanentDeleteRemovesActiveChatDescriptorWithoutMergeResurrection() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        let projectDirectory = root.appendingPathComponent("active-chat-delete-project", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        let workspaceStore = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-state-v1.json")
+        )
+        let transcriptStore = AcpTranscriptStore(
+            fileURL: root.appendingPathComponent("transcripts.json")
+        )
+        let model = AppModel(
+            sessionStore: NativeSessionStore(fileURL: storeFile),
+            workspaceStateStore: workspaceStore,
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore)
+        )
+        let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
+        model.openChat(agent, inDirectory: projectDirectory)
+        let chat = try XCTUnwrap(model.chats.first)
+        let snapshot = try XCTUnwrap(model.workspaceSnapshotForTesting(projectID: chat.projectID))
+        try await workspaceStore.saveProjectState(snapshot)
+
+        let result = await model.deleteChat(chat.id)
+        XCTAssertEqual(result, .removed)
+        XCTAssertTrue(model.chats.isEmpty)
+
+        await workspaceStore.invalidateCache()
+        let afterDelete = try await workspaceStore.projectState(for: chat.projectID)
+        XCTAssertFalse(afterDelete?.panes.contains { $0.id == chat.id } == true)
+
+        // Teardown submits another ordinary full snapshot. Its merge path must
+        // honor the explicit removal fence rather than reviving the stale id.
+        await model.teardown()
+        let reopened = NativeWorkspaceStateStore(
+            fileURL: root.appendingPathComponent("workspace-state-v1.json")
+        )
+        let afterTeardown = try await reopened.projectState(for: chat.projectID)
+        XCTAssertFalse(afterTeardown?.panes.contains { $0.id == chat.id } == true)
+    }
+
+    @MainActor
+    func testRelaunchPrunesTombstonedDescriptorBeforeReclaimingTranscript() async throws {
+        let root = storeFile.deletingLastPathComponent()
+        let projectDirectory = root.appendingPathComponent("tombstoned-chat-project", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: projectDirectory,
+            withIntermediateDirectories: true
+        )
+        let projectID = NativeSessionStore.projectID(forDirectory: projectDirectory.path)
+        let chatID = "chat-interrupted-delete"
+        let descriptor = NativeRestorableAgentChatDescriptor(
+            id: chatID,
+            projectID: projectID,
+            agentID: "codex",
+            workspacePath: projectDirectory.path,
+            acpSessionID: "provider-interrupted-delete",
+            title: "Must stay deleted"
+        )
+        let workspaceURL = root.appendingPathComponent("workspace-state-v1.json")
+        let workspaceStore = NativeWorkspaceStateStore(fileURL: workspaceURL)
+        try await workspaceStore.saveRestorationState(NativeWorkspaceRestorationState(
+            selectedProjectID: projectID,
+            projects: [NativeProjectWorkspaceState(
+                projectID: projectID,
+                layout: SessionPaneLayout(sessionID: chatID),
+                panes: [NativeRestorablePaneState(
+                    id: chatID,
+                    surface: NativeRestorableSurfaceState(agentChat: descriptor)
+                )],
+                focusedPaneID: chatID
+            )]
+        ))
+        let transcriptStore = AcpTranscriptStore(
+            fileURL: root.appendingPathComponent("transcripts.json")
+        )
+        await transcriptStore.scheduleSave(
+            [.message(id: "row-1", text: "delete me")],
+            for: chatID,
+            now: 1
+        )
+        await transcriptStore.flush()
+        let tombstoneResult = await transcriptStore.tombstone(chatID: chatID)
+        XCTAssertEqual(tombstoneResult, .recorded)
+
+        // Simulate termination immediately after the transcript tombstone but
+        // before deleteChat could remove the workspace descriptor.
+        let sessionStore = NativeSessionStore(fileURL: storeFile)
+        _ = sessionStore.openProject(directory: projectDirectory.path)
+        let model = AppModel(
+            sessionStore: sessionStore,
+            workspaceStateStore: workspaceStore,
+            transcriptStore: transcriptStore,
+            usageCenter: UsageCenter(persistenceStore: transcriptStore)
+        )
+        await model.restoreWorkspaceStateIfNeeded()
+
+        XCTAssertTrue(model.chats.isEmpty)
+        await workspaceStore.invalidateCache()
+        let pruned = try await workspaceStore.projectState(for: projectID)
+        XCTAssertFalse(pruned?.panes.contains { $0.id == chatID } == true)
+        let removedTranscript = await transcriptStore.entry(for: chatID)
+        let reclaimedTombstone = await transcriptStore.tombstoneState(chatID: chatID)
+        XCTAssertNil(removedTranscript)
+        XCTAssertEqual(reclaimedTombstone, .absent)
+        await model.teardown()
+    }
+
     @MainActor
     func testChatCloseRestoreAndPermanentDeleteKeepClearDurabilityBoundaries() async throws {
         let (model, _) = makeModel()

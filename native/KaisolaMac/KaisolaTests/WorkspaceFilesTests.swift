@@ -9,6 +9,21 @@ import XCTest
 /// ProjectFiles (tree listing + bounded enumeration) and FilePreviewContent
 /// (what a file renders as) — the workspace rail's foundations.
 final class WorkspaceFilesTests: XCTestCase {
+    func testFilesHeaderPreservesSearchByCollapsingActionsAtNarrowRailWidths() {
+        for width: CGFloat in [150, 164, 196] {
+            let layout = WorkspaceRailHeaderLayout.resolve(availableWidth: width)
+
+            XCTAssertEqual(layout.mode, .compact, "\(width)pt must not scrunch five controls")
+            XCTAssertEqual(layout.searchPlaceholder, "Search")
+            XCTAssertEqual(Set(layout.overflowActions), Set(WorkspaceRailHeaderAction.allCases))
+        }
+
+        let regular = WorkspaceRailHeaderLayout.resolve(availableWidth: 260)
+        XCTAssertEqual(regular.mode, .regular)
+        XCTAssertEqual(regular.searchPlaceholder, "Search files")
+        XCTAssertTrue(regular.overflowActions.isEmpty)
+    }
+
     func testAllDocumentsPresentationKeepsEveryTabReachableInSourceOrder() {
         let project = URL(fileURLWithPath: "/tmp/Overflow project", isDirectory: true)
         let first = AppModel.FileWorkbenchTab(

@@ -1187,16 +1187,21 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             try? NativePreviewPaths.prepareApplicationSupport()
         }
         if visualFixture {
-            settings.navigationLayout = ["topbar", "topbar-attention"].contains(visualSurface)
+            settings.navigationLayout = ["topbar", "topbar-attention", "new-session-topbar"].contains(visualSurface)
                 ? .topBar
                 : .leftTree
             settings.appearance = visualAppearance == "dark" ? .dark : .light
             settings.sidebarAppearance = .glass
             settings.workspaceBackdrop = .glass
+            if visualSurface == "tinted" {
+                settings.sidebarAppearance = .tinted
+                settings.workspaceBackdrop = .tinted
+            }
             // `empty-workspace` is the *idle* canvas — nothing mounted is its
             // whole definition, and a visible Files rail is a mounted surface.
             settings.workspaceRailVisible = visualSurface != "topbar" && visualSurface != "terminal-solo"
-                && visualSurface != "empty-workspace"
+                && visualSurface != "empty-workspace" && visualSurface != "new-session"
+                && visualSurface != "new-session-topbar"
             settings.workspaceRailWidth = 196
             // Pin both ordinary and failure-boundary document widths. The
             // fixture settings object is non-persistent, so these values can
@@ -2243,6 +2248,29 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                     "KAISOLA_NATIVE_VISUAL_COMPOSER_FOCUS=PASS "
                         + "surface=\(visualSurface)"
                 )
+            }
+
+            // The chooser covers a still-mounted terminal so the terminal can
+            // retain its buffer and viewport. The keyboard must nevertheless
+            // belong to the chooser before capture; otherwise ordinary typing
+            // is delivered to the hidden shell underneath it.
+            if ["new-session", "new-session-topbar"].contains(visualSurface) {
+                let responder = captureWindow.firstResponder
+                guard let responder,
+                      !(responder is ReadOnlyTerminalView),
+                      responder !== captureWindow else {
+                    let name = responder.map { String(describing: type(of: $0)) } ?? "nil"
+                    let receipt = "KAISOLA_NATIVE_VISUAL_NEW_SESSION_FOCUS=FAIL "
+                        + "surface=\(visualSurface) responder=\(name)\n"
+                    FileHandle.standardOutput.write(Data(receipt.utf8))
+                    try? FileHandle.standardOutput.synchronize()
+                    requestVisualFixtureTermination()
+                    return
+                }
+                let receipt = "KAISOLA_NATIVE_VISUAL_NEW_SESSION_FOCUS=PASS "
+                    + "surface=\(visualSurface) responder=\(type(of: responder))\n"
+                FileHandle.standardOutput.write(Data(receipt.utf8))
+                try? FileHandle.standardOutput.synchronize()
             }
 
             let terminalAccessibilityMarkers = NativeVisualTerminalAccessibilityGate.expectedMarkers(

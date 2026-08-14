@@ -8,10 +8,8 @@ import SwiftUI
 struct NativeVisualEffectView: NSViewRepresentable {
     let material: NSVisualEffectView.Material
     var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
-    /// Light Glass must carry luminance and movement, not the hue of the window
-    /// behind it. Core Animation evaluates this after AppKit's vibrancy layer,
-    /// so even a saturated live backdrop reaches the white carrier as neutral
-    /// light and shade. Dark and explicitly Tinted surfaces leave it disabled.
+    /// Optional post-vibrancy saturation control. Rails leave it disabled so
+    /// the live desktop keeps its colour as well as its light and movement.
     var neutralizesChroma = false
 
     @MainActor
@@ -105,9 +103,11 @@ enum GlassWarmth {
 /// never appear inside Kaisola's glass.
 struct DesktopGlassLayer: View {
     let liveMaterial: NSVisualEffectView.Material
-    /// Tint coverage (dark, light) laid over *live* vibrancy only. Light Glass
-    /// is neutral by contract, so only the dark half is ever rendered. The
-    /// painted wallpaper already is the hue and must not be tinted twice.
+    let carrierWhiteCoverage: Double
+    /// Tint coverage (dark, light) laid over *live* vibrancy only. The light
+    /// half may be zero because live vibrancy already carries the desktop hue;
+    /// dark retains its small sampled lift. The painted wallpaper already is
+    /// the hue and must not be tinted twice.
     ///
     /// See `SidebarBackdropView` for why the dark half of the pair is so much
     /// smaller than the light one.
@@ -120,10 +120,12 @@ struct DesktopGlassLayer: View {
     init(
         liveMaterial: NSVisualEffectView.Material,
         liveTint: (dark: Double, light: Double)? = nil,
+        carrierWhiteCoverage: Double = LightGlassFrost.carrierWhiteCoverage,
         settings: NativePreviewSettings = .shared
     ) {
         self.liveMaterial = liveMaterial
         self.liveTint = liveTint
+        self.carrierWhiteCoverage = carrierWhiteCoverage
         self.settings = settings
     }
 
@@ -138,20 +140,21 @@ struct DesktopGlassLayer: View {
         isDark ? requested : .sidebar
     }
 
-    /// Light Glass never carries the sampled RGB hue. Returning exact white is
-    /// a fail-closed contract for callers; the live overlay is also omitted in
-    /// light so this does not become a second, redundant whitening layer.
+    /// Live Glass keeps the sampled RGB ratios in both appearances. Light's
+    /// exact white belongs to the workspace carrier, not to a filter on the
+    /// navigation rails.
     nonisolated static func resolvedLiveTint(
         _ tint: DesktopTintComponents,
         isDark: Bool
     ) -> DesktopTintComponents {
-        isDark ? tint : DesktopTintComponents(red: 1, green: 1, blue: 1)
+        tint
     }
 
-    /// Sampled colour belongs to dark Glass and to the explicit Tinted theme,
-    /// never to light Glass.
+    /// Both appearances preserve the live material's sampled colour. The
+    /// light sampled overlay may still have zero coverage; this flag also
+    /// keeps the vibrancy layer itself out of the chroma-neutralizing path.
     nonisolated static func appliesSampledLiveTint(isDark: Bool) -> Bool {
-        isDark
+        true
     }
 
     /// Coverage for the no-wallpaper fallback. Zero in light makes a failed
@@ -181,15 +184,16 @@ struct DesktopGlassLayer: View {
             case .behindWindow:
                 NativeVisualEffectView(
                     material: Self.resolvedLiveMaterial(liveMaterial, isDark: isDark),
-                    neutralizesChroma: !isDark
+                    neutralizesChroma: !Self.appliesSampledLiveTint(isDark: isDark)
                 )
                 if let liveTint, Self.appliesSampledLiveTint(isDark: isDark) {
                     let tint = Self.resolvedLiveTint(desktop.painting.tint, isDark: isDark)
                     let tintColor = Color(red: tint.red, green: tint.green, blue: tint.blue)
+                    let coverage = isDark ? liveTint.dark : liveTint.light
                     LinearGradient(
                         colors: [
-                            tintColor.opacity(liveTint.dark),
-                            tintColor.opacity(liveTint.dark * 0.55),
+                            tintColor.opacity(coverage),
+                            tintColor.opacity(coverage * 0.55),
                         ],
                         startPoint: .top,
                         endPoint: .bottom
@@ -197,7 +201,7 @@ struct DesktopGlassLayer: View {
                 }
             }
             if !isDark {
-                Color.white.opacity(LightGlassFrost.carrierWhiteCoverage)
+                Color.white.opacity(carrierWhiteCoverage)
                     .allowsHitTesting(false)
             }
         }
@@ -557,6 +561,10 @@ final class DesktopWallpaperPatchView: NSView {
 /// Reusable material used by both the project sidebar and the workspace file
 /// rail, keeping the two left-hand navigation surfaces visually coherent.
 struct SidebarBackdropView: View {
+    /// Both window-edge rails live inside this exact AppKit material. Placement
+    /// mirrors only the small colour gradient; it never selects a different
+    /// blur, carrier, or neutral wash for Projects and Files.
+    static let sharedGlassMaterial: NSVisualEffectView.Material = .sidebar
     /// Coverage of the sampled desktop average laid over *live* vibrancy.
     ///
     /// Michael's translucency note names both glass sources — "especially on
@@ -567,9 +575,9 @@ struct SidebarBackdropView: View {
     /// takes that to 0.462, and halving the dark tint takes it to **0.561** —
     /// the material behind the window contributes 67% more than it did.
     ///
-    /// Dark keeps the sampled tint at 0.15. Light is exactly zero: preserving
-    /// sampled RGB ratios was the source of the blue cast, so light gets its
-    /// depth from AppKit vibrancy beneath the achromatic white carrier instead.
+    /// Dark keeps the sampled tint at 0.15. Light's explicit overlay is zero
+    /// because AppKit vibrancy now preserves the live desktop's own chroma;
+    /// adding its average again would tint the material twice.
     ///
     /// (Unlike the wallpaper source, this cannot be measured offline: it lands
     /// on live vibrancy, whose input is whatever is behind the window. The
@@ -578,6 +586,7 @@ struct SidebarBackdropView: View {
     static let liveTint = (dark: 0.15, light: 0.0)
 
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.controlActiveState) private var controlActiveState
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @ObservedObject private var settings = NativePreviewSettings.shared
@@ -585,6 +594,7 @@ struct SidebarBackdropView: View {
     /// path samples it directly, so the provider is observed here too.
     @ObservedObject private var desktop = DesktopBackdropProvider.shared
     let appearance: SidebarAppearance
+    let placement: SidebarRailPlacement
 
     @ViewBuilder
     var body: some View {
@@ -594,13 +604,47 @@ struct SidebarBackdropView: View {
                 Color(nsColor: .controlBackgroundColor)
             } else {
                 ZStack {
-                    DesktopGlassLayer(liveMaterial: .sidebar, liveTint: Self.liveTint)
+                    DesktopGlassLayer(
+                        liveMaterial: Self.sharedGlassMaterial,
+                        liveTint: Self.liveTint,
+                        carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
+                    )
                     GlassBackdropWash
                         .sidebar(isDark: colorScheme == .dark, clarity: settings.glassClarity.resolved(
                             increasedContrast: accessibilityContrast == .increased,
                             reduceTransparency: reduceTransparency
                         ))
                         .veil
+                    if colorScheme == .light {
+                        let visibility = controlActiveState == .key
+                            ? 1.0
+                            : LightRailTint.inactiveMultiplier
+                        LinearGradient(
+                            gradient: Gradient(stops: [
+                                .init(
+                                    color: LightRailTint.coolColor.opacity(
+                                        LightRailTint.coolCoverage * visibility
+                                    ),
+                                    location: 0
+                                ),
+                                .init(
+                                    color: Color.white.opacity(
+                                        LightRailTint.midpointCoverage * visibility
+                                    ),
+                                    location: LightRailTint.midpointLocation
+                                ),
+                                .init(
+                                    color: LightRailTint.pearlColor.opacity(
+                                        LightRailTint.pearlCoverage * visibility
+                                    ),
+                                    location: 1
+                                ),
+                            ]),
+                            startPoint: placement.tintStartPoint,
+                            endPoint: placement.tintEndPoint
+                        )
+                        .allowsHitTesting(false)
+                    }
                     if accessibilityContrast == .increased {
                         Color(nsColor: .controlBackgroundColor)
                             .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
@@ -610,55 +654,51 @@ struct SidebarBackdropView: View {
         case .solid:
             Color(nsColor: .controlBackgroundColor)
         case .tinted:
-            // The same recipe the canvas uses, on the rails: the desktop's hue
-            // re-valued to a declared peak and laid over the solid surface at a
-            // declared coverage, so the only chroma in the stack is the sampled
-            // desktop's and a grey desktop stays grey.
-            //
-            // The rails take a *lighter* coverage than the canvas. They are
-            // narrow columns of small text sitting next to a wide field of it,
-            // and matching the canvas exactly made them read as the louder
-            // surface — the same mistake the sidebar's selection pill made. This
-            // keeps the tint continuous across the window while leaving the
-            // canvas the surface that carries it.
             let isDark = colorScheme == .dark
-            let tint = DesktopTintSampler.revalued(
-                desktop.painting.tint,
-                peak: DesktopTintSampler.canvasTintPeak(isDark: isDark)
-            )
-            let coverage = DesktopTintSampler.canvasTintCoverage(isDark: isDark)
-            let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
             ZStack {
                 Color(nsColor: .controlBackgroundColor)
-                // Same top-to-bottom fall as the canvas, so a rail and the
-                // canvas beside it are lit from the same direction rather than
-                // meeting as two flat panels of slightly different colour.
-                LinearGradient(
-                    colors: [
-                        color.opacity(coverage.top * Self.railTintShare),
-                        color.opacity(coverage.bottom * Self.railTintShare),
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
+                if isDark {
+                    let tint = DesktopTintSampler.revalued(
+                        desktop.painting.tint,
+                        peak: DesktopTintSampler.canvasTintPeak(isDark: true)
+                    )
+                    let coverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
+                    let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
+                    LinearGradient(
+                        colors: [
+                            color.opacity(coverage.top * Self.railTintShare),
+                            color.opacity(coverage.bottom * Self.railTintShare),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                } else {
+                    LightTintedGradient.gradient(
+                        coverageScale: Self.railTintShare,
+                        startPoint: placement.tintStartPoint,
+                        endPoint: placement.tintEndPoint
+                    )
+                }
                 if accessibilityContrast == .increased {
                     Color(nsColor: .controlBackgroundColor)
                         .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
                 }
             }
-            .onAppear { desktop.refresh(isDark: colorScheme == .dark) }
-            .onChange(of: colorScheme) { desktop.refresh(isDark: colorScheme == .dark) }
+            .onAppear {
+                if isDark { desktop.refresh(isDark: true) }
+            }
+            .onChange(of: colorScheme) {
+                if colorScheme == .dark { desktop.refresh(isDark: true) }
+            }
         }
     }
 
     /// How much of the canvas's tint coverage the rails take.
     ///
-    /// Three quarters. At parity the two narrow columns read louder than the
-    /// wide canvas between them, because the same coverage over a small area
-    /// next to a large one is the one the eye lands on. Below about half the
-    /// rails stop looking related to the canvas at all, which is the
-    /// half-applied look this theme exists to fix.
-    static let railTintShare: Double = 0.75
+    /// Ninety percent. The old three-quarter scaling pushed the already-gentle
+    /// stops back into 254–255 quantization, so the rails read as plain white
+    /// even when the center still carried a trace of colour.
+    static let railTintShare: Double = 0.90
 }
 
 struct WorkspaceBackdropView: View {
@@ -787,31 +827,27 @@ struct WorkspaceBackdropView: View {
                 .animation(.easeInOut(duration: 0.35), value: idleActive)
             }
         case .tinted:
-            // The desktop's *hue*, laid into the solid canvas — see
-            // `DesktopTintSampler.revalued(_:peak:)` for why the sample is
-            // re-valued before it is composited. Same neutrality contract as
-            // the glass veil: the sampled desktop colour is the only chroma in
-            // the stack, no mesh (lavender) stop.
-            //
-            // Measured against the real desktop, light: Solid 1.000/1.000/1.000
-            // (0.000 off-neutral) against Tinted 0.816/0.941/1.000 at the top
-            // (0.113 off-neutral, luminance 0.919). Dark: Solid 0.118 flat
-            // against Tinted 0.163/0.216/0.240 (0.209 off-neutral). Nobody has
-            // to squint to tell which one is on.
+            // Light uses a stable cool-to-white-to-pearl composition so a blue
+            // desktop cannot turn the whole window flat blue. Dark keeps the
+            // sampled desktop treatment that already reads clearly there.
             let isDark = colorScheme == .dark
-            let tint = DesktopTintSampler.revalued(
-                desktop.painting.tint,
-                peak: DesktopTintSampler.canvasTintPeak(isDark: isDark)
-            )
-            let coverage = DesktopTintSampler.canvasTintCoverage(isDark: isDark)
-            let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
             ZStack {
                 Color(nsColor: .windowBackgroundColor)
-                LinearGradient(
-                    colors: [color.opacity(coverage.top), color.opacity(coverage.bottom)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
+                if isDark {
+                    let tint = DesktopTintSampler.revalued(
+                        desktop.painting.tint,
+                        peak: DesktopTintSampler.canvasTintPeak(isDark: true)
+                    )
+                    let coverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
+                    let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
+                    LinearGradient(
+                        colors: [color.opacity(coverage.top), color.opacity(coverage.bottom)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                } else {
+                    LightTintedGradient.gradient()
+                }
             }
         }
     }

@@ -884,14 +884,11 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(TerminalThemeRegistry.shipped.first?.title, "macOS Terminal")
     }
 
-    /// The Safari reference is a white frost across the whole window, not a
-    /// white sidebar beside a grey canvas. Rails and canvas keep their existing
-    /// (different) transmission, but the normalized carrier makes both land on
-    /// the same near-white ground before AppKit's live material is involved.
-    func testLightGlassIsWhiteAndCoherentAcrossRailsCanvasAndPanel() {
-        let rail = GlassBackdropWash.sidebar(isDark: false)
+    /// Light Glass deliberately separates the center from the rails: the
+    /// workspace is an exact white working plane, while navigation remains a
+    /// view onto the desktop.
+    func testLightGlassCanvasIsExactlyWhite() {
         let canvas = GlassBackdropWash.workspace(isDark: false)
-        let railLuminance = LightGlassFrost.modeledBackdropLuminance(rail)
         let canvasLuminance = LightGlassFrost.modeledBackdropLuminance(canvas)
 
         XCTAssertEqual(
@@ -899,18 +896,16 @@ final class NativePreviewSettingsTests: XCTestCase {
             LightGlassFrost.backdropLuminance,
             accuracy: 0.0001
         )
-        XCTAssertGreaterThanOrEqual(railLuminance, 0.96, "the LHS/RHS rails still read grey")
-        XCTAssertGreaterThanOrEqual(canvasLuminance, 0.96, "the background canvas still reads grey")
-        XCTAssertLessThan(
-            abs(railLuminance - canvasLuminance),
-            0.011,
-            "rails and canvas are no longer one white-glass family"
+        XCTAssertEqual(canvasLuminance, 1, accuracy: 0.0001, "the workspace canvas is not exact white")
+        XCTAssertEqual(
+            LightGlassFrost.carrierWhiteCoverage,
+            1,
+            accuracy: 0.0001,
+            "a translucent carrier lets the desktop tint the white canvas"
         )
 
         // The detail panel is the last layer over the canvas. Its white frost
         // must be visible but must not become an opaque white card.
-        XCTAssertGreaterThanOrEqual(LightGlassFrost.carrierWhiteCoverage, 0.65)
-        XCTAssertLessThan(LightGlassFrost.carrierWhiteCoverage, 0.80)
         XCTAssertGreaterThanOrEqual(LightGlassFrost.panelWhiteCoverage, 0.35)
         XCTAssertLessThan(LightGlassFrost.panelWhiteCoverage, 0.50)
         XCTAssertGreaterThanOrEqual(
@@ -925,49 +920,159 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(KaisolaTheme.glass.workspaceBackdrop, .glass)
     }
 
-    /// User-facing Glass means neutral white outer chrome. This boundary test
-    /// deliberately guards the mounted rail sources as well as the color
-    /// arithmetic: PRs #819 and #821 both reintroduced the same blue/amber
-    /// post-frost overlay while leaving the shared white carrier untouched.
-    func testLightGlassRailsMountNoDecorativeChromaticOverlay() throws {
-        XCTAssertEqual(
-            LightGlassFrost.navigationChromaCoverage,
-            0,
-            "light Glass rail chroma belongs only to the explicit Tinted theme"
+    func testLightRailTintIsDelicateAndMirroredAtWindowEdges() {
+        XCTAssertEqual(SidebarRailPlacement.leading.tintStartPoint, .topLeading)
+        XCTAssertEqual(SidebarRailPlacement.leading.tintEndPoint, .bottomTrailing)
+        XCTAssertEqual(SidebarRailPlacement.trailing.tintStartPoint, .topTrailing)
+        XCTAssertEqual(SidebarRailPlacement.trailing.tintEndPoint, .bottomLeading)
+
+        XCTAssertLessThanOrEqual(LightRailTint.maximumCoverage, 0.04)
+        XCTAssertGreaterThanOrEqual(LightRailTint.minimumTransmission, 0.96)
+        XCTAssertEqual(LightRailTint.inactiveMultiplier, 0.12, accuracy: 0.0001)
+        XCTAssertGreaterThan(LightRailTint.cool.blue, LightRailTint.cool.green)
+        XCTAssertGreaterThan(LightRailTint.cool.green, LightRailTint.cool.red)
+        XCTAssertGreaterThan(LightRailTint.pearl.red, LightRailTint.pearl.green)
+        XCTAssertGreaterThan(LightRailTint.pearl.green, LightRailTint.pearl.blue)
+    }
+
+    func testGlassRailsDeclareAboutTwelvePercentWhiteAndExposeTheDesktop() {
+        let rail = GlassBackdropWash.sidebar(isDark: false)
+        let canvas = GlassBackdropWash.workspace(isDark: false)
+        let declaredWhiteCoverage = 1
+            - (1 - LightGlassFrost.railCarrierWhiteCoverage) * (1 - rail.baseOpacity)
+
+        XCTAssertGreaterThanOrEqual(declaredWhiteCoverage, 0.10)
+        XCTAssertLessThanOrEqual(
+            declaredWhiteCoverage,
+            0.14,
+            "the shared rail material still carries too much white to read as transparent"
         )
+        XCTAssertLessThanOrEqual(
+            LightGlassFrost.railCarrierWhiteCoverage,
+            0.02,
+            "a second white carrier is stacking on top of the twelve-percent veil"
+        )
+        XCTAssertGreaterThanOrEqual(
+            LightGlassFrost.modeledRailDesktopContribution(rail),
+            0.86,
+            "Glass still paints over most of the wallpaper"
+        )
+        XCTAssertEqual(
+            LightGlassFrost.modeledBackdropLuminance(canvas),
+            1,
+            accuracy: 0.0001,
+            "the separate workspace canvas must remain exact white"
+        )
+    }
 
-        let repositoryRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let mountedRailSources = [
-            "native/KaisolaMac/Kaisola/App/NativeAppearanceViews.swift",
-            "native/KaisolaMac/Kaisola/App/NativeVisualTokens.swift",
-            "native/KaisolaMac/Kaisola/Features/Sessions/RootShellView.swift",
-            "native/KaisolaMac/Kaisola/Features/Workspace/WorkspaceRailView.swift",
-        ]
-        let forbiddenDecorativeLayers = ["LightRailTint", "kaisolaLightRailTint"]
+    func testLightTintedSurfaceIsAGentleSageThroughNeutralToLilacPearlGradient() {
+        // The two coloured ends are pale and point in different directions,
+        // so the whole rail cannot collapse into one blue wash.
+        XCTAssertGreaterThan(LightTintedGradient.cool.green, LightTintedGradient.cool.blue)
+        XCTAssertGreaterThan(LightTintedGradient.cool.blue, LightTintedGradient.cool.red)
+        XCTAssertLessThanOrEqual(
+            LightTintedGradient.cool.green - LightTintedGradient.cool.red,
+            0.18
+        )
+        XCTAssertGreaterThan(LightTintedGradient.pearl.blue, LightTintedGradient.pearl.red)
+        XCTAssertGreaterThan(LightTintedGradient.pearl.red, LightTintedGradient.pearl.green)
+        XCTAssertLessThanOrEqual(
+            LightTintedGradient.pearl.blue - LightTintedGradient.pearl.green,
+            0.18
+        )
+        XCTAssertGreaterThan(LightTintedGradient.neutral.red, LightTintedGradient.neutral.green)
+        XCTAssertGreaterThan(LightTintedGradient.neutral.green, LightTintedGradient.neutral.blue)
 
-        for relativePath in mountedRailSources {
-            let source = try String(
-                contentsOf: repositoryRoot.appendingPathComponent(relativePath),
-                encoding: .utf8
-            )
-            for forbidden in forbiddenDecorativeLayers {
-                XCTAssertFalse(
-                    source.contains(forbidden),
-                    "\(relativePath) reintroduced the chromatic rail layer \(forbidden)"
-                )
+        let maximumCoverage = max(
+            LightTintedGradient.coolCoverage,
+            max(LightTintedGradient.neutralCoverage, LightTintedGradient.pearlCoverage)
+        )
+        XCTAssertGreaterThanOrEqual(maximumCoverage, 0.08, "the light tint disappeared")
+        XCTAssertLessThanOrEqual(maximumCoverage, 0.12, "the light tint is no longer gentle")
+        XCTAssertGreaterThanOrEqual(
+            LightTintedGradient.neutralCoverage,
+            0.08,
+            "the midpoint falls back to an exact-white band"
+        )
+        XCTAssertLessThanOrEqual(LightTintedGradient.neutralCoverage, 0.12)
+        XCTAssertGreaterThan(LightTintedGradient.neutralLocation, 0.35)
+        XCTAssertLessThan(LightTintedGradient.neutralLocation, 0.70)
+    }
+
+    func testLightTintedStopsRemainVisibleAfterCompositingOverWhite() {
+        typealias RGB = (red: Double, green: Double, blue: Double)
+
+        func composite(_ colour: RGB, coverage: Double) -> [Double] {
+            [colour.red, colour.green, colour.blue].map {
+                (1 - coverage + $0 * coverage) * 255
             }
         }
+
+        func metrics(_ channels: [Double]) -> (departure: Double, spread: Double) {
+            let maximum = channels.max() ?? 255
+            let minimum = channels.min() ?? 255
+            return (departure: 255 - minimum, spread: maximum - minimum)
+        }
+
+        let colouredStops: [(name: String, colour: RGB, coverage: Double)] = [
+            ("sage", LightTintedGradient.cool, LightTintedGradient.coolCoverage),
+            ("lilac-pearl", LightTintedGradient.pearl, LightTintedGradient.pearlCoverage),
+        ]
+        for stop in colouredStops {
+            let canvas = metrics(composite(stop.colour, coverage: stop.coverage))
+            XCTAssertGreaterThanOrEqual(
+                canvas.departure,
+                7,
+                "\(stop.name) composites to near-white and disappears on the canvas"
+            )
+            XCTAssertLessThanOrEqual(canvas.departure, 12, "\(stop.name) is no longer gentle")
+            XCTAssertGreaterThanOrEqual(
+                canvas.spread,
+                4,
+                "\(stop.name) has too little channel separation to read as a tint"
+            )
+            XCTAssertLessThanOrEqual(canvas.spread, 6, "\(stop.name) is too saturated")
+
+            let rail = metrics(composite(
+                stop.colour,
+                coverage: stop.coverage * SidebarBackdropView.railTintShare
+            ))
+            XCTAssertGreaterThanOrEqual(
+                rail.departure,
+                6,
+                "\(stop.name) disappears after the rail's coverage scaling"
+            )
+            XCTAssertLessThanOrEqual(rail.departure, 11, "\(stop.name) is too heavy on the rail")
+            XCTAssertGreaterThanOrEqual(rail.spread, 3, "\(stop.name) rail is effectively neutral")
+            XCTAssertLessThanOrEqual(rail.spread, 6, "\(stop.name) rail is too saturated")
+        }
+
+        let neutral = metrics(composite(
+            LightTintedGradient.neutral,
+            coverage: LightTintedGradient.neutralCoverage
+        ))
+        XCTAssertGreaterThanOrEqual(
+            neutral.departure,
+            4,
+            "the warm midpoint still disappears into the white canvas"
+        )
+        XCTAssertLessThanOrEqual(neutral.departure, 6, "the warm midpoint is too heavy")
+        XCTAssertGreaterThanOrEqual(neutral.spread, 2, "the midpoint is effectively neutral")
+        XCTAssertLessThanOrEqual(neutral.spread, 4, "the midpoint is too saturated")
+    }
+
+    func testSurfaceTabOutlinesAreVisibleButRemainHairlines() {
+        XCTAssertEqual(SurfaceTabChrome.projectSelectedStrokeOpacity, 0.38, accuracy: 0.0001)
+        XCTAssertEqual(SurfaceTabChrome.sessionSelectedStrokeOpacity, 0.30, accuracy: 0.0001)
+        XCTAssertEqual(SurfaceTabChrome.inactiveStrokeOpacity, 0.11, accuracy: 0.0001)
+        XCTAssertEqual(KaisolaVisualSystem.hairline, 0.5)
     }
 
     /// Live vibrancy cannot be pixel-tested offline because its input is the
     /// actual desktop behind the test window. Its deterministic choices can be:
-    /// light rails and canvas share the Safari-like material, and sampled hue
-    /// is excluded rather than merely brightened.
-    func testLiveLightGlassUsesTheSharedWhiteCarrier() {
+    /// the rail keeps the sampled RGB ratios and leaves vibrancy saturation on;
+    /// the exact-white canvas is supplied by its separate opaque carrier.
+    func testLiveLightGlassPreservesDesktopChromaInTheRails() {
         XCTAssertEqual(
             DesktopGlassLayer.resolvedLiveMaterial(.sidebar, isDark: false),
             .sidebar
@@ -985,16 +1090,12 @@ final class NativePreviewSettingsTests: XCTestCase {
 
         let sampled = DesktopTintComponents(red: 0.3152, green: 0.4646, blue: 0.5343)
         let light = DesktopGlassLayer.resolvedLiveTint(sampled, isDark: false)
-        XCTAssertEqual(light.red, 1)
-        XCTAssertEqual(light.green, 1)
-        XCTAssertEqual(light.blue, 1)
-        XCTAssertEqual(
-            NativeVisualEffectView.resolvedSaturation(neutralizesChroma: true),
-            0,
-            "live light vibrancy can still transmit a coloured backdrop"
-        )
+        XCTAssertEqual(light, sampled, "light Glass is replacing the live desktop hue with white")
         XCTAssertEqual(NativeVisualEffectView.resolvedSaturation(neutralizesChroma: false), 1)
-        XCTAssertFalse(DesktopGlassLayer.appliesSampledLiveTint(isDark: false))
+        XCTAssertTrue(
+            DesktopGlassLayer.appliesSampledLiveTint(isDark: false),
+            "light Glass still opts into chroma neutralization"
+        )
         XCTAssertTrue(DesktopGlassLayer.appliesSampledLiveTint(isDark: true))
         XCTAssertEqual(DesktopGlassLayer.resolvedLiveTint(sampled, isDark: true), sampled)
 
@@ -1045,13 +1146,18 @@ final class NativePreviewSettingsTests: XCTestCase {
         // passed no desktop colour at all, and the 0.16 that replaced it was
         // calibrated against vibrancy but ended up over a *painted wallpaper*,
         // which passes everything.
-        // Light moved for the same reason dark did, one round later: "light
-        // mode should also be translucent to wallpaper much better". 0.60 →
-        // 0.45, transmission 0.40 → 0.55, and — like dark — only reachable
-        // because the bake bounds the still's range first.
-        XCTAssertEqual(GlassBackdropWash.sidebar(isDark: false).baseOpacity, 0.45, accuracy: 0.0001)
+        // Light rails now use one narrow white veil centered on twelve
+        // percent. There is no second carrier stacked beneath it; the exact
+        // white workspace has its own opaque recipe.
+        let lightSidebar = GlassBackdropWash.sidebar(isDark: false)
+        XCTAssertEqual(lightSidebar.topOpacity, 0.14, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.baseOpacity, 0.12, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.bottomOpacity, 0.10, accuracy: 0.0001)
         XCTAssertEqual(GlassBackdropWash.workspace(isDark: false).baseOpacity, 0.40, accuracy: 0.0001)
-        // Dark is thinner than light now, and deliberately so: it used to be
+        // Dark remains at its previously verified values. Light now passes
+        // more of the desktop through the rails while the light workspace
+        // stays unchanged.
+        // It used to be
         // the least translucent surface in the app (0.40 transmission against
         // light's 0.40 on the sidebar and 0.45 on the workspace), which is what
         // "the background in dark mode looks bad… needs to be glassy/smooth/
@@ -1062,15 +1168,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(GlassBackdropWash.sidebar(isDark: true).baseOpacity, 0.34, accuracy: 0.0001)
         XCTAssertEqual(GlassBackdropWash.workspace(isDark: true).baseOpacity, 0.37, accuracy: 0.0001)
         XCTAssertGreaterThan(
-            GlassBackdropWash.sidebar(isDark: true).desktopTransmission,
-            GlassBackdropWash.sidebar(isDark: false).desktopTransmission
+            GlassBackdropWash.sidebar(isDark: false).desktopTransmission,
+            GlassBackdropWash.sidebar(isDark: true).desktopTransmission
         )
         // The headline, stated the way Michael asked for it: dark now passes
         // half again as much desktop as it did, on both surfaces.
         XCTAssertGreaterThan(GlassBackdropWash.sidebar(isDark: true).desktopTransmission, 0.65)
         XCTAssertGreaterThan(GlassBackdropWash.workspace(isDark: true).desktopTransmission, 0.60)
-        // …and light, whose ask came next, passes at least a third more than the
-        // 0.40/0.45 it shipped with.
+        // Light rail transmission is now twice its original 0.40 floor.
         XCTAssertGreaterThan(
             GlassBackdropWash.sidebar(isDark: false).desktopTransmission, 0.40 * 1.33
         )
@@ -1143,8 +1248,8 @@ final class NativePreviewSettingsTests: XCTestCase {
         // it is the combination that puts a raw wallpaper behind the labels.
         // Asserted for both appearances now that both carry a cap.
         XCTAssertGreaterThan(
-            GlassBackdropWash.desktopTransmissionBand(isDark: true).ceiling,
-            GlassBackdropWash.desktopTransmissionBand(isDark: false).ceiling
+            GlassBackdropWash.desktopTransmissionBand(isDark: false).ceiling,
+            GlassBackdropWash.desktopTransmissionBand(isDark: true).ceiling
         )
         for isDark in [false, true] {
             XCTAssertLessThan(
@@ -1237,9 +1342,16 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertLessThan(darkSidebar.topOpacity, darkSidebar.baseOpacity)
         XCTAssertLessThan(darkSidebar.baseOpacity, darkSidebar.bottomOpacity)
 
-        // The workspace reads one step deeper than the sidebar so the inset
-        // chrome panels have something to float above.
-        XCTAssertLessThan(lightWorkspace.baseOpacity, lightSidebar.baseOpacity)
+        // The canvas keeps more white carrier than the rails, so it remains
+        // the brighter surface even though the rail veil itself is thinner.
+        XCTAssertGreaterThan(
+            LightGlassFrost.modeledBackdropLuminance(lightWorkspace),
+            LightGlassFrost.modeledRailLuminance(lightSidebar)
+        )
+        XCTAssertGreaterThan(
+            LightGlassFrost.modeledRailDesktopContribution(lightSidebar),
+            (1 - LightGlassFrost.carrierWhiteCoverage) * lightWorkspace.desktopTransmission
+        )
         XCTAssertGreaterThan(darkWorkspace.baseOpacity, darkSidebar.baseOpacity)
     }
 
@@ -2012,7 +2124,8 @@ final class NativePreviewSettingsTests: XCTestCase {
         width: Int,
         height: Int,
         crop: CGRect = CGRect(x: 0, y: 0, width: 1, height: 1),
-        warmth: Double? = nil
+        warmth: Double? = nil,
+        carrierWhiteCoverage: Double = LightGlassFrost.carrierWhiteCoverage
     ) throws -> [UInt8] {
         // `DesktopWallpaperPatch` draws the still through a `contentsRect`;
         // cropping the `CGImage` to the same unit rectangle is the same
@@ -2046,7 +2159,7 @@ final class NativePreviewSettingsTests: XCTestCase {
             if !isDark {
                 context.setFillColor(
                     red: 1, green: 1, blue: 1,
-                    alpha: LightGlassFrost.carrierWhiteCoverage
+                    alpha: carrierWhiteCoverage
                 )
                 context.fill(rect)
             }
@@ -2349,7 +2462,10 @@ final class NativePreviewSettingsTests: XCTestCase {
                     return XCTFail("\(name) produced no painting")
                 }
                 let pixels = try renderGlassSurface(
-                    still: still, wash: wash, isDark: false, width: width, height: height
+                    still: still, wash: wash, isDark: false, width: width, height: height,
+                    carrierWhiteCoverage: surface == "sidebar"
+                        ? LightGlassFrost.railCarrierWhiteCoverage
+                        : LightGlassFrost.carrierWhiteCoverage
                 )
                 let worst = worstPatchContrast(pixels, isDark: false)
                 print(String(
@@ -2506,7 +2622,10 @@ final class NativePreviewSettingsTests: XCTestCase {
                     ("workspace", GlassBackdropWash.workspace(isDark: false, clarity: clarity), 900, 900),
                 ] {
                     let pixels = try renderGlassSurface(
-                        still: still, wash: wash, isDark: false, width: width, height: height
+                        still: still, wash: wash, isDark: false, width: width, height: height,
+                        carrierWhiteCoverage: surface == "sidebar"
+                            ? LightGlassFrost.railCarrierWhiteCoverage
+                            : LightGlassFrost.carrierWhiteCoverage
                     )
                     let patch = worstPatchContrast(pixels, isDark: false).patch
                     let kaisola = inkContrast(.secondary, over: patch, isDark: false)
@@ -3229,7 +3348,8 @@ final class NativePreviewSettingsTests: XCTestCase {
                 )
                 let surface = try renderGlassSurface(
                     still: still, wash: GlassBackdropWash.sidebar(isDark: isDark),
-                    isDark: isDark, width: 210, height: 900, crop: crop
+                    isDark: isDark, width: 210, height: 900, crop: crop,
+                    carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
                 )
                 var total = 0.0
                 for pixel in stride(from: 0, to: surface.count, by: 4) {
@@ -3362,7 +3482,10 @@ final class NativePreviewSettingsTests: XCTestCase {
                                 )
                                 let surface = try renderGlassSurface(
                                     still: still, wash: wash, isDark: isDark,
-                                    width: width, height: height, crop: crop
+                                    width: width, height: height, crop: crop,
+                                    carrierWhiteCoverage: label == "sidebar"
+                                        ? LightGlassFrost.railCarrierWhiteCoverage
+                                        : LightGlassFrost.carrierWhiteCoverage
                                 )
                                 let worst = worstPatchContrast(surface, isDark: isDark)
                                 let place = """
@@ -3662,18 +3785,21 @@ final class NativePreviewSettingsTests: XCTestCase {
                 let wash = GlassBackdropWash.sidebar(isDark: isDark)
                 let surface = try renderGlassSurface(
                     still: still, wash: wash, isDark: isDark,
-                    width: 210, height: 900, crop: crop
+                    width: 210, height: 900, crop: crop,
+                    carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
                 )
                 let perceived = perceivedSurface(surface)
                 surfaceLightness.append(perceived.lightness)
                 surfaceSaturation.append(perceived.saturation)
                 bareSaturation.append(perceivedSurface(try renderGlassSurface(
                     still: still, wash: wash, isDark: isDark,
-                    width: 210, height: 900, crop: crop, warmth: 0
+                    width: 210, height: 900, crop: crop, warmth: 0,
+                    carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
                 )).saturation)
                 frozenSaturation.append(perceivedSurface(try renderGlassSurface(
                     still: frozen, wash: wash, isDark: isDark,
-                    width: 210, height: 900
+                    width: 210, height: 900,
+                    carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
                 )).saturation)
                 if member.name == "neutral" { neutralSurface = perceived.saturation }
 
@@ -3854,10 +3980,12 @@ final class NativePreviewSettingsTests: XCTestCase {
                 // a wide canvas showing a stretched still physically is.
                 let wash = GlassBackdropWash.sidebar(isDark: isDark)
                 let before = try renderGlassSurface(
-                    still: legacy, wash: wash, isDark: isDark, width: 210, height: 900
+                    still: legacy, wash: wash, isDark: isDark, width: 210, height: 900,
+                    carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
                 )
                 let after = try renderGlassSurface(
-                    still: still, wash: wash, isDark: isDark, width: 210, height: 900
+                    still: still, wash: wash, isDark: isDark, width: 210, height: 900,
+                    carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
                 )
                 let beforeDetail = localDetail(before, width: 210, height: 900)
                 let afterDetail = localDetail(after, width: 210, height: 900)
@@ -4005,10 +4133,12 @@ final class NativePreviewSettingsTests: XCTestCase {
         }
 
         let beforePixels = try renderGlassSurface(
-            still: still, wash: before, isDark: false, width: 210, height: 900
+            still: still, wash: before, isDark: false, width: 210, height: 900,
+            carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
         )
         let nowPixels = try renderGlassSurface(
-            still: still, wash: now, isDark: false, width: 210, height: 900
+            still: still, wash: now, isDark: false, width: 210, height: 900,
+            carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
         )
         print(String(
             format: "[light-glass] sidebar chroma %.4f -> %.4f  spread %.4f -> %.4f  (transmission %.2f -> %.2f)",
@@ -4039,15 +4169,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(before, 0.336, accuracy: 0.001)
         XCTAssertGreaterThan(after, before * 1.6, "live dark barely moved")
 
-        // Light has no sampled-colour tint. Its remaining material contribution
-        // is achromatically bounded by the shared white carrier and veil.
+        // Light keeps the live material's chroma and uses only the twenty-point
+        // white veil to frost it. No second carrier consumes the transmission.
         XCTAssertEqual(SidebarBackdropView.liveTint.light, 0, accuracy: 0.0001)
         let lightAfterCarrier = transmission(
             tint: SidebarBackdropView.liveTint.light,
             veil: GlassBackdropWash.sidebar(isDark: false).baseOpacity
-        ) * (1 - LightGlassFrost.carrierWhiteCoverage)
-        XCTAssertGreaterThan(lightAfterCarrier, 0.12, "white Glass became opaque")
-        XCTAssertLessThan(lightAfterCarrier, 0.20, "too much live colour can reach light Glass")
+        ) * (1 - LightGlassFrost.railCarrierWhiteCoverage)
+        XCTAssertEqual(lightAfterCarrier, 0.80, accuracy: 0.0001)
     }
 
     /// The bake bounds the wallpaper's dynamic range, not only its mean — the
@@ -4320,14 +4449,9 @@ final class NativePreviewSettingsTests: XCTestCase {
 
     // MARK: - The three workspace canvases
 
-    /// "The tinted canvas settings should actually be tinted or a white solid."
-    ///
-    /// They were neither, because they were the same surface twice: measured
-    /// against the real desktop the old Tinted canvas landed 0.016 off-neutral
-    /// in light, against Solid's 0.000 — one and a half percent of channel
-    /// spread, which nobody can see. This is the arithmetic that says the two
-    /// modes are now different objects.
-    func testSolidAndTintedCanvasesAreUnmistakablyDifferentSurfaces() {
+    /// Light Tinted is intentionally a whisper over white; Dark Tinted keeps
+    /// the stronger sampled-desktop treatment that already works there.
+    func testSolidAndTintedCanvasesStayDistinctWithoutAHeavyLightWash() {
         func offNeutral(_ channels: [Double]) -> Double {
             let mean = channels.reduce(0, +) / Double(channels.count)
             guard mean > 0 else { return 0 }
@@ -4337,50 +4461,47 @@ final class NativePreviewSettingsTests: XCTestCase {
             channels[0] * 0.2126 + channels[1] * 0.7152 + channels[2] * 0.0722
         }
 
-        // The sampled tint of Michael's desktop, through the shipping sampler.
-        let sampled = DesktopTintComponents(red: 0.3152, green: 0.4646, blue: 0.5343)
-        // `windowBackgroundColor`, read off the two appearances.
-        let solids = [false: [1.0, 1.0, 1.0], true: [0.1176, 0.1176, 0.1176]]
-
-        for isDark in [false, true] {
-            let solid = solids[isDark]!
-            let tint = DesktopTintSampler.revalued(
-                sampled,
-                peak: DesktopTintSampler.canvasTintPeak(isDark: isDark)
-            )
-            let coverage = DesktopTintSampler.canvasTintCoverage(isDark: isDark)
-            let channels = [tint.red, tint.green, tint.blue]
-            let tinted = zip(solid, channels).map { $0 * (1 - coverage.top) + $1 * coverage.top }
-
-            // Solid contributes no wallpaper at all: perfectly achromatic.
-            XCTAssertEqual(offNeutral(solid), 0, accuracy: 0.0001)
-
-            // Tinted is unmistakably hued — an order of magnitude past the old
-            // 0.016, and past the 0.05 bar this app sets for anything that
-            // claims to be neutral.
-            XCTAssertGreaterThan(
-                offNeutral(tinted),
-                0.10,
-                "the Tinted canvas (isDark: \(isDark)) is not visibly tinted"
-            )
-
-            // …without becoming a different brightness of canvas. Re-valuing
-            // the tint first is what buys this: light keeps 90%+ of the solid's
-            // luminance instead of dimming toward grey.
-            if isDark {
-                XCTAssertGreaterThan(luminance(tinted), luminance(solid))
-                XCTAssertLessThan(luminance(tinted), 0.30, "a dark canvas that glows is not a canvas")
-            } else {
-                XCTAssertGreaterThan(
-                    luminance(tinted) / luminance(solid),
-                    0.88,
-                    "Tinted is dimming the canvas instead of tinting it"
-                )
+        let lightSolid = [1.0, 1.0, 1.0]
+        let lightStops = [
+            (LightTintedGradient.cool, LightTintedGradient.coolCoverage),
+            (LightTintedGradient.neutral, LightTintedGradient.neutralCoverage),
+            (LightTintedGradient.pearl, LightTintedGradient.pearlCoverage),
+        ]
+        XCTAssertEqual(offNeutral(lightSolid), 0, accuracy: 0.0001)
+        for (colour, coverage) in lightStops {
+            let tinted = [colour.red, colour.green, colour.blue].map {
+                1 * (1 - coverage) + $0 * coverage
             }
-
-            // The gradient still reads as light from above.
-            XCTAssertGreaterThan(coverage.top, coverage.bottom)
+            // Coarse luminance/chroma guard. The precise visible-but-gentle
+            // bounds live in `testLightTintedStopsRemainVisibleAfterCompositingOverWhite`.
+            XCTAssertGreaterThan(
+                luminance(tinted),
+                0.97,
+                "light Tinted is no longer a white-led pastel surface"
+            )
+            XCTAssertLessThan(
+                offNeutral(tinted),
+                0.01,
+                "a light Tinted stop is a colour field instead of a gentle wash"
+            )
         }
+
+        // Dark stays on the established sampled tint and coverage.
+        let sampled = DesktopTintComponents(red: 0.3152, green: 0.4646, blue: 0.5343)
+        let darkSolid = [0.1176, 0.1176, 0.1176]
+        let tint = DesktopTintSampler.revalued(
+            sampled,
+            peak: DesktopTintSampler.canvasTintPeak(isDark: true)
+        )
+        let coverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
+        let channels = [tint.red, tint.green, tint.blue]
+        let darkTinted = zip(darkSolid, channels).map {
+            $0 * (1 - coverage.top) + $1 * coverage.top
+        }
+        XCTAssertGreaterThan(offNeutral(darkTinted), 0.10, "dark Tinted lost its sampled hue")
+        XCTAssertGreaterThan(luminance(darkTinted), luminance(darkSolid))
+        XCTAssertLessThan(luminance(darkTinted), 0.30, "a dark canvas that glows is not a canvas")
+        XCTAssertGreaterThan(coverage.top, coverage.bottom)
     }
 
     /// Re-valuing keeps the hue and moves only the value — that is the whole
@@ -5268,32 +5389,22 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
-    /// The top-bar layout has no sidebar band to move the pair into, so it keeps
-    /// the strip — and the strip has to stay exactly as tall as the controls it
-    /// reveals, so a later pass cannot grow it back into somewhere to put chrome.
-    func testTheTopBarLayoutKeepsTheStripItRevealsItsTogglesIn() {
+    /// The top-bar toggles moved into the content overlay, so their retired
+    /// reveal strip must not survive as an empty band above the detail card.
+    func testTheTopBarLayoutUsesTheSharedGutterWithoutAnEmptyStrip() {
         XCTAssertEqual(
             NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
-            NativeWorkspaceChrome.detailToggleStripHeight
+            KaisolaVisualSystem.chromeInset
         )
+        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar), 6)
         XCTAssertEqual(
-            NativeWorkspaceChrome.detailToggleStripHeight,
-            NativeWorkspaceChrome.detailChromeControlHeight
-                + NativeWorkspaceChrome.detailToggleRevealPadding * 2
-        )
-        XCTAssertEqual(NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar), 28)
-        XCTAssertGreaterThan(
             NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
             NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree)
         )
-
-        // The hover target is sized from the pointer, not from the pair it
-        // reveals: a target the size of what it shows is one you have to
-        // already know is there.
-        XCTAssertGreaterThan(
-            NativeWorkspaceChrome.detailToggleRevealWidth,
-            NativeWorkspaceChrome.detailChromeControlWidth * 2
-                + NativeWorkspaceChrome.detailChromeControlGap
+        XCTAssertLessThan(
+            NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
+            NativeWorkspaceChrome.detailToggleStripHeight,
+            "the retired 28pt toggle strip is still reserving an empty band"
         )
     }
 

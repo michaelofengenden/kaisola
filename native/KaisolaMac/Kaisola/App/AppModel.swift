@@ -3819,13 +3819,14 @@ final class AppModel: ObservableObject {
     /// moving this one, and the sentence the user was mid-way through typing
     /// has to survive that. The source chat keeps its own copy — a navigation
     /// action must never be the reason typed text disappears.
+    @discardableResult
     func openChat(
         _ agent: AgentProfile,
         inDirectory directory: URL,
         accountProfile: UsageAccountProfile? = nil,
         initialDraft: String? = nil,
         runProfile: AcpRunProfile? = nil
-    ) {
+    ) -> String? {
         let project = sessionStore.openProject(directory: directory.path)
         refreshPersistedNavigationState(publish: false)
         selectedProjectID = project.id
@@ -3838,7 +3839,7 @@ final class AppModel: ObservableObject {
             ToastCenter.shared.show(nudge, style: .info, duration: 6)
         }
         let chatID = "chat-\(UUID().uuidString.lowercased())"
-        guard let projectOverlay = projectAccountOverlay(forProject: project.id) else { return }
+        guard let projectOverlay = projectAccountOverlay(forProject: project.id) else { return nil }
         let effectiveAccountEnvironment = ProcessInfo.processInfo.environment
             .merging(projectOverlay) { _, configured in configured }
         // Custom agents bind by their *declared* credentials (review finding
@@ -3853,7 +3854,7 @@ final class AppModel: ObservableObject {
                 fallbackEnvironment: effectiveAccountEnvironment
             ) else {
                 ToastCenter.shared.show("That account does not match \(agent.name).", style: .error)
-                return
+                return nil
             }
             accountBinding = resolved
         } else {
@@ -3887,10 +3888,11 @@ final class AppModel: ObservableObject {
             initialTranscript: nil,
             initialDraft: initialDraft,
             initialQueuedPrompts: []
-        ) != nil else { return }
+        ) != nil else { return nil }
         focusPane(chatID, projectID: project.id)
         focusSurfaceFields(chatID)
         scheduleWorkspaceStateSave(projectID: project.id)
+        return chatID
     }
 
     @discardableResult
@@ -6280,11 +6282,12 @@ final class AppModel: ObservableObject {
     /// Launches a one-click agent session: an owned terminal that boots the
     /// agent's CLI in the chosen directory, exactly like Electron's prepared
     /// terminal agents.
+    @discardableResult
     func createAgentSession(
         _ agent: AgentProfile,
         inDirectory directory: URL,
         accountProfile: UsageAccountProfile? = nil
-    ) async {
+    ) async -> String? {
         await createOwnedSession(
             inDirectory: directory,
             agent: agent,

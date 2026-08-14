@@ -23,26 +23,42 @@ struct WorkspaceRestorationNoticeView: View {
         )
     }
 
+    nonisolated static func reservesLayoutSpace(
+        hasWorkspaceNotice: Bool,
+        hasProjectAccountIssue: Bool
+    ) -> Bool {
+        hasWorkspaceNotice || hasProjectAccountIssue
+    }
+
     var body: some View {
-        VStack(spacing: 6) {
-            if let notice = model.workspaceRestorationNotice {
-                Group {
-                    if notice.isBannerDismissed {
-                        collapsedIndicator(notice)
-                            .frame(maxWidth: .infinity, alignment: .trailing)
-                    } else {
-                        banner(notice)
-                            .frame(maxWidth: 620, alignment: .leading)
+        Group {
+            if Self.reservesLayoutSpace(
+                hasWorkspaceNotice: model.workspaceRestorationNotice != nil,
+                hasProjectAccountIssue: projectAccountRecoveryCenter.issue != nil
+            ) {
+                VStack(spacing: 6) {
+                    if let notice = model.workspaceRestorationNotice {
+                        Group {
+                            if notice.isBannerDismissed {
+                                collapsedIndicator(notice)
+                                    .frame(maxWidth: .infinity, alignment: .trailing)
+                            } else {
+                                banner(notice)
+                                    .frame(maxWidth: 620, alignment: .leading)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                        .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
+                    }
+                    if let issue = projectAccountRecoveryCenter.issue {
+                        projectAccountBanner(issue)
+                            .frame(maxWidth: 720, alignment: .leading)
                             .frame(maxWidth: .infinity, alignment: .leading)
+                            .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
                     }
                 }
-                .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
-            }
-            if let issue = projectAccountRecoveryCenter.issue {
-                projectAccountBanner(issue)
-                    .frame(maxWidth: 720, alignment: .leading)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
+                .padding(.horizontal, KaisolaVisualSystem.chromeInset + 4)
+                .padding(.bottom, 6)
             }
         }
         .animation(

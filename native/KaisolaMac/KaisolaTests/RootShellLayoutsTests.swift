@@ -50,6 +50,97 @@ final class RootShellLayoutsTests: XCTestCase {
         XCTAssertGreaterThan(image.tiffRepresentation?.count ?? 0, 1_000)
     }
 
+    func testTopBarWorkspaceDoesNotReserveAnEmptyToggleStrip() {
+        XCTAssertEqual(
+            NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
+            KaisolaVisualSystem.chromeInset
+        )
+        XCTAssertEqual(
+            NativeWorkspaceChrome.detailPanelTopInset(layout: .topBar),
+            NativeWorkspaceChrome.detailPanelTopInset(layout: .leftTree)
+        )
+    }
+
+    func testCollapsedSidebarMovesSessionIdentityPastWindowControls() {
+        XCTAssertEqual(
+            UnifiedSessionHeaderLayout.leadingInset(
+                navigationLayout: .leftTree,
+                columnVisibility: .all,
+                isWindowLeadingPane: true
+            ),
+            10
+        )
+        XCTAssertGreaterThanOrEqual(
+            UnifiedSessionHeaderLayout.leadingInset(
+                navigationLayout: .leftTree,
+                columnVisibility: .detailOnly,
+                isWindowLeadingPane: true
+            ),
+            150,
+            "the title must clear both the traffic lights and native sidebar button"
+        )
+        XCTAssertEqual(
+            UnifiedSessionHeaderLayout.leadingInset(
+                navigationLayout: .leftTree,
+                columnVisibility: .detailOnly,
+                isWindowLeadingPane: false
+            ),
+            10,
+            "only the pane whose header owns the window corner needs titlebar clearance"
+        )
+        XCTAssertEqual(
+            UnifiedSessionHeaderLayout.leadingInset(
+                navigationLayout: .topBar,
+                columnVisibility: .detailOnly,
+                isWindowLeadingPane: true
+            ),
+            10,
+            "top-bar navigation already reserves its own traffic-light lane"
+        )
+    }
+
+    func testRestorationNoticeReservesSpaceOnlyWhenItsObservedChildHasContent() {
+        XCTAssertFalse(
+            WorkspaceRestorationNoticeView.reservesLayoutSpace(
+                hasWorkspaceNotice: false,
+                hasProjectAccountIssue: false
+            )
+        )
+        XCTAssertTrue(
+            WorkspaceRestorationNoticeView.reservesLayoutSpace(
+                hasWorkspaceNotice: true,
+                hasProjectAccountIssue: false
+            )
+        )
+        XCTAssertTrue(
+            WorkspaceRestorationNoticeView.reservesLayoutSpace(
+                hasWorkspaceNotice: false,
+                hasProjectAccountIssue: true
+            )
+        )
+    }
+
+    func testCollapsedSidebarVisualFixtureStartsInDetailOnlyWithoutChangingProduction() {
+        XCTAssertEqual(
+            RootSidebarVisibilityFixture.initialVisibility(environment: [:]),
+            .all
+        )
+        XCTAssertEqual(
+            RootSidebarVisibilityFixture.initialVisibility(environment: [
+                "KAISOLA_NATIVE_VISUAL_SIDEBAR_VISIBILITY": "detailOnly",
+            ]),
+            .all,
+            "an ordinary launch must ignore fixture-only presentation flags"
+        )
+        XCTAssertEqual(
+            RootSidebarVisibilityFixture.initialVisibility(environment: [
+                "KAISOLA_NATIVE_VISUAL_FIXTURE": "1",
+                "KAISOLA_NATIVE_VISUAL_SIDEBAR_VISIBILITY": "detailOnly",
+            ]),
+            .detailOnly
+        )
+    }
+
     func testBothNavigationShellsShareTheNewSessionAndRealSurfaceRoutes() {
         let project = AppModel.ProjectGroup(
             id: "project-a",

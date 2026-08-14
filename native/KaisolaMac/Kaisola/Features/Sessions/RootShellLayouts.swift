@@ -50,21 +50,24 @@ enum RootShellRenderContract {
 /// same action model as the top-bar shell.
 struct RootLeftTreeShell<Sidebar: View, Detail: View>: View {
     let actions: RootShellActionModel
+    @Binding private var columnVisibility: NavigationSplitViewVisibility
     private let sidebar: (RootShellActionModel) -> Sidebar
     private let detail: (RootShellActionModel) -> Detail
 
     init(
         actions: RootShellActionModel,
+        columnVisibility: Binding<NavigationSplitViewVisibility> = .constant(.all),
         @ViewBuilder sidebar: @escaping (RootShellActionModel) -> Sidebar,
         @ViewBuilder detail: @escaping (RootShellActionModel) -> Detail
     ) {
         self.actions = actions
+        self._columnVisibility = columnVisibility
         self.sidebar = sidebar
         self.detail = detail
     }
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar(actions)
         } detail: {
             detail(actions)

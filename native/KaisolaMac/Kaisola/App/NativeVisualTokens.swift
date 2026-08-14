@@ -59,26 +59,23 @@ enum SurfaceTabChrome {
 /// own material the two large surfaces therefore landed at only 0.846 and
 /// 0.832 luminance. That is grey by construction.
 ///
-/// Whiteness is bought with one explicit, achromatic carrier between the
-/// desktop and `GlassBackdropWash`. The previous light recipe preserved the
-/// sampled desktop's RGB ratios, so a blue wallpaper was guaranteed to make a
-/// blue pane even though every declared veil constant was white. The carrier
-/// keeps blurred light and movement without inheriting the wallpaper's hue.
-/// The rails add their own named, tightly bounded cool-to-pearl edge tint;
-/// the canvas stays neutral white.
+/// The center and rails now have deliberately different jobs. The workspace
+/// carrier is opaque white, making the working canvas exact and stable. The
+/// rails have no second carrier at all: their single white veil sits at about
+/// twenty percent, so live material keeps its colour and movement. The rails
+/// add their own named, tightly bounded cool-to-pearl edge tint.
 enum LightGlassFrost {
     /// Neutral luminance of a painted wallpaper before the white veil.
     static let backdropLuminance: Double = 0.80
 
-    /// White laid over the live or painted desktop before the surface veil.
-    /// With the existing rail/canvas veils this leaves roughly 16-18% of the
-    /// underlying luminance variation visible and lands both surfaces near
-    /// sRGB 247 rather than grey. It is deliberately achromatic.
-    static let carrierWhiteCoverage: Double = 0.70
+    /// The workspace is a white working plane. An opaque carrier states that
+    /// directly and prevents a live desktop from tinting it at any clarity.
+    static let carrierWhiteCoverage: Double = 1.0
 
-    /// The rails use a thinner carrier than the canvas so the wallpaper can
-    /// move through them while the center remains a white working surface.
-    static let railCarrierWhiteCoverage: Double = 0.30
+    /// Rails get their frost from `GlassBackdropWash.sidebar` alone. A second
+    /// white layer would composite with its twenty-percent veil and quietly
+    /// return the old, opaque-looking forty-four-percent stack.
+    static let railCarrierWhiteCoverage: Double = 0.0
 
     /// White over the already-frosted workspace canvas. Light deliberately
     /// gets no second semantic material: that layer re-greyed the canvas and
@@ -141,15 +138,18 @@ enum LightRailTint {
     }
 }
 
-/// The light Tinted theme is a deliberate window-wide colour composition,
+/// The light Tinted theme is a deliberate, very gentle colour composition,
 /// rather than a sampled desktop hue that can turn every surface flat blue.
-/// White remains the carrier; cool and pearl live only at opposite edges.
+/// A pale sage-cool end crosses neutral white into a lilac-pearl end. No stop
+/// covers more than six percent of the white carrier.
 enum LightTintedGradient {
-    static let cool = (red: 90.0 / 255, green: 169.0 / 255, blue: 1.0)
-    static let pearl = (red: 1.0, green: 201.0 / 255, blue: 133.0 / 255)
-    static let coolCoverage = 0.16
-    static let neutralCoverage = 0.02
-    static let pearlCoverage = 0.12
+    /// `#A5CBB2`, a sage source whose 5.5% composite reads as `#FAFCFB`.
+    static let cool = (red: 165.0 / 255, green: 203.0 / 255, blue: 178.0 / 255)
+    /// `#CBB9E2`, a lilac pearl whose 5% composite reads as `#FCFCFE`.
+    static let pearl = (red: 203.0 / 255, green: 185.0 / 255, blue: 226.0 / 255)
+    static let coolCoverage = 0.055
+    static let neutralCoverage = 0.010
+    static let pearlCoverage = 0.050
     static let neutralLocation = 0.54
 
     static var coolColor: Color {
@@ -573,7 +573,7 @@ struct GlassBackdropWash: Equatable, Sendable {
     private static func sidebarBase(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
-            : light(top: 0.24, base: 0.20, bottom: 0.16)
+            : light(top: 0.22, base: 0.20, bottom: 0.18)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour

@@ -729,16 +729,17 @@ final class AppModelProjectContextTests: XCTestCase {
         let agent = try XCTUnwrap(AgentRegistry.all.first { AcpAdapter.forAgent($0.id) != nil })
         let directory = URL(fileURLWithPath: "/tmp/ctx-chat", isDirectory: true)
 
-        model.openChat(agent, inDirectory: directory)
+        let chatID = try XCTUnwrap(model.openChat(agent, inDirectory: directory))
 
         let project = try XCTUnwrap(model.projects.first)
         XCTAssertEqual(project.directory?.path, directory.path)
         XCTAssertEqual(model.chats(in: project.id).count, 1)
+        XCTAssertEqual(model.chats.first?.id, chatID)
         XCTAssertEqual(model.chats.first?.projectID, project.id)
         XCTAssertEqual(model.selectedProjectID, project.id)
         XCTAssertEqual(model.selectedProjectName, project.name)
 
-        if let chatID = model.chats.first?.id { await model.deleteChat(chatID) }
+        await model.deleteChat(chatID)
     }
 
     /// Quit/update teardown persists more than once: first before stopping ACP

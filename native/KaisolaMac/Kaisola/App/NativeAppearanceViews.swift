@@ -8,10 +8,8 @@ import SwiftUI
 struct NativeVisualEffectView: NSViewRepresentable {
     let material: NSVisualEffectView.Material
     var blendingMode: NSVisualEffectView.BlendingMode = .behindWindow
-    /// Light Glass must carry luminance and movement, not the hue of the window
-    /// behind it. Core Animation evaluates this after AppKit's vibrancy layer,
-    /// so even a saturated live backdrop reaches the white carrier as neutral
-    /// light and shade. Dark and explicitly Tinted surfaces leave it disabled.
+    /// Optional post-vibrancy saturation control. Rails leave it disabled so
+    /// the live desktop keeps its colour as well as its light and movement.
     var neutralizesChroma = false
 
     @MainActor
@@ -107,8 +105,9 @@ struct DesktopGlassLayer: View {
     let liveMaterial: NSVisualEffectView.Material
     let carrierWhiteCoverage: Double
     /// Tint coverage (dark, light) laid over *live* vibrancy only. The light
-    /// sampled tint is absent, so only the dark half is ever rendered. The
-    /// painted wallpaper already is the hue and must not be tinted twice.
+    /// half may be zero because live vibrancy already carries the desktop hue;
+    /// dark retains its small sampled lift. The painted wallpaper already is
+    /// the hue and must not be tinted twice.
     ///
     /// See `SidebarBackdropView` for why the dark half of the pair is so much
     /// smaller than the light one.
@@ -141,20 +140,21 @@ struct DesktopGlassLayer: View {
         isDark ? requested : .sidebar
     }
 
-    /// Light Glass never carries the sampled RGB hue. Returning exact white is
-    /// a fail-closed contract for callers; the live overlay is also omitted in
-    /// light so this does not become a second, redundant whitening layer.
+    /// Live Glass keeps the sampled RGB ratios in both appearances. Light's
+    /// exact white belongs to the workspace carrier, not to a filter on the
+    /// navigation rails.
     nonisolated static func resolvedLiveTint(
         _ tint: DesktopTintComponents,
         isDark: Bool
     ) -> DesktopTintComponents {
-        isDark ? tint : DesktopTintComponents(red: 1, green: 1, blue: 1)
+        tint
     }
 
-    /// Sampled colour belongs to dark Glass and to the explicit Tinted theme,
-    /// never to light Glass.
+    /// Both appearances preserve the live material's sampled colour. The
+    /// light sampled overlay may still have zero coverage; this flag also
+    /// keeps the vibrancy layer itself out of the chroma-neutralizing path.
     nonisolated static func appliesSampledLiveTint(isDark: Bool) -> Bool {
-        isDark
+        true
     }
 
     /// Coverage for the no-wallpaper fallback. Zero in light makes a failed
@@ -184,15 +184,16 @@ struct DesktopGlassLayer: View {
             case .behindWindow:
                 NativeVisualEffectView(
                     material: Self.resolvedLiveMaterial(liveMaterial, isDark: isDark),
-                    neutralizesChroma: !isDark
+                    neutralizesChroma: !Self.appliesSampledLiveTint(isDark: isDark)
                 )
                 if let liveTint, Self.appliesSampledLiveTint(isDark: isDark) {
                     let tint = Self.resolvedLiveTint(desktop.painting.tint, isDark: isDark)
                     let tintColor = Color(red: tint.red, green: tint.green, blue: tint.blue)
+                    let coverage = isDark ? liveTint.dark : liveTint.light
                     LinearGradient(
                         colors: [
-                            tintColor.opacity(liveTint.dark),
-                            tintColor.opacity(liveTint.dark * 0.55),
+                            tintColor.opacity(coverage),
+                            tintColor.opacity(coverage * 0.55),
                         ],
                         startPoint: .top,
                         endPoint: .bottom
@@ -570,9 +571,9 @@ struct SidebarBackdropView: View {
     /// takes that to 0.462, and halving the dark tint takes it to **0.561** —
     /// the material behind the window contributes 67% more than it did.
     ///
-    /// Dark keeps the sampled tint at 0.15. Light is exactly zero: preserving
-    /// sampled RGB ratios was the source of the blue cast, so light gets its
-    /// depth from AppKit vibrancy beneath the achromatic white carrier instead.
+    /// Dark keeps the sampled tint at 0.15. Light's explicit overlay is zero
+    /// because AppKit vibrancy now preserves the live desktop's own chroma;
+    /// adding its average again would tint the material twice.
     ///
     /// (Unlike the wallpaper source, this cannot be measured offline: it lands
     /// on live vibrancy, whose input is whatever is behind the window. The

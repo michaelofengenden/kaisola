@@ -91,4 +91,25 @@ final class NewSessionChooserTests: XCTestCase {
             "Session did not start. Check the terminal connection or Run On choice, then try again."
         )
     }
+
+    /// The choice cards answer the pointer: rest, hover, and press are three
+    /// distinct steps, and the hover stroke brightens with the fill so the
+    /// card reads as raised rather than merely darker.
+    func testChoiceCardInteractionLadderStepsUpFromRestThroughHoverToPress() {
+        XCTAssertLessThan(
+            NewSessionChoiceButtonStyle.restFill,
+            NewSessionChoiceButtonStyle.hoverFill
+        )
+        XCTAssertLessThan(
+            NewSessionChoiceButtonStyle.hoverFill,
+            NewSessionChoiceButtonStyle.pressFill
+        )
+        XCTAssertLessThan(
+            NewSessionChoiceButtonStyle.restStroke,
+            NewSessionChoiceButtonStyle.hoverStroke
+        )
+        // The whole ladder stays a wash, never a filled chip.
+        XCTAssertLessThanOrEqual(NewSessionChoiceButtonStyle.pressFill, 0.12)
+        XCTAssertLessThanOrEqual(NewSessionChoiceButtonStyle.hoverStroke, 0.25)
+    }
 }

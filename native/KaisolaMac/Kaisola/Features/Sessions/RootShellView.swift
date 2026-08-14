@@ -4555,14 +4555,12 @@ enum NativeWorkspaceChrome {
     static let projectSidebarMinimumWidth: CGFloat = 168
     /// The rail's resting width. 200 → 248 in v1.1.6 to buy a legible title and
     /// a visible hierarchy step; 248 → 228 in v1.1.7 once the rail stopped
-    /// spending width on chrome; 228 → 210 in v1.1.8.
-    ///
-    /// This step is the first one the row grammar actually pays for. The session
-    /// indent gives back 4pt (40 → 36) so a title still renders 15 characters —
-    /// see `QuietRailMetrics.sessionIndent`. The footer deliberately shows only
-    /// the account's first name at every width; the whole name stays in its help
-    /// text and at the top of the account menu.
-    static let projectSidebarIdealWidth: CGFloat = 210
+    /// spending width on chrome; 228 → 210 in v1.1.8; 210 → 248 in v0.1.124 by
+    /// request — long project and session titles were the point of the wide
+    /// rail, and the density passes had walked the default back below legible.
+    /// Users who dragged their rail keep their width; only fresh windows open
+    /// at the wider resting point.
+    static let projectSidebarIdealWidth: CGFloat = 248
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
     static let projectSidebarMaximumWidth: CGFloat = 340

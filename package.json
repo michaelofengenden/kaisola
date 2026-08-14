@@ -1,6 +1,6 @@
 {
   "name": "kaisola-native",
-  "version": "0.1.124",
+  "version": "0.1.125",
   "private": true,
   "description": "Native Swift macOS and iPhone apps for Kaisola",
   "engines": {

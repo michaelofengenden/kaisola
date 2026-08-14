@@ -8,7 +8,16 @@ public enum BrokerWire {
     public static let protocolVersion = 2
     public static let securityEpoch = 1
     public static let implementationVersion = 2
-    public static let helperPackageSchema = 1
+    public static let nodeHelperPackageSchema = 1
+    public static let nativeHelperPackageSchema = 2
+    public static let supportedHelperPackageSchemas: Set<Int> = [
+        nodeHelperPackageSchema,
+        nativeHelperPackageSchema,
+    ]
+    /// Shipping remains on the Node helper until the launch half of Phase 1.
+    /// Keep this alias pinned to schema 1 so existing bootstrap/configuration
+    /// gates do not accidentally make a decoded schema-2 package launchable.
+    public static let helperPackageSchema = nodeHelperPackageSchema
     /// Protocol-2 implementation N and N+1 are additive-compatible. A future
     /// implementation that needs a wire break must increment `protocolVersion`
     /// rather than widening this range silently.
@@ -37,12 +46,29 @@ public enum BrokerWire {
     /// straight on the main thread.
     public static let terminalObserverCoalescingFeature = "terminal-observer-coalescing-v1"
     public static let terminalHistoryFeature = "terminal-history-v1"
+    public static let terminalHistoryContinuousFeature = "terminal-history-continuous-v1"
     public static let observerRoleFeature = "observer-role-v1"
     public static let brokerUpdateFeature = "broker-update-v1"
     public static let brokerRollingUpdateFeature = "broker-rolling-update-v1"
     public static let brokerMutationIdempotencyFeature = "broker-mutation-idempotency-v1"
     public static let brokerInventoryFeature = "broker-inventory-v1"
     public static let brokerAdministrationFeature = "broker-administration-v1"
+    public static let terminalExitStatusFeature = "terminal-exit-status-v1"
+    public static let advertisedFeatures: [String] = [
+        terminalObserveFeature,
+        terminalHistoryFeature,
+        terminalHistoryContinuousFeature,
+        observerRoleFeature,
+        brokerUpdateFeature,
+        brokerRollingUpdateFeature,
+        brokerMutationIdempotencyFeature,
+        brokerInventoryFeature,
+        brokerAdministrationFeature,
+        terminalExitStatusFeature,
+        terminalObserverOnlyOutputFeature,
+        terminalAttachAcknowledgementFeature,
+        terminalObserverCoalescingFeature,
+    ]
     public static let defaultMaximumLiveTerminals = 64
     public static let maximumConfigurableLiveTerminals = 512
     public static let observerMethods: Set<String> = [

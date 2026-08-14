@@ -4,20 +4,53 @@ import XCTest
 import KaisolaTestSupport
 
 final class BrokerWireTests: XCTestCase {
+    private struct FeatureFixture: Decodable {
+        let schemaVersion: Int
+        let features: [String]
+    }
+
+    private enum FeatureContractError: Error, Equatable {
+        case unsupportedSchema(Int)
+        case advertisedFeaturesDiffer
+    }
+
+    private func loadFeatureFixture() throws -> FeatureFixture {
+        let url = try RepositoryFixtures.brokerFixture(named: "features-v1")
+        return try JSONDecoder().decode(FeatureFixture.self, from: Data(contentsOf: url))
+    }
+
+    private func validateFeatureContract(
+        _ advertisedFeatures: [String],
+        against fixture: FeatureFixture
+    ) throws {
+        guard fixture.schemaVersion == 1 else {
+            throw FeatureContractError.unsupportedSchema(fixture.schemaVersion)
+        }
+        guard advertisedFeatures == fixture.features else {
+            throw FeatureContractError.advertisedFeaturesDiffer
+        }
+    }
+
     func testConstantsMatchTheShippingNodeBroker() {
         XCTAssertEqual(BrokerWire.protocolVersion, 2)
         XCTAssertEqual(BrokerWire.securityEpoch, 1)
         XCTAssertEqual(BrokerWire.implementationVersion, 2)
+        XCTAssertEqual(BrokerWire.nodeHelperPackageSchema, 1)
+        XCTAssertEqual(BrokerWire.nativeHelperPackageSchema, 2)
+        XCTAssertEqual(BrokerWire.supportedHelperPackageSchemas, Set([1, 2]))
+        XCTAssertEqual(BrokerWire.helperPackageSchema, BrokerWire.nodeHelperPackageSchema)
         XCTAssertEqual(BrokerWire.helperPackageSchema, 1)
         XCTAssertEqual(BrokerWire.compatibleImplementationVersions, 1...2)
         XCTAssertEqual(BrokerWire.terminalObserveFeature, "terminal-observe-v1")
         XCTAssertEqual(BrokerWire.terminalHistoryFeature, "terminal-history-v1")
+        XCTAssertEqual(BrokerWire.terminalHistoryContinuousFeature, "terminal-history-continuous-v1")
         XCTAssertEqual(BrokerWire.observerRoleFeature, "observer-role-v1")
         XCTAssertEqual(BrokerWire.brokerUpdateFeature, "broker-update-v1")
         XCTAssertEqual(BrokerWire.brokerRollingUpdateFeature, "broker-rolling-update-v1")
         XCTAssertEqual(BrokerWire.brokerMutationIdempotencyFeature, "broker-mutation-idempotency-v1")
         XCTAssertEqual(BrokerWire.brokerInventoryFeature, "broker-inventory-v1")
         XCTAssertEqual(BrokerWire.brokerAdministrationFeature, "broker-administration-v1")
+        XCTAssertEqual(BrokerWire.terminalExitStatusFeature, "terminal-exit-status-v1")
         XCTAssertEqual(BrokerWire.defaultMaximumLiveTerminals, 64)
         XCTAssertEqual(BrokerWire.maximumConfigurableLiveTerminals, 512)
         XCTAssertEqual(BrokerWire.observerMethods, [
@@ -46,6 +79,27 @@ final class BrokerWireTests: XCTestCase {
             512 * 1_024
         )
         XCTAssertEqual(BrokerWire.maximumEncodedBytes(for: .event("terminal:observer-exit")), 64 * 1_024)
+    }
+
+    func testAdvertisedFeaturesMatchTheSharedOrderedContract() throws {
+        let fixture = try loadFeatureFixture()
+
+        XCTAssertEqual(fixture.schemaVersion, 1)
+        XCTAssertEqual(BrokerWire.advertisedFeatures, fixture.features)
+        XCTAssertNoThrow(try validateFeatureContract(BrokerWire.advertisedFeatures, against: fixture))
+    }
+
+    func testSharedFeatureContractDetectsOneDeliberatelyDriftedSwiftFeature() throws {
+        let fixture = try loadFeatureFixture()
+        var driftedFeatures = BrokerWire.advertisedFeatures
+        let index = try XCTUnwrap(
+            driftedFeatures.firstIndex(of: "terminal-exit-status-v1")
+        )
+        driftedFeatures[index] = "terminal-exit-status-v1-drift"
+
+        XCTAssertThrowsError(try validateFeatureContract(driftedFeatures, against: fixture)) { error in
+            XCTAssertEqual(error as? FeatureContractError, .advertisedFeaturesDiffer)
+        }
     }
 
     func testCrossLanguageCompatibilityMatrix() throws {

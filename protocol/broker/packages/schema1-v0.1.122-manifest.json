@@ -1,0 +1,48 @@
+{
+  "fixtureProvenance": "synthetic schema-1 digest reference shaped like the v0.1.122 helper contract; this is not a captured shipping manifest",
+  "schemaVersion": 1,
+  "packageVersion": "1.1.0",
+  "contentDigest": "45af6df1106c641a4d0efc6d1cffe5c9fbae24c7e4a774509b721dbbaed6f881",
+  "brokerImplementationVersion": 2,
+  "brokerProtocol": {
+    "minimum": 2,
+    "maximum": 2,
+    "securityEpoch": 1
+  },
+  "node": {
+    "version": "22.23.1",
+    "abi": "127",
+    "architectures": [
+      "arm64"
+    ]
+  },
+  "nodePty": {
+    "version": "1.1.0"
+  },
+  "claudeAgentSDK": {
+    "version": "0.3.205"
+  },
+  "files": [
+    {
+      "path": "bin/kaisola-broker-bootstrap",
+      "role": "launch-agent-bootstrap",
+      "size": 9,
+      "mode": "0755",
+      "sha256": "333c04dd151a2a6831c039cb9a651df29198be8a04e16ce861d4b6a34a11c954"
+    },
+    {
+      "path": "bin/node",
+      "role": "node-runtime",
+      "size": 4,
+      "mode": "0755",
+      "sha256": "545ea538461003efdc8c81c244531b003f6f26cfccf6c0073b3239fdedf49446"
+    },
+    {
+      "path": "lib/runtime/node-broker/session-broker.cjs",
+      "role": "broker-javascript",
+      "size": 6,
+      "mode": "0644",
+      "sha256": "faa2a9bdcc837728fffdebbca0ada344aca67ebe6aa54836d298377820590de2"
+    }
+  ]
+}

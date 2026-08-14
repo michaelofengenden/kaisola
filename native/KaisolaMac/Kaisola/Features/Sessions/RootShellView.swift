@@ -252,6 +252,12 @@ struct RootShellView: View {
     }
 
     var body: some View {
+        chromeWithPresentation
+    }
+
+    /// Notification handlers are kept in their own modifier chain so older
+    /// Swift compilers do not have to solve the entire root view at once.
+    private var chromeWithNotifications: some View {
         chromeDecorated
             .kaisolaReduceMotionFallback()
             .onReceive(NotificationCenter.default.publisher(for: .kaisolaOpenFileLink)) { note in
@@ -283,6 +289,12 @@ struct RootShellView: View {
                 settingsSectionID = sectionID
                 showSettings = true
             }
+    }
+
+    /// Model observation and fixture setup are separated from notification
+    /// delivery to stay within the Swift 6.0 type-checking budget.
+    private var chromeWithLifecycle: some View {
+        chromeWithNotifications
             .onChange(of: model.latestAgentFileActivity) { _, activity in
                 guard let activity,
                       WorkspaceAgentFileFollowPolicy.shouldOpen(
@@ -329,6 +341,10 @@ struct RootShellView: View {
                 ) else { return }
                 UsageCenter.shared.refreshPlanUsage(workspace: model.currentProjectDirectory)
             }
+    }
+
+    private var chromeWithPresentation: some View {
+        chromeWithLifecycle
             .sheet(isPresented: $showOnboarding, onDismiss: presentOnboardingSettingsIfNeeded) {
                 OnboardingView(
                     model: model,

@@ -68,9 +68,19 @@ enum LightGlassFrost {
     /// Neutral luminance of a painted wallpaper before the white veil.
     static let backdropLuminance: Double = 0.80
 
-    /// The workspace is a white working plane. An opaque carrier states that
-    /// directly and prevents a live desktop from tinting it at any clarity.
-    static let carrierWhiteCoverage: Double = 1.0
+    /// The workspace is a white-led plane the desktop still shines through.
+    ///
+    /// This was 1.0 — an opaque white carrier, "the workspace is a white
+    /// working plane" — and that made light Glass indistinguishable from the
+    /// white Solid across the whole center of the window. Michael, 2026-08-14:
+    /// "for glass … make sure they're actually translucent." At 0.45, with the
+    /// workspace veil thinned in step, the canvas still white-leads (modeled
+    /// luminance ≈ 0.93 against the normalized 0.80 still) but a third of the
+    /// luminance-normalized, spread-capped desktop arrives — the same chroma
+    /// presence the rail era measured as unmistakably tinted. The ink ladder
+    /// was solved against the rails' deeper worst patch, so the brighter
+    /// canvas stays inside every measured floor.
+    static let carrierWhiteCoverage: Double = 0.45
 
     /// Rails get their frost from `GlassBackdropWash.sidebar` alone. A second
     /// white layer would composite with its twelve-percent veil and quietly
@@ -138,20 +148,27 @@ enum LightRailTint {
     }
 }
 
-/// The light Tinted theme is a deliberate, very gentle colour composition,
-/// rather than a sampled desktop hue that can turn every surface flat blue.
-/// A pale sage-cool end crosses a warm pearl into a lilac-pearl end. No stop
-/// covers more than eleven percent of the white carrier.
+/// The light Tinted theme is a deliberate colour composition rather than a
+/// sampled desktop hue that can turn every surface flat blue. A sage-cool end
+/// crosses a warm pearl into a lilac-pearl end.
+///
+/// The stops tripled in 2026-08-14's pass. At eleven percent the whole
+/// composition quantized to within a few counts of white — the Tinted fixture
+/// was pixel-for-pixel the Glass fixture — and Michael asked for "a flowing
+/// gradient tint", which first of all requires a gradient one can see. Thirty
+/// percent keeps the sources pastel (the sage end composites to `#E0EDE5`,
+/// nowhere near the flat-blue failure the sampled hue had) while the sweep
+/// finally reads as colour crossing the surface.
 enum LightTintedGradient {
-    /// `#A5CBB2`, a sage source whose 11% composite reads as `#F5FAF7`.
+    /// `#A5CBB2`, a sage source whose 30% composite reads as `#E0EDE5`.
     static let cool = (red: 165.0 / 255, green: 203.0 / 255, blue: 178.0 / 255)
     /// `#E9DDCF`, a quiet warm midpoint that prevents a broad white band.
     static let neutral = (red: 233.0 / 255, green: 221.0 / 255, blue: 207.0 / 255)
-    /// `#CBB9E2`, a lilac pearl whose 10% composite reads as `#FAF8FC`.
+    /// `#CBB9E2`, a lilac pearl whose 30% composite reads as `#EFEAF7`.
     static let pearl = (red: 203.0 / 255, green: 185.0 / 255, blue: 226.0 / 255)
-    static let coolCoverage = 0.11
-    static let neutralCoverage = 0.10
-    static let pearlCoverage = 0.10
+    static let coolCoverage = 0.30
+    static let neutralCoverage = 0.22
+    static let pearlCoverage = 0.30
     static let neutralLocation = 0.54
 
     static var coolColor: Color {
@@ -184,6 +201,89 @@ enum LightTintedGradient {
             startPoint: startPoint,
             endPoint: endPoint
         )
+    }
+}
+
+/// The Tinted surfaces' slow drift — what makes the gradient *flow*.
+///
+/// The motion is a Core Animation autoreversing drift of the gradient's
+/// endpoints, chosen over any SwiftUI timeline because the render server owns
+/// the whole animation: zero main-thread wakeups, zero invalidation traffic,
+/// and the glass-era energy rules (painted stills, no per-frame app work)
+/// unchanged.
+/// The period is deliberately far below attention speed — the surface should
+/// never be *seen moving*, only found elsewhere when the eye returns — and
+/// Reduce Motion pins the endpoints outright.
+enum TintFlowMotion {
+    /// One full drift in each direction, in seconds. Twenty-six seconds is
+    /// glacial on purpose: at this period the endpoint travels under a point
+    /// per second on a full-height window.
+    static let period: TimeInterval = 26
+    /// How far each endpoint wanders, as a fraction of the unit square. The
+    /// sweep stays diagonal throughout; only its anchoring breathes.
+    static let drift: Double = 0.18
+
+    /// Where the drifting endpoints travel between, for one placement.
+    /// Pure, so the geometry is a test rather than a screenshot.
+    static func endpoints(
+        start: CGPoint,
+        end: CGPoint
+    ) -> (startFrom: CGPoint, startTo: CGPoint, endFrom: CGPoint, endTo: CGPoint) {
+        let dx = (end.x - start.x) * drift
+        let dy = (end.y - start.y) * drift
+        // The start leads the drift and the end trails it, so the sweep's
+        // length breathes a little as it moves and the midpoint truly travels.
+        return (
+            startFrom: start,
+            startTo: CGPoint(x: start.x + dx, y: start.y + dy),
+            endFrom: CGPoint(x: end.x - dx, y: end.y - dy),
+            endTo: end
+        )
+    }
+
+    /// The dark companion hue: the sampled desktop tint rotated far enough
+    /// around the wheel that the two ends of the sweep read as different
+    /// colours of one family, never as a second unrelated accent.
+    static let companionHueRotation: Double = 0.09
+
+    /// Pure HSB rotation of a sampled tint. Saturation and brightness are
+    /// kept, so the companion stays exactly as quiet as its source.
+    static func companion(
+        red: Double,
+        green: Double,
+        blue: Double
+    ) -> (red: Double, green: Double, blue: Double) {
+        let maximum = max(red, max(green, blue))
+        let minimum = min(red, min(green, blue))
+        let delta = maximum - minimum
+        guard delta > 0.0001, maximum > 0.0001 else { return (red, green, blue) }
+        var hue: Double
+        if maximum == red {
+            hue = ((green - blue) / delta).truncatingRemainder(dividingBy: 6)
+        } else if maximum == green {
+            hue = (blue - red) / delta + 2
+        } else {
+            hue = (red - green) / delta + 4
+        }
+        hue /= 6
+        if hue < 0 { hue += 1 }
+        hue = (hue + companionHueRotation).truncatingRemainder(dividingBy: 1)
+        let saturation = delta / maximum
+        let brightness = maximum
+        let sector = hue * 6
+        let index = Int(sector) % 6
+        let fraction = sector - Double(Int(sector))
+        let p = brightness * (1 - saturation)
+        let q = brightness * (1 - saturation * fraction)
+        let t = brightness * (1 - saturation * (1 - fraction))
+        switch index {
+        case 0: return (brightness, t, p)
+        case 1: return (q, brightness, p)
+        case 2: return (p, brightness, t)
+        case 3: return (p, q, brightness)
+        case 4: return (t, p, brightness)
+        default: return (brightness, p, q)
+        }
     }
 }
 
@@ -605,9 +705,12 @@ struct GlassBackdropWash: Equatable, Sendable {
     }
 
     private static func workspaceBase(isDark: Bool) -> GlassBackdropWash {
+        // Light stepped 0.40 → 0.38 with the 2026-08-14 carrier drop; the two
+        // move together so the canvas lands at modeled luminance ≈ 0.93,
+        // white-led but no longer the flat plane the opaque carrier made it.
         isDark
             ? dark(top: 0.30, base: 0.37, bottom: 0.46)
-            : light(top: 0.46, base: 0.40, bottom: 0.36)
+            : light(top: 0.44, base: 0.38, bottom: 0.34)
     }
 
     /// How much of the workspace veil an **idle** canvas keeps.

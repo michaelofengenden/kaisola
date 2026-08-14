@@ -1593,6 +1593,134 @@ final class AppModelReconnectTests: XCTestCase {
         await fixture.model.disconnect()
     }
 
+    func testInitialTopologyProviderNilFailsClosedBeforeClientConnect() async throws {
+        let authority = topologyAuthorityFixture()
+        let preparer = MutableTopologyBrokerPreparer(
+            info: authority.info,
+            topology: nil
+        )
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            brokerPreparer: preparer
+        )
+        defer { fixture.cleanUp() }
+
+        await fixture.model.reload()
+
+        let topologyRequests = await preparer.topologyRequests()
+        let connectionAttempts = await fixture.client.connectionAttempts()
+        XCTAssertGreaterThanOrEqual(topologyRequests, 1)
+        XCTAssertEqual(connectionAttempts, 0)
+        XCTAssertFalse(fixture.model.connectionState.isConnected)
+        await fixture.model.disconnect()
+    }
+
+    func testEstablishedTopologyProviderNilDisconnectsAndReconnectsAfterAuthorityReturns() async throws {
+        let authority = topologyAuthorityFixture()
+        let preparer = MutableTopologyBrokerPreparer(
+            info: authority.info,
+            topology: authority.topology
+        )
+        let control = RecordingBrokerControlClient()
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            brokerPreparer: preparer,
+            controlClient: control
+        )
+        defer { fixture.cleanUp() }
+        await fixture.model.reload()
+        XCTAssertTrue(fixture.model.connectionState.isConnected)
+        let initialConnectionAttempts = await fixture.client.connectionAttempts()
+        XCTAssertEqual(initialConnectionAttempts, 1)
+        let disconnectsBeforeAuthorityLoss = await fixture.client.disconnectAttempts()
+
+        await preparer.setTopology(nil)
+        await fixture.model.refreshInventory()
+        await waitUntil {
+            await fixture.client.disconnectAttempts() > disconnectsBeforeAuthorityLoss
+                && !fixture.model.connectionState.isConnected
+        }
+        let connectionAttemptsWhileAuthorityMissing = await fixture.client.connectionAttempts()
+        XCTAssertEqual(
+            connectionAttemptsWhileAuthorityMissing,
+            1,
+            "A missing authoritative topology must never redial the retained route."
+        )
+        let createsBeforeAuthorityLoss = await control.createAttempts()
+        let createdWithoutAuthority = await fixture.model.createTerminal(inDirectory: fixture.root)
+        let createsAfterAuthorityLoss = await control.createAttempts()
+        XCTAssertNil(createdWithoutAuthority)
+        XCTAssertEqual(
+            createsAfterAuthorityLoss,
+            createsBeforeAuthorityLoss,
+            "A still-open controller lane must not create on a route whose topology authority was revoked."
+        )
+
+        await preparer.setTopology(authority.topology)
+        await waitUntil {
+            await fixture.client.connectionAttempts() >= 2
+                && fixture.model.connectionState.isConnected
+        }
+        let finalDisconnectAttempts = await fixture.client.disconnectAttempts()
+        XCTAssertGreaterThanOrEqual(finalDisconnectAttempts, 2)
+        await fixture.model.disconnect()
+    }
+
+    func testTopologyAuthorityIsRecheckedAfterObserverDialBeforeConnectionPublishes() async throws {
+        let authority = topologyAuthorityFixture()
+        let preparer = MutableTopologyBrokerPreparer(
+            info: authority.info,
+            topology: authority.topology,
+            nilAfterTopologyRequestCount: 1
+        )
+        let control = RecordingBrokerControlClient()
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            brokerPreparer: preparer,
+            controlClient: control
+        )
+        defer { fixture.cleanUp() }
+
+        await fixture.model.reload()
+
+        let observerConnections = await fixture.client.connectionAttempts()
+        let controlConnections = await control.connectionCount()
+        let topologyRequests = await preparer.topologyRequests()
+        XCTAssertGreaterThanOrEqual(observerConnections, 1)
+        XCTAssertEqual(controlConnections, 0)
+        XCTAssertFalse(fixture.model.connectionState.isConnected)
+        XCTAssertGreaterThanOrEqual(topologyRequests, 2)
+        await fixture.model.disconnect()
+    }
+
+    func testTopologyAuthorityRevokedDuringControlConnectNeverEnablesCreate() async throws {
+        let authority = topologyAuthorityFixture()
+        let preparer = MutableTopologyBrokerPreparer(
+            info: authority.info,
+            topology: authority.topology
+        )
+        let control = RecordingBrokerControlClient(onConnect: {
+            await preparer.setTopology(nil)
+        })
+        let fixture = try Fixture(
+            failingConnectAttempts: [],
+            brokerPreparer: preparer,
+            controlClient: control
+        )
+        defer { fixture.cleanUp() }
+
+        await fixture.model.reload()
+
+        let controlConnections = await control.connectionCount()
+        let created = await fixture.model.createTerminal(inDirectory: fixture.root)
+        let createAttempts = await control.createAttempts()
+        XCTAssertGreaterThanOrEqual(controlConnections, 1)
+        XCTAssertFalse(fixture.model.connectionState.isConnected)
+        XCTAssertNil(created)
+        XCTAssertEqual(createAttempts, 0)
+        await fixture.model.disconnect()
+    }
+
     func testControllerLaneDisconnectReconnectsAndReattachesOwnership() async throws {
         let fixture = try ControllerReconnectFixture()
         defer { fixture.cleanUp() }
@@ -1644,6 +1772,52 @@ final class AppModelReconnectTests: XCTestCase {
         )
     }
 
+    private func topologyAuthorityFixture() -> (
+        info: BrokerInfo,
+        topology: BrokerGenerationTopology
+    ) {
+        let currentInfo = BrokerInfo(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            pid: 54_321,
+            socketPath: "/tmp/kaisola-topology-current.sock",
+            token: String(repeating: "d", count: 64),
+            startedAt: 1_784_250_003_000,
+            version: "current"
+        )
+        let drainingInfo = BrokerInfo(
+            protocolVersion: BrokerWire.protocolVersion,
+            securityEpoch: BrokerWire.securityEpoch,
+            pid: 54_320,
+            socketPath: "/tmp/kaisola-topology-draining.sock",
+            token: String(repeating: "e", count: 64),
+            startedAt: 1_784_250_002_000,
+            version: "draining"
+        )
+        return (
+            currentInfo,
+            BrokerGenerationTopology(
+                current: BrokerGenerationRecord(
+                    id: String(repeating: "d", count: 64),
+                    role: .current,
+                    info: currentInfo,
+                    packageRoot: "/tmp/kaisola-topology-current",
+                    registeredAt: currentInfo.startedAt
+                ),
+                draining: [
+                    BrokerGenerationRecord(
+                        id: String(repeating: "e", count: 64),
+                        role: .draining,
+                        info: drainingInfo,
+                        packageRoot: "/tmp/kaisola-topology-draining",
+                        registeredAt: drainingInfo.startedAt
+                    ),
+                ],
+                registryTopologyVersion: 7
+            )
+        )
+    }
+
     private static func terminalPane(_ id: String) -> NativeRestorablePaneState {
         NativeRestorablePaneState(
             id: id,
@@ -1670,12 +1844,18 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
     private var writeAttemptCountsByTerminalID: [String: Int] = [:]
     private var disconnectHandler: (@Sendable (any Error) -> Void)?
     private var connectCount = 0
+    private var createCount = 0
     private var recordedAttaches: [String] = []
     private let agentTurnAccepted: Bool
+    private let onConnect: (@Sendable () async -> Void)?
     private var recordedAgentTurns: [Bool] = []
 
-    init(agentTurnAccepted: Bool = true) {
+    init(
+        agentTurnAccepted: Bool = true,
+        onConnect: (@Sendable () async -> Void)? = nil
+    ) {
         self.agentTurnAccepted = agentTurnAccepted
+        self.onConnect = onConnect
     }
 
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {
@@ -1684,6 +1864,7 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
 
     func connect(to info: BrokerInfo, ownerID: String) async throws {
         connectCount += 1
+        await onConnect?()
     }
 
     func createTerminal(
@@ -1696,7 +1877,8 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
         rows: Int,
         restore: Bool
     ) async throws -> TerminalCreation {
-        TerminalCreation(
+        createCount += 1
+        return TerminalCreation(
             terminalID: terminalID,
             projectID: projectID,
             pid: 1,
@@ -1749,6 +1931,7 @@ private actor RecordingBrokerControlClient: BrokerControlServing {
         writeAttemptCountsByTerminalID[terminalID, default: 0]
     }
     func connectionCount() -> Int { connectCount }
+    func createAttempts() -> Int { createCount }
     func attachCalls() -> [String] { recordedAttaches }
     func simulateDisconnect() { disconnectHandler?(BrokerClientError.connectionClosed) }
 }
@@ -2019,6 +2202,57 @@ private struct MonitoredBrokerPreparer: BrokerInfoPreparing, BrokerUpgradeMonito
     func retirementDiagnostics() async -> [BrokerRetirementDiagnostic] { [] }
 }
 
+private actor MutableTopologyBrokerPreparer:
+    BrokerGenerationTopologyProviding,
+    BrokerUpgradeMonitoring
+{
+    private let info: BrokerInfo
+    private var topology: BrokerGenerationTopology?
+    private var topologyRequestCount = 0
+    private let nilAfterTopologyRequestCount: Int?
+
+    init(
+        info: BrokerInfo,
+        topology: BrokerGenerationTopology?,
+        nilAfterTopologyRequestCount: Int? = nil
+    ) {
+        self.info = info
+        self.topology = topology
+        self.nilAfterTopologyRequestCount = nilAfterTopologyRequestCount
+    }
+
+    func prepare() async throws -> BrokerInfo { info }
+
+    func generationTopology() async -> BrokerGenerationTopology? {
+        topologyRequestCount += 1
+        if let nilAfterTopologyRequestCount,
+           topologyRequestCount > nilAfterTopologyRequestCount {
+            return nil
+        }
+        return topology
+    }
+
+    func setTopology(_ topology: BrokerGenerationTopology?) {
+        self.topology = topology
+    }
+
+    func topologyRequests() -> Int { topologyRequestCount }
+
+    func upgradeState() async -> BrokerUpgradeState {
+        .pending(
+            fromContentDigest: String(repeating: "e", count: 64),
+            targetContentDigest: String(repeating: "d", count: 64),
+            reason: .requestUnavailable
+        )
+    }
+
+    func attemptUpgradeIfNeeded() async -> BrokerUpgradeState {
+        await upgradeState()
+    }
+
+    func retirementDiagnostics() async -> [BrokerRetirementDiagnostic] { [] }
+}
+
 /// An owned agent terminal on a broker whose upgrade monitor is observable,
 /// so the agent-turn signal and the update gate can be exercised together.
 @MainActor
@@ -2108,6 +2342,8 @@ private final class Fixture {
 
     init(
         failingConnectAttempts: Set<Int>,
+        brokerPreparer: (any BrokerInfoPreparing)? = nil,
+        controlClient: (any BrokerControlServing)? = nil,
         completedAtByTerminalID: [String: Int64] = [:],
         transcriptRemovalFailure: AcpTranscriptStore.RemovalFailurePoint? = nil,
         transcriptTombstoneFailure: AcpTranscriptStore.TombstoneFailurePoint? = nil,
@@ -2152,8 +2388,10 @@ private final class Fixture {
             updatesDockBadge: false
         )
         model = AppModel(
-            brokerPreparer: LocatedBrokerInfoPreparer(locator: FixedBrokerLocator(info: Self.brokerInfo)),
+            brokerPreparer: brokerPreparer
+                ?? LocatedBrokerInfoPreparer(locator: FixedBrokerLocator(info: Self.brokerInfo)),
             client: client,
+            controlClient: controlClient,
             sessionStore: NativeSessionStore(fileURL: root.appendingPathComponent("native-sessions.json")),
             cursorStore: TerminalCursorStore(fileURL: root.appendingPathComponent("cursors.json")),
             workspaceStateStore: workspaceStore,
@@ -2220,6 +2458,7 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
     /// coalescer in the path.
     private let advertisesObserverCoalescing: Bool
     private var connectCount = 0
+    private var disconnectCount = 0
     private var inventoryFailuresRemaining = 0
     private var cursors: [TerminalCursor?] = []
     private var subscribedTerminalIDs: [String] = []
@@ -2387,7 +2626,7 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
         }
         activeTerminalIDs.remove(terminal.id)
     }
-    func disconnect() async {}
+    func disconnect() async { disconnectCount += 1 }
 
     func simulateDisconnect() {
         disconnectHandler?(BrokerClientError.connectionClosed)
@@ -2430,6 +2669,7 @@ private actor ReconnectBrokerClient: ObserveOnlyBrokerServing {
     func subscribedOwnerID(for id: String) -> String? { ownerIDsByTerminal[id] }
 
     func connectionAttempts() -> Int { connectCount }
+    func disconnectAttempts() -> Int { disconnectCount }
     func failNextInventoryRequests(_ count: Int) {
         inventoryFailuresRemaining = max(0, count)
     }

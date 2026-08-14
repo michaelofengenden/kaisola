@@ -6313,7 +6313,7 @@ final class AppModel: ObservableObject {
         select: Bool = true,
         environmentBinding: SessionAccountBinding? = nil
     ) async -> String? {
-        guard controlAvailable else {
+        guard controlAvailable, connectionState.isConnected else {
             // Never fail silently: say WHY sessions can't be created here.
             publishPrimaryDocument(.failure(
                 sessionID: "create-unavailable",
@@ -7530,6 +7530,7 @@ final class AppModel: ObservableObject {
     /// visible but disabled instead of pretending a new PTY was started.
     func canReopenEndedSession(_ terminalID: String) -> Bool {
         controlAvailable
+            && connectionState.isConnected
             && !reopeningTerminalIDs.contains(terminalID)
             && sessions.contains(where: { $0.id == terminalID && $0.exited })
             && isOwned(terminalID)
@@ -7677,10 +7678,17 @@ final class AppModel: ObservableObject {
                 let latest = await provider.generationTopology()
                 guard topologyGeneration == connectionGeneration,
                       connectionState.isConnected else { return }
-                if let latest, latest != activeBrokerTopology {
+                guard let latest else {
                     connectionLost(
                         BrokerClientError.identityChanged,
-                        generation: connectionGeneration
+                        generation: topologyGeneration
+                    )
+                    return
+                }
+                if latest != activeBrokerTopology {
+                    connectionLost(
+                        BrokerClientError.identityChanged,
+                        generation: topologyGeneration
                     )
                     return
                 }
@@ -7877,6 +7885,22 @@ final class AppModel: ObservableObject {
         } catch {
             // Observation continues against brokers that refuse control.
             return
+        }
+        guard generation == connectionGeneration,
+              connectionState.isConnected else {
+            await controlClient.disconnect()
+            connectionLost(BrokerClientError.identityChanged, generation: generation)
+            return
+        }
+        if let provider = activeBrokerTopologyProvider {
+            guard let latest = await provider.generationTopology(),
+                  generation == connectionGeneration,
+                  connectionState.isConnected,
+                  latest == topology else {
+                await controlClient.disconnect()
+                connectionLost(BrokerClientError.identityChanged, generation: generation)
+                return
+            }
         }
         controlAvailable = true
         sessionStore.recoverOwnedSessions(from: sessions)
@@ -8187,6 +8211,17 @@ final class AppModel: ObservableObject {
         brokerRollbackCandidates = []
     }
 
+    private func resolvedGenerationTopology(
+        for info: BrokerInfo,
+        provider: (any BrokerGenerationTopologyProviding)?
+    ) async throws -> BrokerGenerationTopology {
+        guard let provider else { return .single(info) }
+        guard let topology = await provider.generationTopology() else {
+            throw BrokerClientError.identityChanged
+        }
+        return topology
+    }
+
     private func connect(generation: Int, reconnectAttempt: Int?) async -> Bool {
         guard generation == connectionGeneration, shouldReconnect else { return false }
         // Retrying from a settled offline state stays silent: flipping to
@@ -8220,8 +8255,10 @@ final class AppModel: ObservableObject {
                 activeBrokerTopologyProvider = brokerPreparer as? any BrokerGenerationTopologyProviding
                 activeBrokerRollbackController = brokerPreparer as? any BrokerGenerationRollbackServing
                 info = try await brokerPreparer.prepare()
-                topology = await activeBrokerTopologyProvider?
-                    .generationTopology() ?? .single(info)
+                topology = try await resolvedGenerationTopology(
+                    for: info,
+                    provider: activeBrokerTopologyProvider
+                )
                 activeBrokerIdentity = info.persistenceIdentity
                 activeBrokerTopology = topology
                 hello = try await client.connect(to: topology)
@@ -8238,8 +8275,10 @@ final class AppModel: ObservableObject {
                 activeBrokerTopologyProvider = fallbackPreparer as? any BrokerGenerationTopologyProviding
                 activeBrokerRollbackController = fallbackPreparer as? any BrokerGenerationRollbackServing
                 info = try await fallbackPreparer.prepare()
-                topology = await activeBrokerTopologyProvider?
-                    .generationTopology() ?? .single(info)
+                topology = try await resolvedGenerationTopology(
+                    for: info,
+                    provider: activeBrokerTopologyProvider
+                )
                 activeBrokerIdentity = info.persistenceIdentity
                 activeBrokerTopology = topology
                 hello = try await client.connect(to: topology)
@@ -8282,6 +8321,21 @@ final class AppModel: ObservableObject {
                 // subscription is restored. Prune finished ids in the same
                 // main-actor turn so the UI never flashes a dead placeholder.
                 reconcileAllPaneLayoutsWithAvailableSurfaces()
+            }
+            // The topology can be revoked while the observer hello, inventory,
+            // diagnostics, and rollback probes suspend. Re-prove the exact
+            // route immediately before publishing a connected state or
+            // restoring the controller lane. A provider that withholds
+            // authority must never leave a successfully dialed but stale route
+            // eligible for terminal.create.
+            let postDialTopology = try await resolvedGenerationTopology(
+                for: info,
+                provider: activeBrokerTopologyProvider
+            )
+            guard generation == connectionGeneration,
+                  shouldReconnect,
+                  postDialTopology == topology else {
+                throw BrokerClientError.identityChanged
             }
             connectionState = .connected(
                 version: hello.version + (usingSeparateBroker ? " · Kaisola-only continuity" : ""),

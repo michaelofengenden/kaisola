@@ -230,7 +230,7 @@ public actor ShadowBrokerService {
                     "ok": .bool(false),
                     "code": .string("invalid_terminal_write_payload"),
                     "message": .string("terminal.write data must be a string"),
-                    "maximumBytes": .integer(64 * 1_024),
+                    "maximumBytes": .integer(Int64(64 * 1_024)),
                 ]))
             }
             return await freshWrite(

@@ -849,6 +849,17 @@ extension DarwinPTYProcess: FreshTerminalProcess {
         _ = await waitForExit()
     }
 
+    public func freshTerminalExitStatus() async -> FreshTerminalExitStatus? {
+        // Resolves immediately once the leader is reaped. The 0-for-signal
+        // substitution matches the Node broker's `exitCode ?? 0` before the
+        // record reaches the wire; the raw signal number rides alongside.
+        let exit = await waitForExit()
+        return FreshTerminalExitStatus(
+            exitCode: Int64(exit.exitCode ?? 0),
+            signal: exit.terminatingSignal.map(Int64.init)
+        )
+    }
+
     public func terminateFreshTerminal(graceNanoseconds: UInt64) async throws {
         _ = try await terminate(graceNanoseconds: graceNanoseconds)
     }

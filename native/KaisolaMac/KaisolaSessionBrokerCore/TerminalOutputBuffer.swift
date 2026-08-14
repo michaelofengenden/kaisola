@@ -238,3 +238,283 @@ public struct TerminalOutputBuffer: Sendable {
         byte & 0xC0 == 0x80
     }
 }
+
+public struct TerminalOutputHistorySlice: Equatable, Sendable {
+    public let output: String
+    public let startOffset: Int64
+    public let endOffset: Int64
+    public let hasMore: Bool
+    public let truncated: Bool
+
+    public init(
+        output: String,
+        startOffset: Int64,
+        endOffset: Int64,
+        hasMore: Bool,
+        truncated: Bool
+    ) {
+        self.output = output
+        self.startOffset = startOffset
+        self.endOffset = endOffset
+        self.hasMore = hasMore
+        self.truncated = truncated
+    }
+}
+
+extension TerminalOutputBuffer {
+    /// One bounded history page over the retained tail, ending at
+    /// `beforeOffset`. Absolute stream offsets, so pages concatenate exactly
+    /// with subscription snapshots and live events. Requests beneath the
+    /// retained floor clamp to an empty page AT the floor: evicted bytes are
+    /// reported as absent, never fabricated. A `beforeOffset` outside
+    /// `[0, endOffset]` is the caller's protocol error and answers nil.
+    public func historySlice(
+        before beforeOffset: Int64,
+        maximumBytes: Int
+    ) -> TerminalOutputHistorySlice? {
+        let snapshot = snapshot()
+        guard beforeOffset >= 0, beforeOffset <= snapshot.endOffset else { return nil }
+        let retainedStart = snapshot.startOffset
+        let cap = Int64(max(0, maximumBytes))
+        let end = max(retainedStart, beforeOffset)
+        var start = max(retainedStart, end - cap)
+
+        let bytes = Data(snapshot.output.utf8)
+        // A byte cap may land inside a multi-byte scalar. Move forward to the
+        // next boundary; the skipped continuation bytes remain reachable in
+        // the preceding (older) page, so pages still concatenate as valid text.
+        var relativeStart = Int(start - retainedStart)
+        let relativeEnd = Int(end - retainedStart)
+        while relativeStart < relativeEnd, bytes[relativeStart] & 0xC0 == 0x80 {
+            relativeStart += 1
+            start += 1
+        }
+        let output = String(decoding: bytes[relativeStart..<relativeEnd], as: UTF8.self)
+        return TerminalOutputHistorySlice(
+            output: output,
+            startOffset: start,
+            endOffset: end,
+            hasMore: start > retainedStart,
+            truncated: snapshot.truncated
+        )
+    }
+}
+
+extension TerminalOutputEmission {
+    /// The Node broker never broadcasts an observer frame carrying more than
+    /// 64 KiB of raw output (`OBSERVER_CHUNK_BYTES`): worst-case JSON escaping
+    /// expands control-dense bytes several times over, and the encoded
+    /// observer-output frame cap is 512 KiB.
+    public static let observerFrameByteLimit = 64 * 1_024
+
+    /// The primary `terminal:data:<id>` copy travels on an ordinary event
+    /// channel, whose encoded cap is 64 KiB — an eighth of observer-output's —
+    /// so its raw chunk is an eighth of the observer piece. The same
+    /// worst-case-escaping argument then holds: 8 KiB of pure control bytes
+    /// encodes to 48 KiB, leaving 16 KiB for the envelope. A single PTY read
+    /// can be 64 KiB, which unsplit is over the cap on arrival.
+    public static let primaryFrameByteLimit = 8 * 1_024
+
+    /// `splitForObserverFrames` at the primary channel's tighter bound.
+    public func splitForPrimaryFrames(
+        maximumBytes: Int = TerminalOutputEmission.primaryFrameByteLimit
+    ) -> [TerminalOutputEmission] {
+        splitForObserverFrames(maximumBytes: maximumBytes)
+    }
+
+    /// Splits one emission into bounded contiguous pieces on UTF-8 scalar
+    /// boundaries. Offsets subdivide exactly, so every piece is itself a valid
+    /// observer-output payload and the pieces concatenate back byte-for-byte.
+    public func splitForObserverFrames(
+        maximumBytes: Int = TerminalOutputEmission.observerFrameByteLimit
+    ) -> [TerminalOutputEmission] {
+        let bytes = Data(output.utf8)
+        guard bytes.count > maximumBytes, maximumBytes > 0 else { return [self] }
+
+        var pieces: [TerminalOutputEmission] = []
+        var start = 0
+        while start < bytes.count {
+            var end = min(bytes.count, start + maximumBytes)
+            // Retreat to a scalar boundary; a pathological cap smaller than
+            // one scalar advances instead so the split always terminates.
+            while end < bytes.count, end > start, bytes[end] & 0xC0 == 0x80 {
+                end -= 1
+            }
+            if end == start {
+                end = min(bytes.count, start + maximumBytes)
+                while end < bytes.count, bytes[end] & 0xC0 == 0x80 { end += 1 }
+            }
+            pieces.append(TerminalOutputEmission(
+                streamEpoch: streamEpoch,
+                output: String(decoding: bytes[start..<end], as: UTF8.self),
+                startOffset: startOffset + Int64(start),
+                endOffset: startOffset + Int64(end)
+            ))
+            start = end
+        }
+        return pieces
+    }
+}
+
+public enum TerminalObserverRegistryError: Error, Equatable, Sendable {
+    case invalidSubscriber
+    case observerLimitReached(maximum: Int)
+}
+
+public struct TerminalObserverCursor: Equatable, Sendable {
+    public let streamEpoch: String
+    public let endOffset: Int64
+
+    public init(streamEpoch: String, endOffset: Int64) {
+        self.streamEpoch = streamEpoch
+        self.endOffset = endOffset
+    }
+}
+
+public struct TerminalObserverBroadcastResult: Equatable, Sendable {
+    public let delivered: Int
+    public let paused: Int
+    public let dropped: Int
+}
+
+/// Port of the Node broker's `TerminalObservers` (terminalObservers.cjs):
+/// bounded per-subscriber queues and the single fail-closed slow-consumer
+/// policy. Not internally synchronized — the owning terminal serializes every
+/// call under the same lock that serializes output intake, which is what makes
+/// snapshot-then-live registration gapless.
+public struct TerminalOutputObservers: Sendable {
+    public static let defaultQueueBytes = 256 * 1_024
+    public static let minimumQueueBytes = 64 * 1_024
+    public static let maximumQueueBytes = 2 * 1_024 * 1_024
+    public static let maximumObservers = 8
+
+    public typealias Deliver = (
+        _ owner: String,
+        _ channel: String,
+        _ payload: BrokerJSONValue,
+        _ maxQueueBytes: Int?,
+        _ force: Bool
+    ) -> Bool
+
+    private struct Subscriber {
+        var maxQueueBytes: Int
+        var paused: Bool
+    }
+
+    public let terminalID: String
+    private var subscribers: [String: Subscriber] = [:]
+    // Broadcast order matches Node's insertion-ordered Map, so wire timelines
+    // are deterministic for tests and identical across resubscribes.
+    private var order: [String] = []
+
+    public init(terminalID: String) {
+        self.terminalID = terminalID
+    }
+
+    public var subscriberCount: Int { subscribers.count }
+
+    public var pausedCount: Int {
+        subscribers.values.lazy.filter(\.paused).count
+    }
+
+    public static func queueLimit(_ requested: Int64?) -> Int {
+        guard let requested else { return defaultQueueBytes }
+        let clamped = min(Int64(maximumQueueBytes), max(Int64(minimumQueueBytes), requested))
+        return Int(clamped)
+    }
+
+    /// Registers or replaces one subscription. Replacement resets the paused
+    /// state — an explicit resubscribe just obtained a fresh snapshot, so its
+    /// live stream may flow again.
+    @discardableResult
+    public mutating func subscribe(
+        owner: String,
+        maxQueueBytes: Int64?
+    ) throws -> Int {
+        guard !owner.isEmpty, owner.count <= 500 else {
+            throw TerminalObserverRegistryError.invalidSubscriber
+        }
+        if subscribers[owner] == nil {
+            guard subscribers.count < Self.maximumObservers else {
+                throw TerminalObserverRegistryError.observerLimitReached(
+                    maximum: Self.maximumObservers
+                )
+            }
+            order.append(owner)
+        }
+        let limit = Self.queueLimit(maxQueueBytes)
+        subscribers[owner] = Subscriber(maxQueueBytes: limit, paused: false)
+        return limit
+    }
+
+    @discardableResult
+    public mutating func unsubscribe(owner: String) -> Bool {
+        guard subscribers.removeValue(forKey: owner) != nil else { return false }
+        order.removeAll { $0 == owner }
+        return true
+    }
+
+    @discardableResult
+    public mutating func unsubscribe(prefix: String) -> Int {
+        guard !prefix.isEmpty else { return 0 }
+        var removed = 0
+        for owner in order where owner.hasPrefix(prefix) {
+            subscribers.removeValue(forKey: owner)
+            removed += 1
+        }
+        order.removeAll { $0.hasPrefix(prefix) }
+        return removed
+    }
+
+    /// One overflow policy, exactly the Node broker's: a refused delta earns
+    /// one forced, small `terminal:observer-snapshot-required` marker carrying
+    /// the exact resubscribe cursor, and the subscription pauses. A paused
+    /// subscription is never spoken to again until an explicit resubscribe.
+    /// If even the forced marker cannot land, the subscription retires: a
+    /// paused subscriber whose marker never arrived would be silenced forever.
+    @discardableResult
+    public mutating func broadcast(
+        channel: String,
+        payload: BrokerJSONValue,
+        cursor: TerminalObserverCursor,
+        deliver: Deliver
+    ) -> TerminalObserverBroadcastResult {
+        var delivered = 0
+        var paused = 0
+        var dropped = 0
+        for owner in order {
+            guard let subscriber = subscribers[owner], !subscriber.paused else { continue }
+            if deliver(owner, channel, payload, subscriber.maxQueueBytes, false) {
+                delivered += 1
+                continue
+            }
+            let marker: BrokerJSONValue = .object([
+                "id": .string(terminalID),
+                "reason": .string("slow_consumer"),
+                "streamEpoch": .string(cursor.streamEpoch),
+                "endOffset": .integer(cursor.endOffset),
+            ])
+            if deliver(
+                owner,
+                "terminal:observer-snapshot-required",
+                marker,
+                subscriber.maxQueueBytes,
+                true
+            ) {
+                subscribers[owner]?.paused = true
+                paused += 1
+                continue
+            }
+            subscribers.removeValue(forKey: owner)
+            dropped += 1
+        }
+        if dropped > 0 {
+            order.removeAll { subscribers[$0] == nil }
+        }
+        return TerminalObserverBroadcastResult(
+            delivered: delivered,
+            paused: paused,
+            dropped: dropped
+        )
+    }
+}

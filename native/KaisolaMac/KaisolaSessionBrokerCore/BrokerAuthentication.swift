@@ -76,16 +76,37 @@ public enum ShadowBrokerServiceConfigurationError: Error, Equatable, Sendable {
 }
 
 public struct BrokerAuthentication: Sendable {
+    /// The observe-only shadow surface. Shadow mode must keep advertising
+    /// exactly this trio: its terminal routes are stubs, and a feature list is
+    /// a behavioral promise, not a description of the codebase.
     public static let advertisedFeatures = [
         BrokerWire.terminalObserveFeature,
         BrokerWire.observerRoleFeature,
         BrokerWire.brokerInventoryFeature,
     ]
 
+    /// What the fresh PTY runtime actually implements, in the Node broker's
+    /// FEATURES order. Restore-dependent capabilities (continuous history,
+    /// rolling update, idempotency, administration, attach-ack, observer
+    /// coalescing) stay unadvertised because they are not implemented here.
+    public static let freshAdvertisedFeatures = [
+        BrokerWire.terminalObserveFeature,
+        BrokerWire.terminalHistoryFeature,
+        BrokerWire.observerRoleFeature,
+        BrokerWire.brokerInventoryFeature,
+        BrokerWire.terminalExitStatusFeature,
+        BrokerWire.terminalObserverOnlyOutputFeature,
+    ]
+
+    public let features: [String]
     private let configuration: ShadowBrokerServiceConfiguration
 
-    public init(configuration: ShadowBrokerServiceConfiguration) {
+    public init(
+        configuration: ShadowBrokerServiceConfiguration,
+        features: [String] = BrokerAuthentication.advertisedFeatures
+    ) {
         self.configuration = configuration
+        self.features = features
     }
 
     public func authenticate(
@@ -107,7 +128,7 @@ public struct BrokerAuthentication: Sendable {
         }
 
         let requested = Set(hello.features ?? [])
-        let negotiated = Self.advertisedFeatures.filter(requested.contains)
+        let negotiated = features.filter(requested.contains)
         let client = BrokerAuthenticatedClient(
             instanceID: hello.instanceID,
             role: role,
@@ -121,7 +142,7 @@ public struct BrokerAuthentication: Sendable {
             packageSchema: configuration.packageSchema,
             packageVersion: configuration.packageVersion,
             contentDigest: configuration.contentDigest,
-            features: Self.advertisedFeatures,
+            features: features,
             negotiatedFeatures: negotiated,
             access: role.rawValue,
             pid: configuration.pid,

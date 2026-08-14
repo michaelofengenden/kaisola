@@ -2,6 +2,123 @@ import Darwin
 import Foundation
 import KaisolaBrokerProtocol
 
+/// The single ordered outbound path for one connection. Responses, the hello,
+/// and `{type:'event'}` frames all pass through here, so frames can never
+/// interleave mid-JSON and response/event order is exactly enqueue order.
+///
+/// `queuedByteCount` is the Swift analog of Node's `socket.writableLength`:
+/// bytes accepted but not yet handed to the kernel. Event enqueues compare it
+/// against the subscriber's queue budget; responses are never capped, exactly
+/// like the Node broker's `writeFrame` without `maxQueueBytes`.
+final class BrokerOutboundFrameQueue: @unchecked Sendable {
+    private enum State {
+        case open
+        /// No further enqueues; the writer drains what is queued, then ends.
+        case finishing
+        /// Queued frames are dropped; a reconnect replays snapshots.
+        case closed
+    }
+
+    private let lock = NSLock()
+    private var frames: [Data] = []
+    private var head = 0
+    private var unwrittenBytes = 0
+    private var state: State = .open
+    private var waiter: CheckedContinuation<Data?, Never>?
+
+    var queuedByteCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return unwrittenBytes
+    }
+
+    /// Accepts or refuses one complete frame. Refusal (`false`) is the exact
+    /// verdict the slow-consumer policy consumes: the frame was not queued and
+    /// never will be. `force` bypasses the cap for recovery markers but can
+    /// never resurrect a finishing or closed queue.
+    func enqueue(_ frame: Data, maxQueueBytes: Int?, force: Bool) -> Bool {
+        var parked: CheckedContinuation<Data?, Never>?
+        lock.lock()
+        guard state == .open else {
+            lock.unlock()
+            return false
+        }
+        if !force, let maxQueueBytes, unwrittenBytes + frame.count > maxQueueBytes {
+            lock.unlock()
+            return false
+        }
+        unwrittenBytes += frame.count
+        if let waiting = waiter {
+            waiter = nil
+            parked = waiting
+        } else {
+            frames.append(frame)
+        }
+        lock.unlock()
+        // Resumed outside the lock: the writer immediately re-enters `next()`.
+        parked?.resume(returning: frame)
+        return true
+    }
+
+    /// The writer's sole entry point. Returns frames in enqueue order and nil
+    /// once the queue has finished (after draining) or closed.
+    func next() async -> Data? {
+        await withCheckedContinuation { continuation in
+            lock.lock()
+            if head < frames.count {
+                let frame = frames[head]
+                head += 1
+                if head == frames.count {
+                    frames.removeAll(keepingCapacity: true)
+                    head = 0
+                }
+                lock.unlock()
+                continuation.resume(returning: frame)
+                return
+            }
+            if state != .open {
+                lock.unlock()
+                continuation.resume(returning: nil)
+                return
+            }
+            waiter = continuation
+            lock.unlock()
+        }
+    }
+
+    /// Called by the writer after the kernel accepted a frame, releasing its
+    /// bytes from the backpressure budget.
+    func markWritten(_ byteCount: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        unwrittenBytes = max(0, unwrittenBytes - byteCount)
+    }
+
+    func finish() {
+        var parked: CheckedContinuation<Data?, Never>?
+        lock.lock()
+        if state == .open { state = .finishing }
+        // A parked waiter proves the buffer is empty, so finishing ends it.
+        parked = waiter
+        waiter = nil
+        lock.unlock()
+        parked?.resume(returning: nil)
+    }
+
+    func closeDiscarding() {
+        var parked: CheckedContinuation<Data?, Never>?
+        lock.lock()
+        state = .closed
+        frames.removeAll(keepingCapacity: false)
+        head = 0
+        unwrittenBytes = 0
+        parked = waiter
+        waiter = nil
+        lock.unlock()
+        parked?.resume(returning: nil)
+    }
+}
+
 final class BrokerConnection: @unchecked Sendable {
     private static let maximumRequestFrameBytes = BrokerWire.maximumEncodedBytes(
         for: .request("terminal.write")
@@ -12,7 +129,11 @@ final class BrokerConnection: @unchecked Sendable {
     private let log: BrokerLog
     private let helloDeadlineNanoseconds: UInt64
     private let didAuthenticate: @Sendable () -> Void
-    private let ioQueue: DispatchQueue
+    private let readQueue: DispatchQueue
+    // Reads and writes block on separate workers: a writer stalled against a
+    // slow peer must not park the reader (or the reverse) on one serial queue.
+    private let writeQueue: DispatchQueue
+    private let outbound = BrokerOutboundFrameQueue()
     private let descriptorLock = NSLock()
     private var descriptor: Int32
 
@@ -31,13 +152,19 @@ final class BrokerConnection: @unchecked Sendable {
         let timeoutNanoseconds = UInt64(helloTimeoutMilliseconds) * 1_000_000
         helloDeadlineNanoseconds = DispatchTime.now().uptimeNanoseconds &+ timeoutNanoseconds
         self.didAuthenticate = didAuthenticate
-        ioQueue = DispatchQueue(
-            label: "com.kaisola.session-broker.connection.\(UUID().uuidString.lowercased())",
+        let identity = UUID().uuidString.lowercased()
+        readQueue = DispatchQueue(
+            label: "com.kaisola.session-broker.connection.\(identity)",
+            qos: .userInitiated
+        )
+        writeQueue = DispatchQueue(
+            label: "com.kaisola.session-broker.connection-write.\(identity)",
             qos: .userInitiated
         )
     }
 
     func run() async {
+        let writer = Task { await drainOutbound() }
         var authenticatedClient: BrokerAuthenticatedClient?
         do {
             var buffer = Data()
@@ -70,6 +197,11 @@ final class BrokerConnection: @unchecked Sendable {
         if let authenticatedClient {
             await service.disconnect(client: authenticatedClient)
         }
+        // Let already-accepted frames (a hello rejection, the final response)
+        // drain before the descriptor closes; a wedged peer cannot pin this,
+        // because cancel()/socket teardown fails the blocked write.
+        outbound.finish()
+        await writer.value
         finish()
     }
 
@@ -82,6 +214,7 @@ final class BrokerConnection: @unchecked Sendable {
         if current >= 0 {
             _ = Darwin.shutdown(current, SHUT_RDWR)
         }
+        outbound.closeDiscarding()
     }
 
     func closeBeforeRun() {
@@ -128,10 +261,13 @@ final class BrokerConnection: @unchecked Sendable {
         case let .accepted(client, response):
             authenticatedClient = client
             didAuthenticate()
-            try await write(response, purpose: .hello)
+            try enqueueOutbound(response, purpose: .hello)
+            // Attached only after the hello response is queued, so no event
+            // frame can ever precede the hello on this socket.
+            await service.attachConnection(client: client, sink: eventSink())
             log.record(.authenticationAccepted)
         case let .rejected(response):
-            try await write(response, purpose: .hello)
+            try enqueueOutbound(response, purpose: .hello)
             log.record(.authenticationRejected)
             throw BrokerConnectionError.cleanClose
         }
@@ -150,14 +286,38 @@ final class BrokerConnection: @unchecked Sendable {
             throw BrokerConnectionError.invalidFrame
         }
         log.recordRequest(method: request.method)
-        let response = await service.dispatch(client: client, request: request)
-        try await write(response, purpose: .response(request.method))
+        // The subscribe route answers through this responder from inside the
+        // terminal's output critical section (and then returns nil), which is
+        // what pins the response ahead of the first live event.
+        let response = await service.dispatch(
+            client: client,
+            request: request,
+            responder: responder(for: request.method)
+        )
+        if let response {
+            try enqueueOutbound(response, purpose: .response(request.method))
+        }
+    }
+
+    private func eventSink() -> BrokerConnectionEventSink {
+        BrokerConnectionEventSink { [outbound] frame, maxQueueBytes, force in
+            outbound.enqueue(frame, maxQueueBytes: maxQueueBytes, force: force)
+        }
+    }
+
+    private func responder(for method: String) -> @Sendable (BrokerResponse) -> Bool {
+        { [outbound] response in
+            guard let data = try? Self.encodeFrame(response, purpose: .response(method)) else {
+                return false
+            }
+            return outbound.enqueue(data, maxQueueBytes: nil, force: false)
+        }
     }
 
     private func readChunk(helloDeadlineNanoseconds: UInt64?) async throws -> Data? {
         let current = currentDescriptor()
         guard current >= 0 else { return nil }
-        return try await Self.runBlocking(on: ioQueue) { () throws -> Data? in
+        return try await Self.runBlocking(on: readQueue) { () throws -> Data? in
             var bytes = [UInt8](repeating: 0, count: 16 * 1_024)
             while true {
                 if let deadline = helloDeadlineNanoseconds {
@@ -189,20 +349,52 @@ final class BrokerConnection: @unchecked Sendable {
         }
     }
 
-    private func write<Value: Encodable & Sendable>(
+    private func enqueueOutbound<Value: Encodable & Sendable>(
         _ value: Value,
         purpose: BrokerFramePurpose
-    ) async throws {
+    ) throws {
+        let data = try Self.encodeFrame(value, purpose: purpose)
+        guard outbound.enqueue(data, maxQueueBytes: nil, force: false) else {
+            throw BrokerConnectionError.closed
+        }
+    }
+
+    private static func encodeFrame<Value: Encodable>(
+        _ value: Value,
+        purpose: BrokerFramePurpose
+    ) throws -> Data {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
         var data = try encoder.encode(value)
         try BrokerWire.validateEncodedFrame(data, purpose: purpose)
         data.append(0x0a)
-        let framedData = data
+        return data
+    }
 
+    /// The only socket writer. One frame is written completely before the next
+    /// begins, so a JSON frame can never interleave with another.
+    private func drainOutbound() async {
+        while let frame = await outbound.next() {
+            do {
+                try await blockingWrite(frame)
+                outbound.markWritten(frame.count)
+            } catch {
+                outbound.closeDiscarding()
+                // The peer stopped accepting bytes; wake a blocked read so the
+                // connection task can unwind and release the descriptor.
+                let current = currentDescriptor()
+                if current >= 0 {
+                    _ = Darwin.shutdown(current, SHUT_RDWR)
+                }
+                return
+            }
+        }
+    }
+
+    private func blockingWrite(_ framedData: Data) async throws {
         let current = currentDescriptor()
         guard current >= 0 else { throw BrokerConnectionError.closed }
-        try await Self.runBlocking(on: ioQueue) {
+        try await Self.runBlocking(on: writeQueue) {
             try framedData.withUnsafeBytes { bytes in
                 var offset = 0
                 while offset < bytes.count {

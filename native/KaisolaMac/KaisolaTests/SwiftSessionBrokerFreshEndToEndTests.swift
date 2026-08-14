@@ -151,6 +151,118 @@ final class SwiftSessionBrokerFreshEndToEndTests: XCTestCase {
         }
     }
 
+    func testObserverReceivesOrderedLiveOutputAndExitEventsEndToEnd() async throws {
+        let fixture = try FreshEndToEndBrokerFixture(
+            executablePath: try brokerExecutablePath()
+        )
+        let controller = BrokerControlClient(operationTimeoutNanoseconds: 5_000_000_000)
+        let observer = ObserveOnlyBrokerClient(operationTimeoutNanoseconds: 5_000_000_000)
+        var createdShellPID: pid_t?
+
+        do {
+            let info = try await fixture.start()
+            try await controller.connect(to: info, ownerID: fixture.ownerID)
+            _ = try await observer.connect(to: info)
+            let collector = FreshEndToEndEventCollector(terminalID: fixture.terminalID)
+            await observer.setEventHandler(collector.handler())
+
+            let creation = try await controller.createTerminal(
+                projectID: fixture.projectID,
+                terminalID: fixture.terminalID,
+                command: "/bin/zsh",
+                arguments: ["-f", "-i"],
+                cwd: fixture.rootURL.path,
+                columns: 90,
+                rows: 28,
+                restore: false
+            )
+            createdShellPID = try XCTUnwrap(creation.pid)
+
+            let terminal = try await waitForTerminal(
+                observer: observer,
+                terminalID: fixture.terminalID
+            ) { !$0.exited }
+            let result = try await observer.subscribe(
+                to: terminal,
+                ownerID: fixture.ownerID,
+                cursor: nil
+            )
+            guard case let .snapshot(snapshot, _) = result else {
+                throw FreshEndToEndTestError.timedOut("initial live snapshot")
+            }
+
+            // Executed shell output must arrive as ordered incremental events
+            // with no gap and no duplicate against the subscribe snapshot.
+            let markerSuffix = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+            let marker = "__KAISOLA_LIVE_\(markerSuffix)__"
+            try await controller.write(
+                projectID: fixture.projectID,
+                terminalID: fixture.terminalID,
+                data: "printf '__KAISOLA_LIVE_%s__\\n' '\(markerSuffix)'\n"
+            )
+            let deadline = ContinuousClock.now.advanced(by: .seconds(10))
+            while ContinuousClock.now < deadline {
+                if collector.contiguousStream(from: snapshot.endOffset).contains(marker) {
+                    break
+                }
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            let streamed = collector.contiguousStream(from: snapshot.endOffset)
+            XCTAssertTrue(
+                streamed.contains(marker),
+                "live events never carried the executed marker; got \(streamed.suffix(200))"
+            )
+            XCTAssertEqual(
+                collector.gapCount(from: snapshot.endOffset),
+                0,
+                "observer events must be gapless against the subscribe snapshot"
+            )
+            XCTAssertEqual(collector.exitEventCount(), 0)
+
+            try await controller.kill(
+                projectID: fixture.projectID,
+                terminalID: fixture.terminalID
+            )
+            let exitDeadline = ContinuousClock.now.advanced(by: .seconds(10))
+            while ContinuousClock.now < exitDeadline, collector.exitEventCount() == 0 {
+                try await Task.sleep(for: .milliseconds(20))
+            }
+            XCTAssertEqual(collector.exitEventCount(), 1)
+            XCTAssertTrue(
+                collector.exitArrivedAfterAllOutput(),
+                "the exit event must be published after the final output event"
+            )
+
+            try await observer.unsubscribe(from: terminal, ownerID: fixture.ownerID)
+            try await controller.release(
+                projectID: fixture.projectID,
+                terminalID: fixture.terminalID
+            )
+            try await waitForNoTerminals(observer: observer)
+            await controller.disconnect()
+            await observer.disconnect()
+            try await fixture.stop()
+            fixture.removeRoot()
+        } catch {
+            if createdShellPID != nil {
+                try? await controller.kill(
+                    projectID: fixture.projectID,
+                    terminalID: fixture.terminalID
+                )
+                try? await controller.release(
+                    projectID: fixture.projectID,
+                    terminalID: fixture.terminalID
+                )
+            }
+            await controller.disconnect()
+            await observer.disconnect()
+            fixture.forceStop()
+            forceKillIfAlive(createdShellPID)
+            fixture.removeRoot()
+            throw error
+        }
+    }
+
     private func brokerExecutablePath() throws -> String {
         var candidate = Bundle(for: Self.self).bundleURL
         for _ in 0..<8 {
@@ -261,6 +373,87 @@ final class SwiftSessionBrokerFreshEndToEndTests: XCTestCase {
         guard let pid, pid > 1, isProcessAlive(pid) else { return }
         _ = Darwin.kill(-pid, SIGKILL)
         _ = Darwin.kill(pid, SIGKILL)
+    }
+}
+
+/// Collects the observer connection's live events for one terminal exactly as
+/// the app receives them, so ordering can be asserted against a snapshot.
+private final class FreshEndToEndEventCollector: @unchecked Sendable {
+    private struct Output {
+        let startOffset: Int64
+        let endOffset: Int64
+        let data: String
+    }
+
+    private let terminalID: String
+    private let lock = NSLock()
+    private var outputs: [Output] = []
+    private var exitEvents = 0
+    private var outputCountAtFirstExit: Int?
+
+    init(terminalID: String) {
+        self.terminalID = terminalID
+    }
+
+    func handler() -> @Sendable (BrokerEvent) -> Void {
+        { [weak self] event in
+            guard let self, event.terminalID == self.terminalID else { return }
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            switch event.kind {
+            case let .output(_, startOffset, endOffset, data):
+                self.outputs.append(Output(
+                    startOffset: startOffset,
+                    endOffset: endOffset,
+                    data: data
+                ))
+            case .exit:
+                self.exitEvents += 1
+                if self.outputCountAtFirstExit == nil {
+                    self.outputCountAtFirstExit = self.outputs.count
+                }
+            case .snapshotRequired, .activity:
+                break
+            }
+        }
+    }
+
+    /// Concatenates events exactly as the app's projection would: only frames
+    /// that continue the cursor contiguously extend the stream.
+    func contiguousStream(from cursor: Int64) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        var position = cursor
+        var text = ""
+        for output in outputs where output.startOffset == position {
+            text += output.data
+            position = output.endOffset
+        }
+        return text
+    }
+
+    func gapCount(from cursor: Int64) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        var position = cursor
+        var gaps = 0
+        for output in outputs {
+            if output.startOffset != position { gaps += 1 }
+            position = output.endOffset
+        }
+        return gaps
+    }
+
+    func exitEventCount() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return exitEvents
+    }
+
+    func exitArrivedAfterAllOutput() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return outputCountAtFirstExit == outputs.count
     }
 }
 

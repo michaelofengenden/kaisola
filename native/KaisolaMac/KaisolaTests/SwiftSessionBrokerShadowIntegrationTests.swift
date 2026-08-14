@@ -669,6 +669,21 @@ private func connectSocket(at path: String) throws -> Int32 {
     var address = try unixAddress(path: path)
     let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
     guard descriptor >= 0 else { throw currentPOSIXError() }
+    var noSigPipe: Int32 = 1
+    let noSigPipeResult = withUnsafePointer(to: &noSigPipe) {
+        setsockopt(
+            descriptor,
+            SOL_SOCKET,
+            SO_NOSIGPIPE,
+            $0,
+            socklen_t(MemoryLayout<Int32>.size)
+        )
+    }
+    guard noSigPipeResult == 0 else {
+        let code = errno
+        Darwin.close(descriptor)
+        throw POSIXError(POSIXErrorCode(rawValue: code) ?? .EIO)
+    }
     let addressLength = socklen_t(address.sun_len)
     let result = withUnsafePointer(to: &address) { pointer in
         pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {

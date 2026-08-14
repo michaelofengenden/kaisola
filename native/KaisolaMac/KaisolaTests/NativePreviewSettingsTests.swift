@@ -935,26 +935,26 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(LightRailTint.pearl.green, LightRailTint.pearl.blue)
     }
 
-    func testGlassRailsDeclareAboutTwentyPercentWhiteAndExposeTheDesktop() {
+    func testGlassRailsDeclareAboutTwelvePercentWhiteAndExposeTheDesktop() {
         let rail = GlassBackdropWash.sidebar(isDark: false)
         let canvas = GlassBackdropWash.workspace(isDark: false)
         let declaredWhiteCoverage = 1
             - (1 - LightGlassFrost.railCarrierWhiteCoverage) * (1 - rail.baseOpacity)
 
-        XCTAssertGreaterThanOrEqual(declaredWhiteCoverage, 0.18)
+        XCTAssertGreaterThanOrEqual(declaredWhiteCoverage, 0.10)
         XCTAssertLessThanOrEqual(
             declaredWhiteCoverage,
-            0.22,
-            "the rails still carry substantially more than a fifth of declared white"
+            0.14,
+            "the shared rail material still carries too much white to read as transparent"
         )
         XCTAssertLessThanOrEqual(
             LightGlassFrost.railCarrierWhiteCoverage,
             0.02,
-            "a second white carrier is stacking on top of the twenty-percent veil"
+            "a second white carrier is stacking on top of the twelve-percent veil"
         )
         XCTAssertGreaterThanOrEqual(
             LightGlassFrost.modeledRailDesktopContribution(rail),
-            0.78,
+            0.86,
             "Glass still paints over most of the wallpaper"
         )
         XCTAssertEqual(
@@ -980,14 +980,21 @@ final class NativePreviewSettingsTests: XCTestCase {
             LightTintedGradient.pearl.blue - LightTintedGradient.pearl.green,
             0.18
         )
+        XCTAssertGreaterThan(LightTintedGradient.neutral.red, LightTintedGradient.neutral.green)
+        XCTAssertGreaterThan(LightTintedGradient.neutral.green, LightTintedGradient.neutral.blue)
 
         let maximumCoverage = max(
             LightTintedGradient.coolCoverage,
             max(LightTintedGradient.neutralCoverage, LightTintedGradient.pearlCoverage)
         )
-        XCTAssertGreaterThanOrEqual(maximumCoverage, 0.04, "the light tint disappeared")
-        XCTAssertLessThanOrEqual(maximumCoverage, 0.06, "the light tint is no longer gentle")
-        XCTAssertLessThanOrEqual(LightTintedGradient.neutralCoverage, 0.02)
+        XCTAssertGreaterThanOrEqual(maximumCoverage, 0.08, "the light tint disappeared")
+        XCTAssertLessThanOrEqual(maximumCoverage, 0.12, "the light tint is no longer gentle")
+        XCTAssertGreaterThanOrEqual(
+            LightTintedGradient.neutralCoverage,
+            0.08,
+            "the midpoint falls back to an exact-white band"
+        )
+        XCTAssertLessThanOrEqual(LightTintedGradient.neutralCoverage, 0.12)
         XCTAssertGreaterThan(LightTintedGradient.neutralLocation, 0.35)
         XCTAssertLessThan(LightTintedGradient.neutralLocation, 0.70)
     }
@@ -1015,16 +1022,16 @@ final class NativePreviewSettingsTests: XCTestCase {
             let canvas = metrics(composite(stop.colour, coverage: stop.coverage))
             XCTAssertGreaterThanOrEqual(
                 canvas.departure,
-                3,
+                7,
                 "\(stop.name) composites to near-white and disappears on the canvas"
             )
-            XCTAssertLessThanOrEqual(canvas.departure, 7, "\(stop.name) is no longer gentle")
+            XCTAssertLessThanOrEqual(canvas.departure, 12, "\(stop.name) is no longer gentle")
             XCTAssertGreaterThanOrEqual(
                 canvas.spread,
-                2,
+                4,
                 "\(stop.name) has too little channel separation to read as a tint"
             )
-            XCTAssertLessThanOrEqual(canvas.spread, 5, "\(stop.name) is too saturated")
+            XCTAssertLessThanOrEqual(canvas.spread, 6, "\(stop.name) is too saturated")
 
             let rail = metrics(composite(
                 stop.colour,
@@ -1032,19 +1039,26 @@ final class NativePreviewSettingsTests: XCTestCase {
             ))
             XCTAssertGreaterThanOrEqual(
                 rail.departure,
-                2,
-                "\(stop.name) disappears after the rail's 0.75 coverage scaling"
+                6,
+                "\(stop.name) disappears after the rail's coverage scaling"
             )
-            XCTAssertLessThanOrEqual(rail.departure, 5, "\(stop.name) is too heavy on the rail")
-            XCTAssertGreaterThanOrEqual(rail.spread, 1, "\(stop.name) rail is effectively neutral")
-            XCTAssertLessThanOrEqual(rail.spread, 4, "\(stop.name) rail is too saturated")
+            XCTAssertLessThanOrEqual(rail.departure, 11, "\(stop.name) is too heavy on the rail")
+            XCTAssertGreaterThanOrEqual(rail.spread, 3, "\(stop.name) rail is effectively neutral")
+            XCTAssertLessThanOrEqual(rail.spread, 6, "\(stop.name) rail is too saturated")
         }
 
-        let neutral = composite(
-            (red: 1, green: 1, blue: 1),
+        let neutral = metrics(composite(
+            LightTintedGradient.neutral,
             coverage: LightTintedGradient.neutralCoverage
+        ))
+        XCTAssertGreaterThanOrEqual(
+            neutral.departure,
+            4,
+            "the warm midpoint still disappears into the white canvas"
         )
-        XCTAssertEqual(neutral, [255, 255, 255], "the neutral midpoint is not exact white")
+        XCTAssertLessThanOrEqual(neutral.departure, 6, "the warm midpoint is too heavy")
+        XCTAssertGreaterThanOrEqual(neutral.spread, 2, "the midpoint is effectively neutral")
+        XCTAssertLessThanOrEqual(neutral.spread, 4, "the midpoint is too saturated")
     }
 
     func testSurfaceTabOutlinesAreVisibleButRemainHairlines() {
@@ -1132,13 +1146,13 @@ final class NativePreviewSettingsTests: XCTestCase {
         // passed no desktop colour at all, and the 0.16 that replaced it was
         // calibrated against vibrancy but ended up over a *painted wallpaper*,
         // which passes everything.
-        // Light rails now use one narrow white veil centered on twenty
+        // Light rails now use one narrow white veil centered on twelve
         // percent. There is no second carrier stacked beneath it; the exact
         // white workspace has its own opaque recipe.
         let lightSidebar = GlassBackdropWash.sidebar(isDark: false)
-        XCTAssertEqual(lightSidebar.topOpacity, 0.22, accuracy: 0.0001)
-        XCTAssertEqual(lightSidebar.baseOpacity, 0.20, accuracy: 0.0001)
-        XCTAssertEqual(lightSidebar.bottomOpacity, 0.18, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.topOpacity, 0.14, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.baseOpacity, 0.12, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.bottomOpacity, 0.10, accuracy: 0.0001)
         XCTAssertEqual(GlassBackdropWash.workspace(isDark: false).baseOpacity, 0.40, accuracy: 0.0001)
         // Dark remains at its previously verified values. Light now passes
         // more of the desktop through the rails while the light workspace
@@ -4450,7 +4464,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         let lightSolid = [1.0, 1.0, 1.0]
         let lightStops = [
             (LightTintedGradient.cool, LightTintedGradient.coolCoverage),
-            ((red: 1.0, green: 1.0, blue: 1.0), LightTintedGradient.neutralCoverage),
+            (LightTintedGradient.neutral, LightTintedGradient.neutralCoverage),
             (LightTintedGradient.pearl, LightTintedGradient.pearlCoverage),
         ]
         XCTAssertEqual(offNeutral(lightSolid), 0, accuracy: 0.0001)
@@ -4460,7 +4474,11 @@ final class NativePreviewSettingsTests: XCTestCase {
             }
             // Coarse luminance/chroma guard. The precise visible-but-gentle
             // bounds live in `testLightTintedStopsRemainVisibleAfterCompositingOverWhite`.
-            XCTAssertGreaterThan(luminance(tinted), 0.98, "light Tinted is dimming the white canvas")
+            XCTAssertGreaterThan(
+                luminance(tinted),
+                0.97,
+                "light Tinted is no longer a white-led pastel surface"
+            )
             XCTAssertLessThan(
                 offNeutral(tinted),
                 0.01,

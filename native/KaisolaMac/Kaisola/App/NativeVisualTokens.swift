@@ -62,7 +62,7 @@ enum SurfaceTabChrome {
 /// The center and rails now have deliberately different jobs. The workspace
 /// carrier is opaque white, making the working canvas exact and stable. The
 /// rails have no second carrier at all: their single white veil sits at about
-/// twenty percent, so live material keeps its colour and movement. The rails
+/// twelve percent, so live material keeps its colour and movement. The rails
 /// add their own named, tightly bounded cool-to-pearl edge tint.
 enum LightGlassFrost {
     /// Neutral luminance of a painted wallpaper before the white veil.
@@ -73,8 +73,8 @@ enum LightGlassFrost {
     static let carrierWhiteCoverage: Double = 1.0
 
     /// Rails get their frost from `GlassBackdropWash.sidebar` alone. A second
-    /// white layer would composite with its twenty-percent veil and quietly
-    /// return the old, opaque-looking forty-four-percent stack.
+    /// white layer would composite with its twelve-percent veil and quietly
+    /// turn the shared material back into an opaque-looking panel.
     static let railCarrierWhiteCoverage: Double = 0.0
 
     /// White over the already-frosted workspace canvas. Light deliberately
@@ -140,16 +140,18 @@ enum LightRailTint {
 
 /// The light Tinted theme is a deliberate, very gentle colour composition,
 /// rather than a sampled desktop hue that can turn every surface flat blue.
-/// A pale sage-cool end crosses neutral white into a lilac-pearl end. No stop
-/// covers more than six percent of the white carrier.
+/// A pale sage-cool end crosses a warm pearl into a lilac-pearl end. No stop
+/// covers more than eleven percent of the white carrier.
 enum LightTintedGradient {
-    /// `#A5CBB2`, a sage source whose 5.5% composite reads as `#FAFCFB`.
+    /// `#A5CBB2`, a sage source whose 11% composite reads as `#F5FAF7`.
     static let cool = (red: 165.0 / 255, green: 203.0 / 255, blue: 178.0 / 255)
-    /// `#CBB9E2`, a lilac pearl whose 5% composite reads as `#FCFCFE`.
+    /// `#E9DDCF`, a quiet warm midpoint that prevents a broad white band.
+    static let neutral = (red: 233.0 / 255, green: 221.0 / 255, blue: 207.0 / 255)
+    /// `#CBB9E2`, a lilac pearl whose 10% composite reads as `#FAF8FC`.
     static let pearl = (red: 203.0 / 255, green: 185.0 / 255, blue: 226.0 / 255)
-    static let coolCoverage = 0.055
-    static let neutralCoverage = 0.010
-    static let pearlCoverage = 0.050
+    static let coolCoverage = 0.11
+    static let neutralCoverage = 0.10
+    static let pearlCoverage = 0.10
     static let neutralLocation = 0.54
 
     static var coolColor: Color {
@@ -158,6 +160,10 @@ enum LightTintedGradient {
 
     static var pearlColor: Color {
         Color(red: pearl.red, green: pearl.green, blue: pearl.blue)
+    }
+
+    static var neutralColor: Color {
+        Color(red: neutral.red, green: neutral.green, blue: neutral.blue)
     }
 
     static func gradient(
@@ -170,7 +176,7 @@ enum LightTintedGradient {
             gradient: Gradient(stops: [
                 .init(color: coolColor.opacity(coolCoverage * scale), location: 0),
                 .init(
-                    color: Color.white.opacity(neutralCoverage * scale),
+                    color: neutralColor.opacity(neutralCoverage * scale),
                     location: neutralLocation
                 ),
                 .init(color: pearlColor.opacity(pearlCoverage * scale), location: 1),
@@ -573,7 +579,7 @@ struct GlassBackdropWash: Equatable, Sendable {
     private static func sidebarBase(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
-            : light(top: 0.22, base: 0.20, bottom: 0.18)
+            : light(top: 0.14, base: 0.12, bottom: 0.10)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour

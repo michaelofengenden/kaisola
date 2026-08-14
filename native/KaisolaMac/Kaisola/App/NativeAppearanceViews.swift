@@ -561,6 +561,10 @@ final class DesktopWallpaperPatchView: NSView {
 /// Reusable material used by both the project sidebar and the workspace file
 /// rail, keeping the two left-hand navigation surfaces visually coherent.
 struct SidebarBackdropView: View {
+    /// Both window-edge rails live inside this exact AppKit material. Placement
+    /// mirrors only the small colour gradient; it never selects a different
+    /// blur, carrier, or neutral wash for Projects and Files.
+    static let sharedGlassMaterial: NSVisualEffectView.Material = .sidebar
     /// Coverage of the sampled desktop average laid over *live* vibrancy.
     ///
     /// Michael's translucency note names both glass sources — "especially on
@@ -601,7 +605,7 @@ struct SidebarBackdropView: View {
             } else {
                 ZStack {
                     DesktopGlassLayer(
-                        liveMaterial: .sidebar,
+                        liveMaterial: Self.sharedGlassMaterial,
                         liveTint: Self.liveTint,
                         carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
                     )
@@ -691,12 +695,10 @@ struct SidebarBackdropView: View {
 
     /// How much of the canvas's tint coverage the rails take.
     ///
-    /// Three quarters. At parity the two narrow columns read louder than the
-    /// wide canvas between them, because the same coverage over a small area
-    /// next to a large one is the one the eye lands on. Below about half the
-    /// rails stop looking related to the canvas at all, which is the
-    /// half-applied look this theme exists to fix.
-    static let railTintShare: Double = 0.75
+    /// Ninety percent. The old three-quarter scaling pushed the already-gentle
+    /// stops back into 254–255 quantization, so the rails read as plain white
+    /// even when the center still carried a trace of colour.
+    static let railTintShare: Double = 0.90
 }
 
 struct WorkspaceBackdropView: View {

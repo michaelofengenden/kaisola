@@ -90,6 +90,7 @@ struct NewSessionChooserView: View {
     let terminalControlAvailable: Bool
     let isLaunching: Bool
     let launchFailed: Bool
+    var showsCancel = true
     let choose: (NewSessionChoice) -> Void
     let cancel: () -> Void
 
@@ -173,9 +174,11 @@ struct NewSessionChooserView: View {
                     .disabled(isLaunching)
                 }
                 Spacer()
-                Button("Cancel", role: .cancel, action: cancel)
-                    .keyboardShortcut(.cancelAction)
-                    .disabled(isLaunching)
+                if showsCancel {
+                    Button("Cancel", role: .cancel, action: cancel)
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(isLaunching)
+                }
             }
             .font(.callout)
         }
@@ -192,7 +195,7 @@ struct NewSessionChooserView: View {
         .shadow(color: Color.black.opacity(0.06), radius: 16, y: 6)
         .onAppear(perform: focusFirstEnabledChoice)
         .onExitCommand {
-            if !isLaunching {
+            if showsCancel, !isLaunching {
                 cancel()
             }
         }

@@ -1300,6 +1300,18 @@ struct RootShellView: View {
         newSessionDrafts.cancel(projectID: projectID)
     }
 
+    /// The blank project workspace is the same launch surface as the project
+    /// plus button, without manufacturing a temporary tab before the user has
+    /// chosen anything. The first concrete choice creates that draft and then
+    /// travels through the one existing launch path below.
+    private func chooseNewSessionFromEmptyWorkspace(
+        _ choice: NewSessionChoice,
+        project: AppModel.ProjectGroup
+    ) {
+        let draft = newSessionDrafts.begin(projectID: project.id)
+        chooseNewSession(choice, draft: draft)
+    }
+
     private func chooseNewSession(_ choice: NewSessionChoice, draft: NewSessionDraft) {
         guard let project = model.projects.first(where: {
             $0.id == draft.projectID && $0.directory != nil
@@ -2255,15 +2267,33 @@ struct RootShellView: View {
     /// this text is the one thing that must bring its own surface.
     @ViewBuilder
     private var emptyWorkspaceState: some View {
-        emptyWorkspaceContent
-            .frame(maxWidth: 520)
-            .fixedSize(horizontal: false, vertical: true)
-            .padding(.vertical, 8)
-            .background(
-                .regularMaterial,
-                in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+        if let project = model.projects.first(where: {
+            $0.id == activeProjectID && $0.directory != nil
+        }) {
+            NewSessionChooserView(
+                projectName: project.name,
+                catalog: .live,
+                terminalControlAvailable: model.controlAvailable,
+                isLaunching: false,
+                launchFailed: false,
+                showsCancel: false,
+                choose: { chooseNewSessionFromEmptyWorkspace($0, project: project) },
+                cancel: {}
             )
+            .padding(32)
+            .accessibilityIdentifier("empty-workspace-session-chooser")
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            emptyWorkspaceContent
+                .frame(maxWidth: 520)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(.vertical, 8)
+                .background(
+                    .regularMaterial,
+                    in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
     }
 
     @ViewBuilder

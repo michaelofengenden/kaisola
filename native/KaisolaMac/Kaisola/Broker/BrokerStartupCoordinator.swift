@@ -1380,12 +1380,35 @@ actor BrokerStartupCoordinator:
             if existing.topology?.current == record {
                 // A second app window published the same launched generation.
             } else if let topology = existing.topology,
-                      topology.draining.isEmpty,
-                      !topology.current.info.isProcessAlive {
+                      topology.draining.allSatisfy({ $0.id != record.id }),
+                      registryCurrentIsReplaceable(
+                          topology.current,
+                          by: record,
+                          store: store
+                      ) {
+                // Replace only the gone current; every *announced* draining
+                // generation keeps its registration, its terminals, and its
+                // rollback eligibility. A drain whose rendezvous no longer
+                // exists is dropped rather than copied forward: writing it
+                // under a fresh revision would mint a registry that can never
+                // again equal discovered topology, wedging every retirement
+                // sweep and rollback listing behind the phantom.
+                let announcedDrains = topology.draining.filter { drain in
+                    var drainStat = stat()
+                    return lstat(store.metadataURL(for: drain).path, &drainStat) == 0
+                }
+                // A selection can only name the current generation, so it
+                // survives exactly when the replacement is the same sealed
+                // digest relaunched; any other replacement changes the id the
+                // selection is bound to and the pin ends with its generation.
+                let selection = record.id == topology.current.id
+                    ? existing.selection
+                    : nil
                 _ = try store.save(
                     currentGenerationID: record.id,
-                    generations: [record],
-                    expectedRevision: existing.revision
+                    generations: [record] + announcedDrains,
+                    expectedRevision: existing.revision,
+                    selection: selection
                 )
             } else {
                 throw BrokerStartupError.rendezvousChanged
@@ -1396,6 +1419,39 @@ actor BrokerStartupCoordinator:
         pendingUpgrade = nil
         currentUpgradeState = .current(contentDigest: package.contentDigest)
         return adopted
+    }
+
+    /// True when the registry's recorded current generation is adoptable by no
+    /// client *and* provably dead, so a freshly launched `record` may take its
+    /// place. Covers the routine gap where an empty current broker self-exited
+    /// and removed its own rendezvous while older generations still drain live
+    /// terminals (metadata absent, recorded process gone — the exact state
+    /// `locateTopology` reports as `notRunning`), and the relaunch of the same
+    /// sealed digest whose rendezvous now names the replacement.
+    ///
+    /// A recorded process that still answers `kill(0)` is refused even when
+    /// its rendezvous is missing: no client can reach it, but evicting it
+    /// would orphan whatever terminals it owns with no record they existed.
+    /// That state (seen once in the wild on 0.1.118) keeps failing closed,
+    /// exactly as it did before this recovery existed. Metadata that exists
+    /// but agrees with neither identity also stays refused.
+    private func registryCurrentIsReplaceable(
+        _ current: BrokerGenerationRecord,
+        by record: BrokerGenerationRecord,
+        store: BrokerGenerationRegistryStore
+    ) -> Bool {
+        guard !current.info.isProcessAlive else { return false }
+        var metadataStat = stat()
+        if lstat(store.metadataURL(for: current).path, &metadataStat) != 0,
+           errno == ENOENT {
+            return true
+        }
+        guard current.id == record.id else { return false }
+        let published = try? locator.locateGenerationMetadata(
+            contentDigest: current.id,
+            validateSocket: false
+        )
+        return published == record.info
     }
 
     private func publishCutover(

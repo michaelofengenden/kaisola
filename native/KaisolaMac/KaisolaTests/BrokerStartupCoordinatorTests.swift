@@ -231,6 +231,70 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
+    /// The routine no-current state: an empty current broker self-exited and
+    /// removed its own rendezvous while older generations still drain live
+    /// terminals. A fresh launch must replace only the gone current and keep
+    /// every draining generation registered, or the app relaunches its packaged
+    /// broker forever without ever connecting.
+    func testGoneUnpublishedCurrentIsReplacedWhileLiveDrainsArePreserved() async throws {
+        let drainDigest = String(repeating: "a", count: 64)
+        let fixture = try makeDeadCurrentWithDrains(drainDigests: [drainDigest])
+        defer { fixture.drains.forEach { Darwin.close($0.descriptor) } }
+        try FileManager.default.removeItem(
+            at: fixture.store.metadataURL(for: fixture.dead)
+        )
+
+        let launcher = FakeBrokerHelperLauncher()
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [fixture.profile]),
+            launcher: launcher,
+            homeDirectory: fixture.home,
+            appVersion: "native-test"
+        )
+
+        let replacement = try await coordinator.prepare()
+        let registry = try fixture.store.load()
+        let launchCount = await launcher.launchCount
+
+        XCTAssertEqual(replacement.pid, getpid())
+        XCTAssertEqual(replacement.contentDigest, String(repeating: "d", count: 64))
+        XCTAssertEqual(registry.revision, 2)
+        XCTAssertEqual(registry.topology?.current.info, replacement)
+        XCTAssertEqual(registry.topology?.draining, fixture.drains.map(\.generation))
+        XCTAssertNil(registry.selection)
+        XCTAssertEqual(launchCount, 1)
+        await launcher.close()
+    }
+
+    /// Same recovery when the dead current is still published at discovery
+    /// time: prepare() removes the stale rendezvous itself, then the fresh
+    /// publication must complete with the draining generations preserved.
+    func testDeadPublishedCurrentIsReplacedWhileLiveDrainsArePreserved() async throws {
+        let drainDigest = String(repeating: "a", count: 64)
+        let fixture = try makeDeadCurrentWithDrains(drainDigests: [drainDigest])
+        defer { fixture.drains.forEach { Darwin.close($0.descriptor) } }
+
+        let launcher = FakeBrokerHelperLauncher()
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [fixture.profile]),
+            launcher: launcher,
+            homeDirectory: fixture.home,
+            appVersion: "native-test"
+        )
+
+        let replacement = try await coordinator.prepare()
+        let registry = try fixture.store.load()
+        let launchCount = await launcher.launchCount
+
+        XCTAssertEqual(replacement.pid, getpid())
+        XCTAssertEqual(replacement.contentDigest, String(repeating: "d", count: 64))
+        XCTAssertEqual(registry.revision, 2)
+        XCTAssertEqual(registry.topology?.current.info, replacement)
+        XCTAssertEqual(registry.topology?.draining, fixture.drains.map(\.generation))
+        XCTAssertEqual(launchCount, 1)
+        await launcher.close()
+    }
+
     func testTwoCoordinatorsTargetingSamePackageSerializeThroughPublication() async throws {
         let home = try privateTemporaryDirectory()
         let oldDigest = String(repeating: "e", count: 64)

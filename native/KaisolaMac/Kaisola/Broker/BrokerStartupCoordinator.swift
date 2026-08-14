@@ -1380,11 +1380,19 @@ actor BrokerStartupCoordinator:
             if existing.topology?.current == record {
                 // A second app window published the same launched generation.
             } else if let topology = existing.topology,
-                      topology.draining.isEmpty,
-                      !topology.current.info.isProcessAlive {
+                      topology.draining.allSatisfy({ $0.id != record.id }),
+                      registryCurrentIsReplaceable(
+                          topology.current,
+                          by: record,
+                          store: store
+                      ) {
+                // Replace only the gone current; every draining generation
+                // keeps its registration, its terminals, and its rollback
+                // eligibility. An explicit selection cannot outlive the
+                // generation it named, so it is dropped with it.
                 _ = try store.save(
                     currentGenerationID: record.id,
-                    generations: [record],
+                    generations: [record] + topology.draining,
                     expectedRevision: existing.revision
                 )
             } else {
@@ -1396,6 +1404,34 @@ actor BrokerStartupCoordinator:
         pendingUpgrade = nil
         currentUpgradeState = .current(contentDigest: package.contentDigest)
         return adopted
+    }
+
+    /// True when the registry's recorded current generation is adoptable by no
+    /// client, so a freshly launched `record` may take its place. Covers the
+    /// routine gap where an empty current broker self-exited and removed its
+    /// own rendezvous while older generations still drain live terminals
+    /// (metadata absent — the exact state `locateTopology` reports as
+    /// `notRunning`), and the relaunch of the same sealed digest whose
+    /// rendezvous now names the replacement. A live published current, or
+    /// metadata that agrees with neither identity, stays refused.
+    private func registryCurrentIsReplaceable(
+        _ current: BrokerGenerationRecord,
+        by record: BrokerGenerationRecord,
+        store: BrokerGenerationRegistryStore
+    ) -> Bool {
+        var metadataStat = stat()
+        if lstat(store.metadataURL(for: current).path, &metadataStat) != 0,
+           errno == ENOENT {
+            return true
+        }
+        guard current.id == record.id, !current.info.isProcessAlive else {
+            return false
+        }
+        let published = try? locator.locateGenerationMetadata(
+            contentDigest: current.id,
+            validateSocket: false
+        )
+        return published == record.info
     }
 
     private func publishCutover(

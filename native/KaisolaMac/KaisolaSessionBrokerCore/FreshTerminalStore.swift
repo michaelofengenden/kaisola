@@ -333,9 +333,10 @@ public actor FreshTerminalStore {
                 activityClock.advance()
                 return creation(from: record, existed: true)
             }
-            // The exit watcher is the confirmation: replacing this ended
-            // in-memory record cannot orphan a still-running child.
-            records.removeValue(forKey: request.id)
+            // Retain the ended record until the replacement process has
+            // spawned successfully. Installing the new live record below is
+            // the atomic replacement point; capacity or spawn failure must
+            // leave the prior output snapshot and activity epoch intact.
         }
 
         if let pending = pendingCreates[request.id] {

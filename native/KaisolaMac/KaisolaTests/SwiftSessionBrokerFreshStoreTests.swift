@@ -182,6 +182,53 @@ final class SwiftSessionBrokerFreshStoreTests: XCTestCase {
         try await store.shutdown()
     }
 
+    func testFailedSameIDReplacementPreservesTheExitedSnapshotAndActivityEpoch() async throws {
+        let factory = FakeFreshTerminalFactory()
+        let store = FreshTerminalStore(factory: factory)
+        let client = controller()
+        let retainedRequest = createRequest(id: "term-project-a-retained")
+
+        _ = try await store.create(client: client, request: retainedRequest)
+        await factory.emit(Data("retained output".utf8), fromProcessAt: 0)
+        let retainedProcessValue = await factory.process(at: 0)
+        let retainedProcess = try XCTUnwrap(retainedProcessValue)
+        retainedProcess.confirmExit()
+        try await eventually {
+            await store.inventory().contains { record in
+                record.id == retainedRequest.id && record.exited
+            }
+        }
+
+        for index in 0..<64 {
+            _ = try await store.create(
+                client: client,
+                request: createRequest(id: String(format: "term-project-a-%08x", index))
+            )
+        }
+        let snapshotBeforeValue = try await store.snapshot(
+            id: retainedRequest.id,
+            projectID: retainedRequest.projectID
+        )
+        let snapshotBefore = try XCTUnwrap(snapshotBeforeValue)
+        let epochBefore = await store.currentActivityEpoch()
+
+        await assertStoreError(.capacityExceeded(maximum: 64)) {
+            try await store.create(client: client, request: retainedRequest)
+        }
+
+        let snapshotAfterValue = try await store.snapshot(
+            id: retainedRequest.id,
+            projectID: retainedRequest.projectID
+        )
+        let snapshotAfter = try XCTUnwrap(snapshotAfterValue)
+        XCTAssertEqual(snapshotAfter, snapshotBefore)
+        let epochAfter = await store.currentActivityEpoch()
+        XCTAssertEqual(epochAfter, epochBefore)
+        let retainedRecord = await store.inventory().first { $0.id == retainedRequest.id }
+        XCTAssertTrue(try XCTUnwrap(retainedRecord).exited)
+        try await store.shutdown()
+    }
+
     func testConcurrentRepeatedIDNeverStartsASecondProcess() async throws {
         let factory = FakeFreshTerminalFactory()
         await factory.setSpawnsPaused(true)

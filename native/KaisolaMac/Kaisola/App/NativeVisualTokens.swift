@@ -42,6 +42,13 @@ enum KaisolaVisualSystem {
     static let layoutDuration = 0.22
 }
 
+/// Stroke coverage shared by the two horizontal tab families.
+enum SurfaceTabChrome {
+    static let projectSelectedStrokeOpacity = 0.38
+    static let sessionSelectedStrokeOpacity = 0.30
+    static let inactiveStrokeOpacity = 0.11
+}
+
 /// The light-appearance recipe shared by the two navigation rails, the
 /// workspace canvas, and the inset detail panel.
 ///
@@ -52,26 +59,23 @@ enum KaisolaVisualSystem {
 /// own material the two large surfaces therefore landed at only 0.846 and
 /// 0.832 luminance. That is grey by construction.
 ///
-/// Whiteness is bought with one explicit, achromatic carrier between the
-/// desktop and `GlassBackdropWash`. The previous light recipe preserved the
-/// sampled desktop's RGB ratios, so a blue wallpaper was guaranteed to make a
-/// blue pane even though every declared veil constant was white. The carrier
-/// keeps blurred light and movement while making colour a property of the
-/// explicit Tinted theme, not of light Glass.
+/// The center and rails now have deliberately different jobs. The workspace
+/// carrier is opaque white, making the working canvas exact and stable. The
+/// rails have no second carrier at all: their single white veil sits at about
+/// twelve percent, so live material keeps its colour and movement. The rails
+/// add their own named, tightly bounded cool-to-pearl edge tint.
 enum LightGlassFrost {
-    /// Light Glass navigation rails are part of the same achromatic outer
-    /// chrome as the workspace canvas. Decorative colour belongs exclusively
-    /// to the explicit Tinted theme, never to a post-frost rail overlay.
-    static let navigationChromaCoverage: Double = 0
-
     /// Neutral luminance of a painted wallpaper before the white veil.
     static let backdropLuminance: Double = 0.80
 
-    /// White laid over the live or painted desktop before the surface veil.
-    /// With the existing rail/canvas veils this leaves roughly 16-18% of the
-    /// underlying luminance variation visible and lands both surfaces near
-    /// sRGB 247 rather than grey. It is deliberately achromatic.
-    static let carrierWhiteCoverage: Double = 0.70
+    /// The workspace is a white working plane. An opaque carrier states that
+    /// directly and prevents a live desktop from tinting it at any clarity.
+    static let carrierWhiteCoverage: Double = 1.0
+
+    /// Rails get their frost from `GlassBackdropWash.sidebar` alone. A second
+    /// white layer would composite with its twelve-percent veil and quietly
+    /// turn the shared material back into an opaque-looking panel.
+    static let railCarrierWhiteCoverage: Double = 0.0
 
     /// White over the already-frosted workspace canvas. Light deliberately
     /// gets no second semantic material: that layer re-greyed the canvas and
@@ -87,6 +91,99 @@ enum LightGlassFrost {
         let carried = carrierWhiteCoverage
             + (1 - carrierWhiteCoverage) * backdropLuminance
         return wash.baseOpacity + wash.desktopTransmission * carried
+    }
+
+    static func modeledRailLuminance(_ wash: GlassBackdropWash) -> Double {
+        let carried = railCarrierWhiteCoverage
+            + (1 - railCarrierWhiteCoverage) * backdropLuminance
+        return wash.baseOpacity + wash.desktopTransmission * carried
+    }
+
+    static func modeledRailDesktopContribution(_ wash: GlassBackdropWash) -> Double {
+        (1 - railCarrierWhiteCoverage) * wash.desktopTransmission
+    }
+}
+
+enum SidebarRailPlacement: Equatable, Sendable {
+    case leading
+    case trailing
+
+    var tintStartPoint: UnitPoint {
+        self == .leading ? .topLeading : .topTrailing
+    }
+
+    var tintEndPoint: UnitPoint {
+        self == .leading ? .bottomTrailing : .bottomLeading
+    }
+}
+
+/// A restrained cool-to-pearl cast at the two outside window edges.
+enum LightRailTint {
+    static let cool = (red: 90.0 / 255, green: 169.0 / 255, blue: 1.0)
+    static let pearl = (red: 1.0, green: 201.0 / 255, blue: 133.0 / 255)
+    static let coolCoverage = 0.035
+    static let midpointCoverage = 0.008
+    static let pearlCoverage = 0.010
+    static let midpointLocation = 0.62
+    static let inactiveMultiplier = 0.12
+    static let maximumCoverage = max(coolCoverage, midpointCoverage, pearlCoverage)
+    static let minimumTransmission = 1 - maximumCoverage
+
+    static var coolColor: Color {
+        Color(red: cool.red, green: cool.green, blue: cool.blue)
+    }
+
+    static var pearlColor: Color {
+        Color(red: pearl.red, green: pearl.green, blue: pearl.blue)
+    }
+}
+
+/// The light Tinted theme is a deliberate, very gentle colour composition,
+/// rather than a sampled desktop hue that can turn every surface flat blue.
+/// A pale sage-cool end crosses a warm pearl into a lilac-pearl end. No stop
+/// covers more than eleven percent of the white carrier.
+enum LightTintedGradient {
+    /// `#A5CBB2`, a sage source whose 11% composite reads as `#F5FAF7`.
+    static let cool = (red: 165.0 / 255, green: 203.0 / 255, blue: 178.0 / 255)
+    /// `#E9DDCF`, a quiet warm midpoint that prevents a broad white band.
+    static let neutral = (red: 233.0 / 255, green: 221.0 / 255, blue: 207.0 / 255)
+    /// `#CBB9E2`, a lilac pearl whose 10% composite reads as `#FAF8FC`.
+    static let pearl = (red: 203.0 / 255, green: 185.0 / 255, blue: 226.0 / 255)
+    static let coolCoverage = 0.11
+    static let neutralCoverage = 0.10
+    static let pearlCoverage = 0.10
+    static let neutralLocation = 0.54
+
+    static var coolColor: Color {
+        Color(red: cool.red, green: cool.green, blue: cool.blue)
+    }
+
+    static var pearlColor: Color {
+        Color(red: pearl.red, green: pearl.green, blue: pearl.blue)
+    }
+
+    static var neutralColor: Color {
+        Color(red: neutral.red, green: neutral.green, blue: neutral.blue)
+    }
+
+    static func gradient(
+        coverageScale: Double = 1,
+        startPoint: UnitPoint = .topLeading,
+        endPoint: UnitPoint = .bottomTrailing
+    ) -> LinearGradient {
+        let scale = min(1, max(0, coverageScale))
+        return LinearGradient(
+            gradient: Gradient(stops: [
+                .init(color: coolColor.opacity(coolCoverage * scale), location: 0),
+                .init(
+                    color: neutralColor.opacity(neutralCoverage * scale),
+                    location: neutralLocation
+                ),
+                .init(color: pearlColor.opacity(pearlCoverage * scale), location: 1),
+            ]),
+            startPoint: startPoint,
+            endPoint: endPoint
+        )
     }
 }
 
@@ -105,7 +202,7 @@ enum LightGlassFrost {
 /// workspace surface under the widest wallpaper the fixtures carry:
 ///
 ///     α 0.498 (AppKit)   3.43:1
-///     α 0.600 (Kaisola)  4.65:1
+///     α 0.610 (Kaisola)  ≥4.5:1
 ///
 /// **The ladder.** Four rungs, stated as ink coverage, resolved per appearance
 /// at draw time. Alpha is not the contract — contrast is — so each rung is
@@ -137,7 +234,7 @@ enum LightGlassFrost {
 /// asked the system for contrast.
 ///
 /// **Three surfaces, because they are three different backgrounds.** Light glass
-/// is the hard one and sets α 0.60. Light solid is white — `windowBackgroundColor`,
+/// is the hard one and sets α 0.61. Light solid is white — `windowBackgroundColor`,
 /// `controlBackgroundColor` and `textBackgroundColor` all resolve to #FFFFFF in
 /// Aqua — where α 0.535 already reaches exactly 4.5, so it takes 0.55 and keeps
 /// documents and terminals from reading heavier than they are. Dark keeps
@@ -171,7 +268,7 @@ enum KaisolaInk {
         case .primary:
             0.85
         case .secondary:
-            isDark ? 0.55 : (surface == .glass ? 0.60 : 0.55)
+            isDark ? 0.55 : (surface == .glass ? 0.61 : 0.55)
         case .tertiary:
             isDark ? 0.40 : (surface == .glass ? 0.48 : 0.44)
         case .disabled:
@@ -223,8 +320,8 @@ extension ShapeStyle where Self == Color {
     static var kaisolaPrimary: Color { KaisolaInk.color(.primary) }
 
     /// Secondary label ink. The glass value, because one view tree spans both
-    /// kinds of surface and glass is the safe superset: α 0.60 on an opaque
-    /// white surface is 5.7:1, still unmistakably junior to primary's 15:1.
+    /// kinds of surface and glass is the safe superset: α 0.61 on an opaque
+    /// white surface is about 6:1, still unmistakably junior to primary's 15:1.
     /// Surfaces that are opaque *by construction* — the document editors, the
     /// terminal — ask for `.solid` explicitly through `KaisolaInk`.
     static var kaisolaSecondary: Color { KaisolaInk.color(.secondary) }
@@ -469,8 +566,8 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// and 0.45 is exactly where that binds. Going to 0.40 costs 0.06 of it.
     ///
     /// The mechanism that lifts it is a **custom secondary ink** rather than
-    /// the system semantic: on this surface, black at α 0.60 measures
-    /// **4.60:1** at the worst patch (4.56:1 adversarial), clearing the floor.
+    /// the system semantic: on this surface, black at α 0.61 clears the
+    /// **4.5:1** floor on the worst patch of the deliberately clearer rails.
     /// That is `KaisolaInk` now, adopted at the call sites rather than smuggled
     /// in through a glass constant — the veil still may not make text legible
     /// on its own, and the sentence above still binds this number. What changed
@@ -482,7 +579,7 @@ struct GlassBackdropWash: Equatable, Sendable {
     private static func sidebarBase(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
-            : light(top: 0.51, base: 0.45, bottom: 0.41)
+            : light(top: 0.14, base: 0.12, bottom: 0.10)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour
@@ -548,14 +645,11 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// than those two constants allow, whatever the desktop is — which is
     /// exactly the guarantee the 0.50 ceiling was standing in for.
     ///
-    /// Both ceilings therefore sit one step above the veil they permit
-    /// (dark 0.66 under 0.70, light 0.60 under 0.65) rather than at an
-    /// historical number. Light stays the tighter of the two because its own
-    /// contrast budget is tighter, not because it is unguarded: see
-    /// `sidebar(isDark:)` for the 3.98:1 AppKit ceiling that is the real bound
-    /// on the light surface.
+    /// Dark retains its established 0.70 ceiling. Light rails deliberately
+    /// move into a clearer 0.90 band; their normalized still, named twelve-point
+    /// veil, and custom ink keep that extra transmission from becoming raw desktop.
     static func desktopTransmissionBand(isDark: Bool) -> (floor: Double, ceiling: Double) {
-        isDark ? (floor: 0.30, ceiling: 0.70) : (floor: 0.30, ceiling: 0.65)
+        isDark ? (floor: 0.30, ceiling: 0.70) : (floor: 0.30, ceiling: 0.90)
     }
 
     /// How much of a glass surface Increased Contrast must cover, counting the

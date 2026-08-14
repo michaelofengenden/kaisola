@@ -29,6 +29,48 @@ packages:
     exactVersion: 2.9.2
 
 targets:
+  KaisolaSessionBrokerCore:
+    type: library.static
+    platform: macOS
+    sources:
+      - path: KaisolaSessionBrokerCore
+    dependencies:
+      - package: KaisolaCore
+        product: KaisolaBrokerProtocol
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kaisola.mac.session-broker-core
+        PRODUCT_MODULE_NAME: KaisolaSessionBrokerCore
+        PRODUCT_NAME: KaisolaSessionBrokerCore
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: NO
+        SKIP_INSTALL: YES
+
+  # Phase-2 shadow executable. It is a separate, arm64-only build product:
+  # the shipping app neither depends on it nor copies it into the bundle.
+  KaisolaSessionBroker:
+    type: tool
+    platform: macOS
+    sources:
+      - path: KaisolaSessionBroker
+    dependencies:
+      - target: KaisolaSessionBrokerCore
+      # Static-library dependencies do not propagate their package products to
+      # a tool link step, so the executable must link the wire protocol too.
+      - package: KaisolaCore
+        product: KaisolaBrokerProtocol
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.kaisola.mac.session-broker-shadow
+        PRODUCT_MODULE_NAME: KaisolaSessionBroker
+        PRODUCT_NAME: KaisolaSessionBroker
+        GENERATE_INFOPLIST_FILE: YES
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: NO
+        SKIP_INSTALL: YES
+        ENABLE_APP_SANDBOX: NO
+        CODE_SIGN_STYLE: Automatic
+
   KaisolaBrokerBootstrap:
     type: tool
     platform: macOS
@@ -103,6 +145,22 @@ targets:
         ENABLE_APP_SANDBOX: NO
         CODE_SIGN_STYLE: Automatic
       configs:
+        Debug:
+          # Keep the physical Keychain boundary injectable only into the app's
+          # Debug target. These indirections were previously hand-edited into
+          # the generated project, so regenerating for a new target silently
+          # erased the signed boundary lane.
+          CODE_SIGN_ENTITLEMENTS: "$(KAISOLA_KEYCHAIN_BOUNDARY_ENTITLEMENTS)"
+          CODE_SIGN_IDENTITY: "$(KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_IDENTITY)"
+          CODE_SIGN_STYLE: "$(KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_STYLE)"
+          DEVELOPMENT_TEAM: "$(KAISOLA_KEYCHAIN_BOUNDARY_DEVELOPMENT_TEAM)"
+          OTHER_CODE_SIGN_FLAGS: "$(inherited) $(KAISOLA_KEYCHAIN_BOUNDARY_OTHER_CODE_SIGN_FLAGS)"
+          PROVISIONING_PROFILE_SPECIFIER: "$(KAISOLA_KEYCHAIN_BOUNDARY_PROVISIONING_PROFILE_SPECIFIER)"
+          KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_IDENTITY: "-"
+          KAISOLA_KEYCHAIN_BOUNDARY_CODE_SIGN_STYLE: Automatic
+          KAISOLA_KEYCHAIN_BOUNDARY_DEVELOPMENT_TEAM: ""
+          KAISOLA_KEYCHAIN_BOUNDARY_OTHER_CODE_SIGN_FLAGS: ""
+          KAISOLA_KEYCHAIN_BOUNDARY_PROVISIONING_PROFILE_SPECIFIER: ""
         LocalRelease:
           CODE_SIGN_ENTITLEMENTS: BrokerHelper/LocalPreview.entitlements
           ENABLE_HARDENED_RUNTIME: YES
@@ -164,6 +222,10 @@ targets:
       - path: KaisolaTests
     dependencies:
       - target: Kaisola
+      - target: KaisolaSessionBrokerCore
+      - target: KaisolaSessionBroker
+        embed: false
+        link: false
       - package: SwiftTerm
     settings:
       base:

@@ -5,12 +5,12 @@ import SwiftUI
 /// a second copy of session, project, or quick-action behavior.
 struct RootShellActionModel {
     let openDroppedProjects: ([URL]) -> Bool
-    let openProject: () -> Void
+    let beginNewSession: (AppModel.ProjectGroup) -> Void
+    let selectRealSurface: () -> Void
     let useLeftTreeNavigation: () -> Void
     let moveProject: (String, Int) -> Void
     let runQuickAction: (QuickAction, URL) -> Void
     let selectSession: (BrokerTerminalRecord) -> Void
-    let projectLaunchMenu: (AppModel.ProjectGroup) -> AnyView
     let projectContextMenu: (AppModel.ProjectGroup) -> AnyView
     let sessionContextMenu: (BrokerTerminalRecord) -> AnyView
     let chatContextMenu: (AcpChatHandle) -> AnyView
@@ -50,21 +50,24 @@ enum RootShellRenderContract {
 /// same action model as the top-bar shell.
 struct RootLeftTreeShell<Sidebar: View, Detail: View>: View {
     let actions: RootShellActionModel
+    @Binding private var columnVisibility: NavigationSplitViewVisibility
     private let sidebar: (RootShellActionModel) -> Sidebar
     private let detail: (RootShellActionModel) -> Detail
 
     init(
         actions: RootShellActionModel,
+        columnVisibility: Binding<NavigationSplitViewVisibility> = .constant(.all),
         @ViewBuilder sidebar: @escaping (RootShellActionModel) -> Sidebar,
         @ViewBuilder detail: @escaping (RootShellActionModel) -> Detail
     ) {
         self.actions = actions
+        self._columnVisibility = columnVisibility
         self.sidebar = sidebar
         self.detail = detail
     }
 
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
             sidebar(actions)
         } detail: {
             detail(actions)

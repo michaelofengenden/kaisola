@@ -243,6 +243,28 @@ test('broker and shared wire changes expand to the reproducible contract lane', 
   assert.match(plan.reasons.join('\n'), /broker\/shared protocol changed/u)
 })
 
+test('Swift broker core and executable changes use the broker contract lane without fallback', () => {
+  for (const file of [
+    'native/KaisolaMac/KaisolaSessionBrokerCore/ShadowBrokerConfiguration.swift',
+    'native/KaisolaMac/KaisolaSessionBrokerCore/BrokerServer.swift',
+    'native/KaisolaMac/KaisolaSessionBroker/KaisolaSessionBrokerMain.swift',
+  ]) {
+    const plan = selector.planForChanges([file], inventory)
+    assert.equal(plan.native.mode, 'contract', file)
+    assert.ok(plan.native.selectors.includes('SwiftSessionBrokerConfigurationTests'), file)
+    assert.ok(plan.native.selectors.includes('SwiftSessionBrokerCoreTests'), file)
+    assert.ok(plan.native.selectors.includes('SwiftSessionBrokerDarwinPTYTests'), file)
+    assert.ok(plan.native.selectors.includes('SwiftSessionBrokerFreshEndToEndTests'), file)
+    assert.ok(plan.native.selectors.includes('SwiftSessionBrokerFreshStoreTests'), file)
+    assert.ok(plan.native.selectors.includes('SwiftSessionBrokerFreshWireTests'), file)
+    assert.ok(plan.native.selectors.includes('SwiftSessionBrokerOutputTests'), file)
+    assert.ok(plan.native.selectors.includes('SwiftSessionBrokerShadowIntegrationTests'), file)
+    assert.equal(plan.node.mode, 'all', file)
+    assert.deepEqual(plan.swiftPackages, ['native/KaisolaCore'], file)
+    assert.equal(plan.fallback, false, file)
+  }
+})
+
 test('release changes select all Node contracts plus update-facing native tests', () => {
   const plan = selector.planForChanges(['scripts/native-appcast.cjs'], inventory)
 

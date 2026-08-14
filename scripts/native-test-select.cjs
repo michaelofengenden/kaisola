@@ -16,6 +16,9 @@ const NATIVE_CONTRACT_TESTS = Object.freeze([
   'BrokerStartupCoordinatorTests',
   'NativeUpdateConfigurationTests',
   'ObserveOnlyBrokerClientTests',
+  'SwiftSessionBrokerConfigurationTests',
+  'SwiftSessionBrokerCoreTests',
+  'SwiftSessionBrokerShadowIntegrationTests',
   'TerminalLinkRoutingTests',
   'WorkspaceFilesTests',
 ])
@@ -286,6 +289,8 @@ function isBrokerOrSharedProtocolFile(file) {
     || file.startsWith('native/KaisolaCore/Sources/KaisolaBrokerProtocol/')
     || file.startsWith('native/KaisolaMac/BrokerBootstrap/')
     || file.startsWith('native/KaisolaMac/BrokerHelper/')
+    || file.startsWith('native/KaisolaMac/KaisolaSessionBroker/')
+    || file.startsWith('native/KaisolaMac/KaisolaSessionBrokerCore/')
     || file.startsWith('native/KaisolaMac/Shared/Broker')
     || file === 'scripts/native-broker-package.cjs'
 }

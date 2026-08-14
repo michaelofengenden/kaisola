@@ -13,15 +13,31 @@ migration of sessions created by older Node broker versions.
 
 ## Required before the Swift broker becomes the default
 
-### 1. Ordered live output and backpressure
+### 1. Ordered live output and backpressure — done for fresh mode
 
-- Replace snapshot-only subscription with ordered incremental output and exit
-  events using the existing stream epoch and contiguous offsets.
-- Bound every client queue and define one fail-closed slow-consumer policy:
-  disconnect with an exact resubscribe cursor instead of buffering without a
-  limit or silently dropping bytes.
-- Prove snapshot-to-live ordering, UTF-8 repair, truncation, reconnect, and exit
-  publication with multiple controller and observer clients.
+Landed after v0.1.123: `terminal.subscribe` registers a real observer and the
+connection receives ordered incremental `{type:'event'}` output frames and exit
+publication on the existing stream epoch and contiguous offsets, with no gap or
+duplicate between the returned snapshot and the first live event. Every
+subscriber queue is bounded (Node's clamp range and eight-subscriber cap); the
+slow-consumer policy pauses with one forced snapshot-required marker carrying
+the exact resubscribe cursor and retires only a subscriber that cannot even
+take the marker. `terminal.unsubscribe` removes truthfully, connection close
+removes by instance prefix, and `terminal.history` pages the retained tail with
+Node's clamps. Multi-client fan-out, UTF-8 split repair, truncation, resume
+classification, and observer-only-output negotiation are pinned by the fresh
+wire suite and an end-to-end run through the unchanged production clients.
+
+Still open within this item:
+
+- `terminal:observer-activity` events (fresh mode has no agent-turn tracking;
+  `terminal.agentTurn` stays unsupported).
+- `terminal-history-continuous-v1` and `terminal-attach-ack-v1`
+  (restore-dependent; fresh mode has no cross-epoch history).
+- Observer coalescing (`terminal-observer-coalescing-v1` is deliberately not
+  advertised; each PTY read broadcasts immediately at the 64 KiB split).
+- An exited record evicted by the 64-record retention can drop a
+  still-subscribed exited terminal; resubscribe then reports unavailable.
 
 ### 2. Production packaging and default enablement
 

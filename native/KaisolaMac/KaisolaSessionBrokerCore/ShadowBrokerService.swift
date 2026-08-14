@@ -28,6 +28,7 @@ public actor ShadowBrokerService {
     private let authentication: BrokerAuthentication
     private let requestGate: BrokerRequestGate
     private let terminalStore: FreshTerminalStore?
+    private let eventRouter = BrokerEventRouter()
     private var inFlightMutations = 0
     private var authenticatedClients: [String: BrokerAuthenticatedClient] = [:]
 
@@ -37,9 +38,29 @@ public actor ShadowBrokerService {
         terminalStore: FreshTerminalStore? = nil
     ) throws {
         self.configuration = configuration
-        self.authentication = BrokerAuthentication(configuration: configuration)
+        // Feature advertisement is per runtime mode so it stays truthful:
+        // shadow keeps its observe-only trio, the fresh PTY runtime adds only
+        // the terminal streaming surface implemented below.
+        self.authentication = BrokerAuthentication(
+            configuration: configuration,
+            features: terminalStore == nil
+                ? BrokerAuthentication.advertisedFeatures
+                : BrokerAuthentication.freshAdvertisedFeatures
+        )
         self.requestGate = requestGate
         self.terminalStore = terminalStore
+        if let terminalStore {
+            let router = eventRouter
+            terminalStore.setEventSink { owner, channel, payload, maxQueueBytes, force in
+                router.deliver(
+                    owner: owner,
+                    channel: channel,
+                    payload: payload,
+                    maxQueueBytes: maxQueueBytes,
+                    force: force
+                )
+            }
+        }
     }
 
     public func authenticate(
@@ -56,15 +77,55 @@ public actor ShadowBrokerService {
         return result
     }
 
-    public func disconnect(client: BrokerAuthenticatedClient) {
+    /// Called by the connection after its accepted hello. Events for every
+    /// subscription keyed `instanceID|…` flow through this sink from then on.
+    /// The authority guard keeps a stale connection racing its replacement
+    /// from stealing the replacement's stream.
+    public func attachConnection(
+        client: BrokerAuthenticatedClient,
+        sink: BrokerConnectionEventSink
+    ) {
+        guard authenticatedClients[client.instanceID] == client else { return }
+        eventRouter.attach(
+            instanceID: client.instanceID,
+            authority: client,
+            features: Set(client.negotiatedFeatures),
+            sink: sink
+        )
+    }
+
+    public func disconnect(client: BrokerAuthenticatedClient) async {
         guard authenticatedClients[client.instanceID] == client else { return }
         authenticatedClients.removeValue(forKey: client.instanceID)
+        eventRouter.detach(instanceID: client.instanceID, authority: client)
+        // A closed connection can never drain its subscriptions again; drop
+        // them all rather than letting them pause-and-linger on first output.
+        await terminalStore?.unsubscribeSubscriberPrefix("\(client.instanceID)|")
     }
 
     public func dispatch(
         client: BrokerAuthenticatedClient,
         request: BrokerRequest
     ) async -> BrokerResponse {
+        // The responder-free form cannot return nil: only a connection-backed
+        // subscribe answers through its responder.
+        await dispatch(client: client, request: request, responder: nil)
+            ?? .failure(
+                id: request.id,
+                code: "internal_error",
+                message: "broker response was already delivered"
+            )
+    }
+
+    /// `responder` is the connection's ordered outbound queue. A nil return
+    /// means the response was already enqueued there — for `terminal.subscribe`
+    /// that enqueue happens inside the terminal's output critical section, so
+    /// the response frame provably precedes the subscriber's first live event.
+    public func dispatch(
+        client: BrokerAuthenticatedClient,
+        request: BrokerRequest,
+        responder: (@Sendable (BrokerResponse) -> Bool)?
+    ) async -> BrokerResponse? {
         guard authenticatedClients[client.instanceID] == client else {
             return .failure(
                 id: request.id,
@@ -107,22 +168,28 @@ public actor ShadowBrokerService {
             )
         }
 
-        let response = await dispatchAdmitted(client: client, request: request)
+        let response = await dispatchAdmitted(
+            client: client,
+            request: request,
+            responder: responder
+        )
         _ = await lease.release()
         return response
     }
 
     private func dispatchAdmitted(
         client: BrokerAuthenticatedClient,
-        request: BrokerRequest
-    ) async -> BrokerResponse {
+        request: BrokerRequest,
+        responder: (@Sendable (BrokerResponse) -> Bool)?
+    ) async -> BrokerResponse? {
         guard let terminalStore else {
             return dispatchShadowAdmitted(request)
         }
         return await dispatchFreshAdmitted(
             client: client,
             request: request,
-            terminalStore: terminalStore
+            terminalStore: terminalStore,
+            responder: responder
         )
     }
 
@@ -180,8 +247,9 @@ public actor ShadowBrokerService {
     private func dispatchFreshAdmitted(
         client: BrokerAuthenticatedClient,
         request: BrokerRequest,
-        terminalStore: FreshTerminalStore
-    ) async -> BrokerResponse {
+        terminalStore: FreshTerminalStore,
+        responder: (@Sendable (BrokerResponse) -> Bool)?
+    ) async -> BrokerResponse? {
         switch request.method {
         case "terminal.create":
             guard let create = freshCreateRequest(from: request.params) else {
@@ -193,7 +261,13 @@ public actor ShadowBrokerService {
             do {
                 let creation = try await terminalStore.create(
                     client: client,
-                    request: create
+                    request: create,
+                    // The creator's own negotiation answers whether the broker
+                    // should produce the primary `terminal:data` copy for the
+                    // terminal it now owns; adoption re-answers it the same way.
+                    primaryStreamEnabled: !client.negotiatedFeatures.contains(
+                        BrokerWire.terminalObserverOnlyOutputFeature
+                    )
                 )
                 didMutate = true
                 guard let snapshot = try await terminalStore.snapshot(
@@ -427,14 +501,23 @@ public actor ShadowBrokerService {
             return await freshSubscribe(
                 client: client,
                 request: request,
-                terminalStore: terminalStore
+                terminalStore: terminalStore,
+                responder: responder
             )
 
         case "terminal.unsubscribe":
-            return .success(id: request.id, result: .object([
-                "ok": .bool(true),
-                "removed": .bool(false),
-            ]))
+            return await freshUnsubscribe(
+                client: client,
+                request: request,
+                terminalStore: terminalStore
+            )
+
+        case "terminal.history":
+            return await freshHistory(
+                client: client,
+                request: request,
+                terminalStore: terminalStore
+            )
 
         default:
             return .failure(
@@ -560,68 +643,270 @@ public actor ShadowBrokerService {
             "terminal_operation_failed"
         case .shuttingDown, .shutdownIncomplete:
             "broker_shutting_down"
+        case .invalidObserverCursor, .invalidObserverSubscriber:
+            "invalid_request"
+        case .observerLimitReached:
+            "terminal_observer_limit"
+        case .historyEpochMismatch:
+            "terminal_history_epoch_mismatch"
+        case .invalidHistoryOffset:
+            "invalid_terminal_history_offset"
         case nil:
             "terminal_operation_failed"
+        }
+    }
+
+    /// One subscribe/unsubscribe/history identity: the terminal, the access
+    /// scope the role must satisfy, and the subscriber key events route by.
+    private struct FreshObserverIdentity {
+        let id: String
+        let projectID: String
+        /// Controllers must present the exact owner; observers pass nil and
+        /// are bounded by the exact-project check instead.
+        let accessOwner: String?
+        /// `instanceID|ownerId|projectId`, exactly the Node broker's
+        /// subscriber owner key, so events parse back into the same
+        /// `{ownerId, projectId}` wire fields.
+        let subscriber: String
+    }
+
+    private func freshObserverIdentity(
+        client: BrokerAuthenticatedClient,
+        params: [String: BrokerJSONValue]
+    ) -> FreshObserverIdentity?? {
+        guard let id = params["id"]?.stringValue,
+              let projectID = params["projectId"]?.stringValue,
+              !id.isEmpty,
+              !projectID.isEmpty else {
+            return nil
+        }
+        switch client.role {
+        case .observer, .administrator:
+            // The Node broker normalizes an absent/loose observer ownerId to
+            // "0"; the subscriber key still has three parts either way.
+            let ownerID = normalizedFreshOwnerID(params["ownerId"]?.stringValue)
+            return FreshObserverIdentity(
+                id: id,
+                projectID: projectID,
+                accessOwner: nil,
+                subscriber: freshOwnerKey(client: client, ownerID: ownerID, projectID: projectID)
+            )
+        case .controller:
+            guard let ownerID = params["ownerId"]?.stringValue,
+                  validFreshOwnerID(ownerID),
+                  validFreshProjectID(projectID) else {
+                return .some(nil)
+            }
+            let owner = freshOwnerKey(client: client, ownerID: ownerID, projectID: projectID)
+            return FreshObserverIdentity(
+                id: id,
+                projectID: projectID,
+                accessOwner: owner,
+                subscriber: owner
+            )
         }
     }
 
     private func freshSubscribe(
         client: BrokerAuthenticatedClient,
         request: BrokerRequest,
+        terminalStore: FreshTerminalStore,
+        responder: (@Sendable (BrokerResponse) -> Bool)?
+    ) async -> BrokerResponse? {
+        guard let params = request.params?.objectValue,
+              let resolved = freshObserverIdentity(client: client, params: params) else {
+            return invalidFreshRequest(request.id)
+        }
+        guard let identity = resolved else {
+            return freshControllerReadFailure(id: request.id)
+        }
+
+        // Node validates the cursor pair as a unit: absent means a plain
+        // snapshot; a half-provided or malformed cursor is a protocol error.
+        let cursorEpochValue = params["streamEpoch"]
+        let cursorOffsetValue = params["afterOffset"]
+        var cursorEpoch: String?
+        var cursorOffset: Int64?
+        if cursorEpochValue != nil || cursorOffsetValue != nil {
+            guard let epoch = cursorEpochValue?.stringValue,
+                  !epoch.isEmpty,
+                  let offset = cursorOffsetValue?.integerValue,
+                  offset >= 0 else {
+                return freshStoreFailure(
+                    id: request.id,
+                    error: FreshTerminalStoreError.invalidObserverCursor
+                )
+            }
+            cursorEpoch = epoch
+            cursorOffset = offset
+        }
+
+        let requestID = request.id
+        // The reply is produced inside the terminal's output critical section.
+        // With a connection responder it is enqueued right there — before any
+        // later append can broadcast — and this method then returns nil; the
+        // responder-free (in-process test) path captures it instead.
+        let box = FreshSubscribeResponseBox()
+        let respond: @Sendable (FreshTerminalSubscribeReply) -> Void = { reply in
+            let response = Self.freshSubscribeResponse(id: requestID, reply: reply)
+            if let responder {
+                _ = responder(response)
+            } else {
+                box.store(response)
+            }
+        }
+        do {
+            try await terminalStore.subscribe(
+                id: identity.id,
+                projectID: identity.projectID,
+                accessOwner: identity.accessOwner,
+                subscriber: identity.subscriber,
+                streamEpoch: cursorEpoch,
+                afterOffset: cursorOffset,
+                maxQueueBytes: params["maxQueueBytes"]?.integerValue,
+                respond: respond
+            )
+        } catch {
+            return freshStoreFailure(id: request.id, error: error)
+        }
+        if responder != nil { return nil }
+        return box.take() ?? .failure(
+            id: request.id,
+            code: "internal_error",
+            message: "terminal subscribe produced no reply"
+        )
+    }
+
+    private static func freshSubscribeResponse(
+        id: String,
+        reply: FreshTerminalSubscribeReply
+    ) -> BrokerResponse {
+        switch reply {
+        case .unavailable:
+            return .success(id: id, result: .object([
+                "ok": .bool(false),
+                "message": .string("Terminal is no longer available."),
+            ]))
+        case let .current(streamEpoch, offset):
+            return .success(id: id, result: .object([
+                "ok": .bool(true),
+                "mode": .string("current"),
+                "cursor": .object([
+                    "streamEpoch": .string(streamEpoch),
+                    "offset": .integer(offset),
+                ]),
+            ]))
+        case let .snapshot(snapshot, resetReason):
+            var result: [String: BrokerJSONValue] = [
+                "ok": .bool(true),
+                "mode": .string("snapshot"),
+                "snapshot": .object([
+                    "streamEpoch": .string(snapshot.streamEpoch),
+                    "output": .string(snapshot.output),
+                    "startOffset": .integer(snapshot.startOffset),
+                    "endOffset": .integer(snapshot.endOffset),
+                    "truncated": .bool(snapshot.truncated),
+                    "exited": .bool(snapshot.exited),
+                    "exitStatus": freshExitStatusValue(snapshot.exitStatus),
+                ]),
+            ]
+            if let resetReason {
+                result["resetReason"] = .string(resetReason)
+            }
+            return .success(id: id, result: .object(result))
+        }
+    }
+
+    private static func freshExitStatusValue(
+        _ status: FreshTerminalExitStatus?
+    ) -> BrokerJSONValue {
+        guard let status else { return .null }
+        return .object([
+            "exitCode": .integer(status.exitCode),
+            "signal": status.signal.map(BrokerJSONValue.integer) ?? .null,
+        ])
+    }
+
+    private func freshUnsubscribe(
+        client: BrokerAuthenticatedClient,
+        request: BrokerRequest,
         terminalStore: FreshTerminalStore
     ) async -> BrokerResponse {
         guard let params = request.params?.objectValue,
-              let id = params["id"]?.stringValue,
-              let projectID = params["projectId"]?.stringValue,
-              !id.isEmpty,
-              !projectID.isEmpty else {
+              let resolved = freshObserverIdentity(client: client, params: params) else {
             return invalidFreshRequest(request.id)
         }
-        let owner: String?
-        switch client.role {
-        case .observer, .administrator:
-            owner = nil
-        case .controller:
-            guard let ownerID = params["ownerId"]?.stringValue,
-                  validFreshOwnerID(ownerID),
-                  validFreshProjectID(projectID) else {
-                return freshControllerReadFailure(id: request.id)
-            }
-            owner = freshOwnerKey(
-                client: client,
-                ownerID: ownerID,
-                projectID: projectID
-            )
+        guard let identity = resolved else {
+            return freshControllerReadFailure(id: request.id)
         }
-        let snapshot: FreshTerminalSnapshot
         do {
-            guard let value = try await terminalStore.snapshot(
-                id: id,
-                projectID: projectID,
-                owner: owner
+            let removed = try await terminalStore.unsubscribe(
+                id: identity.id,
+                projectID: identity.projectID,
+                accessOwner: identity.accessOwner,
+                subscriber: identity.subscriber
+            )
+            return .success(id: request.id, result: .object([
+                "ok": .bool(true),
+                "removed": .bool(removed),
+            ]))
+        } catch {
+            return freshStoreFailure(id: request.id, error: error)
+        }
+    }
+
+    private func freshHistory(
+        client: BrokerAuthenticatedClient,
+        request: BrokerRequest,
+        terminalStore: FreshTerminalStore
+    ) async -> BrokerResponse {
+        guard let params = request.params?.objectValue,
+              let resolved = freshObserverIdentity(client: client, params: params) else {
+            return invalidFreshRequest(request.id)
+        }
+        guard let identity = resolved else {
+            return freshControllerReadFailure(id: request.id)
+        }
+        do {
+            guard let page = try await terminalStore.history(
+                id: identity.id,
+                projectID: identity.projectID,
+                accessOwner: identity.accessOwner,
+                streamEpoch: params["streamEpoch"]?.stringValue,
+                beforeOffset: params["beforeOffset"]?.integerValue,
+                maxBytes: params["maxBytes"]?.integerValue
             ) else {
                 return .success(id: request.id, result: .object([
                     "ok": .bool(false),
                     "message": .string("Terminal is no longer available."),
                 ]))
             }
-            snapshot = value
+            return .success(id: request.id, result: .object([
+                "ok": .bool(true),
+                "streamEpoch": .string(page.streamEpoch),
+                "output": .string(page.output),
+                "startOffset": .integer(page.startOffset),
+                "endOffset": .integer(page.endOffset),
+                "hasMore": .bool(page.hasMore),
+                "truncated": .bool(page.truncated),
+            ]))
         } catch {
             return freshStoreFailure(id: request.id, error: error)
         }
+    }
 
-        return .success(id: request.id, result: .object([
-            "ok": .bool(true),
-            "mode": .string("snapshot"),
-            "snapshot": .object([
-                "streamEpoch": .string(snapshot.streamEpoch),
-                "output": .string(snapshot.output),
-                "startOffset": .integer(snapshot.startOffset),
-                "endOffset": .integer(snapshot.endOffset),
-                "truncated": .bool(snapshot.truncated),
-                "exited": .bool(snapshot.exited),
-            ]),
-        ]))
+    /// Node's `normalizeBrokerOwnerID`: strip everything outside
+    /// `[a-zA-Z0-9_-]`, cap at 80, and let an empty result mean "0".
+    private func normalizedFreshOwnerID(_ value: String?) -> String {
+        let allowed = (value ?? "0").unicodeScalars.filter { scalar in
+            (scalar >= "a" && scalar <= "z")
+                || (scalar >= "A" && scalar <= "Z")
+                || (scalar >= "0" && scalar <= "9")
+                || scalar == "_"
+                || scalar == "-"
+        }
+        let normalized = String(String.UnicodeScalarView(allowed.prefix(80)))
+        return normalized.isEmpty ? "0" : normalized
     }
 
     private func freshCreateRequest(
@@ -830,7 +1115,7 @@ public actor ShadowBrokerService {
             "packageSchema": .integer(Int64(configuration.packageSchema)),
             "packageVersion": configuration.packageVersion.map(BrokerJSONValue.string) ?? .null,
             "contentDigest": .string(configuration.contentDigest),
-            "features": .array(BrokerAuthentication.advertisedFeatures.map(BrokerJSONValue.string)),
+            "features": .array(authentication.features.map(BrokerJSONValue.string)),
             "pid": .integer(Int64(configuration.pid)),
             "startedAt": .integer(configuration.startedAt),
             "version": .string(configuration.version),
@@ -863,7 +1148,7 @@ public actor ShadowBrokerService {
             "packageSchema": .integer(Int64(configuration.packageSchema)),
             "packageVersion": configuration.packageVersion.map(BrokerJSONValue.string) ?? .null,
             "contentDigest": .string(configuration.contentDigest),
-            "features": .array(BrokerAuthentication.advertisedFeatures.map(BrokerJSONValue.string)),
+            "features": .array(authentication.features.map(BrokerJSONValue.string)),
             "pid": .integer(Int64(configuration.pid)),
             "startedAt": .integer(configuration.startedAt),
             "version": .string(configuration.version),
@@ -877,5 +1162,160 @@ public actor ShadowBrokerService {
             "authenticatedClientCount": .integer(Int64(authenticatedClients.count)),
             "terminals": .array([]),
         ]
+    }
+}
+
+/// One authenticated connection's entry point for `{type:'event'}` frames.
+/// `deliver` must be synchronous and non-blocking: it runs inside terminal
+/// output critical sections. Returning false refuses the frame — the signal
+/// the slow-consumer policy converts into a pause-with-cursor.
+public struct BrokerConnectionEventSink: Sendable {
+    public typealias Deliver = @Sendable (
+        _ frame: Data,
+        _ maxQueueBytes: Int?,
+        _ force: Bool
+    ) -> Bool
+
+    public let deliver: Deliver
+
+    public init(deliver: @escaping Deliver) {
+        self.deliver = deliver
+    }
+}
+
+/// The Swift analog of the Node broker's `mgr.setEventSink` closure plus its
+/// per-client feature shaping: resolves a subscriber owner key to the live
+/// connection for its instance, downgrades `terminal:exit:*` payloads for
+/// clients that never negotiated terminal-exit-status-v1, and validates the
+/// encoded frame against the per-channel event cap before it may be queued.
+/// Lock-protected rather than actor-isolated because delivery happens
+/// synchronously on PTY read threads.
+final class BrokerEventRouter: @unchecked Sendable {
+    private struct Registration {
+        let authority: BrokerAuthenticatedClient
+        let features: Set<String>
+        let sink: BrokerConnectionEventSink
+    }
+
+    private let lock = NSLock()
+    private var registrations: [String: Registration] = [:]
+
+    func attach(
+        instanceID: String,
+        authority: BrokerAuthenticatedClient,
+        features: Set<String>,
+        sink: BrokerConnectionEventSink
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        registrations[instanceID] = Registration(
+            authority: authority,
+            features: features,
+            sink: sink
+        )
+    }
+
+    func detach(instanceID: String, authority: BrokerAuthenticatedClient) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard registrations[instanceID]?.authority == authority else { return }
+        registrations.removeValue(forKey: instanceID)
+    }
+
+    func deliver(
+        owner: String,
+        channel: String,
+        payload: BrokerJSONValue,
+        maxQueueBytes: Int?,
+        force: Bool
+    ) -> Bool {
+        guard let parts = Self.ownerParts(owner) else { return false }
+        lock.lock()
+        let registration = registrations[parts.instanceID]
+        lock.unlock()
+        guard let registration else { return false }
+
+        let frame: BrokerJSONValue = .object([
+            "type": .string("event"),
+            "ownerId": .string(parts.ownerID),
+            "projectId": .string(parts.projectID),
+            "channel": .string(channel),
+            "payload": Self.payloadForFeatures(
+                channel: channel,
+                payload: payload,
+                features: registration.features
+            ),
+        ])
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard var data = try? encoder.encode(frame) else { return false }
+        do {
+            // Same verdict the Node `writeFrame` produces for an oversized
+            // event: undeliverable, so the overflow policy handles it.
+            try BrokerWire.validateEncodedFrame(data, purpose: .event(channel))
+        } catch {
+            return false
+        }
+        data.append(0x0A)
+        return registration.sink.deliver(data, maxQueueBytes, force)
+    }
+
+    /// Node's `terminalOwnerParts`: `instance|owner[|project]`, with a
+    /// missing third part reading as the legacy project scope.
+    static func ownerParts(
+        _ owner: String
+    ) -> (instanceID: String, ownerID: String, projectID: String)? {
+        guard let first = owner.firstIndex(of: "|"), first != owner.startIndex else {
+            return nil
+        }
+        let instanceID = String(owner[..<first])
+        let remainder = owner[owner.index(after: first)...]
+        guard let second = remainder.firstIndex(of: "|") else {
+            let ownerID = String(remainder)
+            return ownerID.isEmpty ? nil : (instanceID, ownerID, "legacy")
+        }
+        let ownerID = String(remainder[..<second])
+        let projectID = String(remainder[remainder.index(after: second)...])
+        guard !ownerID.isEmpty, !projectID.isEmpty else { return nil }
+        return (instanceID, ownerID, projectID)
+    }
+
+    /// Node's `eventPayloadForFeatures`: only `terminal:exit:<id>` is shaped
+    /// per client — a structured status downgrades to the bare exit code for
+    /// clients that never declared terminal-exit-status-v1.
+    static func payloadForFeatures(
+        channel: String,
+        payload: BrokerJSONValue,
+        features: Set<String>
+    ) -> BrokerJSONValue {
+        guard channel.hasPrefix("terminal:exit:"),
+              !features.contains(BrokerWire.terminalExitStatusFeature),
+              case let .object(status) = payload else {
+            return payload
+        }
+        guard let exitCode = status["exitCode"], exitCode != .null else {
+            return .integer(0)
+        }
+        return exitCode
+    }
+}
+
+/// Captures the subscribe reply for responder-free (in-process) dispatch. The
+/// store invokes `respond` synchronously before its subscribe call returns, so
+/// the box is filled by the time the caller reads it.
+private final class FreshSubscribeResponseBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var response: BrokerResponse?
+
+    func store(_ value: BrokerResponse) {
+        lock.lock()
+        defer { lock.unlock() }
+        response = value
+    }
+
+    func take() -> BrokerResponse? {
+        lock.lock()
+        defer { lock.unlock() }
+        return response
     }
 }

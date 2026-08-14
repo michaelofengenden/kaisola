@@ -25,6 +25,20 @@ public struct FreshTerminalSpawnRequest: Equatable, Sendable {
     }
 }
 
+/// The `{exitCode, signal}` record protocol 2 publishes with terminal exit.
+/// `signal` is the raw signal number, mirroring node-pty's exit callback, and
+/// `exitCode` substitutes 0 for a signal-terminated child exactly as the Node
+/// broker does before putting the record on the wire.
+public struct FreshTerminalExitStatus: Equatable, Sendable {
+    public let exitCode: Int64
+    public let signal: Int64?
+
+    public init(exitCode: Int64, signal: Int64? = nil) {
+        self.exitCode = exitCode
+        self.signal = signal
+    }
+}
+
 /// The minimum process boundary the fresh-session store needs. A concrete
 /// Darwin PTY remains free to expose richer exit information; its conformance
 /// can discard that detail in these two lifecycle adapter methods.
@@ -35,6 +49,14 @@ public protocol FreshTerminalProcess: Sendable {
     func send(signal: Int32) throws
     func waitForFreshTerminalExit() async
     func terminateFreshTerminal(graceNanoseconds: UInt64) async throws
+    /// Resolved after `waitForFreshTerminalExit`. Nil means the backend could
+    /// not attribute a status; exit publication then carries a null record
+    /// rather than a fabricated success.
+    func freshTerminalExitStatus() async -> FreshTerminalExitStatus?
+}
+
+extension FreshTerminalProcess {
+    public func freshTerminalExitStatus() async -> FreshTerminalExitStatus? { nil }
 }
 
 public protocol FreshTerminalProcessFactory: Sendable {
@@ -140,6 +162,7 @@ public struct FreshTerminalSnapshot: Equatable, Sendable {
     public let endOffset: Int64
     public let truncated: Bool
     public let exited: Bool
+    public let exitStatus: FreshTerminalExitStatus?
 
     public init(
         streamEpoch: String,
@@ -147,7 +170,8 @@ public struct FreshTerminalSnapshot: Equatable, Sendable {
         startOffset: Int64,
         endOffset: Int64,
         truncated: Bool,
-        exited: Bool
+        exited: Bool,
+        exitStatus: FreshTerminalExitStatus? = nil
     ) {
         self.streamEpoch = streamEpoch
         self.output = output
@@ -155,8 +179,39 @@ public struct FreshTerminalSnapshot: Equatable, Sendable {
         self.endOffset = endOffset
         self.truncated = truncated
         self.exited = exited
+        self.exitStatus = exitStatus
     }
 }
+
+/// One `terminal.subscribe` answer, produced inside the same critical section
+/// that registers the subscription so nothing can slot between the snapshot
+/// and the first live event.
+public enum FreshTerminalSubscribeReply: Equatable, Sendable {
+    case unavailable
+    case snapshot(FreshTerminalSnapshot, resetReason: String?)
+    case current(streamEpoch: String, offset: Int64)
+}
+
+public struct FreshTerminalHistoryPage: Equatable, Sendable {
+    public let streamEpoch: String
+    public let output: String
+    public let startOffset: Int64
+    public let endOffset: Int64
+    public let hasMore: Bool
+    public let truncated: Bool
+}
+
+/// The Node broker sends `{type:'event', ownerId, projectId, channel, payload}`
+/// on the subscriber's own connection. The store only knows subscriber owner
+/// keys; the service resolves them to connections and enforces per-client
+/// payload shaping, so the sink is exactly Node's `mgr.setEventSink` boundary.
+public typealias FreshTerminalEventSink = @Sendable (
+    _ owner: String,
+    _ channel: String,
+    _ payload: BrokerJSONValue,
+    _ maxQueueBytes: Int?,
+    _ force: Bool
+) -> Bool
 
 public struct FreshTerminalRelease: Equatable, Sendable {
     public let id: String
@@ -193,6 +248,11 @@ public enum FreshTerminalStoreError: Error, Equatable, LocalizedError, Sendable 
     case processOperationFailed(operation: String)
     case shuttingDown
     case shutdownIncomplete(ids: [String])
+    case invalidObserverCursor
+    case invalidObserverSubscriber
+    case observerLimitReached(maximum: Int)
+    case historyEpochMismatch
+    case invalidHistoryOffset
 
     public var errorDescription: String? {
         switch self {
@@ -238,6 +298,18 @@ public enum FreshTerminalStoreError: Error, Equatable, LocalizedError, Sendable 
             "terminal store is shutting down"
         case let .shutdownIncomplete(ids):
             "terminal shutdown is incomplete for \(ids.count) processes"
+        // The next five reuse the Node broker's exact rejection strings:
+        // protocol-2 clients branch on these messages, not on typed codes.
+        case .invalidObserverCursor:
+            "invalid terminal observer cursor"
+        case .invalidObserverSubscriber:
+            "terminal subscriber is invalid"
+        case let .observerLimitReached(maximum):
+            "terminal observer limit of \(maximum) reached"
+        case .historyEpochMismatch:
+            "terminal history epoch mismatch"
+        case .invalidHistoryOffset:
+            "invalid terminal history offset"
         }
     }
 }
@@ -293,6 +365,7 @@ public actor FreshTerminalStore {
 
     private let factory: any FreshTerminalProcessFactory
     private let activityClock = FreshTerminalActivityClock()
+    private let eventSinkBox = FreshTerminalEventSinkBox()
     private var records: [String: Record] = [:]
     private var pendingCreates: [String: PendingCreate] = [:]
     private var pendingReleases: [String: PendingRelease] = [:]
@@ -303,9 +376,18 @@ public actor FreshTerminalStore {
         self.factory = factory
     }
 
+    /// Installed once by the broker service. Nonisolated because deliveries
+    /// happen synchronously on the PTY read path, under each terminal's own
+    /// output lock — never through this actor's mailbox, whose reentrancy
+    /// would break the snapshot-then-live ordering guarantee.
+    public nonisolated func setEventSink(_ sink: FreshTerminalEventSink?) {
+        eventSinkBox.set(sink)
+    }
+
     public func create(
         client: BrokerAuthenticatedClient,
-        request: FreshTerminalCreateRequest
+        request: FreshTerminalCreateRequest,
+        primaryStreamEnabled: Bool = true
     ) async throws -> FreshTerminalCreation {
         guard !isShuttingDown else { throw FreshTerminalStoreError.shuttingDown }
         let owner = try validatedOwner(
@@ -330,6 +412,11 @@ public actor FreshTerminalStore {
                 record.owner = owner
                 record.lastOwner = owner
                 records[request.id] = record
+                // Adoption is the fresh analog of a renderer reattach: the
+                // adopting connection re-answers the primary-stream policy
+                // and clears any slow-consumer pause, because the create
+                // response it just received replays the snapshot.
+                record.output.setPrimary(owner: owner, enabled: primaryStreamEnabled)
                 activityClock.advance()
                 return creation(from: record, existed: true)
             }
@@ -358,9 +445,11 @@ public actor FreshTerminalStore {
         let output: FreshTerminalOutputAccumulator
         do {
             output = try FreshTerminalOutputAccumulator(
+                terminalID: request.id,
                 streamEpoch: streamEpoch,
                 tailByteLimit: Limits.outputTailBytes,
-                activityClock: activityClock
+                activityClock: activityClock,
+                eventSink: eventSinkBox
             )
         } catch {
             throw FreshTerminalStoreError.processOperationFailed(operation: "output")
@@ -421,10 +510,14 @@ public actor FreshTerminalStore {
             exitSequence: nil
         )
         records[request.id] = record
+        // Armed only after the record is installed: bytes produced before this
+        // moment are already covered by the create response's snapshot.
+        record.output.setPrimary(owner: owner, enabled: primaryStreamEnabled)
         activityClock.advance()
         Task { [weak self] in
             await process.waitForFreshTerminalExit()
-            await self?.markExited(terminalID: request.id, token: token)
+            let status = await process.freshTerminalExitStatus()
+            await self?.markExited(terminalID: request.id, token: token, status: status)
         }
         removePendingCreate(id: request.id, token: token)
         if isShuttingDown {
@@ -637,7 +730,91 @@ public actor FreshTerminalStore {
             startOffset: snapshot.startOffset,
             endOffset: snapshot.endOffset,
             truncated: snapshot.truncated,
-            exited: record.exited
+            exited: record.exited,
+            exitStatus: record.output.currentExitStatus()
+        )
+    }
+
+    /// Registers one bounded live subscription and answers with the snapshot
+    /// (or resume classification) taken inside the same critical section that
+    /// serializes PTY output — the ordering barrier that makes the reply and
+    /// the first live event gapless and duplicate-free. `respond` runs exactly
+    /// once, synchronously, before any later output can be broadcast; when it
+    /// enqueues onto a connection's outbound queue, the wire order is
+    /// response first, events after.
+    public func subscribe(
+        id: String,
+        projectID: String,
+        accessOwner: String?,
+        subscriber: String,
+        streamEpoch: String?,
+        afterOffset: Int64?,
+        maxQueueBytes: Int64?,
+        respond: @Sendable (FreshTerminalSubscribeReply) -> Void
+    ) throws {
+        guard let record = records[id] else {
+            respond(.unavailable)
+            return
+        }
+        guard record.projectID == projectID,
+              accessOwner == nil || record.owner == accessOwner else {
+            throw FreshTerminalStoreError.terminalAccessDenied
+        }
+        try record.output.subscribe(
+            subscriber: subscriber,
+            maxQueueBytes: maxQueueBytes,
+            streamEpoch: streamEpoch,
+            afterOffset: afterOffset,
+            respond: respond
+        )
+    }
+
+    /// Reports `removed` truthfully. A missing terminal is not an error — the
+    /// subscription it would have carried is definitionally gone.
+    public func unsubscribe(
+        id: String,
+        projectID: String,
+        accessOwner: String?,
+        subscriber: String
+    ) throws -> Bool {
+        guard let record = records[id] else { return false }
+        guard record.projectID == projectID,
+              accessOwner == nil || record.owner == accessOwner else {
+            throw FreshTerminalStoreError.terminalAccessDenied
+        }
+        return record.output.unsubscribe(subscriber: subscriber)
+    }
+
+    /// Socket loss removes every subscription that connection registered, on
+    /// every terminal, exactly like the Node broker's
+    /// `unsubscribeSubscriberPrefix(instanceId + "|")`.
+    public func unsubscribeSubscriberPrefix(_ prefix: String) {
+        guard !prefix.isEmpty else { return }
+        for record in records.values {
+            record.output.unsubscribe(prefix: prefix)
+        }
+    }
+
+    /// One older observer-safe history page over the retained tail. Nil means
+    /// the terminal is gone (the caller answers the Node unavailable shape);
+    /// epoch and offset violations throw the Node broker's exact rejections.
+    public func history(
+        id: String,
+        projectID: String,
+        accessOwner: String?,
+        streamEpoch: String?,
+        beforeOffset: Int64?,
+        maxBytes: Int64?
+    ) throws -> FreshTerminalHistoryPage? {
+        guard let record = records[id] else { return nil }
+        guard record.projectID == projectID,
+              accessOwner == nil || record.owner == accessOwner else {
+            throw FreshTerminalStoreError.terminalAccessDenied
+        }
+        return try record.output.historyPage(
+            streamEpoch: streamEpoch,
+            beforeOffset: beforeOffset,
+            maxBytes: maxBytes
         )
     }
 
@@ -824,9 +1001,15 @@ public actor FreshTerminalStore {
         )
     }
 
-    private func markExited(terminalID: String, token: UUID) {
+    private func markExited(
+        terminalID: String,
+        token: UUID,
+        status: FreshTerminalExitStatus?
+    ) {
         guard var record = records[terminalID], record.token == token else { return }
-        record.output.finish()
+        // Final repaired output, then the exit event, in one critical section:
+        // no subscriber may observe the exit ahead of the bytes that ended it.
+        record.output.finishAndPublishExit(status: status)
         exitSequence &+= 1
         record.exited = true
         record.exitSequence = exitSequence
@@ -863,17 +1046,71 @@ public actor FreshTerminalStore {
     }
 }
 
+/// Holds the one sink through which every event leaves the store. A plain
+/// lock-protected box rather than actor state: deliveries run synchronously on
+/// PTY read threads inside each terminal's output critical section.
+final class FreshTerminalEventSinkBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sink: FreshTerminalEventSink?
+
+    func set(_ sink: FreshTerminalEventSink?) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.sink = sink
+    }
+
+    func deliver(
+        owner: String,
+        channel: String,
+        payload: BrokerJSONValue,
+        maxQueueBytes: Int?,
+        force: Bool
+    ) -> Bool {
+        lock.lock()
+        let current = sink
+        lock.unlock()
+        guard let current else { return false }
+        return current(owner, channel, payload, maxQueueBytes, force)
+    }
+}
+
+/// Owns one terminal's output intake AND its observer fan-out. A single lock
+/// serializes appends, subscription registration, snapshots, exit publication,
+/// and history reads — which is exactly what guarantees a subscribe reply and
+/// the first live event are gapless under concurrent PTY output.
 private final class FreshTerminalOutputAccumulator: @unchecked Sendable {
     private let lock = NSLock()
     private let activityClock: FreshTerminalActivityClock
+    private let eventSink: FreshTerminalEventSinkBox
+    private let terminalID: String
     private var buffer: TerminalOutputBuffer
+    private var observers: TerminalOutputObservers
+    private var exitStatus: FreshTerminalExitStatus?
+    private var exitPublished = false
+    // The primary `terminal:data:<id>` copy for the owner connection, present
+    // for protocol-2 clients that never negotiated observer-only-output. Same
+    // pause discipline as observers: one forced snapshot-required marker, then
+    // silence until adoption replays a snapshot and re-arms the stream.
+    private var primaryOwner: String?
+    private var primaryEnabled = true
+    private var primaryPaused = false
+
+    // Mirrors the Node broker's history clamps: at most one 4 MiB page
+    // (TERMINAL_HISTORY_PAGE_BYTES), never smaller than a useful 64 KiB read.
+    private static let historyPageByteLimit = 4 * 1_024 * 1_024
+    private static let historyPageByteFloor = 64 * 1_024
 
     init(
+        terminalID: String,
         streamEpoch: String,
         tailByteLimit: Int,
-        activityClock: FreshTerminalActivityClock
+        activityClock: FreshTerminalActivityClock,
+        eventSink: FreshTerminalEventSinkBox
     ) throws {
+        self.terminalID = terminalID
         self.activityClock = activityClock
+        self.eventSink = eventSink
+        observers = TerminalOutputObservers(terminalID: terminalID)
         buffer = try TerminalOutputBuffer(
             streamEpoch: streamEpoch,
             tailByteLimit: tailByteLimit
@@ -884,22 +1121,272 @@ private final class FreshTerminalOutputAccumulator: @unchecked Sendable {
         activityClock.withCriticalSection { epoch in
             lock.lock()
             defer { lock.unlock() }
-            if (try? buffer.append(data).emission) != nil {
-                epoch = FreshTerminalActivityClock.advanced(epoch)
+            guard let drain = try? buffer.append(data) else { return }
+            epoch = FreshTerminalActivityClock.advanced(epoch)
+            if let emission = drain.emission {
+                publishLocked(emission)
             }
         }
     }
 
-    func finish() {
+    /// Flushes trailing repaired bytes, then publishes exit — in that order
+    /// and inside one critical section, so no reader sees the exit ahead of
+    /// the output that ended the stream. Idempotent.
+    func finishAndPublishExit(status: FreshTerminalExitStatus?) {
         lock.lock()
         defer { lock.unlock() }
-        _ = try? buffer.finish()
+        if let status { exitStatus = status }
+        if let drain = try? buffer.finish(), let emission = drain.emission {
+            publishLocked(emission)
+        }
+        guard !exitPublished else { return }
+        exitPublished = true
+        let snapshot = buffer.snapshot()
+        let statusValue = Self.exitStatusValue(exitStatus)
+        _ = observers.broadcast(
+            channel: "terminal:observer-exit",
+            payload: .object([
+                "id": .string(terminalID),
+                "streamEpoch": .string(snapshot.streamEpoch),
+                "offset": .integer(snapshot.endOffset),
+                "exitStatus": statusValue,
+            ]),
+            cursor: TerminalObserverCursor(
+                streamEpoch: snapshot.streamEpoch,
+                endOffset: snapshot.endOffset
+            ),
+            deliver: deliverLocked
+        )
+        // The primary exit copy goes to the owner unconditionally — the
+        // observer-only-output feature suppresses `terminal:data`, never exit.
+        // The service downgrades the payload per the owner's negotiation.
+        if let owner = primaryOwner {
+            _ = eventSink.deliver(
+                owner: owner,
+                channel: "terminal:exit:\(terminalID)",
+                payload: statusValue,
+                maxQueueBytes: nil,
+                force: false
+            )
+        }
     }
 
     func snapshot() -> TerminalOutputSnapshot {
         lock.lock()
         defer { lock.unlock() }
         return buffer.snapshot()
+    }
+
+    func currentExitStatus() -> FreshTerminalExitStatus? {
+        lock.lock()
+        defer { lock.unlock() }
+        return exitStatus
+    }
+
+    /// Registration and the reply are one atomic step against `append`: the
+    /// reply's end offset is exactly where this subscriber's live events
+    /// begin. `respond` must therefore publish to the subscriber's connection
+    /// (or capture the value) synchronously.
+    func subscribe(
+        subscriber: String,
+        maxQueueBytes: Int64?,
+        streamEpoch: String?,
+        afterOffset: Int64?,
+        respond: (FreshTerminalSubscribeReply) -> Void
+    ) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        do {
+            try observers.subscribe(owner: subscriber, maxQueueBytes: maxQueueBytes)
+        } catch TerminalObserverRegistryError.invalidSubscriber {
+            throw FreshTerminalStoreError.invalidObserverSubscriber
+        } catch let TerminalObserverRegistryError.observerLimitReached(maximum) {
+            throw FreshTerminalStoreError.observerLimitReached(maximum: maximum)
+        }
+        respond(classifyResumeLocked(streamEpoch: streamEpoch, afterOffset: afterOffset))
+    }
+
+    func unsubscribe(subscriber: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return observers.unsubscribe(owner: subscriber)
+    }
+
+    @discardableResult
+    func unsubscribe(prefix: String) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return observers.unsubscribe(prefix: prefix)
+    }
+
+    func setPrimary(owner: String, enabled: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+        primaryOwner = owner
+        primaryEnabled = enabled
+        primaryPaused = false
+    }
+
+    func historyPage(
+        streamEpoch: String?,
+        beforeOffset: Int64?,
+        maxBytes: Int64?
+    ) throws -> FreshTerminalHistoryPage {
+        lock.lock()
+        defer { lock.unlock() }
+        guard streamEpoch == buffer.streamEpoch else {
+            throw FreshTerminalStoreError.historyEpochMismatch
+        }
+        let requested = maxBytes ?? Int64(Self.historyPageByteLimit)
+        let cap = Int(min(
+            Int64(Self.historyPageByteLimit),
+            max(Int64(Self.historyPageByteFloor), requested)
+        ))
+        guard let beforeOffset,
+              let slice = buffer.historySlice(before: beforeOffset, maximumBytes: cap) else {
+            throw FreshTerminalStoreError.invalidHistoryOffset
+        }
+        return FreshTerminalHistoryPage(
+            streamEpoch: buffer.streamEpoch,
+            output: slice.output,
+            startOffset: slice.startOffset,
+            endOffset: slice.endOffset,
+            hasMore: slice.hasMore,
+            truncated: slice.truncated
+        )
+    }
+
+    /// Port of the Node broker's `resumeFromSnapshot`: the caller's cursor is
+    /// classified against the retained tail, answering the smallest snapshot
+    /// that provably reconnects the stream — or the exact reset reason.
+    private func classifyResumeLocked(
+        streamEpoch: String?,
+        afterOffset: Int64?
+    ) -> FreshTerminalSubscribeReply {
+        let current = freshSnapshotLocked()
+        guard let streamEpoch, let afterOffset else {
+            return .snapshot(current, resetReason: nil)
+        }
+        guard streamEpoch == current.streamEpoch else {
+            return .snapshot(current, resetReason: "epoch_mismatch")
+        }
+        guard afterOffset <= current.endOffset else {
+            return .snapshot(current, resetReason: "cursor_ahead")
+        }
+        guard afterOffset >= current.startOffset else {
+            return .snapshot(current, resetReason: "event_gap")
+        }
+        if afterOffset == current.endOffset {
+            return .current(streamEpoch: current.streamEpoch, offset: afterOffset)
+        }
+        let bytes = Data(current.output.utf8)
+        let relative = Int(afterOffset - current.startOffset)
+        guard relative == 0 || bytes[relative] & 0xC0 != 0x80 else {
+            return .snapshot(current, resetReason: "invalid_utf8_boundary")
+        }
+        return .snapshot(
+            FreshTerminalSnapshot(
+                streamEpoch: current.streamEpoch,
+                output: String(decoding: bytes[relative...], as: UTF8.self),
+                startOffset: afterOffset,
+                endOffset: current.endOffset,
+                truncated: current.truncated || afterOffset > 0,
+                exited: current.exited,
+                exitStatus: current.exitStatus
+            ),
+            resetReason: nil
+        )
+    }
+
+    private func freshSnapshotLocked() -> FreshTerminalSnapshot {
+        let snapshot = buffer.snapshot()
+        return FreshTerminalSnapshot(
+            streamEpoch: snapshot.streamEpoch,
+            output: snapshot.output,
+            startOffset: snapshot.startOffset,
+            endOffset: snapshot.endOffset,
+            truncated: snapshot.truncated,
+            exited: snapshot.state == .final,
+            exitStatus: exitStatus
+        )
+    }
+
+    /// Broadcast happens inside the intake lock so per-terminal event order is
+    /// the append order, always. Pieces stay under the Node broker's 64 KiB
+    /// observer chunk so worst-case JSON escaping fits the encoded frame cap.
+    private func publishLocked(_ emission: TerminalOutputEmission) {
+        for piece in emission.splitForObserverFrames() {
+            _ = observers.broadcast(
+                channel: "terminal:observer-output",
+                payload: .object([
+                    "id": .string(terminalID),
+                    "streamEpoch": .string(piece.streamEpoch),
+                    "startOffset": .integer(piece.startOffset),
+                    "endOffset": .integer(piece.endOffset),
+                    "data": .string(piece.output),
+                ]),
+                cursor: TerminalObserverCursor(
+                    streamEpoch: piece.streamEpoch,
+                    endOffset: piece.endOffset
+                ),
+                deliver: deliverLocked
+            )
+        }
+        deliverPrimaryLocked(emission)
+    }
+
+    private func deliverLocked(
+        owner: String,
+        channel: String,
+        payload: BrokerJSONValue,
+        maxQueueBytes: Int?,
+        force: Bool
+    ) -> Bool {
+        eventSink.deliver(
+            owner: owner,
+            channel: channel,
+            payload: payload,
+            maxQueueBytes: maxQueueBytes,
+            force: force
+        )
+    }
+
+    /// Node's `deliverPrimaryOutput`: a refused delta pauses the primary copy
+    /// behind one forced `terminal:snapshot-required` marker; only an explicit
+    /// adoption (the fresh analog of attach) resumes it with a fresh snapshot.
+    private func deliverPrimaryLocked(_ emission: TerminalOutputEmission) {
+        guard let owner = primaryOwner, primaryEnabled, !primaryPaused else { return }
+        let delivered = eventSink.deliver(
+            owner: owner,
+            channel: "terminal:data:\(terminalID)",
+            payload: .string(emission.output),
+            maxQueueBytes: TerminalOutputObservers.defaultQueueBytes,
+            force: false
+        )
+        if delivered { return }
+        primaryPaused = true
+        _ = eventSink.deliver(
+            owner: owner,
+            channel: "terminal:snapshot-required",
+            payload: .object([
+                "id": .string(terminalID),
+                "reason": .string("slow_consumer"),
+                "streamEpoch": .string(emission.streamEpoch),
+                "endOffset": .integer(emission.endOffset),
+            ]),
+            maxQueueBytes: TerminalOutputObservers.defaultQueueBytes,
+            force: true
+        )
+    }
+
+    private static func exitStatusValue(
+        _ status: FreshTerminalExitStatus?
+    ) -> BrokerJSONValue {
+        guard let status else { return .null }
+        return .object([
+            "exitCode": .integer(status.exitCode),
+            "signal": status.signal.map(BrokerJSONValue.integer) ?? .null,
+        ])
     }
 }
 

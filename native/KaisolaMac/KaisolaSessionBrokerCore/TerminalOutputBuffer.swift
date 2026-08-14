@@ -307,6 +307,21 @@ extension TerminalOutputEmission {
     /// observer-output frame cap is 512 KiB.
     public static let observerFrameByteLimit = 64 * 1_024
 
+    /// The primary `terminal:data:<id>` copy travels on an ordinary event
+    /// channel, whose encoded cap is 64 KiB — an eighth of observer-output's —
+    /// so its raw chunk is an eighth of the observer piece. The same
+    /// worst-case-escaping argument then holds: 8 KiB of pure control bytes
+    /// encodes to 48 KiB, leaving 16 KiB for the envelope. A single PTY read
+    /// can be 64 KiB, which unsplit is over the cap on arrival.
+    public static let primaryFrameByteLimit = 8 * 1_024
+
+    /// `splitForObserverFrames` at the primary channel's tighter bound.
+    public func splitForPrimaryFrames(
+        maximumBytes: Int = TerminalOutputEmission.primaryFrameByteLimit
+    ) -> [TerminalOutputEmission] {
+        splitForObserverFrames(maximumBytes: maximumBytes)
+    }
+
     /// Splits one emission into bounded contiguous pieces on UTF-8 scalar
     /// boundaries. Offsets subdivide exactly, so every piece is itself a valid
     /// observer-output payload and the pieces concatenate back byte-for-byte.

@@ -330,6 +330,73 @@ final class SwiftSessionBrokerFreshStoreTests: XCTestCase {
         )
     }
 
+    /// `respond` runs inside the output critical section, before the primary
+    /// stream is armed: every byte the child spoke first is in the reply, and
+    /// no `terminal:data` event exists yet when the reply is handed out.
+    func testCreateReplyIsAtomicWithPrimaryArmingAgainstEarlySpawnOutput() async throws {
+        let factory = FakeFreshTerminalFactory()
+        await factory.setSpawnsPaused(true)
+        let store = FreshTerminalStore(factory: factory)
+        let recorder = FreshStoreEventRecorder()
+        store.setEventSink(recorder.sink())
+        let client = controller()
+        let request = createRequest()
+        let creating = Task {
+            try await store.create(client: client, request: request) { creation in
+                recorder.recordReply(creation)
+            }
+        }
+        try await eventually { await factory.spawnCount == 1 }
+        await factory.emit(Data("early;".utf8), fromProcessAt: 0)
+        await factory.resumeSpawns()
+        let creation = try await creating.value
+
+        XCTAssertEqual(creation.output, "early;")
+        XCTAssertEqual(creation.startOffset, 0)
+        XCTAssertEqual(creation.endOffset, Int64("early;".utf8.count))
+        XCTAssertFalse(creation.exited)
+        let firstReply = try XCTUnwrap(recorder.replies().first)
+        XCTAssertEqual(firstReply.creation, creation)
+        XCTAssertEqual(
+            firstReply.dataEventsAtReply,
+            0,
+            "a primary data event beat the create reply out"
+        )
+
+        await factory.emit(Data("late;".utf8), fromProcessAt: 0)
+        XCTAssertEqual(recorder.dataPayloads(), ["late;"])
+
+        // Same-project adoption re-answers through the same critical section:
+        // the reply replays everything before the adopter's stream starts.
+        let secondClient = controller(instanceID: "123e4567-e89b-42d3-a456-426614174001")
+        let adopted = try await store.create(
+            client: secondClient,
+            request: createRequest(ownerID: "owner-b")
+        ) { creation in
+            recorder.recordReply(creation)
+        }
+        XCTAssertTrue(adopted.existed)
+        XCTAssertEqual(adopted.output, "early;late;")
+        let adoptionReply = try XCTUnwrap(recorder.replies().last)
+        XCTAssertEqual(adoptionReply.creation, adopted)
+        XCTAssertEqual(
+            adoptionReply.dataEventsAtReply,
+            1,
+            "no adoption-owner data event may precede the adoption reply"
+        )
+
+        await factory.emit(Data("post;".utf8), fromProcessAt: 0)
+        XCTAssertEqual(recorder.dataPayloads(), ["late;", "post;"])
+        XCTAssertEqual(
+            recorder.lastDataOwner(),
+            "\(secondClient.instanceID)|owner-b|project-a"
+        )
+        _ = try await store.release(
+            client: secondClient,
+            identity: identity(ownerID: "owner-b")
+        )
+    }
+
     func testOnlyAControllerWithAValidOwnerCanMutate() async throws {
         let factory = FakeFreshTerminalFactory()
         let store = FreshTerminalStore(factory: factory)
@@ -739,6 +806,61 @@ final class SwiftSessionBrokerFreshStoreTests: XCTestCase {
 
 private enum FakeFreshTerminalError: Error {
     case requested
+}
+
+/// Accepts every delivery and remembers, for each create/adoption reply, how
+/// many primary data events existed at the exact moment the reply ran — the
+/// count a racing event would have raised.
+private final class FreshStoreEventRecorder: @unchecked Sendable {
+    struct DataEvent {
+        let owner: String
+        let payload: String
+    }
+
+    struct Reply {
+        let creation: FreshTerminalCreation
+        let dataEventsAtReply: Int
+    }
+
+    private let lock = NSLock()
+    private var dataEvents: [DataEvent] = []
+    private var storedReplies: [Reply] = []
+
+    func sink() -> FreshTerminalEventSink {
+        { [weak self] owner, channel, payload, _, _ in
+            guard let self else { return false }
+            self.lock.lock()
+            defer { self.lock.unlock() }
+            if channel.hasPrefix("terminal:data:"), let text = payload.stringValue {
+                self.dataEvents.append(DataEvent(owner: owner, payload: text))
+            }
+            return true
+        }
+    }
+
+    func recordReply(_ creation: FreshTerminalCreation) {
+        lock.lock()
+        defer { lock.unlock() }
+        storedReplies.append(Reply(creation: creation, dataEventsAtReply: dataEvents.count))
+    }
+
+    func replies() -> [Reply] {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedReplies
+    }
+
+    func dataPayloads() -> [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return dataEvents.map(\.payload)
+    }
+
+    func lastDataOwner() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return dataEvents.last?.owner
+    }
 }
 
 private final class FakeFreshTerminalProcess: FreshTerminalProcess, @unchecked Sendable {

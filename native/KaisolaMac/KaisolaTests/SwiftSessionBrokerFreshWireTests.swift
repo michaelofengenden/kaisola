@@ -1473,6 +1473,91 @@ final class SwiftSessionBrokerFreshWireTests: XCTestCase {
         ]))
     }
 
+    /// The child may speak before `terminal.create` can even answer. Whatever
+    /// it says must land exactly once — in the response's snapshot, never as a
+    /// `terminal:data` event racing ahead of the response on the wire.
+    func testCreateReplyPrecedesThePrimaryStreamAndSharesNoBytesWithIt() async throws {
+        let factory = WireFreshTerminalFactory()
+        let (service, _) = try makeService(factory: factory)
+        let controller = try await authenticate(
+            service: service,
+            role: .controller,
+            instanceID: controllerInstanceID
+        )
+        let recorder = WireBrokerFrameRecorder()
+        await service.attachConnection(client: controller, sink: recorder.sink())
+
+        // Hold the spawn open and let the child speak first: these bytes
+        // provably exist before the create response is built.
+        await factory.setSpawnsPaused(true)
+        let createRequest = request(id: "create", method: "terminal.create", params: createParams())
+        let creating = Task {
+            await service.dispatch(
+                client: controller,
+                request: createRequest,
+                responder: recorder.responder()
+            )
+        }
+        try await eventually { await factory.spawnCount == 1 }
+        await factory.emit(Data("early;".utf8), fromProcessAt: 0)
+        await factory.resumeSpawns()
+        let inline = await creating.value
+        XCTAssertNil(inline, "a connection-backed create answers through its responder")
+
+        await factory.emit(Data("late;".utf8), fromProcessAt: 0)
+
+        let items = recorder.items()
+        guard case let .response(first) = items.first else {
+            return XCTFail("the create response must precede every event frame")
+        }
+        let result = try XCTUnwrap(first.result?.objectValue)
+        XCTAssertEqual(result["ok"], .bool(true))
+        XCTAssertEqual(result["existed"], .bool(false))
+        XCTAssertEqual(result["output"], .string("early;"))
+        XCTAssertEqual(result["startOffset"], .integer(0))
+        XCTAssertEqual(result["endOffset"], .integer(Int64("early;".utf8.count)))
+        XCTAssertEqual(result["exited"], .bool(false))
+
+        // The armed stream carries only what came after the reply.
+        let dataFrames = recorder.eventFrames(channel: "terminal:data:\(terminalID)")
+        XCTAssertEqual(dataFrames.map(\.payload), [.string("late;")])
+    }
+
+    /// One maximal 64 KiB PTY read. Unsplit, its encoded `terminal:data` frame
+    /// is over the ordinary event cap; the router's refusal then read as a
+    /// slow consumer and paused the primary stream for good.
+    func testMaximalPrimaryReadIsSplitDeliverableAndDoesNotPauseTheStream() async throws {
+        let factory = WireFreshTerminalFactory()
+        let (service, _) = try makeService(factory: factory)
+        let controller = try await authenticate(
+            service: service,
+            role: .controller,
+            instanceID: controllerInstanceID
+        )
+        let recorder = WireBrokerFrameRecorder()
+        await service.attachConnection(client: controller, sink: recorder.sink())
+        _ = await service.dispatch(
+            client: controller,
+            request: request(id: "create", method: "terminal.create", params: createParams())
+        )
+
+        let burst = String(repeating: "b", count: 64 * 1_024)
+        await factory.emit(Data(burst.utf8), fromProcessAt: 0)
+
+        let frames = recorder.eventFrames(channel: "terminal:data:\(terminalID)")
+        XCTAssertEqual(frames.count, 8, "an eighth-cap split of one maximal read")
+        XCTAssertEqual(frames.compactMap { $0.payload.stringValue }.joined(), burst)
+        XCTAssertTrue(
+            recorder.eventFrames(channel: "terminal:snapshot-required").isEmpty,
+            "a deterministic oversize must not be classified as a slow consumer"
+        )
+
+        await factory.emit(Data("tail;".utf8), fromProcessAt: 0)
+        let after = recorder.eventFrames(channel: "terminal:data:\(terminalID)")
+        XCTAssertEqual(after.count, 9)
+        XCTAssertEqual(after.last?.payload, .string("tail;"))
+    }
+
     func testPrimaryStreamOverflowPausesUntilAdoptionRearmsIt() async throws {
         let factory = WireFreshTerminalFactory()
         let (service, _) = try makeService(factory: factory)

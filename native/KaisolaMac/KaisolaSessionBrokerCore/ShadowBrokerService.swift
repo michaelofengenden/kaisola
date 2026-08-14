@@ -258,8 +258,25 @@ public actor ShadowBrokerService {
             beginFreshMutation()
             var didMutate = false
             defer { finishFreshMutation(didMutate: didMutate) }
+            // The reply is produced inside the terminal's output critical
+            // section, before the creator's primary stream is armed. With a
+            // connection responder it is enqueued right there — so the create
+            // response reaches the wire ahead of the first `terminal:data`
+            // event, and its snapshot cannot share bytes with one — and this
+            // method then returns nil; the responder-free (in-process test)
+            // path captures it instead.
+            let requestID = request.id
+            let box = FreshInlineResponseBox()
+            let respond: @Sendable (FreshTerminalCreation) -> Void = { creation in
+                let response = Self.freshCreateResponse(id: requestID, creation: creation)
+                if let responder {
+                    _ = responder(response)
+                } else {
+                    box.store(response)
+                }
+            }
             do {
-                let creation = try await terminalStore.create(
+                _ = try await terminalStore.create(
                     client: client,
                     request: create,
                     // The creator's own negotiation answers whether the broker
@@ -267,35 +284,19 @@ public actor ShadowBrokerService {
                     // terminal it now owns; adoption re-answers it the same way.
                     primaryStreamEnabled: !client.negotiatedFeatures.contains(
                         BrokerWire.terminalObserverOnlyOutputFeature
-                    )
+                    ),
+                    respond: respond
                 )
                 didMutate = true
-                guard let snapshot = try await terminalStore.snapshot(
-                    id: creation.id,
-                    projectID: create.projectID
-                ) else {
-                    return .failure(
-                        id: request.id,
-                        code: "terminal_not_found",
-                        message: "terminal is no longer available"
-                    )
-                }
-                return .success(id: request.id, result: .object([
-                    "ok": .bool(true),
-                    "existed": .bool(creation.existed),
-                    "pid": .integer(Int64(creation.pid)),
-                    "continuation": .null,
-                    "streamEpoch": .string(snapshot.streamEpoch),
-                    "output": .string(snapshot.output),
-                    "startOffset": .integer(snapshot.startOffset),
-                    "endOffset": .integer(snapshot.endOffset),
-                    "truncated": .bool(snapshot.truncated),
-                    "exited": .bool(snapshot.exited),
-                    "recovered": .null,
-                ]))
             } catch {
                 return freshCreateFailure(id: request.id, error: error)
             }
+            if responder != nil { return nil }
+            return box.take() ?? .failure(
+                id: request.id,
+                code: "internal_error",
+                message: "terminal create produced no reply"
+            )
 
         case "terminal.write":
             guard let identity = freshIdentity(from: request.params),
@@ -746,7 +747,7 @@ public actor ShadowBrokerService {
         // With a connection responder it is enqueued right there — before any
         // later append can broadcast — and this method then returns nil; the
         // responder-free (in-process test) path captures it instead.
-        let box = FreshSubscribeResponseBox()
+        let box = FreshInlineResponseBox()
         let respond: @Sendable (FreshTerminalSubscribeReply) -> Void = { reply in
             let response = Self.freshSubscribeResponse(id: requestID, reply: reply)
             if let responder {
@@ -775,6 +776,27 @@ public actor ShadowBrokerService {
             code: "internal_error",
             message: "terminal subscribe produced no reply"
         )
+    }
+
+    /// Byte-for-byte the response shape the pre-atomic handler assembled from
+    /// its separate snapshot read; only the source of truth moved.
+    private static func freshCreateResponse(
+        id: String,
+        creation: FreshTerminalCreation
+    ) -> BrokerResponse {
+        .success(id: id, result: .object([
+            "ok": .bool(true),
+            "existed": .bool(creation.existed),
+            "pid": .integer(Int64(creation.pid)),
+            "continuation": .null,
+            "streamEpoch": .string(creation.streamEpoch),
+            "output": .string(creation.output),
+            "startOffset": .integer(creation.startOffset),
+            "endOffset": .integer(creation.endOffset),
+            "truncated": .bool(creation.truncated),
+            "exited": .bool(creation.exited),
+            "recovered": .null,
+        ]))
     }
 
     private static func freshSubscribeResponse(
@@ -1300,10 +1322,10 @@ final class BrokerEventRouter: @unchecked Sendable {
     }
 }
 
-/// Captures the subscribe reply for responder-free (in-process) dispatch. The
-/// store invokes `respond` synchronously before its subscribe call returns, so
-/// the box is filled by the time the caller reads it.
-private final class FreshSubscribeResponseBox: @unchecked Sendable {
+/// Captures a subscribe or create reply for responder-free (in-process)
+/// dispatch. The store invokes `respond` synchronously before the call
+/// returns, so the box is filled by the time the caller reads it.
+private final class FreshInlineResponseBox: @unchecked Sendable {
     private let lock = NSLock()
     private var response: BrokerResponse?
 

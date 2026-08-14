@@ -1,4 +1,5 @@
 import Foundation
+import KaisolaBrokerProtocol
 import XCTest
 @testable import KaisolaSessionBrokerCore
 
@@ -275,6 +276,54 @@ final class SwiftSessionBrokerOutputTests: XCTestCase {
             endOffset: 5
         )
         XCTAssertEqual(tiny.splitForObserverFrames(), [tiny])
+    }
+
+    /// The primary `terminal:data` copy rides an ordinary event channel whose
+    /// encoded cap is 64 KiB, so a full 64 KiB PTY read must arrive as several
+    /// pieces — and every piece must survive the router's exact envelope and
+    /// escaping even when the payload is pure control bytes.
+    func testEmissionSplitsForThePrimaryChannelAndWorstCasePiecesFitItsEncodedCap() throws {
+        let read = 64 * 1_024
+        for payload in [
+            String(repeating: "x", count: read),
+            String(repeating: "\u{1B}", count: read),
+        ] {
+            let emission = TerminalOutputEmission(
+                streamEpoch: streamEpoch,
+                output: payload,
+                startOffset: 0,
+                endOffset: Int64(payload.utf8.count)
+            )
+            let pieces = emission.splitForPrimaryFrames()
+            XCTAssertEqual(pieces.count, read / TerminalOutputEmission.primaryFrameByteLimit)
+            XCTAssertEqual(pieces.map(\.output).joined(), payload)
+            var cursor = Int64(0)
+            for piece in pieces {
+                XCTAssertEqual(piece.startOffset, cursor)
+                cursor = piece.endOffset
+                XCTAssertLessThanOrEqual(
+                    piece.output.utf8.count,
+                    TerminalOutputEmission.primaryFrameByteLimit
+                )
+                // The exact frame BrokerEventRouter would encode, worst-case
+                // channel and identity lengths included.
+                let frame: BrokerJSONValue = .object([
+                    "type": .string("event"),
+                    "ownerId": .string(String(repeating: "o", count: 256)),
+                    "projectId": .string(String(repeating: "p", count: 256)),
+                    "channel": .string("terminal:data:term-project-a-1234abcd"),
+                    "payload": .string(piece.output),
+                ])
+                let encoder = JSONEncoder()
+                encoder.outputFormatting = [.sortedKeys]
+                let data = try encoder.encode(frame)
+                XCTAssertNoThrow(try BrokerWire.validateEncodedFrame(
+                    data,
+                    purpose: .event("terminal:data:term-project-a-1234abcd")
+                ))
+            }
+            XCTAssertEqual(cursor, emission.endOffset)
+        }
     }
 
     func testHistorySliceServesBoundedPagesOverTheRetainedTail() throws {

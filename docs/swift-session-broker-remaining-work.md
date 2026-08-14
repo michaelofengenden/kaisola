@@ -24,9 +24,15 @@ slow-consumer policy pauses with one forced snapshot-required marker carrying
 the exact resubscribe cursor and retires only a subscriber that cannot even
 take the marker. `terminal.unsubscribe` removes truthfully, connection close
 removes by instance prefix, and `terminal.history` pages the retained tail with
-Node's clamps. Multi-client fan-out, UTF-8 split repair, truncation, resume
-classification, and observer-only-output negotiation are pinned by the fresh
-wire suite and an end-to-end run through the unchanged production clients.
+Node's clamps. The `terminal.create` reply (and its adoption re-reply) is
+produced inside the same output critical section that arms the creator's
+primary stream, so the response precedes the first `terminal:data` event and
+shares no bytes with it; primary emissions split at an eighth of the ordinary
+event channel's encoded cap so a maximal 64 KiB PTY read is deliverable
+instead of misreading as a slow consumer. Multi-client fan-out, UTF-8 split
+repair, truncation, resume classification, and observer-only-output
+negotiation are pinned by the fresh wire suite and an end-to-end run through
+the unchanged production clients.
 
 Still open within this item:
 

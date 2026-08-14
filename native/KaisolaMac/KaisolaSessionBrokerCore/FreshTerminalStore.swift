@@ -121,12 +121,19 @@ public struct FreshTerminalCreateRequest: Equatable, Sendable {
     }
 }
 
+/// Carries the whole reply snapshot, captured in the same critical section
+/// that arms the creator's primary stream — the create response is built from
+/// this one value, never from a second read that live output could outrun.
 public struct FreshTerminalCreation: Equatable, Sendable {
     public let id: String
     public let pid: Int32
     public let existed: Bool
     public let streamEpoch: String
+    public let output: String
+    public let startOffset: Int64
     public let endOffset: Int64
+    public let truncated: Bool
+    public let exited: Bool
     public let cwd: String
     public let cols: Int
     public let rows: Int
@@ -384,10 +391,17 @@ public actor FreshTerminalStore {
         eventSinkBox.set(sink)
     }
 
+    /// `respond` is the create analog of `subscribe`'s reply hand-off: it runs
+    /// exactly once, synchronously, inside the terminal's output critical
+    /// section and *before* the creator's primary stream is armed. A connection
+    /// that enqueues the response there gets it onto the wire ahead of every
+    /// `terminal:data` event, and the reply's snapshot ends exactly where those
+    /// events begin — no byte in both, no byte in neither.
     public func create(
         client: BrokerAuthenticatedClient,
         request: FreshTerminalCreateRequest,
-        primaryStreamEnabled: Bool = true
+        primaryStreamEnabled: Bool = true,
+        respond: (@Sendable (FreshTerminalCreation) -> Void)? = nil
     ) async throws -> FreshTerminalCreation {
         guard !isShuttingDown else { throw FreshTerminalStoreError.shuttingDown }
         let owner = try validatedOwner(
@@ -415,10 +429,22 @@ public actor FreshTerminalStore {
                 // Adoption is the fresh analog of a renderer reattach: the
                 // adopting connection re-answers the primary-stream policy
                 // and clears any slow-consumer pause, because the create
-                // response it just received replays the snapshot.
-                record.output.setPrimary(owner: owner, enabled: primaryStreamEnabled)
+                // response it just received replays the snapshot — captured,
+                // answered, and armed as one step against concurrent output.
+                let adopted = record.output.armPrimary(
+                    owner: owner,
+                    enabled: primaryStreamEnabled
+                ) { snapshot in
+                    let adopted = Self.creation(
+                        record: record,
+                        existed: true,
+                        snapshot: snapshot
+                    )
+                    respond?(adopted)
+                    return adopted
+                }
                 activityClock.advance()
-                return creation(from: record, existed: true)
+                return adopted
             }
             // Retain the ended record until the replacement process has
             // spawned successfully. Installing the new live record below is
@@ -510,9 +536,6 @@ public actor FreshTerminalStore {
             exitSequence: nil
         )
         records[request.id] = record
-        // Armed only after the record is installed: bytes produced before this
-        // moment are already covered by the create response's snapshot.
-        record.output.setPrimary(owner: owner, enabled: primaryStreamEnabled)
         activityClock.advance()
         Task { [weak self] in
             await process.waitForFreshTerminalExit()
@@ -526,7 +549,18 @@ public actor FreshTerminalStore {
         if pending.cancellationRequested {
             throw FreshTerminalStoreError.terminalReleaseInProgress
         }
-        return creation(from: record, existed: false)
+        // Armed last, past every throw above (a reply already handed out could
+        // not be taken back), and atomically with the reply: bytes produced up
+        // to this moment are in the reply's snapshot, bytes after it are the
+        // armed stream's.
+        return record.output.armPrimary(
+            owner: owner,
+            enabled: primaryStreamEnabled
+        ) { snapshot in
+            let made = Self.creation(record: record, existed: false, snapshot: snapshot)
+            respond?(made)
+            return made
+        }
     }
 
     public func write(
@@ -987,14 +1021,24 @@ public actor FreshTerminalStore {
         value.range(of: pattern, options: .regularExpression) != nil
     }
 
-    private func creation(from record: Record, existed: Bool) -> FreshTerminalCreation {
-        let snapshot = record.output.snapshot()
-        return FreshTerminalCreation(
+    /// Pure by design: it runs inside `armPrimary`'s critical section, where
+    /// reaching back into the accumulator would deadlock its non-reentrant
+    /// lock — the snapshot must arrive as an argument.
+    private static func creation(
+        record: Record,
+        existed: Bool,
+        snapshot: FreshTerminalSnapshot
+    ) -> FreshTerminalCreation {
+        FreshTerminalCreation(
             id: record.id,
             pid: record.process.pid,
             existed: existed,
             streamEpoch: snapshot.streamEpoch,
+            output: snapshot.output,
+            startOffset: snapshot.startOffset,
             endOffset: snapshot.endOffset,
+            truncated: snapshot.truncated,
+            exited: snapshot.exited,
             cwd: record.cwd,
             cols: record.cols,
             rows: record.rows
@@ -1219,12 +1263,25 @@ private final class FreshTerminalOutputAccumulator: @unchecked Sendable {
         return observers.unsubscribe(prefix: prefix)
     }
 
-    func setPrimary(owner: String, enabled: Bool) {
+    /// The create/adoption analog of `subscribe`: the reply snapshot and the
+    /// primary arming are one atomic step against `append`. `respond` runs
+    /// exactly once, synchronously, before arming — a connection enqueueing
+    /// the create response there puts it on the wire ahead of the first
+    /// `terminal:data` event, and the snapshot's end offset is exactly where
+    /// that stream begins. Also clears any slow-consumer pause, because the
+    /// reply replays the snapshot the pause demanded.
+    func armPrimary<Reply>(
+        owner: String,
+        enabled: Bool,
+        respond: (FreshTerminalSnapshot) -> Reply
+    ) -> Reply {
         lock.lock()
         defer { lock.unlock() }
+        let reply = respond(freshSnapshotLocked())
         primaryOwner = owner
         primaryEnabled = enabled
         primaryPaused = false
+        return reply
     }
 
     func historyPage(
@@ -1354,29 +1411,36 @@ private final class FreshTerminalOutputAccumulator: @unchecked Sendable {
     /// Node's `deliverPrimaryOutput`: a refused delta pauses the primary copy
     /// behind one forced `terminal:snapshot-required` marker; only an explicit
     /// adoption (the fresh analog of attach) resumes it with a fresh snapshot.
+    /// Pieces stay under the primary chunk bound so a full 64 KiB PTY read is
+    /// deliverable at all — unsplit it exceeds the ordinary event channel's
+    /// encoded cap, and that deterministic refusal would masquerade here as a
+    /// slow consumer and pause the stream for good.
     private func deliverPrimaryLocked(_ emission: TerminalOutputEmission) {
         guard let owner = primaryOwner, primaryEnabled, !primaryPaused else { return }
-        let delivered = eventSink.deliver(
-            owner: owner,
-            channel: "terminal:data:\(terminalID)",
-            payload: .string(emission.output),
-            maxQueueBytes: TerminalOutputObservers.defaultQueueBytes,
-            force: false
-        )
-        if delivered { return }
-        primaryPaused = true
-        _ = eventSink.deliver(
-            owner: owner,
-            channel: "terminal:snapshot-required",
-            payload: .object([
-                "id": .string(terminalID),
-                "reason": .string("slow_consumer"),
-                "streamEpoch": .string(emission.streamEpoch),
-                "endOffset": .integer(emission.endOffset),
-            ]),
-            maxQueueBytes: TerminalOutputObservers.defaultQueueBytes,
-            force: true
-        )
+        for piece in emission.splitForPrimaryFrames() {
+            let delivered = eventSink.deliver(
+                owner: owner,
+                channel: "terminal:data:\(terminalID)",
+                payload: .string(piece.output),
+                maxQueueBytes: TerminalOutputObservers.defaultQueueBytes,
+                force: false
+            )
+            if delivered { continue }
+            primaryPaused = true
+            _ = eventSink.deliver(
+                owner: owner,
+                channel: "terminal:snapshot-required",
+                payload: .object([
+                    "id": .string(terminalID),
+                    "reason": .string("slow_consumer"),
+                    "streamEpoch": .string(emission.streamEpoch),
+                    "endOffset": .integer(emission.endOffset),
+                ]),
+                maxQueueBytes: TerminalOutputObservers.defaultQueueBytes,
+                force: true
+            )
+            return
+        }
     }
 
     private static func exitStatusValue(

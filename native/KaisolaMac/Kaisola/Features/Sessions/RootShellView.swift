@@ -1291,21 +1291,70 @@ struct RootShellView: View {
     }
 
     private func chooseNewSession(_ choice: NewSessionChoice, draft: NewSessionDraft) {
-        guard model.projects.contains(where: { $0.id == draft.projectID && $0.directory != nil }) else {
+        guard let project = model.projects.first(where: {
+            $0.id == draft.projectID && $0.directory != nil
+        }), let directory = project.directory else {
             newSessionDrafts.cancel(projectID: draft.projectID)
             ToastCenter.shared.show("This project folder is no longer available.", style: .info)
             return
         }
         model.activateProject(id: draft.projectID)
-        newSessionDrafts.complete(projectID: draft.projectID)
         switch choice {
         case .terminal:
-            runCommand(.newTerminal)
+            guard let launchID = newSessionDrafts.beginLaunch(projectID: draft.projectID) else {
+                return
+            }
+            Task { @MainActor in
+                let terminalID = await model.createTerminal(inDirectory: directory)
+                let accepted = newSessionDrafts.finishLaunch(
+                    projectID: draft.projectID,
+                    launchID: launchID,
+                    succeeded: terminalID != nil
+                )
+                if accepted, terminalID == nil {
+                    ToastCenter.shared.show(
+                        NewSessionChooserPresentation.launchFailureMessage,
+                        style: .info
+                    )
+                }
+            }
         case let .agentTerminal(agentID):
-            runCommand(.newAgent(agentID))
+            guard let agent = AgentRegistry.profile(id: agentID) else {
+                ToastCenter.shared.show("That terminal agent is no longer available.", style: .info)
+                return
+            }
+            guard let launchID = newSessionDrafts.beginLaunch(projectID: draft.projectID) else {
+                return
+            }
+            Self.promptForNewAgent(
+                agent,
+                model: model,
+                preferredDirectory: directory,
+                cancelled: {
+                    newSessionDrafts.cancelLaunch(
+                        projectID: draft.projectID,
+                        launchID: launchID
+                    )
+                },
+                completed: { terminalID in
+                    let accepted = newSessionDrafts.finishLaunch(
+                        projectID: draft.projectID,
+                        launchID: launchID,
+                        succeeded: terminalID != nil
+                    )
+                    if accepted, terminalID == nil {
+                        ToastCenter.shared.show(
+                            NewSessionChooserPresentation.launchFailureMessage,
+                            style: .info
+                        )
+                    }
+                }
+            )
         case let .chat(agentID):
+            newSessionDrafts.complete(projectID: draft.projectID)
             runCommand(.newChat(agentID))
         case .mesh:
+            newSessionDrafts.complete(projectID: draft.projectID)
             runCommand(.newMesh)
         }
     }
@@ -1669,9 +1718,12 @@ struct RootShellView: View {
                     projectName: project.name,
                     catalog: .live,
                     terminalControlAvailable: model.controlAvailable,
+                    isLaunching: newSessionDrafts.isLaunching(projectID: draft.projectID),
+                    launchFailed: newSessionDrafts.didLastLaunchFail(projectID: draft.projectID),
                     choose: { chooseNewSession($0, draft: draft) },
                     cancel: { cancelNewSession(draft.projectID) }
                 )
+                .id(draft.id)
                 .padding(32)
                 .accessibilityIdentifier("new-session-chooser")
             }
@@ -1733,12 +1785,40 @@ struct RootShellView: View {
     /// host will be before anything launches.
     @MainActor
     static func promptForNewAgent(_ agent: AgentProfile, model: AppModel) {
-        promptForRunOn(agent, model: model) { directory, profile in
-            Task { await model.createAgentSession(
-                agent,
-                inDirectory: directory,
-                accountProfile: profile
-            ) }
+        promptForNewAgent(
+            agent,
+            model: model,
+            preferredDirectory: nil,
+            cancelled: {},
+            completed: { _ in }
+        )
+    }
+
+    /// The draft chooser uses the same explicit Run On and account boundary as
+    /// every other agent launch. It only adds completion/cancellation hooks so
+    /// the temporary tab survives a cancelled picker or a failed terminal.
+    @MainActor
+    private static func promptForNewAgent(
+        _ agent: AgentProfile,
+        model: AppModel,
+        preferredDirectory: URL?,
+        cancelled: @escaping @MainActor () -> Void,
+        completed: @escaping @MainActor (String?) -> Void
+    ) {
+        promptForRunOn(
+            agent,
+            model: model,
+            additionalDirectory: preferredDirectory,
+            cancelled: cancelled
+        ) { directory, profile in
+            Task { @MainActor in
+                let terminalID = await model.createAgentSession(
+                    agent,
+                    inDirectory: directory,
+                    accountProfile: profile
+                )
+                completed(terminalID)
+            }
         }
     }
 
@@ -1781,6 +1861,7 @@ struct RootShellView: View {
         _ agent: AgentProfile,
         model: AppModel,
         additionalDirectory: URL? = nil,
+        cancelled: @escaping @MainActor () -> Void = {},
         then launch: @escaping RunOnLaunch
     ) {
         let preferredPath = additionalDirectory?.standardizedFileURL.path
@@ -1848,6 +1929,7 @@ struct RootShellView: View {
                 model: model,
                 targets: targets,
                 preferredPath: preferredPath,
+                cancelled: cancelled,
                 launch: launch
             )
         }
@@ -1859,6 +1941,7 @@ struct RootShellView: View {
         model: AppModel,
         targets: [RunOnTarget],
         preferredPath: String?,
+        cancelled: @escaping @MainActor () -> Void,
         launch: @escaping RunOnLaunch
     ) {
         let selectedTarget = targets.first { $0.path == preferredPath }
@@ -1912,11 +1995,15 @@ struct RootShellView: View {
 
         let finish: @MainActor (NSApplication.ModalResponse) -> Void = { response in
             if response == .alertThirdButtonReturn {
-                chooseDirectory(prompt: "Run \(agent.name) Here") { directory in
+                chooseDirectory(
+                    prompt: "Run \(agent.name) Here",
+                    cancelled: cancelled
+                ) { directory in
                     promptForRunOn(
                         agent,
                         model: model,
                         additionalDirectory: directory,
+                        cancelled: cancelled,
                         then: launch
                     )
                 }
@@ -1924,7 +2011,10 @@ struct RootShellView: View {
             }
             guard response == .alertFirstButtonReturn,
                   let target = controller.selectedTarget,
-                  target.canStart else { return }
+                  target.canStart else {
+                cancelled()
+                return
+            }
             launch(
                 URL(fileURLWithPath: target.path, isDirectory: true),
                 controller.selectedProfile
@@ -2030,6 +2120,7 @@ struct RootShellView: View {
     private static func chooseDirectory(
         prompt: String,
         startingAt: URL? = nil,
+        cancelled: @escaping @MainActor () -> Void = {},
         then handle: @escaping @MainActor (URL) -> Void
     ) {
         let panel = NSOpenPanel()
@@ -2042,8 +2133,13 @@ struct RootShellView: View {
         // so the panel does not re-enumerate a large repository on open.
         panel.directoryURL = NativeFolderPickerStartingPoint.preferred(currentProject: startingAt)
         panel.begin { response in
-            guard response == .OK, let directory = panel.urls.first else { return }
-            Task { @MainActor in handle(directory) }
+            Task { @MainActor in
+                guard response == .OK, let directory = panel.urls.first else {
+                    cancelled()
+                    return
+                }
+                handle(directory)
+            }
         }
     }
 

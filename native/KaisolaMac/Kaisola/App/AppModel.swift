@@ -6280,11 +6280,12 @@ final class AppModel: ObservableObject {
     /// Launches a one-click agent session: an owned terminal that boots the
     /// agent's CLI in the chosen directory, exactly like Electron's prepared
     /// terminal agents.
+    @discardableResult
     func createAgentSession(
         _ agent: AgentProfile,
         inDirectory directory: URL,
         accountProfile: UsageAccountProfile? = nil
-    ) async {
+    ) async -> String? {
         await createOwnedSession(
             inDirectory: directory,
             agent: agent,

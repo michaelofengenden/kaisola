@@ -19,6 +19,15 @@ struct NewSessionPrimaryOption: Identifiable, Equatable, Sendable {
 
 enum NewSessionChooserPresentation {
     static let terminalUnavailableReason = "Saved terminals are view-only right now."
+    static let launchFailureMessage =
+        "Session did not start. Check the terminal connection or Run On choice, then try again."
+
+    static func terminalRowsEnabled(
+        terminalControlAvailable: Bool,
+        isLaunching: Bool
+    ) -> Bool {
+        terminalControlAvailable && !isLaunching
+    }
 
     static func primaryOptions(
         catalog: NewSessionChoiceCatalog,
@@ -79,6 +88,8 @@ struct NewSessionChooserView: View {
     let projectName: String
     let catalog: NewSessionChoiceCatalog
     let terminalControlAvailable: Bool
+    let isLaunching: Bool
+    let launchFailed: Bool
     let choose: (NewSessionChoice) -> Void
     let cancel: () -> Void
 
@@ -90,6 +101,7 @@ struct NewSessionChooserView: View {
 
     @State private var screen: Screen = .primary
     @FocusState private var focusedPrimaryChoice: NewSessionPrimaryChoice?
+    @FocusState private var focusedAgentID: String?
 
     private var primaryOptions: [NewSessionPrimaryOption] {
         NewSessionChooserPresentation.primaryOptions(
@@ -118,6 +130,10 @@ struct NewSessionChooserView: View {
                         title: "Agent Terminal",
                         agents: catalog.terminalAgents,
                         symbol: "terminal",
+                        isEnabled: NewSessionChooserPresentation.terminalRowsEnabled(
+                            terminalControlAvailable: terminalControlAvailable,
+                            isLaunching: isLaunching
+                        ),
                         choice: NewSessionChoice.agentTerminal
                     )
                 case .chat:
@@ -125,12 +141,28 @@ struct NewSessionChooserView: View {
                         title: "Chat",
                         agents: catalog.chatAgents,
                         symbol: "bubble.left.and.text.bubble.right",
+                        isEnabled: !isLaunching,
                         choice: NewSessionChoice.chat
                     )
                 }
             }
 
             HStack {
+                if isLaunching {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Starting session…")
+                        .foregroundStyle(.kaisolaSecondary)
+                } else if launchFailed {
+                    Label {
+                        Text(NewSessionChooserPresentation.launchFailureMessage)
+                            .foregroundStyle(.kaisolaPrimary)
+                    } icon: {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Color.orange)
+                    }
+                        .accessibilityIdentifier("new-session-launch-failed")
+                }
                 if screen != .primary {
                     Button("Back") {
                         screen = .primary
@@ -138,10 +170,12 @@ struct NewSessionChooserView: View {
                     }
                     .buttonStyle(.plain)
                     .foregroundStyle(.kaisolaSecondary)
+                    .disabled(isLaunching)
                 }
                 Spacer()
                 Button("Cancel", role: .cancel, action: cancel)
                     .keyboardShortcut(.cancelAction)
+                    .disabled(isLaunching)
             }
             .font(.callout)
         }
@@ -157,7 +191,15 @@ struct NewSessionChooserView: View {
         }
         .shadow(color: Color.black.opacity(0.06), radius: 16, y: 6)
         .onAppear(perform: focusFirstEnabledChoice)
-        .onExitCommand(perform: cancel)
+        .onExitCommand {
+            if !isLaunching {
+                cancel()
+            }
+        }
+        .onChange(of: terminalControlAvailable) { _, available in
+            guard available, screen == .agentTerminal else { return }
+            focusFirstAgent(in: catalog.terminalAgents)
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Start a session in \(projectName)")
     }
@@ -175,7 +217,7 @@ struct NewSessionChooserView: View {
                     )
                 }
                 .buttonStyle(NewSessionChoiceButtonStyle())
-                .disabled(!option.isEnabled)
+                .disabled(!option.isEnabled || isLaunching)
                 .focusable()
                 .focused($focusedPrimaryChoice, equals: option.choice)
                 .help(option.disabledReason ?? option.detail)
@@ -189,6 +231,7 @@ struct NewSessionChooserView: View {
         title: String,
         agents: [NewSessionAgentOption],
         symbol: String,
+        isEnabled: Bool,
         choice: @escaping (String) -> NewSessionChoice
     ) -> some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -213,7 +256,16 @@ struct NewSessionChooserView: View {
                     .contentShape(Rectangle())
                 }
                 .buttonStyle(NewSessionChoiceButtonStyle())
+                .disabled(!isEnabled)
+                .focusable()
+                .focused($focusedAgentID, equals: agent.id)
+                .help(isEnabled ? "Start \(agent.name)" : NewSessionChooserPresentation.terminalUnavailableReason)
                 .accessibilityLabel("\(title) with \(agent.name)")
+                .accessibilityHint(
+                    isEnabled
+                        ? "Starts \(title.lowercased()) with \(agent.name)"
+                        : NewSessionChooserPresentation.terminalUnavailableReason
+                )
             }
         }
     }
@@ -246,8 +298,10 @@ struct NewSessionChooserView: View {
             choose(.terminal)
         case .agentTerminalCategory:
             screen = .agentTerminal
+            focusFirstAgent(in: catalog.terminalAgents)
         case .chatCategory:
             screen = .chat
+            focusFirstAgent(in: catalog.chatAgents)
         case .mesh:
             choose(.mesh)
         }
@@ -256,6 +310,12 @@ struct NewSessionChooserView: View {
     private func focusFirstEnabledChoice() {
         DispatchQueue.main.async {
             focusedPrimaryChoice = primaryOptions.first(where: \.isEnabled)?.choice
+        }
+    }
+
+    private func focusFirstAgent(in agents: [NewSessionAgentOption]) {
+        DispatchQueue.main.async {
+            focusedAgentID = agents.first?.id
         }
     }
 }

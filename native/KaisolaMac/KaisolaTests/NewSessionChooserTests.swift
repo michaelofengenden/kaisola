@@ -69,4 +69,26 @@ final class NewSessionChooserTests: XCTestCase {
             "circle.hexagongrid.fill",
         ])
     }
+
+    func testTerminalRowsDisableWhenControlDropsOrALaunchIsAlreadyRunning() {
+        XCTAssertTrue(NewSessionChooserPresentation.terminalRowsEnabled(
+            terminalControlAvailable: true,
+            isLaunching: false
+        ))
+        XCTAssertFalse(NewSessionChooserPresentation.terminalRowsEnabled(
+            terminalControlAvailable: false,
+            isLaunching: false
+        ))
+        XCTAssertFalse(NewSessionChooserPresentation.terminalRowsEnabled(
+            terminalControlAvailable: true,
+            isLaunching: true
+        ))
+    }
+
+    func testLaunchFailureCopyNamesTheTwoRecoveryChecks() {
+        XCTAssertEqual(
+            NewSessionChooserPresentation.launchFailureMessage,
+            "Session did not start. Check the terminal connection or Run On choice, then try again."
+        )
+    }
 }

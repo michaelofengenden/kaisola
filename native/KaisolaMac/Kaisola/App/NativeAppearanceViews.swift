@@ -649,44 +649,42 @@ struct SidebarBackdropView: View {
         case .solid:
             Color(nsColor: .controlBackgroundColor)
         case .tinted:
-            // The same recipe the canvas uses, on the rails: the desktop's hue
-            // re-valued to a declared peak and laid over the solid surface at a
-            // declared coverage, so the only chroma in the stack is the sampled
-            // desktop's and a grey desktop stays grey.
-            //
-            // The rails take a *lighter* coverage than the canvas. They are
-            // narrow columns of small text sitting next to a wide field of it,
-            // and matching the canvas exactly made them read as the louder
-            // surface — the same mistake the sidebar's selection pill made. This
-            // keeps the tint continuous across the window while leaving the
-            // canvas the surface that carries it.
             let isDark = colorScheme == .dark
-            let tint = DesktopTintSampler.revalued(
-                desktop.painting.tint,
-                peak: DesktopTintSampler.canvasTintPeak(isDark: isDark)
-            )
-            let coverage = DesktopTintSampler.canvasTintCoverage(isDark: isDark)
-            let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
             ZStack {
                 Color(nsColor: .controlBackgroundColor)
-                // Same top-to-bottom fall as the canvas, so a rail and the
-                // canvas beside it are lit from the same direction rather than
-                // meeting as two flat panels of slightly different colour.
-                LinearGradient(
-                    colors: [
-                        color.opacity(coverage.top * Self.railTintShare),
-                        color.opacity(coverage.bottom * Self.railTintShare),
-                    ],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
+                if isDark {
+                    let tint = DesktopTintSampler.revalued(
+                        desktop.painting.tint,
+                        peak: DesktopTintSampler.canvasTintPeak(isDark: true)
+                    )
+                    let coverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
+                    let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
+                    LinearGradient(
+                        colors: [
+                            color.opacity(coverage.top * Self.railTintShare),
+                            color.opacity(coverage.bottom * Self.railTintShare),
+                        ],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                } else {
+                    LightTintedGradient.gradient(
+                        coverageScale: Self.railTintShare,
+                        startPoint: placement.tintStartPoint,
+                        endPoint: placement.tintEndPoint
+                    )
+                }
                 if accessibilityContrast == .increased {
                     Color(nsColor: .controlBackgroundColor)
                         .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
                 }
             }
-            .onAppear { desktop.refresh(isDark: colorScheme == .dark) }
-            .onChange(of: colorScheme) { desktop.refresh(isDark: colorScheme == .dark) }
+            .onAppear {
+                if isDark { desktop.refresh(isDark: true) }
+            }
+            .onChange(of: colorScheme) {
+                if colorScheme == .dark { desktop.refresh(isDark: true) }
+            }
         }
     }
 
@@ -826,31 +824,27 @@ struct WorkspaceBackdropView: View {
                 .animation(.easeInOut(duration: 0.35), value: idleActive)
             }
         case .tinted:
-            // The desktop's *hue*, laid into the solid canvas — see
-            // `DesktopTintSampler.revalued(_:peak:)` for why the sample is
-            // re-valued before it is composited. Same neutrality contract as
-            // the glass veil: the sampled desktop colour is the only chroma in
-            // the stack, no mesh (lavender) stop.
-            //
-            // Measured against the real desktop, light: Solid 1.000/1.000/1.000
-            // (0.000 off-neutral) against Tinted 0.816/0.941/1.000 at the top
-            // (0.113 off-neutral, luminance 0.919). Dark: Solid 0.118 flat
-            // against Tinted 0.163/0.216/0.240 (0.209 off-neutral). Nobody has
-            // to squint to tell which one is on.
+            // Light uses a stable cool-to-white-to-pearl composition so a blue
+            // desktop cannot turn the whole window flat blue. Dark keeps the
+            // sampled desktop treatment that already reads clearly there.
             let isDark = colorScheme == .dark
-            let tint = DesktopTintSampler.revalued(
-                desktop.painting.tint,
-                peak: DesktopTintSampler.canvasTintPeak(isDark: isDark)
-            )
-            let coverage = DesktopTintSampler.canvasTintCoverage(isDark: isDark)
-            let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
             ZStack {
                 Color(nsColor: .windowBackgroundColor)
-                LinearGradient(
-                    colors: [color.opacity(coverage.top), color.opacity(coverage.bottom)],
-                    startPoint: .topLeading,
-                    endPoint: .bottomTrailing
-                )
+                if isDark {
+                    let tint = DesktopTintSampler.revalued(
+                        desktop.painting.tint,
+                        peak: DesktopTintSampler.canvasTintPeak(isDark: true)
+                    )
+                    let coverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
+                    let color = Color(red: tint.red, green: tint.green, blue: tint.blue)
+                    LinearGradient(
+                        colors: [color.opacity(coverage.top), color.opacity(coverage.bottom)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                } else {
+                    LightTintedGradient.gradient()
+                }
             }
         }
     }

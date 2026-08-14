@@ -78,7 +78,7 @@ enum LightGlassFrost {
 
     /// The rails use a thinner carrier than the canvas so the wallpaper can
     /// move through them while the center remains a white working surface.
-    static let railCarrierWhiteCoverage: Double = 0.58
+    static let railCarrierWhiteCoverage: Double = 0.30
 
     /// White over the already-frosted workspace canvas. Light deliberately
     /// gets no second semantic material: that layer re-greyed the canvas and
@@ -138,6 +138,46 @@ enum LightRailTint {
 
     static var pearlColor: Color {
         Color(red: pearl.red, green: pearl.green, blue: pearl.blue)
+    }
+}
+
+/// The light Tinted theme is a deliberate window-wide colour composition,
+/// rather than a sampled desktop hue that can turn every surface flat blue.
+/// White remains the carrier; cool and pearl live only at opposite edges.
+enum LightTintedGradient {
+    static let cool = (red: 90.0 / 255, green: 169.0 / 255, blue: 1.0)
+    static let pearl = (red: 1.0, green: 201.0 / 255, blue: 133.0 / 255)
+    static let coolCoverage = 0.16
+    static let neutralCoverage = 0.02
+    static let pearlCoverage = 0.12
+    static let neutralLocation = 0.54
+
+    static var coolColor: Color {
+        Color(red: cool.red, green: cool.green, blue: cool.blue)
+    }
+
+    static var pearlColor: Color {
+        Color(red: pearl.red, green: pearl.green, blue: pearl.blue)
+    }
+
+    static func gradient(
+        coverageScale: Double = 1,
+        startPoint: UnitPoint = .topLeading,
+        endPoint: UnitPoint = .bottomTrailing
+    ) -> LinearGradient {
+        let scale = min(1, max(0, coverageScale))
+        return LinearGradient(
+            gradient: Gradient(stops: [
+                .init(color: coolColor.opacity(coolCoverage * scale), location: 0),
+                .init(
+                    color: Color.white.opacity(neutralCoverage * scale),
+                    location: neutralLocation
+                ),
+                .init(color: pearlColor.opacity(pearlCoverage * scale), location: 1),
+            ]),
+            startPoint: startPoint,
+            endPoint: endPoint
+        )
     }
 }
 
@@ -533,7 +573,7 @@ struct GlassBackdropWash: Equatable, Sendable {
     private static func sidebarBase(isDark: Bool) -> GlassBackdropWash {
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
-            : light(top: 0.42, base: 0.36, bottom: 0.32)
+            : light(top: 0.24, base: 0.20, bottom: 0.16)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour
@@ -599,14 +639,11 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// than those two constants allow, whatever the desktop is — which is
     /// exactly the guarantee the 0.50 ceiling was standing in for.
     ///
-    /// Both ceilings therefore sit one step above the veil they permit
-    /// (dark 0.66 under 0.70, light 0.60 under 0.65) rather than at an
-    /// historical number. Light stays the tighter of the two because its own
-    /// contrast budget is tighter, not because it is unguarded: see
-    /// `sidebar(isDark:)` for the 3.98:1 AppKit ceiling that is the real bound
-    /// on the light surface.
+    /// Dark retains its established 0.70 ceiling. Light rails deliberately
+    /// move into a clearer 0.82 band; their normalized still, white carrier,
+    /// and custom ink keep that extra transmission from becoming raw desktop.
     static func desktopTransmissionBand(isDark: Bool) -> (floor: Double, ceiling: Double) {
-        isDark ? (floor: 0.30, ceiling: 0.70) : (floor: 0.30, ceiling: 0.65)
+        isDark ? (floor: 0.30, ceiling: 0.70) : (floor: 0.30, ceiling: 0.82)
     }
 
     /// How much of a glass surface Increased Contrast must cover, counting the

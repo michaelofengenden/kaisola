@@ -13,6 +13,8 @@ struct NewSessionDraft: Identifiable, Equatable, Sendable {
 struct NewSessionDraftState: Equatable, Sendable {
     private(set) var draftsByProject: [String: NewSessionDraft] = [:]
     private(set) var selectedDraftID: String?
+    private var launchingDraftIDsByProject: [String: String] = [:]
+    private var failedLaunchDraftIDsByProject: [String: String] = [:]
 
     var selectedDraft: NewSessionDraft? {
         guard let selectedDraftID else { return nil }
@@ -48,7 +50,56 @@ struct NewSessionDraftState: Equatable, Sendable {
         selectedDraftID = nil
     }
 
+    func isLaunching(projectID: String) -> Bool {
+        guard let draft = draftsByProject[projectID] else { return false }
+        return launchingDraftIDsByProject[projectID] == draft.id
+    }
+
+    func didLastLaunchFail(projectID: String) -> Bool {
+        guard let draft = draftsByProject[projectID] else { return false }
+        return failedLaunchDraftIDsByProject[projectID] == draft.id
+    }
+
+    /// A click starts work but does not consume the draft. The chooser remains
+    /// the retry surface until the broker confirms a real terminal exists.
+    @discardableResult
+    mutating func beginLaunch(projectID: String) -> String? {
+        guard let draft = draftsByProject[projectID],
+              launchingDraftIDsByProject[projectID] == nil else { return nil }
+        launchingDraftIDsByProject[projectID] = draft.id
+        failedLaunchDraftIDsByProject.removeValue(forKey: projectID)
+        selectedDraftID = draft.id
+        return draft.id
+    }
+
+    @discardableResult
+    mutating func finishLaunch(
+        projectID: String,
+        launchID: String,
+        succeeded: Bool
+    ) -> Bool {
+        guard draftsByProject[projectID]?.id == launchID,
+              launchingDraftIDsByProject[projectID] == launchID else { return false }
+        launchingDraftIDsByProject.removeValue(forKey: projectID)
+        if succeeded {
+            remove(projectID: projectID)
+        } else {
+            failedLaunchDraftIDsByProject[projectID] = launchID
+        }
+        return true
+    }
+
+    /// Dismissing a location/account picker is not a failed launch. Return the
+    /// draft to its idle chooser state so the same option can be tried again.
+    mutating func cancelLaunch(projectID: String, launchID: String) {
+        guard draftsByProject[projectID]?.id == launchID,
+              launchingDraftIDsByProject[projectID] == launchID else { return }
+        launchingDraftIDsByProject.removeValue(forKey: projectID)
+        failedLaunchDraftIDsByProject.removeValue(forKey: projectID)
+    }
+
     mutating func cancel(projectID: String) {
+        guard !isLaunching(projectID: projectID) else { return }
         remove(projectID: projectID)
     }
 
@@ -58,12 +109,20 @@ struct NewSessionDraftState: Equatable, Sendable {
 
     mutating func retainProjects(_ projectIDs: Set<String>) {
         draftsByProject = draftsByProject.filter { projectIDs.contains($0.key) }
+        launchingDraftIDsByProject = launchingDraftIDsByProject.filter {
+            projectIDs.contains($0.key)
+        }
+        failedLaunchDraftIDsByProject = failedLaunchDraftIDsByProject.filter {
+            projectIDs.contains($0.key)
+        }
         if selectedDraft == nil {
             selectedDraftID = nil
         }
     }
 
     private mutating func remove(projectID: String) {
+        launchingDraftIDsByProject.removeValue(forKey: projectID)
+        failedLaunchDraftIDsByProject.removeValue(forKey: projectID)
         guard let removed = draftsByProject.removeValue(forKey: projectID) else { return }
         if selectedDraftID == removed.id {
             selectedDraftID = nil

@@ -2,6 +2,42 @@ import AppKit
 import Darwin
 import SwiftUI
 
+enum WorkspaceRailHeaderAction: String, CaseIterable, Hashable, Sendable {
+    case newFile
+    case newFolder
+    case followAgentFiles
+    case refresh
+    case hide
+}
+
+struct WorkspaceRailHeaderLayout: Equatable, Sendable {
+    enum Mode: Equatable, Sendable {
+        case compact
+        case regular
+    }
+
+    static let regularMinimumWidth: CGFloat = 236
+
+    let mode: Mode
+    let searchPlaceholder: String
+    let overflowActions: [WorkspaceRailHeaderAction]
+
+    static func resolve(availableWidth: CGFloat) -> WorkspaceRailHeaderLayout {
+        guard availableWidth >= regularMinimumWidth else {
+            return WorkspaceRailHeaderLayout(
+                mode: .compact,
+                searchPlaceholder: "Search",
+                overflowActions: WorkspaceRailHeaderAction.allCases
+            )
+        }
+        return WorkspaceRailHeaderLayout(
+            mode: .regular,
+            searchPlaceholder: "Search files",
+            overflowActions: []
+        )
+    }
+}
+
 /// One source of truth for what a file-tree row says and does through either
 /// Full Keyboard Access or VoiceOver. The visible indentation and glyphs are
 /// presentation only; role, hierarchy, disclosure, and selection live here.
@@ -159,63 +195,7 @@ struct WorkspaceRailView: View {
 
     var body: some View {
         AnyView(VStack(spacing: 0) {
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .font(.caption)
-                    .foregroundStyle(.kaisolaSecondary)
-                TextField("Search files", text: $searchText)
-                    .textFieldStyle(.plain)
-                Menu {
-                    Button("New File…") { beginCreate(.file, in: root) }
-                    Button("New Folder…") { beginCreate(.folder, in: root) }
-                } label: {
-                    Image(systemName: "plus")
-                        .font(.caption.weight(.semibold))
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("New file or folder")
-                .accessibilityLabel("New project item")
-                Button {
-                    followsAgentFiles.toggle()
-                } label: {
-                    Image(systemName: "scope")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(followsAgentFiles ? Color.accentColor : Color.kaisolaSecondary)
-                }
-                .buttonStyle(.borderless)
-                .disabled(!canFollowAgentFiles)
-                .help(canFollowAgentFiles
-                    ? (followsAgentFiles ? "Stop following the selected agent's files" : "Follow the selected agent's files")
-                    : "Select a Chat or Mesh to follow its files")
-                .accessibilityLabel("Follow selected agent files")
-                .accessibilityValue(followsAgentFiles ? "On" : "Off")
-                Button(action: { refresh() }) {
-                    Image(systemName: "arrow.clockwise")
-                        .font(.caption)
-                }
-                .buttonStyle(.borderless)
-                .help("Refresh files")
-                if isMutating {
-                    ProgressView().controlSize(.mini)
-                        .accessibilityLabel("Updating project files")
-                }
-                Button(action: close) {
-                    Image(systemName: "minus")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.kaisolaSecondary)
-                        .frame(width: 20, height: 20)
-                }
-                .buttonStyle(.borderless)
-                .help("Hide \(root.lastPathComponent) files (Command-B)")
-                .accessibilityLabel("Hide Files")
-                .accessibilityIdentifier("files.hide")
-            }
-            .padding(.horizontal, 8)
-            .frame(height: 30)
-            .background(.quaternary.opacity(0.38), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
-            .padding(.horizontal, 6)
-            .padding(.vertical, 6)
+            workspaceHeader
 
             if !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                !tree.isSearching {
@@ -407,6 +387,119 @@ struct WorkspaceRailView: View {
             Text(failure.message)
         }
         .accessibilityLabel("Project files")
+    }
+
+    private var workspaceHeader: some View {
+        GeometryReader { geometry in
+            let layout = WorkspaceRailHeaderLayout.resolve(availableWidth: geometry.size.width)
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                TextField(layout.searchPlaceholder, text: $searchText)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1)
+                    .frame(minWidth: 52)
+                    .layoutPriority(1)
+                    .accessibilityLabel("Search files")
+                if isMutating {
+                    ProgressView()
+                        .controlSize(.mini)
+                        .accessibilityLabel("Updating project files")
+                }
+                if layout.mode == .compact {
+                    compactHeaderMenu
+                } else {
+                    regularHeaderActions
+                }
+            }
+            .padding(.horizontal, 8)
+            .frame(height: 30)
+            .background(
+                .quaternary.opacity(0.38),
+                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+            )
+            .padding(.horizontal, 6)
+            .padding(.vertical, 6)
+        }
+        .frame(height: 42)
+    }
+
+    private var compactHeaderMenu: some View {
+        Menu {
+            Button("New File…") { beginCreate(.file, in: root) }
+                .disabled(isMutating)
+            Button("New Folder…") { beginCreate(.folder, in: root) }
+                .disabled(isMutating)
+            Divider()
+            Button(followsAgentFiles ? "Stop Following Agent Files" : "Follow Agent Files") {
+                followsAgentFiles.toggle()
+            }
+            .disabled(!canFollowAgentFiles)
+            Button("Refresh Files") { refresh() }
+            Divider()
+            Button("Hide Files") { close() }
+                .accessibilityIdentifier("files.hide")
+        } label: {
+            Image(systemName: "ellipsis")
+                .font(.caption.weight(.semibold))
+                .frame(width: 20, height: 20)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help("File actions")
+        .accessibilityLabel("File actions")
+    }
+
+    private var regularHeaderActions: some View {
+        HStack(spacing: 6) {
+            Menu {
+                Button("New File…") { beginCreate(.file, in: root) }
+                    .disabled(isMutating)
+                Button("New Folder…") { beginCreate(.folder, in: root) }
+                    .disabled(isMutating)
+            } label: {
+                Image(systemName: "plus")
+                    .font(.caption.weight(.semibold))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("New file or folder")
+            .accessibilityLabel("New project item")
+            Button {
+                followsAgentFiles.toggle()
+            } label: {
+                Image(systemName: "scope")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(followsAgentFiles ? Color.accentColor : Color.kaisolaSecondary)
+            }
+            .buttonStyle(.borderless)
+            .disabled(!canFollowAgentFiles)
+            .help(canFollowAgentFiles
+                ? (followsAgentFiles
+                    ? "Stop following the selected agent's files"
+                    : "Follow the selected agent's files")
+                : "Select a Chat or Mesh to follow its files")
+            .accessibilityLabel("Follow selected agent files")
+            .accessibilityValue(followsAgentFiles ? "On" : "Off")
+            Button(action: { refresh() }) {
+                Image(systemName: "arrow.clockwise")
+                    .font(.caption)
+            }
+            .buttonStyle(.borderless)
+            .help("Refresh files")
+            Button(action: close) {
+                Image(systemName: "minus")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.kaisolaSecondary)
+                    .frame(width: 20, height: 20)
+            }
+            .buttonStyle(.borderless)
+            .help("Hide \(root.lastPathComponent) files (Command-B)")
+            .accessibilityLabel("Hide Files")
+            .accessibilityIdentifier("files.hide")
+        }
+        .fixedSize(horizontal: true, vertical: false)
     }
 
     /// The index is deliberately bounded; when one of those bounds wins, do

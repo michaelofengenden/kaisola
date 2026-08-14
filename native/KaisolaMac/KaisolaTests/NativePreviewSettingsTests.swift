@@ -885,8 +885,8 @@ final class NativePreviewSettingsTests: XCTestCase {
     }
 
     /// The workspace keeps its bright white carrier while the narrow rails let
-    /// more of the desktop through. Both still read as one light-glass family.
-    func testLightGlassIsWhiteAndCoherentAcrossRailsCanvasAndPanel() {
+    /// the desktop show clearly through a separate, lighter frost.
+    func testLightGlassKeepsAWhiteCanvasAndTranslucentRails() {
         let rail = GlassBackdropWash.sidebar(isDark: false)
         let canvas = GlassBackdropWash.workspace(isDark: false)
         let railLuminance = LightGlassFrost.modeledRailLuminance(rail)
@@ -897,16 +897,21 @@ final class NativePreviewSettingsTests: XCTestCase {
             LightGlassFrost.backdropLuminance,
             accuracy: 0.0001
         )
-        XCTAssertGreaterThanOrEqual(railLuminance, 0.94, "the LHS/RHS rails read grey")
+        XCTAssertGreaterThanOrEqual(railLuminance, 0.86, "the LHS/RHS rails became muddy")
         XCTAssertGreaterThanOrEqual(canvasLuminance, 0.96, "the background canvas still reads grey")
+        XCTAssertGreaterThan(
+            canvasLuminance - railLuminance,
+            0.05,
+            "the rails are still painted almost as opaque as the white canvas"
+        )
         XCTAssertLessThan(
-            abs(railLuminance - canvasLuminance),
-            0.021,
-            "rails and canvas are no longer one white-glass family"
+            canvasLuminance - railLuminance,
+            0.11,
+            "the rails no longer read as light glass"
         )
         XCTAssertGreaterThanOrEqual(
             LightGlassFrost.modeledRailDesktopContribution(rail),
-            0.25,
+            0.55,
             "the rails still hide too much of the desktop"
         )
 
@@ -941,6 +946,37 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(LightRailTint.cool.green, LightRailTint.cool.red)
         XCTAssertGreaterThan(LightRailTint.pearl.red, LightRailTint.pearl.green)
         XCTAssertGreaterThan(LightRailTint.pearl.green, LightRailTint.pearl.blue)
+    }
+
+    func testGlassRailsExposeMostOfTheDesktopWithoutChangingTheWhiteCanvasRecipe() {
+        let rail = GlassBackdropWash.sidebar(isDark: false)
+        let canvas = GlassBackdropWash.workspace(isDark: false)
+
+        XCTAssertLessThanOrEqual(LightGlassFrost.railCarrierWhiteCoverage, 0.32)
+        XCTAssertGreaterThanOrEqual(
+            LightGlassFrost.modeledRailDesktopContribution(rail),
+            0.55,
+            "Glass still paints over most of the wallpaper"
+        )
+        XCTAssertGreaterThanOrEqual(
+            LightGlassFrost.modeledBackdropLuminance(canvas),
+            0.96,
+            "the separate workspace carrier must remain white"
+        )
+    }
+
+    func testLightTintedSurfaceIsACoolThroughNeutralToPearlGradient() {
+        XCTAssertGreaterThan(LightTintedGradient.cool.blue, LightTintedGradient.cool.green)
+        XCTAssertGreaterThan(LightTintedGradient.cool.green, LightTintedGradient.cool.red)
+        XCTAssertGreaterThan(LightTintedGradient.pearl.red, LightTintedGradient.pearl.green)
+        XCTAssertGreaterThan(LightTintedGradient.pearl.green, LightTintedGradient.pearl.blue)
+        XCTAssertGreaterThan(LightTintedGradient.coolCoverage, 0.10)
+        XCTAssertLessThanOrEqual(LightTintedGradient.coolCoverage, 0.22)
+        XCTAssertLessThanOrEqual(LightTintedGradient.neutralCoverage, 0.05)
+        XCTAssertGreaterThan(LightTintedGradient.pearlCoverage, 0.08)
+        XCTAssertLessThanOrEqual(LightTintedGradient.pearlCoverage, 0.18)
+        XCTAssertGreaterThan(LightTintedGradient.neutralLocation, 0.35)
+        XCTAssertLessThan(LightTintedGradient.neutralLocation, 0.70)
     }
 
     func testSurfaceTabOutlinesAreVisibleButRemainHairlines() {
@@ -1032,16 +1068,18 @@ final class NativePreviewSettingsTests: XCTestCase {
         // passed no desktop colour at all, and the 0.16 that replaced it was
         // calibrated against vibrancy but ended up over a *painted wallpaper*,
         // which passes everything.
-        // Light moved for the same reason dark did, one round later: "light
-        // mode should also be translucent to wallpaper much better". 0.60 →
-        // 0.45, transmission 0.40 → 0.55, and — like dark — only reachable
-        // because the bake bounds the still's range first.
+        // Light rails now use a 0.20 body veil and a separate 0.30 white
+        // carrier. More than half of the normalized desktop survives that
+        // stack, while the workspace canvas keeps its original white recipe.
         let lightSidebar = GlassBackdropWash.sidebar(isDark: false)
-        XCTAssertEqual(lightSidebar.topOpacity, 0.42, accuracy: 0.0001)
-        XCTAssertEqual(lightSidebar.baseOpacity, 0.36, accuracy: 0.0001)
-        XCTAssertEqual(lightSidebar.bottomOpacity, 0.32, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.topOpacity, 0.24, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.baseOpacity, 0.20, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.bottomOpacity, 0.16, accuracy: 0.0001)
         XCTAssertEqual(GlassBackdropWash.workspace(isDark: false).baseOpacity, 0.40, accuracy: 0.0001)
-        // Dark is thinner than light now, and deliberately so: it used to be
+        // Dark remains at its previously verified values. Light now passes
+        // more of the desktop through the rails while the light workspace
+        // stays unchanged.
+        // It used to be
         // the least translucent surface in the app (0.40 transmission against
         // light's 0.40 on the sidebar and 0.45 on the workspace), which is what
         // "the background in dark mode looks bad… needs to be glassy/smooth/
@@ -1052,15 +1090,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(GlassBackdropWash.sidebar(isDark: true).baseOpacity, 0.34, accuracy: 0.0001)
         XCTAssertEqual(GlassBackdropWash.workspace(isDark: true).baseOpacity, 0.37, accuracy: 0.0001)
         XCTAssertGreaterThan(
-            GlassBackdropWash.sidebar(isDark: true).desktopTransmission,
-            GlassBackdropWash.sidebar(isDark: false).desktopTransmission
+            GlassBackdropWash.sidebar(isDark: false).desktopTransmission,
+            GlassBackdropWash.sidebar(isDark: true).desktopTransmission
         )
         // The headline, stated the way Michael asked for it: dark now passes
         // half again as much desktop as it did, on both surfaces.
         XCTAssertGreaterThan(GlassBackdropWash.sidebar(isDark: true).desktopTransmission, 0.65)
         XCTAssertGreaterThan(GlassBackdropWash.workspace(isDark: true).desktopTransmission, 0.60)
-        // …and light, whose ask came next, passes at least a third more than the
-        // 0.40/0.45 it shipped with.
+        // Light rail transmission is now twice its original 0.40 floor.
         XCTAssertGreaterThan(
             GlassBackdropWash.sidebar(isDark: false).desktopTransmission, 0.40 * 1.33
         )
@@ -1133,8 +1170,8 @@ final class NativePreviewSettingsTests: XCTestCase {
         // it is the combination that puts a raw wallpaper behind the labels.
         // Asserted for both appearances now that both carry a cap.
         XCTAssertGreaterThan(
-            GlassBackdropWash.desktopTransmissionBand(isDark: true).ceiling,
-            GlassBackdropWash.desktopTransmissionBand(isDark: false).ceiling
+            GlassBackdropWash.desktopTransmissionBand(isDark: false).ceiling,
+            GlassBackdropWash.desktopTransmissionBand(isDark: true).ceiling
         )
         for isDark in [false, true] {
             XCTAssertLessThan(
@@ -4061,8 +4098,8 @@ final class NativePreviewSettingsTests: XCTestCase {
             tint: SidebarBackdropView.liveTint.light,
             veil: GlassBackdropWash.sidebar(isDark: false).baseOpacity
         ) * (1 - LightGlassFrost.railCarrierWhiteCoverage)
-        XCTAssertGreaterThan(lightAfterCarrier, 0.25, "white Glass became opaque")
-        XCTAssertLessThan(lightAfterCarrier, 0.30, "too much live colour can reach light Glass")
+        XCTAssertGreaterThan(lightAfterCarrier, 0.55, "white Glass became opaque")
+        XCTAssertLessThan(lightAfterCarrier, 0.60, "the rail lost its light frost")
     }
 
     /// The bake bounds the wallpaper's dynamic range, not only its mean — the

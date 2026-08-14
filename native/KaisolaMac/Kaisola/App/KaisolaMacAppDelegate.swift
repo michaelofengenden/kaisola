@@ -1193,6 +1193,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             settings.appearance = visualAppearance == "dark" ? .dark : .light
             settings.sidebarAppearance = .glass
             settings.workspaceBackdrop = .glass
+            if visualSurface == "tinted" {
+                settings.sidebarAppearance = .tinted
+                settings.workspaceBackdrop = .tinted
+            }
             // `empty-workspace` is the *idle* canvas — nothing mounted is its
             // whole definition, and a visible Files rail is a mounted surface.
             settings.workspaceRailVisible = visualSurface != "topbar" && visualSurface != "terminal-solo"

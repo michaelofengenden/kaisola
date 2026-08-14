@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.124 — 2026-08-14
+
+- Terminals connect again after updates. A broker with no terminals quits on its own to give its memory back — that part is deliberate — but the app would only replace it if no older brokers were still running. After a few updates there always are: they hold the terminals you had open before. So every launch started a new broker, refused to publish it, watched it give up after thirty seconds, and started another, forever — high CPU and not a single working terminal, while your old sessions sat reachable the whole time. The app now replaces the missing broker and keeps every older one exactly as it was, so the terminals they own survive the same fix that brings new ones back.
+- Glass in light mode shows your desktop again. The middle of the window had been made an exact white plane — deliberately, one refinement at a time — until Glass and Solid were the same picture. The canvas is still the brightest surface in the window, but a third of the softened desktop now comes through it.
+- Tinted moves. Its colours were in the code and invisible on screen: at eleven percent over white, the sage and the lilac both rounded to white. They are three times stronger now — still pastel — and the gradient drifts, slowly enough that you will never catch it moving, only notice it is somewhere else. In dark mode the tint comes from your desktop's own colour and flows into a neighbouring hue of the same family. With Reduce Motion on, it holds still.
+- The session cards light up under the pointer. Terminal, Agent Terminal, Chat and Mesh answered a click but not a hover; they now brighten as you pass over them, and a card that cannot be clicked no longer pretends it might.
+- The sidebar opens wider. New windows get the width long project and session titles need; if you dragged yours to a size you like, it stays where you put it.
+
 ## 0.1.120 — 2026-08-12
 
 - Solid and Tinted have a white canvas. The middle of the window was grey in both of them while the sidebar right beside it was white, and those two are meant to be the same surface. The panel holding your terminals and chats was laying a frosted layer over the background no matter which theme you picked, and a frosted layer over white comes out grey. That layer only earns its place over Glass, the one theme that really does show your desktop, so Glass is now the only theme that gets it. Glass itself is a little clearer than it was, for the same reason.

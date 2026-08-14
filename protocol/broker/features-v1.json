@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "features": [
+    "terminal-observe-v1",
+    "terminal-history-v1",
+    "terminal-history-continuous-v1",
+    "observer-role-v1",
+    "broker-update-v1",
+    "broker-rolling-update-v1",
+    "broker-mutation-idempotency-v1",
+    "broker-inventory-v1",
+    "broker-administration-v1",
+    "terminal-exit-status-v1",
+    "terminal-observer-only-output-v1",
+    "terminal-attach-ack-v1",
+    "terminal-observer-coalescing-v1"
+  ]
+}

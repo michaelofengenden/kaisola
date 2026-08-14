@@ -57,12 +57,11 @@ function sha256(file) {
   return hash.digest('hex')
 }
 
-// Stable identity for the behavior-bearing helper payload. `generatedAt`, code
-// signing metadata, and JSON formatting are deliberately excluded: the digest
-// is a pure function of compatibility metadata plus the exact sealed files.
-// Length-prefixing every field makes the byte stream unambiguous across the
-// JavaScript packager and Swift verifier.
-function contentDigest(manifest) {
+// Frozen schema-1 identity for the behavior-bearing Node helper payload.
+// `generatedAt`, code signing metadata, and JSON formatting are deliberately
+// excluded. Keep this byte stream unchanged while schema-1 packages can remain
+// installed or draining.
+function contentDigestV1(manifest) {
   const hash = crypto.createHash('sha256')
   const field = (value) => {
     const bytes = Buffer.from(String(value), 'utf8')
@@ -83,6 +82,50 @@ function contentDigest(manifest) {
     field(String(record.sha256).toLowerCase())
   }
   return hash.digest('hex')
+}
+
+// Schema 2 binds the native launch authority and release provenance in
+// addition to the compatibility envelope and sealed files. Arrays retain
+// their declared order; files remain path-sorted so JSON ordering is inert.
+function contentDigestV2(manifest) {
+  const hash = crypto.createHash('sha256')
+  const field = (value) => {
+    const bytes = Buffer.from(String(value), 'utf8')
+    hash.update(Buffer.from(`${bytes.length}:`, 'ascii'))
+    hash.update(bytes)
+  }
+  field('kaisola-broker-helper-content-v2')
+  field(manifest.schemaVersion)
+  field(manifest.packageVersion)
+  field(manifest.appRelease?.version)
+  field(manifest.appRelease?.build)
+  field(manifest.brokerImplementationVersion)
+  field(manifest.brokerProtocol?.minimum)
+  field(manifest.brokerProtocol?.maximum)
+  field(manifest.brokerProtocol?.securityEpoch)
+  field(manifest.launch?.kind)
+  field(manifest.launch?.executable)
+  const argumentsValue = Array.isArray(manifest.launch?.arguments) ? manifest.launch.arguments : []
+  field(argumentsValue.length)
+  for (const argument of argumentsValue) field(argument)
+  for (const record of [...(manifest.files || [])].sort((a, b) => String(a.path) < String(b.path) ? -1 : String(a.path) > String(b.path) ? 1 : 0)) {
+    field(record.path)
+    field(record.role)
+    field(record.size)
+    field(record.mode)
+    field(String(record.sha256).toLowerCase())
+    const architectures = Array.isArray(record.machO?.architectures) ? record.machO.architectures : []
+    field(architectures.length)
+    for (const architecture of architectures) field(architecture)
+    field(record.machO?.designatedRequirement || '')
+  }
+  return hash.digest('hex')
+}
+
+function contentDigest(manifest) {
+  if (manifest?.schemaVersion === 1) return contentDigestV1(manifest)
+  if (manifest?.schemaVersion === 2) return contentDigestV2(manifest)
+  fail(`unsupported helper manifest schema: ${manifest?.schemaVersion}`)
 }
 
 function ensureDirectory(directory, mode = 0o755) {
@@ -156,11 +199,78 @@ function designatedRequirement(file) {
 function roleFor(relative) {
   if (relative === 'bin/node') return 'node-runtime'
   if (relative === 'bin/kaisola-broker-bootstrap') return 'launch-agent-bootstrap'
+  if (relative === 'bin/kaisola-session-broker') return 'session-broker-executable'
   if (relative.endsWith('/pty.node')) return 'native-module'
   if (relative.endsWith('/spawn-helper')) return 'node-pty-spawn-helper'
   if (relative.endsWith('.cjs') || relative.endsWith('.js') || relative.endsWith('.mjs')) return 'broker-javascript'
   if (relative.includes('/LICENSE') || relative.startsWith('LICENSES/')) return 'license'
   return 'resource'
+}
+
+function isSafePackagePath(value) {
+  if (typeof value !== 'string'
+      || value.length < 1
+      || value.startsWith('/')
+      || value.includes('\\')
+      || value.includes('\0')) return false
+  return value.split('/').every((component) => component.length > 0 && component !== '.' && component !== '..')
+}
+
+function validateNativeV2Manifest(manifest, policy) {
+  if (typeof manifest.appRelease?.version !== 'string'
+      || manifest.appRelease.version.length < 1
+      || manifest.appRelease.version.length > 64
+      || typeof manifest.appRelease?.build !== 'string'
+      || manifest.appRelease.build.length < 1
+      || manifest.appRelease.build.length > 64) {
+    fail('native schema-2 app release is invalid')
+  }
+  if (policy.appRelease
+      && (manifest.appRelease.version !== policy.appRelease.version
+        || manifest.appRelease.build !== policy.appRelease.build)) {
+    fail('native schema-2 app release does not match package policy')
+  }
+  if (manifest.launch?.kind !== 'native'
+      || !isSafePackagePath(manifest.launch?.executable)) {
+    fail('native launch authority is invalid')
+  }
+  const argumentsValue = manifest.launch?.arguments
+  if (!Array.isArray(argumentsValue)
+      || argumentsValue.length > 32
+      || argumentsValue.some((argument) => typeof argument !== 'string'
+        || Buffer.byteLength(argument, 'utf8') < 1
+        || Buffer.byteLength(argument, 'utf8') > 4_096
+        || argument.includes('\0')
+        || argument === '--launch'
+        || argument === '--pty-child')) {
+    fail('native static launch arguments are invalid')
+  }
+  if (!Array.isArray(manifest.files)) fail('native schema-2 file inventory is invalid')
+  const executables = manifest.files.filter((record) => record?.role === 'session-broker-executable')
+  if (executables.length !== 1) fail('native package requires exactly one session-broker-executable')
+  const executable = executables[0]
+  if (manifest.launch.executable !== executable.path) {
+    fail('native launch executable does not match session-broker-executable')
+  }
+  if (executable.mode !== '0755') fail('native executable mode must be 0755')
+  if (!executable.machO
+      || !Array.isArray(executable.machO.architectures)
+      || executable.machO.architectures.length !== 1
+      || executable.machO.architectures[0] !== 'arm64') {
+    fail('native executable must declare exactly arm64')
+  }
+  if (typeof executable.machO.designatedRequirement !== 'string'
+      || executable.machO.designatedRequirement.length < 1) {
+    fail('native executable designated requirement is missing')
+  }
+  for (const record of manifest.files) {
+    if (record?.machO
+        && (!Array.isArray(record.machO.architectures)
+          || record.machO.architectures.length !== 1
+          || record.machO.architectures[0] !== 'arm64')) {
+      fail(`native Mach-O must declare exactly arm64: ${record?.path}`)
+    }
+  }
 }
 
 function createManifest(root, metadata) {
@@ -191,16 +301,37 @@ function verifyPackage(root, { requireSignatures = false, policy = readJSON(poli
   const manifestStat = fs.lstatSync(manifestFile)
   if (manifestStat.isSymbolicLink() || !manifestStat.isFile()) fail('helper manifest is not a regular file')
   const manifest = readJSON(manifestFile)
+  if (manifest.schemaVersion === 2 && manifestStat.nlink !== 1) {
+    fail('native manifest has invalid link count')
+  }
   if (manifest.schemaVersion !== policy.schemaVersion) fail('helper manifest schema does not match package policy')
   if (manifest.packageVersion !== policy.packageVersion) fail('helper package version does not match package policy')
   if (manifest.brokerImplementationVersion !== policy.brokerImplementationVersion) fail('broker implementation version does not match package policy')
-  if (manifest.node?.version !== policy.node.version || String(manifest.node?.abi) !== String(policy.node.abi)) {
-    fail('helper Node runtime does not match package policy')
+  if (!policy.brokerProtocol
+      || manifest.brokerProtocol?.minimum !== policy.brokerProtocol.minimum
+      || manifest.brokerProtocol?.maximum !== policy.brokerProtocol.maximum
+      || manifest.brokerProtocol?.securityEpoch !== policy.brokerProtocol.securityEpoch) {
+    fail('broker protocol does not match package policy')
   }
-  if (manifest.nodePty?.version !== policy.nodePtyVersion) fail('helper node-pty version does not match package policy')
-  if (policy.claudeAgentSDKVersion
-      && manifest.claudeAgentSDK?.version !== policy.claudeAgentSDKVersion) {
-    fail('helper Claude Agent SDK version does not match package policy')
+  if (manifest.schemaVersion === 1) {
+    if (Object.hasOwn(manifest, 'appRelease') || Object.hasOwn(manifest, 'launch')) {
+      fail('schema-1 package cannot contain native launch metadata')
+    }
+    if (manifest.node?.version !== policy.node.version || String(manifest.node?.abi) !== String(policy.node.abi)) {
+      fail('helper Node runtime does not match package policy')
+    }
+    if (manifest.nodePty?.version !== policy.nodePtyVersion) fail('helper node-pty version does not match package policy')
+    if (policy.claudeAgentSDKVersion
+        && manifest.claudeAgentSDK?.version !== policy.claudeAgentSDKVersion) {
+      fail('helper Claude Agent SDK version does not match package policy')
+    }
+  } else if (manifest.schemaVersion === 2) {
+    if (Object.hasOwn(manifest, 'node') || Object.hasOwn(manifest, 'nodePty')) {
+      fail('schema-2 package cannot contain Node runtime metadata')
+    }
+    validateNativeV2Manifest(manifest, policy)
+  } else {
+    fail(`unsupported helper manifest schema: ${manifest.schemaVersion}`)
   }
   if (!/^[0-9a-f]{64}$/.test(String(manifest.contentDigest || ''))
       || manifest.contentDigest !== contentDigest(manifest)) {
@@ -212,11 +343,17 @@ function verifyPackage(root, { requireSignatures = false, policy = readJSON(poli
     .map((entry) => [entry.relative, entry]))
   if (!Array.isArray(manifest.files) || manifest.files.length !== actual.size) fail('helper manifest file inventory is incomplete')
   for (const expected of manifest.files) {
-    if (!expected || typeof expected.path !== 'string' || expected.path.includes('..') || path.isAbsolute(expected.path)) {
+    const safePath = manifest.schemaVersion === 1
+      ? expected && typeof expected.path === 'string' && !expected.path.includes('..') && !path.isAbsolute(expected.path)
+      : expected && isSafePackagePath(expected.path)
+    if (!safePath) {
       fail('helper manifest contains an unsafe path')
     }
     const entry = actual.get(expected.path)
     if (!entry) fail(`helper package is missing ${expected.path}`)
+    if (manifest.schemaVersion === 2 && entry.stat.nlink !== 1) {
+      fail(`native package file has invalid link count: ${expected.path}`)
+    }
     if (entry.stat.size !== expected.size || sha256(entry.absolute) !== expected.sha256) {
       fail(`helper package integrity mismatch: ${expected.path}`)
     }
@@ -226,7 +363,12 @@ function verifyPackage(root, { requireSignatures = false, policy = readJSON(poli
     if (Boolean(macho) !== Boolean(expected.machO)) fail(`helper Mach-O inventory mismatch: ${expected.path}`)
     if (macho) {
       const requirement = designatedRequirement(entry.absolute)
-      if ((expected.machO.designatedRequirement || null) !== requirement) {
+      if (manifest.schemaVersion === 2
+          && JSON.stringify(macho.architectures) !== JSON.stringify(expected.machO.architectures)) {
+        fail(`native Mach-O architecture mismatch: ${expected.path}`)
+      }
+      if ((manifest.schemaVersion === 1 || requireSignatures)
+          && (expected.machO.designatedRequirement || null) !== requirement) {
         fail(`helper designated requirement mismatch: ${expected.path}`)
       }
       if (requireSignatures && !requirement) fail(`helper nested code is unsigned: ${expected.path}`)
@@ -399,6 +541,8 @@ if (require.main === module) {
 module.exports = {
   brokerSources,
   contentDigest,
+  contentDigestV1,
+  contentDigestV2,
   createManifest,
   parseArguments,
   roleFor,

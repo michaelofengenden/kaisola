@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import KaisolaBrokerProtocol
 @testable import Kaisola
 
 final class BrokerLaunchConfigurationTests: XCTestCase {
@@ -99,6 +100,42 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
                 homeDirectory: home
             )
         ) { XCTAssertEqual($0 as? BrokerLaunchConfigurationError, .invalidConfiguration) }
+    }
+
+    func testDecodedNativePackageSchemaRemainsNonLaunchable() throws {
+        let home = URL(fileURLWithPath: "/tmp/kaisola-launch-home")
+        let userData = home.appendingPathComponent("Kaisola", isDirectory: true)
+        let broker = userData.appendingPathComponent("session-broker", isDirectory: true)
+        let current = configuration(userData: userData, broker: broker)
+        let native = BrokerLaunchConfiguration(
+            protocolVersion: current.protocolVersion,
+            securityEpoch: current.securityEpoch,
+            implementationVersion: current.implementationVersion,
+            packageSchema: BrokerWire.nativeHelperPackageSchema,
+            packageVersion: "2.0.0",
+            contentDigest: current.contentDigest,
+            packageRoot: current.packageRoot,
+            token: current.token,
+            socketPath: current.socketPath,
+            infoFile: current.infoFile,
+            lockFile: current.lockFile,
+            storageDir: current.storageDir,
+            logFile: current.logFile,
+            maximumLiveTerminals: current.maximumLiveTerminals,
+            startedAt: current.startedAt,
+            version: current.version,
+            smoke: false
+        )
+
+        XCTAssertThrowsError(
+            try native.validate(
+                configurationURL: broker.appendingPathComponent("launch-native-schema2.json"),
+                homeDirectory: home
+            )
+        ) {
+            XCTAssertEqual($0 as? BrokerLaunchConfigurationError, .invalidConfiguration)
+        }
+        XCTAssertEqual(BrokerWire.helperPackageSchema, BrokerWire.nodeHelperPackageSchema)
     }
 
     func testLegacyLaunchWithoutStagedPackageKeepsExactSingleBrokerLayout() throws {

@@ -1,0 +1,344 @@
+{
+  "schemaVersion": 1,
+  "protocolVersion": 2,
+  "scopeNote": "Initial normalized contract inventory; request and response identifiers are bounded placeholders, not complete payload fixtures or black-box parity evidence.",
+  "identifierConstraints": {
+    "pattern": "^[a-z0-9]+(?:[.-][a-z0-9]+)*$",
+    "maximumUtf8Bytes": 80
+  },
+  "methods": [
+    {
+      "method": "broker.cancelRollingUpdate",
+      "requiredAccess": "administrator",
+      "requestScenario": "request.broker-cancel-rolling-update",
+      "responseScenario": "response.broker-cancel-rolling-update"
+    },
+    {
+      "method": "broker.inventory",
+      "requiredAccess": "observer",
+      "requestScenario": "request.broker-inventory",
+      "responseScenario": "response.broker-inventory"
+    },
+    {
+      "method": "broker.prepareRollingUpdate",
+      "requiredAccess": "administrator",
+      "requestScenario": "request.broker-prepare-rolling-update",
+      "responseScenario": "response.broker-prepare-rolling-update"
+    },
+    {
+      "method": "broker.retireDraining",
+      "requiredAccess": "administrator",
+      "requestScenario": "request.broker-retire-draining",
+      "responseScenario": "response.broker-retire-draining"
+    },
+    {
+      "method": "broker.shutdown",
+      "requiredAccess": "administrator",
+      "requestScenario": "request.broker-shutdown",
+      "responseScenario": "response.broker-shutdown"
+    },
+    {
+      "method": "broker.shutdownForUpdate",
+      "requiredAccess": "administrator",
+      "requestScenario": "request.broker-shutdown-for-update",
+      "responseScenario": "response.broker-shutdown-for-update"
+    },
+    {
+      "method": "broker.status",
+      "requiredAccess": "observer",
+      "requestScenario": "request.broker-status",
+      "responseScenario": "response.broker-status"
+    },
+    {
+      "method": "terminal.agentTurn",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-agent-turn",
+      "responseScenario": "response.terminal-agent-turn"
+    },
+    {
+      "method": "terminal.attach",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-attach",
+      "responseScenario": "response.terminal-attach"
+    },
+    {
+      "method": "terminal.available",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-available",
+      "responseScenario": "response.terminal-available"
+    },
+    {
+      "method": "terminal.cancelRelease",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-cancel-release",
+      "responseScenario": "response.terminal-cancel-release"
+    },
+    {
+      "method": "terminal.controlLease",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-control-lease",
+      "responseScenario": "response.terminal-control-lease"
+    },
+    {
+      "method": "terminal.create",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-create",
+      "responseScenario": "response.terminal-create"
+    },
+    {
+      "method": "terminal.detachOwner",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-detach-owner",
+      "responseScenario": "response.terminal-detach-owner"
+    },
+    {
+      "method": "terminal.detachRenderer",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-detach-renderer",
+      "responseScenario": "response.terminal-detach-renderer"
+    },
+    {
+      "method": "terminal.diagnostics",
+      "requiredAccess": "observer",
+      "requestScenario": "request.terminal-diagnostics",
+      "responseScenario": "response.terminal-diagnostics"
+    },
+    {
+      "method": "terminal.history",
+      "requiredAccess": "observer",
+      "requestScenario": "request.terminal-history",
+      "responseScenario": "response.terminal-history"
+    },
+    {
+      "method": "terminal.kill",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-kill",
+      "responseScenario": "response.terminal-kill"
+    },
+    {
+      "method": "terminal.list",
+      "requiredAccess": "observer",
+      "requestScenario": "request.terminal-list",
+      "responseScenario": "response.terminal-list"
+    },
+    {
+      "method": "terminal.output",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-output",
+      "responseScenario": "response.terminal-output"
+    },
+    {
+      "method": "terminal.release",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-release",
+      "responseScenario": "response.terminal-release"
+    },
+    {
+      "method": "terminal.resize",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-resize",
+      "responseScenario": "response.terminal-resize"
+    },
+    {
+      "method": "terminal.scheduleRelease",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-schedule-release",
+      "responseScenario": "response.terminal-schedule-release"
+    },
+    {
+      "method": "terminal.setFocused",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-set-focused",
+      "responseScenario": "response.terminal-set-focused"
+    },
+    {
+      "method": "terminal.signal",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-signal",
+      "responseScenario": "response.terminal-signal"
+    },
+    {
+      "method": "terminal.snapshot",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-snapshot",
+      "responseScenario": "response.terminal-snapshot"
+    },
+    {
+      "method": "terminal.subscribe",
+      "requiredAccess": "observer",
+      "requestScenario": "request.terminal-subscribe",
+      "responseScenario": "response.terminal-subscribe"
+    },
+    {
+      "method": "terminal.unsubscribe",
+      "requiredAccess": "observer",
+      "requestScenario": "request.terminal-unsubscribe",
+      "responseScenario": "response.terminal-unsubscribe"
+    },
+    {
+      "method": "terminal.waitForExit",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-wait-for-exit",
+      "responseScenario": "response.terminal-wait-for-exit"
+    },
+    {
+      "method": "terminal.write",
+      "requiredAccess": "controller",
+      "requestScenario": "request.terminal-write",
+      "responseScenario": "response.terminal-write"
+    }
+  ],
+  "semanticScenarios": [
+    {
+      "id": "exit.legacy",
+      "kind": "exit-payload",
+      "negotiatedFeatures": [],
+      "input": {
+        "exitCode": 0,
+        "signal": 15
+      },
+      "expected": {
+        "exitCode": 0
+      }
+    },
+    {
+      "id": "exit.structured",
+      "kind": "exit-payload",
+      "negotiatedFeatures": [
+        "terminal-exit-status-v1"
+      ],
+      "input": {
+        "exitCode": 0,
+        "signal": 15
+      },
+      "expected": {
+        "exitCode": 0,
+        "signal": 15
+      }
+    },
+    {
+      "id": "observer.snapshot-before-live",
+      "kind": "observer-ordering",
+      "input": {
+        "snapshotEndOffset": 4,
+        "liveStartOffset": 4
+      },
+      "expected": {
+        "order": [
+          "snapshot",
+          "live"
+        ],
+        "duplicateBytes": 0
+      }
+    },
+    {
+      "id": "terminal-signal.etx",
+      "kind": "terminal-signal-write",
+      "input": {
+        "method": "terminal.signal"
+      },
+      "expected": {
+        "writeHex": "03"
+      }
+    },
+    {
+      "id": "utf8.invalid-sequence",
+      "kind": "utf8-stream-normalization",
+      "input": {
+        "chunksHex": [
+          "f0288c28"
+        ]
+      },
+      "expected": {
+        "text": "�(�(",
+        "replacementCount": 2
+      }
+    },
+    {
+      "id": "utf8.split-scalar",
+      "kind": "utf8-stream-normalization",
+      "input": {
+        "chunksHex": [
+          "f09f",
+          "9982"
+        ]
+      },
+      "expected": {
+        "text": "🙂",
+        "replacementCount": 0
+      }
+    }
+  ],
+  "frameCases": [
+    {
+      "id": "frame.event-observer-output.exact",
+      "purpose": {
+        "type": "event",
+        "channel": "terminal:observer-output"
+      },
+      "encodedBytes": 524288,
+      "expected": "accept"
+    },
+    {
+      "id": "frame.event-observer-output.over",
+      "purpose": {
+        "type": "event",
+        "channel": "terminal:observer-output"
+      },
+      "encodedBytes": 524289,
+      "expected": "reject"
+    },
+    {
+      "id": "frame.request-terminal-write.exact",
+      "purpose": {
+        "type": "request",
+        "method": "terminal.write"
+      },
+      "encodedBytes": 1048576,
+      "expected": "accept"
+    },
+    {
+      "id": "frame.request-terminal-write.over",
+      "purpose": {
+        "type": "request",
+        "method": "terminal.write"
+      },
+      "encodedBytes": 1048577,
+      "expected": "reject"
+    },
+    {
+      "id": "frame.response-terminal-attach.exact",
+      "purpose": {
+        "type": "response",
+        "method": "terminal.attach"
+      },
+      "encodedBytes": 52428800,
+      "expected": "accept"
+    },
+    {
+      "id": "frame.response-terminal-attach.over",
+      "purpose": {
+        "type": "response",
+        "method": "terminal.attach"
+      },
+      "encodedBytes": 52428801,
+      "expected": "reject"
+    },
+    {
+      "id": "frame.transport.exact",
+      "purpose": {
+        "type": "transport"
+      },
+      "encodedBytes": 58720256,
+      "expected": "accept"
+    },
+    {
+      "id": "frame.transport.over",
+      "purpose": {
+        "type": "transport"
+      },
+      "encodedBytes": 58720257,
+      "expected": "reject"
+    }
+  ]
+}

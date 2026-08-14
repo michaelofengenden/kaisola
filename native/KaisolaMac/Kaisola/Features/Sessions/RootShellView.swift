@@ -3415,6 +3415,17 @@ enum InitialSidebarWidth {
     static let systemDefault: CGFloat = 195
     static let tolerance: CGFloat = 10
 
+    /// Resting widths this feature itself asked for in earlier releases.
+    ///
+    /// A window the v1.1.8 applier forced to 210 restores at 210 forever: the
+    /// persisted flag says the work is done and 210 sits outside the system
+    /// default's band, so the 2026-08-14 widening could never reach the very
+    /// windows the request was about. Widths the *app* placed are the app's to
+    /// move again — matched exactly (±2 for the restoration round-trip), so a
+    /// width the user dragged anywhere else stays exactly as found.
+    static let previouslyForcedIdeals: [CGFloat] = [210]
+    static let previouslyForcedTolerance: CGFloat = 2
+
     /// True only for a column still sitting at AppKit's untouched default.
     ///
     /// This is the guard that makes the override safe: a restored width the
@@ -3424,19 +3435,26 @@ enum InitialSidebarWidth {
         abs(width - systemDefault) <= tolerance
     }
 
+    static func isPreviouslyForcedIdeal(_ width: CGFloat) -> Bool {
+        previouslyForcedIdeals.contains { abs(width - $0) <= previouslyForcedTolerance }
+    }
+
     /// - Parameters:
     ///   - currentWidth: the sidebar column's width right now.
     ///   - didForce: whether this window's restoration id has already been
-    ///     widened once. Persisted, so a user who drags the rail narrower and
-    ///     relaunches keeps their width even though it may land back inside the
-    ///     default's tolerance.
+    ///     widened once *under the current key generation*. Persisted, so a
+    ///     user who drags the rail narrower and relaunches keeps their width
+    ///     even though it may land back inside the default's tolerance.
     static func shouldForceInitialWidth(currentWidth: CGFloat, didForce: Bool) -> Bool {
         guard !didForce else { return false }
-        return isSystemDefault(currentWidth)
+        return isSystemDefault(currentWidth) || isPreviouslyForcedIdeal(currentWidth)
     }
 
+    /// The `.v2` generation exists because the flag's meaning changed with the
+    /// 248 widening: v1 recorded "this window was widened to 210", and windows
+    /// carrying it must be revisited exactly once to move to 248.
     static func defaultsKey(restorationID: String) -> String {
-        "kaisola.sidebar.openedAtIdealWidth.\(restorationID)"
+        "kaisola.sidebar.openedAtIdealWidth.v2.\(restorationID)"
     }
 
     static func hasApplied(restorationID: String, defaults: UserDefaults) -> Bool {

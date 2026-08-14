@@ -1134,20 +1134,35 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(light[0].opacity, LightTintedGradient.coolCoverage, accuracy: 0.0001)
         XCTAssertEqual(light[2].opacity, LightTintedGradient.pearlCoverage, accuracy: 0.0001)
 
-        let dark = TintFlowComposition.dark(
-            tint: DesktopTintComponents(red: 0.2, green: 0.4, blue: 0.8),
-            coverageScale: 1
-        )
-        XCTAssertEqual(dark.count, 3)
-        XCTAssertEqual(dark[0].location, 0)
-        XCTAssertEqual(dark[2].location, 1)
+        let sampled = DesktopTintComponents(red: 0.2, green: 0.4, blue: 0.8)
+        let dark = TintFlowComposition.dark(tint: sampled, coverageScale: 1)
+        // Two stops, sampled anchor to rotated companion: a mid-stop of the
+        // anchor's own colour flattened the crossing into a single-hue wash.
+        XCTAssertEqual(dark.count, 2)
+        XCTAssertEqual(dark.map(\.location), [0, 1])
         let darkCoverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
         XCTAssertEqual(dark[0].opacity, darkCoverage.top, accuracy: 0.0001)
-        XCTAssertEqual(dark[2].opacity, darkCoverage.bottom, accuracy: 0.0001)
-        XCTAssertLessThan(
-            dark[1].opacity,
-            dark[0].opacity,
-            "the companion outweighs the sampled anchor"
+        XCTAssertEqual(dark[1].opacity, darkCoverage.bottom, accuracy: 0.0001)
+        let revalued = DesktopTintSampler.revalued(
+            sampled,
+            peak: DesktopTintSampler.canvasTintPeak(isDark: true)
+        )
+        XCTAssertEqual(dark[0].red, revalued.red, accuracy: 0.0001)
+        XCTAssertEqual(dark[0].green, revalued.green, accuracy: 0.0001)
+        XCTAssertEqual(dark[0].blue, revalued.blue, accuracy: 0.0001)
+        let anchorEnd = TintFlowMotion.companion(
+            red: revalued.red,
+            green: revalued.green,
+            blue: revalued.blue
+        )
+        XCTAssertEqual(dark[1].red, anchorEnd.red, accuracy: 0.0001)
+        XCTAssertEqual(dark[1].green, anchorEnd.green, accuracy: 0.0001)
+        XCTAssertEqual(dark[1].blue, anchorEnd.blue, accuracy: 0.0001)
+        XCTAssertGreaterThan(
+            abs(dark[1].red - dark[0].red) + abs(dark[1].green - dark[0].green)
+                + abs(dark[1].blue - dark[0].blue),
+            0.01,
+            "both ends carry the same colour, so nothing visibly flows"
         )
     }
 
@@ -5208,6 +5223,32 @@ final class NativePreviewSettingsTests: XCTestCase {
             InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 195, didForce: true)
         )
 
+        // A width this feature itself placed in an earlier release (the
+        // v1.1.8 210) is the feature's to move again — once, under the new
+        // key generation — or the widening could never reach the windows the
+        // request was about.
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 210, didForce: false)
+        )
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 211.5, didForce: false)
+        )
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 210, didForce: true)
+        )
+        // The band is exact: a nearby width the user dragged to stays theirs.
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 207, didForce: false)
+        )
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 214, didForce: false)
+        )
+        // The new key generation is what re-arms previously-forced windows;
+        // it must actually be new.
+        XCTAssertTrue(
+            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v2.")
+        )
+
         // Never against a restored or user-chosen width — including the ideal
         // itself, so a second window does not re-run the override.
         for width in [168.0, 240.0, 248.0, 300.0, 340.0] {
@@ -5216,7 +5257,7 @@ final class NativePreviewSettingsTests: XCTestCase {
                     currentWidth: width,
                     didForce: false
                 ),
-                "\(width) is not AppKit's default and must be left alone"
+                "\(width) is neither AppKit's default nor a width this feature placed"
             )
         }
     }

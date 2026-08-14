@@ -605,9 +605,10 @@ enum TintFlowComposition {
         ]
     }
 
-    /// Dark: the sampled desktop hue anchors the sweep and its rotated
-    /// companion closes it, so the flow crosses two colours of one family
-    /// instead of fading a single wash in and out.
+    /// Dark: the sampled desktop hue anchors the lit end and flows *into* its
+    /// rotated companion at the settled end — a genuine A → B crossing, with
+    /// the coverage pair kept monotonic so the sweep still reads as light from
+    /// above rather than as a washed band in the middle.
     static func dark(
         tint: DesktopTintComponents,
         coverageScale: Double
@@ -623,7 +624,6 @@ enum TintFlowComposition {
             green: revalued.green,
             blue: revalued.blue
         )
-        let midpoint = (coverage.top + coverage.bottom) / 2
         return [
             TintFlowStop(
                 red: revalued.red,
@@ -636,13 +636,6 @@ enum TintFlowComposition {
                 red: companion.red,
                 green: companion.green,
                 blue: companion.blue,
-                opacity: midpoint * scale * 0.7,
-                location: 0.55
-            ),
-            TintFlowStop(
-                red: revalued.red,
-                green: revalued.green,
-                blue: revalued.blue,
                 opacity: coverage.bottom * scale,
                 location: 1
             ),
@@ -713,9 +706,26 @@ final class FlowingTintGradientHostView: NSView {
     /// Re-arms the drift when the view lands in a window. An animation added
     /// while the layer was windowless is silently dropped by AppKit, and a
     /// Space switch can strip it the same way; re-applying on attach is what
-    /// keeps a long-lived sidebar flowing after either.
+    /// keeps a long-lived sidebar flowing after either. The same attach point
+    /// follows the window's occlusion, so a fully covered or minimized Tinted
+    /// window spends nothing on its drift. Selector-based observation so the
+    /// registration dies with the view instead of needing a deinit.
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSWindow.didChangeOcclusionStateNotification,
+            object: nil
+        )
+        if let window {
+            windowOcclusionChanged(visible: window.occlusionState.contains(.visible))
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowOcclusionStateDidChange(_:)),
+                name: NSWindow.didChangeOcclusionStateNotification,
+                object: window
+            )
+        }
         guard window != nil, appliedAnimated == true else { return }
         appliedAnimated = nil
         apply(
@@ -750,6 +760,11 @@ final class FlowingTintGradientHostView: NSView {
         gradient.frame = bounds
         CATransaction.commit()
 
+        // A colour-only change (a wallpaper rotation resampling the dark tint)
+        // updates the stops under the transaction above and leaves the drift
+        // alone: removing and re-adding it would snap the endpoints back to
+        // phase zero, visibly, every few minutes on a rotating desktop.
+        guard geometryChanged || motionChanged else { return }
         gradient.removeAnimation(forKey: Self.startAnimationKey)
         gradient.removeAnimation(forKey: Self.endAnimationKey)
         guard animated else { return }
@@ -772,6 +787,24 @@ final class FlowingTintGradientHostView: NSView {
         )
     }
 
+    @objc private func windowOcclusionStateDidChange(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window == self.window else {
+            return
+        }
+        windowOcclusionChanged(visible: window.occlusionState.contains(.visible))
+    }
+
+    /// The drift pauses whenever its window is fully occluded, the way every
+    /// other at-rest motion in the app stops when nothing can see it. Layer
+    /// speed zero freezes the render-server animation in place; restoring
+    /// speed resumes it from the same phase.
+    func windowOcclusionChanged(visible: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        gradient.speed = visible ? 1 : 0
+        CATransaction.commit()
+    }
+
     private static let startAnimationKey = "kaisola.tint-flow.start"
     private static let endAnimationKey = "kaisola.tint-flow.end"
 
@@ -788,6 +821,20 @@ final class FlowingTintGradientHostView: NSView {
         animation.repeatCount = .infinity
         animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
         animation.isRemovedOnCompletion = false
+        // Every surface anchors its phase to the same wall clock, so the
+        // project rail, file rail, and canvas — nearly identical gradients —
+        // drift together instead of showing a slowly walking step at their
+        // seams. The offset wraps at one full autoreverse round trip.
+        animation.timeOffset = CACurrentMediaTime()
+            .truncatingRemainder(dividingBy: TintFlowMotion.period * 2)
+        // Motion this slow needs single-digit frame rates; an uncapped
+        // animation would hold a ProMotion display off its idle refresh for
+        // sub-pixel movement.
+        animation.preferredFrameRateRange = CAFrameRateRange(
+            minimum: 5,
+            maximum: 15,
+            preferred: 10
+        )
         return animation
     }
 }
@@ -869,9 +916,6 @@ struct SidebarBackdropView: View {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @ObservedObject private var settings = NativePreviewSettings.shared
-    /// The glass path reads the desktop through `DesktopGlassLayer`; the tinted
-    /// path samples it directly, so the provider is observed here too.
-    @ObservedObject private var desktop = DesktopBackdropProvider.shared
     let appearance: SidebarAppearance
     let placement: SidebarRailPlacement
 
@@ -933,6 +977,10 @@ struct SidebarBackdropView: View {
         case .solid:
             Color(nsColor: .controlBackgroundColor)
         case .tinted:
+            // Both appearances mirror per placement now. Dark used to hardcode
+            // topLeading → bottomTrailing on every rail; unifying on the
+            // placement points means the trailing file rail sweeps from its own
+            // outside edge inward, the same symmetry light has always had.
             ZStack {
                 Color(nsColor: .controlBackgroundColor)
                 FlowingTintedBackdrop(
@@ -1000,11 +1048,9 @@ struct WorkspaceBackdropView: View {
     }
 
     var body: some View {
+        // The tinted branch's refresh hooks live inside FlowingTintedBackdrop,
+        // which owns the sampled tint in both surfaces.
         backdrop
-            .onAppear { if mode == .tinted { desktop.refresh(isDark: colorScheme == .dark) } }
-            .onChange(of: colorScheme) {
-                if mode == .tinted { desktop.refresh(isDark: colorScheme == .dark) }
-            }
             // While idle glass is showing, `DesktopGlassLayer` — which owns
             // these hooks on the washed branch — is unmounted, so a texture or
             // colour change made from Settings over an empty canvas would
@@ -1084,10 +1130,17 @@ struct WorkspaceBackdropView: View {
         case .tinted:
             // Light flows the stable cool-to-white-to-pearl composition so a
             // blue desktop cannot turn the whole window flat blue; dark flows
-            // the sampled desktop hue into its rotated companion.
+            // the sampled desktop hue into its rotated companion. Increased
+            // Contrast dims the canvas exactly as it dims the rails — without
+            // this the tripled coverage left a white-rail-on-tinted-canvas
+            // split at the seam railTintShare exists to prevent.
             ZStack {
                 Color(nsColor: .windowBackgroundColor)
                 FlowingTintedBackdrop()
+                if accessibilityContrast == .increased {
+                    Color(nsColor: .windowBackgroundColor)
+                        .opacity(GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: colorScheme == .dark))
+                }
             }
         }
     }

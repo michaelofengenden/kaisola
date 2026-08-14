@@ -183,25 +183,6 @@ enum LightTintedGradient {
         Color(red: neutral.red, green: neutral.green, blue: neutral.blue)
     }
 
-    static func gradient(
-        coverageScale: Double = 1,
-        startPoint: UnitPoint = .topLeading,
-        endPoint: UnitPoint = .bottomTrailing
-    ) -> LinearGradient {
-        let scale = min(1, max(0, coverageScale))
-        return LinearGradient(
-            gradient: Gradient(stops: [
-                .init(color: coolColor.opacity(coolCoverage * scale), location: 0),
-                .init(
-                    color: neutralColor.opacity(neutralCoverage * scale),
-                    location: neutralLocation
-                ),
-                .init(color: pearlColor.opacity(pearlCoverage * scale), location: 1),
-            ]),
-            startPoint: startPoint,
-            endPoint: endPoint
-        )
-    }
 }
 
 /// The Tinted surfaces' slow drift — what makes the gradient *flow*.

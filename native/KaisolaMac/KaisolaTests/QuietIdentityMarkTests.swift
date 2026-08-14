@@ -800,10 +800,14 @@ final class QuietIdentityMarkTests: XCTestCase {
     /// drawn verbatim with tail truncation — what the rail did — three distinct
     /// sessions collapse to one string.
     func testRepeatedPrefixTitlesStayApartInTheMeasuredTitleLane() {
+        // The shared lead has to outlast the *current* resting lane for the
+        // collapse to reproduce; the 248pt rail draws more characters than the
+        // 210pt one these titles were sampled at, so the fixture carries the
+        // longer prefix real Codex sessions produce.
         let titles = [
-            "Codex · MATLAB kernel bridge",
-            "Codex · MATLAB plotting spike",
-            "Codex · MATLAB solver notes",
+            "Codex · MATLAB integration kernel bridge",
+            "Codex · MATLAB integration plotting spike",
+            "Codex · MATLAB integration solver notes",
         ]
 
         let before = titles.map { QuietRailLaneFixture.drawn(.verbatim($0), in: QuietRailLaneFixture.restingLane) }
@@ -979,11 +983,12 @@ final class QuietIdentityMarkTests: XCTestCase {
             "the narrower rail handed the title back to the indent"
         )
 
-        // …and the narrowing really is a narrowing: the rail is now under every
-        // resting width it has had since v1.1.5, which is what makes the two
-        // trades this release pays for (the 4pt of indent above, and the
-        // footer's compact first-name label below) real rather than decorative.
-        XCTAssertLessThan(NativeWorkspaceChrome.projectSidebarIdealWidth, 228)
+        // …and the resting width is back at v1.1.6's legible-title 248, by
+        // request (2026-08-14). The density era's "under every width since
+        // v1.1.5" pin is retired with the density default itself; what this
+        // release still owes is that the wide rail stays inside its own bounds
+        // and the title lane it buys is real.
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
     }
 
     // MARK: - Header "+" containment

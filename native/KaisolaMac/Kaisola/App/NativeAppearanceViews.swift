@@ -823,8 +823,8 @@ struct FlowingTintedBackdrop: View {
                     coverageScale: coverageScale
                 )
                 : TintFlowComposition.light(coverageScale: coverageScale),
-            startPoint: CGPoint(x: startPoint.x, y: startPoint.y),
-            endPoint: CGPoint(x: endPoint.x, y: endPoint.y),
+            startPoint: TintFlowMotion.layerPoint(startPoint),
+            endPoint: TintFlowMotion.layerPoint(endPoint),
             animated: !reduceMotion
         )
         .allowsHitTesting(false)

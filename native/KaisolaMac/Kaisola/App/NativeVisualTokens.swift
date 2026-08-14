@@ -223,6 +223,15 @@ enum TintFlowMotion {
     /// sweep stays diagonal throughout; only its anchoring breathes.
     static let drift: Double = 0.18
 
+    /// SwiftUI's `UnitPoint` puts (0,0) at the top-leading corner;
+    /// `CAGradientLayer`'s unit space on an unflipped AppKit host puts (0,0)
+    /// at the bottom-left. One explicit conversion, because the first build
+    /// shipped the sweep upside down — sage measured at the bottom of the
+    /// rail — and a flip is invisible in code review and obvious in a pixel.
+    static func layerPoint(_ unit: UnitPoint) -> CGPoint {
+        CGPoint(x: unit.x, y: 1 - unit.y)
+    }
+
     /// Where the drifting endpoints travel between, for one placement.
     /// Pure, so the geometry is a test rather than a screenshot.
     static func endpoints(

@@ -1092,6 +1092,13 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(TintFlowMotion.drift, 0.05, "the drift is too small to ever notice")
         XCTAssertLessThanOrEqual(TintFlowMotion.drift, 0.25, "the drift swings the whole sweep")
 
+        // SwiftUI's top-leading (0,0) must land at the layer's top — which an
+        // unflipped AppKit host addresses as y = 1. This is the conversion
+        // whose absence rendered the first build's sweep upside down.
+        XCTAssertEqual(TintFlowMotion.layerPoint(.topLeading), CGPoint(x: 0, y: 1))
+        XCTAssertEqual(TintFlowMotion.layerPoint(.bottomTrailing), CGPoint(x: 1, y: 0))
+        XCTAssertEqual(TintFlowMotion.layerPoint(.topTrailing), CGPoint(x: 1, y: 1))
+
         let travel = TintFlowMotion.endpoints(
             start: CGPoint(x: 0, y: 0),
             end: CGPoint(x: 1, y: 1)

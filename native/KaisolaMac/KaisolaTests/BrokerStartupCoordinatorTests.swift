@@ -295,6 +295,149 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
+    /// The same-digest half of the recovery: the registry still names a dead
+    /// prior instance of the packaged digest whose rendezvous now describes
+    /// the relaunch. Drains survive, and — because the current generation id
+    /// does not change — so does an explicit selection pinned to it.
+    func testDeadSameDigestCurrentIsRelaunchedKeepingDrainsAndSelection() async throws {
+        let packagedDigest = String(repeating: "d", count: 64)
+        let drainDigest = String(repeating: "a", count: 64)
+        let fixture = try makeDeadCurrent(
+            digest: packagedDigest,
+            drainDigests: [drainDigest],
+            selectionAppDigest: String(repeating: "b", count: 64)
+        )
+        defer { fixture.drains.forEach { Darwin.close($0.descriptor) } }
+
+        let launcher = FakeBrokerHelperLauncher()
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [fixture.profile]),
+            launcher: launcher,
+            homeDirectory: fixture.home,
+            appVersion: "native-test"
+        )
+
+        let replacement = try await coordinator.prepare()
+        let registry = try fixture.store.load()
+
+        XCTAssertEqual(replacement.pid, getpid())
+        XCTAssertEqual(replacement.contentDigest, packagedDigest)
+        XCTAssertEqual(registry.revision, 2)
+        XCTAssertEqual(registry.currentGenerationID, packagedDigest)
+        XCTAssertEqual(registry.topology?.draining, fixture.drains.map(\.generation))
+        XCTAssertEqual(
+            registry.selection?.selectingAppContentDigest,
+            String(repeating: "b", count: 64),
+            "a same-digest relaunch must not clear the explicit selection"
+        )
+        await launcher.close()
+    }
+
+    /// A cross-digest replacement retires the selection with the generation it
+    /// named — asserted against a fixture that actually seeds one, so the nil
+    /// is a decision rather than an accident of the fixture.
+    func testCrossDigestRecoveryDropsTheSelectionItsGenerationHeld() async throws {
+        let drainDigest = String(repeating: "a", count: 64)
+        let fixture = try makeDeadCurrentWithDrains(drainDigests: [drainDigest])
+        defer { fixture.drains.forEach { Darwin.close($0.descriptor) } }
+        let seeded = try fixture.store.save(
+            currentGenerationID: fixture.dead.id,
+            generations: [fixture.dead] + fixture.drains.map(\.generation),
+            expectedRevision: 1,
+            selection: BrokerGenerationSelection(
+                generationID: fixture.dead.id,
+                selectingAppContentDigest: String(repeating: "b", count: 64),
+                selectedAt: 5
+            ),
+            now: 5
+        )
+        XCTAssertNotNil(seeded.selection)
+        try FileManager.default.removeItem(
+            at: fixture.store.metadataURL(for: fixture.dead)
+        )
+
+        let launcher = FakeBrokerHelperLauncher()
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [fixture.profile]),
+            launcher: launcher,
+            homeDirectory: fixture.home,
+            appVersion: "native-test"
+        )
+
+        _ = try await coordinator.prepare()
+        let registry = try fixture.store.load()
+        XCTAssertEqual(registry.currentGenerationID, String(repeating: "d", count: 64))
+        XCTAssertNil(registry.selection)
+        await launcher.close()
+    }
+
+    /// A draining record whose rendezvous no longer exists must not be copied
+    /// into the recovery revision: a phantom written under a fresh revision
+    /// could never again match discovered topology, wedging every retirement
+    /// sweep behind it.
+    func testRecoveryDropsPhantomDrainsInsteadOfWritingThemForward() async throws {
+        let liveDrain = String(repeating: "a", count: 64)
+        let phantomDrain = String(repeating: "f", count: 64)
+        let fixture = try makeDeadCurrentWithDrains(drainDigests: [liveDrain, phantomDrain])
+        defer { fixture.drains.forEach { Darwin.close($0.descriptor) } }
+        try FileManager.default.removeItem(
+            at: fixture.store.metadataURL(for: fixture.dead)
+        )
+        try FileManager.default.removeItem(at: fixture.drains[1].metadataURL)
+
+        let launcher = FakeBrokerHelperLauncher()
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [fixture.profile]),
+            launcher: launcher,
+            homeDirectory: fixture.home,
+            appVersion: "native-test"
+        )
+
+        _ = try await coordinator.prepare()
+        let registry = try fixture.store.load()
+        XCTAssertEqual(
+            registry.topology?.draining.map(\.id),
+            [liveDrain],
+            "the announced drain survives; the phantom must not be reminted"
+        )
+        await launcher.close()
+    }
+
+    /// A recorded current whose process still answers is refused even with its
+    /// rendezvous missing: unreachable, but evicting it would orphan whatever
+    /// terminals it owns with no record they existed.
+    func testAliveUnpublishedCurrentIsStillRefusedReplacement() async throws {
+        let drainDigest = String(repeating: "a", count: 64)
+        let fixture = try makeDeadCurrent(
+            digest: String(repeating: "e", count: 64),
+            drainDigests: [drainDigest],
+            currentPID: getpid()
+        )
+        defer { fixture.drains.forEach { Darwin.close($0.descriptor) } }
+        try FileManager.default.removeItem(
+            at: fixture.store.metadataURL(for: fixture.dead)
+        )
+
+        let launcher = FakeBrokerHelperLauncher()
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [fixture.profile]),
+            launcher: launcher,
+            homeDirectory: fixture.home,
+            appVersion: "native-test"
+        )
+
+        do {
+            _ = try await coordinator.prepare()
+            XCTFail("a live recorded current must never be evicted by a fresh launch")
+        } catch {
+            XCTAssertEqual(error as? BrokerStartupError, .rendezvousChanged)
+        }
+        let registry = try fixture.store.load()
+        XCTAssertEqual(registry.currentGenerationID, fixture.dead.id)
+        XCTAssertEqual(registry.revision, 1)
+        await launcher.close()
+    }
+
     func testTwoCoordinatorsTargetingSamePackageSerializeThroughPublication() async throws {
         let home = try privateTemporaryDirectory()
         let oldDigest = String(repeating: "e", count: 64)
@@ -1885,6 +2028,26 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         drains: [(generation: BrokerGenerationRecord, descriptor: Int32, metadataURL: URL)],
         store: BrokerGenerationRegistryStore
     ) {
+        try makeDeadCurrent(
+            digest: String(repeating: "e", count: 64),
+            drainDigests: drainDigests,
+            implementationVersion: implementationVersion
+        )
+    }
+
+    private func makeDeadCurrent(
+        digest: String,
+        drainDigests: [String],
+        implementationVersion: Int = 1,
+        selectionAppDigest: String? = nil,
+        currentPID: Int32 = Int32.max
+    ) throws -> (
+        home: URL,
+        profile: URL,
+        dead: BrokerGenerationRecord,
+        drains: [(generation: BrokerGenerationRecord, descriptor: Int32, metadataURL: URL)],
+        store: BrokerGenerationRegistryStore
+    ) {
         let home = try privateTemporaryDirectory()
         let profile = home.appendingPathComponent("Kaisola", isDirectory: true)
         let broker = profile.appendingPathComponent("session-broker", isDirectory: true)
@@ -1900,7 +2063,6 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             )
             _ = chmod(directory.path, 0o700)
         }
-        let digest = String(repeating: "e", count: 64)
         let socket = broker.appendingPathComponent(
             BrokerLaunchConfiguration.generationSocketLeaf(
                 userData: profile,
@@ -1916,7 +2078,7 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             packageSchema: 1,
             packageVersion: "old-package",
             contentDigest: digest,
-            pid: Int32.max,
+            pid: currentPID,
             socketPath: socket.path,
             token: String(repeating: "c", count: 64),
             startedAt: 1,
@@ -1978,6 +2140,13 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             currentGenerationID: dead.id,
             generations: [dead] + drains.map(\.generation),
             expectedRevision: nil,
+            selection: selectionAppDigest.map {
+                BrokerGenerationSelection(
+                    generationID: dead.id,
+                    selectingAppContentDigest: $0,
+                    selectedAt: 1
+                )
+            },
             now: 1
         )
         return (home, profile, dead, drains, store)

@@ -323,17 +323,60 @@ struct NewSessionChooserView: View {
     }
 }
 
-private struct NewSessionChoiceButtonStyle: ButtonStyle {
+struct NewSessionChoiceButtonStyle: ButtonStyle {
+    /// Fill/stroke coverage per interaction state. Named so the ladder is
+    /// checkable at a glance: rest < hover < press, and a disabled card
+    /// declines the hover lift entirely rather than dimming it.
+    static let restFill = 0.035
+    static let hoverFill = 0.065
+    static let pressFill = 0.09
+    static let restStroke = 0.11
+    static let hoverStroke = 0.18
+
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .background {
-                RoundedRectangle(cornerRadius: KaisolaVisualSystem.insetRadius, style: .continuous)
-                    .fill(Color.primary.opacity(configuration.isPressed ? 0.075 : 0.035))
+        StyledCard(configuration: configuration)
+    }
+
+    private struct StyledCard: View {
+        let configuration: Configuration
+        @Environment(\.isEnabled) private var isEnabled
+        @State private var hovered = false
+
+        var body: some View {
+            let hovering = hovered && isEnabled
+            let fill = configuration.isPressed
+                ? NewSessionChoiceButtonStyle.pressFill
+                : (hovering
+                    ? NewSessionChoiceButtonStyle.hoverFill
+                    : NewSessionChoiceButtonStyle.restFill)
+            configuration.label
+                .background {
+                    RoundedRectangle(
+                        cornerRadius: KaisolaVisualSystem.insetRadius,
+                        style: .continuous
+                    )
+                    .fill(Color.primary.opacity(fill))
                     .overlay {
-                        RoundedRectangle(cornerRadius: KaisolaVisualSystem.insetRadius, style: .continuous)
-                            .stroke(Color.primary.opacity(0.11), lineWidth: KaisolaVisualSystem.hairline)
+                        RoundedRectangle(
+                            cornerRadius: KaisolaVisualSystem.insetRadius,
+                            style: .continuous
+                        )
+                        .stroke(
+                            Color.primary.opacity(
+                                hovering
+                                    ? NewSessionChoiceButtonStyle.hoverStroke
+                                    : NewSessionChoiceButtonStyle.restStroke
+                            ),
+                            lineWidth: KaisolaVisualSystem.hairline
+                        )
                     }
-            }
-            .opacity(configuration.isPressed ? 0.88 : 1)
+                }
+                .opacity(configuration.isPressed ? 0.88 : (isEnabled ? 1 : 0.55))
+                .animation(
+                    .easeOut(duration: KaisolaVisualSystem.hoverDuration),
+                    value: hovering
+                )
+                .onHover { hovered = $0 }
+        }
     }
 }

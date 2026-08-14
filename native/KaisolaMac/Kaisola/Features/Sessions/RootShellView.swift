@@ -3415,6 +3415,17 @@ enum InitialSidebarWidth {
     static let systemDefault: CGFloat = 195
     static let tolerance: CGFloat = 10
 
+    /// Resting widths this feature itself asked for in earlier releases.
+    ///
+    /// A window the v1.1.8 applier forced to 210 restores at 210 forever: the
+    /// persisted flag says the work is done and 210 sits outside the system
+    /// default's band, so the 2026-08-14 widening could never reach the very
+    /// windows the request was about. Widths the *app* placed are the app's to
+    /// move again — matched exactly (±2 for the restoration round-trip), so a
+    /// width the user dragged anywhere else stays exactly as found.
+    static let previouslyForcedIdeals: [CGFloat] = [210]
+    static let previouslyForcedTolerance: CGFloat = 2
+
     /// True only for a column still sitting at AppKit's untouched default.
     ///
     /// This is the guard that makes the override safe: a restored width the
@@ -3424,19 +3435,26 @@ enum InitialSidebarWidth {
         abs(width - systemDefault) <= tolerance
     }
 
+    static func isPreviouslyForcedIdeal(_ width: CGFloat) -> Bool {
+        previouslyForcedIdeals.contains { abs(width - $0) <= previouslyForcedTolerance }
+    }
+
     /// - Parameters:
     ///   - currentWidth: the sidebar column's width right now.
     ///   - didForce: whether this window's restoration id has already been
-    ///     widened once. Persisted, so a user who drags the rail narrower and
-    ///     relaunches keeps their width even though it may land back inside the
-    ///     default's tolerance.
+    ///     widened once *under the current key generation*. Persisted, so a
+    ///     user who drags the rail narrower and relaunches keeps their width
+    ///     even though it may land back inside the default's tolerance.
     static func shouldForceInitialWidth(currentWidth: CGFloat, didForce: Bool) -> Bool {
         guard !didForce else { return false }
-        return isSystemDefault(currentWidth)
+        return isSystemDefault(currentWidth) || isPreviouslyForcedIdeal(currentWidth)
     }
 
+    /// The `.v2` generation exists because the flag's meaning changed with the
+    /// 248 widening: v1 recorded "this window was widened to 210", and windows
+    /// carrying it must be revisited exactly once to move to 248.
     static func defaultsKey(restorationID: String) -> String {
-        "kaisola.sidebar.openedAtIdealWidth.\(restorationID)"
+        "kaisola.sidebar.openedAtIdealWidth.v2.\(restorationID)"
     }
 
     static func hasApplied(restorationID: String, defaults: UserDefaults) -> Bool {
@@ -4555,14 +4573,12 @@ enum NativeWorkspaceChrome {
     static let projectSidebarMinimumWidth: CGFloat = 168
     /// The rail's resting width. 200 → 248 in v1.1.6 to buy a legible title and
     /// a visible hierarchy step; 248 → 228 in v1.1.7 once the rail stopped
-    /// spending width on chrome; 228 → 210 in v1.1.8.
-    ///
-    /// This step is the first one the row grammar actually pays for. The session
-    /// indent gives back 4pt (40 → 36) so a title still renders 15 characters —
-    /// see `QuietRailMetrics.sessionIndent`. The footer deliberately shows only
-    /// the account's first name at every width; the whole name stays in its help
-    /// text and at the top of the account menu.
-    static let projectSidebarIdealWidth: CGFloat = 210
+    /// spending width on chrome; 228 → 210 in v1.1.8; 210 → 248 in v0.1.124 by
+    /// request — long project and session titles were the point of the wide
+    /// rail, and the density passes had walked the default back below legible.
+    /// Users who dragged their rail keep their width; only fresh windows open
+    /// at the wider resting point.
+    static let projectSidebarIdealWidth: CGFloat = 248
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
     static let projectSidebarMaximumWidth: CGFloat = 340

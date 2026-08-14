@@ -885,9 +885,12 @@ final class NativePreviewSettingsTests: XCTestCase {
     }
 
     /// Light Glass deliberately separates the center from the rails: the
-    /// workspace is an exact white working plane, while navigation remains a
-    /// view onto the desktop.
-    func testLightGlassCanvasIsExactlyWhite() {
+    /// workspace stays the brightest, white-led surface, but the desktop must
+    /// arrive there too. The opaque carrier era (carrier 1.0, canvas modeled
+    /// at exactly 1) made Glass indistinguishable from the white Solid across
+    /// the whole center of the window — "make sure they're actually
+    /// translucent" (2026-08-14) is the contract now.
+    func testLightGlassCanvasIsBrightButTranslucent() {
         let canvas = GlassBackdropWash.workspace(isDark: false)
         let canvasLuminance = LightGlassFrost.modeledBackdropLuminance(canvas)
 
@@ -896,12 +899,25 @@ final class NativePreviewSettingsTests: XCTestCase {
             LightGlassFrost.backdropLuminance,
             accuracy: 0.0001
         )
-        XCTAssertEqual(canvasLuminance, 1, accuracy: 0.0001, "the workspace canvas is not exact white")
-        XCTAssertEqual(
+        XCTAssertGreaterThanOrEqual(
+            canvasLuminance,
+            0.93,
+            "the canvas stopped white-leading the window"
+        )
+        XCTAssertLessThan(
+            canvasLuminance,
+            0.99,
+            "the workspace canvas collapsed back into exact white"
+        )
+        XCTAssertLessThanOrEqual(
             LightGlassFrost.carrierWhiteCoverage,
-            1,
-            accuracy: 0.0001,
-            "a translucent carrier lets the desktop tint the white canvas"
+            0.60,
+            "an opaque carrier shuts the desktop out of the canvas entirely"
+        )
+        XCTAssertGreaterThanOrEqual(
+            (1 - LightGlassFrost.carrierWhiteCoverage) * canvas.desktopTransmission,
+            0.25,
+            "less than a quarter of the normalized desktop reaches the canvas"
         )
 
         // The detail panel is the last layer over the canvas. Its white frost
@@ -957,11 +973,15 @@ final class NativePreviewSettingsTests: XCTestCase {
             0.86,
             "Glass still paints over most of the wallpaper"
         )
-        XCTAssertEqual(
+        XCTAssertGreaterThanOrEqual(
             LightGlassFrost.modeledBackdropLuminance(canvas),
-            1,
-            accuracy: 0.0001,
-            "the separate workspace canvas must remain exact white"
+            0.93,
+            "the separate workspace canvas must stay the brighter surface"
+        )
+        XCTAssertLessThan(
+            LightGlassFrost.modeledBackdropLuminance(canvas),
+            0.99,
+            "the workspace canvas collapsed back into exact white"
         )
     }
 
@@ -983,18 +1003,22 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertGreaterThan(LightTintedGradient.neutral.red, LightTintedGradient.neutral.green)
         XCTAssertGreaterThan(LightTintedGradient.neutral.green, LightTintedGradient.neutral.blue)
 
+        // Eleven-percent stops quantized to within a few counts of white and
+        // Tinted rendered pixel-identical to Glass. "A flowing gradient tint"
+        // (2026-08-14) needs stops one can actually see; the ceiling keeps the
+        // sources pastel rather than letting the sweep become a poster.
         let maximumCoverage = max(
             LightTintedGradient.coolCoverage,
             max(LightTintedGradient.neutralCoverage, LightTintedGradient.pearlCoverage)
         )
-        XCTAssertGreaterThanOrEqual(maximumCoverage, 0.08, "the light tint disappeared")
-        XCTAssertLessThanOrEqual(maximumCoverage, 0.12, "the light tint is no longer gentle")
+        XCTAssertGreaterThanOrEqual(maximumCoverage, 0.22, "the light tint disappeared")
+        XCTAssertLessThanOrEqual(maximumCoverage, 0.34, "the light tint is no longer pastel")
         XCTAssertGreaterThanOrEqual(
             LightTintedGradient.neutralCoverage,
-            0.08,
+            0.18,
             "the midpoint falls back to an exact-white band"
         )
-        XCTAssertLessThanOrEqual(LightTintedGradient.neutralCoverage, 0.12)
+        XCTAssertLessThanOrEqual(LightTintedGradient.neutralCoverage, 0.26)
         XCTAssertGreaterThan(LightTintedGradient.neutralLocation, 0.35)
         XCTAssertLessThan(LightTintedGradient.neutralLocation, 0.70)
     }
@@ -1022,16 +1046,16 @@ final class NativePreviewSettingsTests: XCTestCase {
             let canvas = metrics(composite(stop.colour, coverage: stop.coverage))
             XCTAssertGreaterThanOrEqual(
                 canvas.departure,
-                7,
+                18,
                 "\(stop.name) composites to near-white and disappears on the canvas"
             )
-            XCTAssertLessThanOrEqual(canvas.departure, 12, "\(stop.name) is no longer gentle")
+            XCTAssertLessThanOrEqual(canvas.departure, 34, "\(stop.name) is no longer pastel")
             XCTAssertGreaterThanOrEqual(
                 canvas.spread,
-                4,
+                8,
                 "\(stop.name) has too little channel separation to read as a tint"
             )
-            XCTAssertLessThanOrEqual(canvas.spread, 6, "\(stop.name) is too saturated")
+            XCTAssertLessThanOrEqual(canvas.spread, 16, "\(stop.name) is too saturated")
 
             let rail = metrics(composite(
                 stop.colour,
@@ -1039,12 +1063,12 @@ final class NativePreviewSettingsTests: XCTestCase {
             ))
             XCTAssertGreaterThanOrEqual(
                 rail.departure,
-                6,
+                16,
                 "\(stop.name) disappears after the rail's coverage scaling"
             )
-            XCTAssertLessThanOrEqual(rail.departure, 11, "\(stop.name) is too heavy on the rail")
-            XCTAssertGreaterThanOrEqual(rail.spread, 3, "\(stop.name) rail is effectively neutral")
-            XCTAssertLessThanOrEqual(rail.spread, 6, "\(stop.name) rail is too saturated")
+            XCTAssertLessThanOrEqual(rail.departure, 31, "\(stop.name) is too heavy on the rail")
+            XCTAssertGreaterThanOrEqual(rail.spread, 7, "\(stop.name) rail is effectively neutral")
+            XCTAssertLessThanOrEqual(rail.spread, 15, "\(stop.name) rail is too saturated")
         }
 
         let neutral = metrics(composite(
@@ -1053,12 +1077,93 @@ final class NativePreviewSettingsTests: XCTestCase {
         ))
         XCTAssertGreaterThanOrEqual(
             neutral.departure,
-            4,
+            8,
             "the warm midpoint still disappears into the white canvas"
         )
-        XCTAssertLessThanOrEqual(neutral.departure, 6, "the warm midpoint is too heavy")
-        XCTAssertGreaterThanOrEqual(neutral.spread, 2, "the midpoint is effectively neutral")
-        XCTAssertLessThanOrEqual(neutral.spread, 4, "the midpoint is too saturated")
+        XCTAssertLessThanOrEqual(neutral.departure, 16, "the warm midpoint is too heavy")
+        XCTAssertGreaterThanOrEqual(neutral.spread, 4, "the midpoint is effectively neutral")
+        XCTAssertLessThanOrEqual(neutral.spread, 9, "the midpoint is too saturated")
+    }
+
+    /// The Tinted drift is glacial, bounded, and purely geometric — and the
+    /// dark companion is the sampled hue rotated, never a second accent.
+    func testTintFlowMotionIsGlacialAndItsCompanionKeepsTheSampledFamily() {
+        XCTAssertGreaterThanOrEqual(TintFlowMotion.period, 20, "the flow became watchable motion")
+        XCTAssertGreaterThan(TintFlowMotion.drift, 0.05, "the drift is too small to ever notice")
+        XCTAssertLessThanOrEqual(TintFlowMotion.drift, 0.25, "the drift swings the whole sweep")
+
+        // SwiftUI's top-leading (0,0) must land at the layer's top — which an
+        // unflipped AppKit host addresses as y = 1. This is the conversion
+        // whose absence rendered the first build's sweep upside down.
+        XCTAssertEqual(TintFlowMotion.layerPoint(.topLeading), CGPoint(x: 0, y: 1))
+        XCTAssertEqual(TintFlowMotion.layerPoint(.bottomTrailing), CGPoint(x: 1, y: 0))
+        XCTAssertEqual(TintFlowMotion.layerPoint(.topTrailing), CGPoint(x: 1, y: 1))
+
+        let travel = TintFlowMotion.endpoints(
+            start: CGPoint(x: 0, y: 0),
+            end: CGPoint(x: 1, y: 1)
+        )
+        XCTAssertEqual(travel.startFrom, CGPoint(x: 0, y: 0))
+        XCTAssertEqual(travel.startTo.x, TintFlowMotion.drift, accuracy: 0.0001)
+        XCTAssertEqual(travel.endTo, CGPoint(x: 1, y: 1))
+        XCTAssertEqual(travel.endFrom.x, 1 - TintFlowMotion.drift, accuracy: 0.0001)
+
+        // A saturated blue rotates toward violet: hue moves, peak brightness
+        // stays, so the companion is exactly as quiet as its source.
+        let companion = TintFlowMotion.companion(red: 0.10, green: 0.35, blue: 0.60)
+        XCTAssertEqual(
+            max(companion.red, max(companion.green, companion.blue)),
+            0.60,
+            accuracy: 0.0001,
+            "rotation changed the companion's brightness"
+        )
+        XCTAssertGreaterThan(
+            abs(companion.green - 0.35) + abs(companion.red - 0.10),
+            0.02,
+            "the companion did not actually rotate away from the sampled hue"
+        )
+        // A grey sample has no hue to rotate and must come back unchanged.
+        let grey = TintFlowMotion.companion(red: 0.5, green: 0.5, blue: 0.5)
+        XCTAssertEqual(grey.red, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(grey.green, 0.5, accuracy: 0.0001)
+        XCTAssertEqual(grey.blue, 0.5, accuracy: 0.0001)
+
+        // The composed stop lists stay ordered and inside declared coverage.
+        let light = TintFlowComposition.light(coverageScale: 1)
+        XCTAssertEqual(light.map(\.location), [0, LightTintedGradient.neutralLocation, 1])
+        XCTAssertEqual(light[0].opacity, LightTintedGradient.coolCoverage, accuracy: 0.0001)
+        XCTAssertEqual(light[2].opacity, LightTintedGradient.pearlCoverage, accuracy: 0.0001)
+
+        let sampled = DesktopTintComponents(red: 0.2, green: 0.4, blue: 0.8)
+        let dark = TintFlowComposition.dark(tint: sampled, coverageScale: 1)
+        // Two stops, sampled anchor to rotated companion: a mid-stop of the
+        // anchor's own colour flattened the crossing into a single-hue wash.
+        XCTAssertEqual(dark.count, 2)
+        XCTAssertEqual(dark.map(\.location), [0, 1])
+        let darkCoverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
+        XCTAssertEqual(dark[0].opacity, darkCoverage.top, accuracy: 0.0001)
+        XCTAssertEqual(dark[1].opacity, darkCoverage.bottom, accuracy: 0.0001)
+        let revalued = DesktopTintSampler.revalued(
+            sampled,
+            peak: DesktopTintSampler.canvasTintPeak(isDark: true)
+        )
+        XCTAssertEqual(dark[0].red, revalued.red, accuracy: 0.0001)
+        XCTAssertEqual(dark[0].green, revalued.green, accuracy: 0.0001)
+        XCTAssertEqual(dark[0].blue, revalued.blue, accuracy: 0.0001)
+        let anchorEnd = TintFlowMotion.companion(
+            red: revalued.red,
+            green: revalued.green,
+            blue: revalued.blue
+        )
+        XCTAssertEqual(dark[1].red, anchorEnd.red, accuracy: 0.0001)
+        XCTAssertEqual(dark[1].green, anchorEnd.green, accuracy: 0.0001)
+        XCTAssertEqual(dark[1].blue, anchorEnd.blue, accuracy: 0.0001)
+        XCTAssertGreaterThan(
+            abs(dark[1].red - dark[0].red) + abs(dark[1].green - dark[0].green)
+                + abs(dark[1].blue - dark[0].blue),
+            0.01,
+            "both ends carry the same colour, so nothing visibly flows"
+        )
     }
 
     func testSurfaceTabOutlinesAreVisibleButRemainHairlines() {
@@ -1153,7 +1258,9 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(lightSidebar.topOpacity, 0.14, accuracy: 0.0001)
         XCTAssertEqual(lightSidebar.baseOpacity, 0.12, accuracy: 0.0001)
         XCTAssertEqual(lightSidebar.bottomOpacity, 0.10, accuracy: 0.0001)
-        XCTAssertEqual(GlassBackdropWash.workspace(isDark: false).baseOpacity, 0.40, accuracy: 0.0001)
+        // 0.40 → 0.38 with the 2026-08-14 carrier drop, so the canvas stays
+        // white-led while a third of the normalized desktop reaches it.
+        XCTAssertEqual(GlassBackdropWash.workspace(isDark: false).baseOpacity, 0.38, accuracy: 0.0001)
         // Dark remains at its previously verified values. Light now passes
         // more of the desktop through the rails while the light workspace
         // stays unchanged.
@@ -4449,8 +4556,9 @@ final class NativePreviewSettingsTests: XCTestCase {
 
     // MARK: - The three workspace canvases
 
-    /// Light Tinted is intentionally a whisper over white; Dark Tinted keeps
-    /// the stronger sampled-desktop treatment that already works there.
+    /// Light Tinted is a visible pastel flow over white — the whisper era
+    /// rendered pixel-identical to Glass — while Dark Tinted keeps the
+    /// stronger sampled-desktop treatment that already works there.
     func testSolidAndTintedCanvasesStayDistinctWithoutAHeavyLightWash() {
         func offNeutral(_ channels: [Double]) -> Double {
             let mean = channels.reduce(0, +) / Double(channels.count)
@@ -4472,16 +4580,16 @@ final class NativePreviewSettingsTests: XCTestCase {
             let tinted = [colour.red, colour.green, colour.blue].map {
                 1 * (1 - coverage) + $0 * coverage
             }
-            // Coarse luminance/chroma guard. The precise visible-but-gentle
+            // Coarse luminance/chroma guard. The precise visible-but-pastel
             // bounds live in `testLightTintedStopsRemainVisibleAfterCompositingOverWhite`.
             XCTAssertGreaterThan(
                 luminance(tinted),
-                0.97,
+                0.90,
                 "light Tinted is no longer a white-led pastel surface"
             )
             XCTAssertLessThan(
                 offNeutral(tinted),
-                0.01,
+                0.05,
                 "a light Tinted stop is a colour field instead of a gentle wash"
             )
         }
@@ -5115,6 +5223,32 @@ final class NativePreviewSettingsTests: XCTestCase {
             InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 195, didForce: true)
         )
 
+        // A width this feature itself placed in an earlier release (the
+        // v1.1.8 210) is the feature's to move again — once, under the new
+        // key generation — or the widening could never reach the windows the
+        // request was about.
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 210, didForce: false)
+        )
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 211.5, didForce: false)
+        )
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 210, didForce: true)
+        )
+        // The band is exact: a nearby width the user dragged to stays theirs.
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 207, didForce: false)
+        )
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 214, didForce: false)
+        )
+        // The new key generation is what re-arms previously-forced windows;
+        // it must actually be new.
+        XCTAssertTrue(
+            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v2.")
+        )
+
         // Never against a restored or user-chosen width — including the ideal
         // itself, so a second window does not re-run the override.
         for width in [168.0, 240.0, 248.0, 300.0, 340.0] {
@@ -5123,7 +5257,7 @@ final class NativePreviewSettingsTests: XCTestCase {
                     currentWidth: width,
                     didForce: false
                 ),
-                "\(width) is not AppKit's default and must be left alone"
+                "\(width) is neither AppKit's default nor a width this feature placed"
             )
         }
     }
@@ -5175,7 +5309,7 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The width the override applies is the one the rest of the chrome is
     /// designed around, not a second literal that can drift away from it.
     func testSidebarOverrideTargetsTheIdealWidthTheChromeIsSizedFor() {
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 210)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
         XCTAssertGreaterThan(
             NativeWorkspaceChrome.projectSidebarIdealWidth,
             InitialSidebarWidth.systemDefault + InitialSidebarWidth.tolerance,
@@ -5568,7 +5702,9 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// `QuietIdentityMarkTests` rather than left as comments here.
     func testProjectSidebarHasComfortableResizableWidth() {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168)
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 210)
+        // 210 → 248 in v0.1.124: the rail returns to the width v1.1.6 chose
+        // for legible titles, by request.
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 340)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
         // Still comfortably inside its own bounds after two narrowings.

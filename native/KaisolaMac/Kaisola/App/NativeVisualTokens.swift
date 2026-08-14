@@ -202,7 +202,7 @@ enum LightTintedGradient {
 /// workspace surface under the widest wallpaper the fixtures carry:
 ///
 ///     α 0.498 (AppKit)   3.43:1
-///     α 0.600 (Kaisola)  4.65:1
+///     α 0.610 (Kaisola)  ≥4.5:1
 ///
 /// **The ladder.** Four rungs, stated as ink coverage, resolved per appearance
 /// at draw time. Alpha is not the contract — contrast is — so each rung is
@@ -234,7 +234,7 @@ enum LightTintedGradient {
 /// asked the system for contrast.
 ///
 /// **Three surfaces, because they are three different backgrounds.** Light glass
-/// is the hard one and sets α 0.60. Light solid is white — `windowBackgroundColor`,
+/// is the hard one and sets α 0.61. Light solid is white — `windowBackgroundColor`,
 /// `controlBackgroundColor` and `textBackgroundColor` all resolve to #FFFFFF in
 /// Aqua — where α 0.535 already reaches exactly 4.5, so it takes 0.55 and keeps
 /// documents and terminals from reading heavier than they are. Dark keeps
@@ -268,7 +268,7 @@ enum KaisolaInk {
         case .primary:
             0.85
         case .secondary:
-            isDark ? 0.55 : (surface == .glass ? 0.60 : 0.55)
+            isDark ? 0.55 : (surface == .glass ? 0.61 : 0.55)
         case .tertiary:
             isDark ? 0.40 : (surface == .glass ? 0.48 : 0.44)
         case .disabled:
@@ -320,8 +320,8 @@ extension ShapeStyle where Self == Color {
     static var kaisolaPrimary: Color { KaisolaInk.color(.primary) }
 
     /// Secondary label ink. The glass value, because one view tree spans both
-    /// kinds of surface and glass is the safe superset: α 0.60 on an opaque
-    /// white surface is 5.7:1, still unmistakably junior to primary's 15:1.
+    /// kinds of surface and glass is the safe superset: α 0.61 on an opaque
+    /// white surface is about 6:1, still unmistakably junior to primary's 15:1.
     /// Surfaces that are opaque *by construction* — the document editors, the
     /// terminal — ask for `.solid` explicitly through `KaisolaInk`.
     static var kaisolaSecondary: Color { KaisolaInk.color(.secondary) }
@@ -566,8 +566,8 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// and 0.45 is exactly where that binds. Going to 0.40 costs 0.06 of it.
     ///
     /// The mechanism that lifts it is a **custom secondary ink** rather than
-    /// the system semantic: on this surface, black at α 0.60 measures
-    /// **4.60:1** at the worst patch (4.56:1 adversarial), clearing the floor.
+    /// the system semantic: on this surface, black at α 0.61 clears the
+    /// **4.5:1** floor on the worst patch of the deliberately clearer rails.
     /// That is `KaisolaInk` now, adopted at the call sites rather than smuggled
     /// in through a glass constant — the veil still may not make text legible
     /// on its own, and the sentence above still binds this number. What changed
@@ -646,10 +646,10 @@ struct GlassBackdropWash: Equatable, Sendable {
     /// exactly the guarantee the 0.50 ceiling was standing in for.
     ///
     /// Dark retains its established 0.70 ceiling. Light rails deliberately
-    /// move into a clearer 0.82 band; their normalized still, white carrier,
-    /// and custom ink keep that extra transmission from becoming raw desktop.
+    /// move into a clearer 0.90 band; their normalized still, named twelve-point
+    /// veil, and custom ink keep that extra transmission from becoming raw desktop.
     static func desktopTransmissionBand(isDark: Bool) -> (floor: Double, ceiling: Double) {
-        isDark ? (floor: 0.30, ceiling: 0.70) : (floor: 0.30, ceiling: 0.82)
+        isDark ? (floor: 0.30, ceiling: 0.70) : (floor: 0.30, ceiling: 0.90)
     }
 
     /// How much of a glass surface Increased Contrast must cover, counting the

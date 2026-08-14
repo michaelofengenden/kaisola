@@ -667,7 +667,7 @@ final class SwiftSessionBrokerFreshWireTests: XCTestCase {
                 params: observerIdentityParams(extra: [
                     "streamEpoch": .string("does-not-exist"),
                     "beforeOffset": .integer(0),
-                    "maxBytes": .integer(4 * 1_024 * 1_024),
+                    "maxBytes": .integer(Int64(4 * 1_024 * 1_024)),
                 ])
             )
         )
@@ -785,7 +785,7 @@ final class SwiftSessionBrokerFreshWireTests: XCTestCase {
             "ownerId": .string(ownerID),
             "projectId": .string(projectID ?? self.projectID),
             "id": .string(id ?? terminalID),
-            "maxQueueBytes": .integer(512 * 1_024),
+            "maxQueueBytes": .integer(Int64(512 * 1_024)),
         ]
         params.merge(extra) { _, replacement in replacement }
         return .object(params)

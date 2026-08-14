@@ -6,6 +6,7 @@ public final class BrokerServer: @unchecked Sendable {
     private let expectedPeerUID: uid_t
     private let expectedSocketOwnerUID: uid_t
     private let service: ShadowBrokerService
+    private let terminalStore: FreshTerminalStore?
     private let log: BrokerLog
     private let beforeStaleSocketRemoval: (@Sendable () -> Void)?
     private let afterSocketBind: (@Sendable () throws -> Void)?
@@ -65,7 +66,20 @@ public final class BrokerServer: @unchecked Sendable {
             startedAt: serviceStartedAt,
             version: serviceVersion
         )
-        service = try ShadowBrokerService(configuration: serviceConfiguration)
+        let terminalStore: FreshTerminalStore?
+        switch configuration.runtimeMode {
+        case .shadow:
+            terminalStore = nil
+        case .freshPTY:
+            terminalStore = FreshTerminalStore(
+                factory: DarwinPTYProcessFactory()
+            )
+        }
+        self.terminalStore = terminalStore
+        service = try ShadowBrokerService(
+            configuration: serviceConfiguration,
+            terminalStore: terminalStore
+        )
     }
 
     /// Runs until `stop()` closes the listener. Blocking socket calls are kept
@@ -99,9 +113,24 @@ public final class BrokerServer: @unchecked Sendable {
             log.record(.serverStopped)
         }
 
+        do {
+            try await serveConnections(on: prepared.descriptor)
+        } catch {
+            let servingError = error
+            do {
+                try await terminalStore?.shutdown()
+            } catch {
+                throw error
+            }
+            throw servingError
+        }
+        try await terminalStore?.shutdown()
+    }
+
+    private func serveConnections(on listener: Int32) async throws {
         while true {
             do {
-                let accepted = try await acceptConnection(on: prepared.descriptor)
+                let accepted = try await acceptConnection(on: listener)
                 if isStopping {
                     Darwin.close(accepted)
                     return

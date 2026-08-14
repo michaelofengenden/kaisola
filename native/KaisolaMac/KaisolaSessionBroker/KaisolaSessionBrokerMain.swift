@@ -6,6 +6,15 @@ import KaisolaSessionBrokerCore
 @main
 enum KaisolaSessionBrokerMain {
     static func main() async {
+        // This is the only accepted PTY-child argv shape. Its launch payload
+        // arrives through inherited private descriptors, so commands,
+        // environment values, and working directories never become broker
+        // process arguments. An ordinary invocation cannot enter this path.
+        if CommandLine.arguments.count == 2,
+           CommandLine.arguments[1] == "--pty-child" {
+            DarwinPTYChild.run()
+        }
+
         // Arm termination before configuration I/O or socket preparation. A
         // signal received in either phase remains buffered until the server
         // exists, at which point the shutdown task stops it normally.

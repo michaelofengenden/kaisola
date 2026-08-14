@@ -1,8 +1,14 @@
 import Darwin
 import Foundation
 
+public enum SwiftBrokerRuntimeMode: String, Equatable, Sendable {
+    case shadow
+    case freshPTY
+}
+
 public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
     private static let environmentMarker = "KAISOLA_SWIFT_BROKER_SHADOW"
+    private static let freshPTYEnvironmentMarker = "KAISOLA_SWIFT_BROKER_FRESH_PTY"
     private static let maximumConfigurationBytes = 16 * 1_024
     private static let exactJSONKeys: Set<String> = [
         "protocol",
@@ -21,6 +27,7 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
     public let contentDigest: String
     public let token: String
     public let socketPath: String
+    public let runtimeMode: SwiftBrokerRuntimeMode
 
     public var socketURL: URL { URL(fileURLWithPath: socketPath) }
     public var privateRootURL: URL { socketURL.deletingLastPathComponent() }
@@ -42,7 +49,8 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
         packageSchema: Int,
         contentDigest: String,
         token: String,
-        socketPath: String
+        socketPath: String,
+        runtimeMode: SwiftBrokerRuntimeMode = .shadow
     ) throws {
         guard protocolVersion == 2,
               securityEpoch == 1,
@@ -63,6 +71,7 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
         self.contentDigest = contentDigest
         self.token = token
         self.socketPath = socketPath
+        self.runtimeMode = runtimeMode
     }
 
     public init(from decoder: Decoder) throws {
@@ -74,7 +83,8 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
             packageSchema: values.decode(Int.self, forKey: .packageSchema),
             contentDigest: values.decode(String.self, forKey: .contentDigest),
             token: values.decode(String.self, forKey: .token),
-            socketPath: values.decode(String.self, forKey: .socketPath)
+            socketPath: values.decode(String.self, forKey: .socketPath),
+            runtimeMode: .shadow
         )
     }
 
@@ -101,13 +111,27 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
         environment: [String: String],
         currentUserID: uid_t
     ) throws -> Self {
-        guard environment[environmentMarker] == "1" else {
-            throw ShadowBrokerConfigurationError.shadowModeDisabled
+        let shadowEnabled = environment[environmentMarker] == "1"
+        let freshPTYEnabled = environment[freshPTYEnvironmentMarker] == "1"
+        guard !(shadowEnabled && freshPTYEnabled) else {
+            throw ShadowBrokerConfigurationError.ambiguousRuntimeMode
         }
-        guard !arguments.contains("--launch"),
-              !arguments.contains("--pty-child"),
-              arguments.count == 3,
-              arguments[1] == "--shadow-config" else {
+
+        let runtimeMode: SwiftBrokerRuntimeMode
+        if arguments.count == 3, arguments[1] == "--shadow-config" {
+            guard shadowEnabled else {
+                throw ShadowBrokerConfigurationError.shadowModeDisabled
+            }
+            runtimeMode = .shadow
+        } else if arguments.count == 3, arguments[1] == "--fresh-pty-config" {
+            guard freshPTYEnabled else {
+                throw ShadowBrokerConfigurationError.freshPTYModeDisabled
+            }
+            runtimeMode = .freshPTY
+        } else {
+            guard shadowEnabled || freshPTYEnabled else {
+                throw ShadowBrokerConfigurationError.shadowModeDisabled
+            }
             throw ShadowBrokerConfigurationError.invalidArguments
         }
 
@@ -128,7 +152,17 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
                   Set(object.keys) == exactJSONKeys else {
                 throw ShadowBrokerConfigurationError.invalidConfiguration
             }
-            let configuration = try JSONDecoder().decode(Self.self, from: data)
+            let decoded = try JSONDecoder().decode(Self.self, from: data)
+            let configuration = try Self(
+                protocolVersion: decoded.protocolVersion,
+                securityEpoch: decoded.securityEpoch,
+                implementationVersion: decoded.implementationVersion,
+                packageSchema: decoded.packageSchema,
+                contentDigest: decoded.contentDigest,
+                token: decoded.token,
+                socketPath: decoded.socketPath,
+                runtimeMode: runtimeMode
+            )
             guard configuration.privateRootURL == privateRoot else {
                 throw ShadowBrokerConfigurationError.unsafePath
             }
@@ -234,6 +268,8 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
 
 public enum ShadowBrokerConfigurationError: Error, Equatable, LocalizedError {
     case shadowModeDisabled
+    case freshPTYModeDisabled
+    case ambiguousRuntimeMode
     case invalidArguments
     case unsafePath
     case unsafePermissions
@@ -243,6 +279,10 @@ public enum ShadowBrokerConfigurationError: Error, Equatable, LocalizedError {
         switch self {
         case .shadowModeDisabled:
             "The Swift broker is available only in explicit shadow mode."
+        case .freshPTYModeDisabled:
+            "The Swift PTY broker is available only in explicit fresh-session development mode."
+        case .ambiguousRuntimeMode:
+            "The Swift broker accepts exactly one explicit runtime mode."
         case .invalidArguments:
             "The Swift broker accepts only a private shadow configuration."
         case .unsafePath:

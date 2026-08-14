@@ -57,6 +57,38 @@ final class SwiftSessionBrokerConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.token, String(repeating: "A", count: 64))
         XCTAssertEqual(configuration.socketPath, fixture.socketURL.path)
         XCTAssertEqual(configuration.privateRootURL, fixture.rootURL)
+        XCTAssertEqual(configuration.runtimeMode, .shadow)
+    }
+
+    func testFreshPTYModeRequiresItsOwnExactMarkerAndArgument() throws {
+        let fixture = try makeFixture()
+        defer { fixture.cleanup() }
+
+        XCTAssertThrowsError(try ShadowBrokerConfiguration.load(
+            arguments: ["KaisolaSessionBroker", "--fresh-pty-config", fixture.configurationURL.path],
+            environment: shadowEnvironment
+        )) { error in
+            XCTAssertEqual(error as? ShadowBrokerConfigurationError, .freshPTYModeDisabled)
+        }
+        XCTAssertThrowsError(try ShadowBrokerConfiguration.load(
+            arguments: ["KaisolaSessionBroker", "--shadow-config", fixture.configurationURL.path],
+            environment: freshPTYEnvironment
+        )) { error in
+            XCTAssertEqual(error as? ShadowBrokerConfigurationError, .shadowModeDisabled)
+        }
+        XCTAssertThrowsError(try ShadowBrokerConfiguration.load(
+            arguments: ["KaisolaSessionBroker", "--fresh-pty-config", fixture.configurationURL.path],
+            environment: shadowEnvironment.merging(freshPTYEnvironment) { _, fresh in fresh }
+        )) { error in
+            XCTAssertEqual(error as? ShadowBrokerConfigurationError, .ambiguousRuntimeMode)
+        }
+
+        let configuration = try ShadowBrokerConfiguration.load(
+            arguments: ["KaisolaSessionBroker", "--fresh-pty-config", fixture.configurationURL.path],
+            environment: freshPTYEnvironment
+        )
+        XCTAssertEqual(configuration.runtimeMode, .freshPTY)
+        XCTAssertEqual(configuration.socketURL, fixture.socketURL)
     }
 
     func testLoadRejectsRelativeSymlinkOrNonPrivateConfigurationFiles() throws {
@@ -381,6 +413,7 @@ final class SwiftSessionBrokerConfigurationTests: XCTestCase {
     }
 
     private let shadowEnvironment = ["KAISOLA_SWIFT_BROKER_SHADOW": "1"]
+    private let freshPTYEnvironment = ["KAISOLA_SWIFT_BROKER_FRESH_PTY": "1"]
 
     private func builtProductsURL() throws -> URL {
         var candidate = Bundle(for: Self.self).bundleURL

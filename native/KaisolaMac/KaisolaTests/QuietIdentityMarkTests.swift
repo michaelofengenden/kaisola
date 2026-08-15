@@ -801,13 +801,13 @@ final class QuietIdentityMarkTests: XCTestCase {
     /// sessions collapse to one string.
     func testRepeatedPrefixTitlesStayApartInTheMeasuredTitleLane() {
         // The shared lead has to outlast the *current* resting lane for the
-        // collapse to reproduce; the 248pt rail draws more characters than the
-        // 210pt one these titles were sampled at, so the fixture carries the
-        // longer prefix real Codex sessions produce.
+        // collapse to reproduce; the 12pt session title draws more characters
+        // into the same lane than the 13pt one these titles were sampled at,
+        // so the fixture carries the longer prefix real Codex sessions produce.
         let titles = [
-            "Codex · MATLAB integration kernel bridge",
-            "Codex · MATLAB integration plotting spike",
-            "Codex · MATLAB integration solver notes",
+            "Codex · MATLAB integration kernel bridge review",
+            "Codex · MATLAB integration kernel bridge plotting",
+            "Codex · MATLAB integration kernel bridge solver",
         ]
 
         let before = titles.map { QuietRailLaneFixture.drawn(.verbatim($0), in: QuietRailLaneFixture.restingLane) }
@@ -876,8 +876,10 @@ final class QuietIdentityMarkTests: XCTestCase {
     /// "Audit K…" — because the row's fixed tokens were charged against it and
     /// its trailing lane could still be compressed below its own first glyph.
     func testSessionTitleGetsMostOfTheRowAtTheDefaultSidebarWidth() {
-        let titleFont = NSFont.systemFont(ofSize: 13)
-        let timeFont = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        // The fixture's fonts read the live metrics; hardcoding 13/10.5 here
+        // was the duplication that let the fonts drift from the assertion.
+        let titleFont = QuietRailLaneFixture.titleFont
+        let timeFont = QuietRailLaneFixture.timeFont
         let timeWidth = ("now" as NSString).size(withAttributes: [.font: timeFont]).width
 
         let available = QuietRowBudget.titleWidth(
@@ -897,7 +899,7 @@ final class QuietIdentityMarkTests: XCTestCase {
         }
         XCTAssertGreaterThanOrEqual(
             visible,
-            15,
+            20,
             "only \(visible) characters survive at "
                 + "\(NativeWorkspaceChrome.projectSidebarIdealWidth)pt"
         )
@@ -951,6 +953,69 @@ final class QuietIdentityMarkTests: XCTestCase {
         )
         XCTAssertEqual(QuietRowBudget.sessionIndent, 36)
         XCTAssertEqual(QuietRowBudget.indentStep, 28)
+        XCTAssertEqual(
+            QuietRowBudget.indentStep,
+            QuietRailMetrics.mark * 2,
+            "the hierarchy step stopped being two mark-widths"
+        )
+    }
+
+    /// The size step that makes session rows read as *contents of* the project
+    /// row above them, encoded from the v0.1.127 request: smaller text and
+    /// symbols in the session lane, project rows untouched.
+    func testSessionRowsSitTighterThanTheProjectRowsTheyHangUnder() {
+        XCTAssertLessThan(
+            QuietRailMetrics.sessionRowHeight,
+            QuietRailMetrics.rowHeight,
+            "a session row is no smaller than the project row above it"
+        )
+        XCTAssertGreaterThanOrEqual(
+            QuietRailMetrics.sessionRowHeight,
+            24,
+            "below 24pt the row stops being a comfortable pointer target"
+        )
+        XCTAssertLessThan(QuietRailMetrics.titleText, 13, "the session title did not shrink")
+        XCTAssertGreaterThanOrEqual(
+            QuietRailMetrics.titleText,
+            11,
+            "session titles must stay at or above the 11pt floor"
+        )
+        XCTAssertLessThan(
+            QuietRailMetrics.mark,
+            QuietIdentityMarkView.slot,
+            "the rail draws marks at its own, smaller slot"
+        )
+        XCTAssertGreaterThan(
+            QuietRailMetrics.mark,
+            QuietRailMetrics.titleText,
+            "a mark smaller than its own title reads as a bullet, not an identity"
+        )
+        // The row still holds its type: 12pt of text needs ~14.3pt of line.
+        XCTAssertGreaterThan(
+            QuietRailMetrics.sessionRowHeight,
+            QuietRailMetrics.titleText * 1.8
+        )
+    }
+
+    /// Guards the one soft spot of the smaller slot: glyphs drawn bare in a
+    /// mark frame must scale with it, and the project glyph may overhang only
+    /// into the mark gap.
+    func testTheRailsGlyphsFitTheSlotTheyAreDrawnIn() {
+        XCTAssertLessThanOrEqual(QuietRailMetrics.markSymbolText, QuietRailMetrics.mark)
+        XCTAssertEqual(
+            Double(QuietRailMetrics.markSymbolText),
+            Double(
+                QuietIdentityMarkView.symbolSize * QuietRailMetrics.mark
+                    / QuietIdentityMarkView.slot
+            ),
+            accuracy: 0.0001,
+            "the rail's bare symbols drifted off the mark view's optical size"
+        )
+        XCTAssertLessThanOrEqual(
+            QuietRailMetrics.projectMarkText,
+            QuietRailMetrics.mark,
+            "the folder glyph now overhangs its slot by more than the mark gap"
+        )
     }
 
     /// Three releases have now narrowed the rail, and each one has to survive
@@ -971,7 +1036,7 @@ final class QuietIdentityMarkTests: XCTestCase {
         )
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168, "the narrow rail must not move")
 
-        let timeFont = NSFont.monospacedDigitSystemFont(ofSize: 10.5, weight: .regular)
+        let timeFont = QuietRailLaneFixture.timeFont
         let timeWidth = ("now" as NSString).size(withAttributes: [.font: timeFont]).width
 
         let now = QuietRowBudget.titleWidth(
@@ -1132,7 +1197,8 @@ final class QuietIdentityMarkTests: XCTestCase {
         XCTAssertEqual(QuietProjectEmphasis.weight(isActive: true), .semibold)
         XCTAssertEqual(QuietProjectEmphasis.weight(isActive: false), .regular)
         // The heading no longer outranks the row it contains, and must not: a
-        // project name is 11pt secondary while a session title is 13pt primary,
+        // project name is 11pt secondary while a session title is 12pt primary
+        // on a visibly shorter row — size, ink, and height carry the step —
         // so the two are separated by size and ink instead of by weight. That is
         // the correction — the folder names used to be the loudest text in a
         // column whose job is to point at what is inside them.
@@ -1369,6 +1435,17 @@ final class QuietIdentityMarkTests: XCTestCase {
         // increasing outward.
         XCTAssertEqual(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.controlRadius)
         XCTAssertLessThan(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.insetRadius)
+        // "A 12pt radius on a 32pt row reads as a lozenge rather than a row"
+        // — that 0.375 ratio is the documented failure, and the session lane
+        // (26pt) is now the tighter of the two rows the pill draws in. Both
+        // halves of the ratio moved independently in v0.1.127 (radius 8 → 9,
+        // session rows 32 → 26), so the bound is held here rather than
+        // re-derived by eye on the next pass.
+        XCTAssertLessThan(
+            QuietSelectionPill.cornerRadius / QuietRailMetrics.sessionRowHeight,
+            0.375,
+            "the selected session's pill turned into a lozenge"
+        )
         XCTAssertGreaterThan(QuietSelectionPill.horizontalInset, 0)
         XCTAssertLessThan(
             QuietSelectionPill.horizontalInset,

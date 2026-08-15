@@ -747,7 +747,7 @@ struct AssistantMarkdownText: View {
                     }
                     .accessibilityLabel("Rendering response")
                 } else {
-                    LazyVStack(alignment: .leading, spacing: 10) {
+                    LazyVStack(alignment: .leading, spacing: AcpTranscriptMetrics.messageBlockSpacing) {
                         ForEach(renderer.blocks) { block in
                             AcpTranscriptBlockView(block: block, workspaceURL: workspaceURL)
                                 .equatable()
@@ -814,8 +814,11 @@ private struct AcpTranscriptBlockView: View, Equatable {
                 if level <= 2 { Divider() }
             }
         case let .paragraph(text, _):
+            // Stated, not inherited: a chat is a reading surface and its
+            // paragraphs are body text whatever the enclosing chrome sets.
             Text(AcpTranscriptInlineRendering.attributed(text, workspaceURL: workspaceURL))
-                .lineSpacing(3)
+                .font(.body)
+                .lineSpacing(4)
                 .frame(maxWidth: .infinity, alignment: .leading)
         case let .image(source, alt, _, _, _):
             Label(alt ?? source, systemImage: "photo")

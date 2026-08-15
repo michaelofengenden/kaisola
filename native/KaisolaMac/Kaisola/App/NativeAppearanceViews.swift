@@ -586,58 +586,76 @@ struct TintFlowStop: Equatable {
 /// — which colours, at what coverage, in what order — is a unit test instead
 /// of a screenshot diff.
 enum TintFlowComposition {
-    /// Light: the declared sage → warm pearl → lilac composition.
-    static func light(coverageScale: Double) -> [TintFlowStop] {
+    /// Light: the selected palette's two coloured ends crossing its quiet
+    /// midpoint. Constant palettes ignore the desktop sample; `.desktop`
+    /// resolves its stops from it, clamped to the pastel box.
+    static func light(
+        palette: TintPalette,
+        desktop: DesktopTintComponents,
+        coverageScale: Double
+    ) -> [TintFlowStop] {
         let scale = min(1, max(0, coverageScale))
+        let stops = palette.light(desktop: desktop)
         return [
             TintFlowStop(
-                red: LightTintedGradient.cool.red,
-                green: LightTintedGradient.cool.green,
-                blue: LightTintedGradient.cool.blue,
-                opacity: LightTintedGradient.coolCoverage * scale,
+                red: stops.cool.red,
+                green: stops.cool.green,
+                blue: stops.cool.blue,
+                opacity: stops.coolCoverage * scale,
                 location: 0
             ),
             TintFlowStop(
-                red: LightTintedGradient.neutral.red,
-                green: LightTintedGradient.neutral.green,
-                blue: LightTintedGradient.neutral.blue,
-                opacity: LightTintedGradient.neutralCoverage * scale,
-                location: LightTintedGradient.neutralLocation
+                red: stops.neutral.red,
+                green: stops.neutral.green,
+                blue: stops.neutral.blue,
+                opacity: stops.neutralCoverage * scale,
+                location: stops.neutralLocation
             ),
             TintFlowStop(
-                red: LightTintedGradient.pearl.red,
-                green: LightTintedGradient.pearl.green,
-                blue: LightTintedGradient.pearl.blue,
-                opacity: LightTintedGradient.pearlCoverage * scale,
+                red: stops.pearl.red,
+                green: stops.pearl.green,
+                blue: stops.pearl.blue,
+                opacity: stops.pearlCoverage * scale,
                 location: 1
             ),
         ]
     }
 
-    /// Dark: the sampled desktop hue anchors the lit end and flows *into* its
-    /// rotated companion at the settled end — a genuine A → B crossing, with
-    /// the coverage pair kept monotonic so the sweep still reads as light from
-    /// above rather than as a washed band in the middle.
+    /// Dark: an anchor at the lit end flowing *into* a companion at the
+    /// settled end — a genuine A → B crossing, with the coverage pair kept
+    /// monotonic so the sweep still reads as light from above rather than as
+    /// a washed band in the middle. `.desktop` keeps the sampled path; every
+    /// named palette carries its own light hues to the dark canvas peak.
     static func dark(
+        palette: TintPalette,
         tint: DesktopTintComponents,
         coverageScale: Double
     ) -> [TintFlowStop] {
         let scale = min(1, max(0, coverageScale))
-        let revalued = DesktopTintSampler.revalued(
-            tint,
-            peak: DesktopTintSampler.canvasTintPeak(isDark: true)
-        )
         let coverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
-        let companion = TintFlowMotion.companion(
-            red: revalued.red,
-            green: revalued.green,
-            blue: revalued.blue
-        )
-        return [
-            TintFlowStop(
+        let anchor: TintRGB
+        let companion: TintRGB
+        if let ends = palette.darkEnds() {
+            anchor = ends.anchor
+            companion = ends.companion
+        } else {
+            let revalued = DesktopTintSampler.revalued(
+                tint,
+                peak: DesktopTintSampler.canvasTintPeak(isDark: true)
+            )
+            anchor = TintRGB(red: revalued.red, green: revalued.green, blue: revalued.blue)
+            let rotated = TintFlowMotion.companion(
                 red: revalued.red,
                 green: revalued.green,
-                blue: revalued.blue,
+                blue: revalued.blue
+            )
+            companion = TintRGB(red: rotated.red, green: rotated.green, blue: rotated.blue)
+        }
+        return [
+            TintFlowStop(
+                red: anchor.red,
+                green: anchor.green,
+                blue: anchor.blue,
                 opacity: coverage.top * scale,
                 location: 0
             ),
@@ -777,8 +795,10 @@ final class FlowingTintGradientHostView: NSView {
         gradient.startPoint = startPoint
         gradient.endPoint = endPoint
         gradient.frame = bounds
-        // Turning the breath off must restore the model value deterministically.
+        // Turning the breath off must restore the model values deterministically
+        // — both the opacity it fades and the transform its swell scales.
         gradient.opacity = 1
+        gradient.transform = CATransform3DIdentity
         CATransaction.commit()
 
         // A colour-only change (a wallpaper rotation resampling the dark tint)
@@ -789,6 +809,7 @@ final class FlowingTintGradientHostView: NSView {
         gradient.removeAnimation(forKey: Self.startAnimationKey)
         gradient.removeAnimation(forKey: Self.endAnimationKey)
         gradient.removeAnimation(forKey: Self.breathAnimationKey)
+        gradient.removeAnimation(forKey: Self.swellAnimationKey)
         guard animated else { return }
         let travel = TintFlowMotion.endpoints(start: startPoint, end: endPoint)
         gradient.add(
@@ -809,6 +830,7 @@ final class FlowingTintGradientHostView: NSView {
         )
         guard breathing else { return }
         gradient.add(Self.breath(), forKey: Self.breathAnimationKey)
+        gradient.add(Self.swell(), forKey: Self.swellAnimationKey)
     }
 
     @objc private func windowOcclusionStateDidChange(_ notification: Notification) {
@@ -832,6 +854,17 @@ final class FlowingTintGradientHostView: NSView {
     private static let startAnimationKey = "kaisola.tint-flow.start"
     private static let endAnimationKey = "kaisola.tint-flow.end"
     private static let breathAnimationKey = "kaisola.tint-flow.breath"
+    private static let swellAnimationKey = "kaisola.tint-flow.swell"
+
+    /// The breath's sharper-than-`easeInEaseOut` S curve: more dwell at the
+    /// extremes, a quicker transit between them, which is what lets a shallow
+    /// change register at all without raising its depth.
+    private static var breathTiming: CAMediaTimingFunction {
+        let points = TintFlowMotion.breathTimingControlPoints
+        return CAMediaTimingFunction(
+            controlPoints: points.0, points.1, points.2, points.3
+        )
+    }
 
     /// The opt-in breath: whole-layer opacity easing between the floor and 1.
     /// Same render-server ownership, frame-rate cap, occlusion freeze
@@ -843,10 +876,34 @@ final class FlowingTintGradientHostView: NSView {
         animation.duration = TintFlowMotion.breathPeriod
         animation.autoreverses = true
         animation.repeatCount = .infinity
-        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        animation.timingFunction = breathTiming
         animation.isRemovedOnCompletion = false
         animation.timeOffset = CACurrentMediaTime()
             .truncatingRemainder(dividingBy: TintFlowMotion.breathPeriod * 2)
+        animation.preferredFrameRateRange = CAFrameRateRange(
+            minimum: 5,
+            maximum: 15,
+            preferred: 10
+        )
+        return animation
+    }
+
+    /// The breath's paired swell: the whole field scaling a few percent about
+    /// its centre on its own, longer period. The scale never goes below 1, so
+    /// the layer only ever over-covers its bounds — clipping crops overflow
+    /// rather than exposing a gap. Same discipline as the breath in every
+    /// other respect.
+    private static func swell() -> CABasicAnimation {
+        let animation = CABasicAnimation(keyPath: "transform.scale")
+        animation.fromValue = 1.0
+        animation.toValue = 1.0 + TintFlowMotion.breathScaleAmplitude
+        animation.duration = TintFlowMotion.breathScalePeriod
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        animation.timingFunction = breathTiming
+        animation.isRemovedOnCompletion = false
+        animation.timeOffset = CACurrentMediaTime()
+            .truncatingRemainder(dividingBy: TintFlowMotion.breathScalePeriod * 2)
         animation.preferredFrameRateRange = CAFrameRateRange(
             minimum: 5,
             maximum: 15,
@@ -886,6 +943,217 @@ final class FlowingTintGradientHostView: NSView {
     }
 }
 
+/// The Core Animation host for the thinking shimmer: a horizontal gradient
+/// swept behind a `CATextLayer` mask, so the status word itself carries the
+/// highlight.
+///
+/// Rejected alternatives, deliberately: `TimelineView(.animation)` wakes
+/// SwiftUI every frame on the main thread, which the painted-still energy
+/// rules forbid; a SwiftUI `.mask`/`.overlay`/`repeatForever` build is
+/// CA-backed but SwiftUI silently drops and restarts the repeat whenever the
+/// view's identity or any observed state changes — and this label sits under
+/// a `contentVersion` churning at streaming rate, so it would stutter on
+/// every token. A `locations` animation owned by the render server survives
+/// both.
+struct ShimmerTextView: NSViewRepresentable {
+    let text: String
+    let font: NSFont
+    let animated: Bool
+
+    func makeNSView(context: Context) -> ShimmerTextHostView {
+        let view = ShimmerTextHostView()
+        view.apply(text: text, font: font, animated: animated)
+        return view
+    }
+
+    func updateNSView(_ view: ShimmerTextHostView, context: Context) {
+        view.apply(text: text, font: font, animated: animated)
+    }
+}
+
+final class ShimmerTextHostView: NSView {
+    private let contentLayer = CAGradientLayer()
+    private let maskLayer = CATextLayer()
+    private var appliedText: String?
+    private var appliedFont: NSFont?
+    private var appliedAnimated: Bool?
+    private var attributed = NSAttributedString()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        contentLayer.type = .axial
+        contentLayer.startPoint = CGPoint(x: 0, y: 0.5)
+        contentLayer.endPoint = CGPoint(x: 1, y: 0.5)
+        maskLayer.truncationMode = .none
+        maskLayer.isWrapped = false
+        contentLayer.mask = maskLayer
+        layer?.addSublayer(contentLayer)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// The label is not a control.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    /// The row lays out from the text alone, so SwiftUI never needs a
+    /// `GeometryReader` around it.
+    override var intrinsicContentSize: NSSize {
+        let size = attributed.size()
+        return NSSize(width: ceil(size.width), height: ceil(size.height))
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentLayer.frame = bounds
+        maskLayer.frame = bounds
+        CATransaction.commit()
+    }
+
+    /// A mask layer defaults to 1x and renders blurry glyphs on Retina; it has
+    /// to follow the window's scale. Same hook as `DesktopWallpaperPatchView`.
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        maskLayer.contentsScale = window?.backingScaleFactor ?? 2
+    }
+
+    /// The resting and highlight inks resolve against the effective
+    /// appearance; without this a theme change keeps the old ink.
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    /// Re-arms the sweep when the view lands in a window: an animation added
+    /// while the layer was windowless is silently dropped by AppKit, and this
+    /// label mounts during a transcript update, which is precisely that
+    /// window. The same attach point follows the window's occlusion, so a
+    /// fully covered window spends nothing on the sweep.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSWindow.didChangeOcclusionStateNotification,
+            object: nil
+        )
+        if let window {
+            maskLayer.contentsScale = window.backingScaleFactor
+            windowOcclusionChanged(visible: window.occlusionState.contains(.visible))
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowOcclusionStateDidChange(_:)),
+                name: NSWindow.didChangeOcclusionStateNotification,
+                object: window
+            )
+        }
+        guard window != nil,
+              appliedAnimated == true,
+              let text = appliedText,
+              let font = appliedFont else { return }
+        appliedAnimated = nil
+        apply(text: text, font: font, animated: true)
+    }
+
+    func apply(text: String, font: NSFont, animated: Bool) {
+        let textChanged = text != appliedText || font != appliedFont
+        let motionChanged = animated != appliedAnimated
+        guard textChanged || motionChanged else { return }
+        appliedText = text
+        appliedFont = font
+        appliedAnimated = animated
+
+        if textChanged {
+            // Opaque white: a mask contributes alpha only, and the visible
+            // ink comes from the gradient it clips.
+            attributed = NSAttributedString(string: text, attributes: [
+                .font: font,
+                .foregroundColor: NSColor.white,
+            ])
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            maskLayer.string = attributed
+            CATransaction.commit()
+            invalidateIntrinsicContentSize()
+        }
+        applyColors()
+
+        guard motionChanged else { return }
+        contentLayer.removeAnimation(forKey: Self.sweepAnimationKey)
+        guard animated else { return }
+        contentLayer.add(Self.sweep(), forKey: Self.sweepAnimationKey)
+    }
+
+    /// Resting ink at both ends, the primary-ink highlight in the middle. The
+    /// model value parks the highlight fully off the leading edge, so a
+    /// non-animated shimmer is pixel-identical to the static secondary label.
+    private func applyColors() {
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let ink: CGFloat = isDark ? 1 : 0
+        let resting = KaisolaInk.alpha(.secondary, isDark: isDark)
+        let highlight = ThinkingShimmerMotion.highlightAlpha(
+            resting: resting,
+            primary: KaisolaInk.alpha(.primary, isDark: isDark)
+        )
+        let restingColor = CGColor(srgbRed: ink, green: ink, blue: ink, alpha: resting)
+        let highlightColor = CGColor(srgbRed: ink, green: ink, blue: ink, alpha: highlight)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentLayer.colors = [
+            restingColor, restingColor, highlightColor, restingColor, restingColor,
+        ]
+        contentLayer.locations = ThinkingShimmerMotion.startLocations
+            .map { NSNumber(value: $0) }
+        CATransaction.commit()
+    }
+
+    @objc private func windowOcclusionStateDidChange(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window == self.window else {
+            return
+        }
+        windowOcclusionChanged(visible: window.occlusionState.contains(.visible))
+    }
+
+    /// Layer speed zero freezes the render-server sweep in place; restoring
+    /// speed resumes it from the same phase.
+    private func windowOcclusionChanged(visible: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentLayer.speed = visible ? 1 : 0
+        CATransaction.commit()
+    }
+
+    private static let sweepAnimationKey = "kaisola.thinking-shimmer.sweep"
+
+    private static func sweep() -> CABasicAnimation {
+        let animation = CABasicAnimation(keyPath: "locations")
+        animation.fromValue = ThinkingShimmerMotion.startLocations
+            .map { NSNumber(value: $0) }
+        animation.toValue = ThinkingShimmerMotion.endLocations
+            .map { NSNumber(value: $0) }
+        animation.duration = ThinkingShimmerMotion.period
+        // A sweep that bounces reads as a scrubbing slider, not as progress.
+        animation.autoreverses = false
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.isRemovedOnCompletion = false
+        // Two chats thinking at once sweep in phase rather than showing a
+        // walking beat between panes.
+        animation.timeOffset = CACurrentMediaTime()
+            .truncatingRemainder(dividingBy: ThinkingShimmerMotion.period)
+        // Watchable motion, unlike the tint drift's 5–15 range: a 1.6s sweep
+        // at 10fps steps visibly.
+        animation.preferredFrameRateRange = CAFrameRateRange(
+            minimum: 24,
+            maximum: 60,
+            preferred: 30
+        )
+        return animation
+    }
+}
+
 /// The shared Tinted backdrop: an opaque base, the flowing gradient, and the
 /// same increased-contrast overlay the other appearances honour.
 struct FlowingTintedBackdrop: View {
@@ -913,24 +1181,40 @@ struct FlowingTintedBackdrop: View {
 
     var body: some View {
         let isDark = colorScheme == .dark
+        let palette = settings.tintPalette
+        // A screenshot must never catch a mid-drift frame: fixture processes
+        // pin the endpoints outright, which parks the layer at its given
+        // start/end deterministically. Reduce Motion pins the same way.
+        let pinned = TintFlowMotion.isPinned()
         FlowingTintGradientView(
             stops: isDark
                 ? TintFlowComposition.dark(
+                    palette: palette,
                     tint: desktop.painting.tint,
                     coverageScale: coverageScale
                 )
-                : TintFlowComposition.light(coverageScale: coverageScale),
+                : TintFlowComposition.light(
+                    palette: palette,
+                    desktop: desktop.painting.tint,
+                    coverageScale: coverageScale
+                ),
             startPoint: TintFlowMotion.layerPoint(startPoint),
             endPoint: TintFlowMotion.layerPoint(endPoint),
-            animated: !reduceMotion,
-            breathing: settings.tintedBreathing && !reduceMotion
+            animated: !reduceMotion && !pinned,
+            breathing: settings.tintedBreathing && !reduceMotion && !pinned
         )
         .allowsHitTesting(false)
-        .onAppear {
-            if isDark { desktop.refresh(isDark: true) }
-        }
-        .onChange(of: colorScheme) {
-            if colorScheme == .dark { desktop.refresh(isDark: true) }
+        .onAppear { refreshIfNeeded() }
+        .onChange(of: colorScheme) { refreshIfNeeded() }
+        .onChange(of: settings.tintPalette) { refreshIfNeeded() }
+    }
+
+    /// Dark always follows the wallpaper; light needs a sample only for the
+    /// Desktop palette. Every other light palette is a constant table and
+    /// spends nothing on the sampler.
+    private func refreshIfNeeded() {
+        if colorScheme == .dark || settings.tintPalette == .desktop {
+            desktop.refresh(isDark: colorScheme == .dark)
         }
     }
 }
@@ -1026,22 +1310,60 @@ struct SidebarBackdropView: View {
                 }
             }
         case .solid:
-            Color(nsColor: .controlBackgroundColor)
+            // The rails are ground, and the ground is material in every theme
+            // now: the same coverage as the Solid canvas, because the rails
+            // and the canvas are one surface in the opaque themes and a
+            // separation step here would draw a seam at the divider. No
+            // `LightRailTint` edge cast — that cast is solved against the
+            // glass rail's composite, and it would give Solid a colour it
+            // never had.
+            if reduceTransparency {
+                Color(nsColor: .controlBackgroundColor)
+            } else {
+                ZStack {
+                    DesktopGlassLayer(
+                        liveMaterial: Self.sharedGlassMaterial,
+                        carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
+                    )
+                    GlassBackdropWash
+                        .opaqueRailGround(appearance: .solid, isDark: colorScheme == .dark)
+                        .veil
+                    if accessibilityContrast == .increased {
+                        Color(nsColor: .controlBackgroundColor)
+                            .opacity(GlassBackdropWash.opaqueGroundIncreasedContrastOverlay(
+                                theme: .system,
+                                isDark: colorScheme == .dark
+                            ))
+                    }
+                }
+            }
         case .tinted:
             // Both appearances mirror per placement now. Dark used to hardcode
             // topLeading → bottomTrailing on every rail; unifying on the
             // placement points means the trailing file rail sweeps from its own
             // outside edge inward, the same symmetry light has always had.
-            ZStack {
+            // The opaque base became the shared material ground with the
+            // Tinted plate over it — tint over material, same as the canvas.
+            if reduceTransparency {
                 Color(nsColor: .controlBackgroundColor)
-                FlowingTintedBackdrop(
-                    coverageScale: Self.railTintShare,
-                    startPoint: placement.tintStartPoint,
-                    endPoint: placement.tintEndPoint
-                )
-                if accessibilityContrast == .increased {
-                    Color(nsColor: .controlBackgroundColor)
-                        .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
+            } else {
+                ZStack {
+                    DesktopGlassLayer(
+                        liveMaterial: Self.sharedGlassMaterial,
+                        carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
+                    )
+                    GlassBackdropWash
+                        .opaqueRailGround(appearance: .tinted, isDark: colorScheme == .dark)
+                        .veil
+                    FlowingTintedBackdrop(
+                        coverageScale: Self.railTintShare,
+                        startPoint: placement.tintStartPoint,
+                        endPoint: placement.tintEndPoint
+                    )
+                    if accessibilityContrast == .increased {
+                        Color(nsColor: .controlBackgroundColor)
+                            .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
+                    }
                 }
             }
         }
@@ -1115,17 +1437,48 @@ struct WorkspaceBackdropView: View {
             }
     }
 
+    /// The one ground every theme now sits on: the same behind-window
+    /// material Glass uses, honouring `glassBackdropSource` and the painted
+    /// fallback through the one existing code path. `carrierWhiteCoverage` is
+    /// zero because the opaque themes' own veil does all the covering, and
+    /// stacking the light-Glass carrier under it would push Solid back to
+    /// fully opaque.
+    private var groundMaterial: some View {
+        DesktopGlassLayer(
+            liveMaterial: .underWindowBackground,
+            carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
+        )
+    }
+
     @ViewBuilder
     private var backdrop: some View {
         switch mode {
         case .system:
-            // The white solid. One flat opaque colour, no sampling, no
-            // gradient: whatever is on the desktop contributes exactly nothing.
-            // `windowBackgroundColor` resolves to #FFFFFF in light and #1E1E1E
-            // in dark, so this already *is* the "white solid" — what it lacked
-            // was a name that said so and a Tinted option distinct enough for
-            // the difference to be visible.
-            Color(nsColor: .windowBackgroundColor)
+            // Solid keeps the colour it always had — `windowBackgroundColor`
+            // resolves to #FFFFFF light / #1E1E1E dark — but a tenth of the
+            // surface now arrives as behind-window material, the way Safari's
+            // window ground is material in every mode. What Solid promises is
+            // about the *content*: the chrome card and pane cards stay fully
+            // opaque, so nothing behind the window ever reaches the surface
+            // work sits on. Reduce Transparency remains the true
+            // zero-sampling path.
+            if reduceTransparency {
+                Color(nsColor: .windowBackgroundColor)
+            } else {
+                ZStack {
+                    groundMaterial
+                    GlassBackdropWash
+                        .opaqueGround(theme: .system, isDark: colorScheme == .dark)
+                        .veil
+                    if accessibilityContrast == .increased {
+                        Color(nsColor: .windowBackgroundColor)
+                            .opacity(GlassBackdropWash.opaqueGroundIncreasedContrastOverlay(
+                                theme: .system,
+                                isDark: colorScheme == .dark
+                            ))
+                    }
+                }
+            }
         case .glass:
             if reduceTransparency {
                 Color(nsColor: .windowBackgroundColor)
@@ -1179,18 +1532,29 @@ struct WorkspaceBackdropView: View {
                 .animation(.easeInOut(duration: 0.35), value: idleActive)
             }
         case .tinted:
-            // Light flows the stable cool-to-white-to-pearl composition so a
-            // blue desktop cannot turn the whole window flat blue; dark flows
-            // the sampled desktop hue into its rotated companion. Increased
-            // Contrast dims the canvas exactly as it dims the rails — without
-            // this the tripled coverage left a white-rail-on-tinted-canvas
-            // split at the seam railTintShare exists to prevent.
-            ZStack {
+            // Tint over material now: the flowing gradient composites onto
+            // the shared material ground instead of onto a flat plate, with a
+            // fifth of the surface arriving as behind-window material.
+            // Increased Contrast dims the canvas exactly as it dims the rails
+            // — without this the tripled coverage left a
+            // white-rail-on-tinted-canvas split at the seam railTintShare
+            // exists to prevent. Reduce Transparency gets the plain plate:
+            // it is a request for no material at all, and the gradient is
+            // not material. (This branch had no guard before the ground
+            // became material; the gap only mattered once it did.)
+            if reduceTransparency {
                 Color(nsColor: .windowBackgroundColor)
-                FlowingTintedBackdrop()
-                if accessibilityContrast == .increased {
-                    Color(nsColor: .windowBackgroundColor)
-                        .opacity(GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: colorScheme == .dark))
+            } else {
+                ZStack {
+                    groundMaterial
+                    GlassBackdropWash
+                        .opaqueGround(theme: .tinted, isDark: colorScheme == .dark)
+                        .veil
+                    FlowingTintedBackdrop()
+                    if accessibilityContrast == .increased {
+                        Color(nsColor: .windowBackgroundColor)
+                            .opacity(GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: colorScheme == .dark))
+                    }
                 }
             }
         }

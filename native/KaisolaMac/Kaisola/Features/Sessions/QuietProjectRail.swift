@@ -307,7 +307,12 @@ enum QuietRailMetrics {
     /// a group heading — Finder and Safari both do it — and it costs nothing,
     /// because which project is active was always carried by weight alone.
     static let headerText: CGFloat = 11
-    static let titleText: CGFloat = 13
+    /// Session titles are the leaves. 13 → 12 keeps them the column's largest
+    /// text — they carry the only real reading — while closing most of the
+    /// gap to the 11pt project heading, so a session sits *under* its project
+    /// instead of shouting over it, and stays a point over the 11pt
+    /// accessibility floor the rail holds itself to.
+    static let titleText: CGFloat = 12
     static let secondaryText: CGFloat = 10.5
     static let chevronText: CGFloat = 9
     static let plusText: CGFloat = 10
@@ -317,9 +322,23 @@ enum QuietRailMetrics {
     static let revealText: CGFloat = 10
     /// Slot the hover-only "open beside" control occupies in the trailing lane.
     static let revealSlot: CGFloat = 16
-    /// Identity slot and the gap between it and the label.
-    static let mark: CGFloat = QuietIdentityMarkView.slot
-    static let markGap: CGFloat = 8
+    /// The rail's identity slot, deliberately decoupled from
+    /// `QuietIdentityMarkView.slot`: the mark view keeps its own 16pt default
+    /// for the surfaces that want it full-size, while the rail draws a shade
+    /// smaller so a session's mark sits under its project's name rather than
+    /// beside it in weight. 14 is exactly half the hierarchy step
+    /// (`QuietRowBudget.indentStep` = 28), so a session's mark still starts
+    /// two full mark-widths in from its project's.
+    static let mark: CGFloat = 14
+    /// Optical size for a *bare symbol* drawn in a rail mark frame. The mark
+    /// view scales its own glyphs by `size / slot`; the rail's two bare-symbol
+    /// sites must do the same or they arrive a size larger than their
+    /// neighbours — the drift `QuietIdentityMarkView.symbolSize` exists to
+    /// prevent.
+    static var markSymbolText: CGFloat {
+        QuietIdentityMarkView.symbolSize * (mark / QuietIdentityMarkView.slot)
+    }
+    static let markGap: CGFloat = 7
     static let dot: CGFloat = 6
     /// A session sits a clear step in from its project row's leading edge.
     ///
@@ -340,9 +359,18 @@ enum QuietRailMetrics {
     /// slots. `QuietRowBudget` holds the arithmetic and a test holds the
     /// character count.
     static let sessionIndent: CGFloat = 36
-    /// One cadence for every row in the rail: sessions, compact projects and
-    /// the active project header all measure 32pt.
+    /// The project lane's cadence: compact projects, the active header, and
+    /// the Add Project footer all measure 32pt.
     static let rowHeight: CGFloat = 32
+    /// Sessions get their own, tighter cadence. One 32pt cadence for every
+    /// row is what made a project and the sessions inside it read as
+    /// siblings: same height, same mark, larger text on the child. A 12pt
+    /// title needs ~14.3pt of line, so 26 still leaves air above and below —
+    /// a comfortable pointer target (macOS source lists sit between 24 and
+    /// 28) — and the height step now carries hierarchy alongside the indent.
+    /// Do not take this under 24: below that the pill stops reading as a row
+    /// and the "open beside" control loses its 16pt slot's breathing room.
+    static let sessionRowHeight: CGFloat = 26
     /// How far a selected session's pill starts ahead of its identity mark.
     ///
     /// The pill used to run the full column, painting tens of points of fill to
@@ -498,9 +526,11 @@ enum QuietRowBudget {
     ///
     /// 12 → 18 with the v0.1.125 rail widening (248 → 290): the resting lane
     /// draws about twice the characters it did, so the old window flagged
-    /// pairs the rail now tells apart at a glance. 18 stays under the
-    /// measured resting draw while clearing its half-lane floor.
-    static let ambiguousTitleCharacters = 18
+    /// pairs the rail now tells apart at a glance. 18 → 20 with the v0.1.127
+    /// session-lane densening (title 13 → 12, mark 16 → 14, gap 8 → 7): the
+    /// smaller font and wider lane draw ~31 characters at rest, and 18 sat
+    /// only three above the half-lane floor.
+    static let ambiguousTitleCharacters = 20
 
     /// - Parameters:
     ///   - sidebarWidth: the navigation column's width. Rows span it entirely;
@@ -1060,7 +1090,7 @@ private struct QuietProjectGroup: View {
             .font(.system(size: QuietRailMetrics.secondaryText))
             .foregroundStyle(.kaisolaTertiary)
             .padding(.leading, QuietRailMetrics.sessionIndent)
-            .frame(height: QuietRailMetrics.rowHeight)
+            .frame(height: QuietRailMetrics.sessionRowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onHover { inside in setHover(inside) }
@@ -1099,7 +1129,7 @@ private struct QuietProjectGroup: View {
             .font(.system(size: QuietRailMetrics.secondaryText, weight: .medium))
             .padding(.leading, QuietRailMetrics.sessionIndent)
             .padding(.trailing, QuietRailMetrics.trailingInset)
-            .frame(height: QuietRailMetrics.rowHeight)
+            .frame(height: QuietRailMetrics.sessionRowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
         }
@@ -1621,7 +1651,11 @@ private struct QuietRowBody: View {
         // charged the title for four gaps, three of which sat inside the
         // trailing lane where they bought nothing.
         HStack(spacing: 0) {
-            QuietIdentityMarkView(identity: identity, tint: isSelected ? QuietSelectionPill.ink : nil)
+            QuietIdentityMarkView(
+                identity: identity,
+                size: QuietRailMetrics.mark,
+                tint: isSelected ? QuietSelectionPill.ink : nil
+            )
                 .padding(.trailing, QuietRailMetrics.markGap)
             Text(label.text)
                 .font(.system(size: QuietRailMetrics.titleText, weight: QuietRowEmphasis.weight(isSelected: isSelected)))
@@ -1641,7 +1675,7 @@ private struct QuietRowBody: View {
         }
         .padding(.leading, QuietRailMetrics.sessionIndent)
         .padding(.trailing, QuietRailMetrics.trailingInset)
-        .frame(height: QuietRailMetrics.rowHeight)
+        .frame(height: QuietRailMetrics.sessionRowHeight)
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentShape(Rectangle())
         // The rail's ONE fill, and only under the row on screen. `.isSelected`
@@ -1793,7 +1827,7 @@ private struct QuietNewSessionRowView: View {
         Button(action: select) {
             HStack(spacing: 0) {
                 Image(systemName: "plus")
-                    .font(.system(size: QuietIdentityMarkView.symbolSize, weight: .regular))
+                    .font(.system(size: QuietRailMetrics.markSymbolText, weight: .regular))
                     .foregroundStyle(
                         presentation.isSelected ? QuietSelectionPill.ink : Color.kaisolaSecondary
                     )
@@ -1828,7 +1862,7 @@ private struct QuietNewSessionRowView: View {
             }
             .padding(.leading, QuietRailMetrics.sessionIndent)
             .padding(.trailing, QuietRailMetrics.trailingInset)
-            .frame(height: QuietRailMetrics.rowHeight)
+            .frame(height: QuietRailMetrics.sessionRowHeight)
             .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .background {

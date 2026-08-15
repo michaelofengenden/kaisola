@@ -533,6 +533,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.filePreviewWidth, NativePreviewSettings.filePreviewWidthDefault)
         XCTAssertEqual(settings.toolCallDensity, .balanced)
         XCTAssertFalse(settings.tintedBreathing)
+        XCTAssertEqual(settings.tintPalette, .meadow)
         XCTAssertEqual(settings.projectRailWidth, NativePreviewSettings.projectRailWidthUnset)
 
         settings.navigationLayout = .topBar
@@ -540,6 +541,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         settings.sidebarAppearance = .solid
         settings.workspaceBackdrop = .tinted
         settings.tintedBreathing = true
+        settings.tintPalette = .harbor
         settings.terminalThemeID = "kaisola"
         settings.restoreCLIDrafts = false
         settings.semanticShellIntegration = true
@@ -564,7 +566,21 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.filePreviewWidth, 640)
         XCTAssertEqual(reloaded.toolCallDensity, .detailed)
         XCTAssertTrue(reloaded.tintedBreathing)
+        XCTAssertEqual(reloaded.tintPalette, .harbor)
         XCTAssertEqual(reloaded.projectRailWidth, 290.5)
+    }
+
+    func testTintPaletteRejectsUnknownPersistedValues() {
+        let defaults = makeDefaults()
+        defaults.set("chartreuse", forKey: "tintPalette")
+
+        XCTAssertEqual(NativePreviewSettings(defaults: defaults).tintPalette, .meadow)
+        XCTAssertEqual(TintPalette.allCases.map(\.title), [
+            "Meadow", "Dusk", "Harbor", "Graphite", "Desktop",
+        ])
+        // Desktop is the only palette whose stops are not constants — it reads
+        // as the escape hatch, so it stays last in the menu.
+        XCTAssertEqual(TintPalette.allCases.last, .desktop)
     }
 
     func testToolCallDensityRejectsUnknownPersistedValues() {
@@ -1015,48 +1031,92 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
-    func testLightTintedSurfaceIsAGentleSageThroughNeutralToLilacPearlGradient() {
-        // The two coloured ends are pale and point in different directions,
-        // so the whole rail cannot collapse into one blue wash.
-        XCTAssertGreaterThan(LightTintedGradient.cool.green, LightTintedGradient.cool.blue)
-        XCTAssertGreaterThan(LightTintedGradient.cool.blue, LightTintedGradient.cool.red)
-        XCTAssertLessThanOrEqual(
-            LightTintedGradient.cool.green - LightTintedGradient.cool.red,
-            0.18
-        )
-        XCTAssertGreaterThan(LightTintedGradient.pearl.blue, LightTintedGradient.pearl.red)
-        XCTAssertGreaterThan(LightTintedGradient.pearl.red, LightTintedGradient.pearl.green)
-        XCTAssertLessThanOrEqual(
-            LightTintedGradient.pearl.blue - LightTintedGradient.pearl.green,
-            0.18
-        )
-        XCTAssertGreaterThan(LightTintedGradient.neutral.red, LightTintedGradient.neutral.green)
-        XCTAssertGreaterThan(LightTintedGradient.neutral.green, LightTintedGradient.neutral.blue)
+    func testEveryTintPaletteIsATwoEndedPastelCrossing() {
+        for palette in TintPalette.allCases {
+            // Constant palettes ignore the sample; `.desktop` resolves
+            // against a saturated blue, its historical failure input.
+            let light = palette.light(
+                desktop: DesktopTintComponents(red: 0.1, green: 0.3, blue: 0.9)
+            )
 
-        // Eleven-percent stops quantized to within a few counts of white and
-        // Tinted rendered pixel-identical to Glass. "A flowing gradient tint"
-        // (2026-08-14) needs stops one can actually see; the ceiling keeps the
-        // sources pastel rather than letting the sweep become a poster.
-        let maximumCoverage = max(
-            LightTintedGradient.coolCoverage,
-            max(LightTintedGradient.neutralCoverage, LightTintedGradient.pearlCoverage)
-        )
-        XCTAssertGreaterThanOrEqual(maximumCoverage, 0.22, "the light tint disappeared")
-        XCTAssertLessThanOrEqual(maximumCoverage, 0.34, "the light tint is no longer pastel")
-        XCTAssertGreaterThanOrEqual(
-            LightTintedGradient.neutralCoverage,
-            0.18,
-            "the midpoint falls back to an exact-white band"
-        )
-        XCTAssertLessThanOrEqual(LightTintedGradient.neutralCoverage, 0.26)
-        XCTAssertGreaterThan(LightTintedGradient.neutralLocation, 0.35)
-        XCTAssertLessThan(LightTintedGradient.neutralLocation, 0.70)
+            // Eleven-percent stops quantized to within a few counts of white
+            // and Tinted rendered pixel-identical to Glass. "A flowing
+            // gradient tint" (2026-08-14) needs stops one can actually see;
+            // the ceiling keeps the sources pastel rather than letting the
+            // sweep become a poster.
+            let maximumCoverage = max(
+                light.coolCoverage,
+                max(light.neutralCoverage, light.pearlCoverage)
+            )
+            XCTAssertGreaterThanOrEqual(
+                maximumCoverage, 0.22,
+                "\(palette.title): the light tint disappeared"
+            )
+            XCTAssertLessThanOrEqual(
+                maximumCoverage, 0.34,
+                "\(palette.title): the light tint is no longer pastel"
+            )
+            XCTAssertGreaterThanOrEqual(
+                light.neutralCoverage, 0.18,
+                "\(palette.title): the midpoint falls back to an exact-white band"
+            )
+            XCTAssertLessThanOrEqual(light.neutralCoverage, 0.26, palette.title)
+            XCTAssertGreaterThan(light.neutralLocation, 0.35, palette.title)
+            XCTAssertLessThan(light.neutralLocation, 0.70, palette.title)
+
+            // The two coloured ends genuinely cross rather than washing the
+            // whole surface in one hue.
+            if palette == .graphite {
+                // Achromatic on purpose: at spread this small a hue distance
+                // means nothing, so the crossing is the reversed channel
+                // ordering — cool is blue-led, pearl is red-led.
+                XCTAssertGreaterThan(light.cool.blue, light.cool.red, palette.title)
+                XCTAssertGreaterThan(light.pearl.red, light.pearl.blue, palette.title)
+            } else {
+                guard
+                    let coolHue = TintFlowMotion.hue(
+                        red: light.cool.red, green: light.cool.green, blue: light.cool.blue
+                    ),
+                    let pearlHue = TintFlowMotion.hue(
+                        red: light.pearl.red, green: light.pearl.green, blue: light.pearl.blue
+                    )
+                else {
+                    XCTFail("\(palette.title): a coloured end has no hue")
+                    continue
+                }
+                let distance = abs(coolHue - pearlHue)
+                XCTAssertGreaterThanOrEqual(
+                    min(distance, 1 - distance), 0.03,
+                    "\(palette.title): the sweep is one hue and reads as a wash"
+                )
+            }
+        }
+
+        // The shipped composition stays pinned exactly: Meadow is a gentle
+        // sage crossing a lilac pearl through a warm midpoint, and the tinted
+        // fixture baseline depends on these numbers byte for byte.
+        guard let meadow = TintPalette.meadow.fixedLight else {
+            return XCTFail("Meadow lost its fixed light table")
+        }
+        XCTAssertGreaterThan(meadow.cool.green, meadow.cool.blue)
+        XCTAssertGreaterThan(meadow.cool.blue, meadow.cool.red)
+        XCTAssertLessThanOrEqual(meadow.cool.green - meadow.cool.red, 0.18)
+        XCTAssertGreaterThan(meadow.pearl.blue, meadow.pearl.red)
+        XCTAssertGreaterThan(meadow.pearl.red, meadow.pearl.green)
+        XCTAssertLessThanOrEqual(meadow.pearl.blue - meadow.pearl.green, 0.18)
+        XCTAssertGreaterThan(meadow.neutral.red, meadow.neutral.green)
+        XCTAssertGreaterThan(meadow.neutral.green, meadow.neutral.blue)
+        XCTAssertEqual(meadow, TintPaletteLight(
+            cool: TintRGB(165, 203, 178),
+            neutral: TintRGB(233, 221, 207),
+            pearl: TintRGB(203, 185, 226),
+            coolCoverage: 0.30, neutralCoverage: 0.22, pearlCoverage: 0.30,
+            neutralLocation: 0.54
+        ))
     }
 
     func testLightTintedStopsRemainVisibleAfterCompositingOverWhite() {
-        typealias RGB = (red: Double, green: Double, blue: Double)
-
-        func composite(_ colour: RGB, coverage: Double) -> [Double] {
+        func composite(_ colour: TintRGB, coverage: Double) -> [Double] {
             [colour.red, colour.green, colour.blue].map {
                 (1 - coverage + $0 * coverage) * 255
             }
@@ -1068,51 +1128,197 @@ final class NativePreviewSettingsTests: XCTestCase {
             return (departure: 255 - minimum, spread: maximum - minimum)
         }
 
-        let colouredStops: [(name: String, colour: RGB, coverage: Double)] = [
-            ("sage", LightTintedGradient.cool, LightTintedGradient.coolCoverage),
-            ("lilac-pearl", LightTintedGradient.pearl, LightTintedGradient.pearlCoverage),
+        // `.desktop` has no fixed stops and must hold the box for any
+        // wallpaper, so it is asserted against a saturated blue and a
+        // saturated red. Its grey fallback resolves to exactly Graphite
+        // (asserted in the clamp test below), whose own row covers that box.
+        let desktopSamples = [
+            DesktopTintComponents(red: 0.05, green: 0.20, blue: 0.95),
+            DesktopTintComponents(red: 0.95, green: 0.10, blue: 0.10),
         ]
-        for stop in colouredStops {
-            let canvas = metrics(composite(stop.colour, coverage: stop.coverage))
-            XCTAssertGreaterThanOrEqual(
-                canvas.departure,
-                18,
-                "\(stop.name) composites to near-white and disappears on the canvas"
-            )
-            XCTAssertLessThanOrEqual(canvas.departure, 34, "\(stop.name) is no longer pastel")
-            XCTAssertGreaterThanOrEqual(
-                canvas.spread,
-                8,
-                "\(stop.name) has too little channel separation to read as a tint"
-            )
-            XCTAssertLessThanOrEqual(canvas.spread, 16, "\(stop.name) is too saturated")
 
-            let rail = metrics(composite(
-                stop.colour,
-                coverage: stop.coverage * SidebarBackdropView.railTintShare
-            ))
-            XCTAssertGreaterThanOrEqual(
-                rail.departure,
-                16,
-                "\(stop.name) disappears after the rail's coverage scaling"
-            )
-            XCTAssertLessThanOrEqual(rail.departure, 31, "\(stop.name) is too heavy on the rail")
-            XCTAssertGreaterThanOrEqual(rail.spread, 7, "\(stop.name) rail is effectively neutral")
-            XCTAssertLessThanOrEqual(rail.spread, 15, "\(stop.name) rail is too saturated")
+        for palette in TintPalette.allCases {
+            // A palette may quiet its spread floor, never abandon it.
+            XCTAssertGreaterThan(palette.minimumCanvasSpread, 0, palette.title)
+
+            let lights: [TintPaletteLight]
+            if let fixed = palette.fixedLight {
+                lights = [fixed]
+            } else {
+                lights = desktopSamples.map { palette.light(desktop: $0) }
+            }
+            for light in lights {
+                let colouredStops: [(name: String, colour: TintRGB, coverage: Double)] = [
+                    ("\(palette.title) cool", light.cool, light.coolCoverage),
+                    ("\(palette.title) pearl", light.pearl, light.pearlCoverage),
+                ]
+                for stop in colouredStops {
+                    let canvas = metrics(composite(stop.colour, coverage: stop.coverage))
+                    XCTAssertGreaterThanOrEqual(
+                        canvas.departure,
+                        18,
+                        "\(stop.name) composites to near-white and disappears on the canvas"
+                    )
+                    XCTAssertLessThanOrEqual(canvas.departure, 34, "\(stop.name) is no longer pastel")
+                    XCTAssertGreaterThanOrEqual(
+                        canvas.spread,
+                        palette.minimumCanvasSpread,
+                        "\(stop.name) has too little channel separation to read as a tint"
+                    )
+                    XCTAssertLessThanOrEqual(canvas.spread, 16, "\(stop.name) is too saturated")
+
+                    let rail = metrics(composite(
+                        stop.colour,
+                        coverage: stop.coverage * SidebarBackdropView.railTintShare
+                    ))
+                    XCTAssertGreaterThanOrEqual(
+                        rail.departure,
+                        16,
+                        "\(stop.name) disappears after the rail's coverage scaling"
+                    )
+                    XCTAssertLessThanOrEqual(rail.departure, 31, "\(stop.name) is too heavy on the rail")
+                    XCTAssertGreaterThanOrEqual(
+                        rail.spread,
+                        palette.minimumCanvasSpread * 0.875,
+                        "\(stop.name) rail is effectively neutral"
+                    )
+                    XCTAssertLessThanOrEqual(rail.spread, 15, "\(stop.name) rail is too saturated")
+                }
+
+                let neutral = metrics(composite(light.neutral, coverage: light.neutralCoverage))
+                XCTAssertGreaterThanOrEqual(
+                    neutral.departure,
+                    8,
+                    "\(palette.title): the midpoint still disappears into the white canvas"
+                )
+                XCTAssertLessThanOrEqual(
+                    neutral.departure, 16,
+                    "\(palette.title): the midpoint is too heavy"
+                )
+                XCTAssertGreaterThanOrEqual(
+                    neutral.spread,
+                    palette.minimumCanvasSpread * 0.5,
+                    "\(palette.title): the midpoint is effectively neutral"
+                )
+                XCTAssertLessThanOrEqual(
+                    neutral.spread, 9,
+                    "\(palette.title): the midpoint is too saturated"
+                )
+            }
+        }
+    }
+
+    func testDesktopPaletteClampsEveryWallpaperHueIntoThePastelBox() {
+        func composite(_ colour: TintRGB, coverage: Double) -> [Double] {
+            [colour.red, colour.green, colour.blue].map {
+                (1 - coverage + $0 * coverage) * 255
+            }
         }
 
-        let neutral = metrics(composite(
-            LightTintedGradient.neutral,
-            coverage: LightTintedGradient.neutralCoverage
-        ))
-        XCTAssertGreaterThanOrEqual(
-            neutral.departure,
-            8,
-            "the warm midpoint still disappears into the white canvas"
+        func metrics(_ channels: [Double]) -> (departure: Double, spread: Double) {
+            let maximum = channels.max() ?? 255
+            let minimum = channels.min() ?? 255
+            return (departure: 255 - minimum, spread: maximum - minimum)
+        }
+
+        // The clamp fixes saturation and brightness and keeps only the hue,
+        // so the box metrics are the same constants for *every* wallpaper —
+        // which is the whole reason light is finally allowed to sample it.
+        for degrees in 0..<360 {
+            let source = TintFlowMotion.rgb(
+                hue: Double(degrees) / 360,
+                saturation: 1,
+                brightness: 1
+            )
+            let light = TintPalette.desktop.light(desktop: DesktopTintComponents(
+                red: source.red, green: source.green, blue: source.blue
+            ))
+            for (colour, coverage) in [
+                (light.cool, light.coolCoverage),
+                (light.pearl, light.pearlCoverage),
+            ] {
+                let canvas = metrics(composite(colour, coverage: coverage))
+                XCTAssertEqual(canvas.departure, 28.8, accuracy: 1.0, "hue \(degrees)°")
+                XCTAssertEqual(canvas.spread, 13.5, accuracy: 1.0, "hue \(degrees)°")
+            }
+            let neutral = metrics(composite(light.neutral, coverage: light.neutralCoverage))
+            XCTAssertEqual(neutral.departure, 10.7, accuracy: 1.0, "hue \(degrees)°")
+            XCTAssertEqual(neutral.spread, 5.0, accuracy: 1.0, "hue \(degrees)°")
+        }
+
+        // A grey wallpaper has no hue to keep: Graphite is what "no hue,
+        // pastel" already means, so the sampler's fallback resolves to it
+        // exactly rather than to a near-white nothing.
+        XCTAssertEqual(
+            TintPalette.desktop.light(desktop: DesktopTintSampler.fallback),
+            TintPalette.graphite.fixedLight
         )
-        XCTAssertLessThanOrEqual(neutral.departure, 16, "the warm midpoint is too heavy")
-        XCTAssertGreaterThanOrEqual(neutral.spread, 4, "the midpoint is effectively neutral")
-        XCTAssertLessThanOrEqual(neutral.spread, 9, "the midpoint is too saturated")
+    }
+
+    func testEveryPaletteHasADarkCounterpartAtTheCanvasPeak() {
+        let peak = DesktopTintSampler.canvasTintPeak(isDark: true)
+        for palette in TintPalette.allCases where palette != .desktop {
+            guard let ends = palette.darkEnds(), let light = palette.fixedLight else {
+                XCTFail("\(palette.title) lost its dark pair")
+                continue
+            }
+            // Both ends sit exactly at the dark canvas peak, so the dark
+            // surface's luminance envelope — and the dark ink ladder measured
+            // against it — does not move with the palette.
+            XCTAssertEqual(ends.anchor.maximumChannel, peak, accuracy: 0.0001, palette.title)
+            XCTAssertEqual(ends.companion.maximumChannel, peak, accuracy: 0.0001, palette.title)
+
+            let separation = abs(ends.anchor.red - ends.companion.red)
+                + abs(ends.anchor.green - ends.companion.green)
+                + abs(ends.anchor.blue - ends.companion.blue)
+            XCTAssertGreaterThanOrEqual(
+                separation, 0.05,
+                "\(palette.title): both dark ends carry the same colour, so nothing visibly flows"
+            )
+
+            // Hue family preserved: the dark anchor leads with the same
+            // channel its light cool does, so a dark Harbor is still Harbor.
+            func dominant(_ colour: TintRGB) -> Int {
+                if colour.red >= colour.green && colour.red >= colour.blue { return 0 }
+                return colour.green >= colour.blue ? 1 : 2
+            }
+            XCTAssertEqual(
+                dominant(ends.anchor),
+                dominant(light.cool),
+                "\(palette.title): dark lost its light hue family"
+            )
+        }
+
+        // `.desktop` alone keeps the sampled dark path; its composition is
+        // pinned in `testTintFlowMotionIsGlacialAndItsCompanionKeepsTheSampledFamily`.
+        XCTAssertNil(TintPalette.desktop.darkEnds())
+    }
+
+    func testCompositionsUseTheSelectedPaletteAndKeepTheirShape() {
+        let desktop = DesktopTintComponents(red: 0.3, green: 0.5, blue: 0.7)
+
+        for palette in TintPalette.allCases {
+            let light = TintFlowComposition.light(
+                palette: palette,
+                desktop: desktop,
+                coverageScale: 0.5
+            )
+            let declared = palette.light(desktop: desktop)
+            XCTAssertEqual(light.map(\.location), [0, declared.neutralLocation, 1], palette.title)
+            XCTAssertEqual(light[0].opacity, declared.coolCoverage * 0.5, accuracy: 0.0001, palette.title)
+            XCTAssertEqual(light[1].opacity, declared.neutralCoverage * 0.5, accuracy: 0.0001, palette.title)
+            XCTAssertEqual(light[2].opacity, declared.pearlCoverage * 0.5, accuracy: 0.0001, palette.title)
+
+            let dark = TintFlowComposition.dark(palette: palette, tint: desktop, coverageScale: 1)
+            XCTAssertEqual(dark.map(\.location), [0, 1], palette.title)
+            let coverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
+            XCTAssertEqual(dark[0].opacity, coverage.top, accuracy: 0.0001, palette.title)
+            XCTAssertEqual(dark[1].opacity, coverage.bottom, accuracy: 0.0001, palette.title)
+        }
+
+        let meadow = TintFlowComposition.light(palette: .meadow, desktop: desktop, coverageScale: 1)
+        let dusk = TintFlowComposition.light(palette: .dusk, desktop: desktop, coverageScale: 1)
+        XCTAssertNotEqual(meadow, dusk, "choosing a palette changed nothing on the surface")
     }
 
     /// The Tinted drift is glacial, bounded, and purely geometric — and the
@@ -1122,24 +1328,64 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// visible pulse.
     func testTintBreathIsSlowShallowAndNotAHarmonicOfTheDrift() {
         XCTAssertGreaterThanOrEqual(TintFlowMotion.breathPeriod, 12)
-        XCTAssertGreaterThan(TintFlowMotion.breathAmplitude, 0.03)
-        XCTAssertLessThanOrEqual(TintFlowMotion.breathAmplitude, 0.14)
+        XCTAssertGreaterThan(
+            TintFlowMotion.breathAmplitude, 0.10,
+            "under a tenth of opacity the breath was never once seen — 0.08 shipped and read as off"
+        )
+        XCTAssertLessThanOrEqual(
+            TintFlowMotion.breathAmplitude, 0.20,
+            "over a fifth the breath is a pulse, not a breath"
+        )
         XCTAssertEqual(
             TintFlowMotion.breathFloorOpacity,
             1 - TintFlowMotion.breathAmplitude,
             accuracy: 0.0001
         )
-        let ratio = TintFlowMotion.period / TintFlowMotion.breathPeriod
-        XCTAssertGreaterThan(
-            abs(ratio - ratio.rounded()), 0.05,
-            "an integer period ratio phase-locks the breath to the drift"
-        )
+
+        // No pair of the three periods — drift, opacity breath, scale swell —
+        // may sit near an integer ratio, or two of them phase-lock into a
+        // visible metronome.
+        let ratios: [(String, Double)] = [
+            ("drift/breath", TintFlowMotion.period / TintFlowMotion.breathPeriod),
+            ("drift/swell", TintFlowMotion.period / TintFlowMotion.breathScalePeriod),
+            ("swell/breath", TintFlowMotion.breathScalePeriod / TintFlowMotion.breathPeriod),
+        ]
+        for (name, ratio) in ratios {
+            XCTAssertGreaterThan(
+                abs(ratio - ratio.rounded()), 0.05,
+                "an integer \(name) period ratio phase-locks into a visible pulse"
+            )
+        }
+
+        // The swell must only ever grow — a scale below 1 would uncover the
+        // layer's own edge — and stays a few percent: enough to read as a
+        // living surface, never as watchable motion.
+        XCTAssertGreaterThan(TintFlowMotion.breathScaleAmplitude, 0.01)
+        XCTAssertLessThanOrEqual(TintFlowMotion.breathScaleAmplitude, 0.035)
+
         // The dimmest breath phase multiplies every stop's coverage; even the
-        // heaviest light stop stays far above the point where Tinted could
-        // quantize back into Glass or Solid.
-        let dimmestHeavyStop = LightTintedGradient.coolCoverage
-            * TintFlowMotion.breathFloorOpacity
-        XCTAssertGreaterThan(dimmestHeavyStop, 0.20)
+        // heaviest stop of every palette stays far above the point where
+        // Tinted could quantize back into Glass or Solid.
+        for palette in TintPalette.allCases {
+            let light = palette.light(desktop: DesktopTintSampler.fallback)
+            let heaviest = max(
+                light.coolCoverage,
+                max(light.neutralCoverage, light.pearlCoverage)
+            )
+            XCTAssertGreaterThan(
+                heaviest * TintFlowMotion.breathFloorOpacity, 0.20, palette.title
+            )
+        }
+
+        // The timing curve is a valid monotone S — both control points inside
+        // the unit square, the second genuinely to the right of the first —
+        // not a linear ramp and not an overshoot.
+        let points = TintFlowMotion.breathTimingControlPoints
+        for x in [points.0, points.1, points.2, points.3] {
+            XCTAssertGreaterThanOrEqual(x, 0)
+            XCTAssertLessThanOrEqual(x, 1)
+        }
+        XCTAssertLessThan(points.0, points.2, "the ease collapsed into a ramp")
     }
 
     func testTintFlowMotionIsGlacialAndItsCompanionKeepsTheSampledFamily() {
@@ -1184,13 +1430,17 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(grey.blue, 0.5, accuracy: 0.0001)
 
         // The composed stop lists stay ordered and inside declared coverage.
-        let light = TintFlowComposition.light(coverageScale: 1)
+        let light = TintFlowComposition.light(
+            palette: .meadow,
+            desktop: DesktopTintSampler.fallback,
+            coverageScale: 1
+        )
         XCTAssertEqual(light.map(\.location), [0, LightTintedGradient.neutralLocation, 1])
         XCTAssertEqual(light[0].opacity, LightTintedGradient.coolCoverage, accuracy: 0.0001)
         XCTAssertEqual(light[2].opacity, LightTintedGradient.pearlCoverage, accuracy: 0.0001)
 
         let sampled = DesktopTintComponents(red: 0.2, green: 0.4, blue: 0.8)
-        let dark = TintFlowComposition.dark(tint: sampled, coverageScale: 1)
+        let dark = TintFlowComposition.dark(palette: .desktop, tint: sampled, coverageScale: 1)
         // Two stops, sampled anchor to rotated companion: a mid-stop of the
         // anchor's own colour flattened the crossing into a single-hue wash.
         XCTAssertEqual(dark.count, 2)
@@ -1218,6 +1468,44 @@ final class NativePreviewSettingsTests: XCTestCase {
                 + abs(dark[1].blue - dark[0].blue),
             0.01,
             "both ends carry the same colour, so nothing visibly flows"
+        )
+    }
+
+    /// The transcript's rhythm pair table: a turn boundary is a larger event
+    /// than the next artifact inside the same reply, and the opening row
+    /// leaves the top edge to the page padding.
+    func testTranscriptRhythmSeparatesTurnsMoreThanArtifacts() {
+        XCTAssertGreaterThan(
+            AcpTranscriptMetrics.turnSpacing,
+            AcpTranscriptMetrics.intraTurnSpacing
+        )
+        XCTAssertEqual(AcpTranscriptMetrics.spacing(before: nil, after: .user), 0)
+        XCTAssertEqual(AcpTranscriptMetrics.spacing(before: nil, after: .assistant), 0)
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .user, after: .assistant),
+            AcpTranscriptMetrics.turnSpacing
+        )
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .assistant, after: .user),
+            AcpTranscriptMetrics.turnSpacing
+        )
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .user, after: .user),
+            AcpTranscriptMetrics.turnSpacing
+        )
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .assistant, after: .assistant),
+            AcpTranscriptMetrics.intraTurnSpacing
+        )
+        // Only the user's own rows sit on the user side of the table.
+        XCTAssertEqual(AcpTranscriptRow.user(id: "1", text: "go", failed: false).rhythmKind, .user)
+        XCTAssertEqual(AcpTranscriptRow.message(id: "1", text: "on it").rhythmKind, .assistant)
+        XCTAssertEqual(AcpTranscriptRow.thought(id: "1", text: "…").rhythmKind, .assistant)
+        XCTAssertEqual(
+            AcpTranscriptRow.tool(AcpToolCall(
+                id: "t", title: "Build", kind: "execute", status: .completed
+            )).rhythmKind,
+            .assistant
         )
     }
 
@@ -1481,6 +1769,16 @@ final class NativePreviewSettingsTests: XCTestCase {
                 ? GlassBackdropWash.sidebar(isDark: isDark)
                 : GlassBackdropWash.workspace(isDark: isDark)
             return ("\(name) wash (isDark: \(isDark))", [wash.red, wash.green, wash.blue])
+        } + [("opaque dark plate", [
+            OpaqueThemeGround.darkPlate.red,
+            OpaqueThemeGround.darkPlate.green,
+            OpaqueThemeGround.darkPlate.blue,
+        ])] + [
+            (WorkspaceBackdropMode.system, false), (.system, true),
+            (.tinted, false), (.tinted, true),
+        ].map { theme, isDark -> (String, [Double]) in
+            let wash = GlassBackdropWash.opaqueGround(theme: theme, isDark: isDark)
+            return ("opaque \(theme.rawValue) ground (isDark: \(isDark))", [wash.red, wash.green, wash.blue])
         }
 
         for (name, channels) in neutrals {
@@ -1555,7 +1853,160 @@ final class NativePreviewSettingsTests: XCTestCase {
                 GlassBackdropWash.increasedContrastCoverage - epsilon,
                 "workspace (\(appearance)) leaves too much wallpaper under Increased Contrast"
             )
+            // The opaque themes' grounds sit at or above the floor on their
+            // own, so their derived overlays clamp to zero — the assertions
+            // exist so a future coverage cut cannot fall below it silently.
+            for theme in [WorkspaceBackdropMode.system, .tinted] {
+                XCTAssertGreaterThanOrEqual(
+                    composite(
+                        base: OpaqueThemeGround.coverage(theme: theme, isDark: isDark),
+                        overlay: GlassBackdropWash.opaqueGroundIncreasedContrastOverlay(
+                            theme: theme,
+                            isDark: isDark
+                        )
+                    ),
+                    GlassBackdropWash.increasedContrastCoverage - epsilon,
+                    "\(theme.rawValue) ground (\(appearance)) leaves too much wallpaper under Increased Contrast"
+                )
+            }
         }
+    }
+
+    /// The window ground is material in every theme, the way Safari's is: no
+    /// theme's ground is fully opaque, and the three stay strictly ordered —
+    /// Glass shows the most desktop, Tinted gives up a fifth, Solid a tenth.
+    func testEveryThemeSitsOnTheSameMaterialGround() {
+        for isDark in [false, true] {
+            let glass = OpaqueThemeGround.coverage(theme: .glass, isDark: isDark)
+            let tinted = OpaqueThemeGround.coverage(theme: .tinted, isDark: isDark)
+            let solid = OpaqueThemeGround.coverage(theme: .system, isDark: isDark)
+            XCTAssertLessThan(glass, tinted, "isDark \(isDark): the themes lost their ordering")
+            XCTAssertLessThan(tinted, solid, "isDark \(isDark): the themes lost their ordering")
+            XCTAssertLessThan(solid, 1.0, "isDark \(isDark): Solid went back to a flat plate")
+        }
+    }
+
+    /// The opaque themes keep the colour they always had — light #FFFFFF,
+    /// dark `windowBackgroundColor`'s #1E1E1E (which `controlBackgroundColor`
+    /// matches in Dark Aqua, so one plate covers rails and canvas). Fails
+    /// loudly if AppKit ever moves the dark value. The dark ground also must
+    /// not pick up `GlassWarmth`'s amber: at a tenth of transmission the
+    /// declared amber contributes under a count of 255.
+    func testTheOpaqueThemesKeepTheColourTheyAlwaysHad() {
+        let lightGround = GlassBackdropWash.opaqueGround(theme: .system, isDark: false)
+        XCTAssertEqual(lightGround.red, 1)
+        XCTAssertEqual(lightGround.green, 1)
+        XCTAssertEqual(lightGround.blue, 1)
+
+        let darkGround = GlassBackdropWash.opaqueGround(theme: .system, isDark: true)
+        XCTAssertEqual(darkGround.red, OpaqueThemeGround.darkPlate.red)
+
+        guard let darkAqua = NSAppearance(named: .darkAqua) else {
+            return XCTFail("no darkAqua appearance to resolve against")
+        }
+        var window: NSColor?
+        var control: NSColor?
+        darkAqua.performAsCurrentDrawingAppearance {
+            window = NSColor.windowBackgroundColor.usingColorSpace(.sRGB)
+            control = NSColor.controlBackgroundColor.usingColorSpace(.sRGB)
+        }
+        // The exact byte is environment-dependent: a windowed session resolves
+        // #1E1E1E while CI's headless resolver hands back #323232 for the same
+        // appearance, so asserting the constant against AppKit byte-for-byte
+        // just measures the test host. What the dark grounds actually depend
+        // on is the *family*: an achromatic near-black in the same band as the
+        // plate, so a mismatched card still reads as one surface a step apart.
+        let plateBand = 0.10...0.22
+        XCTAssertTrue(
+            plateBand.contains(OpaqueThemeGround.darkPlate.red),
+            "the declared plate left the dark window-background family"
+        )
+        for (name, resolved) in [("windowBackgroundColor", window), ("controlBackgroundColor", control)] {
+            guard let resolved else { return XCTFail("\(name) did not resolve to sRGB") }
+            let channels = [resolved.redComponent, resolved.greenComponent, resolved.blueComponent]
+                .map(Double.init)
+            for channel in channels {
+                XCTAssertEqual(
+                    channel,
+                    channels[0],
+                    accuracy: 1.0 / 255,
+                    "\(name) is no longer achromatic in dark"
+                )
+                XCTAssertTrue(
+                    plateBand.contains(channel),
+                    "\(name) moved out of the near-black band the dark grounds are built on"
+                )
+            }
+        }
+
+        let warmthShare = GlassWarmth.opacity(isDark: true)
+            * (1 - OpaqueThemeGround.solidCoverage.dark)
+        XCTAssertLessThan(warmthShare, 1.0 / 255, "the dark Solid ground picked up a visible amber")
+    }
+
+    /// The glass transmission band is the *glass* contract — its floor exists
+    /// so a glass surface never becomes an opaque panel. The opaque themes sit
+    /// below that floor on purpose: a tenth to a fifth of material is a pane
+    /// edge, not a glass surface. This test is here so nobody "fixes" the
+    /// band violation by pushing the opaque grounds into it.
+    func testOpaqueGroundsAreOutsideTheGlassTransmissionBandOnPurpose() {
+        for isDark in [false, true] {
+            let floor = GlassBackdropWash.desktopTransmissionBand(isDark: isDark).floor
+            for theme in [WorkspaceBackdropMode.system, .tinted] {
+                XCTAssertLessThan(
+                    1 - OpaqueThemeGround.coverage(theme: theme, isDark: isDark),
+                    floor,
+                    "\(theme.rawValue) (isDark \(isDark)) drifted into the glass band and stopped being an opaque theme"
+                )
+            }
+        }
+    }
+
+    /// Clarity is a glass knob. Scaling the Solid ground by a clarity's veil
+    /// scale would turn Solid into a fourth theme, so `opaqueGround` takes no
+    /// clarity at all — and this test pins that scaling *would* change the
+    /// wash, so routing clarity through cannot pass unnoticed.
+    func testClarityDoesNotScaleTheOpaqueGrounds() {
+        for isDark in [false, true] {
+            let ground = GlassBackdropWash.opaqueGround(theme: .system, isDark: isDark)
+            for clarity in GlassClarity.allCases where clarity.veilScale != 1 {
+                XCTAssertNotEqual(
+                    ground.scaled(by: clarity.veilScale),
+                    ground,
+                    "the sentinel lost its teeth: scaling no longer changes the wash"
+                )
+            }
+            XCTAssertEqual(GlassBackdropWash.opaqueGround(theme: .system, isDark: isDark), ground)
+        }
+    }
+
+    /// The tinted stops were solved against pure white; the material ground
+    /// under them must stay within a few counts of it, or the palette table
+    /// silently re-solves. Dark is the mirror guard: a dark canvas that glows
+    /// is not a canvas.
+    func testTintedGroundStaysWhiteLedEnoughForItsStops() {
+        XCTAssertGreaterThanOrEqual(
+            OpaqueThemeGround.modeledLuminance(theme: .tinted, isDark: false),
+            0.94,
+            "the light tinted ground darkened past what the stop table was solved against"
+        )
+        XCTAssertLessThanOrEqual(
+            OpaqueThemeGround.modeledLuminance(theme: .tinted, isDark: true),
+            0.16
+        )
+        XCTAssertLessThanOrEqual(
+            OpaqueThemeGround.modeledLuminance(theme: .system, isDark: true),
+            0.16
+        )
+    }
+
+    /// A screenshot must never catch a mid-drift frame: every isolated
+    /// fixture process pins the tint's endpoint drift, structurally rather
+    /// than per surface. Pure, no view.
+    func testFixtureProcessesPinTheTintDrift() {
+        XCTAssertTrue(TintFlowMotion.isPinned(environment: ["KAISOLA_NATIVE_VISUAL_FIXTURE": "1"]))
+        XCTAssertTrue(TintFlowMotion.isPinned(environment: ["KAISOLA_NATIVE_RESOURCE_WORKLOAD": "x"]))
+        XCTAssertFalse(TintFlowMotion.isPinned(environment: [:]))
     }
 
     /// Increased Contrast has to be a *visible* step up from the ordinary veil
@@ -5726,13 +6177,82 @@ final class NativePreviewSettingsTests: XCTestCase {
                 "\(inner.0)Radius must stay tighter than \(outer.0)Radius"
             )
         }
-        XCTAssertEqual(KaisolaVisualSystem.shellRadius, 20)
-        XCTAssertEqual(KaisolaVisualSystem.chromeRadius, 18)
+        XCTAssertEqual(KaisolaVisualSystem.shellRadius, 26)
+        XCTAssertEqual(KaisolaVisualSystem.chromeRadius, 22)
 
         // The rail's active-project capsule uses `insetRadius` inside a 32pt
         // row, so it has to stay under half the row height or the capsule turns
         // into a stadium and stops reading as a rectangle at all.
         XCTAssertLessThan(KaisolaVisualSystem.insetRadius, 16)
+    }
+
+    /// A shadow narrower than the gutter is invisible; wider than about twice
+    /// it smears onto the far rail. The offset stays inside the blur so the
+    /// card floats rather than sliding.
+    func testTheChromeCardShadowStaysInsideItsOwnGutterNeighbourhood() {
+        XCTAssertGreaterThan(
+            ChromeCardElevation.shadowRadius,
+            KaisolaVisualSystem.chromeInset
+        )
+        XCTAssertLessThanOrEqual(
+            ChromeCardElevation.shadowRadius,
+            KaisolaVisualSystem.chromeInset * 2
+        )
+        XCTAssertLessThan(
+            ChromeCardElevation.shadowOffsetY,
+            ChromeCardElevation.shadowRadius
+        )
+    }
+
+    /// `engages` is the card's whole accessibility posture: when it is false
+    /// the card drops its shadow AND swaps the lit gradient edge for the flat
+    /// `separatorColor` border — both `cardShadow` and `panelEdge` branch on
+    /// this one function, so the truth table below governs both.
+    func testAccessibilitySurfacesGetNoCardShadow() {
+        XCTAssertFalse(ChromeCardElevation.engages(reduceTransparency: true, increasedContrast: false))
+        XCTAssertFalse(ChromeCardElevation.engages(reduceTransparency: false, increasedContrast: true))
+        XCTAssertTrue(ChromeCardElevation.engages(reduceTransparency: false, increasedContrast: false))
+    }
+
+    /// Dark already separates the card with its `darkPanelCoverage` luminance
+    /// step, so its containment hairline is zero and its appearance stays
+    /// byte-identical; light is where the closing edge was missing. The dark
+    /// shadow is heavier because a dark ground swallows a light one's opacity.
+    func testDarkAppearanceKeepsItsExistingCardEdge() {
+        XCTAssertEqual(ChromeCardElevation.containmentOpacity(isDark: true), 0)
+        XCTAssertGreaterThan(ChromeCardElevation.containmentOpacity(isDark: false), 0)
+        XCTAssertGreaterThan(
+            ChromeCardElevation.shadowOpacity(isDark: true),
+            ChromeCardElevation.shadowOpacity(isDark: false)
+        )
+    }
+
+    /// The regression the flush-rail change fixed by hand: the two rails are
+    /// the ground and the detail content column is the card, and nothing else
+    /// is either. A source-level count, because nothing structural prevents a
+    /// future pass from quietly re-carding a rail.
+    func testOnlyTheDetailColumnWearsTheChromeCard() throws {
+        let sources = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Kaisola", isDirectory: true)
+        let expectations = [
+            ("Features/Sessions/RootShellView.swift", 1),
+            ("Features/Workspace/WorkspaceRailView.swift", 0),
+            ("Features/Sessions/QuietProjectRail.swift", 0),
+        ]
+        for (path, expected) in expectations {
+            let source = try String(
+                contentsOf: sources.appendingPathComponent(path),
+                encoding: .utf8
+            )
+            let calls = source.components(separatedBy: ".kaisolaChromePanel(").count - 1
+            XCTAssertEqual(
+                calls,
+                expected,
+                "\(path): only the detail column may wear the chrome card"
+            )
+        }
     }
 
     func testTerminalPaneGridKeepsSessionsReadable() {
@@ -6409,4 +6929,15 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertNil(NativeVisualCapture.rescaled(retina, pointSize: points, pointPixelScale: 0))
         XCTAssertNil(NativeVisualCapture.rescaled(onePoint, pointSize: points, pointPixelScale: 1))
     }
+}
+
+extension TintPalette {
+    /// The smallest channel separation this palette promises after
+    /// compositing on the canvas. Graphite is grey on purpose and declares a
+    /// lower floor than the coloured palettes; nothing may declare zero.
+    /// A test-side declaration: the shipped constant floor of 8 became
+    /// per-palette the day Graphite joined, which is a real loosening of an
+    /// invariant — mitigated by the floor never being zero and the ceiling
+    /// staying global.
+    var minimumCanvasSpread: Double { self == .graphite ? 4 : 8 }
 }

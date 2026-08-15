@@ -1097,6 +1097,16 @@ private struct MeshColumnView: View {
                                     viewState.noteRow(row.id, isVisible: false, in: conversation.visibleRows)
                                 }
                             }
+                            // The chat's in-transcript thinking status, shared
+                            // so the two surfaces cannot drift apart.
+                            if let status = AcpThinkingStatus.derive(
+                                isRunning: conversation.isRunning,
+                                isConnected: conversation.isConnected,
+                                hasPendingPermission: conversation.pendingPermissionReview != nil,
+                                lastRow: conversation.visibleRows.last
+                            ) {
+                                AcpThinkingStatusRow(status: status)
+                            }
                             Color.clear
                                 .frame(height: 1)
                                 .id(bottomID)

@@ -85,9 +85,11 @@ struct AcpComposerCard: View {
         VStack(alignment: .leading, spacing: 0) {
             providerLaunchNotice
 
+            // Body, matching the transcript's paragraphs: what you type and
+            // what comes back are the same size.
             TextField(placeholder, text: $draft, axis: .vertical)
                 .textFieldStyle(.plain)
-                .font(.callout)
+                .font(.body)
                 .lineLimit(1...8)
                 .focused($focused)
                 .onChange(of: focused) { _, isFocused in
@@ -106,10 +108,21 @@ struct AcpComposerCard: View {
         }
         .background(cardFill, in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius))
         .overlay {
+            // The focused/unfocused split the pane focus ring already uses:
+            // an accent stroke while the field holds focus, a hairline
+            // separator otherwise. A flat full-weight border under Glass read
+            // as a floating grey box.
             RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius)
-                .strokeBorder(Color(nsColor: .separatorColor), lineWidth: KaisolaVisualSystem.focusStroke)
+                .strokeBorder(
+                    focused
+                        ? Color.accentColor.opacity(0.30)
+                        : Color(nsColor: .separatorColor),
+                    lineWidth: focused
+                        ? KaisolaVisualSystem.focusStroke
+                        : KaisolaVisualSystem.hairline
+                )
         }
-        .shadow(color: .black.opacity(colorScheme == .dark ? 0.34 : 0.07), radius: 9, y: 3)
+        .shadow(color: .black.opacity(colorScheme == .dark ? 0.34 : 0.07), radius: 6, y: 2)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("acp.composer")
         .task(id: agentName) {
@@ -768,8 +781,10 @@ struct AcpEmptyStateHeadline: View {
     let heading: AcpEmptyState.Heading
 
     var body: some View {
+        // A text style, not a point size, so accessibility text sizes scale
+        // the headline with everything else.
         Text(attributed)
-            .font(.system(size: 28, weight: .regular))
+            .font(.system(.largeTitle, design: .default).weight(.regular))
             .multilineTextAlignment(.center)
             .foregroundStyle(.primary)
             .padding(.horizontal, 24)

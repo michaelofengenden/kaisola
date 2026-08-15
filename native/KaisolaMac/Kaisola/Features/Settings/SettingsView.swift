@@ -697,7 +697,7 @@ struct SettingsView: View {
                     SettingsDivider()
                     SettingsRow(
                         title: "Theme",
-                        detail: "Glass shows your desktop through the window; Solid is opaque",
+                        detail: "One frosted window: Glass shows your desktop through it, Solid covers it, Tinted colours it",
                         symbol: "sparkles.rectangle.stack"
                     ) {
                         // One row where there were seven.
@@ -717,6 +717,20 @@ struct SettingsView: View {
                         .accessibilityLabel("Theme")
                     }
                     if settings.theme == .tinted {
+                        SettingsDivider()
+                        SettingsRow(
+                            title: "Tint palette",
+                            detail: settings.tintPalette.detail,
+                            symbol: "paintpalette"
+                        ) {
+                            Menu {
+                                ForEach(TintPalette.allCases) { palette in
+                                    Button(palette.title) { settings.tintPalette = palette }
+                                }
+                            } label: { SettingsChoiceLabel(settings.tintPalette.title) }
+                            .menuIndicator(.hidden)
+                            .accessibilityLabel("Tint palette")
+                        }
                         SettingsDivider()
                         SettingsRow(
                             title: "Living tint",

@@ -1982,6 +1982,17 @@ final class AcpConversation: ObservableObject {
                     failed: false
                 )
             }
+        } else if ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_SURFACE"] == "chat-thinking" {
+            // A live turn mid-tool: the thinking status line derives its word
+            // from the trailing in-progress call, and the fixture pin holds
+            // its shimmer static so the capture stays deterministic.
+            rows.append(.tool(AcpToolCall(
+                id: "visual-thinking-tool",
+                title: "Running the focused native tests",
+                kind: "execute",
+                status: .inProgress
+            )))
+            isRunning = true
         }
         usage = AcpUsage(
             used: 18_400,

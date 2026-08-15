@@ -108,10 +108,10 @@ enum SidebarAppearance: String, CaseIterable, Identifiable, Sendable {
 ///   vibrancy, which is a genuine live sample and therefore genuinely shows
 ///   Safari, Xcode, and everything else that happens to be underneath. Kept as
 ///   an explicit choice for people who *want* that classic macOS depth.
-/// - *eco* has no separate setting here: `SidebarAppearance.solid` and
-///   `WorkspaceBackdropMode.system` already are the flat, still, zero-sampling
-///   surfaces that mode described, and Reduce Transparency selects them
-///   automatically.
+/// - *eco* has no separate setting here. Since the glass-ground change even
+///   Solid rests on a sliver of the shared material, so the true
+///   zero-sampling surface is Reduce Transparency, which strips the material
+///   from every theme at once.
 enum GlassBackdropSource: String, CaseIterable, Identifiable, Sendable {
     case wallpaper
     case behindWindow
@@ -385,10 +385,14 @@ enum WorkspaceBackdropMode: String, CaseIterable, Identifiable, Sendable {
     var title: String {
         switch self {
         // "System" described where the colour came from, not what you get, and
-        // what you get is the point: a flat opaque surface with no wallpaper in
-        // it at all. Michael asked for the canvas to "actually be tinted or a
-        // white solid"; this is the white solid, and it now says so. The raw
-        // value stays `system` so nobody's stored preference moves.
+        // what you get is the point: nothing behind the window reaches the
+        // surface your work sits on. Since the glass-ground change the window
+        // *edge* rests on a sliver of shared material like every theme, but
+        // the chrome card and pane cards stay fully opaque — that opacity is
+        // Solid's promise now, and Reduce Transparency remains the true
+        // no-material path. Michael asked for the canvas to "actually be
+        // tinted or a white solid"; this is the white solid, and it says so.
+        // The raw value stays `system` so nobody's stored preference moves.
         case .system: "Solid"
         case .glass: "Glass"
         case .tinted: "Tinted"
@@ -787,6 +791,12 @@ final class NativePreviewSettings: ObservableObject {
     /// Off is exactly the shipped Tinted composition.
     @Published var tintedBreathing: Bool {
         didSet { persist(tintedBreathing, forKey: Keys.tintedBreathing) }
+    }
+
+    /// Which named tint the Tinted theme paints. Meadow is the shipped
+    /// composition, so an existing install sees no change until it chooses.
+    @Published var tintPalette: TintPalette {
+        didSet { persist(tintPalette.rawValue, forKey: Keys.tintPalette) }
     }
 
     /// The single theme control Settings vends, over the two properties above.
@@ -1204,6 +1214,7 @@ final class NativePreviewSettings: ObservableObject {
         static let sidebarAppearance = "sidebarAppearance"
         static let workspaceBackdrop = "workspaceBackdrop"
         static let tintedBreathing = "tintedBreathing"
+        static let tintPalette = "tintPalette"
         static let toolCallDensity = "toolCallDensity"
         static let glassBackdropSource = "glassBackdropSource"
         static let glassTexture = "glassTexture"
@@ -1244,6 +1255,7 @@ final class NativePreviewSettings: ObservableObject {
         sidebarAppearance = defaults.string(forKey: Keys.sidebarAppearance).flatMap(SidebarAppearance.init) ?? .glass
         workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .glass
         tintedBreathing = defaults.object(forKey: Keys.tintedBreathing) as? Bool ?? false
+        tintPalette = defaults.string(forKey: Keys.tintPalette).flatMap(TintPalette.init) ?? .meadow
         toolCallDensity = defaults.string(forKey: Keys.toolCallDensity)
             .flatMap(ToolCallDensity.init) ?? .balanced
         // The four glass knobs are a preset now, not preferences, so they are

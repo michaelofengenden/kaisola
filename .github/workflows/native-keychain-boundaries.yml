@@ -118,6 +118,18 @@ jobs:
           test -s "$profile_path"
 
           security cms -D -i "$profile_path" > "$profile_plist"
+          # JSON carries no data or date types, so plutil refuses a raw
+          # profile outright — this step had never once passed. Strip the
+          # certificate blobs the receipt never reads and restate the two
+          # dates as ISO-8601 strings (Date.parse in the receipt accepts
+          # them) before converting.
+          plutil -remove DeveloperCertificates "$profile_plist"
+          plutil -remove DER-Encoded-Profile "$profile_plist"
+          for date_key in CreationDate ExpirationDate; do
+            plutil -replace "$date_key" -string \
+              "$(plutil -extract "$date_key" raw "$profile_plist")" \
+              "$profile_plist"
+          done
           plutil -convert json -o "$profile_json" "$profile_plist"
           profile_uuid="$(node scripts/native-keychain-boundary-receipt.cjs inspect-profile \
             --profile "$profile_json" \

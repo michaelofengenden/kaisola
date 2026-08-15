@@ -141,6 +141,16 @@ jobs:
           printf 'KAISOLA_KEYCHAIN_PROFILE_UUID=%s\n' "$profile_uuid" >> "$GITHUB_ENV"
           printf 'KAISOLA_INSTALLED_PROVISIONING_PROFILE=%s\n' "$installed_profile" >> "$GITHUB_ENV"
           install -m 600 "$profile_path" "$installed_profile"
+          # Xcode 16 moved the profile directory to UserData, but command-line
+          # provisioning lookup on the runners still resolved nothing there
+          # ("No profile for team … matching <uuid>"). Install into the legacy
+          # location as well; both copies are removed by the cleanup step.
+          legacy_profile_dir="$HOME/Library/MobileDevice/Provisioning Profiles"
+          legacy_installed_profile="$legacy_profile_dir/$profile_uuid.provisionprofile"
+          mkdir -m 700 -p "$legacy_profile_dir"
+          test ! -e "$legacy_installed_profile"
+          printf 'KAISOLA_INSTALLED_LEGACY_PROVISIONING_PROFILE=%s\n' "$legacy_installed_profile" >> "$GITHUB_ENV"
+          install -m 600 "$profile_path" "$legacy_installed_profile"
 
           security create-keychain -p "$signing_password" "$signing_keychain"
           security set-keychain-settings -lut 21600 "$signing_keychain"
@@ -199,6 +209,17 @@ jobs:
             "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/entitlements.plist"
           security cms -D -i "$PROFILE" \
             > "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/provisioning-profile.plist"
+          # Same data/date stripping as the input profile: JSON cannot carry
+          # the certificate blobs or plist dates a real profile contains.
+          plutil -remove DeveloperCertificates \
+            "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/provisioning-profile.plist"
+          plutil -remove DER-Encoded-Profile \
+            "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/provisioning-profile.plist"
+          for date_key in CreationDate ExpirationDate; do
+            plutil -replace "$date_key" -string \
+              "$(plutil -extract "$date_key" raw "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/provisioning-profile.plist")" \
+              "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/provisioning-profile.plist"
+          done
           plutil -convert json -o "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/provisioning-profile.json" \
             "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/provisioning-profile.plist"
           embedded_profile_uuid="$(node scripts/native-keychain-boundary-receipt.cjs inspect-profile \
@@ -239,14 +260,16 @@ jobs:
             "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/signing.provisionprofile" \
             "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/input-profile.plist" \
             "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/input-profile.json" \
-            "$KAISOLA_INSTALLED_PROVISIONING_PROFILE"
+            "$KAISOLA_INSTALLED_PROVISIONING_PROFILE" \
+            "$KAISOLA_INSTALLED_LEGACY_PROVISIONING_PROFILE"
           for material in \
             "$KAISOLA_SIGNING_KEYCHAIN" \
             "$KAISOLA_SIGNING_CERTIFICATE" \
             "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/signing.provisionprofile" \
             "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/input-profile.plist" \
             "$KAISOLA_KEYCHAIN_BOUNDARY_ROOT/input-profile.json" \
-            "$KAISOLA_INSTALLED_PROVISIONING_PROFILE"; do
+            "$KAISOLA_INSTALLED_PROVISIONING_PROFILE" \
+            "$KAISOLA_INSTALLED_LEGACY_PROVISIONING_PROFILE"; do
             test ! -e "$material"
           done
 
@@ -284,6 +307,9 @@ jobs:
           )
           if [[ -n "${KAISOLA_INSTALLED_PROVISIONING_PROFILE:-}" ]]; then
             signing_material+=("$KAISOLA_INSTALLED_PROVISIONING_PROFILE")
+          fi
+          if [[ -n "${KAISOLA_INSTALLED_LEGACY_PROVISIONING_PROFILE:-}" ]]; then
+            signing_material+=("$KAISOLA_INSTALLED_LEGACY_PROVISIONING_PROFILE")
           fi
           rm -f "${signing_material[@]}"
           test ! -e "$signing_keychain"

@@ -5363,22 +5363,41 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// a "Updated N seconds ago" line: two rows of chrome reporting nothing.
     func testOtherMacsSectionStaysHiddenUntilThereIsSomethingToReport() {
         XCTAssertFalse(
-            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 0, errorMessage: nil)
+            RememberedSessionsSectionVisibility.shouldShow(
+                remoteDeviceCount: 0, errorMessage: nil, hasEverSeenRemoteDevice: false
+            )
         )
         XCTAssertFalse(
-            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 0, errorMessage: "")
+            RememberedSessionsSectionVisibility.shouldShow(
+                remoteDeviceCount: 0, errorMessage: "", hasEverSeenRemoteDevice: true
+            )
         )
         XCTAssertFalse(
-            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 0, errorMessage: "  \n ")
+            RememberedSessionsSectionVisibility.shouldShow(
+                remoteDeviceCount: 0, errorMessage: "  \n ", hasEverSeenRemoteDevice: true
+            )
         )
         XCTAssertTrue(
-            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 1, errorMessage: nil)
+            RememberedSessionsSectionVisibility.shouldShow(
+                remoteDeviceCount: 1, errorMessage: nil, hasEverSeenRemoteDevice: false
+            )
         )
-        // A failure must never be silent just because it left the catalog empty.
+        // A failure must never be silent just because it left the catalog
+        // empty — but only about a fleet that has actually been seen.
         XCTAssertTrue(
             RememberedSessionsSectionVisibility.shouldShow(
                 remoteDeviceCount: 0,
-                errorMessage: "Companion is offline"
+                errorMessage: "Companion is offline",
+                hasEverSeenRemoteDevice: true
+            )
+        )
+        // A never-paired install stays silent even when the saved-session
+        // refresh fails; there is no fleet to report on.
+        XCTAssertFalse(
+            RememberedSessionsSectionVisibility.shouldShow(
+                remoteDeviceCount: 0,
+                errorMessage: "The saved Firebase session is unavailable.",
+                hasEverSeenRemoteDevice: false
             )
         )
     }

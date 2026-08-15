@@ -438,12 +438,27 @@ final class RememberedSessionCatalogTests: XCTestCase {
         center.apply([local], now: 1_000)
         XCTAssertEqual(center.source, .live)
         XCTAssertTrue(center.freshnessTitle?.hasPrefix("Updated ") == true)
+        // The fleet latch flipped on the earlier remote-bearing apply and a
+        // later local-only list must not lower it: a transient empty live
+        // catalog would otherwise re-hide the section mid-session.
+        XCTAssertTrue(center.hasEverSeenRemoteDevice)
 
         center.clear()
         XCTAssertTrue(center.devices.isEmpty)
         XCTAssertNil(center.source)
         XCTAssertNil(center.freshnessTitle)
         XCTAssertNil(center.lastUpdatedAt)
+        XCTAssertFalse(center.hasEverSeenRemoteDevice)
+    }
+
+    @MainActor
+    func testFleetLatchStaysDownForALocalOnlyCatalog() {
+        let center = RememberedSessionCatalogCenter(localDeviceID: "local")
+        XCTAssertFalse(center.hasEverSeenRemoteDevice)
+        center.apply([device(id: "local", name: "Local", presence: .online)], now: 10)
+        XCTAssertFalse(center.hasEverSeenRemoteDevice)
+        center.fail(RememberedSessionCatalogError.invalidResponse)
+        XCTAssertFalse(center.hasEverSeenRemoteDevice)
     }
 
     private func draft(createdAt: Int64?, lastActivityAt: Int64?) -> RememberedSessionDraft {

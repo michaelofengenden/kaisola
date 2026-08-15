@@ -641,6 +641,12 @@ final class RememberedSessionCatalogCenter: ObservableObject {
     @Published private(set) var lastUpdatedAt: Int64?
     @Published private(set) var source: RememberedSessionCatalogSource?
     @Published private(set) var errorMessage: String?
+    /// Latched the first time any applied catalog names a device other than
+    /// this one, and reset only by `clear()` (account switch / sign-out). A
+    /// transient empty live list must not re-hide a fleet mid-session, and a
+    /// never-paired install must not surface fleet errors about no fleet.
+    /// Re-seeded on launch by the saved snapshot's `apply`.
+    @Published private(set) var hasEverSeenRemoteDevice = false
 
     let localDeviceID: String
 
@@ -689,6 +695,9 @@ final class RememberedSessionCatalogCenter: ObservableObject {
         self.source = source
         isRefreshing = false
         errorMessage = nil
+        if devices.contains(where: { $0.deviceId != localDeviceID }) {
+            hasEverSeenRemoteDevice = true
+        }
     }
 
     func fail(_ error: any Error) {
@@ -708,6 +717,7 @@ final class RememberedSessionCatalogCenter: ObservableObject {
         lastUpdatedAt = nil
         source = nil
         errorMessage = nil
+        hasEverSeenRemoteDevice = false
     }
 
     func requestRefresh() {

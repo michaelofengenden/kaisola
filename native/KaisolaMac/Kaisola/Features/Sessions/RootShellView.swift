@@ -1042,11 +1042,12 @@ struct RootShellView: View {
     /// permanent empty state plus a "Updated N seconds ago" line — two rows of
     /// chrome saying nothing, which is exactly what the v4 rail is meant not to
     /// carry. It appears when there is something to report: a remote device, or
-    /// an error explaining why there is not.
+    /// an error about a fleet that has actually been seen.
     private var showsRememberedSessionSection: Bool {
         RememberedSessionsSectionVisibility.shouldShow(
             remoteDeviceCount: rememberedSessions.remoteDevices.count,
-            errorMessage: rememberedSessions.errorMessage
+            errorMessage: rememberedSessions.errorMessage,
+            hasEverSeenRemoteDevice: rememberedSessions.hasEverSeenRemoteDevice
         )
     }
 
@@ -4760,12 +4761,17 @@ enum RootSidebarVisibilityFixture {
 /// can be tested without a signed-in account or a catalog fetch.
 enum RememberedSessionsSectionVisibility {
     /// - Returns: `true` only when the section has something to say — at least
-    ///   one remembered remote device, or an error that explains why there is
-    ///   none. An empty, healthy catalog draws nothing: no header, no
-    ///   placeholder row, and no freshness line.
-    static func shouldShow(remoteDeviceCount: Int, errorMessage: String?) -> Bool {
+    ///   one remembered remote device, or an error about a fleet that has
+    ///   actually been seen. An empty, healthy catalog draws nothing, and a
+    ///   never-paired install stays silent even when the saved-session refresh
+    ///   fails: an error is only worth showing about a fleet that exists.
+    static func shouldShow(
+        remoteDeviceCount: Int,
+        errorMessage: String?,
+        hasEverSeenRemoteDevice: Bool
+    ) -> Bool {
         if remoteDeviceCount > 0 { return true }
-        guard let errorMessage else { return false }
+        guard hasEverSeenRemoteDevice, let errorMessage else { return false }
         return !errorMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }

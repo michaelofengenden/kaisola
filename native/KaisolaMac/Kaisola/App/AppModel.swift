@@ -8381,6 +8381,11 @@ final class AppModel: ObservableObject {
             }
             return true
         } catch {
+            // A post-dial failure (identity re-check, inventory, diagnostics)
+            // otherwise leaves the successfully dialed socket open: the broker
+            // counts a client that the app has already given up on, and the
+            // next attempt dials beside the leak.
+            await client.disconnect()
             guard generation == connectionGeneration, shouldReconnect else { return false }
             connectedBrokerFeatures = []
             activeBrokerTopology = nil

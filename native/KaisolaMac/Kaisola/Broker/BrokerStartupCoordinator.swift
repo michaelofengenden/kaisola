@@ -445,8 +445,11 @@ actor BrokerStartupCoordinator:
             let info = topology.current.info
             // A socket vnode can survive its detached broker. Treating that
             // stale file as a live endpoint makes every connection fail with
-            // ECONNREFUSED and bypasses the safe relaunch path below.
-            guard !info.isProcessAlive else {
+            // ECONNREFUSED and bypasses the safe relaunch path below. A
+            // record predating the last boot is dead however its recycled
+            // pid answers kill(0) — reconciling with that phantom dials a
+            // ghost forever.
+            guard info.isProcessProvablyDead else {
                 return try await reconcileLiveBroker(topology, package: package)
             }
             try removeStaleRendezvous(topology.current)
@@ -456,7 +459,7 @@ actor BrokerStartupCoordinator:
                 break
             case .privateEndpointUnavailable:
                 let topology = try locator.locateTopology(validateSockets: false)
-                guard !topology.current.info.isProcessAlive else { throw error }
+                guard topology.current.info.isProcessProvablyDead else { throw error }
                 try removeStaleRendezvous(topology.current)
             default:
                 // A live or ambiguous incompatible broker is never replaced.
@@ -728,7 +731,7 @@ actor BrokerStartupCoordinator:
 
         guard rollingUpdatesEnabled,
               let rolling = upgradeRequester as? any BrokerRollingUpdateRequesting,
-              let topology = currentTopology ?? (try? locator.locateTopology()) else { return }
+              var topology = currentTopology ?? (try? locator.locateTopology()) else { return }
         let handoffStore = BrokerGenerationRegistryStore(
             profileRoot: locator.preferredUserDataRoot.standardizedFileURL
         )
@@ -737,6 +740,22 @@ actor BrokerStartupCoordinator:
         ) else { return }
         defer { handoffClaim.release() }
         let store = BrokerGenerationRegistryStore(profileRoot: locator.preferredUserDataRoot)
+        // Reap EVERY provably dead drain this sweep, not one per heartbeat: a
+        // reboot kills all of them at once, and each later one-at-a-time reap
+        // kept mutating the registry out from under the app's in-flight
+        // connects — the post-dial identity re-check then lost the race on
+        // every attempt while dead drains remained. Reaping is registry-only
+        // work under this sweep's claim; RPC retirement below still commits
+        // at most once per heartbeat. The retained rollback target is not
+        // exempt: rollback() requires a living process.
+        var reapedGenerations = 0
+        while reapedGenerations < BrokerGenerationRegistry.maximumGenerationCount,
+              let dead = topology.draining.first(where: { $0.info.isProcessProvablyDead }) {
+            reapDeadDrainingGeneration(dead, topology: topology, store: store)
+            reapedGenerations += 1
+            guard let refreshed = currentTopology, refreshed != topology else { return }
+            topology = refreshed
+        }
         guard let registry = exactRetirementRegistry(matching: topology, store: store) else {
             return
         }
@@ -756,22 +775,9 @@ actor BrokerStartupCoordinator:
         // incident kept two empty drains pinned in the registry exactly this
         // way. At most one retirement is committed per heartbeat.
         for draining in topology.draining {
-            // A drain whose recorded process is provably dead can never again
-            // serve or hand off its terminals, and RPC retirement against it
-            // fails forever. Before v0.1.125 a host reboot therefore left one
-            // permanent phantom per draining generation, each pinning dead
-            // rendezvous files in the registry. Reap it under the same claim
-            // and exact registry CAS as an ordinary retirement. The retained
-            // rollback target is NOT exempt: rollback() requires a living
-            // process, so a dead one buys nothing — and if it shares the
-            // relaunching app's own digest, retaining the dead record blocks
-            // publishFreshGeneration's recovery and wedges the registry.
-            if !draining.info.isProcessAlive {
-                reapDeadDrainingGeneration(draining, topology: topology, store: store)
-                return
-            }
-            // A living rollback target is retained: it holds the terminals a
-            // rollback would return to.
+            // Dead drains were reaped above; anything here has a living
+            // process. A living rollback target is retained: it holds the
+            // terminals a rollback would return to.
             if draining.id == retainedRollbackID { continue }
             if let quarantine = retirementQuarantines[draining.id],
                quarantine.info == draining.info,
@@ -916,7 +922,7 @@ actor BrokerStartupCoordinator:
         _ generation: BrokerGenerationRecord,
         store: BrokerGenerationRegistryStore
     ) {
-        guard generation.packageRoot != nil, !generation.info.isProcessAlive else { return }
+        guard generation.packageRoot != nil, generation.info.isProcessProvablyDead else { return }
         let root = locator.preferredUserDataRoot.standardizedFileURL
         let metadataDirectory = store.brokerDirectory.appendingPathComponent(
             BrokerLaunchConfiguration.generationMetadataDirectoryName,
@@ -952,7 +958,7 @@ actor BrokerStartupCoordinator:
             validateSocket: false
         )
         if let published, published != generation.info { return }
-        guard !generation.info.isProcessAlive else { return }
+        guard generation.info.isProcessProvablyDead else { return }
         if published == generation.info {
             let socketURL = URL(fileURLWithPath: generation.info.socketPath)
             let expectedSocketLeaf = BrokerLaunchConfiguration.generationSocketLeaf(
@@ -1067,7 +1073,7 @@ actor BrokerStartupCoordinator:
         while DispatchTime.now().uptimeNanoseconds - started < Self.startupTimeoutNanoseconds {
             var metadata = stat()
             let metadataExists = lstat(metadataURL.path, &metadata) == 0
-            if !generation.info.isProcessAlive, !metadataExists { return }
+            if generation.info.isProcessProvablyDead, !metadataExists { return }
             try await sleep(60_000_000)
         }
         throw BrokerStartupError.timedOut(nil)
@@ -1324,7 +1330,7 @@ actor BrokerStartupCoordinator:
         let started = DispatchTime.now().uptimeNanoseconds
         while DispatchTime.now().uptimeNanoseconds - started < Self.startupTimeoutNanoseconds {
             let metadataStillMatches = (try? locator.locateMetadata(validateSocket: false)) == info
-            if !info.isProcessAlive, !metadataStillMatches { return }
+            if info.isProcessProvablyDead, !metadataStillMatches { return }
             try await sleep(60_000_000)
         }
         throw BrokerStartupError.timedOut(nil)
@@ -1655,7 +1661,7 @@ actor BrokerStartupCoordinator:
         by record: BrokerGenerationRecord,
         store: BrokerGenerationRegistryStore
     ) -> Bool {
-        guard !current.info.isProcessAlive else { return false }
+        guard current.info.isProcessProvablyDead else { return false }
         var metadataStat = stat()
         if lstat(store.metadataURL(for: current).path, &metadataStat) != 0,
            errno == ENOENT {
@@ -1739,12 +1745,12 @@ actor BrokerStartupCoordinator:
     }
 
     private func removeStaleGenerationRendezvous(_ stale: BrokerGenerationRecord) throws {
-        guard !stale.info.isProcessAlive else { throw BrokerStartupError.liveBrokerRefused }
+        guard stale.info.isProcessProvablyDead else { throw BrokerStartupError.liveBrokerRefused }
         let root = locator.preferredUserDataRoot.standardizedFileURL
         let store = BrokerGenerationRegistryStore(profileRoot: root)
         let registry = try store.load()
         guard registry.topology?.current == stale,
-              !stale.info.isProcessAlive,
+              stale.info.isProcessProvablyDead,
               try locator.locateGenerationMetadata(
                   contentDigest: stale.id,
                   validateSocket: false
@@ -1774,7 +1780,7 @@ actor BrokerStartupCoordinator:
         // Recheck identity after acquiring the generation lock. Another app
         // may have relaunched it between the registry read and the lock.
         guard registry == (try store.load()),
-              !stale.info.isProcessAlive,
+              stale.info.isProcessProvablyDead,
               try locator.locateGenerationMetadata(
                   contentDigest: stale.id,
                   validateSocket: false
@@ -1825,9 +1831,9 @@ actor BrokerStartupCoordinator:
     }
 
     private func removeStaleLegacyRendezvous(_ stale: BrokerInfo) throws {
-        guard !stale.isProcessAlive else { throw BrokerStartupError.liveBrokerRefused }
+        guard stale.isProcessProvablyDead else { throw BrokerStartupError.liveBrokerRefused }
         let current = try locator.locateMetadata(validateSocket: false)
-        guard current == stale, !current.isProcessAlive else {
+        guard current == stale, current.isProcessProvablyDead else {
             throw BrokerStartupError.rendezvousChanged
         }
         let root = locator.preferredUserDataRoot

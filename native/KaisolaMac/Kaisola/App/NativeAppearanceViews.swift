@@ -14,7 +14,13 @@ struct NativeVisualEffectView: NSViewRepresentable {
 
     @MainActor
     private func configure(_ view: NSVisualEffectView) {
-        view.state = .followsWindowActiveState
+        // Kaisola's glass is the app's surface, not a focus indicator. With
+        // `.followsWindowActiveState` AppKit discards the blur and fills with
+        // the material's flat inactive gray the instant the window loses key,
+        // which is what made every rail gray out behind any other app.
+        // `.active` keeps the behind-window sample alive; compositing stays in
+        // WindowServer either way, so nothing new is scheduled.
+        view.state = Self.resolvedState
         view.material = material
         view.blendingMode = blendingMode
         view.wantsLayer = true
@@ -39,6 +45,9 @@ struct NativeVisualEffectView: NSViewRepresentable {
     nonisolated static func resolvedSaturation(neutralizesChroma: Bool) -> Double {
         neutralizesChroma ? 0 : 1
     }
+
+    /// `.active`, always. See the comment in `configure`.
+    nonisolated static let resolvedState: NSVisualEffectView.State = .active
 }
 
 /// The one **deliberately non-neutral** layer in the dark glass stack.

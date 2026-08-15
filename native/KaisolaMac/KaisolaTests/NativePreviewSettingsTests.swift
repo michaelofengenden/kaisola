@@ -944,33 +944,38 @@ final class NativePreviewSettingsTests: XCTestCase {
 
         XCTAssertLessThanOrEqual(LightRailTint.maximumCoverage, 0.04)
         XCTAssertGreaterThanOrEqual(LightRailTint.minimumTransmission, 0.96)
-        XCTAssertEqual(LightRailTint.inactiveMultiplier, 0.12, accuracy: 0.0001)
+        // An unfocused window keeps nearly all of its edge cast: the rails are
+        // not a focus indicator, and 0.12 stacked on the material's own
+        // inactive collapse was half of the "gray when unfocused" bug.
+        XCTAssertEqual(LightRailTint.inactiveMultiplier, 0.85, accuracy: 0.0001)
         XCTAssertGreaterThan(LightRailTint.cool.blue, LightRailTint.cool.green)
         XCTAssertGreaterThan(LightRailTint.cool.green, LightRailTint.cool.red)
         XCTAssertGreaterThan(LightRailTint.pearl.red, LightRailTint.pearl.green)
         XCTAssertGreaterThan(LightRailTint.pearl.green, LightRailTint.pearl.blue)
     }
 
-    func testGlassRailsDeclareAboutTwelvePercentWhiteAndExposeTheDesktop() {
+    func testGlassRailsDeclareAboutThirtyPercentWhiteAndExposeTheDesktop() {
         let rail = GlassBackdropWash.sidebar(isDark: false)
         let canvas = GlassBackdropWash.workspace(isDark: false)
         let declaredWhiteCoverage = 1
             - (1 - LightGlassFrost.railCarrierWhiteCoverage) * (1 - rail.baseOpacity)
 
-        XCTAssertGreaterThanOrEqual(declaredWhiteCoverage, 0.10)
+        // Twelve percent read gray next to the 0.93-luminance canvas; thirty
+        // keeps the rails white without painting the desktop out.
+        XCTAssertGreaterThanOrEqual(declaredWhiteCoverage, 0.26)
         XCTAssertLessThanOrEqual(
             declaredWhiteCoverage,
-            0.14,
+            0.34,
             "the shared rail material still carries too much white to read as transparent"
         )
         XCTAssertLessThanOrEqual(
             LightGlassFrost.railCarrierWhiteCoverage,
             0.02,
-            "a second white carrier is stacking on top of the twelve-percent veil"
+            "a second white carrier is stacking on top of the thirty-percent veil"
         )
         XCTAssertGreaterThanOrEqual(
             LightGlassFrost.modeledRailDesktopContribution(rail),
-            0.86,
+            0.68,
             "Glass still paints over most of the wallpaper"
         )
         XCTAssertGreaterThanOrEqual(
@@ -1251,13 +1256,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         // passed no desktop colour at all, and the 0.16 that replaced it was
         // calibrated against vibrancy but ended up over a *painted wallpaper*,
         // which passes everything.
-        // Light rails now use one narrow white veil centered on twelve
-        // percent. There is no second carrier stacked beneath it; the exact
-        // white workspace has its own opaque recipe.
+        // Light rails now use one white veil centered on thirty percent —
+        // twelve read gray next to the canvas. There is still no second
+        // carrier stacked beneath it; the exact white workspace has its own
+        // opaque recipe.
         let lightSidebar = GlassBackdropWash.sidebar(isDark: false)
-        XCTAssertEqual(lightSidebar.topOpacity, 0.14, accuracy: 0.0001)
-        XCTAssertEqual(lightSidebar.baseOpacity, 0.12, accuracy: 0.0001)
-        XCTAssertEqual(lightSidebar.bottomOpacity, 0.10, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.topOpacity, 0.34, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.baseOpacity, 0.30, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.bottomOpacity, 0.26, accuracy: 0.0001)
         // 0.40 → 0.38 with the 2026-08-14 carrier drop, so the canvas stays
         // white-led while a third of the normalized desktop reaches it.
         XCTAssertEqual(GlassBackdropWash.workspace(isDark: false).baseOpacity, 0.38, accuracy: 0.0001)
@@ -4276,14 +4282,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(before, 0.336, accuracy: 0.001)
         XCTAssertGreaterThan(after, before * 1.6, "live dark barely moved")
 
-        // Light keeps the live material's chroma and uses only the twelve-point
+        // Light keeps the live material's chroma and uses only the thirty-point
         // white veil to frost it. No second carrier consumes the transmission.
         XCTAssertEqual(SidebarBackdropView.liveTint.light, 0, accuracy: 0.0001)
         let lightAfterCarrier = transmission(
             tint: SidebarBackdropView.liveTint.light,
             veil: GlassBackdropWash.sidebar(isDark: false).baseOpacity
         ) * (1 - LightGlassFrost.railCarrierWhiteCoverage)
-        XCTAssertEqual(lightAfterCarrier, 0.88, accuracy: 0.0001)
+        XCTAssertEqual(lightAfterCarrier, 0.70, accuracy: 0.0001)
     }
 
     /// The bake bounds the wallpaper's dynamic range, not only its mean — the

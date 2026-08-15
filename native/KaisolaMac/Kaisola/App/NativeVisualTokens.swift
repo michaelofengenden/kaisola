@@ -135,7 +135,11 @@ enum LightRailTint {
     static let midpointCoverage = 0.008
     static let pearlCoverage = 0.010
     static let midpointLocation = 0.62
-    static let inactiveMultiplier = 0.12
+    /// Was 0.12, which snuffed the rail's only warmth the moment focus left
+    /// and stacked on top of the material's own inactive collapse. The rails
+    /// are not a focus indicator; the traffic lights and the toolbar already
+    /// are, so an unfocused window keeps nearly all of its edge cast.
+    static let inactiveMultiplier = 0.85
     static let maximumCoverage = max(coolCoverage, midpointCoverage, pearlCoverage)
     static let minimumTransmission = 1 - maximumCoverage
 
@@ -667,9 +671,15 @@ struct GlassBackdropWash: Equatable, Sendable {
     }
 
     private static func sidebarBase(isDark: Bool) -> GlassBackdropWash {
+        // Light rails carried a twelve-percent veil through v0.1.124 and read
+        // gray against the 0.93-luminance canvas — the white glass ask keeps
+        // coming back as "the rails look gray". Thirty percent lifts modeled
+        // rail luminance from 0.824 to 0.86 while transmission (0.70) stays
+        // well inside the light desktopTransmissionBand, so the desktop still
+        // reads through the glass.
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
-            : light(top: 0.14, base: 0.12, bottom: 0.10)
+            : light(top: 0.34, base: 0.30, bottom: 0.26)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour

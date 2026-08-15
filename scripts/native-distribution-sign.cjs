@@ -10,6 +10,15 @@ const {
   verifyPackage,
 } = require('./native-broker-package.cjs')
 
+const nativePolicyFile = path.resolve(
+  __dirname,
+  '..',
+  'native',
+  'KaisolaMac',
+  'BrokerHelper',
+  'native-package-policy.json',
+)
+
 function fail(message) {
   throw new Error(message)
 }
@@ -46,6 +55,9 @@ function resolveAppTarget(rawPath) {
     path.join(app, 'Contents', 'Resources', 'BrokerHelper', 'bin', 'node'),
     path.join(app, 'Contents', 'Resources', 'BrokerHelper', 'bin', 'kaisola-broker-bootstrap'),
     path.join(app, 'Contents', 'Resources', 'BrokerHelper', 'manifest.json'),
+    path.join(app, 'Contents', 'Resources', 'BrokerSessionHelper', 'bin', 'kaisola-session-broker'),
+    path.join(app, 'Contents', 'Resources', 'BrokerSessionHelper', 'bin', 'kaisola-broker-bootstrap'),
+    path.join(app, 'Contents', 'Resources', 'BrokerSessionHelper', 'manifest.json'),
   ]
   for (const entry of required) {
     if (!fs.existsSync(entry)) fail(`Kaisola distribution bundle is missing ${path.relative(app, entry)}`)
@@ -106,9 +118,80 @@ function resealBrokerHelper({ app, identity }) {
   return manifest
 }
 
+function readNativeAppRelease(app) {
+  const infoFile = path.join(app, 'Contents', 'Info.plist')
+  const value = (key) => String(run('/usr/bin/plutil', [
+    '-extract', key, 'raw', '-o', '-', infoFile,
+  ])).trim()
+  const appRelease = {
+    version: value('CFBundleShortVersionString'),
+    build: value('CFBundleVersion'),
+  }
+  if (!appRelease.version || appRelease.version.length > 64
+      || !appRelease.build || appRelease.build.length > 64) {
+    fail('Kaisola app release version and build are invalid')
+  }
+  return appRelease
+}
+
+function resealNativeBrokerHelper({ app, identity }) {
+  const helperRoot = path.join(app, 'Contents', 'Resources', 'BrokerSessionHelper')
+  const manifestFile = path.join(helperRoot, 'manifest.json')
+
+  let priorManifest
+  let policy
+  try {
+    priorManifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'))
+    policy = JSON.parse(fs.readFileSync(nativePolicyFile, 'utf8'))
+  } catch {
+    fail('native broker helper manifest or policy is unreadable')
+  }
+  if (!priorManifest || typeof priorManifest !== 'object' || !Array.isArray(priorManifest.files)) {
+    fail('native broker helper manifest is invalid')
+  }
+  const appRelease = readNativeAppRelease(app)
+  if (priorManifest.schemaVersion !== 2
+      || priorManifest.appRelease?.version !== appRelease.version
+      || priorManifest.appRelease?.build !== appRelease.build) {
+    fail('native broker helper does not match the Kaisola app release')
+  }
+
+  // BrokerSessionHelper is another resources directory, so the outer app
+  // seal cannot be relied on to discover its loose Mach-Os. Unlike the Node
+  // runtime, the native broker must never inherit JIT or unsigned-executable
+  // memory entitlements. Omitting the entitlements argument is intentional.
+  signNestedCode(helperRoot, String(identity))
+  const { files: _priorFiles, ...metadata } = priorManifest
+  const manifest = createManifest(helperRoot, {
+    ...metadata,
+    generatedAt: new Date().toISOString(),
+  })
+  const temporaryManifest = `${manifestFile}.tmp-${process.pid}`
+  try {
+    fs.writeFileSync(temporaryManifest, `${JSON.stringify(manifest, null, 2)}\n`, {
+      mode: 0o644,
+      flag: 'wx',
+    })
+    fs.renameSync(temporaryManifest, manifestFile)
+    fs.chmodSync(manifestFile, 0o644)
+  } finally {
+    fs.rmSync(temporaryManifest, { force: true })
+  }
+
+  // Bind the release-neutral native policy to this exact app release. This
+  // verification happens after signatures and the manifest have changed but
+  // before the enclosing app is signed.
+  verifyPackage(helperRoot, {
+    requireSignatures: true,
+    policy: { ...policy, appRelease },
+  })
+  return manifest
+}
+
 function signDistribution({ app, identity }) {
   if (!identity || !String(identity).trim()) fail('--identity is required')
   resealBrokerHelper({ app, identity })
+  resealNativeBrokerHelper({ app, identity })
   run('/usr/bin/codesign', [
     '--force',
     '--deep',
@@ -132,9 +215,10 @@ function main(argv = process.argv.slice(2)) {
   --app /path/Kaisola.app \\
   --identity "Developer ID Application: Example (TEAMID)"
 
-Explicitly signs every manifest-covered broker Mach-O, regenerates its sealed
-manifest, then re-signs the app and every nested code object with a secure
-timestamp while preserving the minimum existing entitlements. Always follow with native:preflight
+Explicitly signs every manifest-covered broker Mach-O, regenerates both sealed
+manifests, then re-signs the app and every nested code object with a secure
+timestamp while preserving the minimum existing entitlements. The native Swift
+broker is resealed without Node's JIT entitlements. Always follow with native:preflight
 --require-updates --require-developer-id.`)
     return
   }
@@ -152,4 +236,10 @@ if (require.main === module) {
   }
 }
 
-module.exports = { parseArguments, resealBrokerHelper, resolveAppTarget, signDistribution }
+module.exports = {
+  parseArguments,
+  resealBrokerHelper,
+  resealNativeBrokerHelper,
+  resolveAppTarget,
+  signDistribution,
+}

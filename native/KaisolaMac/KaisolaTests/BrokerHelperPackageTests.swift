@@ -151,6 +151,119 @@ final class BrokerHelperPackageTests: XCTestCase {
         )
     }
 
+    func testBundledNativeVerifierBindsPackageToTheContainingAppRelease() throws {
+        let matchingBundle = try makeHelperBundle()
+
+        let verified = try BrokerHelperPackageVerification.verifyBundledNative(
+            bundle: matchingBundle,
+            requireSignatures: false
+        )
+
+        XCTAssertEqual(verified.root.lastPathComponent, "BrokerSessionHelper")
+        XCTAssertEqual(verified.manifest.packageVersion, "2.0.0")
+
+        let staleBundle = try makeHelperBundle(appReleaseVersion: "0.1.124")
+        XCTAssertThrowsError(
+            try BrokerHelperPackageVerification.verifyBundledNative(
+                bundle: staleBundle,
+                requireSignatures: false
+            )
+        ) {
+            XCTAssertEqual($0 as? BrokerHelperPackageError, .incompatibleManifest)
+        }
+    }
+
+    func testBundledNativeVerifierRequiresTheSealedArm64BootstrapItExecutes() throws {
+        let incompleteBundle = try makeHelperBundle(includeNativeBootstrap: false)
+
+        XCTAssertThrowsError(
+            try BrokerHelperPackageVerification.verifyBundledNative(
+                bundle: incompleteBundle,
+                requireSignatures: false
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? BrokerHelperPackageError,
+                .inventoryMismatch("sealed native bootstrap is missing")
+            )
+        }
+    }
+
+    func testDevelopmentRuntimeSelectorChoosesOnlyExactSwiftOptIn() async throws {
+        let bundle = try makeHelperBundle()
+        let unsignedEnvironment = ["KAISOLA_ALLOW_UNSIGNED_NATIVE_HELPER": "1"]
+
+        let defaultManifest = try await BrokerBootstrapClient(
+            bundle: bundle,
+            environment: unsignedEnvironment
+        ).packageManifest()
+        let explicitNodeManifest = try await BrokerBootstrapClient(
+            bundle: bundle,
+            environment: unsignedEnvironment.merging([
+                "KAISOLA_SESSION_BROKER_RUNTIME": "node",
+            ]) { _, selected in selected }
+        ).packageManifest()
+        let invalidManifest = try await BrokerBootstrapClient(
+            bundle: bundle,
+            environment: unsignedEnvironment.merging([
+                "KAISOLA_SESSION_BROKER_RUNTIME": "Swift",
+            ]) { _, selected in selected }
+        ).packageManifest()
+        let swiftManifest = try await BrokerBootstrapClient(
+            bundle: bundle,
+            environment: unsignedEnvironment.merging([
+                "KAISOLA_SESSION_BROKER_RUNTIME": "swift",
+            ]) { _, selected in selected }
+        ).packageManifest()
+
+        // A misspelled or differently cased development selector stays on the
+        // stable Node package. Only the exact opt-in may choose native code.
+        XCTAssertEqual(defaultManifest.schemaVersion, 1)
+        XCTAssertEqual(explicitNodeManifest.schemaVersion, 1)
+        XCTAssertEqual(invalidManifest.schemaVersion, 1)
+        XCTAssertEqual(swiftManifest.schemaVersion, 2)
+        XCTAssertEqual(swiftManifest.packageVersion, "2.0.0")
+    }
+
+    func testNativeSelectorRevalidatesItsStagedSchema2Package() async throws {
+        let bundle = try makeHelperBundle()
+        let environment = [
+            "KAISOLA_ALLOW_UNSIGNED_NATIVE_HELPER": "1",
+            "KAISOLA_SESSION_BROKER_RUNTIME": "swift",
+        ]
+        let client = BrokerBootstrapClient(bundle: bundle, environment: environment)
+        let expected = try await client.packageManifest()
+        let bundled = try BrokerHelperPackageVerification.verifyBundledNative(
+            bundle: bundle,
+            requireSignatures: false
+        )
+        let profile = FileManager.default.temporaryDirectory.appendingPathComponent(
+            "KaisolaStagedNativeTests-\(UUID().uuidString)",
+            isDirectory: true
+        )
+        roots.append(profile)
+        let destination = profile
+            .appendingPathComponent("broker-generations", isDirectory: true)
+            .appendingPathComponent(expected.contentDigest, isDirectory: true)
+        _ = try BrokerHelperPackageStaging.stage(bundled, at: destination)
+
+        try await client.validateStagedPackage(at: destination, expected: expected)
+        let reverified = try await client.verifiedStagedPackage(at: destination)
+        XCTAssertEqual(reverified.manifest, expected)
+
+        // Unsetting the opt-in selects Node for the next launch, but the
+        // current app release must retain enough authority to inspect and
+        // drain or roll back the already-staged Swift generation.
+        let nodeDefaultClient = BrokerBootstrapClient(
+            bundle: bundle,
+            environment: ["KAISOLA_ALLOW_UNSIGNED_NATIVE_HELPER": "1"]
+        )
+        let rollbackReverified = try await nodeDefaultClient.verifiedStagedPackage(
+            at: destination
+        )
+        XCTAssertEqual(rollbackReverified.manifest, expected)
+    }
+
     func testNativeV2RequiresExplicitExactInitialExpectation() throws {
         let root = try makeNativePackage()
 
@@ -598,6 +711,49 @@ final class BrokerHelperPackageTests: XCTestCase {
         return root
     }
 
+    private func makeHelperBundle(
+        appReleaseVersion: String = "0.1.123",
+        appReleaseBuild: String = "1123000",
+        includeNativeBootstrap: Bool = true
+    ) throws -> Bundle {
+        let bundleRoot = FileManager.default.temporaryDirectory
+            .appendingPathComponent("KaisolaHelperTests-\(UUID().uuidString).bundle", isDirectory: true)
+        roots.append(bundleRoot)
+        let contents = bundleRoot.appendingPathComponent("Contents", isDirectory: true)
+        let resources = contents.appendingPathComponent("Resources", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: resources,
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o755]
+        )
+        _ = chmod(bundleRoot.path, 0o755)
+        _ = chmod(contents.path, 0o755)
+        _ = chmod(resources.path, 0o755)
+
+        try FileManager.default.copyItem(
+            at: makePackage(),
+            to: resources.appendingPathComponent("BrokerHelper", isDirectory: true)
+        )
+        try FileManager.default.copyItem(
+            at: makeNativePackage(includeBootstrap: includeNativeBootstrap),
+            to: resources.appendingPathComponent("BrokerSessionHelper", isDirectory: true)
+        )
+
+        let information: [String: Any] = [
+            "CFBundleIdentifier": "com.kaisola.tests.helper.\(UUID().uuidString)",
+            "CFBundlePackageType": "BNDL",
+            "CFBundleShortVersionString": appReleaseVersion,
+            "CFBundleVersion": appReleaseBuild,
+        ]
+        let informationData = try PropertyListSerialization.data(
+            fromPropertyList: information,
+            format: .xml,
+            options: 0
+        )
+        try informationData.write(to: contents.appendingPathComponent("Info.plist"))
+        return try XCTUnwrap(Bundle(url: bundleRoot))
+    }
+
     private func makeNativePackage(
         arguments: [String] = ["--shadow"],
         launchExecutable: String = "bin/kaisola-session-broker",
@@ -605,7 +761,8 @@ final class BrokerHelperPackageTests: XCTestCase {
         executableMode: Int = 0o755,
         designatedRequirement: String = "identifier \"com.kaisola.mac.session-broker\" and anchor apple generic",
         includeDuplicateExecutableRole: Bool = false,
-        includeUndeclaredMachOResource: Bool = false
+        includeUndeclaredMachOResource: Bool = false,
+        includeBootstrap: Bool = false
     ) throws -> URL {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("kaisola-native-helper-test-\(UUID().uuidString)", isDirectory: true)
@@ -648,6 +805,14 @@ final class BrokerHelperPackageTests: XCTestCase {
             data: executableData ?? thinMachO(cpuType: 0x0100000C),
             mode: executableMode
         )]
+        if includeBootstrap {
+            records.append(try writeRecord(
+                path: "bin/kaisola-broker-bootstrap",
+                role: "launch-agent-bootstrap",
+                data: thinMachO(cpuType: 0x0100000C),
+                mode: 0o755
+            ))
+        }
         if includeDuplicateExecutableRole {
             records.append(try writeRecord(
                 path: "bin/duplicate-session-broker",

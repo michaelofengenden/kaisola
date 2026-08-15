@@ -458,6 +458,7 @@ jobs:
           tests/node/companionProtocolTables.test.cjs
           tests/node/nativeAppcast.test.cjs
           tests/node/nativeBrokerPackage.test.cjs
+          tests/node/nativeDistributionSign.test.cjs
           tests/node/nativeReleaseCandidate.test.cjs
           tests/node/nativeReleasePreflight.test.cjs
           tests/node/nativeResourceGate.test.cjs

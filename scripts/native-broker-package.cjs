@@ -271,6 +271,25 @@ function validateNativeV2Manifest(manifest, policy) {
       fail(`native Mach-O must declare exactly arm64: ${record?.path}`)
     }
   }
+  if (policy.requireBootstrap === true) {
+    const bootstrapRecords = manifest.files.filter(
+      (record) => record?.role === 'launch-agent-bootstrap',
+    )
+    if (bootstrapRecords.length !== 1
+        || bootstrapRecords[0].path !== 'bin/kaisola-broker-bootstrap') {
+      fail('native package bootstrap is required at bin/kaisola-broker-bootstrap')
+    }
+    const bootstrap = bootstrapRecords[0]
+    if (bootstrap.mode !== '0755'
+        || !bootstrap.machO
+        || !Array.isArray(bootstrap.machO.architectures)
+        || bootstrap.machO.architectures.length !== 1
+        || bootstrap.machO.architectures[0] !== 'arm64'
+        || typeof bootstrap.machO.designatedRequirement !== 'string'
+        || bootstrap.machO.designatedRequirement.length < 1) {
+      fail('native bootstrap must be a signed arm64 Mach-O with mode 0755')
+    }
+  }
 }
 
 function createManifest(root, metadata) {
@@ -410,16 +429,104 @@ function signNestedCode(root, identity, entitlements) {
   }
 }
 
+function effectivePolicy(policy, appRelease) {
+  return appRelease ? { ...policy, appRelease } : policy
+}
+
+function assertCompleteAppRelease({ appReleaseVersion, appReleaseBuild }) {
+  const hasVersion = typeof appReleaseVersion === 'string'
+  const hasBuild = typeof appReleaseBuild === 'string'
+  if (hasVersion !== hasBuild) fail('app release version and build must be provided together')
+  return hasVersion ? { version: appReleaseVersion, build: appReleaseBuild } : null
+}
+
+function stageNativePackage({
+  output,
+  nativeBroker,
+  bootstrap,
+  signIdentity,
+  requireSignatures,
+  policy,
+  appRelease,
+  launchArguments,
+}) {
+  if (!output || !nativeBroker) fail('output and native broker are required')
+  if (!bootstrap) fail('native broker bootstrap is required')
+  const temporary = fs.mkdtempSync(path.join(path.dirname(output), '.broker-helper-'))
+  try {
+    ensureDirectory(temporary)
+    ensureDirectory(path.join(temporary, 'bin'))
+    copyFile(nativeBroker, path.join(temporary, 'bin', 'kaisola-session-broker'), 0o755)
+    copyFile(bootstrap, path.join(temporary, 'bin', 'kaisola-broker-bootstrap'), 0o755)
+
+    if (signIdentity) signNestedCode(temporary, signIdentity)
+
+    const manifest = createManifest(temporary, {
+      schemaVersion: policy.schemaVersion,
+      packageVersion: policy.packageVersion,
+      appRelease,
+      brokerImplementationVersion: policy.brokerImplementationVersion,
+      brokerProtocol: policy.brokerProtocol,
+      launch: {
+        kind: 'native',
+        executable: 'bin/kaisola-session-broker',
+        arguments: launchArguments,
+      },
+    })
+    fs.writeFileSync(path.join(temporary, manifestName), `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 })
+    verifyPackage(temporary, {
+      requireSignatures,
+      // A caller-supplied schema-2 policy cannot weaken the official staging
+      // contract. Generic verifier fixtures may omit a bootstrap, but every
+      // package emitted for the application must carry its signed launcher.
+      policy: {
+        ...effectivePolicy(policy, appRelease),
+        requireBootstrap: true,
+      },
+    })
+
+    fs.rmSync(output, { recursive: true, force: true })
+    fs.renameSync(temporary, output)
+    return manifest
+  } catch (error) {
+    fs.rmSync(temporary, { recursive: true, force: true })
+    throw error
+  }
+}
+
 function stagePackage({
   output,
-  runtimes,
+  runtimes = [],
   bootstrap,
   signIdentity,
   entitlements,
   requireSignatures = false,
   allowRuntimeMismatch = false,
+  nativeBroker,
+  appReleaseVersion,
+  appReleaseBuild,
+  launchArguments = [],
+  policyPath,
 }) {
-  const policy = readJSON(policyFile)
+  const policy = readJSON(policyPath || policyFile)
+  const appRelease = assertCompleteAppRelease({ appReleaseVersion, appReleaseBuild })
+  if (nativeBroker) {
+    if (runtimes.length) fail('native broker package cannot include Node runtimes')
+    if (allowRuntimeMismatch) fail('native broker package cannot use Node runtime options')
+    if (entitlements) fail('native broker package cannot use Node entitlements')
+    if (!appRelease) fail('native broker package requires app release version and build')
+    return stageNativePackage({
+      output,
+      nativeBroker,
+      bootstrap,
+      signIdentity,
+      requireSignatures,
+      policy,
+      appRelease,
+      launchArguments,
+    })
+  }
+  if (appRelease || launchArguments.length) fail('app release and launch arguments require --native-broker')
   if (!output || !Array.isArray(runtimes) || runtimes.length < 1) fail('output and at least one Node runtime are required')
   const temporary = fs.mkdtempSync(path.join(path.dirname(output), '.broker-helper-'))
   try {
@@ -502,7 +609,7 @@ function stagePackage({
 }
 
 function parseArguments(argv) {
-  const options = { runtimes: [] }
+  const options = { runtimes: [], launchArguments: [] }
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]
     const value = () => {
@@ -511,7 +618,12 @@ function parseArguments(argv) {
     }
     if (argument === '--output') options.output = path.resolve(value())
     else if (argument === '--runtime' || argument === '--runtime-arm64' || argument === '--runtime-x86_64') options.runtimes.push(path.resolve(value()))
+    else if (argument === '--native-broker') options.nativeBroker = path.resolve(value())
     else if (argument === '--bootstrap') options.bootstrap = path.resolve(value())
+    else if (argument === '--app-release-version') options.appReleaseVersion = value()
+    else if (argument === '--app-release-build') options.appReleaseBuild = value()
+    else if (argument === '--launch-argument') options.launchArguments.push(value())
+    else if (argument === '--policy') options.policyPath = path.resolve(value())
     else if (argument === '--sign-identity') options.signIdentity = value()
     else if (argument === '--entitlements') options.entitlements = path.resolve(value())
     else if (argument === '--require-signatures') options.requireSignatures = true
@@ -526,7 +638,19 @@ if (require.main === module) {
   try {
     const options = parseArguments(process.argv.slice(2))
     if (options.verify) {
-      const manifest = verifyPackage(options.verify, { requireSignatures: options.requireSignatures })
+      const appRelease = assertCompleteAppRelease(options)
+      if (options.nativeBroker || options.runtimes.length || options.bootstrap || options.launchArguments.length
+          || options.signIdentity || options.entitlements || options.allowRuntimeMismatch) {
+        fail('--verify cannot be combined with package staging inputs')
+      }
+      const policy = effectivePolicy(readJSON(options.policyPath || policyFile), appRelease)
+      const manifest = verifyPackage(options.verify, { requireSignatures: options.requireSignatures, policy })
+      // The app-release seal is the property a schema-2 verification exists
+      // to prove. Without an expectation from the flags or the policy file,
+      // that check silently never ran — refuse to report PASS on it.
+      if (manifest.schemaVersion === 2 && !policy.appRelease) {
+        fail('schema-2 verification requires an app release expectation (--app-release-version/--app-release-build or a policy appRelease block)')
+      }
       console.log(`NATIVE_BROKER_PACKAGE_VERIFY=PASS package=${manifest.packageVersion} files=${manifest.files.length}`)
     } else {
       const manifest = stagePackage(options)

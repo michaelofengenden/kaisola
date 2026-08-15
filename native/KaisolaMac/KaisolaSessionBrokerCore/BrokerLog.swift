@@ -24,6 +24,7 @@ public final class BrokerLog: @unchecked Sendable {
         "broker.inventory",
         "broker.shutdown",
         "broker.shutdownForUpdate",
+        "broker.prepareCleanStartRollback",
         "broker.prepareRollingUpdate",
         "broker.cancelRollingUpdate",
         "broker.retireDraining",

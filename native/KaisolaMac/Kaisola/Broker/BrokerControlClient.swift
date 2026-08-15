@@ -148,7 +148,8 @@ extension BrokerControlServing {
 /// streams from. Reads never travel here; writes never travel there. The
 /// broker's own ownership model (attach-before-write, stale-write rejection)
 /// stays the final authority on every mutation.
-actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
+actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting,
+    BrokerCleanStartRollbackRequesting {
     typealias DisconnectHandler = @Sendable (any Error) -> Void
     enum UpgradeLifecycleState: Equatable, Sendable {
         case current
@@ -162,11 +163,14 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         /// `broker-administration-v1`. It uses the old controller/owner-0 wire
         /// shape but is never exposed through `BrokerControlServing`.
         case sealedLegacyAdministrator
+        /// Dedicated schema-2 clean-start authority. This wire role can invoke
+        /// only the Swift broker's empty-and-fence rollback mutation.
+        case swiftCleanStartRollback
 
         var wireValue: String {
             switch self {
             case .controller, .sealedLegacyAdministrator: "controller"
-            case .administrator: "administrator"
+            case .administrator, .swiftCleanStartRollback: "administrator"
             }
         }
     }
@@ -286,7 +290,7 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
         try info.validate()
         let ownerIDIsValid: Bool
         switch access {
-        case .administrator, .sealedLegacyAdministrator:
+        case .administrator, .sealedLegacyAdministrator, .swiftCleanStartRollback:
             ownerIDIsValid = ownerID == "0"
         case .controller:
             ownerIDIsValid = !ownerID.isEmpty && ownerID != "0"
@@ -328,6 +332,8 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             ]
             if access == .administrator {
                 requestedFeatures.append(.string(BrokerWire.brokerAdministrationFeature))
+            } else if access == .swiftCleanStartRollback {
+                requestedFeatures.append(.string(BrokerWire.swiftCleanStartRollbackFeature))
             }
             let frame: JSONValue = .object([
                 "type": .string("hello"),
@@ -606,6 +612,47 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
                     "expectedContentDigest": .string(runningDigest),
                     "targetContentDigest": .string(targetContentDigest),
                     "stabilityWindowMs": .integer(300),
+                ])
+            )
+            let decision = try Self.upgradeDecision(result)
+            await disconnect()
+            return decision
+        } catch {
+            await disconnect()
+            throw error
+        }
+    }
+
+    func requestCleanStartRollback(
+        from info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws -> BrokerUpgradeDecision {
+        guard authorization == .sealedLegacyFallback,
+              info.packageSchema == BrokerWire.nativeHelperPackageSchema,
+              let runningDigest = info.contentDigest,
+              BrokerHelperPackageVerification.isLowercaseSHA256(runningDigest),
+              BrokerHelperPackageVerification.isLowercaseSHA256(targetContentDigest),
+              runningDigest != targetContentDigest else {
+            throw BrokerClientError.requestFailed("broker helper identity")
+        }
+        do {
+            try await connect(
+                to: info,
+                ownerID: "0",
+                access: .swiftCleanStartRollback
+            )
+            guard connectedFeatures.contains(BrokerWire.swiftCleanStartRollbackFeature) else {
+                throw BrokerClientError.requestFailed("Swift clean-start rollback capability")
+            }
+            let result = try await requestMutation(
+                "broker.prepareCleanStartRollback",
+                params: .object([
+                    "ownerId": .string("0"),
+                    "expectedPid": .integer(Int64(info.pid)),
+                    "expectedStartedAt": .integer(info.startedAt),
+                    "expectedContentDigest": .string(runningDigest),
+                    "targetContentDigest": .string(targetContentDigest),
                 ])
             )
             let decision = try Self.upgradeDecision(result)
@@ -1006,6 +1053,12 @@ actor BrokerControlClient: BrokerControlServing, BrokerRollingUpdateRequesting {
             if expectedIdentity.access == .administrator {
                 guard features.contains(BrokerWire.brokerAdministrationFeature),
                       negotiatedFeatures.contains(BrokerWire.brokerAdministrationFeature) else {
+                    throw BrokerClientError.authenticationRejected
+                }
+            } else if expectedIdentity.access == .swiftCleanStartRollback {
+                guard features.contains(BrokerWire.swiftCleanStartRollbackFeature),
+                      negotiatedFeatures.contains(BrokerWire.swiftCleanStartRollbackFeature),
+                      !negotiatedFeatures.contains(BrokerWire.brokerAdministrationFeature) else {
                     throw BrokerClientError.authenticationRejected
                 }
             } else {

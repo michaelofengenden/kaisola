@@ -1632,6 +1632,7 @@ final class SwiftSessionBrokerFreshWireTests: XCTestCase {
         XCTAssertEqual(drained, response)
         let ended = await queue.next()
         XCTAssertNil(ended)
+        XCTAssertTrue(queue.completedOrderly)
 
         let discarding = BrokerOutboundFrameQueue()
         XCTAssertTrue(discarding.enqueue(response, maxQueueBytes: nil, force: false))
@@ -1639,6 +1640,7 @@ final class SwiftSessionBrokerFreshWireTests: XCTestCase {
         XCTAssertFalse(discarding.enqueue(response, maxQueueBytes: nil, force: true))
         let dropped = await discarding.next()
         XCTAssertNil(dropped)
+        XCTAssertFalse(discarding.completedOrderly)
     }
 
     private var cleanTerminalEnvironment: [String: String] {

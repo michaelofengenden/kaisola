@@ -370,6 +370,7 @@
 		FA8353B1B2AB10089716A151 /* ObserveOnlyBrokerPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7DE33FAC2761474B7B6A46A2 /* ObserveOnlyBrokerPolicyTests.swift */; };
 		FB7229562C7FBCA9222943F5 /* MemoryEfficiencyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3CDC4E10ECDC8ECE407EBA0E /* MemoryEfficiencyTests.swift */; };
 		FBB4B0FC354CDCDF1137BC9D /* CompanionLinkClientTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1B38FA4E8BE113F582193C3D /* CompanionLinkClientTests.swift */; };
+		FDC5506D285BD3B14AF4EE60 /* BrokerGenerationLifecycle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6FF657FB212FB208007032B5 /* BrokerGenerationLifecycle.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -400,6 +401,13 @@
 			proxyType = 1;
 			remoteGlobalIDString = 9B50D5869255FBBB6D735F0F;
 			remoteInfo = Kaisola;
+		};
+		C15E1FD744DEEB6A74694F4C /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 6A7B0045E39934C243044438 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = C1257D48B7D18F8C7A09749F;
+			remoteInfo = KaisolaSessionBroker;
 		};
 		D839152744A3B4DC8274FA0B /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -567,6 +575,7 @@
 		6E5069F25B113346A58119D3 /* FilePreviewRecovery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FilePreviewRecovery.swift; sourceTree = "<group>"; };
 		6E78A73E4BF5DABAB5BF6826 /* NativePreviewPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewPaths.swift; sourceTree = "<group>"; };
 		6EB61D36CC5BEB88B707C9D7 /* AppModel+Pinning.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppModel+Pinning.swift"; sourceTree = "<group>"; };
+		6FF657FB212FB208007032B5 /* BrokerGenerationLifecycle.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerGenerationLifecycle.swift; sourceTree = "<group>"; };
 		715B03F60293662C778FCB2C /* GlobalHotkeyCenter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GlobalHotkeyCenter.swift; sourceTree = "<group>"; };
 		715C7A32E47628665B42A2F0 /* DarwinPTYProcess.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DarwinPTYProcess.swift; sourceTree = "<group>"; };
 		723801032158344A02236DFE /* UnifiedSessionCardStateTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnifiedSessionCardStateTests.swift; sourceTree = "<group>"; };
@@ -933,6 +942,7 @@
 			children = (
 				5C46CF60802D04C20404D2DF /* BrokerAuthentication.swift */,
 				5E41619A5DB920EB695D01FD /* BrokerConnection.swift */,
+				6FF657FB212FB208007032B5 /* BrokerGenerationLifecycle.swift */,
 				50FBA8BAA80816C3072B1FC3 /* BrokerLog.swift */,
 				911A85E1C6FBFB0A08B51446 /* BrokerProtocolTypes.swift */,
 				9608644964317043ED13E235 /* BrokerRequestGate.swift */,
@@ -1459,6 +1469,7 @@
 			);
 			dependencies = (
 				C3BB6821756EB54E127DF543 /* PBXTargetDependency */,
+				BF6C756AC77AE92AD325E211 /* PBXTargetDependency */,
 			);
 			name = Kaisola;
 			packageProductDependencies = (
@@ -1588,7 +1599,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\nlaunch_agents=\"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents\"\nmkdir -p \"${launch_agents}\"\ncp \"${SRCROOT}/BrokerHelper/com.kaisola.mac.broker-bootstrap.plist\" \"${launch_agents}/com.kaisola.mac.broker-bootstrap.plist\"\n\nif [[ \"${CONFIGURATION}\" != \"Release\" && \"${CONFIGURATION}\" != \"LocalRelease\" && \"${KAISOLA_PACKAGE_BROKER_HELPER:-0}\" != \"1\" ]]; then\n  exit 0\nfi\n\nruntime_arm64=\"${KAISOLA_NODE_RUNTIME_ARM64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-arm64/bin/node}\"\nruntime_x64=\"${KAISOLA_NODE_RUNTIME_X86_64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-x64/bin/node}\"\nif [[ ! -x \"${runtime_arm64}\" ]]; then\n  echo \"Missing pinned arm64 Node runtime. Run: node scripts/download-native-node-runtime.cjs arm64\" >&2\n  exit 1\nfi\n\nargs=(\n  --output \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BrokerHelper\"\n  --runtime-arm64 \"${runtime_arm64}\"\n  --bootstrap \"${BUILT_PRODUCTS_DIR}/KaisolaBrokerBootstrap\"\n  --entitlements \"${SRCROOT}/BrokerHelper/BrokerHelper.entitlements\"\n)\nif [[ \" ${ARCHS} \" == *\" x86_64 \"* ]]; then\n  if [[ ! -x \"${runtime_x64}\" ]]; then\n    echo \"Missing pinned x86_64 Node runtime. Run: node scripts/download-native-node-runtime.cjs x86_64\" >&2\n    exit 1\n  fi\n  args+=(--runtime-x86_64 \"${runtime_x64}\")\nfi\nif [[ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ]]; then\n  args+=(--sign-identity \"${EXPANDED_CODE_SIGN_IDENTITY}\" --require-signatures)\nfi\n/usr/bin/env node \"${SRCROOT}/../../scripts/native-broker-package.cjs\" \"${args[@]}\"\n";
+			shellScript = "set -euo pipefail\nlaunch_agents=\"${TARGET_BUILD_DIR}/${CONTENTS_FOLDER_PATH}/Library/LaunchAgents\"\nmkdir -p \"${launch_agents}\"\ncp \"${SRCROOT}/BrokerHelper/com.kaisola.mac.broker-bootstrap.plist\" \"${launch_agents}/com.kaisola.mac.broker-bootstrap.plist\"\n\nif [[ \"${CONFIGURATION}\" != \"Release\" && \"${CONFIGURATION}\" != \"LocalRelease\" && \"${KAISOLA_PACKAGE_BROKER_HELPER:-0}\" != \"1\" ]]; then\n  exit 0\nfi\n\nruntime_arm64=\"${KAISOLA_NODE_RUNTIME_ARM64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-arm64/bin/node}\"\nruntime_x64=\"${KAISOLA_NODE_RUNTIME_X86_64:-${SRCROOT}/.artifacts/node-v22.23.1-darwin-x64/bin/node}\"\nif [[ ! -x \"${runtime_arm64}\" ]]; then\n  echo \"Missing pinned arm64 Node runtime. Run: node scripts/download-native-node-runtime.cjs arm64\" >&2\n  exit 1\nfi\n\nargs=(\n  --output \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BrokerHelper\"\n  --runtime-arm64 \"${runtime_arm64}\"\n  --bootstrap \"${BUILT_PRODUCTS_DIR}/KaisolaBrokerBootstrap\"\n  --entitlements \"${SRCROOT}/BrokerHelper/BrokerHelper.entitlements\"\n)\nif [[ \" ${ARCHS} \" == *\" x86_64 \"* ]]; then\n  if [[ ! -x \"${runtime_x64}\" ]]; then\n    echo \"Missing pinned x86_64 Node runtime. Run: node scripts/download-native-node-runtime.cjs x86_64\" >&2\n    exit 1\n  fi\n  args+=(--runtime-x86_64 \"${runtime_x64}\")\nfi\nif [[ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ]]; then\n  args+=(--sign-identity \"${EXPANDED_CODE_SIGN_IDENTITY}\" --require-signatures)\nfi\n/usr/bin/env node \"${SRCROOT}/../../scripts/native-broker-package.cjs\" \"${args[@]}\"\n\n# Keep the development-selected Swift engine in its own digest-sealed\n# schema-2 root. It must never be nested inside the stable Node helper\n# package, and it must never inherit Node's JIT entitlements.\nnative_args=(\n  --output \"${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BrokerSessionHelper\"\n  --native-broker \"${BUILT_PRODUCTS_DIR}/KaisolaSessionBroker\"\n  --bootstrap \"${BUILT_PRODUCTS_DIR}/KaisolaBrokerBootstrap\"\n  --policy \"${SRCROOT}/BrokerHelper/native-package-policy.json\"\n  --app-release-version \"${MARKETING_VERSION}\"\n  --app-release-build \"${CURRENT_PROJECT_VERSION}\"\n)\nif [[ -n \"${EXPANDED_CODE_SIGN_IDENTITY:-}\" ]]; then\n  native_args+=(--sign-identity \"${EXPANDED_CODE_SIGN_IDENTITY}\" --require-signatures)\nfi\n/usr/bin/env node \"${SRCROOT}/../../scripts/native-broker-package.cjs\" \"${native_args[@]}\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -1607,6 +1618,7 @@
 			files = (
 				B68BE361569352A22826DEC3 /* BrokerAuthentication.swift in Sources */,
 				50279221F9A37C996D021083 /* BrokerConnection.swift in Sources */,
+				FDC5506D285BD3B14AF4EE60 /* BrokerGenerationLifecycle.swift in Sources */,
 				1F5D94ECB9133B884B3DD0BC /* BrokerLog.swift in Sources */,
 				3B6F860742DA560F55B27009 /* BrokerProtocolTypes.swift in Sources */,
 				9DB217E145925411CB5A2A84 /* BrokerRequestGate.swift in Sources */,
@@ -2003,6 +2015,11 @@
 			isa = PBXTargetDependency;
 			target = 17E8C989CC3B5148CB5E9F8D /* KaisolaSessionBrokerCore */;
 			targetProxy = 47609B9F37DDA655235E3640 /* PBXContainerItemProxy */;
+		};
+		BF6C756AC77AE92AD325E211 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = C1257D48B7D18F8C7A09749F /* KaisolaSessionBroker */;
+			targetProxy = C15E1FD744DEEB6A74694F4C /* PBXContainerItemProxy */;
 		};
 		C3BB6821756EB54E127DF543 /* PBXTargetDependency */ = {
 			isa = PBXTargetDependency;

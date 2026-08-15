@@ -46,8 +46,9 @@ targets:
         ONLY_ACTIVE_ARCH: NO
         SKIP_INSTALL: YES
 
-  # Phase-2 shadow executable. It is a separate, arm64-only build product:
-  # the shipping app neither depends on it nor copies it into the bundle.
+  # Arm64-only Swift broker. The application depends on the build product but
+  # never embeds the loose executable; the post-build phase below seals it in
+  # the distinct schema-2 BrokerSessionHelper package.
   KaisolaSessionBroker:
     type: tool
     platform: macOS
@@ -118,6 +119,9 @@ targets:
         buildPhase: resources
     dependencies:
       - target: KaisolaBrokerBootstrap
+        embed: false
+        link: false
+      - target: KaisolaSessionBroker
         embed: false
         link: false
       - package: KaisolaCore
@@ -214,6 +218,22 @@ targets:
             args+=(--sign-identity "${EXPANDED_CODE_SIGN_IDENTITY}" --require-signatures)
           fi
           /usr/bin/env node "${SRCROOT}/../../scripts/native-broker-package.cjs" "${args[@]}"
+
+          # Keep the development-selected Swift engine in its own digest-sealed
+          # schema-2 root. It must never be nested inside the stable Node helper
+          # package, and it must never inherit Node's JIT entitlements.
+          native_args=(
+            --output "${TARGET_BUILD_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}/BrokerSessionHelper"
+            --native-broker "${BUILT_PRODUCTS_DIR}/KaisolaSessionBroker"
+            --bootstrap "${BUILT_PRODUCTS_DIR}/KaisolaBrokerBootstrap"
+            --policy "${SRCROOT}/BrokerHelper/native-package-policy.json"
+            --app-release-version "${MARKETING_VERSION}"
+            --app-release-build "${CURRENT_PROJECT_VERSION}"
+          )
+          if [[ -n "${EXPANDED_CODE_SIGN_IDENTITY:-}" ]]; then
+            native_args+=(--sign-identity "${EXPANDED_CODE_SIGN_IDENTITY}" --require-signatures)
+          fi
+          /usr/bin/env node "${SRCROOT}/../../scripts/native-broker-package.cjs" "${native_args[@]}"
 
   KaisolaTests:
     type: bundle.unit-test

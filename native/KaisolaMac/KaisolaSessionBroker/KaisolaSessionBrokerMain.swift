@@ -37,7 +37,17 @@ enum KaisolaSessionBrokerMain {
         } catch {
             let message = "kaisola-session-broker: \(error.localizedDescription)\n"
             FileHandle.standardError.write(Data(message.utf8))
-            Darwin.exit(EXIT_FAILURE)
+            let exitCode: Int32
+            if let lifecycleError = error as? BrokerGenerationLifecycleError,
+               lifecycleError.isGenerationLockUnavailable {
+                // Preserve the Node broker's distinct busy-generation exit so
+                // launch diagnostics can separate a live owner from malformed
+                // configuration or listener startup failures.
+                exitCode = 2
+            } else {
+                exitCode = EXIT_FAILURE
+            }
+            Darwin.exit(exitCode)
         }
     }
 }

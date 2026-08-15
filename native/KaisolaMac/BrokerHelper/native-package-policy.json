@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 2,
+  "packageVersion": "2.0.0",
+  "requireBootstrap": true,
+  "brokerImplementationVersion": 2,
+  "brokerProtocol": {
+    "minimum": 2,
+    "maximum": 2,
+    "securityEpoch": 1
+  }
+}

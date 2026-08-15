@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import XCTest
+import KaisolaBrokerProtocol
 @testable import Kaisola
 
 final class BrokerStartupCoordinatorTests: XCTestCase {
@@ -30,6 +31,51 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         XCTAssertEqual(info.contentDigest, String(repeating: "d", count: 64))
         let launchCount = await launcher.launchCount
         XCTAssertEqual(launchCount, 1)
+        let launchConfiguration = await launcher.lastLaunchConfiguration
+        XCTAssertNil(launchConfiguration?.appReleaseVersion)
+        XCTAssertNil(launchConfiguration?.appReleaseBuild)
+        await launcher.close()
+    }
+
+    func testNativePackageLaunchSealsVerifiedAppReleasePair() async throws {
+        let home = try privateTemporaryDirectory()
+        let profile = home.appendingPathComponent("Kaisola", isDirectory: true)
+        let manifest = try JSONDecoder().decode(
+            BrokerHelperManifest.self,
+            from: JSONSerialization.data(withJSONObject: [
+                "schemaVersion": BrokerWire.nativeHelperPackageSchema,
+                "packageVersion": "2.0.0",
+                "contentDigest": String(repeating: "e", count: 64),
+                "brokerImplementationVersion": BrokerWire.implementationVersion,
+                "brokerProtocol": [
+                    "minimum": BrokerWire.protocolVersion,
+                    "maximum": BrokerWire.protocolVersion,
+                    "securityEpoch": BrokerWire.securityEpoch,
+                ],
+                "appRelease": ["version": "0.1.125", "build": "125"],
+                "launch": [
+                    "kind": "native",
+                    "executable": "bin/kaisola-session-broker",
+                    "arguments": [],
+                ],
+                "files": [],
+            ])
+        )
+        let launcher = FakeBrokerHelperLauncher(manifest: manifest)
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test"
+        )
+
+        _ = try await coordinator.prepare()
+        let captured = await launcher.lastLaunchConfiguration
+        let configuration = try XCTUnwrap(captured)
+        XCTAssertEqual(configuration.packageSchema, BrokerWire.nativeHelperPackageSchema)
+        XCTAssertEqual(configuration.packageVersion, "2.0.0")
+        XCTAssertEqual(configuration.appReleaseVersion, "0.1.125")
+        XCTAssertEqual(configuration.appReleaseBuild, "125")
         await launcher.close()
     }
 
@@ -774,6 +820,127 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         XCTAssertTrue(state.detail.contains(String(repeating: "d", count: 64)))
         XCTAssertEqual(requestCount, 1)
         XCTAssertEqual(launchCount, 0)
+    }
+
+    func testUnsettingSwiftSelectorRecoversAnAmbiguousReplyAfterCleanNativeShutdown() async throws {
+        let home = try privateTemporaryDirectory()
+        let nativeDigest = String(repeating: "e", count: 64)
+        let nodeDigest = String(repeating: "d", count: 64)
+        let childPID = try spawnPausedChild()
+        defer {
+            _ = Darwin.kill(childPID, SIGKILL)
+            var status: Int32 = 0
+            _ = waitpid(childPID, &status, WNOHANG)
+        }
+        let live = try makeRegisteredLiveBroker(
+            home: home,
+            contentDigest: nativeDigest,
+            packageSchema: BrokerWire.nativeHelperPackageSchema,
+            packageVersion: "2.0.0",
+            pid: childPID
+        )
+        defer { Darwin.close(live.descriptor) }
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let metadataPath = store.metadataURL(
+            for: BrokerGenerationRecord(
+                id: nativeDigest,
+                role: .current,
+                info: live.info,
+                packageRoot: live.profile
+                    .appendingPathComponent("broker-generations", isDirectory: true)
+                    .appendingPathComponent(nativeDigest, isDirectory: true)
+                    .path,
+                registeredAt: 1
+            )
+        ).path
+        let socketPath = live.info.socketPath
+        let requester = FakeCleanStartRollbackRequester(throwsAfterCleanStart: true) {
+            _ = Darwin.kill(childPID, SIGTERM)
+            var status: Int32 = 0
+            _ = waitpid(childPID, &status, 0)
+            _ = metadataPath.withCString(Darwin.unlink)
+            _ = socketPath.withCString(Darwin.unlink)
+        }
+        let launcher = FakeBrokerHelperLauncher(
+            contentDigest: nodeDigest,
+            stagedManifests: [nativeDigest: try nativeBrokerManifest(contentDigest: nativeDigest)]
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true
+        )
+
+        let replacement = try await coordinator.prepare()
+        let registry = try store.load()
+        let normalCalls = await requester.upgradeCallCount()
+        let cleanCalls = await requester.cleanStartCallCount()
+        let authorizations = await requester.recordedCleanStartAuthorizations()
+        let launchCalls = await launcher.launchCount
+
+        XCTAssertEqual(replacement.contentDigest, nodeDigest)
+        XCTAssertEqual(replacement.packageSchema, BrokerWire.nodeHelperPackageSchema)
+        XCTAssertEqual(registry.currentGenerationID, nodeDigest)
+        XCTAssertEqual(registry.topology?.current.info, replacement)
+        XCTAssertTrue(registry.topology?.draining.isEmpty == true)
+        XCTAssertEqual(normalCalls, 1)
+        XCTAssertEqual(cleanCalls, 1)
+        XCTAssertEqual(authorizations, [.sealedLegacyFallback])
+        XCTAssertEqual(launchCalls, 1)
+        await launcher.close()
+    }
+
+    func testUnsettingSwiftSelectorPreservesNativeGenerationWhenAmbiguousRequestLeavesItLive() async throws {
+        let home = try privateTemporaryDirectory()
+        let nativeDigest = String(repeating: "e", count: 64)
+        let nodeDigest = String(repeating: "d", count: 64)
+        let childPID = try spawnPausedChild()
+        defer {
+            _ = Darwin.kill(childPID, SIGKILL)
+            var status: Int32 = 0
+            _ = waitpid(childPID, &status, 0)
+        }
+        let live = try makeRegisteredLiveBroker(
+            home: home,
+            contentDigest: nativeDigest,
+            packageSchema: BrokerWire.nativeHelperPackageSchema,
+            packageVersion: "2.0.0",
+            pid: childPID
+        )
+        defer { Darwin.close(live.descriptor) }
+        let requester = FakeCleanStartRollbackRequester(throwsAfterCleanStart: true) {}
+        let launcher = FakeBrokerHelperLauncher(
+            contentDigest: nodeDigest,
+            stagedManifests: [nativeDigest: try nativeBrokerManifest(contentDigest: nativeDigest)]
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: requester,
+            rollingUpdatesEnabled: true,
+            sleep: { _ in throw BrokerClientError.requestFailed("stop test wait") }
+        )
+
+        let adopted = try await coordinator.prepare()
+        let state = await coordinator.upgradeState()
+        let launchCalls = await launcher.launchCount
+        let cleanCalls = await requester.cleanStartCallCount()
+
+        XCTAssertEqual(adopted, live.info)
+        XCTAssertTrue(live.info.isProcessAlive)
+        XCTAssertEqual(launchCalls, 0)
+        XCTAssertEqual(cleanCalls, 1)
+        XCTAssertEqual(state, .pending(
+            fromContentDigest: nativeDigest,
+            targetContentDigest: nodeDigest,
+            reason: .requestUnavailable
+        ))
+        await launcher.close()
     }
 
     func testLegacyLiveBrokerIsPreservedWithoutARacyClientSideShutdown() async throws {
@@ -2177,7 +2344,10 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
 
     private func makeRegisteredLiveBroker(
         home: URL,
-        contentDigest: String
+        contentDigest: String,
+        packageSchema: Int = BrokerWire.nodeHelperPackageSchema,
+        packageVersion: String = "old-package",
+        pid: Int32 = getpid()
     ) throws -> (profile: URL, descriptor: Int32, info: BrokerInfo) {
         let profile = home.appendingPathComponent("Kaisola", isDirectory: true)
         let broker = profile.appendingPathComponent("session-broker", isDirectory: true)
@@ -2207,10 +2377,10 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             protocolVersion: 2,
             securityEpoch: 1,
             implementationVersion: 2,
-            packageSchema: 1,
-            packageVersion: "old-package",
+            packageSchema: packageSchema,
+            packageVersion: packageVersion,
             contentDigest: contentDigest,
-            pid: getpid(),
+            pid: pid,
             socketPath: socket.path,
             token: String(repeating: "b", count: 64),
             startedAt: 1,
@@ -2233,6 +2403,30 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             now: 1
         )
         return (profile, descriptor, info)
+    }
+
+    private func nativeBrokerManifest(contentDigest: String) throws -> BrokerHelperManifest {
+        try JSONDecoder().decode(
+            BrokerHelperManifest.self,
+            from: JSONSerialization.data(withJSONObject: [
+                "schemaVersion": BrokerWire.nativeHelperPackageSchema,
+                "packageVersion": "2.0.0",
+                "contentDigest": contentDigest,
+                "brokerImplementationVersion": BrokerWire.implementationVersion,
+                "brokerProtocol": [
+                    "minimum": BrokerWire.protocolVersion,
+                    "maximum": BrokerWire.protocolVersion,
+                    "securityEpoch": BrokerWire.securityEpoch,
+                ],
+                "appRelease": ["version": "0.1.125", "build": "125"],
+                "launch": [
+                    "kind": "native",
+                    "executable": "bin/kaisola-session-broker",
+                    "arguments": [],
+                ],
+                "files": [],
+            ])
+        )
     }
 
     private func makeDeadCurrentWithDrains(
@@ -2440,6 +2634,51 @@ private actor FakeBrokerUpgradeRequester: BrokerUpgradeRequesting {
         callCount += 1
         authorizations.append(authorization)
         return decision
+    }
+}
+
+private actor FakeCleanStartRollbackRequester: BrokerCleanStartRollbackRequesting {
+    private let onCleanStart: @Sendable () -> Void
+    private let throwsAfterCleanStart: Bool
+    private var upgrades = 0
+    private var cleanStarts = 0
+    private var cleanStartAuthorizations: [BrokerUpgradeAuthorization] = []
+
+    init(
+        throwsAfterCleanStart: Bool = false,
+        onCleanStart: @escaping @Sendable () -> Void
+    ) {
+        self.throwsAfterCleanStart = throwsAfterCleanStart
+        self.onCleanStart = onCleanStart
+    }
+
+    func requestUpgrade(
+        from info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws -> BrokerUpgradeDecision {
+        upgrades += 1
+        throw BrokerClientError.requestFailed("broker sealed update capability")
+    }
+
+    func requestCleanStartRollback(
+        from info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws -> BrokerUpgradeDecision {
+        cleanStarts += 1
+        cleanStartAuthorizations.append(authorization)
+        onCleanStart()
+        if throwsAfterCleanStart {
+            throw BrokerClientError.requestFailed("ambiguous clean-start response")
+        }
+        return .accepted
+    }
+
+    func upgradeCallCount() -> Int { upgrades }
+    func cleanStartCallCount() -> Int { cleanStarts }
+    func recordedCleanStartAuthorizations() -> [BrokerUpgradeAuthorization] {
+        cleanStartAuthorizations
     }
 }
 
@@ -2678,30 +2917,38 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
     private let contentDigest: String
     private let rejectedStagedDigests: Set<String>
     private let failLaunch: Bool
+    private let stagedManifests: [String: BrokerHelperManifest]
     private let onLaunch: @Sendable () async throws -> Void
     private let afterLaunch: @Sendable () async throws -> Void
     private(set) var launchCount = 0
+    private(set) var lastLaunchConfiguration: BrokerLaunchConfiguration?
+    private let manifest: BrokerHelperManifest?
     private var descriptor: Int32 = -1
     private var socketURL: URL?
 
     init(
         implementationVersion: Int = 1,
         contentDigest: String = String(repeating: "d", count: 64),
+        manifest: BrokerHelperManifest? = nil,
         rejectedStagedDigests: Set<String> = [],
+        stagedManifests: [String: BrokerHelperManifest] = [:],
         failLaunch: Bool = false,
         onLaunch: @escaping @Sendable () async throws -> Void = {},
         afterLaunch: @escaping @Sendable () async throws -> Void = {}
     ) {
-        self.implementationVersion = implementationVersion
-        self.contentDigest = contentDigest
+        self.implementationVersion = manifest?.brokerImplementationVersion ?? implementationVersion
+        self.contentDigest = manifest?.contentDigest ?? contentDigest
+        self.manifest = manifest
         self.rejectedStagedDigests = rejectedStagedDigests
+        self.stagedManifests = stagedManifests
         self.failLaunch = failLaunch
         self.onLaunch = onLaunch
         self.afterLaunch = afterLaunch
     }
 
     func packageManifest() async throws -> BrokerHelperManifest {
-        BrokerHelperManifest(
+        if let manifest { return manifest }
+        return BrokerHelperManifest(
             schemaVersion: 1,
             packageVersion: "test-package",
             contentDigest: contentDigest,
@@ -2726,6 +2973,9 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
         let digest = root.lastPathComponent
         guard !rejectedStagedDigests.contains(digest) else {
             throw BrokerHelperPackageError.stagedPackageMismatch
+        }
+        if let staged = stagedManifests[digest] {
+            return VerifiedBrokerHelperPackage(root: root, manifest: staged)
         }
         let packageVersion = digest == contentDigest
             ? "test-package"
@@ -2753,6 +3003,7 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
             BrokerLaunchConfiguration.self,
             from: Data(contentsOf: configurationURL)
         )
+        lastLaunchConfiguration = configuration
         let socket = URL(fileURLWithPath: configuration.socketPath)
         descriptor = try bindUnixSocket(at: socket)
         socketURL = socket

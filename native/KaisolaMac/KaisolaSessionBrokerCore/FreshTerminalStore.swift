@@ -1,4 +1,5 @@
 import Foundation
+import KaisolaBrokerProtocol
 
 public struct FreshTerminalSpawnRequest: Equatable, Sendable {
     public let command: String
@@ -323,7 +324,6 @@ public enum FreshTerminalStoreError: Error, Equatable, LocalizedError, Sendable 
 
 public actor FreshTerminalStore {
     private enum Limits {
-        static let maximumLiveTerminals = 64
         static let maximumRetainedExitedTerminals = 64
         static let outputTailBytes = 512 * 1_024
         static let maximumTerminalIDCharacters = 240
@@ -371,6 +371,7 @@ public actor FreshTerminalStore {
     }
 
     private let factory: any FreshTerminalProcessFactory
+    private let maximumLiveTerminals: Int
     private let activityClock = FreshTerminalActivityClock()
     private let eventSinkBox = FreshTerminalEventSinkBox()
     private var records: [String: Record] = [:]
@@ -379,8 +380,15 @@ public actor FreshTerminalStore {
     private var isShuttingDown = false
     private var exitSequence: UInt64 = 0
 
-    public init(factory: any FreshTerminalProcessFactory) {
+    public init(
+        factory: any FreshTerminalProcessFactory,
+        maximumLiveTerminals: Int = BrokerWire.defaultMaximumLiveTerminals
+    ) {
         self.factory = factory
+        self.maximumLiveTerminals = min(
+            max(maximumLiveTerminals, 1),
+            BrokerWire.maximumConfigurableLiveTerminals
+        )
     }
 
     /// Installed once by the broker service. Nonisolated because deliveries
@@ -459,9 +467,9 @@ public actor FreshTerminalStore {
             throw FreshTerminalStoreError.terminalCreationInProgress
         }
         let liveCount = records.values.lazy.filter { !$0.exited }.count
-        guard liveCount + pendingCreates.count < Limits.maximumLiveTerminals else {
+        guard liveCount + pendingCreates.count < maximumLiveTerminals else {
             throw FreshTerminalStoreError.capacityExceeded(
-                maximum: Limits.maximumLiveTerminals
+                maximum: maximumLiveTerminals
             )
         }
 

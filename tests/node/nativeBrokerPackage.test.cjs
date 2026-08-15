@@ -5,6 +5,7 @@ const assert = require('node:assert/strict')
 const fs = require('node:fs')
 const os = require('node:os')
 const path = require('node:path')
+const { spawnSync } = require('node:child_process')
 const {
   brokerSources,
   contentDigest,
@@ -39,6 +40,37 @@ const nativeV2Policy = {
 
 function readJSON(file) {
   return JSON.parse(fs.readFileSync(file, 'utf8'))
+}
+
+function run(command, args, options = {}) {
+  const result = spawnSync(command, args, { encoding: 'utf8', ...options })
+  if (result.error || result.status !== 0) {
+    throw new Error(`${command} ${args.join(' ')} failed: ${String(result.stderr || result.stdout || result.error?.message).trim()}`)
+  }
+  return result
+}
+
+function runFailure(command, args, options = {}) {
+  const result = spawnSync(command, args, { encoding: 'utf8', ...options })
+  assert.notEqual(result.status, 0, `${command} ${args.join(' ')} unexpectedly passed`)
+  return `${result.stdout || ''}${result.stderr || ''}`
+}
+
+function compileArm64BrokerFixture(t) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-native-broker-fixture-'))
+  const compile = (name) => {
+    const source = path.join(root, `${name}.c`)
+    const executable = path.join(root, name)
+    fs.writeFileSync(source, 'int main(void) { return 0; }\n', { mode: 0o644 })
+    run('/usr/bin/xcrun', [
+      '--sdk', 'macosx', 'clang', '-arch', 'arm64', source, '-o', executable,
+    ])
+    return executable
+  }
+  const executable = compile('kaisola-session-broker')
+  const bootstrap = compile('kaisola-broker-bootstrap')
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }))
+  return { executable, bootstrap }
 }
 
 function nativeFixture(t) {
@@ -87,6 +119,158 @@ test('native broker package records every file and verifies exact hashes', (t) =
 
   fs.appendFileSync(path.join(root, 'lib', 'broker.cjs'), 'tampered\n')
   assert.throws(() => verifyPackage(root, { policy }), /integrity mismatch/)
+})
+
+test('native staging CLI seals a signed arm64 runtime-neutral package without Node payload', (t) => {
+  const fixture = compileArm64BrokerFixture(t)
+  const output = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'kaisola-native-broker-output-')), 'BrokerSessionHelper')
+  const policyFile = path.join(repoRoot, 'native', 'KaisolaMac', 'BrokerHelper', 'native-package-policy.json')
+  t.after(() => fs.rmSync(path.dirname(output), { recursive: true, force: true }))
+
+  const result = run(process.execPath, [
+    path.join(repoRoot, 'scripts', 'native-broker-package.cjs'),
+    '--output', output,
+    '--native-broker', fixture.executable,
+    '--bootstrap', fixture.bootstrap,
+    '--app-release-version', '0.1.125',
+    '--app-release-build', '1125000',
+    '--launch-argument', '--log-level=notice',
+    '--launch-argument', 'foreground',
+    '--policy', policyFile,
+    '--sign-identity', '-',
+    '--require-signatures',
+  ])
+
+  assert.match(result.stdout, /NATIVE_BROKER_PACKAGE=PASS package=2\.0\.0 files=2/)
+  assert.deepEqual(fs.readdirSync(output).sort(), ['bin', 'manifest.json'])
+  assert.deepEqual(fs.readdirSync(path.join(output, 'bin')).sort(), ['kaisola-broker-bootstrap', 'kaisola-session-broker'])
+  assert.equal(fs.statSync(path.join(output, 'bin', 'kaisola-session-broker')).mode & 0o777, 0o755)
+  assert.equal(fs.existsSync(path.join(output, 'bin', 'node')), false)
+  assert.equal(fs.existsSync(path.join(output, 'lib')), false)
+  assert.equal(fs.existsSync(path.join(output, 'LICENSES')), false)
+
+  const manifest = readJSON(path.join(output, 'manifest.json'))
+  assert.deepEqual(manifest.appRelease, { version: '0.1.125', build: '1125000' })
+  assert.deepEqual(manifest.launch, {
+    kind: 'native',
+    executable: 'bin/kaisola-session-broker',
+    arguments: ['--log-level=notice', 'foreground'],
+  })
+  assert.deepEqual(manifest.files.map(({ path: file }) => file), [
+    'bin/kaisola-broker-bootstrap',
+    'bin/kaisola-session-broker',
+  ])
+  const bootstrapRecord = manifest.files.find(
+    ({ path: file }) => file === 'bin/kaisola-broker-bootstrap',
+  )
+  assert.equal(bootstrapRecord.role, 'launch-agent-bootstrap')
+  assert.equal(bootstrapRecord.mode, '0755')
+  assert.deepEqual(bootstrapRecord.machO.architectures, ['arm64'])
+  assert.ok(bootstrapRecord.machO.designatedRequirement)
+  assert.deepEqual(manifest.files.find(({ path: file }) => file === 'bin/kaisola-session-broker').machO.architectures, ['arm64'])
+  run('/usr/bin/codesign', ['--verify', '--strict', path.join(output, 'bin', 'kaisola-session-broker')])
+  run('/usr/bin/codesign', ['--verify', '--strict', path.join(output, 'bin', 'kaisola-broker-bootstrap')])
+  const signature = run('/usr/bin/codesign', ['-d', '--entitlements', ':-', path.join(output, 'bin', 'kaisola-session-broker')])
+  assert.doesNotMatch(`${signature.stdout}\n${signature.stderr}`, /allow-jit|allow-unsigned-executable-memory/)
+
+  const verify = run(process.execPath, [
+    path.join(repoRoot, 'scripts', 'native-broker-package.cjs'),
+    '--verify', output,
+    '--app-release-version', '0.1.125',
+    '--app-release-build', '1125000',
+    '--policy', policyFile,
+    '--require-signatures',
+  ])
+  assert.match(verify.stdout, /NATIVE_BROKER_PACKAGE_VERIFY=PASS package=2\.0\.0 files=2/)
+
+  assert.match(runFailure(process.execPath, [
+    path.join(repoRoot, 'scripts', 'native-broker-package.cjs'),
+    '--verify', output,
+    '--app-release-version', '0.1.126',
+    '--app-release-build', '1125000',
+    '--policy', policyFile,
+    '--require-signatures',
+  ]), /app release does not match package policy/)
+
+  // Without an app-release expectation the binding check silently never ran,
+  // so a schema-2 PASS was a weaker claim than the same PASS with the flags.
+  // Verification must refuse rather than report an unbound success.
+  assert.match(runFailure(process.execPath, [
+    path.join(repoRoot, 'scripts', 'native-broker-package.cjs'),
+    '--verify', output,
+    '--policy', policyFile,
+    '--require-signatures',
+  ]), /schema-2 verification requires an app release expectation/)
+})
+
+test('native staging CLI rejects Node inputs and incomplete app-release provenance', (t) => {
+  const fixture = compileArm64BrokerFixture(t)
+  const script = path.join(repoRoot, 'scripts', 'native-broker-package.cjs')
+
+  assert.match(runFailure(process.execPath, [
+    script,
+    '--output', path.join(path.dirname(fixture.executable), 'package'),
+    '--native-broker', fixture.executable,
+    '--runtime', process.execPath,
+    '--app-release-version', '0.1.125',
+    '--app-release-build', '1125000',
+  ]), /cannot include Node runtimes/)
+
+  assert.match(runFailure(process.execPath, [
+    script,
+    '--output', path.join(path.dirname(fixture.executable), 'package'),
+    '--native-broker', fixture.executable,
+    '--app-release-version', '0.1.125',
+  ]), /version and build must be provided together/)
+})
+
+test('native staging CLI rejects a missing bootstrap', (t) => {
+  const fixture = compileArm64BrokerFixture(t)
+  const script = path.join(repoRoot, 'scripts', 'native-broker-package.cjs')
+  const policyFile = path.join(
+    repoRoot,
+    'native',
+    'KaisolaMac',
+    'BrokerHelper',
+    'native-package-policy.json',
+  )
+
+  assert.match(runFailure(process.execPath, [
+    script,
+    '--output', path.join(path.dirname(fixture.executable), 'package-without-bootstrap'),
+    '--native-broker', fixture.executable,
+    '--app-release-version', '0.1.125',
+    '--app-release-build', '1125000',
+    '--policy', policyFile,
+    '--sign-identity', '-',
+    '--require-signatures',
+  ]), /bootstrap is required/)
+})
+
+test('native staging CLI rejects a non-Mach-O bootstrap', (t) => {
+  const fixture = compileArm64BrokerFixture(t)
+  const script = path.join(repoRoot, 'scripts', 'native-broker-package.cjs')
+  const policyFile = path.join(
+    repoRoot,
+    'native',
+    'KaisolaMac',
+    'BrokerHelper',
+    'native-package-policy.json',
+  )
+  const shellBootstrap = path.join(path.dirname(fixture.executable), 'shell-bootstrap')
+  fs.writeFileSync(shellBootstrap, '#!/bin/sh\nexit 0\n', { mode: 0o755 })
+
+  assert.match(runFailure(process.execPath, [
+    script,
+    '--output', path.join(path.dirname(fixture.executable), 'package-with-shell-bootstrap'),
+    '--native-broker', fixture.executable,
+    '--bootstrap', shellBootstrap,
+    '--app-release-version', '0.1.125',
+    '--app-release-build', '1125000',
+    '--policy', policyFile,
+    '--sign-identity', '-',
+    '--require-signatures',
+  ]), /bootstrap must be a signed arm64 Mach-O/)
 })
 
 test('helper content identity is deterministic and excludes generation time', (t) => {

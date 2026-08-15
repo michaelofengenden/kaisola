@@ -1,16 +1,20 @@
 import Darwin
+import CryptoKit
 import Foundation
+import KaisolaBrokerProtocol
 
 public enum SwiftBrokerRuntimeMode: String, Equatable, Sendable {
     case shadow
     case freshPTY
+    case launch
 }
 
 public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
     private static let environmentMarker = "KAISOLA_SWIFT_BROKER_SHADOW"
     private static let freshPTYEnvironmentMarker = "KAISOLA_SWIFT_BROKER_FRESH_PTY"
-    private static let maximumConfigurationBytes = 16 * 1_024
-    private static let exactJSONKeys: Set<String> = [
+    private static let launchEnvironmentMarker = "KAISOLA_SWIFT_BROKER_LAUNCH"
+    private static let maximumConfigurationBytes = 64 * 1_024
+    private static let shadowJSONKeys: Set<String> = [
         "protocol",
         "securityEpoch",
         "implementationVersion",
@@ -19,14 +23,43 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
         "token",
         "socketPath",
     ]
+    private static let launchJSONKeys = shadowJSONKeys.union([
+        "packageVersion",
+        "contentDigest",
+        "packageRoot",
+        "infoFile",
+        "lockFile",
+        "storageDir",
+        "logFile",
+        "maximumLiveTerminals",
+        "startedAt",
+        "version",
+        "smoke",
+    ])
+    private static let nativeLaunchJSONKeys = launchJSONKeys.union([
+        "appReleaseVersion",
+        "appReleaseBuild",
+    ])
 
     public let protocolVersion: Int
     public let securityEpoch: Int
     public let implementationVersion: Int
     public let packageSchema: Int
+    public let packageVersion: String?
+    public let appReleaseVersion: String?
+    public let appReleaseBuild: String?
     public let contentDigest: String
+    public let packageRoot: String?
     public let token: String
     public let socketPath: String
+    public let infoFile: String?
+    public let lockFile: String?
+    public let storageDir: String?
+    public let logFile: String?
+    public let maximumLiveTerminals: Int?
+    public let startedAt: Int64?
+    public let version: String?
+    public let smoke: Bool?
     public let runtimeMode: SwiftBrokerRuntimeMode
 
     public var socketURL: URL { URL(fileURLWithPath: socketPath) }
@@ -37,9 +70,21 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
         case securityEpoch
         case implementationVersion
         case packageSchema
+        case packageVersion
+        case appReleaseVersion
+        case appReleaseBuild
         case contentDigest
+        case packageRoot
         case token
         case socketPath
+        case infoFile
+        case lockFile
+        case storageDir
+        case logFile
+        case maximumLiveTerminals
+        case startedAt
+        case version
+        case smoke
     }
 
     public init(
@@ -47,15 +92,26 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
         securityEpoch: Int,
         implementationVersion: Int,
         packageSchema: Int,
+        packageVersion: String? = nil,
+        appReleaseVersion: String? = nil,
+        appReleaseBuild: String? = nil,
         contentDigest: String,
+        packageRoot: String? = nil,
         token: String,
         socketPath: String,
+        infoFile: String? = nil,
+        lockFile: String? = nil,
+        storageDir: String? = nil,
+        logFile: String? = nil,
+        maximumLiveTerminals: Int? = nil,
+        startedAt: Int64? = nil,
+        version: String? = nil,
+        smoke: Bool? = nil,
         runtimeMode: SwiftBrokerRuntimeMode = .shadow
     ) throws {
         guard protocolVersion == 2,
               securityEpoch == 1,
               implementationVersion == 2,
-              packageSchema == 2,
               Self.isLowercaseSHA256(contentDigest),
               Self.isHexToken(token) else {
             throw ShadowBrokerConfigurationError.invalidConfiguration
@@ -64,13 +120,76 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
             throw ShadowBrokerConfigurationError.unsafePath
         }
 
+        switch runtimeMode {
+        case .shadow, .freshPTY:
+            guard packageSchema == BrokerWire.nativeHelperPackageSchema,
+                  packageVersion == nil,
+                  appReleaseVersion == nil,
+                  appReleaseBuild == nil,
+                  packageRoot == nil,
+                  infoFile == nil,
+                  lockFile == nil,
+                  storageDir == nil,
+                  logFile == nil,
+                  maximumLiveTerminals == nil,
+                  startedAt == nil,
+                  version == nil,
+                  smoke == nil else {
+                throw ShadowBrokerConfigurationError.invalidConfiguration
+            }
+        case .launch:
+            guard BrokerWire.supportedHelperPackageSchemas.contains(packageSchema),
+                  let packageVersion,
+                  Self.isBoundedIdentity(packageVersion, maximumBytes: 64),
+                  let packageRoot,
+                  let infoFile,
+                  let lockFile,
+                  let storageDir,
+                  let logFile,
+                  let maximumLiveTerminals,
+                  (1...BrokerWire.maximumConfigurableLiveTerminals).contains(maximumLiveTerminals),
+                  let startedAt,
+                  startedAt > 0,
+                  let version,
+                  Self.isBoundedIdentity(version, maximumBytes: 120),
+                  smoke == false else {
+                throw ShadowBrokerConfigurationError.invalidConfiguration
+            }
+            let launchPaths = [packageRoot, infoFile, lockFile, storageDir, logFile]
+            guard launchPaths.allSatisfy(Self.isCanonicalAbsolutePath) else {
+                throw ShadowBrokerConfigurationError.unsafePath
+            }
+            if packageSchema == BrokerWire.nativeHelperPackageSchema {
+                guard let appReleaseVersion,
+                      let appReleaseBuild,
+                      Self.isBoundedIdentity(appReleaseVersion, maximumBytes: 64),
+                      Self.isBoundedIdentity(appReleaseBuild, maximumBytes: 64) else {
+                    throw ShadowBrokerConfigurationError.invalidConfiguration
+                }
+            } else if appReleaseVersion != nil || appReleaseBuild != nil {
+                throw ShadowBrokerConfigurationError.invalidConfiguration
+            }
+        }
+
         self.protocolVersion = protocolVersion
         self.securityEpoch = securityEpoch
         self.implementationVersion = implementationVersion
         self.packageSchema = packageSchema
+        self.packageVersion = packageVersion
+        self.appReleaseVersion = appReleaseVersion
+        self.appReleaseBuild = appReleaseBuild
         self.contentDigest = contentDigest
+        self.packageRoot = packageRoot
         self.token = token
         self.socketPath = socketPath
+        self.infoFile = infoFile
+        self.lockFile = lockFile
+        self.storageDir = storageDir
+        self.logFile = logFile
+        self.maximumLiveTerminals = maximumLiveTerminals
+        self.startedAt = startedAt
+        self.version = version
+        self.smoke = smoke
         self.runtimeMode = runtimeMode
     }
 
@@ -81,9 +200,24 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
             securityEpoch: values.decode(Int.self, forKey: .securityEpoch),
             implementationVersion: values.decode(Int.self, forKey: .implementationVersion),
             packageSchema: values.decode(Int.self, forKey: .packageSchema),
+            packageVersion: values.decodeIfPresent(String.self, forKey: .packageVersion),
+            appReleaseVersion: values.decodeIfPresent(String.self, forKey: .appReleaseVersion),
+            appReleaseBuild: values.decodeIfPresent(String.self, forKey: .appReleaseBuild),
             contentDigest: values.decode(String.self, forKey: .contentDigest),
+            packageRoot: values.decodeIfPresent(String.self, forKey: .packageRoot),
             token: values.decode(String.self, forKey: .token),
             socketPath: values.decode(String.self, forKey: .socketPath),
+            infoFile: values.decodeIfPresent(String.self, forKey: .infoFile),
+            lockFile: values.decodeIfPresent(String.self, forKey: .lockFile),
+            storageDir: values.decodeIfPresent(String.self, forKey: .storageDir),
+            logFile: values.decodeIfPresent(String.self, forKey: .logFile),
+            maximumLiveTerminals: values.decodeIfPresent(
+                Int.self,
+                forKey: .maximumLiveTerminals
+            ),
+            startedAt: values.decodeIfPresent(Int64.self, forKey: .startedAt),
+            version: values.decodeIfPresent(String.self, forKey: .version),
+            smoke: values.decodeIfPresent(Bool.self, forKey: .smoke),
             runtimeMode: .shadow
         )
     }
@@ -94,9 +228,21 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
         try values.encode(securityEpoch, forKey: .securityEpoch)
         try values.encode(implementationVersion, forKey: .implementationVersion)
         try values.encode(packageSchema, forKey: .packageSchema)
+        try values.encodeIfPresent(packageVersion, forKey: .packageVersion)
+        try values.encodeIfPresent(appReleaseVersion, forKey: .appReleaseVersion)
+        try values.encodeIfPresent(appReleaseBuild, forKey: .appReleaseBuild)
         try values.encode(contentDigest, forKey: .contentDigest)
+        try values.encodeIfPresent(packageRoot, forKey: .packageRoot)
         try values.encode(token, forKey: .token)
         try values.encode(socketPath, forKey: .socketPath)
+        try values.encodeIfPresent(infoFile, forKey: .infoFile)
+        try values.encodeIfPresent(lockFile, forKey: .lockFile)
+        try values.encodeIfPresent(storageDir, forKey: .storageDir)
+        try values.encodeIfPresent(logFile, forKey: .logFile)
+        try values.encodeIfPresent(maximumLiveTerminals, forKey: .maximumLiveTerminals)
+        try values.encodeIfPresent(startedAt, forKey: .startedAt)
+        try values.encodeIfPresent(version, forKey: .version)
+        try values.encodeIfPresent(smoke, forKey: .smoke)
     }
 
     public static func load(
@@ -113,7 +259,8 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
     ) throws -> Self {
         let shadowEnabled = environment[environmentMarker] == "1"
         let freshPTYEnabled = environment[freshPTYEnvironmentMarker] == "1"
-        guard !(shadowEnabled && freshPTYEnabled) else {
+        let launchEnabled = environment[launchEnvironmentMarker] == "1"
+        guard [shadowEnabled, freshPTYEnabled, launchEnabled].filter({ $0 }).count <= 1 else {
             throw ShadowBrokerConfigurationError.ambiguousRuntimeMode
         }
 
@@ -128,8 +275,13 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
                 throw ShadowBrokerConfigurationError.freshPTYModeDisabled
             }
             runtimeMode = .freshPTY
+        } else if arguments.count == 3, arguments[1] == "--launch" {
+            guard launchEnabled else {
+                throw ShadowBrokerConfigurationError.launchModeDisabled
+            }
+            runtimeMode = .launch
         } else {
-            guard shadowEnabled || freshPTYEnabled else {
+            guard shadowEnabled || freshPTYEnabled || launchEnabled else {
                 throw ShadowBrokerConfigurationError.shadowModeDisabled
             }
             throw ShadowBrokerConfigurationError.invalidArguments
@@ -149,28 +301,150 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
 
         do {
             guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  Set(object.keys) == exactJSONKeys else {
+                  Self.hasExactJSONKeys(Set(object.keys), runtimeMode: runtimeMode) else {
                 throw ShadowBrokerConfigurationError.invalidConfiguration
             }
-            let decoded = try JSONDecoder().decode(Self.self, from: data)
+            let decoded = try JSONDecoder().decode(DecodedConfiguration.self, from: data)
             let configuration = try Self(
                 protocolVersion: decoded.protocolVersion,
                 securityEpoch: decoded.securityEpoch,
                 implementationVersion: decoded.implementationVersion,
                 packageSchema: decoded.packageSchema,
+                packageVersion: decoded.packageVersion,
+                appReleaseVersion: decoded.appReleaseVersion,
+                appReleaseBuild: decoded.appReleaseBuild,
                 contentDigest: decoded.contentDigest,
+                packageRoot: decoded.packageRoot,
                 token: decoded.token,
                 socketPath: decoded.socketPath,
+                infoFile: decoded.infoFile,
+                lockFile: decoded.lockFile,
+                storageDir: decoded.storageDir,
+                logFile: decoded.logFile,
+                maximumLiveTerminals: decoded.maximumLiveTerminals,
+                startedAt: decoded.startedAt,
+                version: decoded.version,
+                smoke: decoded.smoke,
                 runtimeMode: runtimeMode
             )
-            guard configuration.privateRootURL == privateRoot else {
-                throw ShadowBrokerConfigurationError.unsafePath
+            switch runtimeMode {
+            case .shadow, .freshPTY:
+                guard configuration.privateRootURL == privateRoot else {
+                    throw ShadowBrokerConfigurationError.unsafePath
+                }
+            case .launch:
+                try configuration.validateLaunchLayout(configurationURL: configurationURL)
             }
             return configuration
         } catch let error as ShadowBrokerConfigurationError {
             throw error
         } catch {
             throw ShadowBrokerConfigurationError.invalidConfiguration
+        }
+    }
+
+    private struct DecodedConfiguration: Decodable {
+        let protocolVersion: Int
+        let securityEpoch: Int
+        let implementationVersion: Int
+        let packageSchema: Int
+        let packageVersion: String?
+        let appReleaseVersion: String?
+        let appReleaseBuild: String?
+        let contentDigest: String
+        let packageRoot: String?
+        let token: String
+        let socketPath: String
+        let infoFile: String?
+        let lockFile: String?
+        let storageDir: String?
+        let logFile: String?
+        let maximumLiveTerminals: Int?
+        let startedAt: Int64?
+        let version: String?
+        let smoke: Bool?
+
+        private enum CodingKeys: String, CodingKey {
+            case protocolVersion = "protocol"
+            case securityEpoch
+            case implementationVersion
+            case packageSchema
+            case packageVersion
+            case appReleaseVersion
+            case appReleaseBuild
+            case contentDigest
+            case packageRoot
+            case token
+            case socketPath
+            case infoFile
+            case lockFile
+            case storageDir
+            case logFile
+            case maximumLiveTerminals
+            case startedAt
+            case version
+            case smoke
+        }
+    }
+
+    private static func hasExactJSONKeys(
+        _ keys: Set<String>,
+        runtimeMode: SwiftBrokerRuntimeMode
+    ) -> Bool {
+        switch runtimeMode {
+        case .shadow, .freshPTY:
+            keys == shadowJSONKeys
+        case .launch:
+            keys == launchJSONKeys || keys == nativeLaunchJSONKeys
+        }
+    }
+
+    private func validateLaunchLayout(configurationURL: URL) throws {
+        guard runtimeMode == .launch,
+              configurationURL.lastPathComponent.hasPrefix("launch-native-"),
+              configurationURL.pathExtension == "json",
+              let packageRoot,
+              let infoFile,
+              let lockFile,
+              let storageDir,
+              let logFile else {
+            throw ShadowBrokerConfigurationError.unsafePath
+        }
+        let brokerDirectory = configurationURL.deletingLastPathComponent().standardizedFileURL
+        let userData = brokerDirectory.deletingLastPathComponent().standardizedFileURL
+        guard brokerDirectory.lastPathComponent == "session-broker",
+              URL(fileURLWithPath: packageRoot, isDirectory: true).standardizedFileURL
+                == userData
+                    .appendingPathComponent("broker-generations", isDirectory: true)
+                    .appendingPathComponent(contentDigest, isDirectory: true)
+                    .standardizedFileURL else {
+            throw ShadowBrokerConfigurationError.unsafePath
+        }
+
+        let metadata = brokerDirectory.appendingPathComponent("generations", isDirectory: true)
+        let expectedPaths = [
+            infoFile: metadata.appendingPathComponent("\(contentDigest).json").path,
+            lockFile: metadata.appendingPathComponent("\(contentDigest).lock").path,
+            logFile: metadata.appendingPathComponent("\(contentDigest).log").path,
+            storageDir: userData.appendingPathComponent("terminal-cache", isDirectory: true).path,
+        ]
+        guard expectedPaths.allSatisfy({
+            URL(fileURLWithPath: $0.key).standardizedFileURL.path == $0.value
+        }) else {
+            throw ShadowBrokerConfigurationError.unsafePath
+        }
+
+        let socketLeaf = Self.generationSocketLeaf(userData: userData, contentDigest: contentDigest)
+        let socketURL = URL(fileURLWithPath: socketPath).standardizedFileURL
+        let durableSocket = brokerDirectory.appendingPathComponent(socketLeaf).path
+        let compactRoot = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".kaisola-session", isDirectory: true)
+            .standardizedFileURL.path
+        let isDurable = socketURL.path == durableSocket
+        let isCompact = socketURL.deletingLastPathComponent().path == compactRoot
+            && socketURL.lastPathComponent == socketLeaf
+        guard isDurable || isCompact else {
+            throw ShadowBrokerConfigurationError.unsafePath
         }
     }
 
@@ -264,11 +538,24 @@ public struct ShadowBrokerConfiguration: Codable, Equatable, Sendable {
             (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0)
         }
     }
+
+    private static func isBoundedIdentity(_ value: String, maximumBytes: Int) -> Bool {
+        !value.isEmpty && value.utf8.count <= maximumBytes && !value.utf8.contains(0)
+    }
+
+    private static func generationSocketLeaf(userData: URL, contentDigest: String) -> String {
+        let material = Data((userData.standardizedFileURL.path + "\u{0}" + contentDigest).utf8)
+        return Data(SHA256.hash(data: material).prefix(9))
+            .base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_") + ".sock"
+    }
 }
 
 public enum ShadowBrokerConfigurationError: Error, Equatable, LocalizedError {
     case shadowModeDisabled
     case freshPTYModeDisabled
+    case launchModeDisabled
     case ambiguousRuntimeMode
     case invalidArguments
     case unsafePath
@@ -281,16 +568,18 @@ public enum ShadowBrokerConfigurationError: Error, Equatable, LocalizedError {
             "The Swift broker is available only in explicit shadow mode."
         case .freshPTYModeDisabled:
             "The Swift PTY broker is available only in explicit fresh-session development mode."
+        case .launchModeDisabled:
+            "The Swift PTY broker production launch is available only through explicit development selection."
         case .ambiguousRuntimeMode:
             "The Swift broker accepts exactly one explicit runtime mode."
         case .invalidArguments:
-            "The Swift broker accepts only a private shadow configuration."
+            "The Swift broker accepts only one exact private configuration argument."
         case .unsafePath:
-            "The Swift broker shadow configuration contains an unsafe path."
+            "The Swift broker configuration contains an unsafe path."
         case .unsafePermissions:
-            "The Swift broker shadow configuration is not private to this user."
+            "The Swift broker configuration is not private to this user."
         case .invalidConfiguration:
-            "The Swift broker shadow configuration is invalid."
+            "The Swift broker configuration is invalid."
         }
     }
 }

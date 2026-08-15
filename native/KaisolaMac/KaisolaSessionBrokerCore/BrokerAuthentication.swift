@@ -11,6 +11,7 @@ public struct ShadowBrokerServiceConfiguration: Equatable, Sendable {
     public let pid: Int32
     public let startedAt: Int64
     public let version: String
+    public let maximumLiveTerminals: Int
 
     public init(
         expectedToken: String,
@@ -20,12 +21,13 @@ public struct ShadowBrokerServiceConfiguration: Equatable, Sendable {
         contentDigest: String,
         pid: Int32 = getpid(),
         startedAt: Int64 = Int64(Date().timeIntervalSince1970 * 1_000),
-        version: String = "kaisola-swift-shadow"
+        version: String = "kaisola-swift-shadow",
+        maximumLiveTerminals: Int = BrokerWire.defaultMaximumLiveTerminals
     ) throws {
         guard Self.isHex(expectedToken, exactBytes: 64) else {
             throw ShadowBrokerServiceConfigurationError.invalidToken
         }
-        guard packageSchema == BrokerWire.nativeHelperPackageSchema else {
+        guard BrokerWire.supportedHelperPackageSchemas.contains(packageSchema) else {
             throw ShadowBrokerServiceConfigurationError.invalidPackageSchema
         }
         guard Self.isLowercaseHex(contentDigest, exactBytes: 64) else {
@@ -36,7 +38,9 @@ public struct ShadowBrokerServiceConfiguration: Equatable, Sendable {
             throw ShadowBrokerServiceConfigurationError.invalidPackageVersion
         }
         guard pid > 0, startedAt > 0,
-              !version.isEmpty, version.utf8.count <= 128 else {
+              !version.isEmpty, version.utf8.count <= 128,
+              (1...BrokerWire.maximumConfigurableLiveTerminals)
+                .contains(maximumLiveTerminals) else {
             throw ShadowBrokerServiceConfigurationError.invalidRuntimeIdentity
         }
 
@@ -48,6 +52,7 @@ public struct ShadowBrokerServiceConfiguration: Equatable, Sendable {
         self.pid = pid
         self.startedAt = startedAt
         self.version = version
+        self.maximumLiveTerminals = maximumLiveTerminals
     }
 
     private static func isHex(_ value: String, exactBytes: Int) -> Bool {
@@ -96,6 +101,7 @@ public struct BrokerAuthentication: Sendable {
         BrokerWire.brokerInventoryFeature,
         BrokerWire.terminalExitStatusFeature,
         BrokerWire.terminalObserverOnlyOutputFeature,
+        BrokerWire.swiftCleanStartRollbackFeature,
     ]
 
     public let features: [String]
@@ -122,12 +128,21 @@ public struct BrokerAuthentication: Sendable {
               ),
               Self.isCanonicalVersionFourUUID(hello.instanceID),
               let access = hello.access,
-              let role = BrokerAccessRole(rawValue: access),
-              role == .controller || role == .observer else {
+              let role = BrokerAccessRole(rawValue: access) else {
             return .rejected(response: Self.rejection())
         }
 
         let requested = Set(hello.features ?? [])
+        // Fresh mode exposes no general administrator surface. The only
+        // accepted administrator hello must explicitly negotiate the
+        // Swift-only clean-start rollback capability; shadow mode cannot
+        // reach it because its advertised feature set omits that capability.
+        let cleanStartAdministrator = role == .administrator
+            && features.contains(BrokerWire.swiftCleanStartRollbackFeature)
+            && requested.contains(BrokerWire.swiftCleanStartRollbackFeature)
+        guard role == .controller || role == .observer || cleanStartAdministrator else {
+            return .rejected(response: Self.rejection())
+        }
         let negotiated = features.filter(requested.contains)
         let client = BrokerAuthenticatedClient(
             instanceID: hello.instanceID,

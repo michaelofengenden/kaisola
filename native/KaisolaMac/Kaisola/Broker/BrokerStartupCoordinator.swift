@@ -172,6 +172,17 @@ protocol BrokerUpgradeRequesting: Sendable {
     ) async throws -> BrokerUpgradeDecision
 }
 
+/// The native development broker's only lifecycle mutation. It is not a
+/// rolling-update substitute: a sealed schema-2 generation may accept it only
+/// when it has no retained terminal records and can fence all later creates.
+protocol BrokerCleanStartRollbackRequesting: BrokerUpgradeRequesting {
+    func requestCleanStartRollback(
+        from info: BrokerInfo,
+        targetContentDigest: String,
+        authorization: BrokerUpgradeAuthorization
+    ) async throws -> BrokerUpgradeDecision
+}
+
 extension BrokerUpgradeRequesting {
     func requestUpgrade(
         from info: BrokerInfo,
@@ -1140,11 +1151,9 @@ actor BrokerStartupCoordinator:
             fromContentDigest: runningDigest,
             targetContentDigest: package.contentDigest
         )
-        let supportsRolling = rollingUpdatesEnabled
-            && (info.implementationVersion ?? 1) >= 2
-
         let decision: BrokerUpgradeDecision
         let authorization = await upgradeAuthorization(for: topology.current)
+        var usedCleanStartRollback = false
         do {
             decision = try await upgradeRequester.requestUpgrade(
                 from: info,
@@ -1152,13 +1161,52 @@ actor BrokerStartupCoordinator:
                 authorization: authorization
             )
         } catch {
-            currentUpgradeState = .pending(
-                fromContentDigest: runningDigest,
-                targetContentDigest: package.contentDigest,
-                reason: .requestUnavailable
-            )
-            return info
+            // Schema 2 intentionally does not advertise Node's general update
+            // protocol. Returning to the stable default still must be a broker-
+            // owned atomic decision: after complete staged-package verification,
+            // ask the Swift generation to prove it is empty, fence new creates,
+            // and terminate itself through its ordinary cleanup path.
+            guard info.packageSchema == BrokerWire.nativeHelperPackageSchema,
+                  package.schemaVersion == BrokerWire.nodeHelperPackageSchema,
+                  authorization == .sealedLegacyFallback,
+                  let cleanStart = upgradeRequester as? any BrokerCleanStartRollbackRequesting else {
+                currentUpgradeState = .pending(
+                    fromContentDigest: runningDigest,
+                    targetContentDigest: package.contentDigest,
+                    reason: .requestUnavailable
+                )
+                return info
+            }
+            do {
+                decision = try await cleanStart.requestCleanStartRollback(
+                    from: info,
+                    targetContentDigest: package.contentDigest,
+                    authorization: authorization
+                )
+                usedCleanStartRollback = true
+            } catch {
+                // A timeout or disconnect can win after the native broker
+                // wrote its acceptance and entered orderly shutdown. Resolve
+                // that ambiguity only from the exact old process and metadata:
+                // if both are gone, the broker-owned empty-and-fence decision
+                // completed and the ordinary nonrolling publication is safe.
+                do {
+                    try await waitForSafeShutdown(of: info)
+                    decision = .accepted
+                    usedCleanStartRollback = true
+                } catch {
+                    currentUpgradeState = .pending(
+                        fromContentDigest: runningDigest,
+                        targetContentDigest: package.contentDigest,
+                        reason: .requestUnavailable
+                    )
+                    return info
+                }
+            }
         }
+        let supportsRolling = rollingUpdatesEnabled
+            && (info.implementationVersion ?? 1) >= 2
+            && !usedCleanStartRollback
 
         switch decision {
         case .current:
@@ -1450,12 +1498,27 @@ actor BrokerStartupCoordinator:
         }
         let token = tokenBytes.map { String(format: "%02x", $0) }.joined()
         let timestamp = Int64(Date().timeIntervalSince1970 * 1_000)
+        let appReleaseVersion: String?
+        let appReleaseBuild: String?
+        switch package.packageKind {
+        case .nodeV1:
+            appReleaseVersion = nil
+            appReleaseBuild = nil
+        case let .nativeV2(appRelease, _):
+            // This pair came from the verified schema-2 manifest. Seal the
+            // same identities into the private request so the detached
+            // bootstrap can re-verify the staged package against them.
+            appReleaseVersion = appRelease.version
+            appReleaseBuild = appRelease.build
+        }
         let configuration = BrokerLaunchConfiguration(
             protocolVersion: BrokerWire.protocolVersion,
             securityEpoch: BrokerWire.securityEpoch,
             implementationVersion: package.brokerImplementationVersion,
             packageSchema: package.schemaVersion,
             packageVersion: package.packageVersion,
+            appReleaseVersion: appReleaseVersion,
+            appReleaseBuild: appReleaseBuild,
             contentDigest: package.contentDigest,
             packageRoot: userData
                 .appendingPathComponent("broker-generations", isDirectory: true)

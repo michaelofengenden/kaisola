@@ -45,15 +45,23 @@ Still open within this item:
 - An exited record evicted by the 64-record retention can drop a
   still-subscribed exited terminal; resubscribe then reports unavailable.
 
-### 2. Production packaging and default enablement
+### 2. Production packaging and development selection (done for v0.1.125)
 
-- Package and sign the arm64 Swift broker as a native schema-2 helper. The app,
-  bootstrap service, release preflight, and helper probe currently remain
-  intentionally pinned to the schema-1 Node launch path.
-- Add an explicit opt-in selector and rollback to the Node helper before making
-  Swift the default for newly created sessions.
-- Verify the sealed executable identity, launch arguments, update replacement,
-  and app-to-broker version reporting in the signed release artifact.
+Version 0.1.125 packages and signs the arm64 Swift broker as a separate native
+schema-2 helper, verifies its executable and bootstrap identities against the
+containing app release, and checks that root independently during distribution
+resealing and release preflight. The production launch file now carries the
+sealed arguments and real package/app version identity through hello, status,
+and generation rendezvous metadata.
+
+`KAISOLA_SESSION_BROKER_RUNTIME=swift` is the only selector. Unset, `node`, and
+unknown values all choose the stable schema-1 Node package. Returning from an
+empty Swift generation to Node uses a broker-owned fence and orderly shutdown;
+any retained terminal keeps the Swift generation live. There is no UI selector.
+
+This completes the development-selected packaging slice. It does not authorize
+default enablement: Node remains current until the open parity and reliability
+work in items 1 and 3 is complete.
 
 ### 3. Reliability soak
 

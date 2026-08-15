@@ -1,3 +1,5 @@
+import Darwin
+import Dispatch
 import Foundation
 import KaisolaBrokerProtocol
 
@@ -5,6 +7,7 @@ public actor ShadowBrokerService {
     private static let mutationMethods: Set<String> = [
         "broker.shutdown",
         "broker.shutdownForUpdate",
+        "broker.prepareCleanStartRollback",
         "broker.prepareRollingUpdate",
         "broker.cancelRollingUpdate",
         "broker.retireDraining",
@@ -28,14 +31,27 @@ public actor ShadowBrokerService {
     private let authentication: BrokerAuthentication
     private let requestGate: BrokerRequestGate
     private let terminalStore: FreshTerminalStore?
+    private let cleanStartTermination: @Sendable () -> Void
     private let eventRouter = BrokerEventRouter()
     private var inFlightMutations = 0
+    private var cleanStartRollbackTarget: String?
+    private var cleanStartResponseDeliveries = 0
+    private var cleanStartTerminationScheduled = false
     private var authenticatedClients: [String: BrokerAuthenticatedClient] = [:]
 
     public init(
         configuration: ShadowBrokerServiceConfiguration,
         requestGate: BrokerRequestGate = BrokerRequestGate(),
-        terminalStore: FreshTerminalStore? = nil
+        terminalStore: FreshTerminalStore? = nil,
+        cleanStartTermination: @escaping @Sendable () -> Void = {
+            // BrokerConnection invokes this callback only after the kernel has
+            // accepted the complete response frame. Enter the executable's
+            // existing signal monitor so shutdown, PTY cleanup, and rendezvous
+            // removal all follow the ordinary orderly path.
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 0.25) {
+                _ = Darwin.kill(Darwin.getpid(), SIGTERM)
+            }
+        }
     ) throws {
         self.configuration = configuration
         // Feature advertisement is per runtime mode so it stays truthful:
@@ -49,6 +65,7 @@ public actor ShadowBrokerService {
         )
         self.requestGate = requestGate
         self.terminalStore = terminalStore
+        self.cleanStartTermination = cleanStartTermination
         if let terminalStore {
             let router = eventRouter
             terminalStore.setEventSink { owner, channel, payload, maxQueueBytes, force in
@@ -250,7 +267,24 @@ public actor ShadowBrokerService {
         terminalStore: FreshTerminalStore,
         responder: (@Sendable (BrokerResponse) -> Bool)?
     ) async -> BrokerResponse? {
+        if cleanStartRollbackTarget != nil,
+           Self.mutationMethods.contains(request.method),
+           request.method != "broker.prepareCleanStartRollback" {
+            return .failure(
+                id: request.id,
+                code: "broker_shutting_down",
+                message: "broker is shutting down for clean-start rollback"
+            )
+        }
+
         switch request.method {
+        case "broker.prepareCleanStartRollback":
+            return await prepareCleanStartRollback(
+                client: client,
+                request: request,
+                terminalStore: terminalStore
+            )
+
         case "terminal.create":
             guard let create = freshCreateRequest(from: request.params) else {
                 return invalidFreshRequest(request.id)
@@ -526,6 +560,144 @@ public actor ShadowBrokerService {
                 code: "unsupported_method",
                 message: "unsupported broker method: \(request.method)"
             )
+        }
+    }
+
+    /// The schema-2 development broker cannot claim Node's rolling-update or
+    /// administration protocols. It can still make selector rollback safe by
+    /// answering one narrower question inside its actor: is this generation
+    /// completely empty, and can all later mutations be fenced before it exits?
+    private func prepareCleanStartRollback(
+        client: BrokerAuthenticatedClient,
+        request: BrokerRequest,
+        terminalStore: FreshTerminalStore
+    ) async -> BrokerResponse? {
+        guard client.role == .administrator,
+              client.negotiatedFeatures.contains(BrokerWire.swiftCleanStartRollbackFeature),
+              configuration.packageSchema == BrokerWire.nativeHelperPackageSchema,
+              let params = request.params?.objectValue,
+              params["ownerId"]?.stringValue == "0",
+              params["expectedPid"]?.integerValue == Int64(configuration.pid),
+              params["expectedStartedAt"]?.integerValue == configuration.startedAt,
+              params["expectedContentDigest"]?.stringValue == configuration.contentDigest,
+              let targetContentDigest = params["targetContentDigest"]?.stringValue,
+              targetContentDigest != configuration.contentDigest,
+              isLowercaseSHA256(targetContentDigest) else {
+            return .success(id: request.id, result: .object([
+                "ok": .bool(false),
+                "state": .string("identity_changed"),
+            ]))
+        }
+
+        if let preparedTarget = cleanStartRollbackTarget {
+            guard preparedTarget == targetContentDigest else {
+                return .success(id: request.id, result: .object([
+                    "ok": .bool(false),
+                    "state": .string("identity_changed"),
+                ]))
+            }
+            cleanStartResponseDeliveries += 1
+            return cleanStartAcceptedResponse(id: request.id)
+        }
+
+        guard inFlightMutations == 0 else {
+            return await cleanStartPendingResponse(
+                id: request.id,
+                terminalStore: terminalStore,
+                reason: "activity_changed"
+            )
+        }
+        let capture = await terminalStore.atomicInventorySnapshot()
+        let completedEpoch = await terminalStore.currentActivityEpoch()
+        guard inFlightMutations == 0,
+              completedEpoch == capture.activityEpoch else {
+            return await cleanStartPendingResponse(
+                id: request.id,
+                terminalStore: terminalStore,
+                reason: "activity_changed"
+            )
+        }
+        // Exited-but-unreleased records still own retained output. Treat every
+        // record as work for this clean-start-only transition so selecting Node
+        // can never silently discard Swift session state.
+        guard capture.records.isEmpty else {
+            return cleanStartPendingResponse(
+                id: request.id,
+                records: capture.records,
+                reason: "retained_sessions"
+            )
+        }
+
+        // No suspension occurs between the final epoch proof and this fence.
+        // Every later terminal mutation observes the target above and fails;
+        // the coordinator never has to signal a PID that might have recycled.
+        cleanStartRollbackTarget = targetContentDigest
+        cleanStartResponseDeliveries += 1
+        return cleanStartAcceptedResponse(id: request.id)
+    }
+
+    /// Completes the response half of the empty-and-fence transaction. The
+    /// connection calls this only for an accepted clean-start response. More
+    /// than one same-target coordinator may race, so a failed delivery releases
+    /// the fence only after every accepted response attempt has failed.
+    func completeCleanStartResponseDelivery(written: Bool) {
+        guard cleanStartRollbackTarget != nil,
+              cleanStartResponseDeliveries > 0 else { return }
+        cleanStartResponseDeliveries -= 1
+        if written {
+            guard !cleanStartTerminationScheduled else { return }
+            cleanStartTerminationScheduled = true
+            cleanStartTermination()
+        } else if cleanStartResponseDeliveries == 0,
+                  !cleanStartTerminationScheduled {
+            cleanStartRollbackTarget = nil
+        }
+    }
+
+    private func cleanStartAcceptedResponse(id: String) -> BrokerResponse {
+        .success(id: id, result: .object([
+            "ok": .bool(true),
+            "state": .string("updating"),
+        ]))
+    }
+
+    private func cleanStartPendingResponse(
+        id: String,
+        terminalStore: FreshTerminalStore,
+        reason: String
+    ) async -> BrokerResponse {
+        cleanStartPendingResponse(
+            id: id,
+            records: await terminalStore.inventory(),
+            reason: reason
+        )
+    }
+
+    private func cleanStartPendingResponse(
+        id: String,
+        records: [FreshTerminalInventoryRecord],
+        reason: String
+    ) -> BrokerResponse {
+        let retainedIDs = records.map(\.id).sorted()
+        return .success(id: id, result: .object([
+            "ok": .bool(false),
+            "state": .string("pending"),
+            "reason": .string(reason),
+            // The frozen decision shape has no retained-record field. Counting
+            // all records here is deliberately conservative: the coordinator
+            // must keep the Swift generation until each one is released.
+            "liveTerminalCount": .integer(Int64(retainedIDs.count)),
+            "liveTerminalIds": .array(retainedIDs.map(BrokerJSONValue.string)),
+            "busyAgentCount": .integer(0),
+            "busyTerminalIds": .array([]),
+            "childTaskCount": .integer(0),
+        ]))
+    }
+
+    private func isLowercaseSHA256(_ value: String) -> Bool {
+        let bytes = Array(value.utf8)
+        return bytes.count == 64 && bytes.allSatisfy {
+            (48...57).contains($0) || (97...102).contains($0)
         }
     }
 
@@ -1153,9 +1325,13 @@ public actor ShadowBrokerService {
         ]
         if includeCapacity {
             status["terminalCapacity"] = .object([
-                "maximumLiveTerminals": .integer(64),
+                "maximumLiveTerminals": .integer(
+                    Int64(configuration.maximumLiveTerminals)
+                ),
                 "liveTerminalCount": .integer(Int64(liveCount)),
-                "availableTerminalSlots": .integer(Int64(max(0, 64 - liveCount))),
+                "availableTerminalSlots": .integer(
+                    Int64(max(0, configuration.maximumLiveTerminals - liveCount))
+                ),
             ])
         }
         return status

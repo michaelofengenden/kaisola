@@ -1199,6 +1199,10 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 // A screenshot must never catch a mid-breath frame.
                 settings.tintedBreathing = false
             }
+            if visualSurface == "solid" {
+                settings.sidebarAppearance = .solid
+                settings.workspaceBackdrop = .system
+            }
             // Pinned for every surface, not just tinted, so no baseline can
             // pick up a stray palette default. `.desktop` must never be the
             // fixture value: it samples the machine's wallpaper and is

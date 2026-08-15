@@ -1182,6 +1182,10 @@ struct FlowingTintedBackdrop: View {
     var body: some View {
         let isDark = colorScheme == .dark
         let palette = settings.tintPalette
+        // A screenshot must never catch a mid-drift frame: fixture processes
+        // pin the endpoints outright, which parks the layer at its given
+        // start/end deterministically. Reduce Motion pins the same way.
+        let pinned = TintFlowMotion.isPinned()
         FlowingTintGradientView(
             stops: isDark
                 ? TintFlowComposition.dark(
@@ -1196,8 +1200,8 @@ struct FlowingTintedBackdrop: View {
                 ),
             startPoint: TintFlowMotion.layerPoint(startPoint),
             endPoint: TintFlowMotion.layerPoint(endPoint),
-            animated: !reduceMotion,
-            breathing: settings.tintedBreathing && !reduceMotion
+            animated: !reduceMotion && !pinned,
+            breathing: settings.tintedBreathing && !reduceMotion && !pinned
         )
         .allowsHitTesting(false)
         .onAppear { refreshIfNeeded() }
@@ -1306,22 +1310,60 @@ struct SidebarBackdropView: View {
                 }
             }
         case .solid:
-            Color(nsColor: .controlBackgroundColor)
+            // The rails are ground, and the ground is material in every theme
+            // now: the same coverage as the Solid canvas, because the rails
+            // and the canvas are one surface in the opaque themes and a
+            // separation step here would draw a seam at the divider. No
+            // `LightRailTint` edge cast — that cast is solved against the
+            // glass rail's composite, and it would give Solid a colour it
+            // never had.
+            if reduceTransparency {
+                Color(nsColor: .controlBackgroundColor)
+            } else {
+                ZStack {
+                    DesktopGlassLayer(
+                        liveMaterial: Self.sharedGlassMaterial,
+                        carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
+                    )
+                    GlassBackdropWash
+                        .opaqueRailGround(appearance: .solid, isDark: colorScheme == .dark)
+                        .veil
+                    if accessibilityContrast == .increased {
+                        Color(nsColor: .controlBackgroundColor)
+                            .opacity(GlassBackdropWash.opaqueGroundIncreasedContrastOverlay(
+                                theme: .system,
+                                isDark: colorScheme == .dark
+                            ))
+                    }
+                }
+            }
         case .tinted:
             // Both appearances mirror per placement now. Dark used to hardcode
             // topLeading → bottomTrailing on every rail; unifying on the
             // placement points means the trailing file rail sweeps from its own
             // outside edge inward, the same symmetry light has always had.
-            ZStack {
+            // The opaque base became the shared material ground with the
+            // Tinted plate over it — tint over material, same as the canvas.
+            if reduceTransparency {
                 Color(nsColor: .controlBackgroundColor)
-                FlowingTintedBackdrop(
-                    coverageScale: Self.railTintShare,
-                    startPoint: placement.tintStartPoint,
-                    endPoint: placement.tintEndPoint
-                )
-                if accessibilityContrast == .increased {
-                    Color(nsColor: .controlBackgroundColor)
-                        .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
+            } else {
+                ZStack {
+                    DesktopGlassLayer(
+                        liveMaterial: Self.sharedGlassMaterial,
+                        carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
+                    )
+                    GlassBackdropWash
+                        .opaqueRailGround(appearance: .tinted, isDark: colorScheme == .dark)
+                        .veil
+                    FlowingTintedBackdrop(
+                        coverageScale: Self.railTintShare,
+                        startPoint: placement.tintStartPoint,
+                        endPoint: placement.tintEndPoint
+                    )
+                    if accessibilityContrast == .increased {
+                        Color(nsColor: .controlBackgroundColor)
+                            .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
+                    }
                 }
             }
         }
@@ -1395,17 +1437,48 @@ struct WorkspaceBackdropView: View {
             }
     }
 
+    /// The one ground every theme now sits on: the same behind-window
+    /// material Glass uses, honouring `glassBackdropSource` and the painted
+    /// fallback through the one existing code path. `carrierWhiteCoverage` is
+    /// zero because the opaque themes' own veil does all the covering, and
+    /// stacking the light-Glass carrier under it would push Solid back to
+    /// fully opaque.
+    private var groundMaterial: some View {
+        DesktopGlassLayer(
+            liveMaterial: .underWindowBackground,
+            carrierWhiteCoverage: LightGlassFrost.railCarrierWhiteCoverage
+        )
+    }
+
     @ViewBuilder
     private var backdrop: some View {
         switch mode {
         case .system:
-            // The white solid. One flat opaque colour, no sampling, no
-            // gradient: whatever is on the desktop contributes exactly nothing.
-            // `windowBackgroundColor` resolves to #FFFFFF in light and #1E1E1E
-            // in dark, so this already *is* the "white solid" — what it lacked
-            // was a name that said so and a Tinted option distinct enough for
-            // the difference to be visible.
-            Color(nsColor: .windowBackgroundColor)
+            // Solid keeps the colour it always had — `windowBackgroundColor`
+            // resolves to #FFFFFF light / #1E1E1E dark — but a tenth of the
+            // surface now arrives as behind-window material, the way Safari's
+            // window ground is material in every mode. What Solid promises is
+            // about the *content*: the chrome card and pane cards stay fully
+            // opaque, so nothing behind the window ever reaches the surface
+            // work sits on. Reduce Transparency remains the true
+            // zero-sampling path.
+            if reduceTransparency {
+                Color(nsColor: .windowBackgroundColor)
+            } else {
+                ZStack {
+                    groundMaterial
+                    GlassBackdropWash
+                        .opaqueGround(theme: .system, isDark: colorScheme == .dark)
+                        .veil
+                    if accessibilityContrast == .increased {
+                        Color(nsColor: .windowBackgroundColor)
+                            .opacity(GlassBackdropWash.opaqueGroundIncreasedContrastOverlay(
+                                theme: .system,
+                                isDark: colorScheme == .dark
+                            ))
+                    }
+                }
+            }
         case .glass:
             if reduceTransparency {
                 Color(nsColor: .windowBackgroundColor)
@@ -1459,18 +1532,29 @@ struct WorkspaceBackdropView: View {
                 .animation(.easeInOut(duration: 0.35), value: idleActive)
             }
         case .tinted:
-            // Light flows the stable cool-to-white-to-pearl composition so a
-            // blue desktop cannot turn the whole window flat blue; dark flows
-            // the sampled desktop hue into its rotated companion. Increased
-            // Contrast dims the canvas exactly as it dims the rails — without
-            // this the tripled coverage left a white-rail-on-tinted-canvas
-            // split at the seam railTintShare exists to prevent.
-            ZStack {
+            // Tint over material now: the flowing gradient composites onto
+            // the shared material ground instead of onto a flat plate, with a
+            // fifth of the surface arriving as behind-window material.
+            // Increased Contrast dims the canvas exactly as it dims the rails
+            // — without this the tripled coverage left a
+            // white-rail-on-tinted-canvas split at the seam railTintShare
+            // exists to prevent. Reduce Transparency gets the plain plate:
+            // it is a request for no material at all, and the gradient is
+            // not material. (This branch had no guard before the ground
+            // became material; the gap only mattered once it did.)
+            if reduceTransparency {
                 Color(nsColor: .windowBackgroundColor)
-                FlowingTintedBackdrop()
-                if accessibilityContrast == .increased {
-                    Color(nsColor: .windowBackgroundColor)
-                        .opacity(GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: colorScheme == .dark))
+            } else {
+                ZStack {
+                    groundMaterial
+                    GlassBackdropWash
+                        .opaqueGround(theme: .tinted, isDark: colorScheme == .dark)
+                        .veil
+                    FlowingTintedBackdrop()
+                    if accessibilityContrast == .increased {
+                        Color(nsColor: .windowBackgroundColor)
+                            .opacity(GlassBackdropWash.workspaceIncreasedContrastOverlay(isDark: colorScheme == .dark))
+                    }
                 }
             }
         }

@@ -697,7 +697,7 @@ struct SettingsView: View {
                     SettingsDivider()
                     SettingsRow(
                         title: "Theme",
-                        detail: "Glass shows your desktop through the window; Solid is opaque",
+                        detail: "One frosted window: Glass shows your desktop through it, Solid covers it, Tinted colours it",
                         symbol: "sparkles.rectangle.stack"
                     ) {
                         // One row where there were seven.

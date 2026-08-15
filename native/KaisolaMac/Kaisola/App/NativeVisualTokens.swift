@@ -13,22 +13,28 @@ enum KaisolaVisualSystem {
     /// rounder one's junior. `testCornerLadderIsStrictlyIncreasingOutward`
     /// holds that, and it is the check a future "make it rounder" pass has to
     /// keep green rather than a list of literals to edit past.
-    static let controlRadius: CGFloat = 8
+    /// v0.1.127 climbs the whole ladder again ("let's make the edges of the
+    /// app more rounded"): every rung gains one to four points, the strict
+    /// ordering holds at 9 < 11 < 13 < 16 < 18 < 22 < 26, and the perceived
+    /// roundness lives in `chromeRadius` — the corner that sits mid-screen for
+    /// the whole session, where the window's own 10pt system corner is only
+    /// glanced at.
+    static let controlRadius: CGFloat = 9
     /// A session pane card, which sits *inside* the detail chrome panel. Was a
     /// bare `8` written inline in `RootShellView.unifiedSessionCard`; naming it
     /// is what puts it on the ladder at all.
-    static let paneRadius: CGFloat = 10
-    static let insetRadius: CGFloat = 12
-    static let cardRadius: CGFloat = 14
+    static let paneRadius: CGFloat = 11
+    static let insetRadius: CGFloat = 13
+    static let cardRadius: CGFloat = 16
     /// The document-preview and Files panels, which are nested one level inside
     /// the detail chrome panel and so stay a step under `chromeRadius`.
-    static let panelRadius: CGFloat = 16
-    static let shellRadius: CGFloat = 20
+    static let panelRadius: CGFloat = 18
+    static let shellRadius: CGFloat = 26
     /// Safari's inset floating-card chrome: the radius of the sidebar and
     /// detail panels that float over the window backdrop. Larger than
     /// `cardRadius` (which belongs to session cards *inside* a panel) and
     /// smaller than `shellRadius` (the window itself).
-    static let chromeRadius: CGFloat = 18
+    static let chromeRadius: CGFloat = 22
     /// The gutter of window backdrop left visible around each chrome panel.
     static let chromeInset: CGFloat = 6
     static let hairline: CGFloat = 0.5
@@ -40,6 +46,36 @@ enum KaisolaVisualSystem {
     static let hoverDuration = 0.09
     static let stateDuration = 0.14
     static let layoutDuration = 0.22
+}
+
+/// What makes the detail card read as floating rather than as a tinted region.
+///
+/// Safari's web-content card is separated from its sidebar by three things at
+/// once: a gutter of ground, a continuous-corner clip, and a soft shadow.
+/// Kaisola has had the first two since the flush-rail change, and none of the
+/// third — the card's light-appearance bottom edge was a white 0.10 hairline
+/// over a near-white ground, which is no edge at all.
+enum ChromeCardElevation {
+    /// Blur radius of the card's drop shadow. Sized against `chromeInset` (6):
+    /// a shadow that never leaves its own gutter is not perceived as depth,
+    /// and one wider than about twice the gutter smears onto the far rail.
+    static let shadowRadius: CGFloat = 12
+    static let shadowOffsetY: CGFloat = 3
+
+    static func shadowOpacity(isDark: Bool) -> Double { isDark ? 0.30 : 0.10 }
+
+    /// The containment hairline drawn *under* `panelEdge`'s top-light
+    /// gradient. The gradient lights the top; nothing was closing the bottom
+    /// and sides. Dark returns zero because dark already has the
+    /// `darkPanelCoverage` luminance step doing that work.
+    static func containmentOpacity(isDark: Bool) -> Double { isDark ? 0.0 : 0.07 }
+
+    /// Reduce Transparency and Increased Contrast both asked for a flat,
+    /// high-edge surface. Both get the existing `separatorColor` border and
+    /// no shadow.
+    static func engages(reduceTransparency: Bool, increasedContrast: Bool) -> Bool {
+        !reduceTransparency && !increasedContrast
+    }
 }
 
 /// The chat transcript's vertical rhythm. One uniform stack spacing gave a
@@ -170,6 +206,49 @@ enum LightGlassFrost {
 
     static func modeledRailDesktopContribution(_ wash: GlassBackdropWash) -> Double {
         (1 - railCarrierWhiteCoverage) * wash.desktopTransmission
+    }
+}
+
+/// The opaque themes' share of the shared material ground.
+///
+/// Safari's window ground is material in every mode; only the content card
+/// changes. Solid and Tinted used to paint a flat plate instead, which is why
+/// the window's edge read as a box in two of the three themes. They keep the
+/// colour they already had — light #FFFFFF, dark #1E1E1E — and gain the
+/// remainder as behind-window material.
+enum OpaqueThemeGround {
+    /// Dark Solid/Tinted keep `windowBackgroundColor`'s own value (30/255),
+    /// NOT `GlassBackdropWash.darkVeil` (#0D0D0D): the point is that the
+    /// surface does not change colour, only gains transmission.
+    static let darkPlate = (red: 30.0 / 255, green: 30.0 / 255, blue: 30.0 / 255)
+
+    /// Solid keeps almost all of its plate. A tenth of the material is enough
+    /// for the window edge to read as a pane rather than a card, and no
+    /// wallpaper feature survives 0.88 coverage over a 28pt blur.
+    static let solidCoverage = (light: 0.88, dark: 0.90)
+
+    /// Tinted is the living theme, so it gives up more: a fifth of the
+    /// surface is material, and the flowing gradient composites over that.
+    static let tintedCoverage = (light: 0.80, dark: 0.84)
+
+    static func coverage(theme: WorkspaceBackdropMode, isDark: Bool) -> Double {
+        switch theme {
+        case .system: isDark ? solidCoverage.dark : solidCoverage.light
+        case .tinted: isDark ? tintedCoverage.dark : tintedCoverage.light
+        // Glass's ground is its own wash; named here only so the three
+        // themes' coverages can be compared in one expression.
+        case .glass: GlassBackdropWash.workspace(isDark: isDark).baseOpacity
+        }
+    }
+
+    /// Modeled composite luminance over the normalized still, same method as
+    /// `LightGlassFrost.modeledBackdropLuminance`, for the tests.
+    static func modeledLuminance(theme: WorkspaceBackdropMode, isDark: Bool) -> Double {
+        let plateCoverage = coverage(theme: theme, isDark: isDark)
+        // Both plates are achromatic, so luminance is any channel.
+        let plate = isDark ? darkPlate.red : 1.0
+        let underlay = DesktopBackdropRenderer.targetLuminance(isDark: isDark)
+        return plateCoverage * plate + (1 - plateCoverage) * underlay
     }
 }
 
@@ -459,6 +538,16 @@ enum TintFlowMotion {
     /// a quicker transit between them, which is what makes a shallow change
     /// register at all without raising its depth.
     static let breathTimingControlPoints: (Float, Float, Float, Float) = (0.45, 0.05, 0.55, 0.95)
+
+    /// A screenshot must never catch a mid-drift frame. Pinned in every
+    /// isolated fixture process, exactly as `tintedBreathing` already is in
+    /// the app delegate's fixture branch — but structural, so adding a tinted
+    /// surface to CI cannot forget it.
+    static func isPinned(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        NativePreviewSettings.isIsolatedFixture(environment: environment)
+    }
 
     /// SwiftUI's `UnitPoint` puts (0,0) at the top-leading corner;
     /// `CAGradientLayer`'s unit space on an unflipped AppKit host puts (0,0)
@@ -1144,6 +1233,67 @@ struct GlassBackdropWash: Equatable, Sendable {
     static func workspaceIncreasedContrastOverlay(isDark: Bool) -> Double {
         increasedContrastOverlay(base: workspace(isDark: isDark).baseOpacity)
     }
+
+    /// Increased Contrast overlay for an opaque theme's ground. Solid's
+    /// 0.88/0.90 plate already clears the 0.80 floor and derives zero, and
+    /// Tinted's 0.80/0.84 sits exactly at or above it — the call is kept so a
+    /// future coverage cut cannot silently fall below the floor.
+    static func opaqueGroundIncreasedContrastOverlay(
+        theme: WorkspaceBackdropMode,
+        isDark: Bool
+    ) -> Double {
+        increasedContrastOverlay(
+            base: OpaqueThemeGround.coverage(theme: theme, isDark: isDark)
+        )
+    }
+
+    /// The centre ground for an opaque theme: the plate colour at
+    /// `OpaqueThemeGround.coverage`, laid over the shared material. Gradient
+    /// endpoints keep the ±0.04 light-from-above spread the glass washes use,
+    /// so the ground still lights from the top-leading corner in every theme.
+    ///
+    /// Deliberately NOT routed through `desktopTransmissionBand(isDark:)`:
+    /// that band is the *glass* contract and an opaque theme sits below its
+    /// transmission floor on purpose — a tenth of material is a pane edge,
+    /// not a glass surface. `GlassClarity` does not scale these either;
+    /// clarity is a glass knob, and scaling the Solid ground would turn Solid
+    /// into a fourth theme.
+    static func opaqueGround(theme: WorkspaceBackdropMode, isDark: Bool) -> GlassBackdropWash {
+        guard theme != .glass else { return workspace(isDark: isDark) }
+        let coverage = OpaqueThemeGround.coverage(theme: theme, isDark: isDark)
+        let spread = 0.04
+        // Light carries more white at the lit corner; dark carries less
+        // near-black there — both read as light from above.
+        let plate = OpaqueThemeGround.darkPlate
+        return isDark
+            ? GlassBackdropWash(
+                red: plate.red,
+                green: plate.green,
+                blue: plate.blue,
+                topOpacity: max(0, coverage - spread),
+                baseOpacity: coverage,
+                bottomOpacity: min(1, coverage + spread)
+            )
+            : GlassBackdropWash(
+                red: 1,
+                green: 1,
+                blue: 1,
+                topOpacity: min(1, coverage + spread),
+                baseOpacity: coverage,
+                bottomOpacity: max(0, coverage - spread)
+            )
+    }
+
+    /// The rails' half of the same ground. Identical coverage: the rails and
+    /// the canvas are one surface in the opaque themes — there is no chrome
+    /// panel between them — so a separation step here would draw a seam.
+    static func opaqueRailGround(appearance: SidebarAppearance, isDark: Bool) -> GlassBackdropWash {
+        switch appearance {
+        case .glass: sidebar(isDark: isDark)
+        case .solid: opaqueGround(theme: .system, isDark: isDark)
+        case .tinted: opaqueGround(theme: .tinted, isDark: isDark)
+        }
+    }
 }
 
 private struct KaisolaControlSurfaceModifier: ViewModifier {
@@ -1215,9 +1365,11 @@ extension View {
     /// A floating inset card for content that must be isolated from whatever is
     /// behind the window — the detail canvas and its panels.
     ///
-    /// Deliberately *not* used by the project sidebar: navigation chrome has
-    /// nothing to isolate, and stacking this material over the sidebar backdrop
-    /// hid the desktop that backdrop exists to show.
+    /// Deliberately *not* used by the project sidebar or the Files rail: the
+    /// two rails are the ground and the detail content column is the card,
+    /// and nothing else is either. Navigation chrome has nothing to isolate,
+    /// and stacking this material over a rail backdrop hid the desktop that
+    /// backdrop exists to show — the exact box the flush-rail change removed.
     func kaisolaChromePanel(
         inset: CGFloat = KaisolaVisualSystem.chromeInset,
         topInset: CGFloat? = nil
@@ -1237,6 +1389,7 @@ private struct KaisolaChromePanelModifier: ViewModifier {
 
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @ObservedObject private var settings = NativePreviewSettings.shared
 
     func body(content: Content) -> some View {
@@ -1247,11 +1400,45 @@ private struct KaisolaChromePanelModifier: ViewModifier {
         return content
             .clipShape(shape)
             .background { panelFill(shape) }
+            .background { cardShadow(shape) }
             .overlay { panelEdge(shape) }
             .padding(.top, topInset)
             .padding(.leading, inset)
             .padding(.trailing, inset)
             .padding(.bottom, inset)
+    }
+
+    /// The card's float, drawn as a shadow-ring: an opaque shape, shadowed,
+    /// then masked out of its own interior. It composites once and the render
+    /// server caches it — no per-frame work and no offscreen pass over the
+    /// live material the `.glass` fill sits on. The spill into the 6pt gutter
+    /// is the depth cue, not a bug; it must never be clipped away, never
+    /// animated, and never allowed to eat clicks aimed at the divider
+    /// corridors that share that gutter.
+    @ViewBuilder
+    private func cardShadow(_ shape: RoundedRectangle) -> some View {
+        if ChromeCardElevation.engages(
+            reduceTransparency: reduceTransparency,
+            increasedContrast: accessibilityContrast == .increased
+        ) {
+            shape
+                .fill(Color.black)
+                .shadow(
+                    color: .black.opacity(
+                        ChromeCardElevation.shadowOpacity(isDark: colorScheme == .dark)
+                    ),
+                    radius: ChromeCardElevation.shadowRadius,
+                    x: 0,
+                    y: ChromeCardElevation.shadowOffsetY
+                )
+                .compositingGroup()
+                .mask {
+                    Rectangle()
+                        .overlay { shape.fill(Color.black).blendMode(.destinationOut) }
+                        .compositingGroup()
+                }
+                .allowsHitTesting(false)
+        }
     }
 
     /// Dark appearance darkens the panel instead of lightening it.
@@ -1270,14 +1457,15 @@ private struct KaisolaChromePanelModifier: ViewModifier {
     /// thinner material, so the surface moves down instead of up and the backdrop
     /// still shows through. Light appearance is unchanged: there `.thinMaterial`
     /// already moves the surface the way it should go.
-    /// The panel isolates content from the backdrop, so what it should lay down
-    /// depends on what the backdrop actually is. It used to lay a material down
-    /// unconditionally, which is why Solid was never white: `windowBackgroundColor`
-    /// really does resolve to #FFFFFF in light appearance, and then this covered
-    /// it with a translucent grey. Solid promises "a flat opaque surface with no
-    /// wallpaper in it at all" and Tinted promises the desktop's hue over that
-    /// surface. Neither has a backdrop to be isolated from, so neither gets a
-    /// material; only Glass, which genuinely shows the desktop, still needs one.
+    /// The panel isolates content from the backdrop, so what it should lay
+    /// down depends on what the card is asked to isolate. Every theme's
+    /// ground is material now — Solid and Tinted included — so the question
+    /// is no longer *whether* there is a backdrop but whether the card lets
+    /// it through. Solid's card stays fully opaque: that opacity is what
+    /// keeps Solid's promise ("nothing behind the window reaches the surface
+    /// your work sits on") now that the ground around the card is material.
+    /// Tinted's card stays clear so the tint-over-material shows through it,
+    /// and Glass keeps its frost.
     @ViewBuilder
     private func panelFill(_ shape: RoundedRectangle) -> some View {
         if reduceTransparency {
@@ -1285,8 +1473,9 @@ private struct KaisolaChromePanelModifier: ViewModifier {
         } else {
             switch settings.workspaceBackdrop {
             case .system:
-                // The white solid, stated here rather than left to show through,
-                // so the panel keeps its own opacity contract.
+                // The opaque fill is what makes the Solid card read as a
+                // *card* — its edge against the material gutter is the whole
+                // visible delta of the glass-ground change in Solid.
                 shape.fill(Color(nsColor: .windowBackgroundColor))
             case .tinted:
                 // `WorkspaceBackdropView` already composites the solid surface
@@ -1326,17 +1515,29 @@ private struct KaisolaChromePanelModifier: ViewModifier {
                 lineWidth: KaisolaVisualSystem.hairline
             )
         } else {
-            shape.strokeBorder(
-                LinearGradient(
-                    colors: [
-                        Color.white.opacity(colorScheme == .dark ? 0.15 : 0.52),
-                        Color.white.opacity(colorScheme == .dark ? 0.03 : 0.10),
-                    ],
-                    startPoint: .top,
-                    endPoint: .bottom
-                ),
-                lineWidth: KaisolaVisualSystem.hairline
-            )
+            ZStack {
+                // The containment hairline closes the bottom and sides in
+                // light appearance, where the top-light gradient fades to a
+                // white 0.10 that vanishes against a near-white ground. Dark
+                // contributes zero and stays byte-identical.
+                shape.strokeBorder(
+                    Color.black.opacity(
+                        ChromeCardElevation.containmentOpacity(isDark: colorScheme == .dark)
+                    ),
+                    lineWidth: KaisolaVisualSystem.hairline
+                )
+                shape.strokeBorder(
+                    LinearGradient(
+                        colors: [
+                            Color.white.opacity(colorScheme == .dark ? 0.15 : 0.52),
+                            Color.white.opacity(colorScheme == .dark ? 0.03 : 0.10),
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: KaisolaVisualSystem.hairline
+                )
+            }
         }
     }
 }

@@ -108,10 +108,10 @@ enum SidebarAppearance: String, CaseIterable, Identifiable, Sendable {
 ///   vibrancy, which is a genuine live sample and therefore genuinely shows
 ///   Safari, Xcode, and everything else that happens to be underneath. Kept as
 ///   an explicit choice for people who *want* that classic macOS depth.
-/// - *eco* has no separate setting here: `SidebarAppearance.solid` and
-///   `WorkspaceBackdropMode.system` already are the flat, still, zero-sampling
-///   surfaces that mode described, and Reduce Transparency selects them
-///   automatically.
+/// - *eco* has no separate setting here. Since the glass-ground change even
+///   Solid rests on a sliver of the shared material, so the true
+///   zero-sampling surface is Reduce Transparency, which strips the material
+///   from every theme at once.
 enum GlassBackdropSource: String, CaseIterable, Identifiable, Sendable {
     case wallpaper
     case behindWindow

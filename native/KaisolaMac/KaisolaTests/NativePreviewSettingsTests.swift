@@ -1769,6 +1769,16 @@ final class NativePreviewSettingsTests: XCTestCase {
                 ? GlassBackdropWash.sidebar(isDark: isDark)
                 : GlassBackdropWash.workspace(isDark: isDark)
             return ("\(name) wash (isDark: \(isDark))", [wash.red, wash.green, wash.blue])
+        } + [("opaque dark plate", [
+            OpaqueThemeGround.darkPlate.red,
+            OpaqueThemeGround.darkPlate.green,
+            OpaqueThemeGround.darkPlate.blue,
+        ])] + [
+            (WorkspaceBackdropMode.system, false), (.system, true),
+            (.tinted, false), (.tinted, true),
+        ].map { theme, isDark -> (String, [Double]) in
+            let wash = GlassBackdropWash.opaqueGround(theme: theme, isDark: isDark)
+            return ("opaque \(theme.rawValue) ground (isDark: \(isDark))", [wash.red, wash.green, wash.blue])
         }
 
         for (name, channels) in neutrals {
@@ -1843,7 +1853,143 @@ final class NativePreviewSettingsTests: XCTestCase {
                 GlassBackdropWash.increasedContrastCoverage - epsilon,
                 "workspace (\(appearance)) leaves too much wallpaper under Increased Contrast"
             )
+            // The opaque themes' grounds sit at or above the floor on their
+            // own, so their derived overlays clamp to zero — the assertions
+            // exist so a future coverage cut cannot fall below it silently.
+            for theme in [WorkspaceBackdropMode.system, .tinted] {
+                XCTAssertGreaterThanOrEqual(
+                    composite(
+                        base: OpaqueThemeGround.coverage(theme: theme, isDark: isDark),
+                        overlay: GlassBackdropWash.opaqueGroundIncreasedContrastOverlay(
+                            theme: theme,
+                            isDark: isDark
+                        )
+                    ),
+                    GlassBackdropWash.increasedContrastCoverage - epsilon,
+                    "\(theme.rawValue) ground (\(appearance)) leaves too much wallpaper under Increased Contrast"
+                )
+            }
         }
+    }
+
+    /// The window ground is material in every theme, the way Safari's is: no
+    /// theme's ground is fully opaque, and the three stay strictly ordered —
+    /// Glass shows the most desktop, Tinted gives up a fifth, Solid a tenth.
+    func testEveryThemeSitsOnTheSameMaterialGround() {
+        for isDark in [false, true] {
+            let glass = OpaqueThemeGround.coverage(theme: .glass, isDark: isDark)
+            let tinted = OpaqueThemeGround.coverage(theme: .tinted, isDark: isDark)
+            let solid = OpaqueThemeGround.coverage(theme: .system, isDark: isDark)
+            XCTAssertLessThan(glass, tinted, "isDark \(isDark): the themes lost their ordering")
+            XCTAssertLessThan(tinted, solid, "isDark \(isDark): the themes lost their ordering")
+            XCTAssertLessThan(solid, 1.0, "isDark \(isDark): Solid went back to a flat plate")
+        }
+    }
+
+    /// The opaque themes keep the colour they always had — light #FFFFFF,
+    /// dark `windowBackgroundColor`'s #1E1E1E (which `controlBackgroundColor`
+    /// matches in Dark Aqua, so one plate covers rails and canvas). Fails
+    /// loudly if AppKit ever moves the dark value. The dark ground also must
+    /// not pick up `GlassWarmth`'s amber: at a tenth of transmission the
+    /// declared amber contributes under a count of 255.
+    func testTheOpaqueThemesKeepTheColourTheyAlwaysHad() {
+        let lightGround = GlassBackdropWash.opaqueGround(theme: .system, isDark: false)
+        XCTAssertEqual(lightGround.red, 1)
+        XCTAssertEqual(lightGround.green, 1)
+        XCTAssertEqual(lightGround.blue, 1)
+
+        let darkGround = GlassBackdropWash.opaqueGround(theme: .system, isDark: true)
+        XCTAssertEqual(darkGround.red, OpaqueThemeGround.darkPlate.red)
+
+        guard let darkAqua = NSAppearance(named: .darkAqua) else {
+            return XCTFail("no darkAqua appearance to resolve against")
+        }
+        var window: NSColor?
+        var control: NSColor?
+        darkAqua.performAsCurrentDrawingAppearance {
+            window = NSColor.windowBackgroundColor.usingColorSpace(.sRGB)
+            control = NSColor.controlBackgroundColor.usingColorSpace(.sRGB)
+        }
+        for (name, resolved) in [("windowBackgroundColor", window), ("controlBackgroundColor", control)] {
+            guard let resolved else { return XCTFail("\(name) did not resolve to sRGB") }
+            for channel in [resolved.redComponent, resolved.greenComponent, resolved.blueComponent] {
+                XCTAssertEqual(
+                    Double(channel),
+                    OpaqueThemeGround.darkPlate.red,
+                    accuracy: 1.0 / 255,
+                    "\(name) moved off the #1E1E1E plate the dark grounds are built on"
+                )
+            }
+        }
+
+        let warmthShare = GlassWarmth.opacity(isDark: true)
+            * (1 - OpaqueThemeGround.solidCoverage.dark)
+        XCTAssertLessThan(warmthShare, 1.0 / 255, "the dark Solid ground picked up a visible amber")
+    }
+
+    /// The glass transmission band is the *glass* contract — its floor exists
+    /// so a glass surface never becomes an opaque panel. The opaque themes sit
+    /// below that floor on purpose: a tenth to a fifth of material is a pane
+    /// edge, not a glass surface. This test is here so nobody "fixes" the
+    /// band violation by pushing the opaque grounds into it.
+    func testOpaqueGroundsAreOutsideTheGlassTransmissionBandOnPurpose() {
+        for isDark in [false, true] {
+            let floor = GlassBackdropWash.desktopTransmissionBand(isDark: isDark).floor
+            for theme in [WorkspaceBackdropMode.system, .tinted] {
+                XCTAssertLessThan(
+                    1 - OpaqueThemeGround.coverage(theme: theme, isDark: isDark),
+                    floor,
+                    "\(theme.rawValue) (isDark \(isDark)) drifted into the glass band and stopped being an opaque theme"
+                )
+            }
+        }
+    }
+
+    /// Clarity is a glass knob. Scaling the Solid ground by a clarity's veil
+    /// scale would turn Solid into a fourth theme, so `opaqueGround` takes no
+    /// clarity at all — and this test pins that scaling *would* change the
+    /// wash, so routing clarity through cannot pass unnoticed.
+    func testClarityDoesNotScaleTheOpaqueGrounds() {
+        for isDark in [false, true] {
+            let ground = GlassBackdropWash.opaqueGround(theme: .system, isDark: isDark)
+            for clarity in GlassClarity.allCases where clarity.veilScale != 1 {
+                XCTAssertNotEqual(
+                    ground.scaled(by: clarity.veilScale),
+                    ground,
+                    "the sentinel lost its teeth: scaling no longer changes the wash"
+                )
+            }
+            XCTAssertEqual(GlassBackdropWash.opaqueGround(theme: .system, isDark: isDark), ground)
+        }
+    }
+
+    /// The tinted stops were solved against pure white; the material ground
+    /// under them must stay within a few counts of it, or the palette table
+    /// silently re-solves. Dark is the mirror guard: a dark canvas that glows
+    /// is not a canvas.
+    func testTintedGroundStaysWhiteLedEnoughForItsStops() {
+        XCTAssertGreaterThanOrEqual(
+            OpaqueThemeGround.modeledLuminance(theme: .tinted, isDark: false),
+            0.94,
+            "the light tinted ground darkened past what the stop table was solved against"
+        )
+        XCTAssertLessThanOrEqual(
+            OpaqueThemeGround.modeledLuminance(theme: .tinted, isDark: true),
+            0.16
+        )
+        XCTAssertLessThanOrEqual(
+            OpaqueThemeGround.modeledLuminance(theme: .system, isDark: true),
+            0.16
+        )
+    }
+
+    /// A screenshot must never catch a mid-drift frame: every isolated
+    /// fixture process pins the tint's endpoint drift, structurally rather
+    /// than per surface. Pure, no view.
+    func testFixtureProcessesPinTheTintDrift() {
+        XCTAssertTrue(TintFlowMotion.isPinned(environment: ["KAISOLA_NATIVE_VISUAL_FIXTURE": "1"]))
+        XCTAssertTrue(TintFlowMotion.isPinned(environment: ["KAISOLA_NATIVE_RESOURCE_WORKLOAD": "x"]))
+        XCTAssertFalse(TintFlowMotion.isPinned(environment: [:]))
     }
 
     /// Increased Contrast has to be a *visible* step up from the ordinary veil
@@ -6014,13 +6160,78 @@ final class NativePreviewSettingsTests: XCTestCase {
                 "\(inner.0)Radius must stay tighter than \(outer.0)Radius"
             )
         }
-        XCTAssertEqual(KaisolaVisualSystem.shellRadius, 20)
-        XCTAssertEqual(KaisolaVisualSystem.chromeRadius, 18)
+        XCTAssertEqual(KaisolaVisualSystem.shellRadius, 26)
+        XCTAssertEqual(KaisolaVisualSystem.chromeRadius, 22)
 
         // The rail's active-project capsule uses `insetRadius` inside a 32pt
         // row, so it has to stay under half the row height or the capsule turns
         // into a stadium and stops reading as a rectangle at all.
         XCTAssertLessThan(KaisolaVisualSystem.insetRadius, 16)
+    }
+
+    /// A shadow narrower than the gutter is invisible; wider than about twice
+    /// it smears onto the far rail. The offset stays inside the blur so the
+    /// card floats rather than sliding.
+    func testTheChromeCardShadowStaysInsideItsOwnGutterNeighbourhood() {
+        XCTAssertGreaterThan(
+            ChromeCardElevation.shadowRadius,
+            KaisolaVisualSystem.chromeInset
+        )
+        XCTAssertLessThanOrEqual(
+            ChromeCardElevation.shadowRadius,
+            KaisolaVisualSystem.chromeInset * 2
+        )
+        XCTAssertLessThan(
+            ChromeCardElevation.shadowOffsetY,
+            ChromeCardElevation.shadowRadius
+        )
+    }
+
+    func testAccessibilitySurfacesGetNoCardShadow() {
+        XCTAssertFalse(ChromeCardElevation.engages(reduceTransparency: true, increasedContrast: false))
+        XCTAssertFalse(ChromeCardElevation.engages(reduceTransparency: false, increasedContrast: true))
+        XCTAssertTrue(ChromeCardElevation.engages(reduceTransparency: false, increasedContrast: false))
+    }
+
+    /// Dark already separates the card with its `darkPanelCoverage` luminance
+    /// step, so its containment hairline is zero and its appearance stays
+    /// byte-identical; light is where the closing edge was missing. The dark
+    /// shadow is heavier because a dark ground swallows a light one's opacity.
+    func testDarkAppearanceKeepsItsExistingCardEdge() {
+        XCTAssertEqual(ChromeCardElevation.containmentOpacity(isDark: true), 0)
+        XCTAssertGreaterThan(ChromeCardElevation.containmentOpacity(isDark: false), 0)
+        XCTAssertGreaterThan(
+            ChromeCardElevation.shadowOpacity(isDark: true),
+            ChromeCardElevation.shadowOpacity(isDark: false)
+        )
+    }
+
+    /// The regression the flush-rail change fixed by hand: the two rails are
+    /// the ground and the detail content column is the card, and nothing else
+    /// is either. A source-level count, because nothing structural prevents a
+    /// future pass from quietly re-carding a rail.
+    func testOnlyTheDetailColumnWearsTheChromeCard() throws {
+        let sources = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Kaisola", isDirectory: true)
+        let expectations = [
+            ("Features/Sessions/RootShellView.swift", 1),
+            ("Features/Workspace/WorkspaceRailView.swift", 0),
+            ("Features/Sessions/QuietProjectRail.swift", 0),
+        ]
+        for (path, expected) in expectations {
+            let source = try String(
+                contentsOf: sources.appendingPathComponent(path),
+                encoding: .utf8
+            )
+            let calls = source.components(separatedBy: ".kaisolaChromePanel(").count - 1
+            XCTAssertEqual(
+                calls,
+                expected,
+                "\(path): only the detail column may wear the chrome card"
+            )
+        }
     }
 
     func testTerminalPaneGridKeepsSessionsReadable() {

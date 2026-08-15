@@ -153,42 +153,54 @@ final class BrokerGenerationLifecycle: @unchecked Sendable {
         logURL: URL,
         pid: Int32
     ) throws -> (descriptor: Int32, identity: FileIdentity) {
+        // The lock must never exist without its owner's pid inside: creating
+        // it empty and writing afterwards leaves a window in which a
+        // concurrent relaunch (either runtime) reads an ownerless lock and
+        // takes it over. Hard-linking a pre-written claim file makes creation
+        // and content one atomic step — the same contract as the Node broker.
+        let claimURL = lockURL.deletingLastPathComponent()
+            .appendingPathComponent("\(lockURL.lastPathComponent).\(pid).claim")
+        defer { _ = unlink(claimURL.path) }
         for attempt in 0..<2 {
-            let descriptor = Darwin.open(
-                lockURL.path,
-                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
-                0o600
-            )
-            if descriptor >= 0 {
-                var createdIdentity: FileIdentity?
+            let claimIdentity = try writeClaim(at: claimURL, pid: pid)
+            if link(claimURL.path, lockURL.path) == 0 {
+                // Drop the claim's extra link before validating, so the lock
+                // settles to nlink == 1 as fast as a reader can observe it.
+                _ = unlink(claimURL.path)
+                let descriptor = Darwin.open(
+                    lockURL.path,
+                    O_RDWR | O_CLOEXEC | O_NOFOLLOW
+                )
+                guard descriptor >= 0 else {
+                    throw BrokerGenerationLifecycleError.systemCall(errno)
+                }
                 do {
-                    var created = stat()
-                    guard fstat(descriptor, &created) == 0,
-                          created.st_uid == geteuid(),
-                          created.st_mode & S_IFMT == S_IFREG,
-                          created.st_nlink == 1 else {
-                        throw BrokerGenerationLifecycleError.unsafeLock
-                    }
-                    createdIdentity = FileIdentity(created)
-                    guard fchmod(descriptor, 0o600) == 0 else {
-                        throw BrokerGenerationLifecycleError.systemCall(errno)
-                    }
                     var value = stat()
                     guard fstat(descriptor, &value) == 0,
-                          FileIdentity(value) == createdIdentity,
+                          FileIdentity(value) == claimIdentity,
+                          value.st_uid == geteuid(),
+                          value.st_mode & S_IFMT == S_IFREG,
                           value.st_mode & 0o777 == 0o600,
                           value.st_nlink == 1 else {
                         throw BrokerGenerationLifecycleError.unsafeLock
                     }
-                    try writeAll(Data("\(pid)\n".utf8), to: descriptor)
-                    guard fsync(descriptor) == 0 else {
-                        throw BrokerGenerationLifecycleError.systemCall(errno)
+                    // Held for the broker's lifetime and released by close:
+                    // the app-side stale cleanup arbitrates with
+                    // flock(LOCK_EX | LOCK_NB), so the kernel is the single
+                    // referee between a live broker and a cleanup pass.
+                    guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+                        throw BrokerGenerationLifecycleError.lockHeld(nil)
                     }
                     return (descriptor, FileIdentity(value))
                 } catch {
                     Darwin.close(descriptor)
-                    if let createdIdentity {
-                        unlinkIfUnchanged(lockURL, identity: createdIdentity)
+                    unlinkIfUnchanged(lockURL, identity: claimIdentity)
+                    if let lifecycleError = error as? BrokerGenerationLifecycleError,
+                       lifecycleError.isGenerationLockUnavailable {
+                        appendLog(
+                            "generation lock unavailable \(lifecycleError.logCode) \(lifecycleError.localizedDescription)",
+                            to: logURL
+                        )
                     }
                     throw error
                 }
@@ -215,14 +227,20 @@ final class BrokerGenerationLifecycle: @unchecked Sendable {
             }
 
             // Match the Node recovery contract exactly: an absent or malformed
-            // owner hint is "unrecorded"; any valid PID from either authority
-            // blocks takeover when kill(pid, 0) succeeds or returns EPERM.
-            let owners: [Int32]
+            // owner hint is "unrecorded"; a valid PID from either authority
+            // blocks takeover when kill(pid, 0) succeeds or returns EPERM —
+            // but only when its authority file was written since the last
+            // boot. No pre-boot process survives a reboot, so a living pid
+            // recorded pre-boot can only be a post-reboot recycle.
+            let owners: [(pid: Int32, authority: URL)]
             do {
-                owners = try [
-                    recordedLockPID(at: lockURL),
-                    publishedRendezvousPID(at: infoURL),
-                ].compactMap { $0 }.filter { $0 != pid }
+                let hints: [(Int32?, URL)] = try [
+                    (recordedLockPID(at: lockURL), lockURL),
+                    (publishedRendezvousPID(at: infoURL), infoURL),
+                ]
+                owners = hints
+                    .compactMap { hint in hint.0.map { (pid: $0, authority: hint.1) } }
+                    .filter { $0.pid != pid }
             } catch {
                 appendLog(
                     "generation lock unavailable ELOCKHELD unsafe owner authority",
@@ -230,9 +248,9 @@ final class BrokerGenerationLifecycle: @unchecked Sendable {
                 )
                 throw BrokerGenerationLifecycleError.lockHeld(nil)
             }
-            if let living = owners.first(where: pidIsAlive) {
-                let error = BrokerGenerationLifecycleError.lockHeld(living)
-                appendLog("generation lock unavailable ELOCKHELD held by live pid \(living)", to: logURL)
+            if let living = owners.first(where: { writtenSinceBoot($0.authority) && pidIsAlive($0.pid) }) {
+                let error = BrokerGenerationLifecycleError.lockHeld(living.pid)
+                appendLog("generation lock unavailable ELOCKHELD held by live pid \(living.pid)", to: logURL)
                 throw error
             }
 
@@ -255,13 +273,69 @@ final class BrokerGenerationLifecycle: @unchecked Sendable {
             }
             let ownerDescription = owners.isEmpty
                 ? "unrecorded"
-                : owners.map(String.init).joined(separator: ",")
+                : owners.map { String($0.pid) }.joined(separator: ",")
             appendLog(
                 "recovered stale generation lock deadOwner=\(ownerDescription)",
                 to: logURL
             )
         }
         throw BrokerGenerationLifecycleError.lockHeld(nil)
+    }
+
+    /// The claim carries the owner pid before the lock path ever exists.
+    /// O_TRUNC rather than O_EXCL: a crashed earlier run of this same pid can
+    /// leave its claim behind, and pid identity makes reuse safe.
+    private static func writeClaim(at claimURL: URL, pid: Int32) throws -> FileIdentity {
+        let descriptor = Darwin.open(
+            claimURL.path,
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+            0o600
+        )
+        guard descriptor >= 0 else {
+            throw BrokerGenerationLifecycleError.systemCall(errno)
+        }
+        defer { Darwin.close(descriptor) }
+        guard fchmod(descriptor, 0o600) == 0 else {
+            throw BrokerGenerationLifecycleError.systemCall(errno)
+        }
+        var value = stat()
+        guard fstat(descriptor, &value) == 0,
+              value.st_uid == geteuid(),
+              value.st_mode & S_IFMT == S_IFREG,
+              value.st_mode & 0o777 == 0o600,
+              value.st_nlink == 1 else {
+            throw BrokerGenerationLifecycleError.unsafeLock
+        }
+        try writeAll(Data("\(pid)\n".utf8), to: descriptor)
+        guard fsync(descriptor) == 0 else {
+            throw BrokerGenerationLifecycleError.systemCall(errno)
+        }
+        return FileIdentity(value)
+    }
+
+    /// A file written before the last boot cannot have a living owner,
+    /// whatever kill(0) says about a recycled pid. The minute of slack errs
+    /// toward "written after boot", which fails closed; an unreadable boot
+    /// time also fails closed by treating every file as post-boot.
+    private static func writtenSinceBoot(_ url: URL) -> Bool {
+        guard let boot = bootTime() else { return true }
+        var value = stat()
+        guard lstat(url.path, &value) == 0 else { return false }
+        let modified = Double(value.st_mtimespec.tv_sec)
+            + Double(value.st_mtimespec.tv_nsec) / 1_000_000_000
+        return modified > boot.timeIntervalSince1970 - 60
+    }
+
+    private static func bootTime() -> Date? {
+        var value = timeval()
+        var size = MemoryLayout<timeval>.size
+        var name: [Int32] = [CTL_KERN, KERN_BOOTTIME]
+        guard sysctl(&name, 2, &value, &size, nil, 0) == 0, value.tv_sec > 0 else {
+            return nil
+        }
+        return Date(
+            timeIntervalSince1970: Double(value.tv_sec) + Double(value.tv_usec) / 1_000_000
+        )
     }
 
     private static func recordedLockPID(at url: URL) throws -> Int32? {

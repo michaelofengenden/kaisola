@@ -1031,8 +1031,12 @@ final class NativePreviewSettings: ObservableObject {
     }
 
     static let projectRailWidthUnset: Double = 0
-    /// Mirrors `NativeWorkspaceChrome`'s minimum/maximum for the same rail.
-    static let projectRailWidthRange: ClosedRange<Double> = 168...340
+    /// Derived from `NativeWorkspaceChrome`'s band for the same rail so the
+    /// two can never drift — a hand-copied mirror of one band in one module
+    /// already moved once inside this release.
+    static let projectRailWidthRange: ClosedRange<Double> =
+        Double(NativeWorkspaceChrome.projectSidebarMinimumWidth)
+            ... Double(NativeWorkspaceChrome.projectSidebarMaximumWidth)
 
     /// Width of the document preview beside the active terminal/chat. App-owned
     /// sizing avoids HSplitView's stale autosaved dividers and gives us a broad,

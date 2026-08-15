@@ -261,10 +261,19 @@ struct NewSessionChooserView: View {
                     choose(choice(agent.id))
                 } label: {
                     HStack(spacing: 12) {
+                        // The same disabled ink as the primary cards: without
+                        // it a row disabled mid-launch (or with control lost)
+                        // renders pixel-identical to a clickable one.
                         Image(systemName: agent.symbol.isEmpty ? symbol : agent.symbol)
+                            .foregroundStyle(
+                                isEnabled ? AnyShapeStyle(.primary) : AnyShapeStyle(Color.kaisolaDisabled)
+                            )
                             .frame(width: 20)
                         Text(agent.name)
                             .font(.callout.weight(.medium))
+                            .foregroundStyle(
+                                isEnabled ? AnyShapeStyle(.primary) : AnyShapeStyle(Color.kaisolaDisabled)
+                            )
                         Spacer()
                         Image(systemName: "chevron.right")
                             .font(.caption.weight(.semibold))

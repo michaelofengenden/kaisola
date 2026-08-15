@@ -3900,6 +3900,11 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
         private var lastWindowX: CGFloat?
         private weak var activeSplitView: NSSplitView?
         private var activeDividerIndex: Int?
+        /// A bare click on the (deliberately wide) divider corridor must not
+        /// stamp the current app-chosen width as a user choice — a stored
+        /// width opts the user out of every future default-width migration.
+        /// Only a drag that actually moved the divider persists.
+        private var dragMoved = false
         private var trackingArea: NSTrackingArea?
         private lazy var dividerAccessibilityElement = NavigationSidebarAccessibilityElement(
             owner: self
@@ -4011,6 +4016,7 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
             activeSplitView = match.splitView
             activeDividerIndex = match.index
             lastWindowX = event.locationInWindow.x
+            dragMoved = false
         }
 
         override func mouseDragged(with event: NSEvent) {
@@ -4026,18 +4032,26 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
                 splitView.subviews[dividerIndex].frame.maxX + delta,
                 ofDividerAt: dividerIndex
             )
+            dragMoved = true
         }
 
         override func mouseUp(with event: NSEvent) {
             // The width the user let go at is the width every window opens at
             // from now on. Written once per drag, here rather than per
-            // mouseDragged, so a long drag is one defaults write.
-            if let splitView = activeSplitView,
+            // mouseDragged, so a long drag is one defaults write. A zero-move
+            // click writes nothing, and a collapsed pane's maxX of 0 would
+            // round-trip as the unset sentinel, silently erasing the stored
+            // choice — reject it.
+            if dragMoved,
+               let splitView = activeSplitView,
                let index = activeDividerIndex,
                splitView.subviews.indices.contains(index) {
-                NativePreviewSettings.shared.projectRailWidth =
-                    Double(splitView.subviews[index].frame.maxX)
+                let width = Double(splitView.subviews[index].frame.maxX)
+                if width > 0 {
+                    NativePreviewSettings.shared.projectRailWidth = width
+                }
             }
+            dragMoved = false
             lastWindowX = nil
             activeSplitView = nil
             activeDividerIndex = nil
@@ -4068,8 +4082,10 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
             )
             // Keyboard resizes persist the same way a drag's mouse-up does,
             // reading back the split view's clamped result.
-            NativePreviewSettings.shared.projectRailWidth =
-                Double(match.splitView.subviews[match.index].frame.maxX)
+            let width = Double(match.splitView.subviews[match.index].frame.maxX)
+            if width > 0 {
+                NativePreviewSettings.shared.projectRailWidth = width
+            }
             NSAccessibility.post(element: self, notification: .valueChanged)
             return true
         }

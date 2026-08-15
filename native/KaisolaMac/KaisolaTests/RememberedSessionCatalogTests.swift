@@ -411,9 +411,23 @@ final class RememberedSessionCatalogTests: XCTestCase {
         }
     }
 
+    /// An isolated defaults suite per test: the fleet latch persists through
+    /// `.standard`, and leaking it between tests (or into the developer's own
+    /// app defaults) would make these assertions order-dependent.
     @MainActor
-    func testCatalogCenterSeparatesLocalFromOrderedRemoteDevicesAndClearsOnSignOut() {
-        let center = RememberedSessionCatalogCenter(localDeviceID: "local")
+    private func isolatedLatchDefaults() throws -> UserDefaults {
+        let name = "kaisola-tests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: name))
+        addTeardownBlock { defaults.removePersistentDomain(forName: name) }
+        return defaults
+    }
+
+    @MainActor
+    func testCatalogCenterSeparatesLocalFromOrderedRemoteDevicesAndClearsOnSignOut() throws {
+        let center = RememberedSessionCatalogCenter(
+            localDeviceID: "local",
+            latchDefaults: try isolatedLatchDefaults()
+        )
         let remoteOffline = device(id: "z", name: "Zulu", presence: .offline)
         let local = device(id: "local", name: "Local", presence: .online)
         let remoteOnline = device(id: "a", name: "Alpha", presence: .online)
@@ -452,13 +466,39 @@ final class RememberedSessionCatalogTests: XCTestCase {
     }
 
     @MainActor
-    func testFleetLatchStaysDownForALocalOnlyCatalog() {
-        let center = RememberedSessionCatalogCenter(localDeviceID: "local")
+    func testFleetLatchStaysDownForALocalOnlyCatalog() throws {
+        let center = RememberedSessionCatalogCenter(
+            localDeviceID: "local",
+            latchDefaults: try isolatedLatchDefaults()
+        )
         XCTAssertFalse(center.hasEverSeenRemoteDevice)
         center.apply([device(id: "local", name: "Local", presence: .online)], now: 10)
         XCTAssertFalse(center.hasEverSeenRemoteDevice)
         center.fail(RememberedSessionCatalogError.invalidResponse)
         XCTAssertFalse(center.hasEverSeenRemoteDevice)
+    }
+
+    @MainActor
+    func testFleetLatchSurvivesARelaunchWithoutALoadableSnapshot() throws {
+        let defaults = try isolatedLatchDefaults()
+        let first = RememberedSessionCatalogCenter(localDeviceID: "local", latchDefaults: defaults)
+        first.apply(
+            [device(id: "local", name: "Local", presence: .online),
+             device(id: "b", name: "Bravo", presence: .offline)],
+            now: 10
+        )
+        XCTAssertTrue(first.hasEverSeenRemoteDevice)
+
+        // A relaunch whose snapshot fails to load re-seeds nothing through
+        // apply(); the persisted latch alone must keep a real fleet's
+        // refresh errors visible.
+        let relaunched = RememberedSessionCatalogCenter(localDeviceID: "local", latchDefaults: defaults)
+        XCTAssertTrue(relaunched.hasEverSeenRemoteDevice)
+
+        // Sign-out lowers the latch for the next account, durably.
+        relaunched.clear()
+        let afterSignOut = RememberedSessionCatalogCenter(localDeviceID: "local", latchDefaults: defaults)
+        XCTAssertFalse(afterSignOut.hasEverSeenRemoteDevice)
     }
 
     private func draft(createdAt: Int64?, lastActivityAt: Int64?) -> RememberedSessionDraft {

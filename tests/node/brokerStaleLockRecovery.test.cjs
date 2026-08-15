@@ -10,6 +10,7 @@ const test = require('node:test')
 const assert = require('node:assert/strict')
 const crypto = require('node:crypto')
 const fs = require('node:fs')
+const os = require('node:os')
 const path = require('node:path')
 const { spawn } = require('node:child_process')
 
@@ -126,6 +127,24 @@ test('a lock naming a living process keeps failing closed with exit 2', async ()
   // owner's lock file survives untouched.
   assert.match(readLog(fixture), /generation lock unavailable ELOCKHELD/)
   assert.equal(fs.readFileSync(fixture.config.lockFile, 'utf8').trim(), String(process.pid))
+})
+
+test('a reboot-orphaned lock naming a recycled-but-living pid is recovered', async () => {
+  const fixture = makeFixture()
+  // process.pid is certainly alive — but the lock predates the last boot,
+  // and no pre-boot process survives a reboot, so a living pid can only be
+  // a post-reboot recycle. Judging by kill(0) alone re-wedged exactly the
+  // reboot case the recovery exists for.
+  fs.writeFileSync(fixture.config.lockFile, `${process.pid}\n`, { mode: 0o600 })
+  const preBoot = new Date(Date.now() - os.uptime() * 1000 - 3_600_000)
+  fs.utimesSync(fixture.config.lockFile, preBoot, preBoot)
+  const broker = startBroker(fixture, 'recover-recycled-pid')
+  try {
+    await waitFor(() => fs.existsSync(fixture.config.infoFile), 'published rendezvous')
+    assert.match(readLog(fixture), /recovered stale generation lock deadOwner=/)
+  } finally {
+    await terminate(broker)
+  }
 })
 
 test('the lock is born owned: pid inside from creation, claim file cleaned up', async () => {

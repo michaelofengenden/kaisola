@@ -385,10 +385,14 @@ enum WorkspaceBackdropMode: String, CaseIterable, Identifiable, Sendable {
     var title: String {
         switch self {
         // "System" described where the colour came from, not what you get, and
-        // what you get is the point: a flat opaque surface with no wallpaper in
-        // it at all. Michael asked for the canvas to "actually be tinted or a
-        // white solid"; this is the white solid, and it now says so. The raw
-        // value stays `system` so nobody's stored preference moves.
+        // what you get is the point: nothing behind the window reaches the
+        // surface your work sits on. Since the glass-ground change the window
+        // *edge* rests on a sliver of shared material like every theme, but
+        // the chrome card and pane cards stay fully opaque — that opacity is
+        // Solid's promise now, and Reduce Transparency remains the true
+        // no-material path. Michael asked for the canvas to "actually be
+        // tinted or a white solid"; this is the white solid, and it says so.
+        // The raw value stays `system` so nobody's stored preference moves.
         case .system: "Solid"
         case .glass: "Glass"
         case .tinted: "Tinted"

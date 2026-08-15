@@ -56,9 +56,13 @@ struct AcpThinkingStatusRow: View {
     let status: AcpThinkingStatus
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
-    /// The CI capture must never photograph a mid-sweep frame.
+    /// The CI capture must never photograph a mid-sweep frame. Structural,
+    /// like `TintFlowMotion.isPinned()`: every isolated fixture process pins
+    /// the sweep, not just the visual-capture one.
     private var fixture: Bool {
-        ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] == "1"
+        NativePreviewSettings.isIsolatedFixture(
+            environment: ProcessInfo.processInfo.environment
+        )
     }
 
     /// One face for the shimmer mask and the static fallback, so a Reduce

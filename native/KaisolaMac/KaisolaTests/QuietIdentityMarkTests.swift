@@ -1435,6 +1435,17 @@ final class QuietIdentityMarkTests: XCTestCase {
         // increasing outward.
         XCTAssertEqual(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.controlRadius)
         XCTAssertLessThan(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.insetRadius)
+        // "A 12pt radius on a 32pt row reads as a lozenge rather than a row"
+        // — that 0.375 ratio is the documented failure, and the session lane
+        // (26pt) is now the tighter of the two rows the pill draws in. Both
+        // halves of the ratio moved independently in v0.1.127 (radius 8 → 9,
+        // session rows 32 → 26), so the bound is held here rather than
+        // re-derived by eye on the next pass.
+        XCTAssertLessThan(
+            QuietSelectionPill.cornerRadius / QuietRailMetrics.sessionRowHeight,
+            0.375,
+            "the selected session's pill turned into a lozenge"
+        )
         XCTAssertGreaterThan(QuietSelectionPill.horizontalInset, 0)
         XCTAssertLessThan(
             QuietSelectionPill.horizontalInset,

@@ -14,11 +14,11 @@ enum KaisolaVisualSystem {
     /// holds that, and it is the check a future "make it rounder" pass has to
     /// keep green rather than a list of literals to edit past.
     /// v0.1.127 climbs the whole ladder again ("let's make the edges of the
-    /// app more rounded"): every rung gains one to four points, the strict
-    /// ordering holds at 9 < 11 < 13 < 16 < 18 < 22 < 26, and the perceived
-    /// roundness lives in `chromeRadius` — the corner that sits mid-screen for
-    /// the whole session, where the window's own 10pt system corner is only
-    /// glanced at.
+    /// app more rounded"): a point at the small end, four on the chrome, six
+    /// on the shell. The strict ordering holds at 9 < 11 < 13 < 16 < 18 < 22
+    /// < 26, and the perceived roundness lives in `chromeRadius` — the corner
+    /// that sits mid-screen for the whole session, where the window's own
+    /// 10pt system corner is only glanced at.
     static let controlRadius: CGFloat = 9
     /// A session pane card, which sits *inside* the detail chrome panel. Was a
     /// bare `8` written inline in `RootShellView.unifiedSessionCard`; naming it
@@ -1506,10 +1506,15 @@ private struct KaisolaChromePanelModifier: ViewModifier {
     static let darkPanelCoverage: Double = 0.34
 
     /// The lit top edge is what sells a floating card. Reduce Transparency
-    /// swaps it for the flat semantic separator so nothing reads as glass.
+    /// and Increased Contrast both swap it for the flat semantic separator so
+    /// nothing reads as glass — the same `engages` decision that withholds
+    /// the shadow, so the card's whole accessibility posture is one switch.
     @ViewBuilder
     private func panelEdge(_ shape: RoundedRectangle) -> some View {
-        if reduceTransparency {
+        if !ChromeCardElevation.engages(
+            reduceTransparency: reduceTransparency,
+            increasedContrast: accessibilityContrast == .increased
+        ) {
             shape.strokeBorder(
                 Color(nsColor: .separatorColor),
                 lineWidth: KaisolaVisualSystem.hairline

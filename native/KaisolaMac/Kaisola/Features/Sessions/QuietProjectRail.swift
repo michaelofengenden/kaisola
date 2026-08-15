@@ -307,9 +307,10 @@ enum QuietRailMetrics {
     /// a group heading — Finder and Safari both do it — and it costs nothing,
     /// because which project is active was always carried by weight alone.
     static let headerText: CGFloat = 11
-    /// Session titles are the leaves — they no longer need to be the largest
-    /// text in the column. 13 → 12 buys the session lane a visible size step
-    /// under the 11pt project heading while staying a point over the 11pt
+    /// Session titles are the leaves. 13 → 12 keeps them the column's largest
+    /// text — they carry the only real reading — while closing most of the
+    /// gap to the 11pt project heading, so a session sits *under* its project
+    /// instead of shouting over it, and stays a point over the 11pt
     /// accessibility floor the rail holds itself to.
     static let titleText: CGFloat = 12
     static let secondaryText: CGFloat = 10.5
@@ -322,10 +323,10 @@ enum QuietRailMetrics {
     /// Slot the hover-only "open beside" control occupies in the trailing lane.
     static let revealSlot: CGFloat = 16
     /// The rail's identity slot, deliberately decoupled from
-    /// `QuietIdentityMarkView.slot`: the mark view's own 16pt slot is the size
-    /// Settings and the composer draw at, while the rail draws a shade smaller
-    /// so a session's mark sits under its project's name rather than beside it
-    /// in weight. 14 is exactly half the hierarchy step
+    /// `QuietIdentityMarkView.slot`: the mark view keeps its own 16pt default
+    /// for the surfaces that want it full-size, while the rail draws a shade
+    /// smaller so a session's mark sits under its project's name rather than
+    /// beside it in weight. 14 is exactly half the hierarchy step
     /// (`QuietRowBudget.indentStep` = 28), so a session's mark still starts
     /// two full mark-widths in from its project's.
     static let mark: CGFloat = 14

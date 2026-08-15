@@ -6187,6 +6187,10 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
+    /// `engages` is the card's whole accessibility posture: when it is false
+    /// the card drops its shadow AND swaps the lit gradient edge for the flat
+    /// `separatorColor` border — both `cardShadow` and `panelEdge` branch on
+    /// this one function, so the truth table below governs both.
     func testAccessibilitySurfacesGetNoCardShadow() {
         XCTAssertFalse(ChromeCardElevation.engages(reduceTransparency: true, increasedContrast: false))
         XCTAssertFalse(ChromeCardElevation.engages(reduceTransparency: false, increasedContrast: true))

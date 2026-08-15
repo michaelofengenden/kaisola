@@ -834,20 +834,50 @@ struct RootShellView: View {
     /// and `detailShowDoors` floats the show buttons over the content surface
     /// only while something is hidden.
     private var detailArea: some View {
-        VStack(spacing: 0) {
-            // A degraded workspace archive usually means an empty detail pane,
-            // so this belongs in the layout rather than over it: covering the
-            // empty state's own actions is exactly the wrong trade.
-            // Keep the observer mounted even while it renders no content.
-            // ProjectAccountRecoveryCenter is a nested ObservableObject, so
-            // RootShell cannot reliably decide when its child should exist.
-            WorkspaceRestorationNoticeView(model: model)
-            detailPane
-                .kaisolaChromePanel(
-                    topInset: NativeWorkspaceChrome.detailPanelTopInset(
-                        layout: settings.navigationLayout
-                    )
-                )
+        GeometryReader { geometry in
+            // The Files rail sits OUTSIDE the chrome card, flush to the window
+            // edge like the left project rail. Only the content column keeps
+            // the card and its gutters, so the card's two horizontal insets
+            // come out of the width the panels share — the same pool the old
+            // inside-the-card geometry measured.
+            let widths = NativeDetailPaneSizing.resolve(
+                totalWidth: geometry.size.width - KaisolaVisualSystem.chromeInset * 2,
+                preferredPreview: detailPreviewPanelVisible ? settings.filePreviewWidth : nil,
+                preferredRail: detailRailPanelVisible ? settings.workspaceRailWidth : nil
+            )
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    // A degraded workspace archive usually means an empty detail pane,
+                    // so this belongs in the layout rather than over it: covering the
+                    // empty state's own actions is exactly the wrong trade.
+                    // Keep the observer mounted even while it renders no content.
+                    // ProjectAccountRecoveryCenter is a nested ObservableObject, so
+                    // RootShell cannot reliably decide when its child should exist.
+                    WorkspaceRestorationNoticeView(model: model)
+                    detailPane(widths)
+                        .kaisolaChromePanel(
+                            topInset: NativeWorkspaceChrome.detailPanelTopInset(
+                                layout: settings.navigationLayout
+                            )
+                        )
+                }
+                if detailRailPanelVisible, let root = model.currentProjectDirectory {
+                    // Files live on the right, matching the editor/reference rail in
+                    // the Electron workspace and leaving the project hierarchy as the
+                    // sole navigation surface on the left.
+                    workspaceRailDivider
+                    workspaceRail(root: root)
+                        .id(root)
+                        .frame(width: widths.rail)
+                }
+            }
+            // See the corridor note in `detailPane`: the trackers must be
+            // top-level siblings above every hosted AppKit view, and now that
+            // the rail is the trailing-most panel they anchor to the window
+            // edge itself.
+            .overlay(alignment: .trailing) {
+                detailDividerTrackers(widths: widths)
+            }
         }
         // The other half of the sidebar divider's corridor. It has to live in
         // this column: a tracking area is clipped to its own split-view
@@ -1594,103 +1624,90 @@ struct RootShellView: View {
     }
 
     @ViewBuilder
-    private var detailPane: some View {
-        GeometryReader { geometry in
-            let widths = NativeDetailPaneSizing.resolve(
-                totalWidth: geometry.size.width,
-                preferredPreview: detailPreviewPanelVisible ? settings.filePreviewWidth : nil,
-                preferredRail: detailRailPanelVisible ? settings.workspaceRailWidth : nil
-            )
-            HStack(spacing: 0) {
-                detailContent
-                    .frame(minWidth: NativeDetailPaneSizing.minimumContentWidth,
-                           maxWidth: .infinity, maxHeight: .infinity)
-                    .layoutPriority(1)
-                    .overlay(alignment: .topTrailing) { detailShowDoors }
-                if let browserURL = model.browserCardURL {
-                    filePreviewDivider
-                    BrowserCardView(url: browserURL) { model.browserCardURL = nil }
-                        .frame(width: widths.preview)
-                        .frame(maxHeight: .infinity)
-                } else if let fileURL = model.previewedFileURL {
-                    filePreviewDivider
-                    FilePreviewView(
-                        url: fileURL,
-                        workspaceRoot: model.currentProjectDirectory,
-                        targetLine: model.previewedFileLine,
-                        tabs: model.fileTabs(for: model.selectedProjectID),
-                        selectTab: { model.selectFileTab($0) },
-                        setTabPinned: { model.setFileTabPinned($0, pinned: $1) },
-                        closeTab: { model.closeFileTab($0) },
-                        canReopenClosedTab: model.canReopenClosedFileTab,
-                        reopenClosedTab: { model.reopenClosedFileTab() },
-                        commandScopeID: ObjectIdentifier(model),
-                        navigationCommitted: { model.commitFileNavigation($0) },
-                        restoreSelection: { model.cancelFileNavigation(restoring: $0) },
-                        hide: { runCommand(.toggleDocumentPreview) }
-                    ) {
-                        model.closeFilePreview()
-                    }
-                    // Keep document/tab state while navigating inside a
-                    // project, but remount the FSEvents watcher when the file
-                    // workbench moves to a different project root.
-                    .id("file-preview-\(model.currentProjectDirectory?.standardizedFileURL.path ?? fileURL.deletingLastPathComponent().path)")
+    private func detailPane(_ widths: NativeDetailPaneSizing.Widths) -> some View {
+        // Both detail dividers' pointer trackers live in one overlay on
+        // `detailArea`'s outer HStack, not inside the handles they belong to.
+        //
+        // `FilePreviewView` hosts real AppKit views — a `WKWebView` for
+        // rendered Markdown, an `NSTextView` for source — and a hosted
+        // AppKit view outranks a SwiftUI sibling for cursor dispatch.
+        // `zIndex` reorders SwiftUI's drawing but NOT the backing NSViews,
+        // measured: with the tracker inside the handle the document
+        // divider's corridor read `arrow` across its whole width at every
+        // zIndex, while the identical Files handle (whose neighbour hosts
+        // no web view) read `resizeLeftRight`. An overlay attached to the
+        // outer HStack is added to the same backing hierarchy AFTER the
+        // panels, so those tracking views are true top-level siblings above
+        // the hosted content and receive `.cursorUpdate` first.
+        HStack(spacing: 0) {
+            detailContent
+                .frame(minWidth: NativeDetailPaneSizing.minimumContentWidth,
+                       maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+                .overlay(alignment: .topTrailing) { detailShowDoors }
+            if let browserURL = model.browserCardURL {
+                filePreviewDivider
+                BrowserCardView(url: browserURL) { model.browserCardURL = nil }
                     .frame(width: widths.preview)
                     .frame(maxHeight: .infinity)
+            } else if let fileURL = model.previewedFileURL {
+                filePreviewDivider
+                FilePreviewView(
+                    url: fileURL,
+                    workspaceRoot: model.currentProjectDirectory,
+                    targetLine: model.previewedFileLine,
+                    tabs: model.fileTabs(for: model.selectedProjectID),
+                    selectTab: { model.selectFileTab($0) },
+                    setTabPinned: { model.setFileTabPinned($0, pinned: $1) },
+                    closeTab: { model.closeFileTab($0) },
+                    canReopenClosedTab: model.canReopenClosedFileTab,
+                    reopenClosedTab: { model.reopenClosedFileTab() },
+                    commandScopeID: ObjectIdentifier(model),
+                    navigationCommitted: { model.commitFileNavigation($0) },
+                    restoreSelection: { model.cancelFileNavigation(restoring: $0) },
+                    hide: { runCommand(.toggleDocumentPreview) }
+                ) {
+                    model.closeFilePreview()
                 }
-                if settings.workspaceRailVisible, let root = model.currentProjectDirectory {
-                    // Files live on the right, matching the editor/reference rail in
-                    // the Electron workspace and leaving the project hierarchy as the
-                    // sole navigation surface on the left.
-                    workspaceRailDivider
-                    WorkspaceRailView(root: root, selectedFile: model.previewedFileURL, openFile: { url, pinned in
-                        model.openFilePreview(url, pinned: pinned)
-                    }, followsAgentFiles: $followsSelectedAgentFiles, canFollowAgentFiles: canFollowAgentFiles,
-                    didMoveItem: { source, destination in
-                        model.reconcileWorkspaceFileMove(from: source, to: destination)
-                        model.registerWorkspaceMoveUndo(
-                            .init(source: source, destination: destination),
-                            workspaceRoot: root,
-                            undoManager: undoManager
-                        )
-                    }, didTrashItem: { move in
-                        let snapshot = model.reconcileWorkspaceFileRemoval(move.original)
-                        model.registerWorkspaceTrashUndo(
-                            move,
-                            removalSnapshot: snapshot,
-                            workspaceRoot: root,
-                            undoManager: undoManager
-                        )
-                    }, didCreateItem: { created in
-                        model.registerWorkspaceCreationUndo(
-                            created,
-                            workspaceRoot: root,
-                            undoManager: undoManager
-                        )
-                    }) {
-                        settings.workspaceRailVisible = false
-                    }
-                    .id(root)
-                    .frame(width: widths.rail)
-                }
+                // Keep document/tab state while navigating inside a
+                // project, but remount the FSEvents watcher when the file
+                // workbench moves to a different project root.
+                .id("file-preview-\(model.currentProjectDirectory?.standardizedFileURL.path ?? fileURL.deletingLastPathComponent().path)")
+                .frame(width: widths.preview)
+                .frame(maxHeight: .infinity)
             }
-            // Both detail dividers' pointer trackers live HERE, in one overlay
-            // on the stack, instead of inside the handles they belong to.
-            //
-            // `FilePreviewView` hosts real AppKit views — a `WKWebView` for
-            // rendered Markdown, an `NSTextView` for source — and a hosted
-            // AppKit view outranks a SwiftUI sibling for cursor dispatch.
-            // `zIndex` reorders SwiftUI's drawing but NOT the backing NSViews,
-            // measured: with the tracker inside the handle the document
-            // divider's corridor read `arrow` across its whole width at every
-            // zIndex, while the identical Files handle (whose neighbour hosts
-            // no web view) read `resizeLeftRight`. An overlay attached to the
-            // HStack is added to the same backing hierarchy AFTER the panels,
-            // so these tracking views are true top-level siblings above the
-            // hosted content and finally receive `.cursorUpdate` first.
-            .overlay(alignment: .trailing) {
-                detailDividerTrackers(widths: widths)
-            }
+        }
+    }
+
+    /// The Files rail, mounted by `detailArea` OUTSIDE the chrome card so it
+    /// runs flush to the window edges the way the left project rail does.
+    private func workspaceRail(root: URL) -> some View {
+        WorkspaceRailView(root: root, selectedFile: model.previewedFileURL, openFile: { url, pinned in
+            model.openFilePreview(url, pinned: pinned)
+        }, followsAgentFiles: $followsSelectedAgentFiles, canFollowAgentFiles: canFollowAgentFiles,
+        didMoveItem: { source, destination in
+            model.reconcileWorkspaceFileMove(from: source, to: destination)
+            model.registerWorkspaceMoveUndo(
+                .init(source: source, destination: destination),
+                workspaceRoot: root,
+                undoManager: undoManager
+            )
+        }, didTrashItem: { move in
+            let snapshot = model.reconcileWorkspaceFileRemoval(move.original)
+            model.registerWorkspaceTrashUndo(
+                move,
+                removalSnapshot: snapshot,
+                workspaceRoot: root,
+                undoManager: undoManager
+            )
+        }, didCreateItem: { created in
+            model.registerWorkspaceCreationUndo(
+                created,
+                workspaceRoot: root,
+                undoManager: undoManager
+            )
+        }) {
+            settings.workspaceRailVisible = false
         }
     }
 
@@ -1708,7 +1725,8 @@ struct RootShellView: View {
         let corridors = NativeDetailPaneSizing.corridors(
             widths: widths,
             previewVisible: detailPreviewPanelVisible,
-            railVisible: detailRailPanelVisible
+            railVisible: detailRailPanelVisible,
+            trailingPanelInset: KaisolaVisualSystem.chromeInset
         )
         return DetailDividerTrackingView(
             corridors: corridors,
@@ -4946,17 +4964,21 @@ enum NativeDetailPaneSizing {
     static func corridors(
         widths: Widths,
         previewVisible: Bool,
-        railVisible: Bool
+        railVisible: Bool,
+        trailingPanelInset: CGFloat = 0
     ) -> [Corridor] {
         var corridors: [Corridor] = []
-        // Walk in from the trailing edge in the same order the HStack lays the
-        // panels out: [ content | preview divider | preview | rail divider | rail ].
-        var consumed: CGFloat = 0
+        // Walk in from the trailing edge in the same order the layout mounts
+        // the panels: [ card( content | preview divider | preview ) |
+        // rail divider | rail ]. The rail is flush to the window edge; the
+        // preview lives inside the chrome card, whose trailing gutter is
+        // `trailingPanelInset`.
+        var consumed: CGFloat = trailingPanelInset
         if railVisible {
             corridors.append(
                 Corridor(divider: .rail, centerFromTrailing: widths.rail + dividerWidth / 2)
             )
-            consumed = widths.rail + dividerWidth
+            consumed = widths.rail + dividerWidth + trailingPanelInset
         }
         if previewVisible {
             corridors.append(

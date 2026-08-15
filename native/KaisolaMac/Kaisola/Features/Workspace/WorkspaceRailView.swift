@@ -272,15 +272,15 @@ struct WorkspaceRailView: View {
         // The persisted preference stays at least 164 pt, but the responsive
         // shell may temporarily compress Files to 150 pt at minimum window size.
         .frame(minWidth: 150, maxWidth: .infinity, maxHeight: .infinity)
+        // One layer, flush to the window edges, exactly like the left project
+        // rail (see the "no chrome panel here" comment in `leftTreeLayout`).
+        // The rounded card, its stroke, and the 4pt float were the box overlay
+        // Michael asked to remove; the seam to the content is the resize
+        // divider's own hairline.
         .background {
             SidebarBackdropView(appearance: settings.sidebarAppearance, placement: .trailing)
+                .ignoresSafeArea()
         }
-        .clipShape(RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius, style: .continuous)
-                .stroke(Color(nsColor: .separatorColor).opacity(0.52), lineWidth: 0.65)
-        }
-        .padding(4)
         .task {
             tree.load(root)
             tree.search(searchText)

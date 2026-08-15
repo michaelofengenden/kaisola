@@ -877,6 +877,25 @@ final class NativePreviewSettingsTests: XCTestCase {
             previewVisible: false,
             railVisible: false
         ).isEmpty)
+
+        // With the rail flush to the window edge (v0.1.125), the preview
+        // stays inside the chrome card, so its corridor alone shifts inward
+        // by the card's trailing gutter; the rail corridor is unmoved.
+        let inset = NativeDetailPaneSizing.corridors(
+            widths: widths,
+            previewVisible: true,
+            railVisible: true,
+            trailingPanelInset: 6
+        )
+        XCTAssertEqual(inset[0].centerFromTrailing, 218.5, accuracy: 0.001)
+        XCTAssertEqual(inset[1].centerFromTrailing, 705.5, accuracy: 0.001)
+        let insetPreviewOnly = NativeDetailPaneSizing.corridors(
+            widths: NativeDetailPaneSizing.Widths(preview: 480, rail: 0),
+            previewVisible: true,
+            railVisible: false,
+            trailingPanelInset: 6
+        )
+        XCTAssertEqual(insetPreviewOnly[0].centerFromTrailing, 486.5, accuracy: 0.001)
     }
 
     func testVisualChoiceTitlesRemainUserFacing() {

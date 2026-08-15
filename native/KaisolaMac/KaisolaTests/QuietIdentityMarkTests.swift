@@ -829,7 +829,12 @@ final class QuietIdentityMarkTests: XCTestCase {
     /// …and the same fixture for the case a shared lead cannot fix, where the
     /// distinguishing word is at the *end* of the title.
     func testTitlesThatDifferOnlyAtTheirTailStayApartInTheMeasuredLane() {
-        let titles = ["MATLAB kernel bridge alpha", "MATLAB kernel bridge beta"]
+        // Long enough that the v0.1.125 resting lane (290pt rail) still
+        // truncates both to the same visible prefix.
+        let titles = [
+            "MATLAB kernel bridge integration alpha",
+            "MATLAB kernel bridge integration beta",
+        ]
 
         let before = titles.map { QuietRailLaneFixture.drawn(.verbatim($0), in: QuietRailLaneFixture.restingLane) }
         XCTAssertEqual(Set(before).count, 1, "the fixture no longer reproduces: \(before)")
@@ -983,12 +988,12 @@ final class QuietIdentityMarkTests: XCTestCase {
             "the narrower rail handed the title back to the indent"
         )
 
-        // …and the resting width is back at v1.1.6's legible-title 248, by
-        // request (2026-08-14). The density era's "under every width since
-        // v1.1.5" pin is retired with the density default itself; what this
-        // release still owes is that the wide rail stays inside its own bounds
-        // and the title lane it buys is real.
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
+        // …and the resting width sits at v0.1.125's 290, by request — the
+        // width Michael pins the Files rail to. The density era's "under
+        // every width since v1.1.5" pin is retired with the density default
+        // itself; what this release still owes is that the wide rail stays
+        // inside its own bounds and the title lane it buys is real.
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 290)
     }
 
     // MARK: - Header "+" containment

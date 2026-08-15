@@ -495,7 +495,12 @@ enum QuietRowBudget {
     /// it would otherwise re-measure every title against a font each time.
     /// `QuietIdentityMarkTests` measures the real font against this constant so
     /// the approximation cannot quietly drift past what the lane draws.
-    static let ambiguousTitleCharacters = 12
+    ///
+    /// 12 → 18 with the v0.1.125 rail widening (248 → 290): the resting lane
+    /// draws about twice the characters it did, so the old window flagged
+    /// pairs the rail now tells apart at a glance. 18 stays under the
+    /// measured resting draw while clearing its half-lane floor.
+    static let ambiguousTitleCharacters = 18
 
     /// - Parameters:
     ///   - sidebarWidth: the navigation column's width. Rows span it entirely;

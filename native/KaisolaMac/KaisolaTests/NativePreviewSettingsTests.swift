@@ -533,6 +533,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.filePreviewWidth, NativePreviewSettings.filePreviewWidthDefault)
         XCTAssertEqual(settings.toolCallDensity, .balanced)
         XCTAssertFalse(settings.tintedBreathing)
+        XCTAssertEqual(settings.projectRailWidth, NativePreviewSettings.projectRailWidthUnset)
 
         settings.navigationLayout = .topBar
         settings.appearance = .dark
@@ -547,6 +548,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         settings.workspaceRailWidth = 300
         settings.filePreviewWidth = 640
         settings.toolCallDensity = .detailed
+        settings.projectRailWidth = 290.5
 
         let reloaded = NativePreviewSettings(defaults: defaults)
         XCTAssertEqual(reloaded.navigationLayout, .topBar)
@@ -562,6 +564,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.filePreviewWidth, 640)
         XCTAssertEqual(reloaded.toolCallDensity, .detailed)
         XCTAssertTrue(reloaded.tintedBreathing)
+        XCTAssertEqual(reloaded.projectRailWidth, 290.5)
     }
 
     func testToolCallDensityRejectsUnknownPersistedValues() {
@@ -5277,15 +5280,24 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertFalse(
             InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 214, didForce: false)
         )
+        // 248 is a previously-forced ideal now too (the v0.1.124 resting
+        // width), so v2-forced windows move once to the v0.1.125 width.
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 248, didForce: false)
+        )
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 248, didForce: true)
+        )
+
         // The new key generation is what re-arms previously-forced windows;
         // it must actually be new.
         XCTAssertTrue(
-            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v2.")
+            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v3.")
         )
 
         // Never against a restored or user-chosen width — including the ideal
         // itself, so a second window does not re-run the override.
-        for width in [168.0, 240.0, 248.0, 300.0, 340.0] {
+        for width in [168.0, 240.0, 290.0, 300.0, 340.0] {
             XCTAssertFalse(
                 InitialSidebarWidth.shouldForceInitialWidth(
                     currentWidth: width,
@@ -5343,7 +5355,7 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The width the override applies is the one the rest of the chrome is
     /// designed around, not a second literal that can drift away from it.
     func testSidebarOverrideTargetsTheIdealWidthTheChromeIsSizedFor() {
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 290)
         XCTAssertGreaterThan(
             NativeWorkspaceChrome.projectSidebarIdealWidth,
             InitialSidebarWidth.systemDefault + InitialSidebarWidth.tolerance,
@@ -5357,6 +5369,41 @@ final class NativePreviewSettingsTests: XCTestCase {
             NativeWorkspaceChrome.projectSidebarIdealWidth,
             NativeWorkspaceChrome.projectSidebarMaximumWidth
         )
+    }
+
+    /// A dragged rail width persists and outranks the resting ideal for every
+    /// new window; the unset sentinel keeps fresh installs on the constant.
+    func testPersistedProjectRailWidthWinsOverTheRestingIdeal() {
+        XCTAssertEqual(
+            NativeWorkspaceChrome.resolvedProjectRailIdealWidth(
+                storedWidth: NativePreviewSettings.projectRailWidthUnset
+            ),
+            NativeWorkspaceChrome.projectSidebarIdealWidth
+        )
+        XCTAssertEqual(
+            NativeWorkspaceChrome.resolvedProjectRailIdealWidth(storedWidth: 275),
+            275
+        )
+        // Stored values clamp to the rail's own band, and the settings clamp
+        // mirrors the chrome band exactly so the two can never disagree.
+        XCTAssertEqual(
+            NativeWorkspaceChrome.resolvedProjectRailIdealWidth(storedWidth: 80),
+            NativeWorkspaceChrome.projectSidebarMinimumWidth
+        )
+        XCTAssertEqual(
+            NativeWorkspaceChrome.resolvedProjectRailIdealWidth(storedWidth: 900),
+            NativeWorkspaceChrome.projectSidebarMaximumWidth
+        )
+        XCTAssertEqual(
+            NativePreviewSettings.projectRailWidthRange.lowerBound,
+            Double(NativeWorkspaceChrome.projectSidebarMinimumWidth)
+        )
+        XCTAssertEqual(
+            NativePreviewSettings.projectRailWidthRange.upperBound,
+            Double(NativeWorkspaceChrome.projectSidebarMaximumWidth)
+        )
+        XCTAssertEqual(NativePreviewSettings.clampedProjectRailWidth(80), 168)
+        XCTAssertEqual(NativePreviewSettings.clampedProjectRailWidth(900), 340)
     }
 
     /// With no paired Mac the section was a permanent "No other Macs yet" plus
@@ -5755,9 +5802,9 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// `QuietIdentityMarkTests` rather than left as comments here.
     func testProjectSidebarHasComfortableResizableWidth() {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168)
-        // 210 → 248 in v0.1.124: the rail returns to the width v1.1.6 chose
-        // for legible titles, by request.
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
+        // 210 → 248 in v0.1.124, 248 → 290 in v0.1.125: the resting rail
+        // matches the width Michael pins the Files rail to, by request.
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 290)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 340)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
         // Still comfortably inside its own bounds after two narrowings.

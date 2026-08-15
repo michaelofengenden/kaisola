@@ -1012,6 +1012,28 @@ final class NativePreviewSettings: ObservableObject {
     static let workspaceRailWidthRange: ClosedRange<Double> = 164...300
     static let workspaceRailWidthDefault: Double = 196
 
+    /// Width of the LEFT project rail, written by the sidebar resize handle
+    /// when the user lets go of a drag. Zero means "never dragged": nothing
+    /// before v0.1.125 persisted this rail, so the sentinel keeps a fresh
+    /// window on the chrome's compile-time ideal until the user has actually
+    /// chosen a width — after which every new window opens at that choice.
+    @Published var projectRailWidth: Double {
+        didSet {
+            if projectRailWidth != Self.projectRailWidthUnset {
+                let clamped = Self.clampedProjectRailWidth(projectRailWidth)
+                if clamped != projectRailWidth {
+                    projectRailWidth = clamped
+                    return
+                }
+            }
+            persist(projectRailWidth, forKey: Keys.projectRailWidth)
+        }
+    }
+
+    static let projectRailWidthUnset: Double = 0
+    /// Mirrors `NativeWorkspaceChrome`'s minimum/maximum for the same rail.
+    static let projectRailWidthRange: ClosedRange<Double> = 168...340
+
     /// Width of the document preview beside the active terminal/chat. App-owned
     /// sizing avoids HSplitView's stale autosaved dividers and gives us a broad,
     /// discoverable hit target without drawing a heavy separator.
@@ -1198,6 +1220,7 @@ final class NativePreviewSettings: ObservableObject {
         static let terminalClipboardWriteAllowed = "terminalClipboardWriteAllowed"
         static let workspaceRail = "workspaceRailVisible"
         static let workspaceRailWidth = "workspaceRailWidth"
+        static let projectRailWidth = "projectRailWidth"
         static let filePreviewWidth = "filePreviewWidth"
         static let sensitiveGlobs = "sensitiveGlobs"
         static let claudeConfigDir = "claudeConfigDir"
@@ -1243,6 +1266,10 @@ final class NativePreviewSettings: ObservableObject {
         workspaceRailWidth = storedRailWidth > 0
             ? Self.clampedWorkspaceRailWidth(storedRailWidth)
             : Self.workspaceRailWidthDefault
+        let storedProjectRailWidth = defaults.double(forKey: Keys.projectRailWidth)
+        projectRailWidth = storedProjectRailWidth > 0
+            ? Self.clampedProjectRailWidth(storedProjectRailWidth)
+            : Self.projectRailWidthUnset
         let storedPreviewWidth = defaults.double(forKey: Keys.filePreviewWidth)
         filePreviewWidth = storedPreviewWidth > 0
             ? Self.clampedFilePreviewWidth(storedPreviewWidth)
@@ -1333,6 +1360,10 @@ final class NativePreviewSettings: ObservableObject {
 
     static func clampedWorkspaceRailWidth(_ width: Double) -> Double {
         min(max(width, workspaceRailWidthRange.lowerBound), workspaceRailWidthRange.upperBound)
+    }
+
+    static func clampedProjectRailWidth(_ width: Double) -> Double {
+        min(max(width, projectRailWidthRange.lowerBound), projectRailWidthRange.upperBound)
     }
 
     static func clampedFilePreviewWidth(_ width: Double) -> Double {

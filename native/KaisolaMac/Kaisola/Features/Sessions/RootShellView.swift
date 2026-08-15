@@ -793,7 +793,7 @@ struct RootShellView: View {
             // the opening width; this plants the one AppKit view that can fix
             // that, once per window. It draws nothing and takes no hits.
             .background {
-                InitialSidebarWidthApplier()
+                InitialSidebarWidthApplier(idealWidth: resolvedProjectRailIdealWidth)
                     .frame(width: 0, height: 0)
                     .accessibilityHidden(true)
             }
@@ -808,7 +808,7 @@ struct RootShellView: View {
             }
             .navigationSplitViewColumnWidth(
                 min: NativeWorkspaceChrome.projectSidebarMinimumWidth,
-                ideal: NativeWorkspaceChrome.projectSidebarIdealWidth,
+                ideal: resolvedProjectRailIdealWidth,
                 max: NativeWorkspaceChrome.projectSidebarMaximumWidth
             )
         } detail: { _ in
@@ -1048,6 +1048,14 @@ struct RootShellView: View {
             remoteDeviceCount: rememberedSessions.remoteDevices.count,
             errorMessage: rememberedSessions.errorMessage,
             hasEverSeenRemoteDevice: rememberedSessions.hasEverSeenRemoteDevice
+        )
+    }
+
+    /// A dragged rail width persists and becomes every window's opening
+    /// width; a never-dragged install follows the chrome's resting ideal.
+    private var resolvedProjectRailIdealWidth: CGFloat {
+        NativeWorkspaceChrome.resolvedProjectRailIdealWidth(
+            storedWidth: settings.projectRailWidth
         )
     }
 
@@ -3423,8 +3431,10 @@ enum InitialSidebarWidth {
     /// default's band, so the 2026-08-14 widening could never reach the very
     /// windows the request was about. Widths the *app* placed are the app's to
     /// move again — matched exactly (±2 for the restoration round-trip), so a
-    /// width the user dragged anywhere else stays exactly as found.
-    static let previouslyForcedIdeals: [CGFloat] = [210]
+    /// width the user dragged anywhere else stays exactly as found. 248
+    /// joined the list with the v0.1.125 move to 290, and dragged widths now
+    /// persist, so a user choice can never sit in this band by accident.
+    static let previouslyForcedIdeals: [CGFloat] = [210, 248]
     static let previouslyForcedTolerance: CGFloat = 2
 
     /// True only for a column still sitting at AppKit's untouched default.
@@ -3451,11 +3461,12 @@ enum InitialSidebarWidth {
         return isSystemDefault(currentWidth) || isPreviouslyForcedIdeal(currentWidth)
     }
 
-    /// The `.v2` generation exists because the flag's meaning changed with the
-    /// 248 widening: v1 recorded "this window was widened to 210", and windows
-    /// carrying it must be revisited exactly once to move to 248.
+    /// The key generation moves whenever the flag's meaning changes: v2
+    /// recorded "this window was widened to 248", and windows carrying it
+    /// must be revisited exactly once to move to 290 (or to the user's own
+    /// persisted width, which wins outright).
     static func defaultsKey(restorationID: String) -> String {
-        "kaisola.sidebar.openedAtIdealWidth.v2.\(restorationID)"
+        "kaisola.sidebar.openedAtIdealWidth.v3.\(restorationID)"
     }
 
     static func hasApplied(restorationID: String, defaults: UserDefaults) -> Bool {
@@ -3962,6 +3973,10 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
                     NativeWorkspaceChrome.projectSidebarIdealWidth,
                     ofDividerAt: match.index
                 )
+                // A double-click means "back to the default", so it clears the
+                // persisted drag rather than pinning the current ideal as one.
+                NativePreviewSettings.shared.projectRailWidth =
+                    NativePreviewSettings.projectRailWidthUnset
                 return
             }
             activeSplitView = match.splitView
@@ -3985,6 +4000,15 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
         }
 
         override func mouseUp(with event: NSEvent) {
+            // The width the user let go at is the width every window opens at
+            // from now on. Written once per drag, here rather than per
+            // mouseDragged, so a long drag is one defaults write.
+            if let splitView = activeSplitView,
+               let index = activeDividerIndex,
+               splitView.subviews.indices.contains(index) {
+                NativePreviewSettings.shared.projectRailWidth =
+                    Double(splitView.subviews[index].frame.maxX)
+            }
             lastWindowX = nil
             activeSplitView = nil
             activeDividerIndex = nil
@@ -4013,6 +4037,10 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
                 match.splitView.subviews[match.index].frame.maxX + delta,
                 ofDividerAt: match.index
             )
+            // Keyboard resizes persist the same way a drag's mouse-up does,
+            // reading back the split view's clamped result.
+            NativePreviewSettings.shared.projectRailWidth =
+                Double(match.splitView.subviews[match.index].frame.maxX)
             NSAccessibility.post(element: self, notification: .valueChanged)
             return true
         }
@@ -4576,13 +4604,27 @@ enum NativeWorkspaceChrome {
     /// a visible hierarchy step; 248 → 228 in v1.1.7 once the rail stopped
     /// spending width on chrome; 228 → 210 in v1.1.8; 210 → 248 in v0.1.124 by
     /// request — long project and session titles were the point of the wide
-    /// rail, and the density passes had walked the default back below legible.
-    /// Users who dragged their rail keep their width; only fresh windows open
-    /// at the wider resting point.
-    static let projectSidebarIdealWidth: CGFloat = 248
+    /// rail, and the density passes had walked the default back below legible;
+    /// 248 → 290 in v0.1.125, again by request, matching the width Michael
+    /// pins the Files rail to. Users who dragged their rail keep their width —
+    /// and as of v0.1.125 a drag persists (`NativePreviewSettings
+    /// .projectRailWidth`), so this constant only sizes truly fresh windows.
+    static let projectSidebarIdealWidth: CGFloat = 290
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
     static let projectSidebarMaximumWidth: CGFloat = 340
+
+    /// The width a fresh sidebar column opens at: the user's persisted drag
+    /// when one exists (clamped to this rail's own band), else the resting
+    /// ideal above. Pure, so "which width wins" is a test rather than a
+    /// window.
+    static func resolvedProjectRailIdealWidth(storedWidth: Double) -> CGFloat {
+        guard storedWidth > 0 else { return projectSidebarIdealWidth }
+        return CGFloat(min(
+            max(storedWidth, Double(projectSidebarMinimumWidth)),
+            Double(projectSidebarMaximumWidth)
+        ))
+    }
     static let projectSidebarDividerWidth: CGFloat = 1
     /// Centered across the visible divider, not laid wholly inside either pane.
     ///

@@ -333,6 +333,40 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
+    /// An unclean death (crash, host reboot) leaves the broker's
+    /// exclusive-create lock file behind. Cleanup must remove it with the
+    /// rest of the stale rendezvous — a survivor wedges every relaunch of
+    /// the same digest in a silent EEXIST exit before the broker logs ready.
+    func testStaleCleanupRemovesGenerationLockFileForSameDigestRelaunch() async throws {
+        let packagedDigest = String(repeating: "d", count: 64)
+        let fixture = try makeDeadCurrent(digest: packagedDigest, drainDigests: [])
+        let lockURL = fixture.profile
+            .appendingPathComponent("session-broker", isDirectory: true)
+            .appendingPathComponent(
+                BrokerLaunchConfiguration.generationMetadataDirectoryName,
+                isDirectory: true
+            )
+            .appendingPathComponent("\(packagedDigest).lock")
+        try Data().write(to: lockURL)
+        _ = chmod(lockURL.path, 0o600)
+
+        let launcher = FakeBrokerHelperLauncher()
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [fixture.profile]),
+            launcher: launcher,
+            homeDirectory: fixture.home,
+            appVersion: "native-test"
+        )
+
+        let replacement = try await coordinator.prepare()
+        XCTAssertEqual(replacement.contentDigest, packagedDigest)
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: lockURL.path),
+            "stale cleanup left the exclusive-create generation lock behind"
+        )
+        await launcher.close()
+    }
+
     /// A cross-digest replacement retires the selection with the generation it
     /// named — asserted against a fixture that actually seeds one, so the nil
     /// is a decision rather than an accident of the fixture.
@@ -1419,6 +1453,97 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         XCTAssertTrue(retired.topology?.draining.isEmpty == true)
         XCTAssertEqual(retirementCalls, 1)
         XCTAssertFalse(FileManager.default.fileExists(atPath: metadataPath))
+        await launcher.close()
+    }
+
+    /// A host reboot kills every draining generation at once. Their recorded
+    /// processes are provably dead, so RPC retirement can never succeed;
+    /// the sweep must reap the record (and its rendezvous files, including
+    /// the exclusive-create lock) instead of quarantining it forever.
+    func testHeartbeatReapsProvablyDeadDrainWithoutRetirementRPC() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let cutoverRequester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(implementationVersion: 2)
+        let locator = BrokerInfoLocator(userDataCandidates: [live.profile])
+        let cutoverCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: cutoverRequester,
+            rollingUpdatesEnabled: true
+        )
+        _ = try await cutoverCoordinator.prepare()
+
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let cutoverRegistry = try store.load()
+        let cutoverTopology = try XCTUnwrap(cutoverRegistry.topology)
+        let old = try XCTUnwrap(cutoverTopology.draining.first)
+        let childPID = try spawnPausedChild()
+        _ = Darwin.kill(childPID, SIGKILL)
+        var status: Int32 = 0
+        _ = waitpid(childPID, &status, 0)
+        let deadInfo = BrokerInfo(
+            protocolVersion: old.info.protocolVersion,
+            securityEpoch: old.info.securityEpoch,
+            implementationVersion: old.info.implementationVersion,
+            packageSchema: old.info.packageSchema,
+            packageVersion: old.info.packageVersion,
+            contentDigest: old.info.contentDigest,
+            pid: childPID,
+            socketPath: old.info.socketPath,
+            token: old.info.token,
+            startedAt: old.info.startedAt,
+            version: old.info.version
+        )
+        let deadGeneration = BrokerGenerationRecord(
+            id: old.id,
+            role: .draining,
+            info: deadInfo,
+            packageRoot: old.packageRoot,
+            registeredAt: old.registeredAt
+        )
+        let metadataURL = store.metadataURL(for: deadGeneration)
+        try JSONEncoder().encode(deadInfo).write(to: metadataURL)
+        _ = chmod(metadataURL.path, 0o600)
+        let lockURL = metadataURL.deletingPathExtension().appendingPathExtension("lock")
+        try Data().write(to: lockURL)
+        _ = chmod(lockURL.path, 0o600)
+        _ = try store.save(
+            currentGenerationID: cutoverTopology.current.id,
+            generations: [cutoverTopology.current, deadGeneration],
+            expectedRevision: cutoverRegistry.revision
+        )
+
+        let reapRequester = FakeRollingBrokerUpgradeRequester(
+            upgradeDecision: .accepted,
+            retirementDecision: .accepted
+        )
+        let reapCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: reapRequester,
+            rollingUpdatesEnabled: true
+        )
+        _ = try await reapCoordinator.prepare()
+        _ = await reapCoordinator.attemptUpgradeIfNeeded()
+
+        let reaped = try store.load()
+        let retirementCalls = await reapRequester.retirementCallCount()
+        XCTAssertEqual(reaped.currentGenerationID, cutoverTopology.current.id)
+        XCTAssertTrue(reaped.topology?.draining.isEmpty == true)
+        XCTAssertEqual(
+            retirementCalls, 0,
+            "a provably dead drain is reaped without asking the dead process"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: metadataURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: lockURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deadInfo.socketPath))
         await launcher.close()
     }
 

@@ -1009,10 +1009,75 @@ if (process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_REJECTION
   process.on('SIGUSR2', () => { void Promise.reject(new Error('rejection-probe-secret-marker')) })
 }
 
+// The generation lock is an exclusive-create file removed only by an orderly
+// exit. A crash or a host reboot leaves it behind with no living owner, and
+// the bare EEXIST exit used to wedge every relaunch of this digest in a
+// silent exit 2 — the 2026-08-14 reboot stranded the installed app on
+// "Session Connection Unavailable" all day exactly this way. Ownership is
+// judged by the PID recorded in the lock file and the PID published in the
+// rendezvous info file: only when neither names a living process is the stale
+// file replaced. Anything ambiguous keeps failing closed as before, but now
+// with a logged reason.
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true } catch (error) { return error?.code === 'EPERM' }
+}
+
+function recordedLockPid() {
+  try {
+    const pid = Number.parseInt(fs.readFileSync(config.lockFile, 'utf8').trim(), 10)
+    return Number.isSafeInteger(pid) && pid > 1 ? pid : null
+  } catch { return null }
+}
+
+function publishedRendezvousPid() {
+  try {
+    const pid = Number(JSON.parse(fs.readFileSync(config.infoFile, 'utf8'))?.pid)
+    return Number.isSafeInteger(pid) && pid > 1 ? pid : null
+  } catch { return null }
+}
+
+function acquireGenerationLock() {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let created
+    try {
+      created = fs.openSync(config.lockFile, 'wx', 0o600)
+    } catch (error) {
+      if (error?.code !== 'EEXIST' || attempt > 0) throw error
+      let stale
+      try { stale = fs.lstatSync(config.lockFile) } catch (statError) {
+        if (statError?.code === 'ENOENT') continue
+        throw error
+      }
+      if (!stale.isFile()) throw error
+      const owners = [recordedLockPid(), publishedRendezvousPid()]
+        .filter((pid) => pid != null && pid !== process.pid)
+      const living = owners.find(pidAlive)
+      if (living != null) {
+        throw Object.assign(new Error(`held by live pid ${living}`), { code: 'ELOCKHELD' })
+      }
+      // Remove only the exact file judged stale. A concurrent fresh owner
+      // replaces the lock with a new inode that must survive this takeover.
+      try {
+        const current = fs.lstatSync(config.lockFile)
+        if (!current.isFile() || current.ino !== stale.ino || current.dev !== stale.dev) throw error
+        fs.unlinkSync(config.lockFile)
+      } catch (takeoverError) {
+        if (takeoverError?.code !== 'ENOENT') throw error
+      }
+      log(`recovered stale generation lock deadOwner=${owners.join(',') || 'unrecorded'}`)
+      continue
+    }
+    try { fs.writeSync(created, `${process.pid}\n`) } catch { /* owner hint only */ }
+    return created
+  }
+  throw Object.assign(new Error('busy after stale takeover retry'), { code: 'ELOCKHELD' })
+}
+
 try {
-  const lockFd = fs.openSync(config.lockFile, 'wx', 0o600)
+  const lockFd = acquireGenerationLock()
   process.on('exit', () => { try { fs.closeSync(lockFd) } catch {}; cleanupFiles() })
-} catch {
+} catch (error) {
+  log(`generation lock unavailable ${error?.code || ''} ${error?.message || error}`)
   process.exit(2)
 }
 

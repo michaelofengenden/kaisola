@@ -745,6 +745,16 @@ actor BrokerStartupCoordinator:
         // incident kept two empty drains pinned in the registry exactly this
         // way. At most one retirement is committed per heartbeat.
         for draining in topology.draining where draining.id != retainedRollbackID {
+            // A drain whose recorded process is provably dead can never again
+            // serve or hand off its terminals, and RPC retirement against it
+            // fails forever. Before v0.1.125 a host reboot therefore left one
+            // permanent phantom per draining generation, each pinning dead
+            // rendezvous files in the registry. Reap it under the same claim
+            // and exact registry CAS as an ordinary retirement.
+            if !draining.info.isProcessAlive {
+                reapDeadDrainingGeneration(draining, topology: topology, store: store)
+                return
+            }
             if let quarantine = retirementQuarantines[draining.id],
                quarantine.info == draining.info,
                retirementSweepNumber < quarantine.nextEligibleSweep {
@@ -844,6 +854,72 @@ actor BrokerStartupCoordinator:
             try? garbageCollectRetiredMetadata(draining, store: store)
             return
         }
+    }
+
+    private func reapDeadDrainingGeneration(
+        _ draining: BrokerGenerationRecord,
+        topology: BrokerGenerationTopology,
+        store: BrokerGenerationRegistryStore
+    ) {
+        guard let registry = exactRetirementRegistry(matching: topology, store: store),
+              registry.generations.contains(draining) else { return }
+        let retained = registry.generations.filter { $0.id != draining.id }
+        guard let next = try? store.save(
+            currentGenerationID: topology.current.id,
+            generations: retained,
+            expectedRevision: registry.revision,
+            selection: registry.selection
+        ) else {
+            currentTopology = (try? store.load())?.topology
+            return
+        }
+        retirementQuarantines.removeValue(forKey: draining.id)
+        currentTopology = next.topology
+        // Registry removal is the authority boundary; file cleanup afterward
+        // is best-effort, mirroring ordinary retirement.
+        try? garbageCollectRetiredMetadata(draining, store: store)
+        removeDeadGenerationRendezvousFiles(draining, store: store)
+    }
+
+    /// Best-effort removal of a reaped generation's rendezvous files. The
+    /// socket and metadata are dead weight once the registry no longer names
+    /// the generation, and the exclusive-create lock file would otherwise
+    /// wedge any future relaunch of the same digest.
+    private func removeDeadGenerationRendezvousFiles(
+        _ generation: BrokerGenerationRecord,
+        store: BrokerGenerationRegistryStore
+    ) {
+        guard generation.packageRoot != nil else { return }
+        let root = locator.preferredUserDataRoot.standardizedFileURL
+        let metadataDirectory = store.brokerDirectory.appendingPathComponent(
+            BrokerLaunchConfiguration.generationMetadataDirectoryName,
+            isDirectory: true
+        )
+        let socketURL = URL(fileURLWithPath: generation.info.socketPath)
+        let expectedSocketLeaf = BrokerLaunchConfiguration.generationSocketLeaf(
+            userData: root,
+            contentDigest: generation.id
+        )
+        if socketURL.lastPathComponent == expectedSocketLeaf {
+            try? removePrivateRendezvousFile(
+                socketURL,
+                expectedParents: [
+                    store.brokerDirectory,
+                    homeDirectory.appendingPathComponent(".kaisola-session", isDirectory: true),
+                ],
+                allowedKinds: [S_IFSOCK]
+            )
+        }
+        try? removePrivateRendezvousFile(
+            metadataDirectory.appendingPathComponent("\(generation.id).json"),
+            expectedParent: metadataDirectory,
+            allowedKinds: [S_IFREG]
+        )
+        try? removePrivateRendezvousFile(
+            metadataDirectory.appendingPathComponent("\(generation.id).lock"),
+            expectedParent: metadataDirectory,
+            allowedKinds: [S_IFREG]
+        )
     }
 
     private func exactRetirementRegistry(
@@ -1590,6 +1666,23 @@ actor BrokerStartupCoordinator:
             expectedParent: metadataURL.deletingLastPathComponent(),
             allowedKinds: [S_IFREG]
         )
+        // The broker acquires this lock by exclusive creation and removes it
+        // only on orderly exit, so a file left behind here — by the dead
+        // generation's unclean death or by this cleanup's own O_CREAT above —
+        // wedges every relaunch of the same digest in a silent EEXIST exit.
+        // Remove it only while the path still names the exact inode this
+        // cleanup holds locked; a freshly launched broker's replacement lock
+        // must survive.
+        var lockPathMetadata = stat()
+        if lstat(lockURL.path, &lockPathMetadata) == 0,
+           lockPathMetadata.st_dev == lockMetadata.st_dev,
+           lockPathMetadata.st_ino == lockMetadata.st_ino {
+            try removePrivateRendezvousFile(
+                lockURL,
+                expectedParent: lockURL.deletingLastPathComponent(),
+                allowedKinds: [S_IFREG]
+            )
+        }
     }
 
     private func removeStaleLegacyRendezvous(_ stale: BrokerInfo) throws {

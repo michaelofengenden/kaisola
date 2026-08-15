@@ -532,11 +532,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.workspaceRailWidth, NativePreviewSettings.workspaceRailWidthDefault)
         XCTAssertEqual(settings.filePreviewWidth, NativePreviewSettings.filePreviewWidthDefault)
         XCTAssertEqual(settings.toolCallDensity, .balanced)
+        XCTAssertFalse(settings.tintedBreathing)
+        XCTAssertEqual(settings.projectRailWidth, NativePreviewSettings.projectRailWidthUnset)
 
         settings.navigationLayout = .topBar
         settings.appearance = .dark
         settings.sidebarAppearance = .solid
         settings.workspaceBackdrop = .tinted
+        settings.tintedBreathing = true
         settings.terminalThemeID = "kaisola"
         settings.restoreCLIDrafts = false
         settings.semanticShellIntegration = true
@@ -545,6 +548,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         settings.workspaceRailWidth = 300
         settings.filePreviewWidth = 640
         settings.toolCallDensity = .detailed
+        settings.projectRailWidth = 290.5
 
         let reloaded = NativePreviewSettings(defaults: defaults)
         XCTAssertEqual(reloaded.navigationLayout, .topBar)
@@ -559,6 +563,8 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.workspaceRailWidth, 300)
         XCTAssertEqual(reloaded.filePreviewWidth, 640)
         XCTAssertEqual(reloaded.toolCallDensity, .detailed)
+        XCTAssertTrue(reloaded.tintedBreathing)
+        XCTAssertEqual(reloaded.projectRailWidth, 290.5)
     }
 
     func testToolCallDensityRejectsUnknownPersistedValues() {
@@ -871,6 +877,25 @@ final class NativePreviewSettingsTests: XCTestCase {
             previewVisible: false,
             railVisible: false
         ).isEmpty)
+
+        // With the rail flush to the window edge (v0.1.125), the preview
+        // stays inside the chrome card, so its corridor alone shifts inward
+        // by the card's trailing gutter; the rail corridor is unmoved.
+        let inset = NativeDetailPaneSizing.corridors(
+            widths: widths,
+            previewVisible: true,
+            railVisible: true,
+            trailingPanelInset: 6
+        )
+        XCTAssertEqual(inset[0].centerFromTrailing, 218.5, accuracy: 0.001)
+        XCTAssertEqual(inset[1].centerFromTrailing, 705.5, accuracy: 0.001)
+        let insetPreviewOnly = NativeDetailPaneSizing.corridors(
+            widths: NativeDetailPaneSizing.Widths(preview: 480, rail: 0),
+            previewVisible: true,
+            railVisible: false,
+            trailingPanelInset: 6
+        )
+        XCTAssertEqual(insetPreviewOnly[0].centerFromTrailing, 486.5, accuracy: 0.001)
     }
 
     func testVisualChoiceTitlesRemainUserFacing() {
@@ -944,33 +969,38 @@ final class NativePreviewSettingsTests: XCTestCase {
 
         XCTAssertLessThanOrEqual(LightRailTint.maximumCoverage, 0.04)
         XCTAssertGreaterThanOrEqual(LightRailTint.minimumTransmission, 0.96)
-        XCTAssertEqual(LightRailTint.inactiveMultiplier, 0.12, accuracy: 0.0001)
+        // An unfocused window keeps nearly all of its edge cast: the rails are
+        // not a focus indicator, and 0.12 stacked on the material's own
+        // inactive collapse was half of the "gray when unfocused" bug.
+        XCTAssertEqual(LightRailTint.inactiveMultiplier, 0.85, accuracy: 0.0001)
         XCTAssertGreaterThan(LightRailTint.cool.blue, LightRailTint.cool.green)
         XCTAssertGreaterThan(LightRailTint.cool.green, LightRailTint.cool.red)
         XCTAssertGreaterThan(LightRailTint.pearl.red, LightRailTint.pearl.green)
         XCTAssertGreaterThan(LightRailTint.pearl.green, LightRailTint.pearl.blue)
     }
 
-    func testGlassRailsDeclareAboutTwelvePercentWhiteAndExposeTheDesktop() {
+    func testGlassRailsDeclareAboutThirtyPercentWhiteAndExposeTheDesktop() {
         let rail = GlassBackdropWash.sidebar(isDark: false)
         let canvas = GlassBackdropWash.workspace(isDark: false)
         let declaredWhiteCoverage = 1
             - (1 - LightGlassFrost.railCarrierWhiteCoverage) * (1 - rail.baseOpacity)
 
-        XCTAssertGreaterThanOrEqual(declaredWhiteCoverage, 0.10)
+        // Twelve percent read gray next to the 0.93-luminance canvas; thirty
+        // keeps the rails white without painting the desktop out.
+        XCTAssertGreaterThanOrEqual(declaredWhiteCoverage, 0.26)
         XCTAssertLessThanOrEqual(
             declaredWhiteCoverage,
-            0.14,
+            0.34,
             "the shared rail material still carries too much white to read as transparent"
         )
         XCTAssertLessThanOrEqual(
             LightGlassFrost.railCarrierWhiteCoverage,
             0.02,
-            "a second white carrier is stacking on top of the twelve-percent veil"
+            "a second white carrier is stacking on top of the thirty-percent veil"
         )
         XCTAssertGreaterThanOrEqual(
             LightGlassFrost.modeledRailDesktopContribution(rail),
-            0.86,
+            0.68,
             "Glass still paints over most of the wallpaper"
         )
         XCTAssertGreaterThanOrEqual(
@@ -1087,6 +1117,31 @@ final class NativePreviewSettingsTests: XCTestCase {
 
     /// The Tinted drift is glacial, bounded, and purely geometric — and the
     /// dark companion is the sampled hue rotated, never a second accent.
+    /// The opt-in breath must stay as quiet as the drift it joins: slow,
+    /// shallow, and never phase-locked with the endpoint period into a
+    /// visible pulse.
+    func testTintBreathIsSlowShallowAndNotAHarmonicOfTheDrift() {
+        XCTAssertGreaterThanOrEqual(TintFlowMotion.breathPeriod, 12)
+        XCTAssertGreaterThan(TintFlowMotion.breathAmplitude, 0.03)
+        XCTAssertLessThanOrEqual(TintFlowMotion.breathAmplitude, 0.14)
+        XCTAssertEqual(
+            TintFlowMotion.breathFloorOpacity,
+            1 - TintFlowMotion.breathAmplitude,
+            accuracy: 0.0001
+        )
+        let ratio = TintFlowMotion.period / TintFlowMotion.breathPeriod
+        XCTAssertGreaterThan(
+            abs(ratio - ratio.rounded()), 0.05,
+            "an integer period ratio phase-locks the breath to the drift"
+        )
+        // The dimmest breath phase multiplies every stop's coverage; even the
+        // heaviest light stop stays far above the point where Tinted could
+        // quantize back into Glass or Solid.
+        let dimmestHeavyStop = LightTintedGradient.coolCoverage
+            * TintFlowMotion.breathFloorOpacity
+        XCTAssertGreaterThan(dimmestHeavyStop, 0.20)
+    }
+
     func testTintFlowMotionIsGlacialAndItsCompanionKeepsTheSampledFamily() {
         XCTAssertGreaterThanOrEqual(TintFlowMotion.period, 20, "the flow became watchable motion")
         XCTAssertGreaterThan(TintFlowMotion.drift, 0.05, "the drift is too small to ever notice")
@@ -1251,13 +1306,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         // passed no desktop colour at all, and the 0.16 that replaced it was
         // calibrated against vibrancy but ended up over a *painted wallpaper*,
         // which passes everything.
-        // Light rails now use one narrow white veil centered on twelve
-        // percent. There is no second carrier stacked beneath it; the exact
-        // white workspace has its own opaque recipe.
+        // Light rails now use one white veil centered on thirty percent —
+        // twelve read gray next to the canvas. There is still no second
+        // carrier stacked beneath it; the exact white workspace has its own
+        // opaque recipe.
         let lightSidebar = GlassBackdropWash.sidebar(isDark: false)
-        XCTAssertEqual(lightSidebar.topOpacity, 0.14, accuracy: 0.0001)
-        XCTAssertEqual(lightSidebar.baseOpacity, 0.12, accuracy: 0.0001)
-        XCTAssertEqual(lightSidebar.bottomOpacity, 0.10, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.topOpacity, 0.34, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.baseOpacity, 0.30, accuracy: 0.0001)
+        XCTAssertEqual(lightSidebar.bottomOpacity, 0.26, accuracy: 0.0001)
         // 0.40 → 0.38 with the 2026-08-14 carrier drop, so the canvas stays
         // white-led while a third of the normalized desktop reaches it.
         XCTAssertEqual(GlassBackdropWash.workspace(isDark: false).baseOpacity, 0.38, accuracy: 0.0001)
@@ -4276,14 +4332,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(before, 0.336, accuracy: 0.001)
         XCTAssertGreaterThan(after, before * 1.6, "live dark barely moved")
 
-        // Light keeps the live material's chroma and uses only the twelve-point
+        // Light keeps the live material's chroma and uses only the thirty-point
         // white veil to frost it. No second carrier consumes the transmission.
         XCTAssertEqual(SidebarBackdropView.liveTint.light, 0, accuracy: 0.0001)
         let lightAfterCarrier = transmission(
             tint: SidebarBackdropView.liveTint.light,
             veil: GlassBackdropWash.sidebar(isDark: false).baseOpacity
         ) * (1 - LightGlassFrost.railCarrierWhiteCoverage)
-        XCTAssertEqual(lightAfterCarrier, 0.88, accuracy: 0.0001)
+        XCTAssertEqual(lightAfterCarrier, 0.70, accuracy: 0.0001)
     }
 
     /// The bake bounds the wallpaper's dynamic range, not only its mean — the
@@ -5243,15 +5299,24 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertFalse(
             InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 214, didForce: false)
         )
+        // 248 is a previously-forced ideal now too (the v0.1.124 resting
+        // width), so v2-forced windows move once to the v0.1.125 width.
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 248, didForce: false)
+        )
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 248, didForce: true)
+        )
+
         // The new key generation is what re-arms previously-forced windows;
         // it must actually be new.
         XCTAssertTrue(
-            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v2.")
+            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v3.")
         )
 
         // Never against a restored or user-chosen width — including the ideal
         // itself, so a second window does not re-run the override.
-        for width in [168.0, 240.0, 248.0, 300.0, 340.0] {
+        for width in [168.0, 240.0, 290.0, 300.0, 340.0] {
             XCTAssertFalse(
                 InitialSidebarWidth.shouldForceInitialWidth(
                     currentWidth: width,
@@ -5309,7 +5374,7 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The width the override applies is the one the rest of the chrome is
     /// designed around, not a second literal that can drift away from it.
     func testSidebarOverrideTargetsTheIdealWidthTheChromeIsSizedFor() {
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 290)
         XCTAssertGreaterThan(
             NativeWorkspaceChrome.projectSidebarIdealWidth,
             InitialSidebarWidth.systemDefault + InitialSidebarWidth.tolerance,
@@ -5325,26 +5390,80 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
+    /// A dragged rail width persists and outranks the resting ideal for every
+    /// new window; the unset sentinel keeps fresh installs on the constant.
+    func testPersistedProjectRailWidthWinsOverTheRestingIdeal() {
+        XCTAssertEqual(
+            NativeWorkspaceChrome.resolvedProjectRailIdealWidth(
+                storedWidth: NativePreviewSettings.projectRailWidthUnset
+            ),
+            NativeWorkspaceChrome.projectSidebarIdealWidth
+        )
+        XCTAssertEqual(
+            NativeWorkspaceChrome.resolvedProjectRailIdealWidth(storedWidth: 275),
+            275
+        )
+        // Stored values clamp to the rail's own band, and the settings clamp
+        // mirrors the chrome band exactly so the two can never disagree.
+        XCTAssertEqual(
+            NativeWorkspaceChrome.resolvedProjectRailIdealWidth(storedWidth: 80),
+            NativeWorkspaceChrome.projectSidebarMinimumWidth
+        )
+        XCTAssertEqual(
+            NativeWorkspaceChrome.resolvedProjectRailIdealWidth(storedWidth: 900),
+            NativeWorkspaceChrome.projectSidebarMaximumWidth
+        )
+        XCTAssertEqual(
+            NativePreviewSettings.projectRailWidthRange.lowerBound,
+            Double(NativeWorkspaceChrome.projectSidebarMinimumWidth)
+        )
+        XCTAssertEqual(
+            NativePreviewSettings.projectRailWidthRange.upperBound,
+            Double(NativeWorkspaceChrome.projectSidebarMaximumWidth)
+        )
+        XCTAssertEqual(NativePreviewSettings.clampedProjectRailWidth(80), 168)
+        XCTAssertEqual(NativePreviewSettings.clampedProjectRailWidth(900), 340)
+    }
+
     /// With no paired Mac the section was a permanent "No other Macs yet" plus
     /// a "Updated N seconds ago" line: two rows of chrome reporting nothing.
     func testOtherMacsSectionStaysHiddenUntilThereIsSomethingToReport() {
         XCTAssertFalse(
-            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 0, errorMessage: nil)
+            RememberedSessionsSectionVisibility.shouldShow(
+                remoteDeviceCount: 0, errorMessage: nil, hasEverSeenRemoteDevice: false
+            )
         )
         XCTAssertFalse(
-            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 0, errorMessage: "")
+            RememberedSessionsSectionVisibility.shouldShow(
+                remoteDeviceCount: 0, errorMessage: "", hasEverSeenRemoteDevice: true
+            )
         )
         XCTAssertFalse(
-            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 0, errorMessage: "  \n ")
+            RememberedSessionsSectionVisibility.shouldShow(
+                remoteDeviceCount: 0, errorMessage: "  \n ", hasEverSeenRemoteDevice: true
+            )
         )
         XCTAssertTrue(
-            RememberedSessionsSectionVisibility.shouldShow(remoteDeviceCount: 1, errorMessage: nil)
+            RememberedSessionsSectionVisibility.shouldShow(
+                remoteDeviceCount: 1, errorMessage: nil, hasEverSeenRemoteDevice: false
+            )
         )
-        // A failure must never be silent just because it left the catalog empty.
+        // A failure must never be silent just because it left the catalog
+        // empty — but only about a fleet that has actually been seen.
         XCTAssertTrue(
             RememberedSessionsSectionVisibility.shouldShow(
                 remoteDeviceCount: 0,
-                errorMessage: "Companion is offline"
+                errorMessage: "Companion is offline",
+                hasEverSeenRemoteDevice: true
+            )
+        )
+        // A never-paired install stays silent even when the saved-session
+        // refresh fails; there is no fleet to report on.
+        XCTAssertFalse(
+            RememberedSessionsSectionVisibility.shouldShow(
+                remoteDeviceCount: 0,
+                errorMessage: "The saved Firebase session is unavailable.",
+                hasEverSeenRemoteDevice: false
             )
         )
     }
@@ -5702,9 +5821,9 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// `QuietIdentityMarkTests` rather than left as comments here.
     func testProjectSidebarHasComfortableResizableWidth() {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168)
-        // 210 → 248 in v0.1.124: the rail returns to the width v1.1.6 chose
-        // for legible titles, by request.
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 248)
+        // 210 → 248 in v0.1.124, 248 → 290 in v0.1.125: the resting rail
+        // matches the width Michael pins the Files rail to, by request.
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 290)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 340)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
         // Still comfortably inside its own bounds after two narrowings.

@@ -9,6 +9,7 @@
 const crypto = require('node:crypto')
 const fs = require('node:fs')
 const net = require('node:net')
+const os = require('node:os')
 const path = require('node:path')
 const { StringDecoder } = require('node:string_decoder')
 const mgr = require('./ipc/terminalManager.cjs')
@@ -1009,10 +1010,112 @@ if (process.env.NODE_ENV === 'test' && process.env.KAISOLA_TEST_BROKER_REJECTION
   process.on('SIGUSR2', () => { void Promise.reject(new Error('rejection-probe-secret-marker')) })
 }
 
+// The generation lock is an exclusive-create file removed only by an orderly
+// exit. A crash or a host reboot leaves it behind with no living owner, and
+// the bare EEXIST exit used to wedge every relaunch of this digest in a
+// silent exit 2 — the 2026-08-14 reboot stranded the installed app on
+// "Session Connection Unavailable" all day exactly this way. Ownership is
+// judged by the PID recorded in the lock file and the PID published in the
+// rendezvous info file: only when neither names a living process is the stale
+// file replaced. Anything ambiguous keeps failing closed as before, but now
+// with a logged reason.
+function pidAlive(pid) {
+  try { process.kill(pid, 0); return true } catch (error) { return error?.code === 'EPERM' }
+}
+
+// A file written before the last boot cannot have a living owner: no pre-boot
+// process survives a reboot, whatever kill(0) says about a recycled pid — the
+// exact hazard of judging a reboot-orphaned lock by pid alone. The minute of
+// slack absorbs uptime jitter by erring toward "written after boot", which
+// fails closed.
+function writtenSinceBoot(file) {
+  try {
+    return fs.lstatSync(file).mtimeMs > Date.now() - os.uptime() * 1000 - 60_000
+  } catch { return false }
+}
+
+function recordedLockPid() {
+  try {
+    const pid = Number.parseInt(fs.readFileSync(config.lockFile, 'utf8').trim(), 10)
+    return Number.isSafeInteger(pid) && pid > 1 ? pid : null
+  } catch { return null }
+}
+
+function publishedRendezvousPid() {
+  try {
+    const pid = Number(JSON.parse(fs.readFileSync(config.infoFile, 'utf8'))?.pid)
+    return Number.isSafeInteger(pid) && pid > 1 ? pid : null
+  } catch { return null }
+}
+
+// Hold a kernel flock on the lock for the broker's lifetime where the
+// platform supports taking it at open (macOS O_EXLOCK). The app-side stale
+// cleanup arbitrates with flock(LOCK_EX|LOCK_NB); holding the shared kernel
+// lock here makes the kernel the single referee between the two, instead of
+// two processes racing one file under two different protocols. The plain
+// open fallback keeps the pid-and-inode guards as the only (bounded)
+// protection elsewhere.
+function openHeldLock() {
+  const { O_RDONLY, O_NONBLOCK, O_EXLOCK } = fs.constants
+  if (O_EXLOCK != null) {
+    try { return fs.openSync(config.lockFile, O_RDONLY | O_NONBLOCK | O_EXLOCK) } catch { /* fall through */ }
+  }
+  return fs.openSync(config.lockFile, 'r')
+}
+
+function acquireGenerationLock() {
+  // The lock must never exist without its owner's pid inside: a bare 'wx'
+  // create left a window between creation and the pid write in which a
+  // concurrent relaunch read an empty file, judged the lock ownerless, and
+  // took it over — two brokers on one generation. Hard-linking a pre-written
+  // claim file makes creation and content a single atomic step.
+  const claim = `${config.lockFile}.${process.pid}.claim`
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const claimFd = fs.openSync(claim, 'w', 0o600)
+      try { fs.writeSync(claimFd, `${process.pid}\n`) } finally { fs.closeSync(claimFd) }
+      try {
+        fs.linkSync(claim, config.lockFile)
+        return openHeldLock()
+      } catch (error) {
+        if (error?.code !== 'EEXIST' || attempt > 0) throw error
+        let stale
+        try { stale = fs.lstatSync(config.lockFile) } catch (statError) {
+          if (statError?.code === 'ENOENT') continue
+          throw error
+        }
+        if (!stale.isFile()) throw error
+        const owners = [
+          { pid: recordedLockPid(), file: config.lockFile },
+          { pid: publishedRendezvousPid(), file: config.infoFile },
+        ].filter((owner) => owner.pid != null && owner.pid !== process.pid)
+        const living = owners.find((owner) => writtenSinceBoot(owner.file) && pidAlive(owner.pid))
+        if (living != null) {
+          throw Object.assign(new Error(`held by live pid ${living.pid}`), { code: 'ELOCKHELD' })
+        }
+        // Remove only the exact file judged stale. A concurrent fresh owner
+        // replaces the lock with a new inode that must survive this takeover.
+        try {
+          const current = fs.lstatSync(config.lockFile)
+          if (!current.isFile() || current.ino !== stale.ino || current.dev !== stale.dev) throw error
+          fs.unlinkSync(config.lockFile)
+        } catch (takeoverError) {
+          if (takeoverError?.code !== 'ENOENT') throw error
+        }
+        log(`recovered stale generation lock deadOwner=${owners.map((owner) => owner.pid).join(',') || 'unrecorded'}`)
+      }
+    }
+    throw Object.assign(new Error('busy after stale takeover retry'), { code: 'ELOCKHELD' })
+  } finally {
+    try { fs.unlinkSync(claim) } catch { /* already gone */ }
+  }
+}
+
 try {
-  const lockFd = fs.openSync(config.lockFile, 'wx', 0o600)
+  const lockFd = acquireGenerationLock()
   process.on('exit', () => { try { fs.closeSync(lockFd) } catch {}; cleanupFiles() })
-} catch {
+} catch (error) {
+  log(`generation lock unavailable ${error?.code || ''} ${error?.message || error}`)
   process.exit(2)
 }
 

@@ -744,7 +744,24 @@ actor BrokerStartupCoordinator:
         // of retirement on every heartbeat — the 2026-08-07 stuck-typing
         // incident kept two empty drains pinned in the registry exactly this
         // way. At most one retirement is committed per heartbeat.
-        for draining in topology.draining where draining.id != retainedRollbackID {
+        for draining in topology.draining {
+            // A drain whose recorded process is provably dead can never again
+            // serve or hand off its terminals, and RPC retirement against it
+            // fails forever. Before v0.1.125 a host reboot therefore left one
+            // permanent phantom per draining generation, each pinning dead
+            // rendezvous files in the registry. Reap it under the same claim
+            // and exact registry CAS as an ordinary retirement. The retained
+            // rollback target is NOT exempt: rollback() requires a living
+            // process, so a dead one buys nothing — and if it shares the
+            // relaunching app's own digest, retaining the dead record blocks
+            // publishFreshGeneration's recovery and wedges the registry.
+            if !draining.info.isProcessAlive {
+                reapDeadDrainingGeneration(draining, topology: topology, store: store)
+                return
+            }
+            // A living rollback target is retained: it holds the terminals a
+            // rollback would return to.
+            if draining.id == retainedRollbackID { continue }
             if let quarantine = retirementQuarantines[draining.id],
                quarantine.info == draining.info,
                retirementSweepNumber < quarantine.nextEligibleSweep {
@@ -844,6 +861,141 @@ actor BrokerStartupCoordinator:
             try? garbageCollectRetiredMetadata(draining, store: store)
             return
         }
+    }
+
+    private func reapDeadDrainingGeneration(
+        _ draining: BrokerGenerationRecord,
+        topology: BrokerGenerationTopology,
+        store: BrokerGenerationRegistryStore
+    ) {
+        guard let registry = exactRetirementRegistry(matching: topology, store: store),
+              registry.generations.contains(draining) else { return }
+        let retained = registry.generations.filter { $0.id != draining.id }
+        guard let next = try? store.save(
+            currentGenerationID: topology.current.id,
+            generations: retained,
+            expectedRevision: registry.revision,
+            selection: registry.selection
+        ) else {
+            currentTopology = (try? store.load())?.topology
+            return
+        }
+        retirementQuarantines.removeValue(forKey: draining.id)
+        currentTopology = next.topology
+        // Registry removal is the authority boundary; file cleanup afterward
+        // is best-effort, mirroring ordinary retirement.
+        try? garbageCollectRetiredMetadata(draining, store: store)
+        removeDeadGenerationRendezvousFiles(draining, store: store)
+    }
+
+    /// Best-effort removal of a reaped generation's rendezvous files. The
+    /// socket and metadata are dead weight once the registry no longer names
+    /// the generation, and the exclusive-create lock file would otherwise
+    /// wedge any future relaunch of the same digest.
+    ///
+    /// A reaped record can be stale about its digest: a live broker may have
+    /// republished the same digest since this record's process died (the
+    /// pre-claim windows and refused publications documented on the sweep).
+    /// Every removal therefore runs under the generation lock with the same
+    /// identity re-checks as `removeStaleGenerationRendezvous` — the socket
+    /// and metadata go only while the published identity still describes the
+    /// dead record, and the lock only while its recorded owner is not a
+    /// living process and the path still names the locked inode.
+    private func removeDeadGenerationRendezvousFiles(
+        _ generation: BrokerGenerationRecord,
+        store: BrokerGenerationRegistryStore
+    ) {
+        guard generation.packageRoot != nil, !generation.info.isProcessAlive else { return }
+        let root = locator.preferredUserDataRoot.standardizedFileURL
+        let metadataDirectory = store.brokerDirectory.appendingPathComponent(
+            BrokerLaunchConfiguration.generationMetadataDirectoryName,
+            isDirectory: true
+        )
+        let lockURL = metadataDirectory.appendingPathComponent(
+            "\(generation.id).lock",
+            isDirectory: false
+        )
+        let lockDescriptor = open(lockURL.path, O_RDWR | O_CREAT | O_NOFOLLOW, 0o600)
+        guard lockDescriptor >= 0 else { return }
+        defer { Darwin.close(lockDescriptor) }
+        var lockMetadata = stat()
+        guard fstat(lockDescriptor, &lockMetadata) == 0,
+              lockMetadata.st_uid == getuid(),
+              lockMetadata.st_mode & S_IFMT == S_IFREG,
+              lockMetadata.st_mode & 0o077 == 0,
+              flock(lockDescriptor, LOCK_EX | LOCK_NB) == 0 else {
+            return
+        }
+        defer { _ = flock(lockDescriptor, LOCK_UN) }
+        // The broker writes its pid into the lock at creation. A recorded
+        // owner that is a living process — even one that has not yet
+        // published its metadata — means a relaunch beat this reap, and
+        // every file here now belongs to the newcomer.
+        if let owner = recordedLockOwner(lockDescriptor),
+           owner != generation.info.pid,
+           processAlive(owner) {
+            return
+        }
+        let published = try? locator.locateGenerationMetadata(
+            contentDigest: generation.id,
+            validateSocket: false
+        )
+        if let published, published != generation.info { return }
+        guard !generation.info.isProcessAlive else { return }
+        if published == generation.info {
+            let socketURL = URL(fileURLWithPath: generation.info.socketPath)
+            let expectedSocketLeaf = BrokerLaunchConfiguration.generationSocketLeaf(
+                userData: root,
+                contentDigest: generation.id
+            )
+            if socketURL.lastPathComponent == expectedSocketLeaf {
+                try? removePrivateRendezvousFile(
+                    socketURL,
+                    expectedParents: [
+                        store.brokerDirectory,
+                        homeDirectory.appendingPathComponent(".kaisola-session", isDirectory: true),
+                    ],
+                    allowedKinds: [S_IFSOCK]
+                )
+            }
+            try? removePrivateRendezvousFile(
+                metadataDirectory.appendingPathComponent("\(generation.id).json"),
+                expectedParent: metadataDirectory,
+                allowedKinds: [S_IFREG]
+            )
+        }
+        // Remove the lock only while the path still names the exact inode
+        // this cleanup holds locked; a freshly created replacement survives.
+        var lockPathMetadata = stat()
+        if lstat(lockURL.path, &lockPathMetadata) == 0,
+           lockPathMetadata.st_dev == lockMetadata.st_dev,
+           lockPathMetadata.st_ino == lockMetadata.st_ino {
+            try? removePrivateRendezvousFile(
+                lockURL,
+                expectedParent: metadataDirectory,
+                allowedKinds: [S_IFREG]
+            )
+        }
+    }
+
+    /// The pid a broker recorded in its generation lock at creation, read
+    /// through the already-open descriptor so the check and the flock cover
+    /// one inode.
+    private func recordedLockOwner(_ descriptor: Int32) -> pid_t? {
+        var bytes = [UInt8](repeating: 0, count: 32)
+        let count = pread(descriptor, &bytes, bytes.count, 0)
+        guard count > 0,
+              let text = String(bytes: bytes.prefix(count), encoding: .utf8),
+              let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 1 else { return nil }
+        return pid
+    }
+
+    /// Same liveness rule as `BrokerInfo.isProcessAlive`: signalable, or
+    /// EPERM (alive but owned elsewhere).
+    private func processAlive(_ pid: pid_t) -> Bool {
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
     }
 
     private func exactRetirementRegistry(
@@ -1590,6 +1742,23 @@ actor BrokerStartupCoordinator:
             expectedParent: metadataURL.deletingLastPathComponent(),
             allowedKinds: [S_IFREG]
         )
+        // The broker acquires this lock by exclusive creation and removes it
+        // only on orderly exit, so a file left behind here — by the dead
+        // generation's unclean death or by this cleanup's own O_CREAT above —
+        // wedges every relaunch of the same digest in a silent EEXIST exit.
+        // Remove it only while the path still names the exact inode this
+        // cleanup holds locked; a freshly launched broker's replacement lock
+        // must survive.
+        var lockPathMetadata = stat()
+        if lstat(lockURL.path, &lockPathMetadata) == 0,
+           lockPathMetadata.st_dev == lockMetadata.st_dev,
+           lockPathMetadata.st_ino == lockMetadata.st_ino {
+            try removePrivateRendezvousFile(
+                lockURL,
+                expectedParent: lockURL.deletingLastPathComponent(),
+                allowedKinds: [S_IFREG]
+            )
+        }
     }
 
     private func removeStaleLegacyRendezvous(_ stale: BrokerInfo) throws {

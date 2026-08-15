@@ -111,5 +111,12 @@ final class NewSessionChooserTests: XCTestCase {
         // The whole ladder stays a wash, never a filled chip.
         XCTAssertLessThanOrEqual(NewSessionChoiceButtonStyle.pressFill, 0.12)
         XCTAssertLessThanOrEqual(NewSessionChoiceButtonStyle.hoverStroke, 0.25)
+        // Keyboard focus is a rung of its own: the style defaults unfocused
+        // and a focused card must at least reach the hover fill, or the
+        // programmatically focused first card is indistinguishable from the
+        // other three.
+        XCTAssertFalse(NewSessionChoiceButtonStyle().isFocused)
+        XCTAssertTrue(NewSessionChoiceButtonStyle(isFocused: true).isFocused)
+        XCTAssertGreaterThan(KaisolaVisualSystem.focusStroke, 0)
     }
 }

@@ -793,7 +793,7 @@ struct RootShellView: View {
             // the opening width; this plants the one AppKit view that can fix
             // that, once per window. It draws nothing and takes no hits.
             .background {
-                InitialSidebarWidthApplier()
+                InitialSidebarWidthApplier(idealWidth: resolvedProjectRailIdealWidth)
                     .frame(width: 0, height: 0)
                     .accessibilityHidden(true)
             }
@@ -808,7 +808,7 @@ struct RootShellView: View {
             }
             .navigationSplitViewColumnWidth(
                 min: NativeWorkspaceChrome.projectSidebarMinimumWidth,
-                ideal: NativeWorkspaceChrome.projectSidebarIdealWidth,
+                ideal: resolvedProjectRailIdealWidth,
                 max: NativeWorkspaceChrome.projectSidebarMaximumWidth
             )
         } detail: { _ in
@@ -834,20 +834,50 @@ struct RootShellView: View {
     /// and `detailShowDoors` floats the show buttons over the content surface
     /// only while something is hidden.
     private var detailArea: some View {
-        VStack(spacing: 0) {
-            // A degraded workspace archive usually means an empty detail pane,
-            // so this belongs in the layout rather than over it: covering the
-            // empty state's own actions is exactly the wrong trade.
-            // Keep the observer mounted even while it renders no content.
-            // ProjectAccountRecoveryCenter is a nested ObservableObject, so
-            // RootShell cannot reliably decide when its child should exist.
-            WorkspaceRestorationNoticeView(model: model)
-            detailPane
-                .kaisolaChromePanel(
-                    topInset: NativeWorkspaceChrome.detailPanelTopInset(
-                        layout: settings.navigationLayout
-                    )
-                )
+        GeometryReader { geometry in
+            // The Files rail sits OUTSIDE the chrome card, flush to the window
+            // edge like the left project rail. Only the content column keeps
+            // the card and its gutters, so the card's two horizontal insets
+            // come out of the width the panels share — the same pool the old
+            // inside-the-card geometry measured.
+            let widths = NativeDetailPaneSizing.resolve(
+                totalWidth: geometry.size.width - KaisolaVisualSystem.chromeInset * 2,
+                preferredPreview: detailPreviewPanelVisible ? settings.filePreviewWidth : nil,
+                preferredRail: detailRailPanelVisible ? settings.workspaceRailWidth : nil
+            )
+            HStack(spacing: 0) {
+                VStack(spacing: 0) {
+                    // A degraded workspace archive usually means an empty detail pane,
+                    // so this belongs in the layout rather than over it: covering the
+                    // empty state's own actions is exactly the wrong trade.
+                    // Keep the observer mounted even while it renders no content.
+                    // ProjectAccountRecoveryCenter is a nested ObservableObject, so
+                    // RootShell cannot reliably decide when its child should exist.
+                    WorkspaceRestorationNoticeView(model: model)
+                    detailPane(widths)
+                        .kaisolaChromePanel(
+                            topInset: NativeWorkspaceChrome.detailPanelTopInset(
+                                layout: settings.navigationLayout
+                            )
+                        )
+                }
+                if detailRailPanelVisible, let root = model.currentProjectDirectory {
+                    // Files live on the right, matching the editor/reference rail in
+                    // the Electron workspace and leaving the project hierarchy as the
+                    // sole navigation surface on the left.
+                    workspaceRailDivider
+                    workspaceRail(root: root)
+                        .id(root)
+                        .frame(width: widths.rail)
+                }
+            }
+            // See the corridor note in `detailPane`: the trackers must be
+            // top-level siblings above every hosted AppKit view, and now that
+            // the rail is the trailing-most panel they anchor to the window
+            // edge itself.
+            .overlay(alignment: .trailing) {
+                detailDividerTrackers(widths: widths)
+            }
         }
         // The other half of the sidebar divider's corridor. It has to live in
         // this column: a tracking area is clipped to its own split-view
@@ -1042,11 +1072,20 @@ struct RootShellView: View {
     /// permanent empty state plus a "Updated N seconds ago" line — two rows of
     /// chrome saying nothing, which is exactly what the v4 rail is meant not to
     /// carry. It appears when there is something to report: a remote device, or
-    /// an error explaining why there is not.
+    /// an error about a fleet that has actually been seen.
     private var showsRememberedSessionSection: Bool {
         RememberedSessionsSectionVisibility.shouldShow(
             remoteDeviceCount: rememberedSessions.remoteDevices.count,
-            errorMessage: rememberedSessions.errorMessage
+            errorMessage: rememberedSessions.errorMessage,
+            hasEverSeenRemoteDevice: rememberedSessions.hasEverSeenRemoteDevice
+        )
+    }
+
+    /// A dragged rail width persists and becomes every window's opening
+    /// width; a never-dragged install follows the chrome's resting ideal.
+    private var resolvedProjectRailIdealWidth: CGFloat {
+        NativeWorkspaceChrome.resolvedProjectRailIdealWidth(
+            storedWidth: settings.projectRailWidth
         )
     }
 
@@ -1585,103 +1624,90 @@ struct RootShellView: View {
     }
 
     @ViewBuilder
-    private var detailPane: some View {
-        GeometryReader { geometry in
-            let widths = NativeDetailPaneSizing.resolve(
-                totalWidth: geometry.size.width,
-                preferredPreview: detailPreviewPanelVisible ? settings.filePreviewWidth : nil,
-                preferredRail: detailRailPanelVisible ? settings.workspaceRailWidth : nil
-            )
-            HStack(spacing: 0) {
-                detailContent
-                    .frame(minWidth: NativeDetailPaneSizing.minimumContentWidth,
-                           maxWidth: .infinity, maxHeight: .infinity)
-                    .layoutPriority(1)
-                    .overlay(alignment: .topTrailing) { detailShowDoors }
-                if let browserURL = model.browserCardURL {
-                    filePreviewDivider
-                    BrowserCardView(url: browserURL) { model.browserCardURL = nil }
-                        .frame(width: widths.preview)
-                        .frame(maxHeight: .infinity)
-                } else if let fileURL = model.previewedFileURL {
-                    filePreviewDivider
-                    FilePreviewView(
-                        url: fileURL,
-                        workspaceRoot: model.currentProjectDirectory,
-                        targetLine: model.previewedFileLine,
-                        tabs: model.fileTabs(for: model.selectedProjectID),
-                        selectTab: { model.selectFileTab($0) },
-                        setTabPinned: { model.setFileTabPinned($0, pinned: $1) },
-                        closeTab: { model.closeFileTab($0) },
-                        canReopenClosedTab: model.canReopenClosedFileTab,
-                        reopenClosedTab: { model.reopenClosedFileTab() },
-                        commandScopeID: ObjectIdentifier(model),
-                        navigationCommitted: { model.commitFileNavigation($0) },
-                        restoreSelection: { model.cancelFileNavigation(restoring: $0) },
-                        hide: { runCommand(.toggleDocumentPreview) }
-                    ) {
-                        model.closeFilePreview()
-                    }
-                    // Keep document/tab state while navigating inside a
-                    // project, but remount the FSEvents watcher when the file
-                    // workbench moves to a different project root.
-                    .id("file-preview-\(model.currentProjectDirectory?.standardizedFileURL.path ?? fileURL.deletingLastPathComponent().path)")
+    private func detailPane(_ widths: NativeDetailPaneSizing.Widths) -> some View {
+        // Both detail dividers' pointer trackers live in one overlay on
+        // `detailArea`'s outer HStack, not inside the handles they belong to.
+        //
+        // `FilePreviewView` hosts real AppKit views — a `WKWebView` for
+        // rendered Markdown, an `NSTextView` for source — and a hosted
+        // AppKit view outranks a SwiftUI sibling for cursor dispatch.
+        // `zIndex` reorders SwiftUI's drawing but NOT the backing NSViews,
+        // measured: with the tracker inside the handle the document
+        // divider's corridor read `arrow` across its whole width at every
+        // zIndex, while the identical Files handle (whose neighbour hosts
+        // no web view) read `resizeLeftRight`. An overlay attached to the
+        // outer HStack is added to the same backing hierarchy AFTER the
+        // panels, so those tracking views are true top-level siblings above
+        // the hosted content and receive `.cursorUpdate` first.
+        HStack(spacing: 0) {
+            detailContent
+                .frame(minWidth: NativeDetailPaneSizing.minimumContentWidth,
+                       maxWidth: .infinity, maxHeight: .infinity)
+                .layoutPriority(1)
+                .overlay(alignment: .topTrailing) { detailShowDoors }
+            if let browserURL = model.browserCardURL {
+                filePreviewDivider
+                BrowserCardView(url: browserURL) { model.browserCardURL = nil }
                     .frame(width: widths.preview)
                     .frame(maxHeight: .infinity)
+            } else if let fileURL = model.previewedFileURL {
+                filePreviewDivider
+                FilePreviewView(
+                    url: fileURL,
+                    workspaceRoot: model.currentProjectDirectory,
+                    targetLine: model.previewedFileLine,
+                    tabs: model.fileTabs(for: model.selectedProjectID),
+                    selectTab: { model.selectFileTab($0) },
+                    setTabPinned: { model.setFileTabPinned($0, pinned: $1) },
+                    closeTab: { model.closeFileTab($0) },
+                    canReopenClosedTab: model.canReopenClosedFileTab,
+                    reopenClosedTab: { model.reopenClosedFileTab() },
+                    commandScopeID: ObjectIdentifier(model),
+                    navigationCommitted: { model.commitFileNavigation($0) },
+                    restoreSelection: { model.cancelFileNavigation(restoring: $0) },
+                    hide: { runCommand(.toggleDocumentPreview) }
+                ) {
+                    model.closeFilePreview()
                 }
-                if settings.workspaceRailVisible, let root = model.currentProjectDirectory {
-                    // Files live on the right, matching the editor/reference rail in
-                    // the Electron workspace and leaving the project hierarchy as the
-                    // sole navigation surface on the left.
-                    workspaceRailDivider
-                    WorkspaceRailView(root: root, selectedFile: model.previewedFileURL, openFile: { url, pinned in
-                        model.openFilePreview(url, pinned: pinned)
-                    }, followsAgentFiles: $followsSelectedAgentFiles, canFollowAgentFiles: canFollowAgentFiles,
-                    didMoveItem: { source, destination in
-                        model.reconcileWorkspaceFileMove(from: source, to: destination)
-                        model.registerWorkspaceMoveUndo(
-                            .init(source: source, destination: destination),
-                            workspaceRoot: root,
-                            undoManager: undoManager
-                        )
-                    }, didTrashItem: { move in
-                        let snapshot = model.reconcileWorkspaceFileRemoval(move.original)
-                        model.registerWorkspaceTrashUndo(
-                            move,
-                            removalSnapshot: snapshot,
-                            workspaceRoot: root,
-                            undoManager: undoManager
-                        )
-                    }, didCreateItem: { created in
-                        model.registerWorkspaceCreationUndo(
-                            created,
-                            workspaceRoot: root,
-                            undoManager: undoManager
-                        )
-                    }) {
-                        settings.workspaceRailVisible = false
-                    }
-                    .id(root)
-                    .frame(width: widths.rail)
-                }
+                // Keep document/tab state while navigating inside a
+                // project, but remount the FSEvents watcher when the file
+                // workbench moves to a different project root.
+                .id("file-preview-\(model.currentProjectDirectory?.standardizedFileURL.path ?? fileURL.deletingLastPathComponent().path)")
+                .frame(width: widths.preview)
+                .frame(maxHeight: .infinity)
             }
-            // Both detail dividers' pointer trackers live HERE, in one overlay
-            // on the stack, instead of inside the handles they belong to.
-            //
-            // `FilePreviewView` hosts real AppKit views — a `WKWebView` for
-            // rendered Markdown, an `NSTextView` for source — and a hosted
-            // AppKit view outranks a SwiftUI sibling for cursor dispatch.
-            // `zIndex` reorders SwiftUI's drawing but NOT the backing NSViews,
-            // measured: with the tracker inside the handle the document
-            // divider's corridor read `arrow` across its whole width at every
-            // zIndex, while the identical Files handle (whose neighbour hosts
-            // no web view) read `resizeLeftRight`. An overlay attached to the
-            // HStack is added to the same backing hierarchy AFTER the panels,
-            // so these tracking views are true top-level siblings above the
-            // hosted content and finally receive `.cursorUpdate` first.
-            .overlay(alignment: .trailing) {
-                detailDividerTrackers(widths: widths)
-            }
+        }
+    }
+
+    /// The Files rail, mounted by `detailArea` OUTSIDE the chrome card so it
+    /// runs flush to the window edges the way the left project rail does.
+    private func workspaceRail(root: URL) -> some View {
+        WorkspaceRailView(root: root, selectedFile: model.previewedFileURL, openFile: { url, pinned in
+            model.openFilePreview(url, pinned: pinned)
+        }, followsAgentFiles: $followsSelectedAgentFiles, canFollowAgentFiles: canFollowAgentFiles,
+        didMoveItem: { source, destination in
+            model.reconcileWorkspaceFileMove(from: source, to: destination)
+            model.registerWorkspaceMoveUndo(
+                .init(source: source, destination: destination),
+                workspaceRoot: root,
+                undoManager: undoManager
+            )
+        }, didTrashItem: { move in
+            let snapshot = model.reconcileWorkspaceFileRemoval(move.original)
+            model.registerWorkspaceTrashUndo(
+                move,
+                removalSnapshot: snapshot,
+                workspaceRoot: root,
+                undoManager: undoManager
+            )
+        }, didCreateItem: { created in
+            model.registerWorkspaceCreationUndo(
+                created,
+                workspaceRoot: root,
+                undoManager: undoManager
+            )
+        }) {
+            settings.workspaceRailVisible = false
         }
     }
 
@@ -1699,7 +1725,8 @@ struct RootShellView: View {
         let corridors = NativeDetailPaneSizing.corridors(
             widths: widths,
             previewVisible: detailPreviewPanelVisible,
-            railVisible: detailRailPanelVisible
+            railVisible: detailRailPanelVisible,
+            trailingPanelInset: KaisolaVisualSystem.chromeInset
         )
         return DetailDividerTrackingView(
             corridors: corridors,
@@ -1780,7 +1807,12 @@ struct RootShellView: View {
             unifiedSessionPaneGrid
             if let draft = selectedNewSessionDraft,
                let project = model.projects.first(where: { $0.id == draft.projectID }) {
+                // The opaque rect hides the still-mounted panes; the primary
+                // wash on top gives the white chooser card a ground to sit on
+                // — card and backdrop otherwise both resolve to #FFFFFF in
+                // light Aqua, with only a hairline between them.
                 Color(nsColor: .windowBackgroundColor)
+                    .overlay(Color.primary.opacity(0.05))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 NewSessionChooserView(
                     projectName: project.name,
@@ -2378,7 +2410,13 @@ struct RootShellView: View {
             } else if let maximized = model.maximizedPaneID, layout.contains(maximized) {
                 unifiedSessionCard(maximized, clearsWindowControls: true)
             } else if layout.isEmpty {
-                emptyWorkspaceState
+                // The draft overlay paints its own chooser over this grid;
+                // mounting the empty state's chooser underneath it doubled
+                // the AX tree and left two `@FocusState` publishers fighting
+                // over "Start a session".
+                if selectedNewSessionDraft == nil {
+                    emptyWorkspaceState
+                }
             } else {
                 GeometryReader { geometry in
                     let dividerSpace = CGFloat(max(0, layout.columns.count - 1)) * SessionPaneDividerSizing.layoutExtent
@@ -3422,8 +3460,10 @@ enum InitialSidebarWidth {
     /// default's band, so the 2026-08-14 widening could never reach the very
     /// windows the request was about. Widths the *app* placed are the app's to
     /// move again — matched exactly (±2 for the restoration round-trip), so a
-    /// width the user dragged anywhere else stays exactly as found.
-    static let previouslyForcedIdeals: [CGFloat] = [210]
+    /// width the user dragged anywhere else stays exactly as found. 248
+    /// joined the list with the v0.1.125 move to 290, and dragged widths now
+    /// persist, so a user choice can never sit in this band by accident.
+    static let previouslyForcedIdeals: [CGFloat] = [210, 248]
     static let previouslyForcedTolerance: CGFloat = 2
 
     /// True only for a column still sitting at AppKit's untouched default.
@@ -3450,11 +3490,12 @@ enum InitialSidebarWidth {
         return isSystemDefault(currentWidth) || isPreviouslyForcedIdeal(currentWidth)
     }
 
-    /// The `.v2` generation exists because the flag's meaning changed with the
-    /// 248 widening: v1 recorded "this window was widened to 210", and windows
-    /// carrying it must be revisited exactly once to move to 248.
+    /// The key generation moves whenever the flag's meaning changes: v2
+    /// recorded "this window was widened to 248", and windows carrying it
+    /// must be revisited exactly once to move to 290 (or to the user's own
+    /// persisted width, which wins outright).
     static func defaultsKey(restorationID: String) -> String {
-        "kaisola.sidebar.openedAtIdealWidth.v2.\(restorationID)"
+        "kaisola.sidebar.openedAtIdealWidth.v3.\(restorationID)"
     }
 
     static func hasApplied(restorationID: String, defaults: UserDefaults) -> Bool {
@@ -3859,6 +3900,11 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
         private var lastWindowX: CGFloat?
         private weak var activeSplitView: NSSplitView?
         private var activeDividerIndex: Int?
+        /// A bare click on the (deliberately wide) divider corridor must not
+        /// stamp the current app-chosen width as a user choice — a stored
+        /// width opts the user out of every future default-width migration.
+        /// Only a drag that actually moved the divider persists.
+        private var dragMoved = false
         private var trackingArea: NSTrackingArea?
         private lazy var dividerAccessibilityElement = NavigationSidebarAccessibilityElement(
             owner: self
@@ -3961,11 +4007,16 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
                     NativeWorkspaceChrome.projectSidebarIdealWidth,
                     ofDividerAt: match.index
                 )
+                // A double-click means "back to the default", so it clears the
+                // persisted drag rather than pinning the current ideal as one.
+                NativePreviewSettings.shared.projectRailWidth =
+                    NativePreviewSettings.projectRailWidthUnset
                 return
             }
             activeSplitView = match.splitView
             activeDividerIndex = match.index
             lastWindowX = event.locationInWindow.x
+            dragMoved = false
         }
 
         override func mouseDragged(with event: NSEvent) {
@@ -3981,9 +4032,26 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
                 splitView.subviews[dividerIndex].frame.maxX + delta,
                 ofDividerAt: dividerIndex
             )
+            dragMoved = true
         }
 
         override func mouseUp(with event: NSEvent) {
+            // The width the user let go at is the width every window opens at
+            // from now on. Written once per drag, here rather than per
+            // mouseDragged, so a long drag is one defaults write. A zero-move
+            // click writes nothing, and a collapsed pane's maxX of 0 would
+            // round-trip as the unset sentinel, silently erasing the stored
+            // choice — reject it.
+            if dragMoved,
+               let splitView = activeSplitView,
+               let index = activeDividerIndex,
+               splitView.subviews.indices.contains(index) {
+                let width = Double(splitView.subviews[index].frame.maxX)
+                if width > 0 {
+                    NativePreviewSettings.shared.projectRailWidth = width
+                }
+            }
+            dragMoved = false
             lastWindowX = nil
             activeSplitView = nil
             activeDividerIndex = nil
@@ -4012,6 +4080,12 @@ struct NavigationSidebarResizeHandle: NSViewRepresentable {
                 match.splitView.subviews[match.index].frame.maxX + delta,
                 ofDividerAt: match.index
             )
+            // Keyboard resizes persist the same way a drag's mouse-up does,
+            // reading back the split view's clamped result.
+            let width = Double(match.splitView.subviews[match.index].frame.maxX)
+            if width > 0 {
+                NativePreviewSettings.shared.projectRailWidth = width
+            }
             NSAccessibility.post(element: self, notification: .valueChanged)
             return true
         }
@@ -4575,13 +4649,27 @@ enum NativeWorkspaceChrome {
     /// a visible hierarchy step; 248 → 228 in v1.1.7 once the rail stopped
     /// spending width on chrome; 228 → 210 in v1.1.8; 210 → 248 in v0.1.124 by
     /// request — long project and session titles were the point of the wide
-    /// rail, and the density passes had walked the default back below legible.
-    /// Users who dragged their rail keep their width; only fresh windows open
-    /// at the wider resting point.
-    static let projectSidebarIdealWidth: CGFloat = 248
+    /// rail, and the density passes had walked the default back below legible;
+    /// 248 → 290 in v0.1.125, again by request, matching the width Michael
+    /// pins the Files rail to. Users who dragged their rail keep their width —
+    /// and as of v0.1.125 a drag persists (`NativePreviewSettings
+    /// .projectRailWidth`), so this constant only sizes truly fresh windows.
+    static let projectSidebarIdealWidth: CGFloat = 290
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
     static let projectSidebarMaximumWidth: CGFloat = 340
+
+    /// The width a fresh sidebar column opens at: the user's persisted drag
+    /// when one exists (clamped to this rail's own band), else the resting
+    /// ideal above. Pure, so "which width wins" is a test rather than a
+    /// window.
+    static func resolvedProjectRailIdealWidth(storedWidth: Double) -> CGFloat {
+        guard storedWidth > 0 else { return projectSidebarIdealWidth }
+        return CGFloat(min(
+            max(storedWidth, Double(projectSidebarMinimumWidth)),
+            Double(projectSidebarMaximumWidth)
+        ))
+    }
     static let projectSidebarDividerWidth: CGFloat = 1
     /// Centered across the visible divider, not laid wholly inside either pane.
     ///
@@ -4760,12 +4848,17 @@ enum RootSidebarVisibilityFixture {
 /// can be tested without a signed-in account or a catalog fetch.
 enum RememberedSessionsSectionVisibility {
     /// - Returns: `true` only when the section has something to say — at least
-    ///   one remembered remote device, or an error that explains why there is
-    ///   none. An empty, healthy catalog draws nothing: no header, no
-    ///   placeholder row, and no freshness line.
-    static func shouldShow(remoteDeviceCount: Int, errorMessage: String?) -> Bool {
+    ///   one remembered remote device, or an error about a fleet that has
+    ///   actually been seen. An empty, healthy catalog draws nothing, and a
+    ///   never-paired install stays silent even when the saved-session refresh
+    ///   fails: an error is only worth showing about a fleet that exists.
+    static func shouldShow(
+        remoteDeviceCount: Int,
+        errorMessage: String?,
+        hasEverSeenRemoteDevice: Bool
+    ) -> Bool {
         if remoteDeviceCount > 0 { return true }
-        guard let errorMessage else { return false }
+        guard hasEverSeenRemoteDevice, let errorMessage else { return false }
         return !errorMessage.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
@@ -4898,17 +4991,21 @@ enum NativeDetailPaneSizing {
     static func corridors(
         widths: Widths,
         previewVisible: Bool,
-        railVisible: Bool
+        railVisible: Bool,
+        trailingPanelInset: CGFloat = 0
     ) -> [Corridor] {
         var corridors: [Corridor] = []
-        // Walk in from the trailing edge in the same order the HStack lays the
-        // panels out: [ content | preview divider | preview | rail divider | rail ].
-        var consumed: CGFloat = 0
+        // Walk in from the trailing edge in the same order the layout mounts
+        // the panels: [ card( content | preview divider | preview ) |
+        // rail divider | rail ]. The rail is flush to the window edge; the
+        // preview lives inside the chrome card, whose trailing gutter is
+        // `trailingPanelInset`.
+        var consumed: CGFloat = trailingPanelInset
         if railVisible {
             corridors.append(
                 Corridor(divider: .rail, centerFromTrailing: widths.rail + dividerWidth / 2)
             )
-            consumed = widths.rail + dividerWidth
+            consumed = widths.rail + dividerWidth + trailingPanelInset
         }
         if previewVisible {
             corridors.append(
@@ -4987,6 +5084,11 @@ enum TerminalPaneMinimizeAction: Equatable {
 /// real workspace boundary rather than decoration.
 private struct SessionStrip: View {
     @ObservedObject var model: AppModel
+    @Environment(\.colorScheme) private var colorScheme
+    /// One hover at a time across the whole strip; the tabs had no pointer
+    /// feedback at all, and a per-row `@State` would leave stale highlights
+    /// behind fast pointer sweeps.
+    @State private var hoveredTabID: String?
     let projectID: String?
     let draft: NewSessionDraft?
     let selectedDraftID: String?
@@ -5048,11 +5150,15 @@ private struct SessionStrip: View {
                         .background {
                             surfaceTabBackground(
                                 selected: draftSelected,
-                                tint: WorkspacePalette.project
+                                tint: WorkspacePalette.project,
+                                hovered: hoveredTabID == draft.id
                             )
                         }
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        hoveredTabID = hovering ? draft.id : (hoveredTabID == draft.id ? nil : hoveredTabID)
+                    }
                     .accessibilityLabel("New Session")
                     .accessibilityAddTraits(draftSelected ? .isSelected : [])
                     .contextMenu {
@@ -5082,17 +5188,23 @@ private struct SessionStrip: View {
                                     .foregroundStyle(.kaisolaSecondary)
                             }
                         }
-                        .font(.callout)
+                        .font(.callout.weight(
+                            !draftSelected && model.selectedChatID == chat.id ? .semibold : .regular
+                        ))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
                         .background {
                             surfaceTabBackground(
                                 selected: !draftSelected && model.selectedChatID == chat.id,
-                                tint: WorkspacePalette.chat
+                                tint: WorkspacePalette.chat,
+                                hovered: hoveredTabID == chat.id
                             )
                         }
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        hoveredTabID = hovering ? chat.id : (hoveredTabID == chat.id ? nil : hoveredTabID)
+                    }
                     .contextMenu {
                         if chat.conversation.isRunning {
                             Button("Stop Chat") { model.stopChat(chat.id) }
@@ -5117,17 +5229,23 @@ private struct SessionStrip: View {
                                     .foregroundStyle(.kaisolaSecondary)
                             }
                         }
-                        .font(.callout)
+                        .font(.callout.weight(
+                            !draftSelected && model.selectedMeshID == mesh.id ? .semibold : .regular
+                        ))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
                         .background {
                             surfaceTabBackground(
                                 selected: !draftSelected && model.selectedMeshID == mesh.id,
-                                tint: WorkspacePalette.mesh
+                                tint: WorkspacePalette.mesh,
+                                hovered: hoveredTabID == mesh.id
                             )
                         }
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        hoveredTabID = hovering ? mesh.id : (hoveredTabID == mesh.id ? nil : hoveredTabID)
+                    }
                     .contextMenu {
                         if mesh.anyRunning {
                             Button("Stop All Columns") { Task { await mesh.stopAllTurns() } }
@@ -5187,17 +5305,23 @@ private struct SessionStrip: View {
                                 .frame(width: 6, height: 6)
                             Text(model.sessionTitle(for: session)).lineLimit(1)
                         }
-                        .font(.callout)
+                        .font(.callout.weight(
+                            !draftSelected && model.selectedSessionID == session.id ? .semibold : .regular
+                        ))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
                         .background {
                             surfaceTabBackground(
                                 selected: !draftSelected && model.selectedSessionID == session.id,
-                                tint: WorkspacePalette.terminal
+                                tint: WorkspacePalette.terminal,
+                                hovered: hoveredTabID == session.id
                             )
                         }
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        hoveredTabID = hovering ? session.id : (hoveredTabID == session.id ? nil : hoveredTabID)
+                    }
                     .contextMenu {
                         Button("Rename…") { rename(session.id) }
                         if model.isOwned(session.id) || model.canClose(session.id) {
@@ -5236,9 +5360,21 @@ private struct SessionStrip: View {
         }
     }
 
-    private func surfaceTabBackground(selected: Bool, tint: Color) -> some View {
+    private func surfaceTabBackground(
+        selected: Bool,
+        tint: Color,
+        hovered: Bool = false
+    ) -> some View {
+        // Selection follows `QuietSelectionPill.fillOpacity`'s dark step-up:
+        // a mid-dark tint at 0.10 over a dark panel was a 0.007 luminance
+        // delta — selection the eye could not find. Hover lifts an unselected
+        // tab the same way the rail's controls answer the pointer.
         RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
-            .fill(selected ? tint.opacity(0.10) : Color.primary.opacity(0.035))
+            .fill(
+                selected
+                    ? tint.opacity(colorScheme == .dark ? 0.22 : 0.13)
+                    : Color.primary.opacity(hovered ? 0.07 : 0.035)
+            )
             .overlay {
                 RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
                     .stroke(

@@ -135,7 +135,11 @@ enum LightRailTint {
     static let midpointCoverage = 0.008
     static let pearlCoverage = 0.010
     static let midpointLocation = 0.62
-    static let inactiveMultiplier = 0.12
+    /// Was 0.12, which snuffed the rail's only warmth the moment focus left
+    /// and stacked on top of the material's own inactive collapse. The rails
+    /// are not a focus indicator; the traffic lights and the toolbar already
+    /// are, so an unfocused window keeps nearly all of its edge cast.
+    static let inactiveMultiplier = 0.85
     static let maximumCoverage = max(coolCoverage, midpointCoverage, pearlCoverage)
     static let minimumTransmission = 1 - maximumCoverage
 
@@ -203,6 +207,15 @@ enum TintFlowMotion {
     /// How far each endpoint wanders, as a fraction of the unit square. The
     /// sweep stays diagonal throughout; only its anchoring breathes.
     static let drift: Double = 0.18
+
+    /// Opt-in breath: the whole tint fading a few percent and back. Seventeen
+    /// seconds is deliberately not a harmonic of `period`, so the breath never
+    /// phase-locks with the drift into a visible pulse; the amplitude is a
+    /// multiply on already-small coverages, so the dimmest phase is one or two
+    /// counts of 255 — found, like the drift, only when the eye returns.
+    static let breathPeriod: TimeInterval = 17
+    static let breathAmplitude: Double = 0.08
+    static var breathFloorOpacity: Double { 1 - breathAmplitude }
 
     /// SwiftUI's `UnitPoint` puts (0,0) at the top-leading corner;
     /// `CAGradientLayer`'s unit space on an unflipped AppKit host puts (0,0)
@@ -667,9 +680,15 @@ struct GlassBackdropWash: Equatable, Sendable {
     }
 
     private static func sidebarBase(isDark: Bool) -> GlassBackdropWash {
+        // Light rails carried a twelve-percent veil through v0.1.124 and read
+        // gray against the 0.93-luminance canvas — the white glass ask keeps
+        // coming back as "the rails look gray". Thirty percent lifts modeled
+        // rail luminance from 0.824 to 0.86 while transmission (0.70) stays
+        // well inside the light desktopTransmissionBand, so the desktop still
+        // reads through the glass.
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
-            : light(top: 0.14, base: 0.12, bottom: 0.10)
+            : light(top: 0.34, base: 0.30, bottom: 0.26)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour

@@ -69,6 +69,9 @@ struct ProjectTabStripView: View {
     /// left by a cancelled drag is harmless — every new drag overwrites it
     /// before any hover can act on it.
     @State private var draggingID: String? = nil
+    /// One hover across the strip: chips plus the two icon buttons (keyed
+    /// "plus"/"sidebar"). The controls previously gave the pointer nothing.
+    @State private var hoveredID: String? = nil
 
     var body: some View {
         let selectedProject = projects.first { $0.id == selected }
@@ -86,6 +89,11 @@ struct ProjectTabStripView: View {
                             chipLabel(project)
                         }
                         .buttonStyle(.plain)
+                        .onHover { hovering in
+                            hoveredID = hovering
+                                ? project.id
+                                : (hoveredID == project.id ? nil : hoveredID)
+                        }
                         .accessibilityLabel(projectAccessibilityLabel(project))
                         .accessibilityValue(
                             ProjectTabReorder.positionDescription(
@@ -122,16 +130,10 @@ struct ProjectTabStripView: View {
                         guard let selectedProject, selectedProject.directory != nil else { return }
                         newSession(selectedProject)
                     } label: {
-                        Image(systemName: "plus")
-                            .font(.caption.weight(.semibold))
-                            .frame(width: 26, height: 26)
-                            .background(Color.primary.opacity(0.04), in: Circle())
-                            .overlay {
-                                Circle()
-                                    .stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
-                            }
+                        iconCircle("plus", enabled: selectedProject?.directory != nil)
                     }
                     .buttonStyle(.plain)
+                    .onHover { hoveredID = $0 ? "plus" : (hoveredID == "plus" ? nil : hoveredID) }
                     .disabled(selectedProject?.directory == nil)
                     .help(
                         selectedProject.map { project in
@@ -150,15 +152,10 @@ struct ProjectTabStripView: View {
                             : "Opens a temporary tab for choosing a session type."
                     )
                     Button(action: useSidebar) {
-                        Image(systemName: "sidebar.left")
-                            .font(.caption.weight(.semibold))
-                            .frame(width: 26, height: 26)
-                            .background(Color.primary.opacity(0.04), in: Circle())
-                            .overlay {
-                                Circle().stroke(Color.primary.opacity(0.08), lineWidth: 0.8)
-                            }
+                        iconCircle("sidebar.left", enabled: true, hoverKey: "sidebar")
                     }
                     .buttonStyle(.plain)
+                    .onHover { hoveredID = $0 ? "sidebar" : (hoveredID == "sidebar" ? nil : hoveredID) }
                     .help("Move projects and sessions to the sidebar")
                     .accessibilityLabel("Use sidebar navigation")
                     Spacer(minLength: 0)
@@ -204,7 +201,11 @@ struct ProjectTabStripView: View {
         .padding(.vertical, 5)
         .background {
             RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
-                .fill(selected == project.id ? Color.primary.opacity(0.075) : Color.primary.opacity(0.035))
+                .fill(
+                    selected == project.id
+                        ? Color.primary.opacity(0.075)
+                        : Color.primary.opacity(hoveredID == project.id ? 0.07 : 0.035)
+                )
                 .overlay {
                     RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
                         .stroke(
@@ -216,6 +217,31 @@ struct ProjectTabStripView: View {
                         )
                 }
         }
+    }
+
+    /// The strip's two icon buttons share one chrome. Hover raises the fill
+    /// and stroke; a disabled control visibly recedes instead of rendering
+    /// pixel-identical to an enabled one.
+    private func iconCircle(
+        _ symbol: String,
+        enabled: Bool,
+        hoverKey: String? = nil
+    ) -> some View {
+        let key = hoverKey ?? symbol
+        let hovering = hoveredID == key && enabled
+        let presence = enabled ? 1.0 : 0.45
+        return Image(systemName: symbol)
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(enabled ? AnyShapeStyle(.primary) : AnyShapeStyle(Color.kaisolaDisabled))
+            .frame(width: 26, height: 26)
+            .background(Color.primary.opacity((hovering ? 0.09 : 0.04) * presence), in: Circle())
+            .overlay {
+                Circle().stroke(
+                    Color.primary.opacity((hovering ? 0.16 : 0.08) * presence),
+                    lineWidth: 0.8
+                )
+            }
+            .animation(.easeOut(duration: KaisolaVisualSystem.hoverDuration), value: hovering)
     }
 
     private func projectAccessibilityLabel(_ project: AppModel.ProjectGroup) -> String {

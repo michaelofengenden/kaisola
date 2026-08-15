@@ -641,11 +641,23 @@ final class RememberedSessionCatalogCenter: ObservableObject {
     @Published private(set) var lastUpdatedAt: Int64?
     @Published private(set) var source: RememberedSessionCatalogSource?
     @Published private(set) var errorMessage: String?
+    /// Latched the first time any applied catalog names a device other than
+    /// this one, and reset only by `clear()` (account switch / sign-out). A
+    /// transient empty live list must not re-hide a fleet mid-session, and a
+    /// never-paired install must not surface fleet errors about no fleet.
+    /// Persisted in defaults, not only re-seeded by the saved snapshot: a
+    /// fleet whose snapshot fails to load (cache wipe, decode failure) must
+    /// still surface its refresh errors instead of hiding the whole section.
+    @Published private(set) var hasEverSeenRemoteDevice = false
 
     let localDeviceID: String
+    private let latchDefaults: UserDefaults
+    private static let fleetLatchKey = "kaisola.rememberedSessions.hasEverSeenRemoteDevice"
 
-    init(localDeviceID: String) {
+    init(localDeviceID: String, latchDefaults: UserDefaults = .standard) {
         self.localDeviceID = localDeviceID
+        self.latchDefaults = latchDefaults
+        hasEverSeenRemoteDevice = latchDefaults.bool(forKey: Self.fleetLatchKey)
     }
 
     var remoteDevices: [RememberedDeviceCatalog] {
@@ -689,6 +701,10 @@ final class RememberedSessionCatalogCenter: ObservableObject {
         self.source = source
         isRefreshing = false
         errorMessage = nil
+        if devices.contains(where: { $0.deviceId != localDeviceID }), !hasEverSeenRemoteDevice {
+            hasEverSeenRemoteDevice = true
+            latchDefaults.set(true, forKey: Self.fleetLatchKey)
+        }
     }
 
     func fail(_ error: any Error) {
@@ -708,6 +724,8 @@ final class RememberedSessionCatalogCenter: ObservableObject {
         lastUpdatedAt = nil
         source = nil
         errorMessage = nil
+        hasEverSeenRemoteDevice = false
+        latchDefaults.removeObject(forKey: Self.fleetLatchKey)
     }
 
     func requestRefresh() {

@@ -586,58 +586,76 @@ struct TintFlowStop: Equatable {
 /// — which colours, at what coverage, in what order — is a unit test instead
 /// of a screenshot diff.
 enum TintFlowComposition {
-    /// Light: the declared sage → warm pearl → lilac composition.
-    static func light(coverageScale: Double) -> [TintFlowStop] {
+    /// Light: the selected palette's two coloured ends crossing its quiet
+    /// midpoint. Constant palettes ignore the desktop sample; `.desktop`
+    /// resolves its stops from it, clamped to the pastel box.
+    static func light(
+        palette: TintPalette,
+        desktop: DesktopTintComponents,
+        coverageScale: Double
+    ) -> [TintFlowStop] {
         let scale = min(1, max(0, coverageScale))
+        let stops = palette.light(desktop: desktop)
         return [
             TintFlowStop(
-                red: LightTintedGradient.cool.red,
-                green: LightTintedGradient.cool.green,
-                blue: LightTintedGradient.cool.blue,
-                opacity: LightTintedGradient.coolCoverage * scale,
+                red: stops.cool.red,
+                green: stops.cool.green,
+                blue: stops.cool.blue,
+                opacity: stops.coolCoverage * scale,
                 location: 0
             ),
             TintFlowStop(
-                red: LightTintedGradient.neutral.red,
-                green: LightTintedGradient.neutral.green,
-                blue: LightTintedGradient.neutral.blue,
-                opacity: LightTintedGradient.neutralCoverage * scale,
-                location: LightTintedGradient.neutralLocation
+                red: stops.neutral.red,
+                green: stops.neutral.green,
+                blue: stops.neutral.blue,
+                opacity: stops.neutralCoverage * scale,
+                location: stops.neutralLocation
             ),
             TintFlowStop(
-                red: LightTintedGradient.pearl.red,
-                green: LightTintedGradient.pearl.green,
-                blue: LightTintedGradient.pearl.blue,
-                opacity: LightTintedGradient.pearlCoverage * scale,
+                red: stops.pearl.red,
+                green: stops.pearl.green,
+                blue: stops.pearl.blue,
+                opacity: stops.pearlCoverage * scale,
                 location: 1
             ),
         ]
     }
 
-    /// Dark: the sampled desktop hue anchors the lit end and flows *into* its
-    /// rotated companion at the settled end — a genuine A → B crossing, with
-    /// the coverage pair kept monotonic so the sweep still reads as light from
-    /// above rather than as a washed band in the middle.
+    /// Dark: an anchor at the lit end flowing *into* a companion at the
+    /// settled end — a genuine A → B crossing, with the coverage pair kept
+    /// monotonic so the sweep still reads as light from above rather than as
+    /// a washed band in the middle. `.desktop` keeps the sampled path; every
+    /// named palette carries its own light hues to the dark canvas peak.
     static func dark(
+        palette: TintPalette,
         tint: DesktopTintComponents,
         coverageScale: Double
     ) -> [TintFlowStop] {
         let scale = min(1, max(0, coverageScale))
-        let revalued = DesktopTintSampler.revalued(
-            tint,
-            peak: DesktopTintSampler.canvasTintPeak(isDark: true)
-        )
         let coverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
-        let companion = TintFlowMotion.companion(
-            red: revalued.red,
-            green: revalued.green,
-            blue: revalued.blue
-        )
-        return [
-            TintFlowStop(
+        let anchor: TintRGB
+        let companion: TintRGB
+        if let ends = palette.darkEnds() {
+            anchor = ends.anchor
+            companion = ends.companion
+        } else {
+            let revalued = DesktopTintSampler.revalued(
+                tint,
+                peak: DesktopTintSampler.canvasTintPeak(isDark: true)
+            )
+            anchor = TintRGB(red: revalued.red, green: revalued.green, blue: revalued.blue)
+            let rotated = TintFlowMotion.companion(
                 red: revalued.red,
                 green: revalued.green,
-                blue: revalued.blue,
+                blue: revalued.blue
+            )
+            companion = TintRGB(red: rotated.red, green: rotated.green, blue: rotated.blue)
+        }
+        return [
+            TintFlowStop(
+                red: anchor.red,
+                green: anchor.green,
+                blue: anchor.blue,
                 opacity: coverage.top * scale,
                 location: 0
             ),
@@ -777,8 +795,10 @@ final class FlowingTintGradientHostView: NSView {
         gradient.startPoint = startPoint
         gradient.endPoint = endPoint
         gradient.frame = bounds
-        // Turning the breath off must restore the model value deterministically.
+        // Turning the breath off must restore the model values deterministically
+        // — both the opacity it fades and the transform its swell scales.
         gradient.opacity = 1
+        gradient.transform = CATransform3DIdentity
         CATransaction.commit()
 
         // A colour-only change (a wallpaper rotation resampling the dark tint)
@@ -789,6 +809,7 @@ final class FlowingTintGradientHostView: NSView {
         gradient.removeAnimation(forKey: Self.startAnimationKey)
         gradient.removeAnimation(forKey: Self.endAnimationKey)
         gradient.removeAnimation(forKey: Self.breathAnimationKey)
+        gradient.removeAnimation(forKey: Self.swellAnimationKey)
         guard animated else { return }
         let travel = TintFlowMotion.endpoints(start: startPoint, end: endPoint)
         gradient.add(
@@ -809,6 +830,7 @@ final class FlowingTintGradientHostView: NSView {
         )
         guard breathing else { return }
         gradient.add(Self.breath(), forKey: Self.breathAnimationKey)
+        gradient.add(Self.swell(), forKey: Self.swellAnimationKey)
     }
 
     @objc private func windowOcclusionStateDidChange(_ notification: Notification) {
@@ -832,6 +854,17 @@ final class FlowingTintGradientHostView: NSView {
     private static let startAnimationKey = "kaisola.tint-flow.start"
     private static let endAnimationKey = "kaisola.tint-flow.end"
     private static let breathAnimationKey = "kaisola.tint-flow.breath"
+    private static let swellAnimationKey = "kaisola.tint-flow.swell"
+
+    /// The breath's sharper-than-`easeInEaseOut` S curve: more dwell at the
+    /// extremes, a quicker transit between them, which is what lets a shallow
+    /// change register at all without raising its depth.
+    private static var breathTiming: CAMediaTimingFunction {
+        let points = TintFlowMotion.breathTimingControlPoints
+        return CAMediaTimingFunction(
+            controlPoints: points.0, points.1, points.2, points.3
+        )
+    }
 
     /// The opt-in breath: whole-layer opacity easing between the floor and 1.
     /// Same render-server ownership, frame-rate cap, occlusion freeze
@@ -843,10 +876,34 @@ final class FlowingTintGradientHostView: NSView {
         animation.duration = TintFlowMotion.breathPeriod
         animation.autoreverses = true
         animation.repeatCount = .infinity
-        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        animation.timingFunction = breathTiming
         animation.isRemovedOnCompletion = false
         animation.timeOffset = CACurrentMediaTime()
             .truncatingRemainder(dividingBy: TintFlowMotion.breathPeriod * 2)
+        animation.preferredFrameRateRange = CAFrameRateRange(
+            minimum: 5,
+            maximum: 15,
+            preferred: 10
+        )
+        return animation
+    }
+
+    /// The breath's paired swell: the whole field scaling a few percent about
+    /// its centre on its own, longer period. The scale never goes below 1, so
+    /// the layer only ever over-covers its bounds — clipping crops overflow
+    /// rather than exposing a gap. Same discipline as the breath in every
+    /// other respect.
+    private static func swell() -> CABasicAnimation {
+        let animation = CABasicAnimation(keyPath: "transform.scale")
+        animation.fromValue = 1.0
+        animation.toValue = 1.0 + TintFlowMotion.breathScaleAmplitude
+        animation.duration = TintFlowMotion.breathScalePeriod
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        animation.timingFunction = breathTiming
+        animation.isRemovedOnCompletion = false
+        animation.timeOffset = CACurrentMediaTime()
+            .truncatingRemainder(dividingBy: TintFlowMotion.breathScalePeriod * 2)
         animation.preferredFrameRateRange = CAFrameRateRange(
             minimum: 5,
             maximum: 15,
@@ -913,24 +970,36 @@ struct FlowingTintedBackdrop: View {
 
     var body: some View {
         let isDark = colorScheme == .dark
+        let palette = settings.tintPalette
         FlowingTintGradientView(
             stops: isDark
                 ? TintFlowComposition.dark(
+                    palette: palette,
                     tint: desktop.painting.tint,
                     coverageScale: coverageScale
                 )
-                : TintFlowComposition.light(coverageScale: coverageScale),
+                : TintFlowComposition.light(
+                    palette: palette,
+                    desktop: desktop.painting.tint,
+                    coverageScale: coverageScale
+                ),
             startPoint: TintFlowMotion.layerPoint(startPoint),
             endPoint: TintFlowMotion.layerPoint(endPoint),
             animated: !reduceMotion,
             breathing: settings.tintedBreathing && !reduceMotion
         )
         .allowsHitTesting(false)
-        .onAppear {
-            if isDark { desktop.refresh(isDark: true) }
-        }
-        .onChange(of: colorScheme) {
-            if colorScheme == .dark { desktop.refresh(isDark: true) }
+        .onAppear { refreshIfNeeded() }
+        .onChange(of: colorScheme) { refreshIfNeeded() }
+        .onChange(of: settings.tintPalette) { refreshIfNeeded() }
+    }
+
+    /// Dark always follows the wallpaper; light needs a sample only for the
+    /// Desktop palette. Every other light palette is a constant table and
+    /// spends nothing on the sampler.
+    private func refreshIfNeeded() {
+        if colorScheme == .dark || settings.tintPalette == .desktop {
+            desktop.refresh(isDark: colorScheme == .dark)
         }
     }
 }

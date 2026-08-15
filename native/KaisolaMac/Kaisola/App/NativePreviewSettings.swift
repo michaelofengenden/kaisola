@@ -789,6 +789,12 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(tintedBreathing, forKey: Keys.tintedBreathing) }
     }
 
+    /// Which named tint the Tinted theme paints. Meadow is the shipped
+    /// composition, so an existing install sees no change until it chooses.
+    @Published var tintPalette: TintPalette {
+        didSet { persist(tintPalette.rawValue, forKey: Keys.tintPalette) }
+    }
+
     /// The single theme control Settings vends, over the two properties above.
     ///
     /// Reads as Glass only when *both* surfaces are glass, so a workspace left on
@@ -1204,6 +1210,7 @@ final class NativePreviewSettings: ObservableObject {
         static let sidebarAppearance = "sidebarAppearance"
         static let workspaceBackdrop = "workspaceBackdrop"
         static let tintedBreathing = "tintedBreathing"
+        static let tintPalette = "tintPalette"
         static let toolCallDensity = "toolCallDensity"
         static let glassBackdropSource = "glassBackdropSource"
         static let glassTexture = "glassTexture"
@@ -1244,6 +1251,7 @@ final class NativePreviewSettings: ObservableObject {
         sidebarAppearance = defaults.string(forKey: Keys.sidebarAppearance).flatMap(SidebarAppearance.init) ?? .glass
         workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .glass
         tintedBreathing = defaults.object(forKey: Keys.tintedBreathing) as? Bool ?? false
+        tintPalette = defaults.string(forKey: Keys.tintPalette).flatMap(TintPalette.init) ?? .meadow
         toolCallDensity = defaults.string(forKey: Keys.toolCallDensity)
             .flatMap(ToolCallDensity.init) ?? .balanced
         // The four glass knobs are a preset now, not preferences, so they are

@@ -533,6 +533,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.filePreviewWidth, NativePreviewSettings.filePreviewWidthDefault)
         XCTAssertEqual(settings.toolCallDensity, .balanced)
         XCTAssertFalse(settings.tintedBreathing)
+        XCTAssertEqual(settings.tintPalette, .meadow)
         XCTAssertEqual(settings.projectRailWidth, NativePreviewSettings.projectRailWidthUnset)
 
         settings.navigationLayout = .topBar
@@ -540,6 +541,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         settings.sidebarAppearance = .solid
         settings.workspaceBackdrop = .tinted
         settings.tintedBreathing = true
+        settings.tintPalette = .harbor
         settings.terminalThemeID = "kaisola"
         settings.restoreCLIDrafts = false
         settings.semanticShellIntegration = true
@@ -564,7 +566,21 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.filePreviewWidth, 640)
         XCTAssertEqual(reloaded.toolCallDensity, .detailed)
         XCTAssertTrue(reloaded.tintedBreathing)
+        XCTAssertEqual(reloaded.tintPalette, .harbor)
         XCTAssertEqual(reloaded.projectRailWidth, 290.5)
+    }
+
+    func testTintPaletteRejectsUnknownPersistedValues() {
+        let defaults = makeDefaults()
+        defaults.set("chartreuse", forKey: "tintPalette")
+
+        XCTAssertEqual(NativePreviewSettings(defaults: defaults).tintPalette, .meadow)
+        XCTAssertEqual(TintPalette.allCases.map(\.title), [
+            "Meadow", "Dusk", "Harbor", "Graphite", "Desktop",
+        ])
+        // Desktop is the only palette whose stops are not constants — it reads
+        // as the escape hatch, so it stays last in the menu.
+        XCTAssertEqual(TintPalette.allCases.last, .desktop)
     }
 
     func testToolCallDensityRejectsUnknownPersistedValues() {
@@ -1015,48 +1031,92 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
-    func testLightTintedSurfaceIsAGentleSageThroughNeutralToLilacPearlGradient() {
-        // The two coloured ends are pale and point in different directions,
-        // so the whole rail cannot collapse into one blue wash.
-        XCTAssertGreaterThan(LightTintedGradient.cool.green, LightTintedGradient.cool.blue)
-        XCTAssertGreaterThan(LightTintedGradient.cool.blue, LightTintedGradient.cool.red)
-        XCTAssertLessThanOrEqual(
-            LightTintedGradient.cool.green - LightTintedGradient.cool.red,
-            0.18
-        )
-        XCTAssertGreaterThan(LightTintedGradient.pearl.blue, LightTintedGradient.pearl.red)
-        XCTAssertGreaterThan(LightTintedGradient.pearl.red, LightTintedGradient.pearl.green)
-        XCTAssertLessThanOrEqual(
-            LightTintedGradient.pearl.blue - LightTintedGradient.pearl.green,
-            0.18
-        )
-        XCTAssertGreaterThan(LightTintedGradient.neutral.red, LightTintedGradient.neutral.green)
-        XCTAssertGreaterThan(LightTintedGradient.neutral.green, LightTintedGradient.neutral.blue)
+    func testEveryTintPaletteIsATwoEndedPastelCrossing() {
+        for palette in TintPalette.allCases {
+            // Constant palettes ignore the sample; `.desktop` resolves
+            // against a saturated blue, its historical failure input.
+            let light = palette.light(
+                desktop: DesktopTintComponents(red: 0.1, green: 0.3, blue: 0.9)
+            )
 
-        // Eleven-percent stops quantized to within a few counts of white and
-        // Tinted rendered pixel-identical to Glass. "A flowing gradient tint"
-        // (2026-08-14) needs stops one can actually see; the ceiling keeps the
-        // sources pastel rather than letting the sweep become a poster.
-        let maximumCoverage = max(
-            LightTintedGradient.coolCoverage,
-            max(LightTintedGradient.neutralCoverage, LightTintedGradient.pearlCoverage)
-        )
-        XCTAssertGreaterThanOrEqual(maximumCoverage, 0.22, "the light tint disappeared")
-        XCTAssertLessThanOrEqual(maximumCoverage, 0.34, "the light tint is no longer pastel")
-        XCTAssertGreaterThanOrEqual(
-            LightTintedGradient.neutralCoverage,
-            0.18,
-            "the midpoint falls back to an exact-white band"
-        )
-        XCTAssertLessThanOrEqual(LightTintedGradient.neutralCoverage, 0.26)
-        XCTAssertGreaterThan(LightTintedGradient.neutralLocation, 0.35)
-        XCTAssertLessThan(LightTintedGradient.neutralLocation, 0.70)
+            // Eleven-percent stops quantized to within a few counts of white
+            // and Tinted rendered pixel-identical to Glass. "A flowing
+            // gradient tint" (2026-08-14) needs stops one can actually see;
+            // the ceiling keeps the sources pastel rather than letting the
+            // sweep become a poster.
+            let maximumCoverage = max(
+                light.coolCoverage,
+                max(light.neutralCoverage, light.pearlCoverage)
+            )
+            XCTAssertGreaterThanOrEqual(
+                maximumCoverage, 0.22,
+                "\(palette.title): the light tint disappeared"
+            )
+            XCTAssertLessThanOrEqual(
+                maximumCoverage, 0.34,
+                "\(palette.title): the light tint is no longer pastel"
+            )
+            XCTAssertGreaterThanOrEqual(
+                light.neutralCoverage, 0.18,
+                "\(palette.title): the midpoint falls back to an exact-white band"
+            )
+            XCTAssertLessThanOrEqual(light.neutralCoverage, 0.26, palette.title)
+            XCTAssertGreaterThan(light.neutralLocation, 0.35, palette.title)
+            XCTAssertLessThan(light.neutralLocation, 0.70, palette.title)
+
+            // The two coloured ends genuinely cross rather than washing the
+            // whole surface in one hue.
+            if palette == .graphite {
+                // Achromatic on purpose: at spread this small a hue distance
+                // means nothing, so the crossing is the reversed channel
+                // ordering — cool is blue-led, pearl is red-led.
+                XCTAssertGreaterThan(light.cool.blue, light.cool.red, palette.title)
+                XCTAssertGreaterThan(light.pearl.red, light.pearl.blue, palette.title)
+            } else {
+                guard
+                    let coolHue = TintFlowMotion.hue(
+                        red: light.cool.red, green: light.cool.green, blue: light.cool.blue
+                    ),
+                    let pearlHue = TintFlowMotion.hue(
+                        red: light.pearl.red, green: light.pearl.green, blue: light.pearl.blue
+                    )
+                else {
+                    XCTFail("\(palette.title): a coloured end has no hue")
+                    continue
+                }
+                let distance = abs(coolHue - pearlHue)
+                XCTAssertGreaterThanOrEqual(
+                    min(distance, 1 - distance), 0.03,
+                    "\(palette.title): the sweep is one hue and reads as a wash"
+                )
+            }
+        }
+
+        // The shipped composition stays pinned exactly: Meadow is a gentle
+        // sage crossing a lilac pearl through a warm midpoint, and the tinted
+        // fixture baseline depends on these numbers byte for byte.
+        guard let meadow = TintPalette.meadow.fixedLight else {
+            return XCTFail("Meadow lost its fixed light table")
+        }
+        XCTAssertGreaterThan(meadow.cool.green, meadow.cool.blue)
+        XCTAssertGreaterThan(meadow.cool.blue, meadow.cool.red)
+        XCTAssertLessThanOrEqual(meadow.cool.green - meadow.cool.red, 0.18)
+        XCTAssertGreaterThan(meadow.pearl.blue, meadow.pearl.red)
+        XCTAssertGreaterThan(meadow.pearl.red, meadow.pearl.green)
+        XCTAssertLessThanOrEqual(meadow.pearl.blue - meadow.pearl.green, 0.18)
+        XCTAssertGreaterThan(meadow.neutral.red, meadow.neutral.green)
+        XCTAssertGreaterThan(meadow.neutral.green, meadow.neutral.blue)
+        XCTAssertEqual(meadow, TintPaletteLight(
+            cool: TintRGB(165, 203, 178),
+            neutral: TintRGB(233, 221, 207),
+            pearl: TintRGB(203, 185, 226),
+            coolCoverage: 0.30, neutralCoverage: 0.22, pearlCoverage: 0.30,
+            neutralLocation: 0.54
+        ))
     }
 
     func testLightTintedStopsRemainVisibleAfterCompositingOverWhite() {
-        typealias RGB = (red: Double, green: Double, blue: Double)
-
-        func composite(_ colour: RGB, coverage: Double) -> [Double] {
+        func composite(_ colour: TintRGB, coverage: Double) -> [Double] {
             [colour.red, colour.green, colour.blue].map {
                 (1 - coverage + $0 * coverage) * 255
             }
@@ -1068,51 +1128,197 @@ final class NativePreviewSettingsTests: XCTestCase {
             return (departure: 255 - minimum, spread: maximum - minimum)
         }
 
-        let colouredStops: [(name: String, colour: RGB, coverage: Double)] = [
-            ("sage", LightTintedGradient.cool, LightTintedGradient.coolCoverage),
-            ("lilac-pearl", LightTintedGradient.pearl, LightTintedGradient.pearlCoverage),
+        // `.desktop` has no fixed stops and must hold the box for any
+        // wallpaper, so it is asserted against a saturated blue and a
+        // saturated red. Its grey fallback resolves to exactly Graphite
+        // (asserted in the clamp test below), whose own row covers that box.
+        let desktopSamples = [
+            DesktopTintComponents(red: 0.05, green: 0.20, blue: 0.95),
+            DesktopTintComponents(red: 0.95, green: 0.10, blue: 0.10),
         ]
-        for stop in colouredStops {
-            let canvas = metrics(composite(stop.colour, coverage: stop.coverage))
-            XCTAssertGreaterThanOrEqual(
-                canvas.departure,
-                18,
-                "\(stop.name) composites to near-white and disappears on the canvas"
-            )
-            XCTAssertLessThanOrEqual(canvas.departure, 34, "\(stop.name) is no longer pastel")
-            XCTAssertGreaterThanOrEqual(
-                canvas.spread,
-                8,
-                "\(stop.name) has too little channel separation to read as a tint"
-            )
-            XCTAssertLessThanOrEqual(canvas.spread, 16, "\(stop.name) is too saturated")
 
-            let rail = metrics(composite(
-                stop.colour,
-                coverage: stop.coverage * SidebarBackdropView.railTintShare
-            ))
-            XCTAssertGreaterThanOrEqual(
-                rail.departure,
-                16,
-                "\(stop.name) disappears after the rail's coverage scaling"
-            )
-            XCTAssertLessThanOrEqual(rail.departure, 31, "\(stop.name) is too heavy on the rail")
-            XCTAssertGreaterThanOrEqual(rail.spread, 7, "\(stop.name) rail is effectively neutral")
-            XCTAssertLessThanOrEqual(rail.spread, 15, "\(stop.name) rail is too saturated")
+        for palette in TintPalette.allCases {
+            // A palette may quiet its spread floor, never abandon it.
+            XCTAssertGreaterThan(palette.minimumCanvasSpread, 0, palette.title)
+
+            let lights: [TintPaletteLight]
+            if let fixed = palette.fixedLight {
+                lights = [fixed]
+            } else {
+                lights = desktopSamples.map { palette.light(desktop: $0) }
+            }
+            for light in lights {
+                let colouredStops: [(name: String, colour: TintRGB, coverage: Double)] = [
+                    ("\(palette.title) cool", light.cool, light.coolCoverage),
+                    ("\(palette.title) pearl", light.pearl, light.pearlCoverage),
+                ]
+                for stop in colouredStops {
+                    let canvas = metrics(composite(stop.colour, coverage: stop.coverage))
+                    XCTAssertGreaterThanOrEqual(
+                        canvas.departure,
+                        18,
+                        "\(stop.name) composites to near-white and disappears on the canvas"
+                    )
+                    XCTAssertLessThanOrEqual(canvas.departure, 34, "\(stop.name) is no longer pastel")
+                    XCTAssertGreaterThanOrEqual(
+                        canvas.spread,
+                        palette.minimumCanvasSpread,
+                        "\(stop.name) has too little channel separation to read as a tint"
+                    )
+                    XCTAssertLessThanOrEqual(canvas.spread, 16, "\(stop.name) is too saturated")
+
+                    let rail = metrics(composite(
+                        stop.colour,
+                        coverage: stop.coverage * SidebarBackdropView.railTintShare
+                    ))
+                    XCTAssertGreaterThanOrEqual(
+                        rail.departure,
+                        16,
+                        "\(stop.name) disappears after the rail's coverage scaling"
+                    )
+                    XCTAssertLessThanOrEqual(rail.departure, 31, "\(stop.name) is too heavy on the rail")
+                    XCTAssertGreaterThanOrEqual(
+                        rail.spread,
+                        palette.minimumCanvasSpread * 0.875,
+                        "\(stop.name) rail is effectively neutral"
+                    )
+                    XCTAssertLessThanOrEqual(rail.spread, 15, "\(stop.name) rail is too saturated")
+                }
+
+                let neutral = metrics(composite(light.neutral, coverage: light.neutralCoverage))
+                XCTAssertGreaterThanOrEqual(
+                    neutral.departure,
+                    8,
+                    "\(palette.title): the midpoint still disappears into the white canvas"
+                )
+                XCTAssertLessThanOrEqual(
+                    neutral.departure, 16,
+                    "\(palette.title): the midpoint is too heavy"
+                )
+                XCTAssertGreaterThanOrEqual(
+                    neutral.spread,
+                    palette.minimumCanvasSpread * 0.5,
+                    "\(palette.title): the midpoint is effectively neutral"
+                )
+                XCTAssertLessThanOrEqual(
+                    neutral.spread, 9,
+                    "\(palette.title): the midpoint is too saturated"
+                )
+            }
+        }
+    }
+
+    func testDesktopPaletteClampsEveryWallpaperHueIntoThePastelBox() {
+        func composite(_ colour: TintRGB, coverage: Double) -> [Double] {
+            [colour.red, colour.green, colour.blue].map {
+                (1 - coverage + $0 * coverage) * 255
+            }
         }
 
-        let neutral = metrics(composite(
-            LightTintedGradient.neutral,
-            coverage: LightTintedGradient.neutralCoverage
-        ))
-        XCTAssertGreaterThanOrEqual(
-            neutral.departure,
-            8,
-            "the warm midpoint still disappears into the white canvas"
+        func metrics(_ channels: [Double]) -> (departure: Double, spread: Double) {
+            let maximum = channels.max() ?? 255
+            let minimum = channels.min() ?? 255
+            return (departure: 255 - minimum, spread: maximum - minimum)
+        }
+
+        // The clamp fixes saturation and brightness and keeps only the hue,
+        // so the box metrics are the same constants for *every* wallpaper —
+        // which is the whole reason light is finally allowed to sample it.
+        for degrees in 0..<360 {
+            let source = TintFlowMotion.rgb(
+                hue: Double(degrees) / 360,
+                saturation: 1,
+                brightness: 1
+            )
+            let light = TintPalette.desktop.light(desktop: DesktopTintComponents(
+                red: source.red, green: source.green, blue: source.blue
+            ))
+            for (colour, coverage) in [
+                (light.cool, light.coolCoverage),
+                (light.pearl, light.pearlCoverage),
+            ] {
+                let canvas = metrics(composite(colour, coverage: coverage))
+                XCTAssertEqual(canvas.departure, 28.8, accuracy: 1.0, "hue \(degrees)°")
+                XCTAssertEqual(canvas.spread, 13.5, accuracy: 1.0, "hue \(degrees)°")
+            }
+            let neutral = metrics(composite(light.neutral, coverage: light.neutralCoverage))
+            XCTAssertEqual(neutral.departure, 10.7, accuracy: 1.0, "hue \(degrees)°")
+            XCTAssertEqual(neutral.spread, 5.0, accuracy: 1.0, "hue \(degrees)°")
+        }
+
+        // A grey wallpaper has no hue to keep: Graphite is what "no hue,
+        // pastel" already means, so the sampler's fallback resolves to it
+        // exactly rather than to a near-white nothing.
+        XCTAssertEqual(
+            TintPalette.desktop.light(desktop: DesktopTintSampler.fallback),
+            TintPalette.graphite.fixedLight
         )
-        XCTAssertLessThanOrEqual(neutral.departure, 16, "the warm midpoint is too heavy")
-        XCTAssertGreaterThanOrEqual(neutral.spread, 4, "the midpoint is effectively neutral")
-        XCTAssertLessThanOrEqual(neutral.spread, 9, "the midpoint is too saturated")
+    }
+
+    func testEveryPaletteHasADarkCounterpartAtTheCanvasPeak() {
+        let peak = DesktopTintSampler.canvasTintPeak(isDark: true)
+        for palette in TintPalette.allCases where palette != .desktop {
+            guard let ends = palette.darkEnds(), let light = palette.fixedLight else {
+                XCTFail("\(palette.title) lost its dark pair")
+                continue
+            }
+            // Both ends sit exactly at the dark canvas peak, so the dark
+            // surface's luminance envelope — and the dark ink ladder measured
+            // against it — does not move with the palette.
+            XCTAssertEqual(ends.anchor.maximumChannel, peak, accuracy: 0.0001, palette.title)
+            XCTAssertEqual(ends.companion.maximumChannel, peak, accuracy: 0.0001, palette.title)
+
+            let separation = abs(ends.anchor.red - ends.companion.red)
+                + abs(ends.anchor.green - ends.companion.green)
+                + abs(ends.anchor.blue - ends.companion.blue)
+            XCTAssertGreaterThanOrEqual(
+                separation, 0.05,
+                "\(palette.title): both dark ends carry the same colour, so nothing visibly flows"
+            )
+
+            // Hue family preserved: the dark anchor leads with the same
+            // channel its light cool does, so a dark Harbor is still Harbor.
+            func dominant(_ colour: TintRGB) -> Int {
+                if colour.red >= colour.green && colour.red >= colour.blue { return 0 }
+                return colour.green >= colour.blue ? 1 : 2
+            }
+            XCTAssertEqual(
+                dominant(ends.anchor),
+                dominant(light.cool),
+                "\(palette.title): dark lost its light hue family"
+            )
+        }
+
+        // `.desktop` alone keeps the sampled dark path; its composition is
+        // pinned in `testTintFlowMotionIsGlacialAndItsCompanionKeepsTheSampledFamily`.
+        XCTAssertNil(TintPalette.desktop.darkEnds())
+    }
+
+    func testCompositionsUseTheSelectedPaletteAndKeepTheirShape() {
+        let desktop = DesktopTintComponents(red: 0.3, green: 0.5, blue: 0.7)
+
+        for palette in TintPalette.allCases {
+            let light = TintFlowComposition.light(
+                palette: palette,
+                desktop: desktop,
+                coverageScale: 0.5
+            )
+            let declared = palette.light(desktop: desktop)
+            XCTAssertEqual(light.map(\.location), [0, declared.neutralLocation, 1], palette.title)
+            XCTAssertEqual(light[0].opacity, declared.coolCoverage * 0.5, accuracy: 0.0001, palette.title)
+            XCTAssertEqual(light[1].opacity, declared.neutralCoverage * 0.5, accuracy: 0.0001, palette.title)
+            XCTAssertEqual(light[2].opacity, declared.pearlCoverage * 0.5, accuracy: 0.0001, palette.title)
+
+            let dark = TintFlowComposition.dark(palette: palette, tint: desktop, coverageScale: 1)
+            XCTAssertEqual(dark.map(\.location), [0, 1], palette.title)
+            let coverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
+            XCTAssertEqual(dark[0].opacity, coverage.top, accuracy: 0.0001, palette.title)
+            XCTAssertEqual(dark[1].opacity, coverage.bottom, accuracy: 0.0001, palette.title)
+        }
+
+        let meadow = TintFlowComposition.light(palette: .meadow, desktop: desktop, coverageScale: 1)
+        let dusk = TintFlowComposition.light(palette: .dusk, desktop: desktop, coverageScale: 1)
+        XCTAssertNotEqual(meadow, dusk, "choosing a palette changed nothing on the surface")
     }
 
     /// The Tinted drift is glacial, bounded, and purely geometric — and the
@@ -1122,24 +1328,64 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// visible pulse.
     func testTintBreathIsSlowShallowAndNotAHarmonicOfTheDrift() {
         XCTAssertGreaterThanOrEqual(TintFlowMotion.breathPeriod, 12)
-        XCTAssertGreaterThan(TintFlowMotion.breathAmplitude, 0.03)
-        XCTAssertLessThanOrEqual(TintFlowMotion.breathAmplitude, 0.14)
+        XCTAssertGreaterThan(
+            TintFlowMotion.breathAmplitude, 0.10,
+            "under a tenth of opacity the breath was never once seen — 0.08 shipped and read as off"
+        )
+        XCTAssertLessThanOrEqual(
+            TintFlowMotion.breathAmplitude, 0.20,
+            "over a fifth the breath is a pulse, not a breath"
+        )
         XCTAssertEqual(
             TintFlowMotion.breathFloorOpacity,
             1 - TintFlowMotion.breathAmplitude,
             accuracy: 0.0001
         )
-        let ratio = TintFlowMotion.period / TintFlowMotion.breathPeriod
-        XCTAssertGreaterThan(
-            abs(ratio - ratio.rounded()), 0.05,
-            "an integer period ratio phase-locks the breath to the drift"
-        )
+
+        // No pair of the three periods — drift, opacity breath, scale swell —
+        // may sit near an integer ratio, or two of them phase-lock into a
+        // visible metronome.
+        let ratios: [(String, Double)] = [
+            ("drift/breath", TintFlowMotion.period / TintFlowMotion.breathPeriod),
+            ("drift/swell", TintFlowMotion.period / TintFlowMotion.breathScalePeriod),
+            ("swell/breath", TintFlowMotion.breathScalePeriod / TintFlowMotion.breathPeriod),
+        ]
+        for (name, ratio) in ratios {
+            XCTAssertGreaterThan(
+                abs(ratio - ratio.rounded()), 0.05,
+                "an integer \(name) period ratio phase-locks into a visible pulse"
+            )
+        }
+
+        // The swell must only ever grow — a scale below 1 would uncover the
+        // layer's own edge — and stays a few percent: enough to read as a
+        // living surface, never as watchable motion.
+        XCTAssertGreaterThan(TintFlowMotion.breathScaleAmplitude, 0.01)
+        XCTAssertLessThanOrEqual(TintFlowMotion.breathScaleAmplitude, 0.035)
+
         // The dimmest breath phase multiplies every stop's coverage; even the
-        // heaviest light stop stays far above the point where Tinted could
-        // quantize back into Glass or Solid.
-        let dimmestHeavyStop = LightTintedGradient.coolCoverage
-            * TintFlowMotion.breathFloorOpacity
-        XCTAssertGreaterThan(dimmestHeavyStop, 0.20)
+        // heaviest stop of every palette stays far above the point where
+        // Tinted could quantize back into Glass or Solid.
+        for palette in TintPalette.allCases {
+            let light = palette.light(desktop: DesktopTintSampler.fallback)
+            let heaviest = max(
+                light.coolCoverage,
+                max(light.neutralCoverage, light.pearlCoverage)
+            )
+            XCTAssertGreaterThan(
+                heaviest * TintFlowMotion.breathFloorOpacity, 0.20, palette.title
+            )
+        }
+
+        // The timing curve is a valid monotone S — both control points inside
+        // the unit square, the second genuinely to the right of the first —
+        // not a linear ramp and not an overshoot.
+        let points = TintFlowMotion.breathTimingControlPoints
+        for x in [points.0, points.1, points.2, points.3] {
+            XCTAssertGreaterThanOrEqual(x, 0)
+            XCTAssertLessThanOrEqual(x, 1)
+        }
+        XCTAssertLessThan(points.0, points.2, "the ease collapsed into a ramp")
     }
 
     func testTintFlowMotionIsGlacialAndItsCompanionKeepsTheSampledFamily() {
@@ -1184,13 +1430,17 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(grey.blue, 0.5, accuracy: 0.0001)
 
         // The composed stop lists stay ordered and inside declared coverage.
-        let light = TintFlowComposition.light(coverageScale: 1)
+        let light = TintFlowComposition.light(
+            palette: .meadow,
+            desktop: DesktopTintSampler.fallback,
+            coverageScale: 1
+        )
         XCTAssertEqual(light.map(\.location), [0, LightTintedGradient.neutralLocation, 1])
         XCTAssertEqual(light[0].opacity, LightTintedGradient.coolCoverage, accuracy: 0.0001)
         XCTAssertEqual(light[2].opacity, LightTintedGradient.pearlCoverage, accuracy: 0.0001)
 
         let sampled = DesktopTintComponents(red: 0.2, green: 0.4, blue: 0.8)
-        let dark = TintFlowComposition.dark(tint: sampled, coverageScale: 1)
+        let dark = TintFlowComposition.dark(palette: .desktop, tint: sampled, coverageScale: 1)
         // Two stops, sampled anchor to rotated companion: a mid-stop of the
         // anchor's own colour flattened the crossing into a single-hue wash.
         XCTAssertEqual(dark.count, 2)
@@ -6409,4 +6659,15 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertNil(NativeVisualCapture.rescaled(retina, pointSize: points, pointPixelScale: 0))
         XCTAssertNil(NativeVisualCapture.rescaled(onePoint, pointSize: points, pointPixelScale: 1))
     }
+}
+
+extension TintPalette {
+    /// The smallest channel separation this palette promises after
+    /// compositing on the canvas. Graphite is grey on purpose and declares a
+    /// lower floor than the coloured palettes; nothing may declare zero.
+    /// A test-side declaration: the shipped constant floor of 8 became
+    /// per-palette the day Graphite joined, which is a real loosening of an
+    /// invariant — mitigated by the floor never being zero and the ceiling
+    /// staying global.
+    var minimumCanvasSpread: Double { self == .graphite ? 4 : 8 }
 }

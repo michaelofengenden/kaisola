@@ -1199,6 +1199,13 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 // A screenshot must never catch a mid-breath frame.
                 settings.tintedBreathing = false
             }
+            // Pinned for every surface, not just tinted, so no baseline can
+            // pick up a stray palette default. `.desktop` must never be the
+            // fixture value: it samples the machine's wallpaper and is
+            // therefore not deterministic.
+            settings.tintPalette = ProcessInfo.processInfo
+                .environment["KAISOLA_NATIVE_VISUAL_TINT_PALETTE"]
+                .flatMap(TintPalette.init) ?? .meadow
             // `empty-workspace` is the *idle* canvas — nothing mounted is its
             // whole definition, and a visible Files rail is a mounted surface.
             settings.workspaceRailVisible = visualSurface != "topbar" && visualSurface != "terminal-solo"

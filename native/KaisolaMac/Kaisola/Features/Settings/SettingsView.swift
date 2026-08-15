@@ -719,6 +719,20 @@ struct SettingsView: View {
                     if settings.theme == .tinted {
                         SettingsDivider()
                         SettingsRow(
+                            title: "Tint palette",
+                            detail: settings.tintPalette.detail,
+                            symbol: "paintpalette"
+                        ) {
+                            Menu {
+                                ForEach(TintPalette.allCases) { palette in
+                                    Button(palette.title) { settings.tintPalette = palette }
+                                }
+                            } label: { SettingsChoiceLabel(settings.tintPalette.title) }
+                            .menuIndicator(.hidden)
+                            .accessibilityLabel("Tint palette")
+                        }
+                        SettingsDivider()
+                        SettingsRow(
                             title: "Living tint",
                             detail: "The tinted surfaces breathe, very slowly",
                             symbol: "wind"

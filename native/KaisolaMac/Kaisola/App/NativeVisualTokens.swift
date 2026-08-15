@@ -152,41 +152,209 @@ enum LightRailTint {
     }
 }
 
-/// The light Tinted theme is a deliberate colour composition rather than a
-/// sampled desktop hue that can turn every surface flat blue. A sage-cool end
-/// crosses a warm pearl into a lilac-pearl end.
+/// One tint source colour. A struct rather than a `(red:green:blue:)` tuple
+/// so palettes can be compared, iterated, and held in a table.
+struct TintRGB: Equatable, Sendable {
+    let red: Double
+    let green: Double
+    let blue: Double
+
+    init(red: Double, green: Double, blue: Double) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+    }
+
+    /// 8-bit convenience so the palette table reads as the hexes it documents.
+    init(_ r: Int, _ g: Int, _ b: Int) {
+        self.init(red: Double(r) / 255, green: Double(g) / 255, blue: Double(b) / 255)
+    }
+
+    var color: Color { Color(red: red, green: green, blue: blue) }
+    var minimumChannel: Double { min(red, min(green, blue)) }
+    var maximumChannel: Double { max(red, max(green, blue)) }
+}
+
+/// The light half of a palette: two coloured ends crossing a quiet midpoint.
+struct TintPaletteLight: Equatable, Sendable {
+    let cool: TintRGB
+    let neutral: TintRGB
+    let pearl: TintRGB
+    let coolCoverage: Double
+    let neutralCoverage: Double
+    let pearlCoverage: Double
+    let neutralLocation: Double
+}
+
+/// The Tinted theme's named colourways. The light Tinted surface is a
+/// deliberate colour composition rather than a raw sampled desktop hue that
+/// can turn every surface flat blue: every palette here was solved against
+/// the composite-over-white box the visibility tests assert, not eyeballed.
+/// Meadow is the shipped composition and stays the default.
+enum TintPalette: String, CaseIterable, Identifiable, Sendable {
+    case meadow, dusk, harbor, graphite, desktop
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .meadow: "Meadow"
+        case .dusk: "Dusk"
+        case .harbor: "Harbor"
+        case .graphite: "Graphite"
+        case .desktop: "Desktop"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .meadow: "Sage crossing a lilac pearl"
+        case .dusk: "Warm sand crossing a dusty rose"
+        case .harbor: "Powder blue crossing a seafoam"
+        case .graphite: "Cool grey crossing a warm grey"
+        case .desktop: "Your wallpaper's own hue, held to a pastel"
+        }
+    }
+}
+
+extension TintPalette {
+    /// Graphite stands alone so `desktopLight(_:)` can fall back to it
+    /// without force-unwrapping its own table.
+    private static let graphiteLight = TintPaletteLight(
+        cool: TintRGB(178, 186, 196),
+        neutral: TintRGB(224, 219, 212),
+        pearl: TintRGB(196, 189, 180),
+        coolCoverage: 0.30, neutralCoverage: 0.22, pearlCoverage: 0.30,
+        neutralLocation: 0.54
+    )
+
+    /// The constant light stops. `.desktop` has none — see `light(desktop:)`.
+    ///
+    /// Coverages are shared across the table: only the sources change per
+    /// palette, so every palette's luminance envelope — and therefore the ink
+    /// ladder measured against the worst patch — stays where Meadow put it.
+    var fixedLight: TintPaletteLight? {
+        switch self {
+        case .meadow: TintPaletteLight(
+            cool: TintRGB(165, 203, 178),
+            neutral: TintRGB(233, 221, 207),
+            pearl: TintRGB(203, 185, 226),
+            coolCoverage: 0.30, neutralCoverage: 0.22, pearlCoverage: 0.30,
+            neutralLocation: 0.54
+        )
+        case .dusk: TintPaletteLight(
+            cool: TintRGB(216, 191, 172),
+            neutral: TintRGB(233, 213, 198),
+            pearl: TintRGB(217, 175, 192),
+            coolCoverage: 0.30, neutralCoverage: 0.22, pearlCoverage: 0.30,
+            neutralLocation: 0.54
+        )
+        case .harbor: TintPaletteLight(
+            cool: TintRGB(171, 196, 218),
+            neutral: TintRGB(230, 222, 208),
+            pearl: TintRGB(175, 213, 203),
+            coolCoverage: 0.30, neutralCoverage: 0.22, pearlCoverage: 0.30,
+            neutralLocation: 0.54
+        )
+        case .graphite: Self.graphiteLight
+        case .desktop: nil
+        }
+    }
+
+    /// The light stops for a given desktop sample. Constant palettes ignore it.
+    func light(desktop tint: DesktopTintComponents) -> TintPaletteLight {
+        if let fixedLight { return fixedLight }
+        return Self.desktopLight(tint)
+    }
+
+    /// Saturation/brightness that put *any* hue inside the composite box.
+    /// The reason light never sampled the desktop before is that a saturated
+    /// wallpaper turns every surface flat blue; fixing saturation and
+    /// brightness and keeping only the hue removes that failure by
+    /// construction.
+    static let desktopSaturation: Double = 0.22
+    static let desktopBrightness: Double = 0.80
+    static let desktopNeutralSaturation: Double = 0.10
+    static let desktopNeutralBrightness: Double = 0.90
+
+    static func desktopLight(_ tint: DesktopTintComponents) -> TintPaletteLight {
+        // A grey wallpaper has no hue to keep; Graphite is what "no hue,
+        // pastel" already means, so it is the fallback rather than a
+        // near-white nothing.
+        guard let hue = TintFlowMotion.hue(red: tint.red, green: tint.green, blue: tint.blue)
+        else { return graphiteLight }
+        let companionHue = (hue + TintFlowMotion.companionHueRotation)
+            .truncatingRemainder(dividingBy: 1)
+        return TintPaletteLight(
+            cool: TintFlowMotion.rgb(
+                hue: hue,
+                saturation: desktopSaturation,
+                brightness: desktopBrightness
+            ),
+            neutral: TintFlowMotion.rgb(
+                hue: hue,
+                saturation: desktopNeutralSaturation,
+                brightness: desktopNeutralBrightness
+            ),
+            pearl: TintFlowMotion.rgb(
+                hue: companionHue,
+                saturation: desktopSaturation,
+                brightness: desktopBrightness
+            ),
+            coolCoverage: graphiteLight.coolCoverage,
+            neutralCoverage: graphiteLight.neutralCoverage,
+            pearlCoverage: graphiteLight.pearlCoverage,
+            neutralLocation: graphiteLight.neutralLocation
+        )
+    }
+
+    /// How much chroma the palette keeps in dark. Graphite is grey by
+    /// definition and would stop being itself at the shared value.
+    var darkSaturation: Double { self == .graphite ? 0.10 : 0.30 }
+
+    /// The dark stop pair: the palette's two light ends taken to the dark
+    /// canvas peak at the palette's own saturation. Hue is the only thing
+    /// carried over, which is what keeps a dark Harbor recognisably Harbor.
+    /// `.desktop` returns nil — its dark path stays the sampled one.
+    func darkEnds() -> (anchor: TintRGB, companion: TintRGB)? {
+        guard let light = fixedLight else { return nil }
+        let peak = DesktopTintSampler.canvasTintPeak(isDark: true)
+        func end(_ source: TintRGB) -> TintRGB {
+            guard let hue = TintFlowMotion.hue(
+                red: source.red,
+                green: source.green,
+                blue: source.blue
+            ) else { return TintRGB(red: peak, green: peak, blue: peak) }
+            return TintFlowMotion.rgb(hue: hue, saturation: darkSaturation, brightness: peak)
+        }
+        return (anchor: end(light.cool), companion: end(light.pearl))
+    }
+}
+
+/// The Meadow palette's original name.
 ///
 /// The stops tripled in 2026-08-14's pass. At eleven percent the whole
 /// composition quantized to within a few counts of white — the Tinted fixture
 /// was pixel-for-pixel the Glass fixture — and Michael asked for "a flowing
 /// gradient tint", which first of all requires a gradient one can see. Thirty
-/// percent keeps the sources pastel (the sage end composites to `#E0EDE5`,
-/// nowhere near the flat-blue failure the sampled hue had) while the sweep
-/// finally reads as colour crossing the surface.
+/// percent keeps the sources pastel while the sweep finally reads as colour
+/// crossing the surface. The numbers live in `TintPalette.meadow.fixedLight`
+/// now; this shim only forwards them so long-standing call sites keep
+/// compiling.
 enum LightTintedGradient {
-    /// `#A5CBB2`, a sage source whose 30% composite reads as `#E0EDE5`.
-    static let cool = (red: 165.0 / 255, green: 203.0 / 255, blue: 178.0 / 255)
-    /// `#E9DDCF`, a quiet warm midpoint that prevents a broad white band.
-    static let neutral = (red: 233.0 / 255, green: 221.0 / 255, blue: 207.0 / 255)
-    /// `#CBB9E2`, a lilac pearl whose 30% composite reads as `#EFEAF7`.
-    static let pearl = (red: 203.0 / 255, green: 185.0 / 255, blue: 226.0 / 255)
-    static let coolCoverage = 0.30
-    static let neutralCoverage = 0.22
-    static let pearlCoverage = 0.30
-    static let neutralLocation = 0.54
+    private static var meadow: TintPaletteLight { TintPalette.meadow.fixedLight! }
 
-    static var coolColor: Color {
-        Color(red: cool.red, green: cool.green, blue: cool.blue)
-    }
+    static var cool: TintRGB { meadow.cool }
+    static var neutral: TintRGB { meadow.neutral }
+    static var pearl: TintRGB { meadow.pearl }
+    static var coolCoverage: Double { meadow.coolCoverage }
+    static var neutralCoverage: Double { meadow.neutralCoverage }
+    static var pearlCoverage: Double { meadow.pearlCoverage }
+    static var neutralLocation: Double { meadow.neutralLocation }
 
-    static var pearlColor: Color {
-        Color(red: pearl.red, green: pearl.green, blue: pearl.blue)
-    }
-
-    static var neutralColor: Color {
-        Color(red: neutral.red, green: neutral.green, blue: neutral.blue)
-    }
-
+    static var coolColor: Color { cool.color }
+    static var pearlColor: Color { pearl.color }
+    static var neutralColor: Color { neutral.color }
 }
 
 /// The Tinted surfaces' slow drift — what makes the gradient *flow*.
@@ -208,14 +376,30 @@ enum TintFlowMotion {
     /// sweep stays diagonal throughout; only its anchoring breathes.
     static let drift: Double = 0.18
 
-    /// Opt-in breath: the whole tint fading a few percent and back. Seventeen
-    /// seconds is deliberately not a harmonic of `period`, so the breath never
-    /// phase-locks with the drift into a visible pulse; the amplitude is a
-    /// multiply on already-small coverages, so the dimmest phase is one or two
-    /// counts of 255 — found, like the drift, only when the eye returns.
-    static let breathPeriod: TimeInterval = 17
-    static let breathAmplitude: Double = 0.08
+    /// Opt-in breath: the whole tint fading and returning. Nineteen seconds,
+    /// and a sixth of the layer's opacity rather than a twelfth: at 0.08 the
+    /// swing was two counts of 255 on the heaviest stop — under the threshold
+    /// where anyone reported seeing it at all. At 0.16 it is four to five
+    /// counts across nineteen seconds: found when the eye returns, still
+    /// nowhere near a pulse. The period is deliberately not a harmonic of
+    /// `period`, so the breath never phase-locks with the drift.
+    static let breathPeriod: TimeInterval = 19
+    static let breathAmplitude: Double = 0.16
     static var breathFloorOpacity: Double { 1 - breathAmplitude }
+
+    /// The breath's second half: the gradient field swelling 2.8% about its
+    /// centre on its own, longer period. Opacity alone reads as a dimmer;
+    /// opacity plus a slow swell reads as a surface that is alive. The scale
+    /// never goes below 1, so the layer only ever over-covers its bounds and
+    /// no edge can be exposed. Drift 26, opacity 19, scale 23: no pair within
+    /// 0.05 of an integer ratio, so nothing phase-locks into a metronome.
+    static let breathScalePeriod: TimeInterval = 23
+    static let breathScaleAmplitude: Double = 0.028
+
+    /// A slightly sharper S than `easeInEaseOut`: more dwell at the extremes,
+    /// a quicker transit between them, which is what makes a shallow change
+    /// register at all without raising its depth.
+    static let breathTimingControlPoints: (Float, Float, Float, Float) = (0.45, 0.05, 0.55, 0.95)
 
     /// SwiftUI's `UnitPoint` puts (0,0) at the top-leading corner;
     /// `CAGradientLayer`'s unit space on an unflipped AppKit host puts (0,0)
@@ -249,17 +433,18 @@ enum TintFlowMotion {
     /// colours of one family, never as a second unrelated accent.
     static let companionHueRotation: Double = 0.09
 
-    /// Pure HSB rotation of a sampled tint. Saturation and brightness are
-    /// kept, so the companion stays exactly as quiet as its source.
-    static func companion(
+    /// The full HSB reading, or nil for an achromatic sample. The guard is
+    /// deliberately identical to `companion`'s original inline one so a grey
+    /// keeps passing through untouched.
+    static func hsb(
         red: Double,
         green: Double,
         blue: Double
-    ) -> (red: Double, green: Double, blue: Double) {
+    ) -> (hue: Double, saturation: Double, brightness: Double)? {
         let maximum = max(red, max(green, blue))
         let minimum = min(red, min(green, blue))
         let delta = maximum - minimum
-        guard delta > 0.0001, maximum > 0.0001 else { return (red, green, blue) }
+        guard delta > 0.0001, maximum > 0.0001 else { return nil }
         var hue: Double
         if maximum == red {
             hue = ((green - blue) / delta).truncatingRemainder(dividingBy: 6)
@@ -270,9 +455,15 @@ enum TintFlowMotion {
         }
         hue /= 6
         if hue < 0 { hue += 1 }
-        hue = (hue + companionHueRotation).truncatingRemainder(dividingBy: 1)
-        let saturation = delta / maximum
-        let brightness = maximum
+        return (hue: hue, saturation: delta / maximum, brightness: maximum)
+    }
+
+    /// Hue in [0,1), or nil for an achromatic sample that has no hue to keep.
+    static func hue(red: Double, green: Double, blue: Double) -> Double? {
+        hsb(red: red, green: green, blue: blue)?.hue
+    }
+
+    static func rgb(hue: Double, saturation: Double, brightness: Double) -> TintRGB {
         let sector = hue * 6
         let index = Int(sector) % 6
         let fraction = sector - Double(Int(sector))
@@ -280,13 +471,31 @@ enum TintFlowMotion {
         let q = brightness * (1 - saturation * fraction)
         let t = brightness * (1 - saturation * (1 - fraction))
         switch index {
-        case 0: return (brightness, t, p)
-        case 1: return (q, brightness, p)
-        case 2: return (p, brightness, t)
-        case 3: return (p, q, brightness)
-        case 4: return (t, p, brightness)
-        default: return (brightness, p, q)
+        case 0: return TintRGB(red: brightness, green: t, blue: p)
+        case 1: return TintRGB(red: q, green: brightness, blue: p)
+        case 2: return TintRGB(red: p, green: brightness, blue: t)
+        case 3: return TintRGB(red: p, green: q, blue: brightness)
+        case 4: return TintRGB(red: t, green: p, blue: brightness)
+        default: return TintRGB(red: brightness, green: p, blue: q)
         }
+    }
+
+    /// Pure HSB rotation of a sampled tint. Saturation and brightness are
+    /// kept, so the companion stays exactly as quiet as its source.
+    static func companion(
+        red: Double,
+        green: Double,
+        blue: Double
+    ) -> (red: Double, green: Double, blue: Double) {
+        guard let source = hsb(red: red, green: green, blue: blue) else {
+            return (red, green, blue)
+        }
+        let rotated = rgb(
+            hue: (source.hue + companionHueRotation).truncatingRemainder(dividingBy: 1),
+            saturation: source.saturation,
+            brightness: source.brightness
+        )
+        return (rotated.red, rotated.green, rotated.blue)
     }
 }
 

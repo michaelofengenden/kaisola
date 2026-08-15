@@ -102,7 +102,7 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             "pid": getpid(),
             "socketPath": socket.path,
             "token": String(repeating: "b", count: 64),
-            "startedAt": 1,
+            "startedAt": liveFixtureStartedAt(),
             "version": "incompatible",
         ]
         let infoURL = broker.appendingPathComponent("broker.json")
@@ -2445,7 +2445,7 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             "pid": getpid(),
             "socketPath": socket.path,
             "token": String(repeating: "b", count: 64),
-            "startedAt": 1,
+            "startedAt": liveFixtureStartedAt(),
             "version": "old-native",
         ]
         if let contentDigest { metadata["contentDigest"] = contentDigest }
@@ -2496,7 +2496,7 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             pid: pid,
             socketPath: socket.path,
             token: String(repeating: "b", count: 64),
-            startedAt: 1,
+            startedAt: liveFixtureStartedAt(),
             version: "old-native"
         )
         let metadataURL = metadataDirectory.appendingPathComponent("\(contentDigest).json")
@@ -2605,7 +2605,10 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             pid: currentPID,
             socketPath: socket.path,
             token: String(repeating: "c", count: 64),
-            startedAt: 1,
+            // A live-pid caller means "this current genuinely answers"; the
+            // boot corroboration must not undercut that with a pre-boot
+            // placeholder. The default Int32.max stays epoch-1 dead.
+            startedAt: currentPID == Int32.max ? 1 : liveFixtureStartedAt(),
             version: "stale-native"
         )
         let metadataURL = metadataDirectory.appendingPathComponent("\(digest).json")
@@ -2712,7 +2715,10 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
             pid: getpid(),
             socketPath: socket.path,
             token: template.info.token,
-            startedAt: template.info.startedAt,
+            // The drain is genuinely alive regardless of its template: a dead
+            // template's epoch-1 placeholder would read as pre-boot and make
+            // the live drain provably dead on a freshly booted CI runner.
+            startedAt: liveFixtureStartedAt(),
             version: template.info.version
         )
         let generation = BrokerGenerationRecord(
@@ -3146,6 +3152,17 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
         if let socketURL { try? FileManager.default.removeItem(at: socketURL) }
         socketURL = nil
     }
+}
+
+/// A `startedAt` for fixtures that mean "this broker is genuinely alive":
+/// after this machine's boot, so `BrokerInfo.isProcessProvablyDead`'s boot
+/// corroboration cannot misread the fixture as a recycled pid. CI runners
+/// boot moments before the suite runs, so the old epoch-1 placeholder was
+/// pre-boot there even though it looked harmless on a long-running developer
+/// machine. Dead fixtures keep epoch 1 — a pre-boot start is exactly what
+/// dead means.
+private func liveFixtureStartedAt() -> Int64 {
+    Int64(Date().timeIntervalSince1970 * 1000)
 }
 
 private func bindUnixSocket(at url: URL) throws -> Int32 {

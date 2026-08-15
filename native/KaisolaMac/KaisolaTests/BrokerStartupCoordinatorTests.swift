@@ -1456,6 +1456,98 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
+    /// A dead drain is reaped even when the registry's rollback selection
+    /// names its digest. Rollback requires a living target, so retaining a
+    /// dead one buys nothing — and when the drain shares the relaunching
+    /// app's own digest, the retained dead record blocks
+    /// publishFreshGeneration's recovery and wedges the registry after a
+    /// reboot-during-rollback.
+    func testHeartbeatReapsADeadDrainEvenWhenItIsTheRetainedRollbackTarget() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let cutoverRequester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(implementationVersion: 2)
+        let locator = BrokerInfoLocator(userDataCandidates: [live.profile])
+        let cutoverCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: cutoverRequester,
+            rollingUpdatesEnabled: true
+        )
+        _ = try await cutoverCoordinator.prepare()
+
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let cutoverRegistry = try store.load()
+        let cutoverTopology = try XCTUnwrap(cutoverRegistry.topology)
+        let old = try XCTUnwrap(cutoverTopology.draining.first)
+        let childPID = try spawnPausedChild()
+        _ = Darwin.kill(childPID, SIGKILL)
+        var status: Int32 = 0
+        _ = waitpid(childPID, &status, 0)
+        let deadInfo = BrokerInfo(
+            protocolVersion: old.info.protocolVersion,
+            securityEpoch: old.info.securityEpoch,
+            implementationVersion: old.info.implementationVersion,
+            packageSchema: old.info.packageSchema,
+            packageVersion: old.info.packageVersion,
+            contentDigest: old.info.contentDigest,
+            pid: childPID,
+            socketPath: old.info.socketPath,
+            token: old.info.token,
+            startedAt: old.info.startedAt,
+            version: old.info.version
+        )
+        let deadGeneration = BrokerGenerationRecord(
+            id: old.id,
+            role: .draining,
+            info: deadInfo,
+            packageRoot: old.packageRoot,
+            registeredAt: old.registeredAt
+        )
+        let metadataURL = store.metadataURL(for: deadGeneration)
+        try JSONEncoder().encode(deadInfo).write(to: metadataURL)
+        _ = chmod(metadataURL.path, 0o600)
+        _ = try store.save(
+            currentGenerationID: cutoverTopology.current.id,
+            generations: [cutoverTopology.current, deadGeneration],
+            expectedRevision: cutoverRegistry.revision,
+            selection: BrokerGenerationSelection(
+                generationID: cutoverTopology.current.id,
+                selectingAppContentDigest: deadGeneration.id,
+                selectedAt: Int64(Date().timeIntervalSince1970 * 1_000)
+            )
+        )
+
+        let reapRequester = FakeRollingBrokerUpgradeRequester(
+            upgradeDecision: .accepted,
+            retirementDecision: .accepted
+        )
+        let reapCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: reapRequester,
+            rollingUpdatesEnabled: true
+        )
+        _ = try await reapCoordinator.prepare()
+        _ = await reapCoordinator.attemptUpgradeIfNeeded()
+
+        let reaped = try store.load()
+        let retirementCalls = await reapRequester.retirementCallCount()
+        XCTAssertTrue(
+            reaped.topology?.draining.isEmpty == true,
+            "a dead rollback target must be reaped, not retained"
+        )
+        XCTAssertEqual(retirementCalls, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: metadataURL.path))
+        await launcher.close()
+    }
+
     /// A host reboot kills every draining generation at once. Their recorded
     /// processes are provably dead, so RPC retirement can never succeed;
     /// the sweep must reap the record (and its rendezvous files, including

@@ -1356,7 +1356,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 model.setCompanionControlFixtureActive(true, for: terminal)
             } else if ["attention-completed", "topbar-attention"].contains(visualSurface) {
                 model.loadVisualCompletedAttentionFixture()
-            } else if ["mixed", "mixed-search", "mixed-density", "permission"].contains(visualSurface) {
+            } else if ["mixed", "mixed-search", "mixed-density", "permission", "chat-thinking"].contains(visualSurface) {
                 model.loadVisualMixedSessionFixture(
                     workspace: workspace,
                     includePermission: visualSurface == "permission"

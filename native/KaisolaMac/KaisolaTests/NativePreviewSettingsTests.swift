@@ -1221,6 +1221,44 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
+    /// The transcript's rhythm pair table: a turn boundary is a larger event
+    /// than the next artifact inside the same reply, and the opening row
+    /// leaves the top edge to the page padding.
+    func testTranscriptRhythmSeparatesTurnsMoreThanArtifacts() {
+        XCTAssertGreaterThan(
+            AcpTranscriptMetrics.turnSpacing,
+            AcpTranscriptMetrics.intraTurnSpacing
+        )
+        XCTAssertEqual(AcpTranscriptMetrics.spacing(before: nil, after: .user), 0)
+        XCTAssertEqual(AcpTranscriptMetrics.spacing(before: nil, after: .assistant), 0)
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .user, after: .assistant),
+            AcpTranscriptMetrics.turnSpacing
+        )
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .assistant, after: .user),
+            AcpTranscriptMetrics.turnSpacing
+        )
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .user, after: .user),
+            AcpTranscriptMetrics.turnSpacing
+        )
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .assistant, after: .assistant),
+            AcpTranscriptMetrics.intraTurnSpacing
+        )
+        // Only the user's own rows sit on the user side of the table.
+        XCTAssertEqual(AcpTranscriptRow.user(id: "1", text: "go", failed: false).rhythmKind, .user)
+        XCTAssertEqual(AcpTranscriptRow.message(id: "1", text: "on it").rhythmKind, .assistant)
+        XCTAssertEqual(AcpTranscriptRow.thought(id: "1", text: "…").rhythmKind, .assistant)
+        XCTAssertEqual(
+            AcpTranscriptRow.tool(AcpToolCall(
+                id: "t", title: "Build", kind: "execute", status: .completed
+            )).rhythmKind,
+            .assistant
+        )
+    }
+
     func testSurfaceTabOutlinesAreVisibleButRemainHairlines() {
         XCTAssertEqual(SurfaceTabChrome.projectSelectedStrokeOpacity, 0.38, accuracy: 0.0001)
         XCTAssertEqual(SurfaceTabChrome.sessionSelectedStrokeOpacity, 0.30, accuracy: 0.0001)

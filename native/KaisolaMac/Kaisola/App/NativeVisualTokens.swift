@@ -42,6 +42,65 @@ enum KaisolaVisualSystem {
     static let layoutDuration = 0.22
 }
 
+/// The chat transcript's vertical rhythm. One uniform stack spacing gave a
+/// user message, a tool chip, and a 400-word answer identical separation,
+/// which reads as a list rather than a conversation: a turn boundary must be
+/// a larger event than the next artifact inside the same reply. Mesh columns
+/// are narrow and keep their own tighter literals on purpose.
+enum AcpTranscriptMetrics {
+    /// Across a turn boundary — before a user message, and before the reply
+    /// that follows one.
+    static let turnSpacing: CGFloat = 20
+    /// Between consecutive assistant artifacts: message, tool call, plan.
+    static let intraTurnSpacing: CGFloat = 8
+    static let pagePadding: CGFloat = 20
+    static let horizontalPadding: CGFloat = 22
+    /// Between blocks inside one rendered assistant message.
+    static let messageBlockSpacing: CGFloat = 12
+
+    /// The only distinction the rhythm draws. Everything that is not the
+    /// user's own message — audits and permission decisions included — sits
+    /// on the assistant's side of the conversation.
+    enum RowKind: Equatable, Sendable {
+        case user
+        case assistant
+    }
+
+    /// Top spacing for the row after the pair's boundary. Pure, so the pair
+    /// table is a unit test rather than a scroll-through; `nil` means the row
+    /// opens the transcript and the page padding owns that edge.
+    static func spacing(before previous: RowKind?, after current: RowKind) -> CGFloat {
+        guard let previous else { return 0 }
+        if current == .user || previous == .user { return turnSpacing }
+        return intraTurnSpacing
+    }
+}
+
+/// The user bubble's surface. Achromatic on purpose: the Glass and Tinted
+/// backdrops are deliberately near-achromatic, and the old accent wash was
+/// the one tinted plate fighting them on every desktop. The accent survives
+/// only on the failed state's border.
+enum AcpBubble {
+    /// Wider than this and a short prompt stops being a bubble and becomes
+    /// the old full-width band; longer prompts wrap instead of stretching.
+    static let maximumWidth: CGFloat = 560
+    /// A bubble is wider than it is tall.
+    static let horizontalPadding: CGFloat = 13
+    static let verticalPadding: CGFloat = 9
+
+    /// Light: a quiet ink wash, quaternary-weight. Dark: a near-black lift
+    /// above the pane — opaque, like the composer card, so a pasted block
+    /// stays readable over any backdrop. Resolved by the drawing appearance,
+    /// the `KaisolaInk` idiom.
+    static var userFill: Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                ? NSColor(srgbRed: 0x2C / 255, green: 0x2C / 255, blue: 0x2E / 255, alpha: 1)
+                : NSColor(srgbRed: 0, green: 0, blue: 0, alpha: 0.055)
+        })
+    }
+}
+
 /// Stroke coverage shared by the two horizontal tab families.
 enum SurfaceTabChrome {
     static let projectSelectedStrokeOpacity = 0.38
@@ -287,6 +346,54 @@ enum TintFlowMotion {
         case 4: return (t, p, brightness)
         default: return (brightness, p, q)
         }
+    }
+}
+
+/// The thinking shimmer: a highlight sweeping the chat's status word while a
+/// turn runs.
+///
+/// This is watchable motion in an app whose whole visual thesis is motion you
+/// never catch moving. It is allowed because it is bounded — the label exists
+/// only while a turn is running — and because it replaces a spinner, which was
+/// also watchable motion saying less. The sweep itself is a Core Animation
+/// `locations` interpolation owned by the render server, the same ownership as
+/// `TintFlowMotion`: zero main-thread wakeups while it runs.
+enum ThinkingShimmerMotion {
+    /// One sweep, leading edge to trailing edge, in seconds. Below one second
+    /// the sweep is a strobe; above two and a half it reads as a hang.
+    static let period: TimeInterval = 1.6
+    /// Half-width of the highlight ramp as a fraction of the label's width.
+    static let highlightWidth: Double = 0.16
+    /// How far past each edge the highlight starts and ends, so the sweep
+    /// enters and leaves rather than materialising inside the word.
+    static let overscan: Double = 0.25
+    /// The highlight's lift over the resting ink, as an alpha delta. Sized so
+    /// `highlightAlpha` always reaches its cap: the shimmer is the existing
+    /// secondary ink briefly becoming the existing primary ink, never a new
+    /// colour on the ladder.
+    static let highlightLift: Double = 0.55
+
+    /// The five gradient-stop locations at a phase of the sweep, 0 through 1.
+    /// Pure: the geometry is a unit test rather than a screenshot.
+    static func locations(phase: Double) -> [Double] {
+        let center = -overscan + phase * (1 + 2 * overscan)
+        return [
+            center - highlightWidth,
+            center - highlightWidth / 2,
+            center,
+            center + highlightWidth / 2,
+            center + highlightWidth,
+        ]
+    }
+
+    static var startLocations: [Double] { locations(phase: 0) }
+    static var endLocations: [Double] { locations(phase: 1) }
+
+    /// The highlight's ink coverage: the resting rung lifted by
+    /// `highlightLift`, held at the primary rung so the peak of the sweep is
+    /// exactly the primary ink.
+    static func highlightAlpha(resting: Double, primary: Double) -> Double {
+        min(primary, resting + highlightLift)
     }
 }
 

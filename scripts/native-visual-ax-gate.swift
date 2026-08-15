@@ -192,6 +192,24 @@ private func failure(surface: String, snapshot: Snapshot) -> String? {
         }
         return nil
     }
+    if surface == "chat-thinking" {
+        let matches = snapshot.records.filter { $0.identifier == "acp.thinkingStatus" }
+        guard matches.count == 1 else {
+            return "wrong-thinking-status-count-\(matches.count)"
+        }
+        let summary = matches[0].labels.joined(separator: " ")
+        guard !summary.isEmpty else { return "empty-thinking-status-label" }
+        // The fixture's trailing in-progress call titles the line, and the
+        // spoken form appends ", working" — never an ellipsis.
+        guard summary.localizedCaseInsensitiveContains("Running the focused native tests") else {
+            return "thinking-status-missing-tool-title"
+        }
+        guard summary.localizedCaseInsensitiveContains("working") else {
+            return "thinking-status-missing-working"
+        }
+        guard !summary.contains("…") else { return "thinking-status-speaks-ellipsis" }
+        return nil
+    }
     let identifiers = snapshot.identifiers
     guard identifiers.contains("extensions.hub") else { return "missing-hub-identifier" }
     guard let search = matchingRecord(label: "Search extensions", in: snapshot),
@@ -300,9 +318,12 @@ guard CommandLine.arguments.count == 3,
     exit(64)
 }
 let surface = CommandLine.arguments[2]
-let receiptPrefix = surface == "settings-terminal"
-    ? "KAISOLA_NATIVE_TERMINAL_PALETTE_AX"
-    : "KAISOLA_NATIVE_EXTENSIONS_AX"
+let receiptPrefix: String
+switch surface {
+case "settings-terminal": receiptPrefix = "KAISOLA_NATIVE_TERMINAL_PALETTE_AX"
+case "chat-thinking": receiptPrefix = "KAISOLA_NATIVE_CHAT_THINKING_AX"
+default: receiptPrefix = "KAISOLA_NATIVE_EXTENSIONS_AX"
+}
 let deadline = Date().addingTimeInterval(6)
 var latest = Snapshot()
 var latestFailure = "window-not-ready"

@@ -191,7 +191,7 @@ jobs:
             # Keep a broken AppKit sheet or framework callback from hiding the
             # responsible surface until the job-wide 25-minute timeout. POSIX
             # preserves alarm(2) across exec, including env -> Kaisola.
-            if [[ "$surface" == settings-extensions || "$surface" == settings-extensions-narrow || "$surface" == settings-terminal ]]; then
+            if [[ "$surface" == settings-extensions || "$surface" == settings-extensions-narrow || "$surface" == settings-terminal || "$surface" == chat-thinking ]]; then
               local fixture_pid ax_pid fixture_exit ax_exit ax_log
               ax_log="${log%.log}.ax.log"
               /usr/bin/perl -e '
@@ -450,7 +450,7 @@ jobs:
             "$output/dark-terminal-continuous-scroll.png" \
             "$output/dark-terminal-continuous-scroll.log"
 
-          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-ownership-flap terminal-transcript account-picker attention-completed companion-control mixed permission palette preview preview-narrow preview-code-editor preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file workspace-move topbar topbar-attention mesh onboarding settings settings-minimum settings-ideal settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-extensions settings-extensions-narrow settings-models settings-shortcuts settings-account-recovery usage; do
+          for surface in terminal terminal-solo terminal-semantic terminal-scroll-output terminal-ownership-flap terminal-transcript account-picker attention-completed companion-control mixed chat-thinking permission palette preview preview-narrow preview-code-editor preview-dirty-tab preview-tab-overflow preview-table-edit preview-html preview-docx preview-pdf workspace-rename workspace-new-file workspace-move topbar topbar-attention mesh onboarding settings settings-minimum settings-ideal settings-terminal settings-terminal-history settings-terminal-interaction settings-companion settings-mcp settings-extensions settings-extensions-narrow settings-models settings-shortcuts settings-account-recovery usage; do
             capture="$output/$surface.png"
             log="$output/$surface.log"
             run_fixture "$surface" "$capture" "$log" "$binary"
@@ -468,7 +468,7 @@ jobs:
 
           # settings-account-recovery is included because its migration notice
           # uses an appearance-specific warning palette (issue #310).
-          for surface in terminal terminal-semantic mixed permission palette preview-code-editor workspace-move topbar-attention mesh onboarding settings-minimum settings-ideal settings-terminal settings-extensions settings-shortcuts settings-account-recovery; do
+          for surface in terminal terminal-semantic mixed chat-thinking permission palette preview-code-editor workspace-move topbar-attention mesh onboarding settings-minimum settings-ideal settings-terminal settings-extensions settings-shortcuts settings-account-recovery; do
             capture="$output/dark-$surface.png"
             log="$output/dark-$surface.log"
             run_fixture "$surface" "$capture" "$log" \

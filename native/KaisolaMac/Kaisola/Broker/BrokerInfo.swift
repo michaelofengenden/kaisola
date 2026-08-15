@@ -112,6 +112,34 @@ struct BrokerInfo: Codable, Equatable, Sendable {
         if kill(pid, 0) == 0 { return true }
         return errno == EPERM
     }
+
+    /// True when the record's process is certainly gone: kill(0) says so, or
+    /// the record predates the last boot — no pre-boot process survives a
+    /// reboot, whatever kill(0) answers for a recycled pid. The 2026-08-14
+    /// reboot handed a v0.1.105 drain's pid to a system daemon: kill(0)
+    /// answered EPERM, the record read as alive, the dead-drain reap exempted
+    /// it forever, and every connect raced the sweeps working around it.
+    /// The minute of slack errs toward "started after boot" (not provably
+    /// dead), which fails closed.
+    var isProcessProvablyDead: Bool {
+        if !isProcessAlive { return true }
+        if startedAt > 0,
+           let boot = Self.bootTimeMilliseconds,
+           startedAt < boot - 60_000 {
+            return true
+        }
+        return false
+    }
+
+    static var bootTimeMilliseconds: Int64? {
+        var value = timeval()
+        var size = MemoryLayout<timeval>.size
+        var name: [Int32] = [CTL_KERN, KERN_BOOTTIME]
+        guard sysctl(&name, 2, &value, &size, nil, 0) == 0, value.tv_sec > 0 else {
+            return nil
+        }
+        return Int64(value.tv_sec) * 1_000 + Int64(value.tv_usec) / 1_000
+    }
 }
 
 protocol BrokerInfoLocating: Sendable {

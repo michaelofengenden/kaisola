@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.126 — 2026-08-14
+
+- Connecting no longer loses to the ghosts of brokers past. After a restart, the process numbers of long-dead brokers get handed out again — sometimes to system processes the app has no right to signal, which it read as "still alive". One such phantom from v0.1.105 could never be cleaned up, the cleanup that worked around it kept rewriting the shared registry, and every connection attempt noticed the rewrite mid-handshake and aborted as a safety measure — so the app sat on "Session Connection Unavailable" while a perfectly healthy broker waited to be asked. A broker recorded as started before the last boot is now known dead no matter who holds its old number, every dead record is cleared in one pass instead of one per heartbeat, and a failed handshake closes its connection instead of leaving it dangling.
+
 ## 0.1.125 — 2026-08-14
 
 - Terminals survive a restart of your Mac. Each session broker leaves a lock file while it runs and removes it as it exits — but a broker that dies with the machine never gets to remove anything. On the next launch the new broker saw the old lock, concluded another copy of itself was already running, and quit without writing a single line of log, over and over, all day. A lock now names the process that took it from the moment it exists, one written before the last boot is never mistaken for a living owner however its process number has been recycled, and a lock whose owner is provably gone is cleared and taken over. A lock whose owner is genuinely alive is still respected, and now says so in the log instead of saying nothing.

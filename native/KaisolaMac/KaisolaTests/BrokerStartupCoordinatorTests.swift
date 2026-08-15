@@ -1623,6 +1623,119 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
+    /// No pre-boot process survives a reboot: a record started before the
+    /// last boot is provably dead however kill(0) answers for its recycled
+    /// pid, and one started now is not.
+    func testProvablyDeadCorroboratesRecordedStartAgainstBootTime() throws {
+        let boot = try XCTUnwrap(BrokerInfo.bootTimeMilliseconds)
+        func info(startedAt: Int64) -> BrokerInfo {
+            BrokerInfo(
+                protocolVersion: 2,
+                securityEpoch: 1,
+                implementationVersion: 2,
+                packageSchema: 1,
+                packageVersion: "1.1.0",
+                contentDigest: String(repeating: "a", count: 64),
+                pid: getpid(),
+                socketPath: "/tmp/kaisola-test.sock",
+                token: String(repeating: "b", count: 64),
+                startedAt: startedAt,
+                version: "test"
+            )
+        }
+        // getpid() is certainly alive; only the pre-boot record is provably
+        // dead. The v0.1.105 drain the 2026-08-14 reboot left behind carried
+        // a pid recycled by a system daemon and pinned itself exactly this
+        // way.
+        XCTAssertTrue(info(startedAt: boot - 3_600_000).isProcessProvablyDead)
+        XCTAssertFalse(info(startedAt: boot + 60_000).isProcessProvablyDead)
+        XCTAssertTrue(info(startedAt: boot + 60_000).isProcessAlive)
+    }
+
+    /// The reboot phantom: a drain whose recorded pid is a post-reboot
+    /// recycle of a living process. kill(0)-only liveness exempted it from
+    /// the reap forever, and the sweeps working around it kept mutating the
+    /// registry out from under the app's connects.
+    func testHeartbeatReapsARebootOrphanedDrainWithARecycledLivingPid() async throws {
+        let home = try privateTemporaryDirectory()
+        let oldDigest = String(repeating: "e", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: oldDigest)
+        defer { Darwin.close(live.descriptor) }
+        let cutoverRequester = FakeRollingBrokerUpgradeRequester(upgradeDecision: .accepted)
+        let launcher = FakeBrokerHelperLauncher(implementationVersion: 2)
+        let locator = BrokerInfoLocator(userDataCandidates: [live.profile])
+        let cutoverCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: cutoverRequester,
+            rollingUpdatesEnabled: true
+        )
+        _ = try await cutoverCoordinator.prepare()
+
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let cutoverRegistry = try store.load()
+        let cutoverTopology = try XCTUnwrap(cutoverRegistry.topology)
+        let old = try XCTUnwrap(cutoverTopology.draining.first)
+        // This process is certainly alive — but the record claims a start an
+        // hour before the last boot, so the pid can only be a recycle.
+        let boot = try XCTUnwrap(BrokerInfo.bootTimeMilliseconds)
+        let phantomInfo = BrokerInfo(
+            protocolVersion: old.info.protocolVersion,
+            securityEpoch: old.info.securityEpoch,
+            implementationVersion: old.info.implementationVersion,
+            packageSchema: old.info.packageSchema,
+            packageVersion: old.info.packageVersion,
+            contentDigest: old.info.contentDigest,
+            pid: getpid(),
+            socketPath: old.info.socketPath,
+            token: old.info.token,
+            startedAt: boot - 3_600_000,
+            version: old.info.version
+        )
+        let phantom = BrokerGenerationRecord(
+            id: old.id,
+            role: .draining,
+            info: phantomInfo,
+            packageRoot: old.packageRoot,
+            registeredAt: old.registeredAt
+        )
+        let metadataURL = store.metadataURL(for: phantom)
+        try JSONEncoder().encode(phantomInfo).write(to: metadataURL)
+        _ = chmod(metadataURL.path, 0o600)
+        _ = try store.save(
+            currentGenerationID: cutoverTopology.current.id,
+            generations: [cutoverTopology.current, phantom],
+            expectedRevision: cutoverRegistry.revision
+        )
+
+        let reapRequester = FakeRollingBrokerUpgradeRequester(
+            upgradeDecision: .accepted,
+            retirementDecision: .accepted
+        )
+        let reapCoordinator = BrokerStartupCoordinator(
+            locator: locator,
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test",
+            upgradeRequester: reapRequester,
+            rollingUpdatesEnabled: true
+        )
+        _ = try await reapCoordinator.prepare()
+        _ = await reapCoordinator.attemptUpgradeIfNeeded()
+
+        let reaped = try store.load()
+        let retirementCalls = await reapRequester.retirementCallCount()
+        XCTAssertTrue(
+            reaped.topology?.draining.isEmpty == true,
+            "a reboot-orphaned drain with a recycled living pid must be reaped"
+        )
+        XCTAssertEqual(retirementCalls, 0, "no RPC is ever sent to a phantom")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: metadataURL.path))
+        await launcher.close()
+    }
+
     /// A dead drain is reaped even when the registry's rollback selection
     /// names its digest. Rollback requires a living target, so retaining a
     /// dead one buys nothing — and when the drain shares the relaunching

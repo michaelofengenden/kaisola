@@ -1037,40 +1037,49 @@ function publishedRendezvousPid() {
 }
 
 function acquireGenerationLock() {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    let created
-    try {
-      created = fs.openSync(config.lockFile, 'wx', 0o600)
-    } catch (error) {
-      if (error?.code !== 'EEXIST' || attempt > 0) throw error
-      let stale
-      try { stale = fs.lstatSync(config.lockFile) } catch (statError) {
-        if (statError?.code === 'ENOENT') continue
-        throw error
-      }
-      if (!stale.isFile()) throw error
-      const owners = [recordedLockPid(), publishedRendezvousPid()]
-        .filter((pid) => pid != null && pid !== process.pid)
-      const living = owners.find(pidAlive)
-      if (living != null) {
-        throw Object.assign(new Error(`held by live pid ${living}`), { code: 'ELOCKHELD' })
-      }
-      // Remove only the exact file judged stale. A concurrent fresh owner
-      // replaces the lock with a new inode that must survive this takeover.
+  // The lock must never exist without its owner's pid inside: a bare 'wx'
+  // create left a window between creation and the pid write in which a
+  // concurrent relaunch read an empty file, judged the lock ownerless, and
+  // took it over — two brokers on one generation. Hard-linking a pre-written
+  // claim file makes creation and content a single atomic step.
+  const claim = `${config.lockFile}.${process.pid}.claim`
+  try {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const claimFd = fs.openSync(claim, 'w', 0o600)
+      try { fs.writeSync(claimFd, `${process.pid}\n`) } finally { fs.closeSync(claimFd) }
       try {
-        const current = fs.lstatSync(config.lockFile)
-        if (!current.isFile() || current.ino !== stale.ino || current.dev !== stale.dev) throw error
-        fs.unlinkSync(config.lockFile)
-      } catch (takeoverError) {
-        if (takeoverError?.code !== 'ENOENT') throw error
+        fs.linkSync(claim, config.lockFile)
+        return fs.openSync(config.lockFile, 'r')
+      } catch (error) {
+        if (error?.code !== 'EEXIST' || attempt > 0) throw error
+        let stale
+        try { stale = fs.lstatSync(config.lockFile) } catch (statError) {
+          if (statError?.code === 'ENOENT') continue
+          throw error
+        }
+        if (!stale.isFile()) throw error
+        const owners = [recordedLockPid(), publishedRendezvousPid()]
+          .filter((pid) => pid != null && pid !== process.pid)
+        const living = owners.find(pidAlive)
+        if (living != null) {
+          throw Object.assign(new Error(`held by live pid ${living}`), { code: 'ELOCKHELD' })
+        }
+        // Remove only the exact file judged stale. A concurrent fresh owner
+        // replaces the lock with a new inode that must survive this takeover.
+        try {
+          const current = fs.lstatSync(config.lockFile)
+          if (!current.isFile() || current.ino !== stale.ino || current.dev !== stale.dev) throw error
+          fs.unlinkSync(config.lockFile)
+        } catch (takeoverError) {
+          if (takeoverError?.code !== 'ENOENT') throw error
+        }
+        log(`recovered stale generation lock deadOwner=${owners.join(',') || 'unrecorded'}`)
       }
-      log(`recovered stale generation lock deadOwner=${owners.join(',') || 'unrecorded'}`)
-      continue
     }
-    try { fs.writeSync(created, `${process.pid}\n`) } catch { /* owner hint only */ }
-    return created
+    throw Object.assign(new Error('busy after stale takeover retry'), { code: 'ELOCKHELD' })
+  } finally {
+    try { fs.unlinkSync(claim) } catch { /* already gone */ }
   }
-  throw Object.assign(new Error('busy after stale takeover retry'), { code: 'ELOCKHELD' })
 }
 
 try {

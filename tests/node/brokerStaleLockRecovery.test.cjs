@@ -128,6 +128,26 @@ test('a lock naming a living process keeps failing closed with exit 2', async ()
   assert.equal(fs.readFileSync(fixture.config.lockFile, 'utf8').trim(), String(process.pid))
 })
 
+test('the lock is born owned: pid inside from creation, claim file cleaned up', async () => {
+  const fixture = makeFixture()
+  const broker = startBroker(fixture, 'atomic-claim')
+  try {
+    await waitFor(() => fs.existsSync(fixture.config.infoFile), 'published rendezvous')
+    // The lock is created by hard-linking a pre-written claim file, so at no
+    // instant does it exist empty — an empty lock read mid-creation is what
+    // let a concurrent relaunch judge a fresh lock ownerless and steal it.
+    assert.equal(
+      fs.readFileSync(fixture.config.lockFile, 'utf8').trim(),
+      String(broker.child.pid)
+    )
+    const leftovers = fs.readdirSync(path.dirname(fixture.config.lockFile))
+      .filter((name) => name.endsWith('.claim'))
+    assert.deepEqual(leftovers, [])
+  } finally {
+    await terminate(broker)
+  }
+})
+
 test('a live published rendezvous blocks takeover of an unrecorded lock', async () => {
   const fixture = makeFixture()
   fs.writeFileSync(fixture.config.lockFile, '', { mode: 0o600 })

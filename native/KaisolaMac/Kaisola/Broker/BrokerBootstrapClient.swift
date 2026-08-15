@@ -21,9 +21,25 @@ extension BrokerHelperLaunching {
         at root: URL,
         expected manifest: BrokerHelperManifest
     ) async throws {
+        let schema2Expectation: BrokerHelperPackageExpectation?
+        switch manifest.packageKind {
+        case .nodeV1:
+            schema2Expectation = nil
+        case let .nativeV2(appRelease, _):
+            // This expected manifest came from the independently verified
+            // application bundle. Reuse that trusted release identity when
+            // checking the copied generation; learning it from the staged
+            // manifest would make its app-release seal circular.
+            schema2Expectation = BrokerHelperPackageExpectation(
+                packageVersion: manifest.packageVersion,
+                appReleaseVersion: appRelease.version,
+                appReleaseBuild: appRelease.build
+            )
+        }
         let verified = try BrokerHelperPackageVerification.verify(
             root: root,
-            requireSignatures: false
+            requireSignatures: false,
+            schema2Expectation: schema2Expectation
         )
         guard verified.manifest == manifest else {
             throw BrokerHelperPackageError.stagedPackageMismatch
@@ -105,10 +121,25 @@ private final class BoundedBootstrapPipeDrain: @unchecked Sendable {
     }
 }
 
+enum BrokerSessionBrokerRuntime: Equatable, Sendable {
+    case node
+    case swift
+
+    static let selectionEnvironmentKey = "KAISOLA_SESSION_BROKER_RUNTIME"
+
+    init(environment: [String: String]) {
+        // Native execution is a development-only canary. An absent, explicit
+        // Node, or unrecognized value must retain the stable current runtime.
+        // Only this exact spelling opts into the Swift broker.
+        self = environment[Self.selectionEnvironmentKey] == "swift" ? .swift : .node
+    }
+}
+
 actor BrokerBootstrapClient: BrokerHelperLaunching {
     private let bundle: Bundle
     private let registrationRecordURL: URL
     private let environment: [String: String]
+    private let runtime: BrokerSessionBrokerRuntime
     /// Always spawn the sealed bootstrap directly instead of going through the
     /// SMAppService agent. The fallback (separate native broker) uses this: the
     /// bootstrap double-forks a broker that provably outlives the app, and it
@@ -124,11 +155,28 @@ actor BrokerBootstrapClient: BrokerHelperLaunching {
         self.bundle = bundle
         self.registrationRecordURL = registrationRecordURL
         self.environment = environment
+        runtime = BrokerSessionBrokerRuntime(environment: environment)
         self.directOnly = directOnly
     }
 
     func packageManifest() throws -> BrokerHelperManifest {
         try verifiedPackage().manifest
+    }
+
+    func verifiedStagedPackage(at root: URL) async throws -> VerifiedBrokerHelperPackage {
+        let expectation = try BrokerHelperPackageVerification.bundledNativeExpectation(
+            bundle: bundle
+        )
+        // Runtime selection chooses only the next package. It must not erase
+        // the authority needed to inspect a staged Swift generation after the
+        // user unsets the development opt-in. Schema 1 ignores this native
+        // expectation, while schema 2 remains bound to the enclosing release
+        // during rollback and generation draining.
+        return try BrokerHelperPackageVerification.verify(
+            root: root,
+            requireSignatures: false,
+            schema2Expectation: expectation
+        )
     }
 
     func launch(configurationURL: URL) async throws -> Int32 {
@@ -141,10 +189,19 @@ actor BrokerBootstrapClient: BrokerHelperLaunching {
     }
 
     private func verifiedPackage() throws -> VerifiedBrokerHelperPackage {
-        try BrokerHelperPackageVerification.verifyBundled(
-            bundle: bundle,
-            requireSignatures: environment["KAISOLA_ALLOW_UNSIGNED_NATIVE_HELPER"] != "1"
-        )
+        let requireSignatures = environment["KAISOLA_ALLOW_UNSIGNED_NATIVE_HELPER"] != "1"
+        switch runtime {
+        case .node:
+            return try BrokerHelperPackageVerification.verifyBundled(
+                bundle: bundle,
+                requireSignatures: requireSignatures
+            )
+        case .swift:
+            return try BrokerHelperPackageVerification.verifyBundledNative(
+                bundle: bundle,
+                requireSignatures: requireSignatures
+            )
+        }
     }
 
     private func stagedPackage(for configurationURL: URL) throws -> VerifiedBrokerHelperPackage {

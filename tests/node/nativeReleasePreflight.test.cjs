@@ -10,6 +10,8 @@ const {
   validateLaunchAgent,
   validateLocalAppEntitlements,
   validateNodeEntitlements,
+  validateNativeCodePolicy,
+  validateNativeReleaseMetadata,
   validateUpdateConfiguration,
   writeJSONAtomic,
 } = require('../../scripts/native-release-preflight.cjs')
@@ -67,6 +69,128 @@ test('release preflight pins the per-user helper launch contract', () => {
     MachServices: { 'com.kaisola.mac.broker-bootstrap': true },
     AssociatedBundleIdentifiers: ['com.kaisola.mac'],
   }), /does not point/)
+})
+
+test('release preflight binds the native helper to this exact app release', () => {
+  const manifest = {
+    schemaVersion: 2,
+    packageVersion: '2.0.0',
+    contentDigest: 'a'.repeat(64),
+    brokerImplementationVersion: 2,
+    brokerProtocol: { minimum: 2, maximum: 2, securityEpoch: 1 },
+    appRelease: { version: '0.1.125', build: '1125000' },
+    launch: {
+      kind: 'native',
+      executable: 'bin/kaisola-session-broker',
+      arguments: [],
+    },
+    files: [
+      {
+        path: 'bin/kaisola-broker-bootstrap',
+        role: 'launch-agent-bootstrap',
+        mode: '0755',
+        machO: { architectures: ['arm64'], designatedRequirement: 'identifier bootstrap' },
+      },
+      {
+        path: 'bin/kaisola-session-broker',
+        role: 'session-broker-executable',
+        mode: '0755',
+        machO: { architectures: ['arm64'], designatedRequirement: 'identifier broker' },
+      },
+    ],
+  }
+
+  assert.deepEqual(validateNativeReleaseMetadata(manifest, {
+    CFBundleShortVersionString: '0.1.125',
+    CFBundleVersion: '1125000',
+  }), {
+    packageVersion: '2.0.0',
+    contentDigest: 'a'.repeat(64),
+    schemaVersion: 2,
+    implementationVersion: 2,
+    protocol: { minimum: 2, maximum: 2, securityEpoch: 1 },
+    appRelease: { version: '0.1.125', build: '1125000' },
+    launchExecutable: 'bin/kaisola-session-broker',
+    fileCount: 2,
+  })
+  assert.throws(() => validateNativeReleaseMetadata(manifest, {
+    CFBundleShortVersionString: '0.1.126',
+    CFBundleVersion: '1125000',
+  }), /does not match the app release/)
+  assert.throws(() => validateNativeReleaseMetadata({
+    ...manifest,
+    launch: { ...manifest.launch, executable: 'bin/node' },
+  }, {
+    CFBundleShortVersionString: '0.1.125',
+    CFBundleVersion: '1125000',
+  }), /launch contract/)
+  assert.throws(() => validateNativeReleaseMetadata({
+    ...manifest,
+    files: manifest.files.filter((entry) => entry.role !== 'launch-agent-bootstrap'),
+  }, {
+    CFBundleShortVersionString: '0.1.125',
+    CFBundleVersion: '1125000',
+  }), /bootstrap contract/)
+})
+
+test('distribution preflight pins native code to the app team without Node entitlements', () => {
+  const appSignature = {
+    developerID: true,
+    teamIdentifier: 'TEAM123456',
+    hardenedRuntime: true,
+    secureTimestamp: true,
+  }
+  const validEntry = (relativePath) => ({
+    relativePath,
+    signature: {
+      developerID: true,
+      teamIdentifier: 'TEAM123456',
+      hardenedRuntime: true,
+      secureTimestamp: true,
+    },
+    entitlements: {},
+  })
+  const entries = [
+    validEntry('bin/kaisola-broker-bootstrap'),
+    validEntry('bin/kaisola-session-broker'),
+  ]
+
+  assert.doesNotThrow(() => validateNativeCodePolicy({ appSignature, entries }))
+  assert.throws(() => validateNativeCodePolicy({
+    appSignature,
+    entries: [{
+      ...entries[0],
+      signature: { ...entries[0].signature, teamIdentifier: 'OTHER12345' },
+    }],
+  }), /not signed by the app Developer ID team/)
+  assert.throws(() => validateNativeCodePolicy({
+    appSignature,
+    entries: [{
+      ...entries[0],
+      signature: { ...entries[0].signature, hardenedRuntime: false },
+    }],
+  }), /does not enable the hardened runtime/)
+  assert.throws(() => validateNativeCodePolicy({
+    appSignature,
+    entries: [{
+      ...entries[0],
+      signature: { ...entries[0].signature, secureTimestamp: false },
+    }],
+  }), /has no secure timestamp/)
+  assert.throws(() => validateNativeCodePolicy({
+    appSignature,
+    entries: [{
+      ...entries[1],
+      entitlements: { 'com.apple.security.cs.allow-jit': true },
+    }],
+  }), /contains forbidden Node runtime entitlements/)
+  assert.throws(() => validateNativeCodePolicy({
+    appSignature,
+    entries: [{
+      ...entries[0],
+      entitlements: { 'com.apple.security.cs.allow-unsigned-executable-memory': true },
+    }],
+  }), /contains forbidden Node runtime entitlements/)
 })
 
 test('notarization implies Developer ID validation', () => {
@@ -194,6 +318,42 @@ test('the candidate workflow reseals BrokerHelper before notarization and proven
   assert.ok(signingIndex >= 0, 'the distribution signer must run in the candidate workflow')
   assert.ok(signingIndex < preflightIndex, 'the resealed package must be verified by release preflight')
   assert.ok(preflightIndex < receiptIndex, 'only a verified candidate may receive provenance')
+})
+
+test('the candidate build produces and explicitly verifies the native broker package', () => {
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const root = path.join(__dirname, '..', '..')
+  const workflow = fs.readFileSync(
+    path.join(root, '.github/workflows/release-candidate.yml'),
+    'utf8',
+  )
+  const project = fs.readFileSync(path.join(root, 'native/KaisolaMac/project.yml'), 'utf8')
+
+  assert.match(
+    project,
+    /target: KaisolaSessionBroker\s+embed: false\s+link: false/,
+    'the app target must build its Swift broker dependency implicitly',
+  )
+  assert.match(workflow, /Contents\/Resources\/BrokerSessionHelper/)
+  assert.match(workflow, /native-package-policy\.json/)
+  assert.match(workflow, /--app-release-version "\$NATIVE_MARKETING_VERSION"/)
+  assert.match(workflow, /--app-release-build "\$NATIVE_BUILD_VERSION"/)
+  assert.match(workflow, /--require-signatures/)
+})
+
+test('macOS workflows run the native distribution reseal regression', () => {
+  const fs = require('node:fs')
+  const path = require('node:path')
+  const root = path.join(__dirname, '..', '..')
+  for (const workflow of ['swift-contracts.yml', 'release-candidate.yml']) {
+    const contents = fs.readFileSync(path.join(root, '.github/workflows', workflow), 'utf8')
+    assert.match(
+      contents,
+      /tests\/node\/nativeDistributionSign\.test\.cjs/,
+      `${workflow} must run the native reseal and no-JIT contract`,
+    )
+  }
 })
 
 test('the shipped update key matches the key that signs the appcast', () => {

@@ -11,6 +11,7 @@ public struct ShadowBrokerServiceConfiguration: Equatable, Sendable {
     public let pid: Int32
     public let startedAt: Int64
     public let version: String
+    public let maximumLiveTerminals: Int
 
     public init(
         expectedToken: String,
@@ -20,12 +21,13 @@ public struct ShadowBrokerServiceConfiguration: Equatable, Sendable {
         contentDigest: String,
         pid: Int32 = getpid(),
         startedAt: Int64 = Int64(Date().timeIntervalSince1970 * 1_000),
-        version: String = "kaisola-swift-shadow"
+        version: String = "kaisola-swift-shadow",
+        maximumLiveTerminals: Int = BrokerWire.defaultMaximumLiveTerminals
     ) throws {
         guard Self.isHex(expectedToken, exactBytes: 64) else {
             throw ShadowBrokerServiceConfigurationError.invalidToken
         }
-        guard packageSchema == BrokerWire.nativeHelperPackageSchema else {
+        guard BrokerWire.supportedHelperPackageSchemas.contains(packageSchema) else {
             throw ShadowBrokerServiceConfigurationError.invalidPackageSchema
         }
         guard Self.isLowercaseHex(contentDigest, exactBytes: 64) else {
@@ -36,7 +38,9 @@ public struct ShadowBrokerServiceConfiguration: Equatable, Sendable {
             throw ShadowBrokerServiceConfigurationError.invalidPackageVersion
         }
         guard pid > 0, startedAt > 0,
-              !version.isEmpty, version.utf8.count <= 128 else {
+              !version.isEmpty, version.utf8.count <= 128,
+              (1...BrokerWire.maximumConfigurableLiveTerminals)
+                .contains(maximumLiveTerminals) else {
             throw ShadowBrokerServiceConfigurationError.invalidRuntimeIdentity
         }
 
@@ -48,6 +52,7 @@ public struct ShadowBrokerServiceConfiguration: Equatable, Sendable {
         self.pid = pid
         self.startedAt = startedAt
         self.version = version
+        self.maximumLiveTerminals = maximumLiveTerminals
     }
 
     private static func isHex(_ value: String, exactBytes: Int) -> Bool {

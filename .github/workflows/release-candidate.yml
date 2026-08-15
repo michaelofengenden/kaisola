@@ -63,6 +63,7 @@ jobs:
           node --test
           tests/node/nativeReleaseCandidate.test.cjs
           tests/node/nativeAppcast.test.cjs
+          tests/node/nativeDistributionSign.test.cjs
           tests/node/nativeReleasePreflight.test.cjs
       - name: Require release signing and notarization credentials
         env:
@@ -178,8 +179,15 @@ jobs:
       - name: Verify Developer ID candidate before notarization
         run: |
           set -euo pipefail
+          app="$RUNNER_TEMP/kaisola-native/Build/Products/Release/Kaisola.app"
+          node scripts/native-broker-package.cjs \
+            --verify "$app/Contents/Resources/BrokerSessionHelper" \
+            --policy native/KaisolaMac/BrokerHelper/native-package-policy.json \
+            --app-release-version "$NATIVE_MARKETING_VERSION" \
+            --app-release-build "$NATIVE_BUILD_VERSION" \
+            --require-signatures
           npm run native:preflight -- \
-            --app "$RUNNER_TEMP/kaisola-native/Build/Products/Release/Kaisola.app" \
+            --app "$app" \
             --require-updates --require-developer-id \
             --source-commit "$GITHUB_SHA"
       - name: Prove packaged broker and PTY continuity

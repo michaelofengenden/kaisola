@@ -1,6 +1,7 @@
 import Darwin
 import Foundation
 import XCTest
+import KaisolaBrokerProtocol
 @testable import Kaisola
 
 final class BrokerStartupCoordinatorTests: XCTestCase {
@@ -30,6 +31,51 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         XCTAssertEqual(info.contentDigest, String(repeating: "d", count: 64))
         let launchCount = await launcher.launchCount
         XCTAssertEqual(launchCount, 1)
+        let launchConfiguration = await launcher.lastLaunchConfiguration
+        XCTAssertNil(launchConfiguration?.appReleaseVersion)
+        XCTAssertNil(launchConfiguration?.appReleaseBuild)
+        await launcher.close()
+    }
+
+    func testNativePackageLaunchSealsVerifiedAppReleasePair() async throws {
+        let home = try privateTemporaryDirectory()
+        let profile = home.appendingPathComponent("Kaisola", isDirectory: true)
+        let manifest = try JSONDecoder().decode(
+            BrokerHelperManifest.self,
+            from: JSONSerialization.data(withJSONObject: [
+                "schemaVersion": BrokerWire.nativeHelperPackageSchema,
+                "packageVersion": "2.0.0",
+                "contentDigest": String(repeating: "e", count: 64),
+                "brokerImplementationVersion": BrokerWire.implementationVersion,
+                "brokerProtocol": [
+                    "minimum": BrokerWire.protocolVersion,
+                    "maximum": BrokerWire.protocolVersion,
+                    "securityEpoch": BrokerWire.securityEpoch,
+                ],
+                "appRelease": ["version": "0.1.125", "build": "125"],
+                "launch": [
+                    "kind": "native",
+                    "executable": "bin/kaisola-session-broker",
+                    "arguments": [],
+                ],
+                "files": [],
+            ])
+        )
+        let launcher = FakeBrokerHelperLauncher(manifest: manifest)
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test"
+        )
+
+        _ = try await coordinator.prepare()
+        let captured = await launcher.lastLaunchConfiguration
+        let configuration = try XCTUnwrap(captured)
+        XCTAssertEqual(configuration.packageSchema, BrokerWire.nativeHelperPackageSchema)
+        XCTAssertEqual(configuration.packageVersion, "2.0.0")
+        XCTAssertEqual(configuration.appReleaseVersion, "0.1.125")
+        XCTAssertEqual(configuration.appReleaseBuild, "125")
         await launcher.close()
     }
 
@@ -2681,19 +2727,23 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
     private let onLaunch: @Sendable () async throws -> Void
     private let afterLaunch: @Sendable () async throws -> Void
     private(set) var launchCount = 0
+    private(set) var lastLaunchConfiguration: BrokerLaunchConfiguration?
+    private let manifest: BrokerHelperManifest?
     private var descriptor: Int32 = -1
     private var socketURL: URL?
 
     init(
         implementationVersion: Int = 1,
         contentDigest: String = String(repeating: "d", count: 64),
+        manifest: BrokerHelperManifest? = nil,
         rejectedStagedDigests: Set<String> = [],
         failLaunch: Bool = false,
         onLaunch: @escaping @Sendable () async throws -> Void = {},
         afterLaunch: @escaping @Sendable () async throws -> Void = {}
     ) {
-        self.implementationVersion = implementationVersion
-        self.contentDigest = contentDigest
+        self.implementationVersion = manifest?.brokerImplementationVersion ?? implementationVersion
+        self.contentDigest = manifest?.contentDigest ?? contentDigest
+        self.manifest = manifest
         self.rejectedStagedDigests = rejectedStagedDigests
         self.failLaunch = failLaunch
         self.onLaunch = onLaunch
@@ -2701,7 +2751,8 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
     }
 
     func packageManifest() async throws -> BrokerHelperManifest {
-        BrokerHelperManifest(
+        if let manifest { return manifest }
+        return BrokerHelperManifest(
             schemaVersion: 1,
             packageVersion: "test-package",
             contentDigest: contentDigest,
@@ -2753,6 +2804,7 @@ private actor FakeBrokerHelperLauncher: BrokerHelperLaunching {
             BrokerLaunchConfiguration.self,
             from: Data(contentsOf: configurationURL)
         )
+        lastLaunchConfiguration = configuration
         let socket = URL(fileURLWithPath: configuration.socketPath)
         descriptor = try bindUnixSocket(at: socket)
         socketURL = socket

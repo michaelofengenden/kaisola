@@ -102,7 +102,7 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
         ) { XCTAssertEqual($0 as? BrokerLaunchConfigurationError, .invalidConfiguration) }
     }
 
-    func testDecodedNativePackageSchemaRemainsNonLaunchable() throws {
+    func testNativePackageSchemaRequiresAuthenticatedAppReleasePair() throws {
         let home = URL(fileURLWithPath: "/tmp/kaisola-launch-home")
         let userData = home.appendingPathComponent("Kaisola", isDirectory: true)
         let broker = userData.appendingPathComponent("session-broker", isDirectory: true)
@@ -110,9 +110,11 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
         let native = BrokerLaunchConfiguration(
             protocolVersion: current.protocolVersion,
             securityEpoch: current.securityEpoch,
-            implementationVersion: current.implementationVersion,
+            implementationVersion: BrokerWire.implementationVersion,
             packageSchema: BrokerWire.nativeHelperPackageSchema,
             packageVersion: "2.0.0",
+            appReleaseVersion: "0.1.125",
+            appReleaseBuild: "125",
             contentDigest: current.contentDigest,
             packageRoot: current.packageRoot,
             token: current.token,
@@ -127,15 +129,113 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
             smoke: false
         )
 
-        XCTAssertThrowsError(
-            try native.validate(
+        XCTAssertNoThrow(try native.validate(
+            configurationURL: broker.appendingPathComponent("launch-native-schema2.json"),
+            homeDirectory: home
+        ))
+        XCTAssertEqual(native.appReleaseVersion, "0.1.125")
+        XCTAssertEqual(native.appReleaseBuild, "125")
+
+        for incomplete in [
+            BrokerLaunchConfiguration(
+                replacingAppReleaseIn: native,
+                version: "0.1.125",
+                build: nil
+            ),
+            BrokerLaunchConfiguration(
+                replacingAppReleaseIn: native,
+                version: nil,
+                build: "125"
+            ),
+        ] {
+            XCTAssertThrowsError(try incomplete.validate(
                 configurationURL: broker.appendingPathComponent("launch-native-schema2.json"),
                 homeDirectory: home
+            )) {
+                XCTAssertEqual($0 as? BrokerLaunchConfigurationError, .invalidConfiguration)
+            }
+        }
+        for invalidIdentity in ["", String(repeating: "x", count: 65), "bad\0identity"] {
+            let invalid = BrokerLaunchConfiguration(
+                replacingAppReleaseIn: native,
+                version: invalidIdentity,
+                build: "125"
             )
-        ) {
+            XCTAssertThrowsError(try invalid.validate(
+                configurationURL: broker.appendingPathComponent("launch-native-schema2.json"),
+                homeDirectory: home
+            )) {
+                XCTAssertEqual($0 as? BrokerLaunchConfigurationError, .invalidConfiguration)
+            }
+        }
+        let schema1WithNativeProvenance = BrokerLaunchConfiguration(
+            replacingAppReleaseIn: current,
+            version: "0.1.125",
+            build: "125"
+        )
+        XCTAssertThrowsError(try schema1WithNativeProvenance.validate(
+            configurationURL: broker.appendingPathComponent("launch-native-schema1.json"),
+            homeDirectory: home
+        )) {
             XCTAssertEqual($0 as? BrokerLaunchConfigurationError, .invalidConfiguration)
         }
         XCTAssertEqual(BrokerWire.helperPackageSchema, BrokerWire.nodeHelperPackageSchema)
+    }
+
+    func testLaunchPayloadMustMatchAuthenticatedPackageSchema() throws {
+        let home = URL(fileURLWithPath: "/tmp/kaisola-launch-home")
+        let userData = home.appendingPathComponent("Kaisola", isDirectory: true)
+        let broker = userData.appendingPathComponent("session-broker", isDirectory: true)
+        let node = configuration(userData: userData, broker: broker)
+        let native = BrokerLaunchConfiguration(
+            replacingAppReleaseIn: node,
+            packageSchema: BrokerWire.nativeHelperPackageSchema,
+            packageVersion: "2.0.0",
+            version: "0.1.125",
+            build: "125"
+        )
+        let nodePayload = BrokerLaunchPayload.node(
+            executable: URL(fileURLWithPath: "/private/tmp/node"),
+            script: URL(fileURLWithPath: "/private/tmp/session-broker.cjs")
+        )
+        let nativePayload = BrokerLaunchPayload.native(
+            executable: URL(fileURLWithPath: "/private/tmp/kaisola-session-broker"),
+            arguments: ["--sealed-static-argument"]
+        )
+        let launchURL = broker.appendingPathComponent("launch-native-payload.json")
+
+        let nodeCommand = try node.launchCommand(
+            for: nodePayload,
+            configurationURL: launchURL
+        )
+        XCTAssertEqual(nodeCommand.arguments, [
+            "/private/tmp/session-broker.cjs",
+            "--launch",
+            launchURL.path,
+        ])
+        XCTAssertFalse(nodeCommand.requiresSwiftLaunchMarker)
+        let nativeCommand = try native.launchCommand(
+            for: nativePayload,
+            configurationURL: launchURL
+        )
+        XCTAssertEqual(nativeCommand.arguments, [
+            "--sealed-static-argument",
+            "--launch",
+            launchURL.path,
+        ])
+        XCTAssertTrue(nativeCommand.requiresSwiftLaunchMarker)
+        XCTAssertThrowsError(try native.launchCommand(
+            for: nodePayload,
+            configurationURL: launchURL
+        )) {
+            XCTAssertEqual($0 as? BrokerLaunchConfigurationError, .invalidConfiguration)
+        }
+        XCTAssertThrowsError(try node.launchCommand(
+            for: nativePayload,
+            configurationURL: launchURL
+        )) {
+            XCTAssertEqual($0 as? BrokerLaunchConfigurationError, .invalidConfiguration)
+        }
     }
 
     func testLegacyLaunchWithoutStagedPackageKeepsExactSingleBrokerLayout() throws {
@@ -205,6 +305,38 @@ final class BrokerLaunchConfigurationTests: XCTestCase {
             startedAt: 1,
             version: "native-test",
             smoke: false
+        )
+    }
+}
+
+private extension BrokerLaunchConfiguration {
+    init(
+        replacingAppReleaseIn source: BrokerLaunchConfiguration,
+        packageSchema: Int? = nil,
+        packageVersion: String? = nil,
+        version: String?,
+        build: String?
+    ) {
+        self.init(
+            protocolVersion: source.protocolVersion,
+            securityEpoch: source.securityEpoch,
+            implementationVersion: source.implementationVersion,
+            packageSchema: packageSchema ?? source.packageSchema,
+            packageVersion: packageVersion ?? source.packageVersion,
+            appReleaseVersion: version,
+            appReleaseBuild: build,
+            contentDigest: source.contentDigest,
+            packageRoot: source.packageRoot,
+            token: source.token,
+            socketPath: source.socketPath,
+            infoFile: source.infoFile,
+            lockFile: source.lockFile,
+            storageDir: source.storageDir,
+            logFile: source.logFile,
+            maximumLiveTerminals: source.maximumLiveTerminals,
+            startedAt: source.startedAt,
+            version: source.version,
+            smoke: source.smoke
         )
     }
 }

@@ -1153,9 +1153,13 @@ public actor ShadowBrokerService {
         ]
         if includeCapacity {
             status["terminalCapacity"] = .object([
-                "maximumLiveTerminals": .integer(64),
+                "maximumLiveTerminals": .integer(
+                    Int64(configuration.maximumLiveTerminals)
+                ),
                 "liveTerminalCount": .integer(Int64(liveCount)),
-                "availableTerminalSlots": .integer(Int64(max(0, 64 - liveCount))),
+                "availableTerminalSlots": .integer(
+                    Int64(max(0, configuration.maximumLiveTerminals - liveCount))
+                ),
             ])
         }
         return status

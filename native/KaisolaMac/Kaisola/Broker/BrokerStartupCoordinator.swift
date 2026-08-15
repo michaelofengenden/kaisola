@@ -1450,12 +1450,27 @@ actor BrokerStartupCoordinator:
         }
         let token = tokenBytes.map { String(format: "%02x", $0) }.joined()
         let timestamp = Int64(Date().timeIntervalSince1970 * 1_000)
+        let appReleaseVersion: String?
+        let appReleaseBuild: String?
+        switch package.packageKind {
+        case .nodeV1:
+            appReleaseVersion = nil
+            appReleaseBuild = nil
+        case let .nativeV2(appRelease, _):
+            // This pair came from the verified schema-2 manifest. Seal the
+            // same identities into the private request so the detached
+            // bootstrap can re-verify the staged package against them.
+            appReleaseVersion = appRelease.version
+            appReleaseBuild = appRelease.build
+        }
         let configuration = BrokerLaunchConfiguration(
             protocolVersion: BrokerWire.protocolVersion,
             securityEpoch: BrokerWire.securityEpoch,
             implementationVersion: package.brokerImplementationVersion,
             packageSchema: package.schemaVersion,
             packageVersion: package.packageVersion,
+            appReleaseVersion: appReleaseVersion,
+            appReleaseBuild: appReleaseBuild,
             contentDigest: package.contentDigest,
             packageRoot: userData
                 .appendingPathComponent("broker-generations", isDirectory: true)

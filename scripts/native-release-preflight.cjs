@@ -128,6 +128,70 @@ function validateLaunchAgent(plist) {
   }
 }
 
+function validateNativeReleaseMetadata(manifest, info) {
+  const appVersion = String(info?.CFBundleShortVersionString || '')
+  const appBuild = String(info?.CFBundleVersion || '')
+  const executableRecords = Array.isArray(manifest?.files)
+    ? manifest.files.filter((entry) => entry?.role === 'session-broker-executable')
+    : []
+  const bootstrapRecords = Array.isArray(manifest?.files)
+    ? manifest.files.filter((entry) => entry?.role === 'launch-agent-bootstrap')
+    : []
+  if (manifest?.schemaVersion !== 2
+      || manifest?.brokerImplementationVersion !== 2
+      || manifest?.brokerProtocol?.minimum !== 2
+      || manifest?.brokerProtocol?.maximum !== 2
+      || manifest?.brokerProtocol?.securityEpoch !== 1
+      || !/^[0-9a-f]{64}$/.test(String(manifest?.contentDigest || ''))) {
+    fail('native helper manifest version is outside this preflight policy')
+  }
+  if (!appVersion || !appBuild
+      || manifest?.appRelease?.version !== appVersion
+      || manifest?.appRelease?.build !== appBuild) {
+    fail('native helper does not match the app release')
+  }
+  if (manifest?.launch?.kind !== 'native'
+      || manifest.launch.executable !== 'bin/kaisola-session-broker'
+      || !Array.isArray(manifest.launch.arguments)
+      || executableRecords.length !== 1
+      || executableRecords[0].path !== manifest.launch.executable) {
+    fail('native helper launch contract is invalid')
+  }
+  const bootstrap = bootstrapRecords[0]
+  if (bootstrapRecords.length !== 1
+      || bootstrap?.path !== 'bin/kaisola-broker-bootstrap'
+      || bootstrap?.mode !== '0755'
+      || bootstrap?.machO?.designatedRequirement == null
+      || bootstrap.machO.designatedRequirement.length < 1) {
+    fail('native helper bootstrap contract is invalid')
+  }
+  requireExactArchitectures(
+    executableRecords[0]?.machO?.architectures || [],
+    'native helper manifest session broker',
+  )
+  requireExactArchitectures(
+    bootstrap.machO.architectures || [],
+    'native helper manifest bootstrap',
+  )
+  return {
+    packageVersion: manifest.packageVersion,
+    contentDigest: manifest.contentDigest,
+    schemaVersion: manifest.schemaVersion,
+    implementationVersion: manifest.brokerImplementationVersion,
+    protocol: {
+      minimum: manifest.brokerProtocol.minimum,
+      maximum: manifest.brokerProtocol.maximum,
+      securityEpoch: manifest.brokerProtocol.securityEpoch,
+    },
+    appRelease: {
+      version: manifest.appRelease.version,
+      build: manifest.appRelease.build,
+    },
+    launchExecutable: manifest.launch.executable,
+    fileCount: manifest.files.length,
+  }
+}
+
 function codeSignature(file) {
   return parseCodeSignature(run('/usr/bin/codesign', ['-dv', '--verbose=4', file]))
 }
@@ -161,6 +225,34 @@ function validateDistributionCode({ app, appSignature, helperRoot, manifest, nod
   }
   validateNodeEntitlements(codeEntitlements(node))
   validateEmbeddedFrameworks(app, appSignature)
+}
+
+function validateNativeCodePolicy({ appSignature, entries }) {
+  if (!Array.isArray(entries) || entries.length < 1) {
+    fail('native helper manifest contains no signed Mach-O code')
+  }
+  for (const entry of entries) {
+    const label = `native helper code: ${entry.relativePath}`
+    if (!entry.signature?.developerID
+        || entry.signature.teamIdentifier !== appSignature.teamIdentifier) {
+      fail(`${label} is not signed by the app Developer ID team`)
+    }
+    if (!entry.signature.hardenedRuntime) {
+      fail(`${label} does not enable the hardened runtime`)
+    }
+    if (!entry.signature.secureTimestamp) {
+      fail(`${label} has no secure timestamp`)
+    }
+    const entitlements = entry.entitlements || {}
+    if (entitlements['com.apple.security.cs.allow-jit'] === true
+        || entitlements['com.apple.security.cs.allow-unsigned-executable-memory'] === true) {
+      fail(`${label} contains forbidden Node runtime entitlements`)
+    }
+    if (entitlements['com.apple.security.cs.disable-library-validation'] === true
+        || entitlements['com.apple.security.get-task-allow'] === true) {
+      fail(`${label} contains a forbidden code-signing entitlement`)
+    }
+  }
 }
 
 /** Notarization rejects any nested executable without a Developer ID chain,
@@ -263,19 +355,43 @@ function preflight(options) {
 
   const main = path.join(contents, 'MacOS', String(info.CFBundleExecutable || ''))
   const helperRoot = path.join(contents, 'Resources', 'BrokerHelper')
+  const nativeHelperRoot = path.join(contents, 'Resources', 'BrokerSessionHelper')
   const node = path.join(helperRoot, 'bin', 'node')
   const bootstrap = path.join(helperRoot, 'bin', 'kaisola-broker-bootstrap')
   const manifestFile = path.join(helperRoot, 'manifest.json')
+  const nativeBroker = path.join(nativeHelperRoot, 'bin', 'kaisola-session-broker')
+  const nativeBootstrap = path.join(nativeHelperRoot, 'bin', 'kaisola-broker-bootstrap')
+  const nativeManifestFile = path.join(nativeHelperRoot, 'manifest.json')
   const launchAgentFile = path.join(contents, 'Library', 'LaunchAgents', `${EXPECTED_HELPER_LABEL}.plist`)
   const sparkle = path.join(contents, 'Frameworks', 'Sparkle.framework')
-  for (const required of [main, node, bootstrap, manifestFile, launchAgentFile, sparkle]) {
+  for (const required of [
+    main,
+    node,
+    bootstrap,
+    manifestFile,
+    nativeBroker,
+    nativeBootstrap,
+    nativeManifestFile,
+    launchAgentFile,
+    sparkle,
+  ]) {
     if (!fs.existsSync(required)) fail(`packaged build is missing ${path.relative(app, required)}`)
   }
 
   const appArchitectures = requireExactArchitectures(architectures(main), 'native app')
   const nodeArchitectures = requireExactArchitectures(architectures(node), 'Node runtime')
   const bootstrapArchitectures = requireExactArchitectures(architectures(bootstrap), 'broker bootstrap')
+  const nativeBrokerArchitectures = requireExactArchitectures(
+    architectures(nativeBroker),
+    'Swift session broker',
+  )
+  const nativeBootstrapArchitectures = requireExactArchitectures(
+    architectures(nativeBootstrap),
+    'native broker bootstrap',
+  )
   const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf8'))
+  const nativeManifest = JSON.parse(fs.readFileSync(nativeManifestFile, 'utf8'))
+  const nativeReceipt = validateNativeReleaseMetadata(nativeManifest, info)
   requireExactArchitectures(manifest?.node?.architectures || [], 'helper manifest Node runtime')
   if (manifest.schemaVersion !== 1 || manifest.brokerImplementationVersion !== 2) {
     fail('helper manifest version is outside this preflight policy')
@@ -292,17 +408,46 @@ function preflight(options) {
     '--verify', helperRoot,
     '--require-signatures',
   ])
+  run(process.execPath, [
+    path.join(__dirname, 'native-broker-package.cjs'),
+    '--verify', nativeHelperRoot,
+    '--policy', path.join(
+      __dirname,
+      '..',
+      'native',
+      'KaisolaMac',
+      'BrokerHelper',
+      'native-package-policy.json',
+    ),
+    '--app-release-version', String(info.CFBundleShortVersionString),
+    '--app-release-build', String(info.CFBundleVersion),
+    '--require-signatures',
+  ])
   run(bootstrap, ['--verify-package'])
 
   const signature = codeSignature(app)
-  if (signature.developerID || options.requireDeveloperID) validateDistributionCode({
-    app,
-    appSignature: signature,
-    helperRoot,
-    manifest,
-    node,
-  })
-  else {
+  if (signature.developerID || options.requireDeveloperID) {
+    validateDistributionCode({
+      app,
+      appSignature: signature,
+      helperRoot,
+      manifest,
+      node,
+    })
+    validateNativeCodePolicy({
+      appSignature: signature,
+      entries: nativeManifest.files
+        .filter((entry) => entry?.machO)
+        .map((entry) => {
+          const absolute = path.join(nativeHelperRoot, entry.path)
+          return {
+            relativePath: entry.path,
+            signature: codeSignature(absolute),
+            entitlements: codeEntitlements(absolute),
+          }
+        }),
+    })
+  } else {
     if (!signature.hardenedRuntime) fail('local preview must enable the hardened runtime')
     validateLocalAppEntitlements(codeEntitlements(app))
   }
@@ -328,6 +473,8 @@ function preflight(options) {
       app: appArchitectures,
       node: nodeArchitectures,
       bootstrap: bootstrapArchitectures,
+      nativeBroker: nativeBrokerArchitectures,
+      nativeBootstrap: nativeBootstrapArchitectures,
     },
     helper: {
       packageVersion: manifest.packageVersion,
@@ -340,6 +487,7 @@ function preflight(options) {
         securityEpoch: manifest.brokerProtocol?.securityEpoch,
       },
       fileCount: manifest.files?.length,
+      native: nativeReceipt,
     },
     updatesConfigured: updates != null,
     developerID: signature.developerID,
@@ -389,6 +537,8 @@ module.exports = {
   validateDistributionAppEntitlements,
   validateLocalAppEntitlements,
   validateNodeEntitlements,
+  validateNativeCodePolicy,
+  validateNativeReleaseMetadata,
   validateLaunchAgent,
   validateUpdateConfiguration,
   writeJSONAtomic,

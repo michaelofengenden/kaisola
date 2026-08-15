@@ -151,9 +151,9 @@ struct BrokerHelperPackageExpectation: Equatable, Sendable {
     let appReleaseBuild: String
 }
 
-// Schema 2 is decoded and staged for conformance only in this slice;
-// BrokerLaunchConfiguration and BrokerBootstrapService remain pinned to the
-// schema-1 Node launch.
+// The package discriminator stays explicit throughout verification and launch.
+// Schema 1 remains the stable Node default while schema 2 is reachable only
+// through the development-selected native package root.
 enum BrokerLaunchPayload: Equatable, Sendable {
     case node(executable: URL, script: URL)
     case native(executable: URL, arguments: [String])
@@ -193,6 +193,11 @@ struct VerifiedBrokerHelperPackage: Equatable, Sendable {
 }
 
 enum BrokerHelperPackageVerification {
+    /// This is the trust-policy identity from
+    /// `BrokerHelper/native-package-policy.json`, not a value learned from the
+    /// package being verified. Keep the two values synchronized whenever the
+    /// native package format or compatibility envelope changes.
+    static let bundledNativePackageVersion = "2.0.0"
     static let maximumManifestBytes = 2 * 1_024 * 1_024
     static let maximumFileCount = 512
     static let maximumSingleFileBytes: Int64 = 512 * 1_024 * 1_024
@@ -207,11 +212,55 @@ enum BrokerHelperPackageVerification {
         return resourceURL.appendingPathComponent("BrokerHelper", isDirectory: true)
     }
 
+    static func bundledNativeRoot(bundle: Bundle = .main) throws -> URL {
+        guard let resourceURL = bundle.resourceURL else {
+            throw BrokerHelperPackageError.notPackaged
+        }
+        return resourceURL.appendingPathComponent("BrokerSessionHelper", isDirectory: true)
+    }
+
     static func verifyBundled(
         bundle: Bundle = .main,
         requireSignatures: Bool
     ) throws -> VerifiedBrokerHelperPackage {
         try verify(root: bundledRoot(bundle: bundle), requireSignatures: requireSignatures)
+    }
+
+    static func verifyBundledNative(
+        bundle: Bundle = .main,
+        requireSignatures: Bool
+    ) throws -> VerifiedBrokerHelperPackage {
+        let expectation = try bundledNativeExpectation(bundle: bundle)
+        let verified = try verify(
+            root: bundledNativeRoot(bundle: bundle),
+            requireSignatures: requireSignatures,
+            schema2Expectation: expectation
+        )
+        try validateBundledNativeBootstrap(verified)
+        return verified
+    }
+
+    static func bundledNativeExpectation(
+        bundle: Bundle = .main
+    ) throws -> BrokerHelperPackageExpectation {
+        // Schema 2 binds a candidate to the app release that sealed it. Never
+        // accept the package's own appRelease fields as their expectation.
+        // They become trusted only after matching these outer-bundle values.
+        guard let appReleaseVersion = bundle.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String,
+        let appReleaseBuild = bundle.object(
+            forInfoDictionaryKey: "CFBundleVersion"
+        ) as? String,
+        isBoundedIdentity(appReleaseVersion),
+        isBoundedIdentity(appReleaseBuild) else {
+            throw BrokerHelperPackageError.incompatibleManifest
+        }
+        return BrokerHelperPackageExpectation(
+            packageVersion: bundledNativePackageVersion,
+            appReleaseVersion: appReleaseVersion,
+            appReleaseBuild: appReleaseBuild
+        )
     }
 
     static func verify(
@@ -459,6 +508,34 @@ enum BrokerHelperPackageVerification {
               let requirement = machO.designatedRequirement,
               !requirement.isEmpty else {
             throw BrokerHelperPackageError.invalidManifest
+        }
+    }
+
+    /// The runtime-neutral schema permits a package whose only executable is
+    /// the broker, but Kaisola's current detached-launch path deliberately
+    /// travels through the sealed Swift bootstrap inside the selected root.
+    /// Hold bundled candidates to that stronger deployment profile so a
+    /// missing, script-based, or substituted bootstrap fails during selection
+    /// instead of at process execution.
+    private static func validateBundledNativeBootstrap(
+        _ package: VerifiedBrokerHelperPackage
+    ) throws {
+        let records = package.manifest.files.filter {
+            $0.role == "launch-agent-bootstrap"
+        }
+        guard records.count == 1,
+              let bootstrap = records.first,
+              bootstrap.path == "bin/kaisola-broker-bootstrap",
+              bootstrap.mode == "0755",
+              bootstrap.machO?.architectures == ["arm64"],
+              let requirement = bootstrap.machO?.designatedRequirement,
+              !requirement.isEmpty,
+              FileManager.default.isExecutableFile(
+                  atPath: package.bootstrapExecutable.path
+              ) else {
+            throw BrokerHelperPackageError.inventoryMismatch(
+                "sealed native bootstrap is missing"
+            )
         }
     }
 

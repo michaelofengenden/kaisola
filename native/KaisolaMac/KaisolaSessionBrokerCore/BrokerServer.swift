@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import KaisolaBrokerProtocol
 
 public final class BrokerServer: @unchecked Sendable {
     private let configuration: ShadowBrokerConfiguration
@@ -7,6 +8,7 @@ public final class BrokerServer: @unchecked Sendable {
     private let expectedSocketOwnerUID: uid_t
     private let service: ShadowBrokerService
     private let terminalStore: FreshTerminalStore?
+    private let generationLifecycle: BrokerGenerationLifecycle?
     private let log: BrokerLog
     private let beforeStaleSocketRemoval: (@Sendable () -> Void)?
     private let afterSocketBind: (@Sendable () throws -> Void)?
@@ -25,9 +27,16 @@ public final class BrokerServer: @unchecked Sendable {
     private var preAuthenticationConnectionIDs: Set<UUID> = []
 
     public convenience init(configuration: ShadowBrokerConfiguration) throws {
+        let generationLifecycle = configuration.runtimeMode == .launch
+            ? try BrokerGenerationLifecycle(configuration: configuration)
+            : nil
         try self.init(
             configuration: configuration,
-            expectedPeerUID: geteuid()
+            expectedPeerUID: geteuid(),
+            generationLifecycle: generationLifecycle,
+            serviceStartedAt: configuration.startedAt
+                ?? Int64(Date().timeIntervalSince1970 * 1_000),
+            serviceVersion: configuration.version ?? "kaisola-swift-shadow"
         )
     }
 
@@ -36,6 +45,7 @@ public final class BrokerServer: @unchecked Sendable {
         expectedPeerUID: uid_t,
         expectedSocketOwnerUID: uid_t = geteuid(),
         log: BrokerLog = BrokerLog(),
+        generationLifecycle: BrokerGenerationLifecycle? = nil,
         beforeStaleSocketRemoval: (@Sendable () -> Void)? = nil,
         afterSocketBind: (@Sendable () throws -> Void)? = nil,
         afterSocketChmodValidation: (@Sendable () throws -> Void)? = nil,
@@ -49,6 +59,7 @@ public final class BrokerServer: @unchecked Sendable {
         self.expectedPeerUID = expectedPeerUID
         self.expectedSocketOwnerUID = expectedSocketOwnerUID
         self.log = log
+        self.generationLifecycle = generationLifecycle
         self.beforeStaleSocketRemoval = beforeStaleSocketRemoval
         self.afterSocketBind = afterSocketBind
         self.afterSocketChmodValidation = afterSocketChmodValidation
@@ -61,18 +72,23 @@ public final class BrokerServer: @unchecked Sendable {
             expectedToken: configuration.token,
             expectedUID: UInt32(expectedPeerUID),
             packageSchema: configuration.packageSchema,
+            packageVersion: configuration.packageVersion,
             contentDigest: configuration.contentDigest,
             pid: servicePID,
             startedAt: serviceStartedAt,
-            version: serviceVersion
+            version: serviceVersion,
+            maximumLiveTerminals: configuration.maximumLiveTerminals
+                ?? BrokerWire.defaultMaximumLiveTerminals
         )
         let terminalStore: FreshTerminalStore?
         switch configuration.runtimeMode {
         case .shadow:
             terminalStore = nil
-        case .freshPTY:
+        case .freshPTY, .launch:
             terminalStore = FreshTerminalStore(
-                factory: DarwinPTYProcessFactory()
+                factory: DarwinPTYProcessFactory(),
+                maximumLiveTerminals: configuration.maximumLiveTerminals
+                    ?? BrokerWire.defaultMaximumLiveTerminals
             )
         }
         self.terminalStore = terminalStore
@@ -110,8 +126,11 @@ public final class BrokerServer: @unchecked Sendable {
             }
             closing.connections.forEach { $0.cancel() }
             removeCreatedSocketIfUnchanged(prepared.identity)
+            generationLifecycle?.cleanup()
             log.record(.serverStopped)
         }
+
+        try generationLifecycle?.publish()
 
         do {
             try await serveConnections(on: prepared.descriptor)

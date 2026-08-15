@@ -13,6 +13,12 @@ struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
     let implementationVersion: Int
     let packageSchema: Int
     let packageVersion: String
+    /// Schema-2 app provenance is copied from the already verified native
+    /// package. The bootstrap then uses this pair as an expectation while it
+    /// re-verifies the staged root, so the private launch file cannot select a
+    /// different native build under the same compatibility envelope.
+    let appReleaseVersion: String?
+    let appReleaseBuild: String?
     let contentDigest: String
     /// Digest-addressed verified copy outside the replaceable application
     /// bundle. Older launch files omit this field and retain the bundled
@@ -35,9 +41,52 @@ struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
     enum CodingKeys: String, CodingKey {
         case protocolVersion = "protocol"
         case securityEpoch, implementationVersion, packageSchema, packageVersion, contentDigest
+        case appReleaseVersion, appReleaseBuild
         case packageRoot
         case token, socketPath, infoFile, lockFile, storageDir, logFile, maximumLiveTerminals
         case startedAt, version, smoke
+    }
+
+    init(
+        protocolVersion: Int,
+        securityEpoch: Int,
+        implementationVersion: Int,
+        packageSchema: Int,
+        packageVersion: String,
+        appReleaseVersion: String? = nil,
+        appReleaseBuild: String? = nil,
+        contentDigest: String,
+        packageRoot: String?,
+        token: String,
+        socketPath: String,
+        infoFile: String,
+        lockFile: String,
+        storageDir: String,
+        logFile: String,
+        maximumLiveTerminals: Int?,
+        startedAt: Int64,
+        version: String,
+        smoke: Bool
+    ) {
+        self.protocolVersion = protocolVersion
+        self.securityEpoch = securityEpoch
+        self.implementationVersion = implementationVersion
+        self.packageSchema = packageSchema
+        self.packageVersion = packageVersion
+        self.appReleaseVersion = appReleaseVersion
+        self.appReleaseBuild = appReleaseBuild
+        self.contentDigest = contentDigest
+        self.packageRoot = packageRoot
+        self.token = token
+        self.socketPath = socketPath
+        self.infoFile = infoFile
+        self.lockFile = lockFile
+        self.storageDir = storageDir
+        self.logFile = logFile
+        self.maximumLiveTerminals = maximumLiveTerminals
+        self.startedAt = startedAt
+        self.version = version
+        self.smoke = smoke
     }
 
     func validate(
@@ -47,9 +96,9 @@ struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
         guard protocolVersion == BrokerWire.protocolVersion,
               securityEpoch == BrokerWire.securityEpoch,
               BrokerWire.compatibleImplementationVersions.contains(implementationVersion),
-              packageSchema == BrokerWire.helperPackageSchema,
+              BrokerWire.supportedHelperPackageSchemas.contains(packageSchema),
               !packageVersion.isEmpty,
-              packageVersion.count <= 64,
+              packageVersion.utf8.count <= 64,
               BrokerHelperPackageVerification.isLowercaseSHA256(contentDigest),
               token.count == 64,
               token.allSatisfy(\.isHexDigit),
@@ -60,6 +109,30 @@ struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
               !version.isEmpty,
               version.count <= 120,
               !smoke else {
+            throw BrokerLaunchConfigurationError.invalidConfiguration
+        }
+
+        // A schema-1 request must remain byte-for-byte compatible with the
+        // stable Node launch contract. Schema 2 carries both signed app
+        // provenance fields as one indivisible bounded identity and always
+        // names its digest-addressed package root.
+        switch packageSchema {
+        case BrokerWire.nodeHelperPackageSchema:
+            guard appReleaseVersion == nil, appReleaseBuild == nil else {
+                throw BrokerLaunchConfigurationError.invalidConfiguration
+            }
+        case BrokerWire.nativeHelperPackageSchema:
+            guard let appReleaseVersion,
+                  let appReleaseBuild,
+                  Self.isBoundedIdentity(appReleaseVersion),
+                  Self.isBoundedIdentity(appReleaseBuild),
+                  packageRoot != nil else {
+                throw BrokerLaunchConfigurationError.invalidConfiguration
+            }
+        default:
+            // The supported-schema guard above is the sole compatibility
+            // window. Keep this explicit branch so widening that set requires
+            // defining the launch provenance contract here too.
             throw BrokerLaunchConfigurationError.invalidConfiguration
         }
 
@@ -155,6 +228,45 @@ struct BrokerLaunchConfiguration: Codable, Equatable, Sendable {
             .replacingOccurrences(of: "/", with: "_")
         return "\(shortIdentity).sock"
     }
+
+    /// The package manifest schema and its runtime-neutral launch payload are
+    /// two independently decoded inputs. Resolve them together so the tested
+    /// command is exactly the command the privileged bootstrap spawns.
+    func launchCommand(
+        for launchPayload: BrokerLaunchPayload,
+        configurationURL: URL
+    ) throws -> BrokerLaunchCommand {
+        switch (packageSchema, launchPayload) {
+        case let (BrokerWire.nodeHelperPackageSchema, .node(executable, script)):
+            return BrokerLaunchCommand(
+                executable: executable,
+                arguments: [script.path, "--launch", configurationURL.path],
+                requiresSwiftLaunchMarker: false
+            )
+        case let (BrokerWire.nativeHelperPackageSchema, .native(executable, arguments)):
+            return BrokerLaunchCommand(
+                executable: executable,
+                arguments: arguments + ["--launch", configurationURL.path],
+                requiresSwiftLaunchMarker: true
+            )
+        default:
+            throw BrokerLaunchConfigurationError.invalidConfiguration
+        }
+    }
+
+    private static func isBoundedIdentity(_ value: String) -> Bool {
+        !value.isEmpty
+            && value.utf8.count <= 64
+            && !value.contains("\0")
+    }
+}
+
+struct BrokerLaunchCommand: Equatable, Sendable {
+    let executable: URL
+    let arguments: [String]
+    /// The native executable refuses production launch mode without this
+    /// explicit environment marker. Node must never receive it.
+    let requiresSwiftLaunchMarker: Bool
 }
 
 enum BrokerLaunchConfigurationError: Error, Equatable, LocalizedError {

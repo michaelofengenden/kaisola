@@ -716,6 +716,19 @@ struct SettingsView: View {
                         .menuIndicator(.hidden)
                         .accessibilityLabel("Theme")
                     }
+                    if settings.theme == .tinted {
+                        SettingsDivider()
+                        SettingsRow(
+                            title: "Living tint",
+                            detail: "The tinted surfaces breathe, very slowly",
+                            symbol: "wind"
+                        ) {
+                            Toggle("", isOn: $settings.tintedBreathing)
+                                .labelsHidden()
+                                .toggleStyle(.switch)
+                                .accessibilityLabel("Living tint")
+                        }
+                    }
                     SettingsDivider()
                     SettingsRow(
                         title: "Tool-call detail",
@@ -1506,7 +1519,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var searchTerms: [String] {
         switch self {
         case .general:
-            ["Default Project Directory", "On Launch", "External Editor", "Appearance", "sidebar transparency"]
+            ["Default Project Directory", "On Launch", "External Editor", "Appearance", "sidebar transparency", "Tinted", "Living tint", "breathing"]
         case .terminal:
             ["Font", "Font Size", "Theme", "Palette", "Copy on Select", "Option as Meta", "Scrollback", "Shell"]
         case .companion:

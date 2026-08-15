@@ -782,6 +782,13 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(workspaceBackdrop.rawValue, forKey: Keys.workspaceBackdrop) }
     }
 
+    /// Opt-in "living tint": the Tinted surfaces breathe a few percent of
+    /// opacity on the render server, alongside the always-on endpoint drift.
+    /// Off is exactly the shipped Tinted composition.
+    @Published var tintedBreathing: Bool {
+        didSet { persist(tintedBreathing, forKey: Keys.tintedBreathing) }
+    }
+
     /// The single theme control Settings vends, over the two properties above.
     ///
     /// Reads as Glass only when *both* surfaces are glass, so a workspace left on
@@ -1170,6 +1177,7 @@ final class NativePreviewSettings: ObservableObject {
         static let appearance = "appearanceMode"
         static let sidebarAppearance = "sidebarAppearance"
         static let workspaceBackdrop = "workspaceBackdrop"
+        static let tintedBreathing = "tintedBreathing"
         static let toolCallDensity = "toolCallDensity"
         static let glassBackdropSource = "glassBackdropSource"
         static let glassTexture = "glassTexture"
@@ -1208,6 +1216,7 @@ final class NativePreviewSettings: ObservableObject {
         appearance = defaults.string(forKey: Keys.appearance).flatMap(AppearanceMode.init) ?? .system
         sidebarAppearance = defaults.string(forKey: Keys.sidebarAppearance).flatMap(SidebarAppearance.init) ?? .glass
         workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .glass
+        tintedBreathing = defaults.object(forKey: Keys.tintedBreathing) as? Bool ?? false
         toolCallDensity = defaults.string(forKey: Keys.toolCallDensity)
             .flatMap(ToolCallDensity.init) ?? .balanced
         // The four glass knobs are a preset now, not preferences, so they are

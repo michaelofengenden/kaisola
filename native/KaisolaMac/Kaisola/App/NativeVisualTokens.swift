@@ -208,6 +208,15 @@ enum TintFlowMotion {
     /// sweep stays diagonal throughout; only its anchoring breathes.
     static let drift: Double = 0.18
 
+    /// Opt-in breath: the whole tint fading a few percent and back. Seventeen
+    /// seconds is deliberately not a harmonic of `period`, so the breath never
+    /// phase-locks with the drift into a visible pulse; the amplitude is a
+    /// multiply on already-small coverages, so the dimmest phase is one or two
+    /// counts of 255 — found, like the drift, only when the eye returns.
+    static let breathPeriod: TimeInterval = 17
+    static let breathAmplitude: Double = 0.08
+    static var breathFloorOpacity: Double { 1 - breathAmplitude }
+
     /// SwiftUI's `UnitPoint` puts (0,0) at the top-leading corner;
     /// `CAGradientLayer`'s unit space on an unflipped AppKit host puts (0,0)
     /// at the bottom-left. One explicit conversion, because the first build

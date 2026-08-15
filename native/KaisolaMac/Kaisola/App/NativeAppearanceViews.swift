@@ -663,6 +663,7 @@ struct FlowingTintGradientView: NSViewRepresentable {
     let startPoint: CGPoint
     let endPoint: CGPoint
     let animated: Bool
+    var breathing: Bool = false
 
     func makeNSView(context: Context) -> FlowingTintGradientHostView {
         let view = FlowingTintGradientHostView()
@@ -670,7 +671,8 @@ struct FlowingTintGradientView: NSViewRepresentable {
             stops: stops,
             startPoint: startPoint,
             endPoint: endPoint,
-            animated: animated
+            animated: animated,
+            breathing: breathing
         )
         return view
     }
@@ -680,7 +682,8 @@ struct FlowingTintGradientView: NSViewRepresentable {
             stops: stops,
             startPoint: startPoint,
             endPoint: endPoint,
-            animated: animated
+            animated: animated,
+            breathing: breathing
         )
     }
 }
@@ -691,6 +694,7 @@ final class FlowingTintGradientHostView: NSView {
     private var appliedStart: CGPoint = .zero
     private var appliedEnd: CGPoint = .zero
     private var appliedAnimated: Bool?
+    private var appliedBreathing: Bool?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -735,13 +739,16 @@ final class FlowingTintGradientHostView: NSView {
                 object: window
             )
         }
-        guard window != nil, appliedAnimated == true else { return }
+        guard window != nil, appliedAnimated == true || appliedBreathing == true else { return }
+        let restoreBreathing = appliedBreathing == true
         appliedAnimated = nil
+        appliedBreathing = nil
         apply(
             stops: appliedStops,
             startPoint: appliedStart,
             endPoint: appliedEnd,
-            animated: true
+            animated: true,
+            breathing: restoreBreathing
         )
     }
 
@@ -749,16 +756,19 @@ final class FlowingTintGradientHostView: NSView {
         stops: [TintFlowStop],
         startPoint: CGPoint,
         endPoint: CGPoint,
-        animated: Bool
+        animated: Bool,
+        breathing: Bool = false
     ) {
         let colorsChanged = stops != appliedStops
         let geometryChanged = startPoint != appliedStart || endPoint != appliedEnd
         let motionChanged = animated != appliedAnimated
-        guard colorsChanged || geometryChanged || motionChanged else { return }
+        let breathingChanged = breathing != appliedBreathing
+        guard colorsChanged || geometryChanged || motionChanged || breathingChanged else { return }
         appliedStops = stops
         appliedStart = startPoint
         appliedEnd = endPoint
         appliedAnimated = animated
+        appliedBreathing = breathing
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -767,15 +777,18 @@ final class FlowingTintGradientHostView: NSView {
         gradient.startPoint = startPoint
         gradient.endPoint = endPoint
         gradient.frame = bounds
+        // Turning the breath off must restore the model value deterministically.
+        gradient.opacity = 1
         CATransaction.commit()
 
         // A colour-only change (a wallpaper rotation resampling the dark tint)
         // updates the stops under the transaction above and leaves the drift
         // alone: removing and re-adding it would snap the endpoints back to
         // phase zero, visibly, every few minutes on a rotating desktop.
-        guard geometryChanged || motionChanged else { return }
+        guard geometryChanged || motionChanged || breathingChanged else { return }
         gradient.removeAnimation(forKey: Self.startAnimationKey)
         gradient.removeAnimation(forKey: Self.endAnimationKey)
+        gradient.removeAnimation(forKey: Self.breathAnimationKey)
         guard animated else { return }
         let travel = TintFlowMotion.endpoints(start: startPoint, end: endPoint)
         gradient.add(
@@ -794,6 +807,8 @@ final class FlowingTintGradientHostView: NSView {
             ),
             forKey: Self.endAnimationKey
         )
+        guard breathing else { return }
+        gradient.add(Self.breath(), forKey: Self.breathAnimationKey)
     }
 
     @objc private func windowOcclusionStateDidChange(_ notification: Notification) {
@@ -816,6 +831,29 @@ final class FlowingTintGradientHostView: NSView {
 
     private static let startAnimationKey = "kaisola.tint-flow.start"
     private static let endAnimationKey = "kaisola.tint-flow.end"
+    private static let breathAnimationKey = "kaisola.tint-flow.breath"
+
+    /// The opt-in breath: whole-layer opacity easing between the floor and 1.
+    /// Same render-server ownership, frame-rate cap, occlusion freeze
+    /// (`gradient.speed`), and wall-clock phase lock as the drift.
+    private static func breath() -> CABasicAnimation {
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = TintFlowMotion.breathFloorOpacity
+        animation.toValue = 1
+        animation.duration = TintFlowMotion.breathPeriod
+        animation.autoreverses = true
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+        animation.isRemovedOnCompletion = false
+        animation.timeOffset = CACurrentMediaTime()
+            .truncatingRemainder(dividingBy: TintFlowMotion.breathPeriod * 2)
+        animation.preferredFrameRateRange = CAFrameRateRange(
+            minimum: 5,
+            maximum: 15,
+            preferred: 10
+        )
+        return animation
+    }
 
     private static func drift(
         keyPath: String,
@@ -854,6 +892,9 @@ struct FlowingTintedBackdrop: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject private var desktop = DesktopBackdropProvider.shared
+    // This view owns its own tint hooks (see the rail call sites), so the
+    // opt-in breath is read here rather than threaded through both of them.
+    @ObservedObject private var settings = NativePreviewSettings.shared
     /// Rails pass their share so one theme reads continuously across the
     /// window; the canvas passes 1.
     let coverageScale: Double
@@ -881,7 +922,8 @@ struct FlowingTintedBackdrop: View {
                 : TintFlowComposition.light(coverageScale: coverageScale),
             startPoint: TintFlowMotion.layerPoint(startPoint),
             endPoint: TintFlowMotion.layerPoint(endPoint),
-            animated: !reduceMotion
+            animated: !reduceMotion,
+            breathing: settings.tintedBreathing && !reduceMotion
         )
         .allowsHitTesting(false)
         .onAppear {

@@ -1196,6 +1196,8 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             if visualSurface == "tinted" {
                 settings.sidebarAppearance = .tinted
                 settings.workspaceBackdrop = .tinted
+                // A screenshot must never catch a mid-breath frame.
+                settings.tintedBreathing = false
             }
             // `empty-workspace` is the *idle* canvas — nothing mounted is its
             // whole definition, and a visible Files rail is a mounted surface.

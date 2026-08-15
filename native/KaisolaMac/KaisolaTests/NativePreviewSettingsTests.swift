@@ -532,11 +532,13 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.workspaceRailWidth, NativePreviewSettings.workspaceRailWidthDefault)
         XCTAssertEqual(settings.filePreviewWidth, NativePreviewSettings.filePreviewWidthDefault)
         XCTAssertEqual(settings.toolCallDensity, .balanced)
+        XCTAssertFalse(settings.tintedBreathing)
 
         settings.navigationLayout = .topBar
         settings.appearance = .dark
         settings.sidebarAppearance = .solid
         settings.workspaceBackdrop = .tinted
+        settings.tintedBreathing = true
         settings.terminalThemeID = "kaisola"
         settings.restoreCLIDrafts = false
         settings.semanticShellIntegration = true
@@ -559,6 +561,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.workspaceRailWidth, 300)
         XCTAssertEqual(reloaded.filePreviewWidth, 640)
         XCTAssertEqual(reloaded.toolCallDensity, .detailed)
+        XCTAssertTrue(reloaded.tintedBreathing)
     }
 
     func testToolCallDensityRejectsUnknownPersistedValues() {
@@ -1092,6 +1095,31 @@ final class NativePreviewSettingsTests: XCTestCase {
 
     /// The Tinted drift is glacial, bounded, and purely geometric — and the
     /// dark companion is the sampled hue rotated, never a second accent.
+    /// The opt-in breath must stay as quiet as the drift it joins: slow,
+    /// shallow, and never phase-locked with the endpoint period into a
+    /// visible pulse.
+    func testTintBreathIsSlowShallowAndNotAHarmonicOfTheDrift() {
+        XCTAssertGreaterThanOrEqual(TintFlowMotion.breathPeriod, 12)
+        XCTAssertGreaterThan(TintFlowMotion.breathAmplitude, 0.03)
+        XCTAssertLessThanOrEqual(TintFlowMotion.breathAmplitude, 0.14)
+        XCTAssertEqual(
+            TintFlowMotion.breathFloorOpacity,
+            1 - TintFlowMotion.breathAmplitude,
+            accuracy: 0.0001
+        )
+        let ratio = TintFlowMotion.period / TintFlowMotion.breathPeriod
+        XCTAssertGreaterThan(
+            abs(ratio - ratio.rounded()), 0.05,
+            "an integer period ratio phase-locks the breath to the drift"
+        )
+        // The dimmest breath phase multiplies every stop's coverage; even the
+        // heaviest light stop stays far above the point where Tinted could
+        // quantize back into Glass or Solid.
+        let dimmestHeavyStop = LightTintedGradient.coolCoverage
+            * TintFlowMotion.breathFloorOpacity
+        XCTAssertGreaterThan(dimmestHeavyStop, 0.20)
+    }
+
     func testTintFlowMotionIsGlacialAndItsCompanionKeepsTheSampledFamily() {
         XCTAssertGreaterThanOrEqual(TintFlowMotion.period, 20, "the flow became watchable motion")
         XCTAssertGreaterThan(TintFlowMotion.drift, 0.05, "the drift is too small to ever notice")

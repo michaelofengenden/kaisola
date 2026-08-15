@@ -943,6 +943,217 @@ final class FlowingTintGradientHostView: NSView {
     }
 }
 
+/// The Core Animation host for the thinking shimmer: a horizontal gradient
+/// swept behind a `CATextLayer` mask, so the status word itself carries the
+/// highlight.
+///
+/// Rejected alternatives, deliberately: `TimelineView(.animation)` wakes
+/// SwiftUI every frame on the main thread, which the painted-still energy
+/// rules forbid; a SwiftUI `.mask`/`.overlay`/`repeatForever` build is
+/// CA-backed but SwiftUI silently drops and restarts the repeat whenever the
+/// view's identity or any observed state changes — and this label sits under
+/// a `contentVersion` churning at streaming rate, so it would stutter on
+/// every token. A `locations` animation owned by the render server survives
+/// both.
+struct ShimmerTextView: NSViewRepresentable {
+    let text: String
+    let font: NSFont
+    let animated: Bool
+
+    func makeNSView(context: Context) -> ShimmerTextHostView {
+        let view = ShimmerTextHostView()
+        view.apply(text: text, font: font, animated: animated)
+        return view
+    }
+
+    func updateNSView(_ view: ShimmerTextHostView, context: Context) {
+        view.apply(text: text, font: font, animated: animated)
+    }
+}
+
+final class ShimmerTextHostView: NSView {
+    private let contentLayer = CAGradientLayer()
+    private let maskLayer = CATextLayer()
+    private var appliedText: String?
+    private var appliedFont: NSFont?
+    private var appliedAnimated: Bool?
+    private var attributed = NSAttributedString()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        contentLayer.type = .axial
+        contentLayer.startPoint = CGPoint(x: 0, y: 0.5)
+        contentLayer.endPoint = CGPoint(x: 1, y: 0.5)
+        maskLayer.truncationMode = .none
+        maskLayer.isWrapped = false
+        contentLayer.mask = maskLayer
+        layer?.addSublayer(contentLayer)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// The label is not a control.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    /// The row lays out from the text alone, so SwiftUI never needs a
+    /// `GeometryReader` around it.
+    override var intrinsicContentSize: NSSize {
+        let size = attributed.size()
+        return NSSize(width: ceil(size.width), height: ceil(size.height))
+    }
+
+    override func layout() {
+        super.layout()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentLayer.frame = bounds
+        maskLayer.frame = bounds
+        CATransaction.commit()
+    }
+
+    /// A mask layer defaults to 1x and renders blurry glyphs on Retina; it has
+    /// to follow the window's scale. Same hook as `DesktopWallpaperPatchView`.
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        maskLayer.contentsScale = window?.backingScaleFactor ?? 2
+    }
+
+    /// The resting and highlight inks resolve against the effective
+    /// appearance; without this a theme change keeps the old ink.
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyColors()
+    }
+
+    /// Re-arms the sweep when the view lands in a window: an animation added
+    /// while the layer was windowless is silently dropped by AppKit, and this
+    /// label mounts during a transcript update, which is precisely that
+    /// window. The same attach point follows the window's occlusion, so a
+    /// fully covered window spends nothing on the sweep.
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(
+            self,
+            name: NSWindow.didChangeOcclusionStateNotification,
+            object: nil
+        )
+        if let window {
+            maskLayer.contentsScale = window.backingScaleFactor
+            windowOcclusionChanged(visible: window.occlusionState.contains(.visible))
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowOcclusionStateDidChange(_:)),
+                name: NSWindow.didChangeOcclusionStateNotification,
+                object: window
+            )
+        }
+        guard window != nil,
+              appliedAnimated == true,
+              let text = appliedText,
+              let font = appliedFont else { return }
+        appliedAnimated = nil
+        apply(text: text, font: font, animated: true)
+    }
+
+    func apply(text: String, font: NSFont, animated: Bool) {
+        let textChanged = text != appliedText || font != appliedFont
+        let motionChanged = animated != appliedAnimated
+        guard textChanged || motionChanged else { return }
+        appliedText = text
+        appliedFont = font
+        appliedAnimated = animated
+
+        if textChanged {
+            // Opaque white: a mask contributes alpha only, and the visible
+            // ink comes from the gradient it clips.
+            attributed = NSAttributedString(string: text, attributes: [
+                .font: font,
+                .foregroundColor: NSColor.white,
+            ])
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            maskLayer.string = attributed
+            CATransaction.commit()
+            invalidateIntrinsicContentSize()
+        }
+        applyColors()
+
+        guard motionChanged else { return }
+        contentLayer.removeAnimation(forKey: Self.sweepAnimationKey)
+        guard animated else { return }
+        contentLayer.add(Self.sweep(), forKey: Self.sweepAnimationKey)
+    }
+
+    /// Resting ink at both ends, the primary-ink highlight in the middle. The
+    /// model value parks the highlight fully off the leading edge, so a
+    /// non-animated shimmer is pixel-identical to the static secondary label.
+    private func applyColors() {
+        let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let ink: CGFloat = isDark ? 1 : 0
+        let resting = KaisolaInk.alpha(.secondary, isDark: isDark)
+        let highlight = ThinkingShimmerMotion.highlightAlpha(
+            resting: resting,
+            primary: KaisolaInk.alpha(.primary, isDark: isDark)
+        )
+        let restingColor = CGColor(srgbRed: ink, green: ink, blue: ink, alpha: resting)
+        let highlightColor = CGColor(srgbRed: ink, green: ink, blue: ink, alpha: highlight)
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentLayer.colors = [
+            restingColor, restingColor, highlightColor, restingColor, restingColor,
+        ]
+        contentLayer.locations = ThinkingShimmerMotion.startLocations
+            .map { NSNumber(value: $0) }
+        CATransaction.commit()
+    }
+
+    @objc private func windowOcclusionStateDidChange(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window == self.window else {
+            return
+        }
+        windowOcclusionChanged(visible: window.occlusionState.contains(.visible))
+    }
+
+    /// Layer speed zero freezes the render-server sweep in place; restoring
+    /// speed resumes it from the same phase.
+    private func windowOcclusionChanged(visible: Bool) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        contentLayer.speed = visible ? 1 : 0
+        CATransaction.commit()
+    }
+
+    private static let sweepAnimationKey = "kaisola.thinking-shimmer.sweep"
+
+    private static func sweep() -> CABasicAnimation {
+        let animation = CABasicAnimation(keyPath: "locations")
+        animation.fromValue = ThinkingShimmerMotion.startLocations
+            .map { NSNumber(value: $0) }
+        animation.toValue = ThinkingShimmerMotion.endLocations
+            .map { NSNumber(value: $0) }
+        animation.duration = ThinkingShimmerMotion.period
+        // A sweep that bounces reads as a scrubbing slider, not as progress.
+        animation.autoreverses = false
+        animation.repeatCount = .infinity
+        animation.timingFunction = CAMediaTimingFunction(name: .linear)
+        animation.isRemovedOnCompletion = false
+        // Two chats thinking at once sweep in phase rather than showing a
+        // walking beat between panes.
+        animation.timeOffset = CACurrentMediaTime()
+            .truncatingRemainder(dividingBy: ThinkingShimmerMotion.period)
+        // Watchable motion, unlike the tint drift's 5–15 range: a 1.6s sweep
+        // at 10fps steps visibly.
+        animation.preferredFrameRateRange = CAFrameRateRange(
+            minimum: 24,
+            maximum: 60,
+            preferred: 30
+        )
+        return animation
+    }
+}
+
 /// The shared Tinted backdrop: an opaque base, the flowing gradient, and the
 /// same increased-contrast overlay the other appearances honour.
 struct FlowingTintedBackdrop: View {

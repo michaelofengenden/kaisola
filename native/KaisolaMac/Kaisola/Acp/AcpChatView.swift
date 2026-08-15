@@ -314,10 +314,9 @@ struct AcpChatView: View {
             .accessibilityLabel(conversation.isConnected ? "Connected" : "Not connected")
             .help(conversation.isConnected ? "Connected" : "Not connected")
             Text(conversation.title).font(.subheadline.weight(.medium))
-            if conversation.isRunning {
-                ProgressView().controlSize(.small)
-                Text("Working…").font(.caption).foregroundStyle(.kaisolaSecondary)
-            }
+            // No working spinner here: the transcript's thinking status row
+            // is the running-turn signal, and a second indicator in the
+            // header would say the same fact twice.
             Spacer()
             sessionControls
         }
@@ -474,7 +473,10 @@ struct AcpChatView: View {
         ScrollViewReader { proxy in
             ZStack(alignment: .bottomTrailing) {
                 ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 12) {
+                    // Spacing zero: the rhythm lives in the pure pair table on
+                    // `AcpTranscriptMetrics`, applied per row, so a turn
+                    // boundary is a larger event than the next artifact.
+                    LazyVStack(alignment: .leading, spacing: 0) {
                         if conversation.hiddenEarlierCount > 0 {
                             HStack(spacing: 8) {
                                 ProgressView().controlSize(.small)
@@ -483,7 +485,8 @@ struct AcpChatView: View {
                                     .foregroundStyle(.kaisolaSecondary)
                             }
                             .frame(maxWidth: .infinity)
-                            .padding(.vertical, 6)
+                            .padding(.top, 6)
+                            .padding(.bottom, AcpTranscriptMetrics.intraTurnSpacing)
                             .onAppear {
                                 loadEarlierRows(using: proxy)
                             }
@@ -492,15 +495,18 @@ struct AcpChatView: View {
                                 .font(.caption)
                                 .foregroundStyle(.kaisolaSecondary)
                                 .frame(maxWidth: .infinity)
-                                .padding(.vertical, 6)
+                                .padding(.top, 6)
+                                .padding(.bottom, AcpTranscriptMetrics.intraTurnSpacing)
                                 .accessibilityLabel("Beginning of session history")
                         }
                         if let status = conversation.statusMessage {
                             Label(status, systemImage: "exclamationmark.triangle")
                                 .font(.caption)
                                 .foregroundStyle(.kaisolaSecondary)
+                                .padding(.bottom, AcpTranscriptMetrics.intraTurnSpacing)
                         }
-                        ForEach(conversation.visibleRows) { row in
+                        let visibleRows = conversation.visibleRows
+                        ForEach(Array(visibleRows.enumerated()), id: \.element.id) { index, row in
                             TranscriptRowView(
                                 row: row,
                                 workspaceURL: conversation.workspaceURL,
@@ -522,6 +528,26 @@ struct AcpChatView: View {
                                         .accessibilityHidden(true)
                                 }
                             }
+                            // After the backgrounds, so the viewport marker
+                            // and search highlight hug the row rather than
+                            // annexing the turn gap above it.
+                            .padding(.top, AcpTranscriptMetrics.spacing(
+                                before: index == 0 ? nil : visibleRows[index - 1].rhythmKind,
+                                after: row.rhythmKind
+                            ))
+                        }
+                        if let status = AcpThinkingStatus.derive(
+                            isRunning: conversation.isRunning,
+                            isConnected: conversation.isConnected,
+                            hasPendingPermission: conversation.pendingPermissionReview != nil,
+                            lastRow: visibleRows.last
+                        ) {
+                            AcpThinkingStatusRow(status: status)
+                                .id("acp-thinking-status")
+                                .padding(.top, AcpTranscriptMetrics.spacing(
+                                    before: visibleRows.last?.rhythmKind,
+                                    after: .assistant
+                                ))
                         }
                         Color.clear
                             .frame(height: 1)
@@ -532,7 +558,8 @@ struct AcpChatView: View {
                             }
                             .onDisappear { transcriptIsAtBottom = false }
                     }
-                    .padding(16)
+                    .padding(.horizontal, AcpTranscriptMetrics.horizontalPadding)
+                    .padding(.vertical, AcpTranscriptMetrics.pagePadding)
                     .frame(maxWidth: .infinity, alignment: .leading)
                 }
 
@@ -1380,7 +1407,7 @@ struct TranscriptRowView: View {
             .accessibilityLabel("Run profile audit: \(profile.name)")
         case let .user(_, text, failed):
             HStack(spacing: 8) {
-                Spacer(minLength: 40)
+                Spacer(minLength: 0)
                 if failed {
                     Button {
                         retry?(row.id)
@@ -1392,18 +1419,24 @@ struct TranscriptRowView: View {
                     .tint(.red)
                     .help("This message failed to send — try again")
                 }
+                // Capped, not guttered: the old 40pt gutter turned a message
+                // on a wide pane into a full-width band. The bubble hugs its
+                // text up to the cap and wraps past it.
                 Text(text)
-                    .padding(10)
+                    .padding(.horizontal, AcpBubble.horizontalPadding)
+                    .padding(.vertical, AcpBubble.verticalPadding)
                     .background(
-                        failed ? Color.red.opacity(0.12) : Color.accentColor.opacity(0.15),
-                        in: RoundedRectangle(cornerRadius: 10)
+                        failed ? Color.red.opacity(0.12) : AcpBubble.userFill,
+                        in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius)
                     )
                     .overlay {
                         if failed {
-                            RoundedRectangle(cornerRadius: 10).strokeBorder(.red.opacity(0.5))
+                            RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius)
+                                .strokeBorder(.red.opacity(0.5))
                         }
                     }
                     .textSelection(.enabled)
+                    .frame(maxWidth: AcpBubble.maximumWidth, alignment: .trailing)
             }
             // Identified so the user's own side of the transcript — including a
             // prompt restored from a resumed thread, and a message steered into
@@ -1414,25 +1447,33 @@ struct TranscriptRowView: View {
         case let .message(_, text):
             AssistantMarkdownText(text: text, workspaceURL: workspaceURL)
         case let .thought(_, text):
-            DisclosureGroup {
-                let bounded = AcpChatRendering.bounded(
-                    text,
-                    characterLimit: AcpChatRendering.assistantCharacterLimit,
-                    lineLimit: AcpChatRendering.assistantLineLimit
-                )
-                Text(bounded.text)
-                    .font(.callout)
-                    .foregroundStyle(.kaisolaSecondary)
-                    .textSelection(.enabled)
-                if bounded.isTruncated {
-                    Text("Thinking output truncated in this view")
-                        .font(.caption2)
+            // The quote block's left rule, in tertiary ink: an expanded
+            // thought must stay separable from the answer around it.
+            HStack(alignment: .top, spacing: 10) {
+                RoundedRectangle(cornerRadius: 2)
+                    .fill(.kaisolaTertiary)
+                    .frame(width: 3)
+                    .accessibilityHidden(true)
+                DisclosureGroup {
+                    let bounded = AcpChatRendering.bounded(
+                        text,
+                        characterLimit: AcpChatRendering.assistantCharacterLimit,
+                        lineLimit: AcpChatRendering.assistantLineLimit
+                    )
+                    Text(bounded.text)
+                        .font(.callout)
+                        .foregroundStyle(.kaisolaSecondary)
+                        .textSelection(.enabled)
+                    if bounded.isTruncated {
+                        Text("Thinking output truncated in this view")
+                            .font(.caption2)
+                            .foregroundStyle(.kaisolaSecondary)
+                    }
+                } label: {
+                    Label("Thinking", systemImage: "brain")
+                        .font(.caption.weight(.medium))
                         .foregroundStyle(.kaisolaSecondary)
                 }
-            } label: {
-                Label("Thinking", systemImage: "brain")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.kaisolaSecondary)
             }
         case let .tool(call):
             ToolCallCard(
@@ -1459,8 +1500,17 @@ struct TranscriptRowView: View {
     }
 }
 
+extension AcpTranscriptRow {
+    /// Which side of the conversation the row sits on, for the transcript's
+    /// vertical rhythm.
+    var rhythmKind: AcpTranscriptMetrics.RowKind {
+        if case .user = self { return .user }
+        return .assistant
+    }
+}
+
 /// One spoken contract for the tool header. The visible row contains a status
-/// symbol, title, disclosure chevron, and kind; exposing those children
+/// symbol, kind tag, title, and disclosure chevron; exposing those children
 /// separately made the symbol-derived button name opaque and left status
 /// changes silent. Keep the description bounded to metadata already visible in
 /// the row — artifact contents may contain sensitive output and are available
@@ -1571,7 +1621,21 @@ struct ToolCallCard: View {
             }
         }
         .padding(presentation.cardPadding)
-        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 8))
+        .background(
+            .quaternary.opacity(0.5),
+            in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius)
+        )
+        .overlay {
+            // A failed call must differ from a completed one by more than one
+            // red glyph.
+            if call.status == .failed {
+                RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius)
+                    .strokeBorder(
+                        Color.red.opacity(0.35),
+                        lineWidth: KaisolaVisualSystem.focusStroke
+                    )
+            }
+        }
         .environment(\.openURL, OpenURLAction { link in
             AcpTranscriptLinkRouting.open(link, workspaceURL: workspaceURL)
         })
@@ -1582,9 +1646,13 @@ struct ToolCallCard: View {
             Image(systemName: statusSymbol)
                 .foregroundStyle(statusColor)
                 .accessibilityHidden(true)
-            Text(presentation.statusLabel)
-                .font(.caption.weight(.medium))
-                .foregroundStyle(statusColor)
+            // The symbol already carries the status, so no status word: the
+            // kind leads instead, and a column of chips scans as a left-aligned
+            // kind column rather than a ragged right one. VoiceOver keeps the
+            // full status via `ToolCallAccessibility`.
+            Text(call.kind)
+                .font(.caption.monospaced())
+                .foregroundStyle(.kaisolaSecondary)
             Text(call.title)
                 .lineLimit(density == .detailed ? 2 : 1)
             Spacer()
@@ -1592,7 +1660,6 @@ struct ToolCallCard: View {
                 Image(systemName: expanded ? "chevron.down" : "chevron.right")
                     .font(.caption2).foregroundStyle(.kaisolaSecondary)
             }
-            Text(call.kind).font(.caption).foregroundStyle(.kaisolaSecondary)
         }
         .contentShape(Rectangle())
     }

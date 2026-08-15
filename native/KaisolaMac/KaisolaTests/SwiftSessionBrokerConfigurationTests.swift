@@ -1,10 +1,298 @@
 import Darwin
 import Foundation
+import KaisolaBrokerProtocol
 import XCTest
 @testable import Kaisola
 @testable import KaisolaSessionBrokerCore
 
 final class SwiftSessionBrokerConfigurationTests: XCTestCase {
+    func testCleanStartConnectionTerminatesAfterAcceptedFrameReachesTheSocket() async throws {
+        var descriptors = [Int32](repeating: -1, count: 2)
+        XCTAssertEqual(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+        guard descriptors.allSatisfy({ $0 >= 0 }) else { return }
+        defer { Darwin.close(descriptors[1]) }
+
+        let termination = CleanStartTerminationRecorder()
+        let token = String(repeating: "a", count: 64)
+        let runningDigest = String(repeating: "b", count: 64)
+        let service = try ShadowBrokerService(
+            configuration: ShadowBrokerServiceConfiguration(
+                expectedToken: token,
+                expectedUID: UInt32(geteuid()),
+                packageSchema: BrokerWire.nativeHelperPackageSchema,
+                packageVersion: "2.0.0",
+                contentDigest: runningDigest,
+                pid: 12_345,
+                startedAt: 1_786_000_000_000,
+                version: "0.1.125"
+            ),
+            terminalStore: FreshTerminalStore(factory: NeverSpawnFreshTerminalFactory()),
+            cleanStartTermination: { termination.record() }
+        )
+        let connection = BrokerConnection(
+            descriptor: descriptors[0],
+            peerUID: geteuid(),
+            service: service,
+            log: BrokerLog(),
+            helloTimeoutMilliseconds: 1_000,
+            didAuthenticate: {}
+        )
+        let running = Task { await connection.run() }
+        try await Task.sleep(nanoseconds: 10_000_000)
+
+        try writeBrokerFrame(
+            BrokerHelloRequest(
+                protocolVersion: BrokerWire.protocolVersion,
+                token: token,
+                instanceID: UUID().uuidString.lowercased(),
+                access: BrokerAccessRole.administrator.rawValue,
+                features: [BrokerWire.swiftCleanStartRollbackFeature]
+            ),
+            to: descriptors[1]
+        )
+        let hello = try readBrokerFrame(from: descriptors[1])
+        XCTAssertEqual(hello["ok"] as? Bool, true)
+
+        try writeBrokerFrame(
+            BrokerRequest(
+                id: "rollback-wire",
+                method: "broker.prepareCleanStartRollback",
+                params: .object([
+                    "ownerId": .string("0"),
+                    "expectedPid": .integer(12_345),
+                    "expectedStartedAt": .integer(1_786_000_000_000),
+                    "expectedContentDigest": .string(runningDigest),
+                    "targetContentDigest": .string(String(repeating: "c", count: 64)),
+                ])
+            ),
+            to: descriptors[1]
+        )
+        let response = try readBrokerFrame(from: descriptors[1])
+        let result = response["result"] as? [String: Any]
+        XCTAssertEqual(response["ok"] as? Bool, true)
+        XCTAssertEqual(result?["state"] as? String, "updating")
+
+        await running.value
+        XCTAssertEqual(termination.count, 1)
+    }
+
+    func testCleanStartRollbackUsesDedicatedAuthorityAndFencesNewMutations() async throws {
+        let termination = CleanStartTerminationRecorder()
+        let store = FreshTerminalStore(factory: NeverSpawnFreshTerminalFactory())
+        let service = try ShadowBrokerService(
+            configuration: ShadowBrokerServiceConfiguration(
+                expectedToken: String(repeating: "a", count: 64),
+                expectedUID: UInt32(geteuid()),
+                packageSchema: BrokerWire.nativeHelperPackageSchema,
+                packageVersion: "2.0.0",
+                contentDigest: String(repeating: "b", count: 64),
+                pid: 12_345,
+                startedAt: 1_786_000_000_000,
+                version: "0.1.125"
+            ),
+            terminalStore: store,
+            cleanStartTermination: { termination.record() }
+        )
+        let ordinaryAdministrator = await service.authenticate(
+            hello: BrokerHelloRequest(
+                protocolVersion: BrokerWire.protocolVersion,
+                token: String(repeating: "a", count: 64),
+                instanceID: UUID().uuidString.lowercased(),
+                access: BrokerAccessRole.administrator.rawValue,
+                features: []
+            ),
+            peerUID: UInt32(geteuid())
+        )
+        guard case .rejected = ordinaryAdministrator else {
+            return XCTFail("the Swift broker must not expose general administration")
+        }
+
+        let authenticated = await service.authenticate(
+            hello: BrokerHelloRequest(
+                protocolVersion: BrokerWire.protocolVersion,
+                token: String(repeating: "a", count: 64),
+                instanceID: UUID().uuidString.lowercased(),
+                access: BrokerAccessRole.administrator.rawValue,
+                features: [BrokerWire.swiftCleanStartRollbackFeature]
+            ),
+            peerUID: UInt32(geteuid())
+        )
+        guard case let .accepted(client, hello) = authenticated else {
+            return XCTFail("expected dedicated clean-start authority")
+        }
+        XCTAssertEqual(
+            hello.negotiatedFeatures,
+            [BrokerWire.swiftCleanStartRollbackFeature]
+        )
+
+        let rollbackParams: BrokerJSONValue = .object([
+            "ownerId": .string("0"),
+            "expectedPid": .integer(12_345),
+            "expectedStartedAt": .integer(1_786_000_000_000),
+            "expectedContentDigest": .string(String(repeating: "b", count: 64)),
+            "targetContentDigest": .string(String(repeating: "c", count: 64)),
+        ])
+        let response = await service.dispatch(
+            client: client,
+            request: BrokerRequest(
+                id: "rollback",
+                method: "broker.prepareCleanStartRollback",
+                params: rollbackParams
+            )
+        )
+        XCTAssertEqual(response.result?.objectValue?["ok"], .bool(true))
+        XCTAssertEqual(response.result?.objectValue?["state"], .string("updating"))
+        XCTAssertEqual(termination.count, 0)
+
+        // Two app windows can receive acceptance for the same target before
+        // either writer finishes. One failed write must keep the shared fence
+        // until the second accepted delivery is also resolved.
+        let overlapping = await service.dispatch(
+            client: client,
+            request: BrokerRequest(
+                id: "rollback-overlapping",
+                method: "broker.prepareCleanStartRollback",
+                params: rollbackParams
+            )
+        )
+        XCTAssertEqual(overlapping.result?.objectValue?["state"], .string("updating"))
+        await service.completeCleanStartResponseDelivery(written: false)
+        XCTAssertEqual(termination.count, 0)
+        let stillFenced = await service.dispatch(
+            client: client,
+            request: BrokerRequest(id: "still-fenced-create", method: "terminal.create")
+        )
+        XCTAssertEqual(stillFenced.code, "broker_shutting_down")
+
+        // Once both overlapping writes fail, no coordinator observed the
+        // acceptance, so the service releases the fence without terminating.
+        await service.completeCleanStartResponseDelivery(written: false)
+        XCTAssertEqual(termination.count, 0)
+
+        let unfenced = await service.dispatch(
+            client: client,
+            request: BrokerRequest(id: "unfenced-create", method: "terminal.create")
+        )
+        XCTAssertNotEqual(unfenced.code, "broker_shutting_down")
+
+        let retry = await service.dispatch(
+            client: client,
+            request: BrokerRequest(
+                id: "rollback-retry",
+                method: "broker.prepareCleanStartRollback",
+                params: rollbackParams
+            )
+        )
+        XCTAssertEqual(retry.result?.objectValue?["state"], .string("updating"))
+        let retryOverlap = await service.dispatch(
+            client: client,
+            request: BrokerRequest(
+                id: "rollback-retry-overlap",
+                method: "broker.prepareCleanStartRollback",
+                params: rollbackParams
+            )
+        )
+        XCTAssertEqual(retryOverlap.result?.objectValue?["state"], .string("updating"))
+        await service.completeCleanStartResponseDelivery(written: true)
+        XCTAssertEqual(termination.count, 1)
+        await service.completeCleanStartResponseDelivery(written: false)
+        XCTAssertEqual(termination.count, 1)
+
+        let fenced = await service.dispatch(
+            client: client,
+            request: BrokerRequest(id: "create", method: "terminal.create")
+        )
+        XCTAssertFalse(fenced.ok)
+        XCTAssertEqual(fenced.code, "broker_shutting_down")
+        XCTAssertEqual(termination.count, 1)
+    }
+
+    func testCleanStartRollbackRefusesEveryRetainedSwiftSessionRecord() async throws {
+        let termination = CleanStartTerminationRecorder()
+        let service = try ShadowBrokerService(
+            configuration: ShadowBrokerServiceConfiguration(
+                expectedToken: String(repeating: "a", count: 64),
+                expectedUID: UInt32(geteuid()),
+                packageSchema: BrokerWire.nativeHelperPackageSchema,
+                packageVersion: "2.0.0",
+                contentDigest: String(repeating: "b", count: 64),
+                pid: 12_345,
+                startedAt: 1_786_000_000_000,
+                version: "0.1.125"
+            ),
+            terminalStore: FreshTerminalStore(factory: RetainedFreshTerminalFactory()),
+            cleanStartTermination: { termination.record() }
+        )
+        let controllerResult = await service.authenticate(
+            hello: BrokerHelloRequest(
+                protocolVersion: BrokerWire.protocolVersion,
+                token: String(repeating: "a", count: 64),
+                instanceID: UUID().uuidString.lowercased(),
+                access: BrokerAccessRole.controller.rawValue
+            ),
+            peerUID: UInt32(geteuid())
+        )
+        guard case let .accepted(controller, _) = controllerResult else {
+            return XCTFail("expected controller authentication")
+        }
+        let terminalID = "term-clean-start-retained"
+        let created = await service.dispatch(
+            client: controller,
+            request: BrokerRequest(
+                id: "create",
+                method: "terminal.create",
+                params: .object([
+                    "ownerId": .string("owner-a"),
+                    "projectId": .string("project-a"),
+                    "id": .string(terminalID),
+                    "command": .string("/bin/zsh"),
+                    "args": .array([]),
+                    "cwd": .string("/tmp"),
+                    "env": .object([:]),
+                    "cols": .integer(80),
+                    "rows": .integer(24),
+                ])
+            )
+        )
+        XCTAssertTrue(created.ok)
+
+        let administratorResult = await service.authenticate(
+            hello: BrokerHelloRequest(
+                protocolVersion: BrokerWire.protocolVersion,
+                token: String(repeating: "a", count: 64),
+                instanceID: UUID().uuidString.lowercased(),
+                access: BrokerAccessRole.administrator.rawValue,
+                features: [BrokerWire.swiftCleanStartRollbackFeature]
+            ),
+            peerUID: UInt32(geteuid())
+        )
+        guard case let .accepted(administrator, _) = administratorResult else {
+            return XCTFail("expected dedicated clean-start authority")
+        }
+        let refused = await service.dispatch(
+            client: administrator,
+            request: BrokerRequest(
+                id: "rollback",
+                method: "broker.prepareCleanStartRollback",
+                params: .object([
+                    "ownerId": .string("0"),
+                    "expectedPid": .integer(12_345),
+                    "expectedStartedAt": .integer(1_786_000_000_000),
+                    "expectedContentDigest": .string(String(repeating: "b", count: 64)),
+                    "targetContentDigest": .string(String(repeating: "c", count: 64)),
+                ])
+            )
+        )
+        XCTAssertEqual(refused.result?.objectValue?["ok"], .bool(false))
+        XCTAssertEqual(refused.result?.objectValue?["state"], .string("pending"))
+        XCTAssertEqual(refused.result?.objectValue?["liveTerminalCount"], .integer(1))
+        XCTAssertEqual(
+            refused.result?.objectValue?["liveTerminalIds"],
+            .array([.string(terminalID)])
+        )
+        XCTAssertEqual(termination.count, 0)
+    }
+
     func testLoadRequiresExplicitShadowMarkerAndOnlyShadowConfigArguments() throws {
         let fixture = try makeFixture()
         defer { fixture.cleanup() }
@@ -589,6 +877,115 @@ final class SwiftSessionBrokerConfigurationTests: XCTestCase {
         }
     }
 
+    /// Mirror of tests/node/brokerStaleLockRecovery's recycled-pid case:
+    /// getpid() is certainly alive, but the lock predates the last boot, and
+    /// no pre-boot process survives a reboot — so the living pid can only be
+    /// a post-reboot recycle and takeover must proceed.
+    func testLaunchModeRecoversARebootOrphanedLockNamingALivingRecycledPid() async throws {
+        let executable = try builtProductsURL().appendingPathComponent("KaisolaSessionBroker")
+        let fixture = try makeLaunchFixture()
+        defer { fixture.cleanup() }
+        try Data("\(getpid())\n".utf8).write(to: fixture.lockURL)
+        XCTAssertEqual(chmod(fixture.lockURL.path, 0o600), 0)
+        let preBoot = timeval(tv_sec: 946_684_800, tv_usec: 0)
+        var times = [preBoot, preBoot]
+        XCTAssertEqual(utimes(fixture.lockURL.path, &times), 0)
+
+        let launched = try startLaunchBroker(executable: executable, fixture: fixture)
+        defer { terminateIfRunning(launched.process) }
+        _ = try await awaitHelloReadiness(
+            socketPath: fixture.socketURL.path,
+            token: fixture.token,
+            process: launched.process,
+            standardError: launched.standardError
+        )
+        XCTAssertTrue(waitUntil(timeout: 2, condition: {
+            (try? String(contentsOf: fixture.logURL, encoding: .utf8))?
+                .contains("recovered stale generation lock deadOwner=\(getpid())") == true
+        }), "pre-boot lock naming a living recycled pid must be taken over")
+        XCTAssertEqual(
+            try String(contentsOf: fixture.lockURL, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            String(launched.process.processIdentifier)
+        )
+    }
+
+    /// An acquisition killed between link() and its claim unlink leaves the
+    /// lock sharing an inode with the leftover claim (st_nlink == 2), which
+    /// the owner-hint reader's nlink guard once turned into a permanent
+    /// lockHeld wedge. The recovery sweep removes proven residue and the
+    /// takeover proceeds.
+    func testLaunchModeSweepsAnInterruptedAcquisitionsLeftoverClaim() async throws {
+        let executable = try builtProductsURL().appendingPathComponent("KaisolaSessionBroker")
+        let fixture = try makeLaunchFixture()
+        defer { fixture.cleanup() }
+        try Data("99999998\n".utf8).write(to: fixture.lockURL)
+        XCTAssertEqual(chmod(fixture.lockURL.path, 0o600), 0)
+        let claim = fixture.lockURL.deletingLastPathComponent()
+            .appendingPathComponent("\(fixture.lockURL.lastPathComponent).99999998.claim")
+        XCTAssertEqual(Darwin.link(fixture.lockURL.path, claim.path), 0)
+
+        let launched = try startLaunchBroker(executable: executable, fixture: fixture)
+        defer { terminateIfRunning(launched.process) }
+        _ = try await awaitHelloReadiness(
+            socketPath: fixture.socketURL.path,
+            token: fixture.token,
+            process: launched.process,
+            standardError: launched.standardError
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: claim.path))
+        XCTAssertEqual(
+            try String(contentsOf: fixture.lockURL, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+            String(launched.process.processIdentifier)
+        )
+    }
+
+    /// The broker holds flock(LOCK_EX) on its generation lock for its
+    /// lifetime, so the app-side cleanup's non-blocking flock loses against a
+    /// live broker at the kernel rather than by convention.
+    func testLaunchModeHoldsAKernelFlockOnTheGenerationLockWhileRunning() async throws {
+        let executable = try builtProductsURL().appendingPathComponent("KaisolaSessionBroker")
+        let fixture = try makeLaunchFixture()
+        defer { fixture.cleanup() }
+        let launched = try startLaunchBroker(executable: executable, fixture: fixture)
+        defer { terminateIfRunning(launched.process) }
+        _ = try await awaitHelloReadiness(
+            socketPath: fixture.socketURL.path,
+            token: fixture.token,
+            process: launched.process,
+            standardError: launched.standardError
+        )
+        let descriptor = Darwin.open(fixture.lockURL.path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW)
+        XCTAssertGreaterThanOrEqual(descriptor, 0)
+        defer { Darwin.close(descriptor) }
+        XCTAssertEqual(flock(descriptor, LOCK_EX | LOCK_NB), -1)
+        XCTAssertEqual(errno, EWOULDBLOCK)
+    }
+
+    /// A candidate whose listener never starts must not leave the generation
+    /// lock behind: main exits without running deinit, and a lock naming a
+    /// pid later recycled to a living process wedges the digest forever.
+    func testLaunchModeRemovesItsLockWhenTheListenerCannotStart() async throws {
+        let executable = try builtProductsURL().appendingPathComponent("KaisolaSessionBroker")
+        let fixture = try makeLaunchFixture()
+        defer { fixture.cleanup() }
+        // A directory squatting on the socket path fails listener
+        // preparation after the generation lock is already held.
+        try FileManager.default.createDirectory(
+            at: fixture.socketURL,
+            withIntermediateDirectories: false,
+            attributes: [.posixPermissions: 0o700]
+        )
+        let launched = try startLaunchBroker(executable: executable, fixture: fixture)
+        defer { terminateIfRunning(launched.process) }
+        XCTAssertTrue(waitUntil(timeout: 5, condition: { !launched.process.isRunning }))
+        launched.process.waitUntilExit()
+        XCTAssertNotEqual(launched.process.terminationStatus, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.lockURL.path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.infoURL.path))
+    }
+
     func testRealBrokerExecutableSupportsObserveOnlyHelloAndInventory() async throws {
         let executable = try builtProductsURL().appendingPathComponent("KaisolaSessionBroker")
         let fixture = try makeFixture()
@@ -1001,5 +1398,86 @@ private struct LaunchFixture {
 
     func cleanup() {
         try? FileManager.default.removeItem(at: userDataURL)
+    }
+}
+
+private actor NeverSpawnFreshTerminalFactory: FreshTerminalProcessFactory {
+    func spawn(
+        request _: FreshTerminalSpawnRequest,
+        onOutput _: @escaping @Sendable (Data) -> Void
+    ) async throws -> any FreshTerminalProcess {
+        throw ProbeError.unexpectedEOF
+    }
+}
+
+private func writeBrokerFrame<Value: Encodable>(_ value: Value, to descriptor: Int32) throws {
+    var frame = try JSONEncoder().encode(value)
+    frame.append(0x0a)
+    try frame.withUnsafeBytes { bytes in
+        var offset = 0
+        while offset < bytes.count {
+            let written = Darwin.write(
+                descriptor,
+                bytes.baseAddress!.advanced(by: offset),
+                bytes.count - offset
+            )
+            guard written > 0 else { throw ProbeError.unexpectedEOF }
+            offset += written
+        }
+    }
+}
+
+private func readBrokerFrame(from descriptor: Int32) throws -> [String: Any] {
+    var frame = Data()
+    while true {
+        var readiness = pollfd(fd: descriptor, events: Int16(POLLIN | POLLHUP), revents: 0)
+        guard Darwin.poll(&readiness, 1, 2_000) > 0 else {
+            throw ProbeError.attemptTimedOut
+        }
+        var byte: UInt8 = 0
+        let count = Darwin.read(descriptor, &byte, 1)
+        guard count == 1 else { throw ProbeError.unexpectedEOF }
+        if byte == 0x0a { break }
+        frame.append(byte)
+    }
+    guard let object = try JSONSerialization.jsonObject(with: frame) as? [String: Any] else {
+        throw ProbeError.unexpectedEOF
+    }
+    return object
+}
+
+private actor RetainedFreshTerminalFactory: FreshTerminalProcessFactory {
+    func spawn(
+        request _: FreshTerminalSpawnRequest,
+        onOutput _: @escaping @Sendable (Data) -> Void
+    ) async throws -> any FreshTerminalProcess {
+        RetainedFreshTerminalProcess()
+    }
+}
+
+private struct RetainedFreshTerminalProcess: FreshTerminalProcess {
+    let pid: Int32 = 23_456
+
+    func write(_: Data) throws {}
+    func resize(columns _: Int, rows _: Int) throws {}
+    func send(signal _: Int32) throws {}
+    func waitForFreshTerminalExit() async {}
+    func terminateFreshTerminal(graceNanoseconds _: UInt64) async throws {}
+}
+
+private final class CleanStartTerminationRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedCount = 0
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedCount
+    }
+
+    func record() {
+        lock.lock()
+        recordedCount += 1
+        lock.unlock()
     }
 }

@@ -337,6 +337,7 @@ final class SwiftSessionBrokerCoreTests: XCTestCase {
         let mutationMethods = [
             "broker.shutdown",
             "broker.shutdownForUpdate",
+            "broker.prepareCleanStartRollback",
             "broker.prepareRollingUpdate",
             "broker.cancelRollingUpdate",
             "broker.retireDraining",

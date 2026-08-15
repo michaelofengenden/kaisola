@@ -53,6 +53,12 @@ public enum BrokerWire {
     public static let brokerMutationIdempotencyFeature = "broker-mutation-idempotency-v1"
     public static let brokerInventoryFeature = "broker-inventory-v1"
     public static let brokerAdministrationFeature = "broker-administration-v1"
+    /// A deliberately narrow native-broker authority. It permits only an
+    /// atomic empty-generation fence followed by orderly termination, so an
+    /// app relaunched without the development selector can return to Node
+    /// without claiming Swift implements the general update protocol.
+    /// This is Swift-only and therefore is not part of the Node feature list.
+    public static let swiftCleanStartRollbackFeature = "swift-clean-start-rollback-v1"
     public static let terminalExitStatusFeature = "terminal-exit-status-v1"
     public static let advertisedFeatures: [String] = [
         terminalObserveFeature,

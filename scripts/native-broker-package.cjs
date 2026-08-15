@@ -645,6 +645,12 @@ if (require.main === module) {
       }
       const policy = effectivePolicy(readJSON(options.policyPath || policyFile), appRelease)
       const manifest = verifyPackage(options.verify, { requireSignatures: options.requireSignatures, policy })
+      // The app-release seal is the property a schema-2 verification exists
+      // to prove. Without an expectation from the flags or the policy file,
+      // that check silently never ran — refuse to report PASS on it.
+      if (manifest.schemaVersion === 2 && !policy.appRelease) {
+        fail('schema-2 verification requires an app release expectation (--app-release-version/--app-release-build or a policy appRelease block)')
+      }
       console.log(`NATIVE_BROKER_PACKAGE_VERIFY=PASS package=${manifest.packageVersion} files=${manifest.files.length}`)
     } else {
       const manifest = stagePackage(options)

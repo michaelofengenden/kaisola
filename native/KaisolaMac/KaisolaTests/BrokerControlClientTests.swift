@@ -33,6 +33,20 @@ private let replacementControlBrokerInfo = BrokerInfo(
     version: "test"
 )
 
+private let nativeCleanStartBrokerInfo = BrokerInfo(
+    protocolVersion: BrokerWire.protocolVersion,
+    securityEpoch: BrokerWire.securityEpoch,
+    implementationVersion: BrokerWire.implementationVersion,
+    packageSchema: BrokerWire.nativeHelperPackageSchema,
+    packageVersion: "2.0.0",
+    contentDigest: String(repeating: "e", count: 64),
+    pid: 12_347,
+    socketPath: "/tmp/kaisola-controller-test-swift.sock",
+    token: String(repeating: "e", count: 64),
+    startedAt: 1_784_250_010_000,
+    version: "0.1.125"
+)
+
 private let otherControlBrokerInfoFixture = BrokerInfo(
     protocolVersion: BrokerWire.protocolVersion,
     securityEpoch: BrokerWire.securityEpoch,
@@ -323,6 +337,43 @@ final class BrokerControlClientTests: XCTestCase {
         for frame in frames where frame.objectValue?["type"]?.stringValue == "request" {
             XCTAssertEqual(frame.objectValue?["params"]?.objectValue?["ownerId"]?.stringValue, "0")
         }
+    }
+
+    func testVerifiedNativeBrokerUsesOnlyDedicatedCleanStartRollbackAuthority() async throws {
+        let transport = CleanStartRollbackControlBrokerTransport()
+        let client = BrokerControlClient(
+            transport: transport,
+            operationTimeoutNanoseconds: 100_000_000
+        )
+        let targetDigest = String(repeating: "d", count: 64)
+
+        let decision = try await client.requestCleanStartRollback(
+            from: nativeCleanStartBrokerInfo,
+            targetContentDigest: targetDigest,
+            authorization: .sealedLegacyFallback
+        )
+
+        XCTAssertEqual(decision, .accepted)
+        let frames = await transport.sentFrames()
+        let hello = try XCTUnwrap(frames.first?.objectValue)
+        XCTAssertEqual(hello["access"]?.stringValue, "administrator")
+        XCTAssertEqual(
+            hello["features"]?.arrayValue?.compactMap(\.stringValue).contains(
+                BrokerWire.swiftCleanStartRollbackFeature
+            ),
+            true
+        )
+        let request = try XCTUnwrap(frames.last?.objectValue)
+        XCTAssertEqual(request["method"]?.stringValue, "broker.prepareCleanStartRollback")
+        XCTAssertEqual(request["params"]?.objectValue?["ownerId"]?.stringValue, "0")
+        XCTAssertEqual(
+            request["params"]?.objectValue?["expectedContentDigest"]?.stringValue,
+            nativeCleanStartBrokerInfo.contentDigest
+        )
+        XCTAssertEqual(
+            request["params"]?.objectValue?["targetContentDigest"]?.stringValue,
+            targetDigest
+        )
     }
 
     func testUpgradeWithoutRegistryClaimNeverCancelsStatusReportedOtherTarget() async throws {
@@ -1851,6 +1902,89 @@ private actor LegacyAdministrationControlBrokerTransport: BrokerByteTransport {
             "access": .string("controller"),
         ])
     }
+
+    private func encoded(_ frame: JSONValue) throws -> Data {
+        var data = try JSONEncoder().encode(frame)
+        data.append(0x0A)
+        return data
+    }
+
+    private func deliver(_ data: Data?) {
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            incoming.append(data)
+        }
+    }
+}
+
+private actor CleanStartRollbackControlBrokerTransport: BrokerByteTransport {
+    private var frames: [JSONValue] = []
+    private var incoming: [Data?] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+
+    func connect(path: String) async throws {
+        guard path == nativeCleanStartBrokerInfo.socketPath else {
+            throw BrokerClientError.identityChanged
+        }
+    }
+
+    func send(_ data: Data) async throws {
+        guard let newline = data.firstIndex(of: 0x0A) else {
+            throw BrokerClientError.malformedResponse
+        }
+        let frame = try JSONDecoder().decode(JSONValue.self, from: data[..<newline])
+        frames.append(frame)
+        guard let object = frame.objectValue,
+              let type = object["type"]?.stringValue else { return }
+        if type == "hello" {
+            deliver(try encoded(.object([
+                "type": .string("hello"),
+                "ok": .bool(true),
+                "protocol": .integer(Int64(nativeCleanStartBrokerInfo.protocolVersion)),
+                "securityEpoch": .integer(Int64(nativeCleanStartBrokerInfo.securityEpoch)),
+                "implementationVersion": .integer(Int64(nativeCleanStartBrokerInfo.implementationVersion ?? 1)),
+                "packageSchema": .integer(Int64(nativeCleanStartBrokerInfo.packageSchema ?? 0)),
+                "packageVersion": .string(nativeCleanStartBrokerInfo.packageVersion ?? ""),
+                "contentDigest": .string(nativeCleanStartBrokerInfo.contentDigest ?? ""),
+                "pid": .integer(Int64(nativeCleanStartBrokerInfo.pid)),
+                "startedAt": .integer(nativeCleanStartBrokerInfo.startedAt),
+                "version": .string(nativeCleanStartBrokerInfo.version),
+                "features": .array([
+                    .string(BrokerWire.terminalObserveFeature),
+                    .string(BrokerWire.swiftCleanStartRollbackFeature),
+                ]),
+                "negotiatedFeatures": .array([
+                    .string(BrokerWire.swiftCleanStartRollbackFeature),
+                ]),
+                "access": .string("administrator"),
+            ])))
+            return
+        }
+        guard type == "request",
+              object["method"]?.stringValue == "broker.prepareCleanStartRollback",
+              let id = object["id"]?.stringValue else {
+            throw BrokerClientError.requestFailed("unexpected clean-start request")
+        }
+        deliver(try encoded(.object([
+            "type": .string("response"),
+            "id": .string(id),
+            "ok": .bool(true),
+            "result": .object([
+                "ok": .bool(true),
+                "state": .string("updating"),
+            ]),
+        ])))
+    }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !incoming.isEmpty { return incoming.removeFirst() }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func close() async { deliver(nil) }
+    func sentFrames() -> [JSONValue] { frames }
 
     private func encoded(_ frame: JSONValue) throws -> Data {
         var data = try JSONEncoder().encode(frame)

@@ -101,6 +101,14 @@ public final class BrokerServer: @unchecked Sendable {
     /// Runs until `stop()` closes the listener. Blocking socket calls are kept
     /// on dedicated GCD workers rather than Swift's cooperative executor.
     public func run() async throws {
+        // The generation lock exists from init. Every exit of run() must
+        // release it — including the early returns and throws before the
+        // serving defer below is registered, since main exits the process
+        // without running deinit. cleanup() is idempotent, so the serving
+        // defer calling it again is harmless. Node registers its equivalent
+        // process exit handler immediately after taking the lock; this is
+        // that same guarantee.
+        defer { generationLifecycle?.cleanup() }
         try beginRun()
         if isStopping { return }
         let prepared: PreparedListener

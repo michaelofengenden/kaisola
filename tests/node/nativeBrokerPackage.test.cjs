@@ -191,6 +191,16 @@ test('native staging CLI seals a signed arm64 runtime-neutral package without No
     '--policy', policyFile,
     '--require-signatures',
   ]), /app release does not match package policy/)
+
+  // Without an app-release expectation the binding check silently never ran,
+  // so a schema-2 PASS was a weaker claim than the same PASS with the flags.
+  // Verification must refuse rather than report an unbound success.
+  assert.match(runFailure(process.execPath, [
+    path.join(repoRoot, 'scripts', 'native-broker-package.cjs'),
+    '--verify', output,
+    '--policy', policyFile,
+    '--require-signatures',
+  ]), /schema-2 verification requires an app release expectation/)
 })
 
 test('native staging CLI rejects Node inputs and incomplete app-release provenance', (t) => {

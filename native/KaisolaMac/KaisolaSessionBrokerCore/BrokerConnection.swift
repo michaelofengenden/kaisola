@@ -32,6 +32,16 @@ final class BrokerOutboundFrameQueue: @unchecked Sendable {
         return unwrittenBytes
     }
 
+    /// `next() == nil` has two meanings: an orderly `finish()` drained every
+    /// accepted frame, or `closeDiscarding()` dropped them. Lifecycle callers
+    /// must distinguish the two before treating a response as delivered.
+    var completedOrderly: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if case .finishing = state { return true }
+        return false
+    }
+
     /// Accepts or refuses one complete frame. Refusal (`false`) is the exact
     /// verdict the slow-consumer policy consumes: the frame was not queued and
     /// never will be. `force` bypasses the cap for recovery markers but can
@@ -166,6 +176,7 @@ final class BrokerConnection: @unchecked Sendable {
     func run() async {
         let writer = Task { await drainOutbound() }
         var authenticatedClient: BrokerAuthenticatedClient?
+        var cleanStartResponseQueued = false
         do {
             var buffer = Data()
             while let chunk = try await readChunk(
@@ -188,6 +199,10 @@ final class BrokerConnection: @unchecked Sendable {
             guard buffer.isEmpty else { throw BrokerConnectionError.incompleteFrame }
         } catch BrokerConnectionError.cleanClose {
             // A rejected hello is answered before the orderly close.
+        } catch BrokerConnectionError.cleanStartResponseQueued {
+            // The clean-start fence is committed, so stop reading this
+            // dedicated control connection and let its accepted response drain.
+            cleanStartResponseQueued = true
         } catch BrokerConnectionError.helloTimedOut {
             // Idle and slow-drip pre-authentication peers are closed quietly.
         } catch {
@@ -201,8 +216,14 @@ final class BrokerConnection: @unchecked Sendable {
         // drain before the descriptor closes; a wedged peer cannot pin this,
         // because cancel()/socket teardown fails the blocked write.
         outbound.finish()
-        await writer.value
+        let outboundDrained = await writer.value
         finish()
+        if cleanStartResponseQueued {
+            // Orderly broker termination is authorized only after the kernel
+            // accepted the complete response frame. A failed write releases
+            // the fence so an ambiguous delivery cannot strand the broker.
+            await service.completeCleanStartResponseDelivery(written: outboundDrained)
+        }
     }
 
     /// Wake an outstanding blocking read. The connection task remains the sole
@@ -295,7 +316,21 @@ final class BrokerConnection: @unchecked Sendable {
             responder: responder(for: request.method)
         )
         if let response {
-            try enqueueOutbound(response, purpose: .response(request.method))
+            let completesCleanStart = request.method == "broker.prepareCleanStartRollback"
+                && response.ok
+                && response.result?.objectValue?["ok"]?.boolValue == true
+                && response.result?.objectValue?["state"]?.stringValue == "updating"
+            do {
+                try enqueueOutbound(response, purpose: .response(request.method))
+            } catch {
+                if completesCleanStart {
+                    await service.completeCleanStartResponseDelivery(written: false)
+                }
+                throw error
+            }
+            if completesCleanStart {
+                throw BrokerConnectionError.cleanStartResponseQueued
+            }
         }
     }
 
@@ -373,7 +408,7 @@ final class BrokerConnection: @unchecked Sendable {
 
     /// The only socket writer. One frame is written completely before the next
     /// begins, so a JSON frame can never interleave with another.
-    private func drainOutbound() async {
+    private func drainOutbound() async -> Bool {
         while let frame = await outbound.next() {
             do {
                 try await blockingWrite(frame)
@@ -386,9 +421,10 @@ final class BrokerConnection: @unchecked Sendable {
                 if current >= 0 {
                     _ = Darwin.shutdown(current, SHUT_RDWR)
                 }
-                return
+                return false
             }
         }
+        return outbound.completedOrderly
     }
 
     private func blockingWrite(_ framedData: Data) async throws {
@@ -447,6 +483,7 @@ final class BrokerConnection: @unchecked Sendable {
 
 private enum BrokerConnectionError: Error {
     case cleanClose
+    case cleanStartResponseQueued
     case closed
     case frameTooLarge
     case helloTimedOut

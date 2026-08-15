@@ -101,6 +101,7 @@ public struct BrokerAuthentication: Sendable {
         BrokerWire.brokerInventoryFeature,
         BrokerWire.terminalExitStatusFeature,
         BrokerWire.terminalObserverOnlyOutputFeature,
+        BrokerWire.swiftCleanStartRollbackFeature,
     ]
 
     public let features: [String]
@@ -127,12 +128,21 @@ public struct BrokerAuthentication: Sendable {
               ),
               Self.isCanonicalVersionFourUUID(hello.instanceID),
               let access = hello.access,
-              let role = BrokerAccessRole(rawValue: access),
-              role == .controller || role == .observer else {
+              let role = BrokerAccessRole(rawValue: access) else {
             return .rejected(response: Self.rejection())
         }
 
         let requested = Set(hello.features ?? [])
+        // Fresh mode exposes no general administrator surface. The only
+        // accepted administrator hello must explicitly negotiate the
+        // Swift-only clean-start rollback capability; shadow mode cannot
+        // reach it because its advertised feature set omits that capability.
+        let cleanStartAdministrator = role == .administrator
+            && features.contains(BrokerWire.swiftCleanStartRollbackFeature)
+            && requested.contains(BrokerWire.swiftCleanStartRollbackFeature)
+        guard role == .controller || role == .observer || cleanStartAdministrator else {
+            return .rejected(response: Self.rejection())
+        }
         let negotiated = features.filter(requested.contains)
         let client = BrokerAuthenticatedClient(
             instanceID: hello.instanceID,

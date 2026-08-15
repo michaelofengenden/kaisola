@@ -187,9 +187,14 @@ final class BrokerGenerationLifecycle: @unchecked Sendable {
                     // Held for the broker's lifetime and released by close:
                     // the app-side stale cleanup arbitrates with
                     // flock(LOCK_EX | LOCK_NB), so the kernel is the single
-                    // referee between a live broker and a cleanup pass.
+                    // referee between a live broker and a cleanup pass. Only
+                    // a genuinely contended lock reports as held; any other
+                    // failure keeps its real errno for the log.
                     guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
-                        throw BrokerGenerationLifecycleError.lockHeld(nil)
+                        let flockError = errno
+                        throw flockError == EWOULDBLOCK
+                            ? BrokerGenerationLifecycleError.lockHeld(nil)
+                            : BrokerGenerationLifecycleError.systemCall(flockError)
                     }
                     return (descriptor, FileIdentity(value))
                 } catch {
@@ -225,6 +230,12 @@ final class BrokerGenerationLifecycle: @unchecked Sendable {
                 appendLog("generation lock unavailable ELOCKHELD unsafe lock", to: logURL)
                 throw BrokerGenerationLifecycleError.unsafeLock
             }
+            // An acquisition killed between link() and its claim unlink leaves
+            // the lock sharing an inode with a leftover claim (st_nlink == 2),
+            // which the owner-hint reader's nlink guard would otherwise turn
+            // into a permanent lockHeld wedge. A claim proven to be the lock's
+            // own inode is residue by definition — drop it before judging.
+            sweepInterruptedClaims(lockURL: lockURL, lockIdentity: FileIdentity(stale))
 
             // Match the Node recovery contract exactly: an absent or malformed
             // owner hint is "unrecorded"; a valid PID from either authority
@@ -283,12 +294,18 @@ final class BrokerGenerationLifecycle: @unchecked Sendable {
     }
 
     /// The claim carries the owner pid before the lock path ever exists.
-    /// O_TRUNC rather than O_EXCL: a crashed earlier run of this same pid can
-    /// leave its claim behind, and pid identity makes reuse safe.
+    /// Unlink-then-O_EXCL rather than O_TRUNC: a leftover claim from a
+    /// crashed run of this same (recycled) pid can still be hard-linked to
+    /// the live lock, and truncating through it would empty an inode this
+    /// process does not own. Dropping the leftover link touches nothing but
+    /// the claim name.
     private static func writeClaim(at claimURL: URL, pid: Int32) throws -> FileIdentity {
+        guard unlink(claimURL.path) == 0 || errno == ENOENT else {
+            throw BrokerGenerationLifecycleError.systemCall(errno)
+        }
         let descriptor = Darwin.open(
             claimURL.path,
-            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW,
+            O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW,
             0o600
         )
         guard descriptor >= 0 else {
@@ -311,6 +328,25 @@ final class BrokerGenerationLifecycle: @unchecked Sendable {
             throw BrokerGenerationLifecycleError.systemCall(errno)
         }
         return FileIdentity(value)
+    }
+
+    /// Claims hard-linked to the lock itself are residue of an interrupted
+    /// acquisition (the winner unlinks its claim immediately after link()).
+    /// Removing one never touches a foreign inode: identity is compared
+    /// against the lock's own dev/ino before unlinking.
+    private static func sweepInterruptedClaims(lockURL: URL, lockIdentity: FileIdentity) {
+        let directory = lockURL.deletingLastPathComponent()
+        let prefix = "\(lockURL.lastPathComponent)."
+        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: directory.path) else {
+            return
+        }
+        for entry in entries where entry.hasPrefix(prefix) && entry.hasSuffix(".claim") {
+            let candidate = directory.appendingPathComponent(entry)
+            var value = stat()
+            guard lstat(candidate.path, &value) == 0,
+                  FileIdentity(value) == lockIdentity else { continue }
+            _ = unlink(candidate.path)
+        }
     }
 
     /// A file written before the last boot cannot have a living owner,

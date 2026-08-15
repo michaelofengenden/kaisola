@@ -619,6 +619,10 @@ private struct QuietProjectGroup: View {
     let deleteRecentlyClosed: (AppModel.RecentlyClosedSurface) -> Void
 
     @State private var hovering = false
+    /// The header's `+` control tracks its own pointer separately from the
+    /// group hover: the group flag decides whether the control *exists*, this
+    /// one decides whether it answers the pointer resting on it.
+    @State private var launchHovering = false
     /// Bumped on every hover transition anywhere in the group so a pending
     /// "leave" can tell whether the pointer actually left or merely crossed
     /// into the next row of the same group.
@@ -917,14 +921,33 @@ private struct QuietProjectGroup: View {
                             // `.secondary` at rest, not `.primary`: present
                             // enough to find without competing with the project
                             // name beside it, which is the row's actual subject.
-                            .foregroundStyle(.kaisolaSecondary)
+                            // Under the pointer it steps up to primary and gains
+                            // a faint circle, so the rail's one resting control
+                            // acknowledges being aimed at.
+                            .foregroundStyle(
+                                launchHovering
+                                    ? AnyShapeStyle(Color.kaisolaPrimary)
+                                    : AnyShapeStyle(Color.kaisolaSecondary)
+                            )
                             .frame(
                                 width: QuietProjectHeaderControls.launchHitTarget,
                                 height: QuietProjectHeaderControls.launchHitTarget
                             )
+                            .background {
+                                Circle().fill(Color.primary.opacity(launchHovering ? 0.09 : 0))
+                            }
                             .contentShape(Rectangle())
+                            .animation(
+                                .easeOut(duration: KaisolaVisualSystem.hoverDuration),
+                                value: launchHovering
+                            )
                     }
                     .buttonStyle(.plain)
+                    .onHover { launchHovering = $0 }
+                    // The control can leave the hierarchy while hovered (the
+                    // pointer exits the row sideways); without the reset it
+                    // would reappear pre-lit on the next hover.
+                    .onDisappear { launchHovering = false }
                     .help("New session in \(project.name)")
                     .accessibilityLabel("New session in \(project.name)")
                     .accessibilityIdentifier(QuietProjectHeaderControls.launchIdentifier)
@@ -1764,6 +1787,8 @@ private struct QuietNewSessionRowView: View {
     let cancel: () -> Void
     let groupHover: (Bool) -> Void
 
+    @State private var hovering = false
+
     var body: some View {
         Button(action: select) {
             HStack(spacing: 0) {
@@ -1785,6 +1810,21 @@ private struct QuietNewSessionRowView: View {
                             : AnyShapeStyle(HierarchicalShapeStyle.primary)
                     )
                 Spacer(minLength: QuietRailMetrics.laneGap)
+                if hovering {
+                    // A `highPriorityGesture` on an Image, not a nested Button
+                    // (which the enclosing Button would swallow) — the same
+                    // construction as the surface rows' "open beside" control.
+                    // Context menu and the named accessibility action remain
+                    // the pointer-free paths to cancelling.
+                    Image(systemName: "xmark")
+                        .font(.system(size: QuietRailMetrics.revealText, weight: .medium))
+                        .foregroundStyle(.kaisolaSecondary)
+                        .frame(width: QuietRailMetrics.revealSlot, height: QuietRailMetrics.revealSlot)
+                        .contentShape(Rectangle())
+                        .highPriorityGesture(TapGesture().onEnded { cancel() })
+                        .help("Cancel New Session")
+                        .accessibilityHidden(true)
+                }
             }
             .padding(.leading, QuietRailMetrics.sessionIndent)
             .padding(.trailing, QuietRailMetrics.trailingInset)
@@ -1808,7 +1848,10 @@ private struct QuietNewSessionRowView: View {
         .accessibilityIdentifier(presentation.accessibilityIdentifier)
         .accessibilityAction { select() }
         .accessibilityAction(named: Text("Cancel New Session")) { cancel() }
-        .onHover(perform: groupHover)
+        .onHover { inside in
+            groupHover(inside)
+            withAnimation(.easeOut(duration: KaisolaVisualSystem.hoverDuration)) { hovering = inside }
+        }
         .help("Choose a session type")
         .contextMenu {
             Button("Cancel New Session", action: cancel)

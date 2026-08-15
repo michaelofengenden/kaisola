@@ -165,12 +165,13 @@ struct NewSessionChooserView: View {
                         .accessibilityIdentifier("new-session-launch-failed")
                 }
                 if screen != .primary {
+                    // Same grammar as Cancel across the row: two buttons, one
+                    // style. Plain text here read as an inert status label.
                     Button("Back") {
                         screen = .primary
                         focusFirstEnabledChoice()
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.kaisolaSecondary)
+                    .buttonStyle(.bordered)
                     .disabled(isLaunching)
                 }
                 Spacer()
@@ -183,7 +184,10 @@ struct NewSessionChooserView: View {
             .font(.callout)
         }
         .padding(24)
-        .frame(width: 500)
+        // A ceiling, not a fixed size: the content column can legitimately be
+        // 220pt with Files and a document open, and a fixed 500 clipped the
+        // grid instead of letting it reflow.
+        .frame(maxWidth: 500)
         .background {
             RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
                 .fill(Color(nsColor: .controlBackgroundColor).opacity(0.76))
@@ -195,7 +199,14 @@ struct NewSessionChooserView: View {
         .shadow(color: Color.black.opacity(0.06), radius: 16, y: 6)
         .onAppear(perform: focusFirstEnabledChoice)
         .onExitCommand {
-            if showsCancel, !isLaunching {
+            // Escape backs out one level before it cancels anything: on an
+            // agent sub-screen the expected exit is "back", and the
+            // empty-workspace instance (showsCancel == false) previously had
+            // no keyboard exit from that screen at all.
+            if screen != .primary {
+                screen = .primary
+                focusFirstEnabledChoice()
+            } else if showsCancel, !isLaunching {
                 cancel()
             }
         }
@@ -208,7 +219,9 @@ struct NewSessionChooserView: View {
     }
 
     private var primaryChoices: some View {
-        LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible())], spacing: 10) {
+        // Adaptive so a narrow content column reflows to one column instead
+        // of clipping the second.
+        LazyVGrid(columns: [GridItem(.adaptive(minimum: 190))], spacing: 10) {
             ForEach(primaryOptions) { option in
                 Button {
                     select(option.choice)
@@ -216,10 +229,13 @@ struct NewSessionChooserView: View {
                     choiceLabel(
                         title: option.title,
                         detail: option.disabledReason ?? option.detail,
-                        symbol: option.symbol
+                        symbol: option.symbol,
+                        isEnabled: option.isEnabled && !isLaunching
                     )
                 }
-                .buttonStyle(NewSessionChoiceButtonStyle())
+                .buttonStyle(NewSessionChoiceButtonStyle(
+                    isFocused: focusedPrimaryChoice == option.choice
+                ))
                 .disabled(!option.isEnabled || isLaunching)
                 .focusable()
                 .focused($focusedPrimaryChoice, equals: option.choice)
@@ -258,7 +274,9 @@ struct NewSessionChooserView: View {
                     .frame(height: 42)
                     .contentShape(Rectangle())
                 }
-                .buttonStyle(NewSessionChoiceButtonStyle())
+                .buttonStyle(NewSessionChoiceButtonStyle(
+                    isFocused: focusedAgentID == agent.id
+                ))
                 .disabled(!isEnabled)
                 .focusable()
                 .focused($focusedAgentID, equals: agent.id)
@@ -273,15 +291,24 @@ struct NewSessionChooserView: View {
         }
     }
 
-    private func choiceLabel(title: String, detail: String, symbol: String) -> some View {
+    private func choiceLabel(
+        title: String,
+        detail: String,
+        symbol: String,
+        isEnabled: Bool = true
+    ) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Image(systemName: symbol)
                 .font(.system(size: 17, weight: .medium))
-                .foregroundStyle(Color.accentColor)
+                .foregroundStyle(isEnabled ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.kaisolaDisabled))
                 .frame(width: 22, height: 22)
             VStack(alignment: .leading, spacing: 3) {
+                // A disabled card dims its own title, never the explanation:
+                // the detail line IS the reason the card is disabled, and a
+                // whole-card opacity used to push it below the readable floor.
                 Text(title)
                     .font(.callout.weight(.semibold))
+                    .foregroundStyle(isEnabled ? AnyShapeStyle(.primary) : AnyShapeStyle(Color.kaisolaDisabled))
                 Text(detail)
                     .font(.caption)
                     .foregroundStyle(.kaisolaSecondary)
@@ -325,28 +352,35 @@ struct NewSessionChooserView: View {
 
 struct NewSessionChoiceButtonStyle: ButtonStyle {
     /// Fill/stroke coverage per interaction state. Named so the ladder is
-    /// checkable at a glance: rest < hover < press, and a disabled card
-    /// declines the hover lift entirely rather than dimming it.
+    /// checkable at a glance: rest < hover ≤ focus < press, and a disabled
+    /// card declines the hover lift entirely rather than dimming it.
     static let restFill = 0.035
     static let hoverFill = 0.065
     static let pressFill = 0.09
     static let restStroke = 0.11
     static let hoverStroke = 0.18
 
+    /// Keyboard focus, driven by the chooser's own `@FocusState`. The view
+    /// focuses its first enabled card programmatically and Tab moves between
+    /// them, so without a visible rung the cursor was invisible.
+    var isFocused = false
+
     func makeBody(configuration: Configuration) -> some View {
-        StyledCard(configuration: configuration)
+        StyledCard(configuration: configuration, isFocused: isFocused)
     }
 
     private struct StyledCard: View {
         let configuration: Configuration
+        let isFocused: Bool
         @Environment(\.isEnabled) private var isEnabled
         @State private var hovered = false
 
         var body: some View {
             let hovering = hovered && isEnabled
+            let focused = isFocused && isEnabled
             let fill = configuration.isPressed
                 ? NewSessionChoiceButtonStyle.pressFill
-                : (hovering
+                : (hovering || focused
                     ? NewSessionChoiceButtonStyle.hoverFill
                     : NewSessionChoiceButtonStyle.restFill)
             configuration.label
@@ -370,8 +404,23 @@ struct NewSessionChoiceButtonStyle: ButtonStyle {
                             lineWidth: KaisolaVisualSystem.hairline
                         )
                     }
+                    .overlay {
+                        if focused {
+                            RoundedRectangle(
+                                cornerRadius: KaisolaVisualSystem.insetRadius,
+                                style: .continuous
+                            )
+                            .stroke(
+                                Color.accentColor,
+                                lineWidth: KaisolaVisualSystem.focusStroke
+                            )
+                        }
+                    }
                 }
-                .opacity(configuration.isPressed ? 0.88 : (isEnabled ? 1 : 0.55))
+                // The press dip is the only whole-card dim left: a disabled
+                // card keeps its ink readable and states its reason in the
+                // detail line instead (see `choiceLabel`).
+                .opacity(configuration.isPressed ? 0.88 : 1)
                 .animation(
                     .easeOut(duration: KaisolaVisualSystem.hoverDuration),
                     value: hovering

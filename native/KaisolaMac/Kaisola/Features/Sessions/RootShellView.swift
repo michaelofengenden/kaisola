@@ -1807,7 +1807,12 @@ struct RootShellView: View {
             unifiedSessionPaneGrid
             if let draft = selectedNewSessionDraft,
                let project = model.projects.first(where: { $0.id == draft.projectID }) {
+                // The opaque rect hides the still-mounted panes; the primary
+                // wash on top gives the white chooser card a ground to sit on
+                // — card and backdrop otherwise both resolve to #FFFFFF in
+                // light Aqua, with only a hairline between them.
                 Color(nsColor: .windowBackgroundColor)
+                    .overlay(Color.primary.opacity(0.05))
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 NewSessionChooserView(
                     projectName: project.name,
@@ -2405,7 +2410,13 @@ struct RootShellView: View {
             } else if let maximized = model.maximizedPaneID, layout.contains(maximized) {
                 unifiedSessionCard(maximized, clearsWindowControls: true)
             } else if layout.isEmpty {
-                emptyWorkspaceState
+                // The draft overlay paints its own chooser over this grid;
+                // mounting the empty state's chooser underneath it doubled
+                // the AX tree and left two `@FocusState` publishers fighting
+                // over "Start a session".
+                if selectedNewSessionDraft == nil {
+                    emptyWorkspaceState
+                }
             } else {
                 GeometryReader { geometry in
                     let dividerSpace = CGFloat(max(0, layout.columns.count - 1)) * SessionPaneDividerSizing.layoutExtent
@@ -5057,6 +5068,11 @@ enum TerminalPaneMinimizeAction: Equatable {
 /// real workspace boundary rather than decoration.
 private struct SessionStrip: View {
     @ObservedObject var model: AppModel
+    @Environment(\.colorScheme) private var colorScheme
+    /// One hover at a time across the whole strip; the tabs had no pointer
+    /// feedback at all, and a per-row `@State` would leave stale highlights
+    /// behind fast pointer sweeps.
+    @State private var hoveredTabID: String?
     let projectID: String?
     let draft: NewSessionDraft?
     let selectedDraftID: String?
@@ -5118,11 +5134,15 @@ private struct SessionStrip: View {
                         .background {
                             surfaceTabBackground(
                                 selected: draftSelected,
-                                tint: WorkspacePalette.project
+                                tint: WorkspacePalette.project,
+                                hovered: hoveredTabID == draft.id
                             )
                         }
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        hoveredTabID = hovering ? draft.id : (hoveredTabID == draft.id ? nil : hoveredTabID)
+                    }
                     .accessibilityLabel("New Session")
                     .accessibilityAddTraits(draftSelected ? .isSelected : [])
                     .contextMenu {
@@ -5152,17 +5172,23 @@ private struct SessionStrip: View {
                                     .foregroundStyle(.kaisolaSecondary)
                             }
                         }
-                        .font(.callout)
+                        .font(.callout.weight(
+                            !draftSelected && model.selectedChatID == chat.id ? .semibold : .regular
+                        ))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
                         .background {
                             surfaceTabBackground(
                                 selected: !draftSelected && model.selectedChatID == chat.id,
-                                tint: WorkspacePalette.chat
+                                tint: WorkspacePalette.chat,
+                                hovered: hoveredTabID == chat.id
                             )
                         }
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        hoveredTabID = hovering ? chat.id : (hoveredTabID == chat.id ? nil : hoveredTabID)
+                    }
                     .contextMenu {
                         if chat.conversation.isRunning {
                             Button("Stop Chat") { model.stopChat(chat.id) }
@@ -5187,17 +5213,23 @@ private struct SessionStrip: View {
                                     .foregroundStyle(.kaisolaSecondary)
                             }
                         }
-                        .font(.callout)
+                        .font(.callout.weight(
+                            !draftSelected && model.selectedMeshID == mesh.id ? .semibold : .regular
+                        ))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
                         .background {
                             surfaceTabBackground(
                                 selected: !draftSelected && model.selectedMeshID == mesh.id,
-                                tint: WorkspacePalette.mesh
+                                tint: WorkspacePalette.mesh,
+                                hovered: hoveredTabID == mesh.id
                             )
                         }
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        hoveredTabID = hovering ? mesh.id : (hoveredTabID == mesh.id ? nil : hoveredTabID)
+                    }
                     .contextMenu {
                         if mesh.anyRunning {
                             Button("Stop All Columns") { Task { await mesh.stopAllTurns() } }
@@ -5257,17 +5289,23 @@ private struct SessionStrip: View {
                                 .frame(width: 6, height: 6)
                             Text(model.sessionTitle(for: session)).lineLimit(1)
                         }
-                        .font(.callout)
+                        .font(.callout.weight(
+                            !draftSelected && model.selectedSessionID == session.id ? .semibold : .regular
+                        ))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 5)
                         .background {
                             surfaceTabBackground(
                                 selected: !draftSelected && model.selectedSessionID == session.id,
-                                tint: WorkspacePalette.terminal
+                                tint: WorkspacePalette.terminal,
+                                hovered: hoveredTabID == session.id
                             )
                         }
                     }
                     .buttonStyle(.plain)
+                    .onHover { hovering in
+                        hoveredTabID = hovering ? session.id : (hoveredTabID == session.id ? nil : hoveredTabID)
+                    }
                     .contextMenu {
                         Button("Rename…") { rename(session.id) }
                         if model.isOwned(session.id) || model.canClose(session.id) {
@@ -5306,9 +5344,21 @@ private struct SessionStrip: View {
         }
     }
 
-    private func surfaceTabBackground(selected: Bool, tint: Color) -> some View {
+    private func surfaceTabBackground(
+        selected: Bool,
+        tint: Color,
+        hovered: Bool = false
+    ) -> some View {
+        // Selection follows `QuietSelectionPill.fillOpacity`'s dark step-up:
+        // a mid-dark tint at 0.10 over a dark panel was a 0.007 luminance
+        // delta — selection the eye could not find. Hover lifts an unselected
+        // tab the same way the rail's controls answer the pointer.
         RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
-            .fill(selected ? tint.opacity(0.10) : Color.primary.opacity(0.035))
+            .fill(
+                selected
+                    ? tint.opacity(colorScheme == .dark ? 0.22 : 0.13)
+                    : Color.primary.opacity(hovered ? 0.07 : 0.035)
+            )
             .overlay {
                 RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
                     .stroke(

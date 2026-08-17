@@ -9,9 +9,32 @@ struct UsageSettingsTab: View {
 
     @State private var accountProfiles: [UsageAccountProfile] = []
     @State private var pendingAccountRemoval: UsageAccountProfile?
+    @State private var accountRemovalError: String?
     @State private var signingIn: UsageAccountProfile?
     @State private var showsResetConfirmation = false
     private let accountStore = UsageAccountStore()
+
+    /// Removal here must be exactly as safe as removal from the Accounts tab:
+    /// any project pinned to this account is reassigned to App Default FIRST,
+    /// and a failure to reassign aborts the removal rather than stranding
+    /// projects on a directory with no owner.
+    private func removeAccount(_ profile: UsageAccountProfile) {
+        do {
+            _ = try usage.projectAccountRecoveryCenter.clearAssignments(
+                to: profile.directory,
+                provider: profile.provider
+            )
+        } catch {
+            accountRemovalError = error.localizedDescription
+            return
+        }
+        guard accountStore.remove(id: profile.id) else {
+            accountRemovalError = "Kaisola reassigned affected projects to App Default, but couldn't remove \(profile.label). Try removing the account again."
+            return
+        }
+        accountProfiles.removeAll { $0.id == profile.id }
+        NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+    }
 
     /// Reading for a configured account. `ProviderPlanUsage.profileID` carries
     /// the account it was read for, so two Claude subscriptions never collapse
@@ -208,8 +231,10 @@ struct UsageSettingsTab: View {
 
         .task(id: workspace?.standardizedFileURL.path) {
             // Reading the account list is a small local JSON decode, so cards
-            // can paint before any probe runs.
-            accountProfiles = accountStore.profiles()
+            // can paint before any probe runs. Fixtures publish their named
+            // accounts through UsageCenter instead of the on-disk registry so
+            // the multi-subscription grid is renderable deterministically.
+            accountProfiles = usage.fixtureAccountProfiles ?? accountStore.profiles()
             // Hosted/local visual fixtures are deterministic and must never
             // replace their provider cards by probing an unsigned debug helper.
             // Production always performs the real signed-helper refresh.
@@ -238,13 +263,22 @@ struct UsageSettingsTab: View {
             Button("Remove Account", role: .destructive) {
                 guard let profile = pendingAccountRemoval else { return }
                 pendingAccountRemoval = nil
-                guard accountStore.remove(id: profile.id) else { return }
-                accountProfiles.removeAll { $0.id == profile.id }
-                NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+                removeAccount(profile)
             }
             Button("Cancel", role: .cancel) { pendingAccountRemoval = nil }
         } message: {
             Text("Kaisola will forget this named account. Its provider files and sign-in stay on disk.")
+        }
+        .alert(
+            "Couldn't Remove Account",
+            isPresented: Binding(
+                get: { accountRemovalError != nil },
+                set: { if !$0 { accountRemovalError = nil } }
+            )
+        ) {
+            Button("OK") { accountRemovalError = nil }
+        } message: {
+            Text(accountRemovalError ?? "")
         }
         .alert(
             "Reset Usage History?",

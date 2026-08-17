@@ -344,7 +344,13 @@ function codexUsage(codexHome, options = {}) {
     const extraEnv = codexHome ? { CODEX_HOME: expandHome(codexHome) } : undefined
     // GUI-launched macOS apps inherit /usr/bin:/bin, not the user's shell PATH.
     // Every other agent process already uses agentEnv(); usage must do the same.
-    const env = options.env || agentEnv(extraEnv)
+    // The explicit codexHome argument is merged OVER a caller-supplied env —
+    // `options.env || agentEnv(extraEnv)` used to discard the only carrier of
+    // CODEX_HOME whenever a caller passed its own environment, so every
+    // per-account probe from the native usage service read the ambient login.
+    const env = options.env
+      ? { ...options.env, ...(extraEnv || {}) }
+      : agentEnv(extraEnv)
     let proc
     let timer
     let lines

@@ -1587,6 +1587,14 @@ final class UsageCenter: ObservableObject {
 
     /// Deterministic provider cards for the hosted macOS visual job. No local
     /// account process or credential is touched; production never calls this.
+    /// Fixture account profiles for the Usage surface, published so the tab
+    /// can render named subscription cards without touching the on-disk
+    /// registry. Nil outside fixtures; the tab falls back to the real store.
+    /// Multiple accounts with DISTINCT readings are the whole point: the
+    /// release where every per-account probe read the default login rendered
+    /// N subscriptions as clones, and no fixture could show it.
+    private(set) var fixtureAccountProfiles: [UsageAccountProfile]?
+
     func loadVisualFixture() {
         planRefreshTask?.cancel()
         planRefreshTask = nil
@@ -1617,21 +1625,81 @@ final class UsageCenter: ObservableObject {
             ),
         ]
         let reset = Date().addingTimeInterval(7_200).timeIntervalSince1970
+        let updated = Date().timeIntervalSince1970 * 1_000
+        // Three named Claude subscriptions with visibly different readings,
+        // plus the CLI's own unnamed default Codex login. Distinct emails and
+        // percentages are the regression surface: identical cards under
+        // different names is the exact bug this fixture exists to catch.
+        let accounts = [
+            UsageAccountProfile(
+                id: "fixture-claude-work",
+                provider: .claude,
+                label: "Work",
+                directory: "~/.claude-work"
+            ),
+            UsageAccountProfile(
+                id: "fixture-claude-research",
+                provider: .claude,
+                label: "Research",
+                directory: "~/.claude-research"
+            ),
+            UsageAccountProfile(
+                id: "fixture-claude-team",
+                provider: .claude,
+                label: "Team",
+                directory: "~/.claude-team"
+            ),
+        ]
+        fixtureAccountProfiles = accounts
         planUsage = [
             ProviderPlanUsage(
                 provider: "claude",
                 displayName: "Claude",
+                profileID: "fixture-claude-work",
+                profileLabel: "Work",
                 ok: true,
                 sourceLabel: "Claude Agent SDK 0.3.205",
                 experimental: true,
-                account: nil,
+                account: "work@example.com · Example Corp",
                 plan: "max",
                 windows: [
                     PlanWindow(label: "5 hour", usedPercent: 38, resetsAt: reset),
                     PlanWindow(label: "7 day", usedPercent: 16, resetsAt: reset + 338_400),
                 ],
                 message: nil,
-                updatedAt: Date().timeIntervalSince1970 * 1_000
+                updatedAt: updated
+            ),
+            ProviderPlanUsage(
+                provider: "claude",
+                displayName: "Claude",
+                profileID: "fixture-claude-research",
+                profileLabel: "Research",
+                ok: true,
+                sourceLabel: "Claude Agent SDK 0.3.205",
+                experimental: true,
+                account: "research@example.com",
+                plan: "max",
+                windows: [
+                    PlanWindow(label: "5 hour", usedPercent: 91, resetsAt: reset - 3_600),
+                    PlanWindow(label: "7 day", usedPercent: 64, resetsAt: reset + 250_000),
+                ],
+                message: nil,
+                updatedAt: updated
+            ),
+            ProviderPlanUsage(
+                provider: "claude",
+                displayName: "Claude",
+                profileID: "fixture-claude-team",
+                profileLabel: "Team",
+                ok: false,
+                authRequired: true,
+                sourceLabel: "Claude Agent SDK 0.3.205",
+                experimental: true,
+                account: nil,
+                plan: nil,
+                windows: [],
+                message: "Sign in with a Claude.ai subscription to read plan limits.",
+                updatedAt: updated
             ),
             ProviderPlanUsage(
                 provider: "codex",
@@ -1643,7 +1711,7 @@ final class UsageCenter: ObservableObject {
                 plan: "pro",
                 windows: [PlanWindow(label: "5 hour", usedPercent: 24, resetsAt: reset)],
                 message: nil,
-                updatedAt: Date().timeIntervalSince1970 * 1_000
+                updatedAt: updated
             ),
         ]
         planUsageError = nil
@@ -1705,6 +1773,28 @@ final class UsageCenter: ObservableObject {
         }
     }
 
+    /// The helper invocation for one account probe. The account pointer rides
+    /// as an explicit argument, not only as an environment variable: the
+    /// helper rebuilds its child environment from a compatibility allowlist,
+    /// and the release where that allowlist silently deleted
+    /// CLAUDE_CONFIG_DIR/CODEX_HOME rendered six subscriptions as clones of
+    /// the default login. Arguments cannot be stripped by an env filter.
+    nonisolated static func usageServiceArguments(
+        scriptPath: String,
+        request: PlanUsageRequest
+    ) -> [String] {
+        var arguments = [scriptPath, "--provider", request.provider.rawValue]
+        if let pointer = request.environment[request.provider.environmentKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !pointer.isEmpty {
+            arguments += [
+                request.provider == .claude ? "--claude-config-dir" : "--codex-home",
+                pointer,
+            ]
+        }
+        return arguments
+    }
+
     private nonisolated static func readSingleProviderPlanUsage(
         package: VerifiedBrokerHelperPackage,
         currentDirectory: URL?,
@@ -1730,7 +1820,10 @@ final class UsageCenter: ObservableObject {
         do {
             let process = Process()
             process.executableURL = package.nodeExecutable
-            process.arguments = [package.usageScript.path, "--provider", request.provider.rawValue]
+            process.arguments = Self.usageServiceArguments(
+                scriptPath: package.usageScript.path,
+                request: request
+            )
             process.environment = request.environment
             process.currentDirectoryURL = currentDirectory
             let output = Pipe()

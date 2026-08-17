@@ -383,7 +383,12 @@ struct ProjectAccountsSection: View {
             AccountSignInSheet(profile: profile) {
                 signingIn = nil
                 loadUsageProfiles()
-                refreshAuthentication(force: true)
+                // A successful sign-in already forced a probe through the
+                // controller's notification; forcing again mid-read would
+                // cancel and restart it for nothing.
+                if !usage.isRefreshingPlanUsage {
+                    refreshAuthentication(force: true)
+                }
             }
         }
         .confirmationDialog(

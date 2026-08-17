@@ -4503,11 +4503,14 @@ final class AppModel: ObservableObject {
     /// had removed the registry entry, this explicit action re-registers the
     /// exact immutable id/path before authentication begins.
     ///
-    /// Deliberately does NOT begin the chat's recovery window here. Recovery
-    /// used to start when the sheet opened, so a real sign-in — browser,
-    /// approval, code — always outlived the five-second window and the card
-    /// flipped to "could not confirm in time" mid-flow. The window now starts
-    /// when the sheet closes, in `completeChatAccountSignIn`.
+    /// The recovery window is armed twice, deliberately. Here, at sheet-open,
+    /// with the long sign-in window: any reconcile the notification below (or
+    /// the controller's own success post) triggers must see a fresh deadline —
+    /// against the stale one from restore time, the watchdog fired within one
+    /// run-loop turn and re-invalidated the resume identity before the user
+    /// had even seen the sheet. And again at sheet-close, in
+    /// `completeChatAccountSignIn`, so the probe that actually decides the
+    /// outcome gets its own full window however long the browser took.
     func accountSignInProfile(for chatID: String) -> UsageAccountProfile? {
         guard let chat = chats.first(where: { $0.id == chatID }),
               let binding = chat.accountBinding,
@@ -4527,6 +4530,7 @@ final class AppModel: ObservableObject {
             )?.continuationKey == binding.continuationKey
         })
         guard let profile = existing ?? usageAccountStore.restore(requested) else { return nil }
+        chat.accountAccess.beginRecovery(window: ChatAccountAccess.signInVerificationWindow)
         if existing == nil {
             // A profile was actually re-registered; the account lists need to
             // hear about it. A pre-sign-in probe fan-out for the unchanged
@@ -4538,11 +4542,14 @@ final class AppModel: ObservableObject {
     }
 
     /// The sign-in sheet for a blocked chat closed — signed in, cancelled, or
-    /// failed. Start the bounded verification now, sized for a real probe
-    /// rather than a cache hit, and force the probe that decides it.
+    /// failed. Re-arm the bounded verification, sized for a real probe rather
+    /// than a cache hit, and make sure a probe decides it: a successful
+    /// sign-in already forced one via the controller's notification, so a
+    /// second post here would only cancel and restart that probe mid-read.
     func completeChatAccountSignIn(_ chatID: String) {
         guard let chat = chats.first(where: { $0.id == chatID }) else { return }
         chat.accountAccess.beginRecovery(window: ChatAccountAccess.signInVerificationWindow)
+        guard !usageCenter.isRefreshingPlanUsage else { return }
         NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
     }
 

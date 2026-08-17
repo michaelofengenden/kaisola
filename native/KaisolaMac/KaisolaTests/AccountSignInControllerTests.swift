@@ -51,19 +51,59 @@ final class AccountSignInControllerTests: XCTestCase {
         )
     }
 
-    /// Only the phases that should be producing output get a patience window.
-    /// A browser wait with a URL, or a code prompt, is waiting on the user —
-    /// there is nothing to call stalled.
+    /// Only the phases where the app is waiting on the CLI get a patience
+    /// window — launching, a browser wait with no URL yet, and a submitted
+    /// code the CLI went quiet on. A browser wait with its link, or the code
+    /// prompt, is waiting on the user; there is nothing to call stalled.
     @MainActor
     func testOnlySilentWorkingPhasesEverCountAsStalled() throws {
         XCTAssertNotNil(AccountSignInSheet.stallPatience(for: .launching))
         XCTAssertNotNil(AccountSignInSheet.stallPatience(for: .awaitingBrowser(nil)))
+        XCTAssertNotNil(AccountSignInSheet.stallPatience(for: .submitting))
         let url = try XCTUnwrap(URL(string: "https://claude.com/oauth"))
         XCTAssertNil(AccountSignInSheet.stallPatience(for: .awaitingBrowser(url)))
         XCTAssertNil(AccountSignInSheet.stallPatience(for: .awaitingCode(nil)))
-        XCTAssertNil(AccountSignInSheet.stallPatience(for: .submitting))
         XCTAssertNil(AccountSignInSheet.stallPatience(for: .succeeded))
         XCTAssertNil(AccountSignInSheet.stallPatience(for: .failed("x")))
+    }
+
+    /// The sheet's per-phase task keys on attempt + phase. Keying on phase
+    /// alone left a retry from a stalled `.launching` with the stale stall
+    /// banner and no fresh patience window, because the replacement attempt's
+    /// `.launching` compared equal to the one it replaced.
+    @MainActor
+    func testEveryAttemptChangesTheSheetTaskIdentityEvenWithinOnePhase() async throws {
+        let resolver = HoldingResolver()
+        let controller = AccountSignInController(executableResolver: { tool in
+            await resolver.resolve(tool)
+        })
+        let profile = UsageAccountProfile(
+            id: "claude-work",
+            provider: .claude,
+            label: "Work",
+            directory: "/tmp/kaisola-account-signin-task-id"
+        )
+
+        controller.start(profile: profile)
+        try await waitUntil { await resolver.callCount == 1 }
+        let first = AccountSignInSheet.PhaseTaskID(
+            attempt: controller.attemptCount,
+            phase: controller.phase
+        )
+
+        controller.retry(profile: profile)
+        try await waitUntil { await resolver.callCount == 2 }
+        let second = AccountSignInSheet.PhaseTaskID(
+            attempt: controller.attemptCount,
+            phase: controller.phase
+        )
+
+        XCTAssertEqual(controller.phase, .launching)
+        XCTAssertNotEqual(first, second)
+
+        await resolver.finishAll(with: .missing)
+        try await waitUntil { controller.phase.isFinished }
+        controller.cancel()
     }
 
     func testRetryFormResetClearsCodeDetailsAndFocusIntent() {

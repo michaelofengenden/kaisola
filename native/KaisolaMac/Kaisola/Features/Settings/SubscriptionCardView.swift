@@ -196,9 +196,11 @@ struct SubscriptionCardView: View {
     ///
     /// A signed-in account therefore says nothing here at all. The states you
     /// can act on speak, and the two that need a sign-in carry the action as a
-    /// visible button — it used to hide two levels deep, behind the ellipsis
-    /// and then inside a menu section, while the Accounts list put the same
-    /// action on a first-class button.
+    /// visible button — the primary affordance used to hide two levels deep,
+    /// behind the ellipsis and then inside a menu section, while the Accounts
+    /// list put the same action on a first-class button. The menu keeps its
+    /// copy so a signed-in account, which shows no button, can still start a
+    /// fresh sign-in.
     @ViewBuilder
     private var authLine: some View {
         switch authentication.status {

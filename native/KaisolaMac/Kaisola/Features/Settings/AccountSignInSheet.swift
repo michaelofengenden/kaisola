@@ -59,14 +59,28 @@ struct AccountSignInSheet: View {
     @FocusState private var codeFocused: Bool
 
     /// How long each phase may sit silent before the sheet says so and offers
-    /// Retry. Launching covers the 12-second shell probe plus the spawn;
-    /// a browser wait with no URL yet means the CLI has printed nothing usable.
+    /// Retry. Launching covers the 12-second shell probe plus the spawn; a
+    /// browser wait with no URL yet means the CLI has printed nothing usable;
+    /// submitting means the CLI took a code and went quiet, which is the one
+    /// hang the user cannot diagnose. The phases that are genuinely waiting
+    /// on the user — a browser wait with its link, the code prompt — never
+    /// count as stalled.
     static func stallPatience(for phase: AccountSignInController.Phase) -> Duration? {
         switch phase {
         case .launching: .seconds(25)
         case .awaitingBrowser(.none): .seconds(20)
+        case .submitting: .seconds(20)
         default: nil
         }
+    }
+
+    /// The identity the per-phase task keys on. The attempt number matters:
+    /// a retry from a stalled `.launching` lands back on `.launching`, which
+    /// compares equal — phase alone would keep the stale stall verdict and
+    /// never start a fresh patience window for the replacement attempt.
+    struct PhaseTaskID: Equatable {
+        let attempt: Int
+        let phase: AccountSignInController.Phase
     }
 
     /// How long the success beat stays on screen before the sheet closes
@@ -183,10 +197,11 @@ struct AccountSignInSheet: View {
                 codeFocused = false
             }
         }
-        // Restarts on every phase change, so each phase gets a fresh patience
-        // window and success gets its exit beat. Cancellation on phase change
-        // is what clears a pending stall verdict.
-        .task(id: controller.phase) {
+        // Restarts on every phase change AND every new attempt, so each phase
+        // gets a fresh patience window and success gets its exit beat.
+        // Cancellation on identity change is what clears a pending stall
+        // verdict.
+        .task(id: PhaseTaskID(attempt: controller.attemptCount, phase: controller.phase)) {
             stalled = false
             if controller.phase == .succeeded {
                 try? await Task.sleep(for: Self.successDismissDelay)

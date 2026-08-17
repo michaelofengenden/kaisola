@@ -410,17 +410,20 @@ struct RootShellView: View {
                 customModelTarget = nil
             }
         }
-        .sheet(item: $signingInChatAccount) { profile in
+        // Completion rides onDismiss, not the sheet's own dismiss closure, so
+        // it runs however the sheet ends — Done, Cancel, auto-dismiss, or any
+        // dismissal that bypasses the buttons. It re-arms the chat's bounded
+        // verification with the window a real post-sign-in probe needs; the
+        // launch-time five-second window always expired while the user was
+        // still in the browser.
+        .sheet(item: $signingInChatAccount, onDismiss: {
+            if let chatID = signingInChatID {
+                signingInChatID = nil
+                model.completeChatAccountSignIn(chatID)
+            }
+        }) { profile in
             AccountSignInSheet(profile: profile) {
                 signingInChatAccount = nil
-                // Only now does the chat's bounded verification start. It used
-                // to start when the sheet OPENED, so any real sign-in outlived
-                // the five-second window and the card announced "could not
-                // confirm … in time" while the user was still in the browser.
-                if let chatID = signingInChatID {
-                    signingInChatID = nil
-                    model.completeChatAccountSignIn(chatID)
-                }
             }
         }
         .sheet(item: Binding(get: { gitRepo.map(GitRepoID.init) }, set: { gitRepo = $0?.url })) { repo in

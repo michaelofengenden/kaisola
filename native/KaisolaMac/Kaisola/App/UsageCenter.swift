@@ -1585,8 +1585,6 @@ final class UsageCenter: ObservableObject {
         }
     }
 
-    /// Deterministic provider cards for the hosted macOS visual job. No local
-    /// account process or credential is touched; production never calls this.
     /// Fixture account profiles for the Usage surface, published so the tab
     /// can render named subscription cards without touching the on-disk
     /// registry. Nil outside fixtures; the tab falls back to the real store.
@@ -1595,6 +1593,8 @@ final class UsageCenter: ObservableObject {
     /// N subscriptions as clones, and no fixture could show it.
     private(set) var fixtureAccountProfiles: [UsageAccountProfile]?
 
+    /// Deterministic provider cards for the hosted macOS visual job. No local
+    /// account process or credential is touched; production never calls this.
     func loadVisualFixture() {
         planRefreshTask?.cancel()
         planRefreshTask = nil

@@ -204,6 +204,11 @@ final class AccountSignInController: ObservableObject {
     /// message read this, so a preserved earlier attempt in `transcript`
     /// cannot re-trigger an old prompt or speak for a new failure.
     private var attemptOutput = ""
+    /// Increments per attempt so the sheet can key per-attempt work — the
+    /// stall patience timer — on something that actually changes across a
+    /// retry. Phase alone returns to `.launching`, which compares equal to
+    /// the previous attempt's value and restarts nothing.
+    @Published private(set) var attemptCount = 0
 
     private var process: Process?
     private var input: FileHandle?
@@ -566,6 +571,7 @@ final class AccountSignInController: ObservableObject {
         attemptGeneration &+= 1
         let generation = attemptGeneration
         attemptActive = true
+        attemptCount += 1
         let tool = Self.toolName(for: profile.provider)
         phase = .launching
         outputPhaseTracker.reset(for: profile.provider)

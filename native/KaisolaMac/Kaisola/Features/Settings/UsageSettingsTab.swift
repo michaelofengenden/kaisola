@@ -19,6 +19,13 @@ struct UsageSettingsTab: View {
     /// and a failure to reassign aborts the removal rather than stranding
     /// projects on a directory with no owner.
     private func removeAccount(_ profile: UsageAccountProfile) {
+        // Fixture cards are published by UsageCenter, not the on-disk
+        // registry. Their Remove action must never reach the real
+        // project-account store a hosted visual job happens to share.
+        if usage.fixtureAccountProfiles != nil {
+            accountProfiles.removeAll { $0.id == profile.id }
+            return
+        }
         do {
             _ = try usage.projectAccountRecoveryCenter.clearAssignments(
                 to: profile.directory,
@@ -249,12 +256,15 @@ struct UsageSettingsTab: View {
         // Post-dismiss matches the Accounts host exactly: reload the list and
         // force a probe. Relying on the controller's success notification
         // alone left a cancelled-after-browser-approval sign-in unprobed, and
-        // the card behind the sheet stuck on its cached "Not signed in".
+        // the card behind the sheet stuck on its cached "Not signed in". When
+        // that notification's probe is already running, though, forcing again
+        // would only cancel it mid-read and delay the numbers.
         .sheet(item: $signingIn) { profile in
             AccountSignInSheet(profile: profile) {
                 signingIn = nil
                 accountProfiles = usage.fixtureAccountProfiles ?? accountStore.profiles()
-                guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] != "1" else { return }
+                guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] != "1",
+                      !usage.isRefreshingPlanUsage else { return }
                 usage.refreshPlanUsage(workspace: workspace, force: true)
             }
         }

@@ -242,14 +242,20 @@ struct UsageSettingsTab: View {
             usage.refreshPlanUsage(workspace: workspace)
         }
         .onReceive(NotificationCenter.default.publisher(for: .kaisolaUsageAccountsChanged)) { _ in
-            accountProfiles = accountStore.profiles()
+            accountProfiles = usage.fixtureAccountProfiles ?? accountStore.profiles()
             guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] != "1" else { return }
             usage.refreshPlanUsage(workspace: workspace, force: true)
         }
+        // Post-dismiss matches the Accounts host exactly: reload the list and
+        // force a probe. Relying on the controller's success notification
+        // alone left a cancelled-after-browser-approval sign-in unprobed, and
+        // the card behind the sheet stuck on its cached "Not signed in".
         .sheet(item: $signingIn) { profile in
             AccountSignInSheet(profile: profile) {
                 signingIn = nil
-                accountProfiles = accountStore.profiles()
+                accountProfiles = usage.fixtureAccountProfiles ?? accountStore.profiles()
+                guard ProcessInfo.processInfo.environment["KAISOLA_NATIVE_VISUAL_FIXTURE"] != "1" else { return }
+                usage.refreshPlanUsage(workspace: workspace, force: true)
             }
         }
         .confirmationDialog(

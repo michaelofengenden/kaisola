@@ -24,6 +24,15 @@ struct SubscriptionCardView: View {
     var onReveal: (() -> Void)?
     var onRemove: (() -> Void)?
 
+    /// The same resolver the Accounts list uses, so a card and its account row
+    /// can never disagree about whether the account is signed in. They used to
+    /// derive state from different fields — the row from `ok`/`authRequired`,
+    /// the card from whether an email string happened to be non-empty — and
+    /// the same account read "Signed in" on one screen and orange on the other.
+    private var authentication: NamedAccountAuthenticationPresentation {
+        NamedAccountAuthenticationPresentation.resolve(reading: usage, isRefreshing: isRefreshing)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             header
@@ -149,21 +158,27 @@ struct SubscriptionCardView: View {
     }
 
     private var statusColor: Color {
-        guard let usage else { return .secondary }
-        if !usage.ok { return .red }
-        return usage.account?.isEmpty == false ? .green : .orange
+        switch authentication.status {
+        case .checking, .unchecked: .secondary
+        case .signedIn: .green
+        case .signedOut, .expired: .orange
+        case .failed: .red
+        }
     }
 
+    /// Simple glyphs on purpose: this badge renders at 9 points over the brand
+    /// mark, where the resolver's fuller symbols turn to noise. The color and
+    /// title carry the distinction.
     private var statusSymbol: String {
-        guard let usage else { return "circle.dotted" }
-        if !usage.ok { return "exclamationmark.circle.fill" }
-        return usage.account?.isEmpty == false ? "checkmark.circle.fill" : "circle"
+        switch authentication.status {
+        case .checking, .unchecked: "circle.dotted"
+        case .signedIn: "checkmark.circle.fill"
+        case .signedOut, .expired, .failed: "exclamationmark.circle.fill"
+        }
     }
 
     private var statusDescription: String {
-        guard let usage else { return "Checking this account" }
-        if !usage.ok { return "Needs attention" }
-        return usage.account?.isEmpty == false ? "Signed in" : "Not signed in"
+        authentication.title
     }
 
     // MARK: - Identity
@@ -179,18 +194,37 @@ struct SubscriptionCardView: View {
     /// label already told you. You named these accounts; the email underneath
     /// is the provider's business.
     ///
-    /// A signed-in account therefore says nothing here at all. The two states
-    /// you can act on still speak.
+    /// A signed-in account therefore says nothing here at all. The states you
+    /// can act on speak, and the two that need a sign-in carry the action as a
+    /// visible button — it used to hide two levels deep, behind the ellipsis
+    /// and then inside a menu section, while the Accounts list put the same
+    /// action on a first-class button.
     @ViewBuilder
     private var authLine: some View {
-        if let account = usage?.account, !account.isEmpty {
+        switch authentication.status {
+        case .signedIn:
             EmptyView()
-        } else if usage == nil {
+        case .checking:
             Text("Checking this account…")
                 .font(.caption)
                 .foregroundStyle(.kaisolaSecondary)
-        } else {
-            Text("Not signed in")
+        case .unchecked:
+            Text("Not checked yet")
+                .font(.caption)
+                .foregroundStyle(.kaisolaSecondary)
+        case .signedOut, .expired:
+            HStack(spacing: 8) {
+                Text(authentication.title)
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                if let onSignIn {
+                    Button(authentication.actionTitle, action: onSignIn)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                }
+            }
+        case .failed:
+            Text(authentication.title)
                 .font(.caption)
                 .foregroundStyle(.kaisolaSecondary)
         }

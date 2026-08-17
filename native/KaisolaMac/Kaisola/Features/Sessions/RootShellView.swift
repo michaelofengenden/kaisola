@@ -64,6 +64,9 @@ struct RootShellView: View {
     @State private var customModelTarget: String?
     @State private var customModelText: String = ""
     @State private var signingInChatAccount: UsageAccountProfile?
+    /// The blocked chat whose sign-in sheet is open, so dismissal can start
+    /// that chat's verification window rather than leaving the gate hanging.
+    @State private var signingInChatID: String?
     @State private var renameProjectTarget: String?
     @State private var renameText: String = ""
     @State private var gitRepo: URL?
@@ -410,6 +413,14 @@ struct RootShellView: View {
         .sheet(item: $signingInChatAccount) { profile in
             AccountSignInSheet(profile: profile) {
                 signingInChatAccount = nil
+                // Only now does the chat's bounded verification start. It used
+                // to start when the sheet OPENED, so any real sign-in outlived
+                // the five-second window and the card announced "could not
+                // confirm … in time" while the user was still in the browser.
+                if let chatID = signingInChatID {
+                    signingInChatID = nil
+                    model.completeChatAccountSignIn(chatID)
+                }
             }
         }
         .sheet(item: Binding(get: { gitRepo.map(GitRepoID.init) }, set: { gitRepo = $0?.url })) { repo in
@@ -2823,6 +2834,7 @@ struct RootShellView: View {
             )
             return
         }
+        signingInChatID = chat.id
         signingInChatAccount = profile
     }
 

@@ -33,6 +33,39 @@ final class AccountSignInControllerTests: XCTestCase {
         )
     }
 
+    /// A hung login never becomes `.failed` on its own, so the stall verdict
+    /// is what unlocks Retry — everywhere except success, which has nothing to
+    /// retry.
+    func testAStalledAttemptOffersRetryWithoutWaitingForFailure() {
+        XCTAssertEqual(
+            AccountSignInFooterPolicy.actions(for: .launching, stalled: true),
+            [.cancel, .retry]
+        )
+        XCTAssertEqual(
+            AccountSignInFooterPolicy.actions(for: .awaitingBrowser(nil), stalled: true),
+            [.cancel, .retry]
+        )
+        XCTAssertEqual(
+            AccountSignInFooterPolicy.actions(for: .succeeded, stalled: true),
+            [.done]
+        )
+    }
+
+    /// Only the phases that should be producing output get a patience window.
+    /// A browser wait with a URL, or a code prompt, is waiting on the user —
+    /// there is nothing to call stalled.
+    @MainActor
+    func testOnlySilentWorkingPhasesEverCountAsStalled() throws {
+        XCTAssertNotNil(AccountSignInSheet.stallPatience(for: .launching))
+        XCTAssertNotNil(AccountSignInSheet.stallPatience(for: .awaitingBrowser(nil)))
+        let url = try XCTUnwrap(URL(string: "https://claude.com/oauth"))
+        XCTAssertNil(AccountSignInSheet.stallPatience(for: .awaitingBrowser(url)))
+        XCTAssertNil(AccountSignInSheet.stallPatience(for: .awaitingCode(nil)))
+        XCTAssertNil(AccountSignInSheet.stallPatience(for: .submitting))
+        XCTAssertNil(AccountSignInSheet.stallPatience(for: .succeeded))
+        XCTAssertNil(AccountSignInSheet.stallPatience(for: .failed("x")))
+    }
+
     func testRetryFormResetClearsCodeDetailsAndFocusIntent() {
         var form = AccountSignInFormState(
             code: "secret-code",
@@ -46,7 +79,7 @@ final class AccountSignInControllerTests: XCTestCase {
     }
 
     @MainActor
-    func testRetryStartsOneFreshAttemptAndDropsThePreviousTranscript() async throws {
+    func testRetryStartsOneFreshAttemptAndKeepsThePreviousTranscript() async throws {
         let resolver = AccountSignInRetryResolver()
         let controller = AccountSignInController(executableResolver: { tool in
             await resolver.resolve(tool)
@@ -65,9 +98,13 @@ final class AccountSignInControllerTests: XCTestCase {
         }
         XCTAssertTrue(controller.transcript.contains("couldn’t find"))
 
+        // The earlier attempt stays readable under a divider — wiping it
+        // destroyed exactly what someone retrying wants to compare.
         controller.retry(profile: profile)
         XCTAssertEqual(controller.phase, .launching)
-        XCTAssertEqual(controller.transcript, "Looking for the claude command…\n")
+        XCTAssertTrue(controller.transcript.contains("couldn’t find"))
+        XCTAssertTrue(controller.transcript.contains("— Retrying —"))
+        XCTAssertTrue(controller.transcript.hasSuffix("Looking for the claude command…\n"))
 
         // A second appearance/start signal while Retry is already resolving
         // must not launch a concurrent provider process.
@@ -344,6 +381,51 @@ final class AccountSignInControllerTests: XCTestCase {
         )
     }
 
+    /// One literal substring stranded the flow the day the CLI reworded its
+    /// prompt: field locked, no error, Cancel the only exit. The variants stay
+    /// prompt-shaped — a sentence merely containing "code" must not unlock.
+    func testACodePromptRewordingStillUnlocksTheCodeField() {
+        XCTAssertTrue(AccountSignInController.promptsForCode("Paste the code from your browser:"))
+        XCTAssertTrue(AccountSignInController.promptsForCode("Enter the code shown in your browser"))
+        XCTAssertTrue(AccountSignInController.promptsForCode("Enter code: "))
+        XCTAssertFalse(AccountSignInController.promptsForCode("error code 401"))
+        XCTAssertFalse(AccountSignInController.promptsForCode("Your code editor is ready"))
+    }
+
+    /// Retry must be reachable from a live attempt that has stalled, not only
+    /// from `.failed` — a CLI that never prints a URL and never exits used to
+    /// leave Cancel as the only way out.
+    @MainActor
+    func testRetryReplacesALiveAttemptThatNeverAnswered() async throws {
+        let resolver = HoldingResolver()
+        let controller = AccountSignInController(executableResolver: { tool in
+            await resolver.resolve(tool)
+        })
+        let profile = UsageAccountProfile(
+            id: "claude-work",
+            provider: .claude,
+            label: "Work",
+            directory: "/tmp/kaisola-account-signin-stall"
+        )
+
+        controller.start(profile: profile)
+        try await waitUntil { await resolver.callCount == 1 }
+        XCTAssertEqual(controller.phase, .launching)
+
+        controller.retry(profile: profile)
+        try await waitUntil { await resolver.callCount == 2 }
+        XCTAssertEqual(controller.phase, .launching)
+
+        // Both lookups answer; the first is a stale generation and must be
+        // ignored, the second finishes the replacement attempt.
+        await resolver.finishAll(with: .missing)
+        try await waitUntil { controller.phase.isFinished }
+        guard case .failed = controller.phase else {
+            return XCTFail("expected the replacement attempt to finish, got \(controller.phase)")
+        }
+        controller.cancel()
+    }
+
     func testOutputAfterSubmitDoesNotReopenTheOldCodePrompt() throws {
         let url = try XCTUnwrap(URL(string: "https://claude.com/oauth"))
         var tracker = AccountSignInController.OutputPhaseTracker()
@@ -562,6 +644,25 @@ final class AccountSignInControllerTests: XCTestCase {
 /// orders the write before the read.
 private final class LookupBox: @unchecked Sendable {
     var value: AccountSignInController.ExecutableLookup?
+}
+
+/// Holds every lookup open until told, standing in for a discovery that never
+/// answers while a retry replaces it.
+private actor HoldingResolver {
+    private var continuations: [CheckedContinuation<AccountSignInController.ExecutableLookup, Never>] = []
+    private var calls = 0
+
+    var callCount: Int { calls }
+
+    func resolve(_ tool: String) async -> AccountSignInController.ExecutableLookup {
+        calls += 1
+        return await withCheckedContinuation { continuations.append($0) }
+    }
+
+    func finishAll(with result: AccountSignInController.ExecutableLookup) {
+        continuations.forEach { $0.resume(returning: result) }
+        continuations.removeAll()
+    }
 }
 
 private actor AccountSignInRetryResolver {

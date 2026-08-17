@@ -54,6 +54,13 @@ final class ChatAccountAccess: ObservableObject {
     /// successful probe still unlocks the chat after this deadline.
     static let resolutionTimeout: TimeInterval = 5
 
+    /// The window after a sign-in sheet closes. This one has to cover a real
+    /// probe — helper verification plus a provider subprocess per account —
+    /// not a cache read, so the launch-time bound would flip the card to
+    /// "could not confirm in time" while the probe it asked for was still
+    /// running.
+    static let signInVerificationWindow: TimeInterval = 45
+
     let binding: SessionAccountBinding?
     @Published private(set) var phase: Phase
     /// AppModel installs this hook so a timeout reached without another usage
@@ -161,11 +168,15 @@ final class ChatAccountAccess: ObservableObject {
         return .unchanged
     }
 
-    /// Explicit Sign In starts a fresh bounded resolution window. Restoring a
-    /// removed profile and authenticating can take longer than the launch-time
-    /// window that originally exposed the action card.
-    func beginRecovery(now: Date = Date()) {
-        deadline = now.addingTimeInterval(Self.resolutionTimeout)
+    /// Explicit recovery starts a fresh bounded resolution window. The default
+    /// suits a re-check against cached readings; a caller that just triggered
+    /// real work — a post-sign-in probe — passes the window that covers it.
+    func beginRecovery(now: Date = Date(), window: TimeInterval = ChatAccountAccess.resolutionTimeout) {
+        deadline = now.addingTimeInterval(max(0, window))
+        // A pending watchdog still aims at the previous, possibly shorter
+        // deadline; left alone it would time this fresh window out early.
+        timeoutTask?.cancel()
+        timeoutTask = nil
         _ = apply(.resolving)
         scheduleTimeoutIfNeeded()
     }

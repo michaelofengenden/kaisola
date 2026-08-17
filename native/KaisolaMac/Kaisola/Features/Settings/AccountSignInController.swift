@@ -200,6 +200,10 @@ final class AccountSignInController: ObservableObject {
     /// Everything the CLI has said, for the disclosure the sheet can show. Kept
     /// verbatim so a flow that changes shape is visible rather than swallowed.
     @Published private(set) var transcript = ""
+    /// Output of the current attempt only. Phase detection and the failure
+    /// message read this, so a preserved earlier attempt in `transcript`
+    /// cannot re-trigger an old prompt or speak for a new failure.
+    private var attemptOutput = ""
 
     private var process: Process?
     private var input: FileHandle?
@@ -272,8 +276,17 @@ final class AccountSignInController: ObservableObject {
     }
 
     /// Whether the CLI is now blocked on a pasted code.
+    ///
+    /// Matched against several phrasings, not one: the literal "paste code"
+    /// was the CLI's exact wording when this shipped, and a wording change
+    /// would have stranded the flow — field locked, no error, Cancel the only
+    /// exit. The variants stay prompt-shaped ("paste/enter … code") rather
+    /// than matching any sentence containing "code", which URLs and banner
+    /// text use freely.
     nonisolated static func promptsForCode(_ output: String) -> Bool {
-        output.lowercased().contains("paste code")
+        let normalized = output.lowercased()
+        return ["paste code", "paste the code", "enter code", "enter the code"]
+            .contains { normalized.contains($0) }
     }
 
     /// The provider's CLI tool name.
@@ -539,8 +552,12 @@ final class AccountSignInController: ObservableObject {
         beginAttempt(profile: profile)
     }
 
+    /// Reachable from a failure and from a live attempt that has stalled. It
+    /// used to require `.failed`, which left every hung state — a CLI that
+    /// never prints a URL, a login that never exits — with Cancel as the only
+    /// way out.
     func retry(profile: UsageAccountProfile) {
-        guard case .failed = phase else { return }
+        guard phase != .succeeded else { return }
         stopCurrentAttempt()
         beginAttempt(profile: profile)
     }
@@ -552,7 +569,15 @@ final class AccountSignInController: ObservableObject {
         let tool = Self.toolName(for: profile.provider)
         phase = .launching
         outputPhaseTracker.reset(for: profile.provider)
-        transcript = "Looking for the \(tool) command…\n"
+        // The visible transcript survives a retry under a divider — wiping it
+        // destroyed exactly the evidence someone retrying wants to compare.
+        // Phase detection reads `attemptOutput`, never this, so a stale
+        // "paste code" from the previous attempt cannot move the new one.
+        attemptOutput = ""
+        let opening = "Looking for the \(tool) command…\n"
+        transcript = transcript.isEmpty
+            ? opening
+            : transcript + "\n— Retrying —\n\n" + opening
         discovery?.cancel()
         let executableResolver = self.executableResolver
         discovery = Task { [weak self] in
@@ -680,10 +705,11 @@ final class AccountSignInController: ObservableObject {
     private func absorb(_ text: String, generation: UInt64) {
         guard attemptGeneration == generation else { return }
         transcript += text
+        attemptOutput += text
         guard !phase.isFinished else { return }
         phase = outputPhaseTracker.phaseAfterOutput(
             current: phase,
-            transcript: transcript,
+            transcript: attemptOutput,
             newOutput: text
         )
     }
@@ -718,7 +744,9 @@ final class AccountSignInController: ObservableObject {
             // something tells it to look again.
             NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
         } else {
-            phase = .failed(Self.failureMessage(transcript: transcript, status: status))
+            // The current attempt's output only: a preserved earlier attempt
+            // must not supply the last words for this failure.
+            phase = .failed(Self.failureMessage(transcript: attemptOutput, status: status))
         }
     }
 

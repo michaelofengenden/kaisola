@@ -1083,6 +1083,30 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(codexHome, forKey: Keys.codexHome) }
     }
 
+    /// How new sessions pick their subscription. Stored as the raw value so a
+    /// downgrade reading an unknown policy falls back instead of crashing.
+    @Published var accountRoutingPolicy: AccountRoutingPolicy {
+        didSet { persist(accountRoutingPolicy.rawValue, forKey: Keys.accountRoutingPolicy) }
+    }
+
+    /// The last explicit subscription choice per agent, from the Run On
+    /// picker. Values are profile ids, or `AccountRouter.projectDefaultSelection`
+    /// when the user explicitly chose Project default — an explicit default is
+    /// a choice the sticky policy must respect, not absence of one.
+    @Published private(set) var lastAccountSelections: [String: String] {
+        didSet { persist(lastAccountSelections, forKey: Keys.lastAccountSelections) }
+    }
+
+    func rememberAccountSelection(agentID: String, profileID: String?) {
+        let trimmed = agentID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        lastAccountSelections[trimmed] = profileID ?? AccountRouter.projectDefaultSelection
+    }
+
+    func recallAccountSelection(agentID: String) -> String? {
+        lastAccountSelections[agentID]
+    }
+
     /// Non-secret direct-provider routing. Blank values retain each provider's
     /// own default. Invalid drafts are persisted so the user can correct them,
     /// but `ProviderRouting` refuses to inject them into child processes.
@@ -1240,6 +1264,8 @@ final class NativePreviewSettings: ObservableObject {
         static let sensitiveGlobs = "sensitiveGlobs"
         static let claudeConfigDir = "claudeConfigDir"
         static let codexHome = "codexHome"
+        static let accountRoutingPolicy = "accountRoutingPolicy"
+        static let lastAccountSelections = "accountRoutingLastSelections"
         static let anthropicBaseURL = "anthropicBaseURL"
         static let anthropicModel = "anthropicModel"
         static let openAIBaseURL = "openAIBaseURL"
@@ -1334,6 +1360,12 @@ final class NativePreviewSettings: ObservableObject {
         sensitiveGlobs = defaults.stringArray(forKey: Keys.sensitiveGlobs) ?? AcpPermissionRules.defaultSensitiveGlobs
         claudeConfigDir = defaults.string(forKey: Keys.claudeConfigDir) ?? ""
         codexHome = defaults.string(forKey: Keys.codexHome) ?? ""
+        // Sticky is the no-surprise default: it behaves exactly like manual
+        // until the user picks an account once, then keeps that choice.
+        accountRoutingPolicy = defaults.string(forKey: Keys.accountRoutingPolicy)
+            .flatMap(AccountRoutingPolicy.init) ?? .sticky
+        lastAccountSelections = defaults.dictionary(forKey: Keys.lastAccountSelections)
+            as? [String: String] ?? [:]
         anthropicBaseURL = defaults.string(forKey: Keys.anthropicBaseURL) ?? ""
         anthropicModel = defaults.string(forKey: Keys.anthropicModel) ?? ""
         openAIBaseURL = defaults.string(forKey: Keys.openAIBaseURL) ?? ""

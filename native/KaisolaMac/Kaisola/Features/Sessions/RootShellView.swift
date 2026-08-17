@@ -2126,6 +2126,19 @@ struct RootShellView: View {
             $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending
         }
 
+        // The router suggests; the popup decides. Fixtures keep their own
+        // deterministic preselection instead of routing over invented data.
+        let routingSettings = NativePreviewSettings.shared
+        let routedVerdict: AccountRouter.Verdict? = visualFixture ? nil : provider.flatMap {
+            AccountRouter.route(
+                provider: $0,
+                profiles: profiles,
+                readings: UsageCenter.shared.planUsage,
+                policy: routingSettings.accountRoutingPolicy,
+                lastUsedProfileID: routingSettings.recallAccountSelection(agentID: agent.id)
+            )
+        }
+
         let controller = RunOnPickerController(
             model: RunOnPickerModel(
                 targets: targets,
@@ -2140,6 +2153,7 @@ struct RootShellView: View {
                 : nil,
             restoredSelection: restoredSelection,
             preferNamedAccount: visualFixture,
+            routedVerdict: routedVerdict,
             removeRecent: { path in model.removeRecentFolder(path) }
         )
         let alert = NSAlert()
@@ -2186,6 +2200,14 @@ struct RootShellView: View {
                   target.canStart else {
                 cancelled()
                 return
+            }
+            // What actually launched is what sticky remembers — including an
+            // explicit Project default, which is a choice, not an absence.
+            if provider != nil, !visualFixture {
+                routingSettings.rememberAccountSelection(
+                    agentID: agent.id,
+                    profileID: controller.selectedProfile?.id
+                )
             }
             launch(
                 URL(fileURLWithPath: target.path, isDirectory: true),
@@ -5922,6 +5944,9 @@ final class RunOnPickerController: NSObject {
     let removeRecentButton = NSButton(title: "Remove from Recents", target: nil, action: nil)
     let chooseFolderButton = NSButton(title: "Choose another folder…", target: nil, action: nil)
     let confirmationLabel = NSTextField(wrappingLabelWithString: "")
+    /// Why the router preselected an account. Hidden the moment the user
+    /// touches the popup — a suggestion the user overrode has been heard.
+    let routingReasonLabel = NSTextField(wrappingLabelWithString: "")
     weak var startButton: NSButton?
     var chooseFolder: (() -> Void)?
 
@@ -5933,6 +5958,7 @@ final class RunOnPickerController: NSObject {
         selectedRunProfileID: String? = nil,
         restoredSelection: RunOnPickerSelection? = nil,
         preferNamedAccount: Bool,
+        routedVerdict: AccountRouter.Verdict? = nil,
         removeRecent: @escaping (String) -> Void
     ) {
         self.model = model
@@ -5983,6 +6009,7 @@ final class RunOnPickerController: NSObject {
             ))
             accountPopup.lastItem?.toolTip = "\(profile.provider.displayName) · \(profile.expandedDirectory)"
         }
+        var showsRoutingReason = false
         if let restoredSelection {
             if let profileID = restoredSelection.accountProfileID,
                let index = profiles.firstIndex(where: { $0.id == profileID }) {
@@ -5990,11 +6017,25 @@ final class RunOnPickerController: NSObject {
             } else {
                 accountPopup.selectItem(at: 0)
             }
+        } else if let routedVerdict,
+                  let index = profiles.firstIndex(where: { $0.id == routedVerdict.profileID }) {
+            // The router's suggestion, preselected with its reason on show.
+            // Never applied over a restored selection: an explicit choice the
+            // user already made outranks any policy.
+            accountPopup.selectItem(at: index + 1)
+            routingReasonLabel.stringValue = routedVerdict.reason
+            showsRoutingReason = true
         } else if preferNamedAccount, !profiles.isEmpty {
             accountPopup.selectItem(at: 1)
         }
         accountPopup.target = self
         accountPopup.action = #selector(accountChanged)
+
+        routingReasonLabel.font = .systemFont(ofSize: 11)
+        routingReasonLabel.textColor = .secondaryLabelColor
+        routingReasonLabel.maximumNumberOfLines = 2
+        routingReasonLabel.isHidden = !showsRoutingReason
+        routingReasonLabel.setAccessibilityLabel("Why this subscription is suggested")
 
         runProfilePopup.setAccessibilityLabel("Run profile")
         for profile in runProfiles {
@@ -6047,6 +6088,10 @@ final class RunOnPickerController: NSObject {
         }
 
         let accountColumn = choiceColumn(title: "Subscription", control: accountPopup)
+        accountColumn.addArrangedSubview(routingReasonLabel)
+        routingReasonLabel.widthAnchor.constraint(
+            equalTo: accountColumn.widthAnchor
+        ).isActive = true
         var choiceViews: [NSView] = [accountColumn]
         if !runProfiles.isEmpty {
             choiceViews.append(choiceColumn(title: "Run profile", control: runProfilePopup))
@@ -6201,6 +6246,7 @@ final class RunOnPickerController: NSObject {
     }
 
     @objc private func accountChanged() {
+        routingReasonLabel.isHidden = true
         refreshConfirmation()
     }
 

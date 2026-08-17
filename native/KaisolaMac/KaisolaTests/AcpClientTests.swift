@@ -3619,6 +3619,56 @@ final class AcpClientTests: XCTestCase {
         XCTAssertTrue(persisted.conversation === conversation)
     }
 
+    /// The recovery window is caller-sized. The post-sign-in window has to
+    /// cover a real probe rather than a cache read, and starting it must
+    /// replace a watchdog still aimed at the old, expired deadline — the
+    /// stale deadline is exactly what flipped a signing-in chat to "could not
+    /// confirm in time" within one run-loop turn.
+    @MainActor
+    func testBeginRecoveryHonorsTheCallerSizedVerificationWindow() {
+        let binding = SessionAccountBinding(
+            accountID: "work",
+            provider: .claude,
+            label: "Work",
+            configDirectory: "/tmp/claude-work"
+        )
+        let profile = UsageAccountProfile(
+            id: "work",
+            provider: .claude,
+            label: "Work",
+            directory: "/tmp/claude-work"
+        )
+        let start = Date(timeIntervalSince1970: 1_800_000_000)
+        let access = ChatAccountAccess(
+            binding: binding,
+            requiresResolution: true,
+            now: start.addingTimeInterval(-600)
+        )
+
+        // The launch-time window is long expired by the time the user acts.
+        _ = access.reconcile(.init(
+            profiles: [profile], readings: [], isRefreshing: false, now: start
+        ))
+        XCTAssertEqual(access.phase, .actionRequired(.resolutionTimedOut))
+
+        access.beginRecovery(now: start, window: ChatAccountAccess.signInVerificationWindow)
+        XCTAssertEqual(access.phase, .resolving)
+
+        // Inside the sign-in window: still resolving, not timed out.
+        _ = access.reconcile(.init(
+            profiles: [profile], readings: [], isRefreshing: false,
+            now: start.addingTimeInterval(30)
+        ))
+        XCTAssertEqual(access.phase, .resolving)
+
+        // Past it: bounded, as promised.
+        _ = access.reconcile(.init(
+            profiles: [profile], readings: [], isRefreshing: false,
+            now: start.addingTimeInterval(50)
+        ))
+        XCTAssertEqual(access.phase, .actionRequired(.resolutionTimedOut))
+    }
+
     @MainActor
     func testFollowUpQueuedWhileRunningDispatchesAfterTurn() async throws {
         let transport = ScriptedAcpTransport()

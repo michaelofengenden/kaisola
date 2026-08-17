@@ -884,9 +884,28 @@ final class MeshSession: ObservableObject, Identifiable {
             }
         }
         // Filtered adapter order determines role assignment (first = scout).
-        for assignment in Self.roles(for: usable, mode: mode, purpose: purpose) {
+        let assignments = Self.roles(for: usable, mode: mode, purpose: purpose)
+        // Under the balanced policy a Mesh fans its columns across
+        // subscriptions, freest first — Mesh has no account picker, and every
+        // column used to stack on the same project default. Other policies
+        // route nothing here and the resolve below behaves exactly as before.
+        let routedProfiles = AccountRouter.meshSpread(
+            columnProviders: assignments.map {
+                SessionAccountBinding.provider(forAgentID: $0.agent.id)
+            },
+            profiles: UsageAccountStore().profiles(),
+            readings: UsageCenter.shared.planUsage,
+            policy: NativePreviewSettings.shared.accountRoutingPolicy
+        )
+        for (assignmentIndex, assignment) in assignments.enumerated() {
             let agent = assignment.agent
+            // A routed profile that fails resolution falls back to the
+            // default binding — a routing suggestion must never cost a column.
             guard let accountBinding = SessionAccountBinding.resolve(
+                agentID: agent.id,
+                profile: routedProfiles[assignmentIndex],
+                fallbackEnvironment: environment
+            ) ?? SessionAccountBinding.resolve(
                 agentID: agent.id,
                 profile: nil,
                 fallbackEnvironment: environment

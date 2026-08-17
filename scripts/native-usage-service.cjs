@@ -188,14 +188,39 @@ function fixture(now = Date.now(), provider) {
   return { providers: provider ? providers.filter((value) => value.provider === provider) : providers }
 }
 
-async function readUsage({ provider } = {}) {
+/** The account pointer for this probe, stated explicitly.
+ *
+ * `agentEnv()` rebuilds the child environment from a fixed compatibility
+ * allowlist that deliberately excludes provider variables — which is correct
+ * for agent sessions, whose account values arrive through the `extra`
+ * argument, but silently deleted the per-account CLAUDE_CONFIG_DIR/CODEX_HOME
+ * the app set on this very process. Every one of N per-subscription probes
+ * then read the same default login and N different accounts rendered as
+ * clones of one. The pointer therefore travels twice now: as an explicit
+ * argument (immune to any env filtering) with the spawn environment kept as
+ * the fallback for direct CLI invocation. */
+function accountEnvironmentOverrides(options = {}, environment = process.env) {
+  const overrides = {}
+  const claude = typeof options.claudeConfigDir === 'string' && options.claudeConfigDir.trim()
+    ? options.claudeConfigDir.trim()
+    : (typeof environment.CLAUDE_CONFIG_DIR === 'string' ? environment.CLAUDE_CONFIG_DIR.trim() : '')
+  const codex = typeof options.codexHome === 'string' && options.codexHome.trim()
+    ? options.codexHome.trim()
+    : (typeof environment.CODEX_HOME === 'string' ? environment.CODEX_HOME.trim() : '')
+  if (claude) overrides.CLAUDE_CONFIG_DIR = claude
+  if (codex) overrides.CODEX_HOME = codex
+  return overrides
+}
+
+async function readUsage(options = {}) {
+  const { provider } = options
   if (provider != null && provider !== 'claude' && provider !== 'codex') {
     throw new Error('Unknown usage provider. Expected claude or codex.')
   }
   const now = Date.now()
   if (process.env.KAISOLA_NATIVE_USAGE_FIXTURE === '1') return fixture(now, provider)
 
-  const env = agentEnv()
+  const env = agentEnv(accountEnvironmentOverrides(options, process.env))
   const codexHome = typeof env.CODEX_HOME === 'string' && env.CODEX_HOME.trim()
     ? env.CODEX_HOME.trim()
     : undefined
@@ -226,11 +251,28 @@ async function readUsage({ provider } = {}) {
 }
 
 function parseArguments(argv) {
-  if (argv.length === 0) return {}
-  if (argv.length === 2 && argv[0] === '--provider' && (argv[1] === 'claude' || argv[1] === 'codex')) {
-    return { provider: argv[1] }
+  const usage = 'Usage: native-usage-service.cjs [--provider claude|codex]'
+    + ' [--claude-config-dir <path>] [--codex-home <path>]'
+  const options = {}
+  for (let index = 0; index < argv.length; index += 2) {
+    const flag = argv[index]
+    const value = argv[index + 1]
+    if (typeof value !== 'string' || value.startsWith('--')) throw new Error(usage)
+    if (flag === '--provider') {
+      if (value !== 'claude' && value !== 'codex') throw new Error(usage)
+      if (options.provider) throw new Error(usage)
+      options.provider = value
+    } else if (flag === '--claude-config-dir') {
+      if (options.claudeConfigDir || !value.trim()) throw new Error(usage)
+      options.claudeConfigDir = value
+    } else if (flag === '--codex-home') {
+      if (options.codexHome || !value.trim()) throw new Error(usage)
+      options.codexHome = value
+    } else {
+      throw new Error(usage)
+    }
   }
-  throw new Error('Usage: native-usage-service.cjs [--provider claude|codex]')
+  return options
 }
 
 if (require.main === module) {
@@ -250,6 +292,7 @@ if (require.main === module) {
 }
 
 module.exports = {
+  accountEnvironmentOverrides,
   executableOnPath,
   fixture,
   normalizeClaude,

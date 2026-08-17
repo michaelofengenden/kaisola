@@ -110,7 +110,9 @@
 		4552F75BAE695B4A4E2327A3 /* AcpProcessTransport.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32406CFD933CD31D2751A8AF /* AcpProcessTransport.swift */; };
 		45BDB67E55C8E0C6B1F2FF3E /* AcpComposerModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28FFC42BA9783C68516FA31C /* AcpComposerModel.swift */; };
 		461796BC63E29B3BAD8CAB8D /* BrokerBootstrapMain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6647914275EC9AD4E4A1C04B /* BrokerBootstrapMain.swift */; };
+		46BA25D027D7A256C24EB26B /* AccountRouter.swift in Sources */ = {isa = PBXBuildFile; fileRef = F5BAFFCCA8277AEFF3F83AF7 /* AccountRouter.swift */; };
 		46E02CD62E68B411ADECE3D9 /* UsageMeterPaletteTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B12E9F413AC35E693709288A /* UsageMeterPaletteTests.swift */; };
+		479DE2FE9457787C45E9E44D /* AccountRouterTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 07BD11CA9BE6F5EEFA96519F /* AccountRouterTests.swift */; };
 		4A0D957608380D5A77E8C001 /* NewSessionChooserView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7372202EE0749274E875CC59 /* NewSessionChooserView.swift */; };
 		4AEED15A504F6575273F165A /* AcpAdapterResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = BC20168C86DDDBA7D70222F3 /* AcpAdapterResolver.swift */; };
 		4B4670EA43E862CC87D986E2 /* AcpTranscriptPagingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5B9366DA57DF29F48E569785 /* AcpTranscriptPagingTests.swift */; };
@@ -323,7 +325,6 @@
 		D83D8C6FE8AE67D4E40DB17E /* CompanionTerminalStreamHub.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A7B902D6525FF8C39FC9CD3 /* CompanionTerminalStreamHub.swift */; };
 		D8684CF2B2E76859A488B89C /* NativeSessionStore+AutoTitle.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C11BDCCBCE80BB806B9AF63 /* NativeSessionStore+AutoTitle.swift */; };
 		D9CC5B14BE10AAA4250C69C5 /* TerminalImageDrop.swift in Sources */ = {isa = PBXBuildFile; fileRef = 678CF5145359C73DCF6F759F /* TerminalImageDrop.swift */; };
-		D9F08EBBD24B11EC7FA83C3C /* SignInCardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 95FFBAD11DCF40DF75829960 /* SignInCardView.swift */; };
 		D9F62D7BF944B5FF7DC5F508 /* UsageMeterPalette.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22979BDC18D58657F10D3A45 /* UsageMeterPalette.swift */; };
 		DB2D418E97E6131AF8B7EE3D /* UsageCenter.swift in Sources */ = {isa = PBXBuildFile; fileRef = C88BF5404563C22955EE7B51 /* UsageCenter.swift */; };
 		DC00CE55888A4B1629DF4C86 /* FuzzyMatch.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8FCBB2E107C280C3B125DF67 /* FuzzyMatch.swift */; };
@@ -434,6 +435,7 @@
 		0441702AA1CD407632FB480D /* SessionPaneLayoutTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionPaneLayoutTests.swift; sourceTree = "<group>"; };
 		055F15AB1B998161AD252189 /* DetailShowDoors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailShowDoors.swift; sourceTree = "<group>"; };
 		07063F75FCF57994E572B99C /* AppModelProjectContextTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModelProjectContextTests.swift; sourceTree = "<group>"; };
+		07BD11CA9BE6F5EEFA96519F /* AccountRouterTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountRouterTests.swift; sourceTree = "<group>"; };
 		07F25711B7E71707CD583039 /* AcpTerminalHostTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpTerminalHostTests.swift; sourceTree = "<group>"; };
 		081788CB50A2F8085E0929CE /* NativePreviewSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NativePreviewSettings.swift; sourceTree = "<group>"; };
 		0947C7DA82513DC2C0D20226 /* CustomThemeStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomThemeStore.swift; sourceTree = "<group>"; };
@@ -636,7 +638,6 @@
 		951C625A854E3A9D499DF660 /* KaisolaKeychainTests.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = KaisolaKeychainTests.entitlements; sourceTree = "<group>"; };
 		95607C26D9D00EAA7955A72D /* AuthModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthModel.swift; sourceTree = "<group>"; };
 		9586CAAF5EE496B213F01998 /* GitPanelView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GitPanelView.swift; sourceTree = "<group>"; };
-		95FFBAD11DCF40DF75829960 /* SignInCardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SignInCardView.swift; sourceTree = "<group>"; };
 		9606084ED3CB161CA3F53665 /* AppModel+QuickActions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "AppModel+QuickActions.swift"; sourceTree = "<group>"; };
 		9608644964317043ED13E235 /* BrokerRequestGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BrokerRequestGate.swift; sourceTree = "<group>"; };
 		9653464233B6252DE76DC814 /* TerminalSurfaceCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSurfaceCache.swift; sourceTree = "<group>"; };
@@ -769,6 +770,7 @@
 		F45BCF775EB8D43CFD1BFE2E /* FuzzyMatchTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FuzzyMatchTests.swift; sourceTree = "<group>"; };
 		F4C9DE8414FD78B1EFA06235 /* CustomAgentStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomAgentStore.swift; sourceTree = "<group>"; };
 		F55D6B3D9C8F9291C4F594FE /* ShadowBrokerConfiguration.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ShadowBrokerConfiguration.swift; sourceTree = "<group>"; };
+		F5BAFFCCA8277AEFF3F83AF7 /* AccountRouter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountRouter.swift; sourceTree = "<group>"; };
 		F60291E350621AED42329A3B /* NewSessionDraftTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NewSessionDraftTests.swift; sourceTree = "<group>"; };
 		F6886FE576953B0452EE0392 /* TerminalSemantics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TerminalSemantics.swift; sourceTree = "<group>"; };
 		F77C01E777DFFBA5912C93B3 /* AcpThinkingStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AcpThinkingStatus.swift; sourceTree = "<group>"; };
@@ -1080,7 +1082,6 @@
 				4A9119A3AFA982A1A42C4356 /* McpSettingsTab.swift */,
 				154C63628A43E6BD8410F578 /* ProjectAccountsSection.swift */,
 				1DC5E2009F74FD5A05DFB27D /* SettingsView.swift */,
-				95FFBAD11DCF40DF75829960 /* SignInCardView.swift */,
 				E180769B3F8FA3924EE82AF3 /* SubscriptionCardView.swift */,
 				22979BDC18D58657F10D3A45 /* UsageMeterPalette.swift */,
 				CB03F186495669D5F881F00E /* UsageSettingsTab.swift */,
@@ -1125,6 +1126,7 @@
 		C131D090B01AB3367C562B7E /* App */ = {
 			isa = PBXGroup;
 			children = (
+				F5BAFFCCA8277AEFF3F83AF7 /* AccountRouter.swift */,
 				496E90C9073FF30527C9C128 /* ApiKeyStore.swift */,
 				45799AC8A5D80828BB3EB235 /* AppModel.swift */,
 				6EB61D36CC5BEB88B707C9D7 /* AppModel+Pinning.swift */,
@@ -1164,6 +1166,7 @@
 			isa = PBXGroup;
 			children = (
 				1186936559305BAEF5106851 /* AccountHeadroomTests.swift */,
+				07BD11CA9BE6F5EEFA96519F /* AccountRouterTests.swift */,
 				0D0C0AB93E53CC4CC7AA3A38 /* AccountSignInControllerTests.swift */,
 				C5926CF38392E45AD77539A6 /* AcpAttachmentsTests.swift */,
 				87E8CB81899E1EDA02B677F9 /* AcpClientTests.swift */,
@@ -1645,6 +1648,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				46BA25D027D7A256C24EB26B /* AccountRouter.swift in Sources */,
 				B31E292AEB6FAAB870582010 /* AccountSignInController.swift in Sources */,
 				E2DC7F36968EA13B0E6FB431 /* AccountSignInSheet.swift in Sources */,
 				4AEED15A504F6575273F165A /* AcpAdapterResolver.swift in Sources */,
@@ -1798,7 +1802,6 @@
 				1869F552C4F7CEA346F1E96A /* SessionTitleTracker.swift in Sources */,
 				75C96456BA526067D7B840A7 /* SettingsView.swift in Sources */,
 				6244537E4A60B9BFCD6445C2 /* SharedWebKit.swift in Sources */,
-				D9F08EBBD24B11EC7FA83C3C /* SignInCardView.swift in Sources */,
 				F8C6FB0C2C3588D89201E634 /* SourceOutline.swift in Sources */,
 				D814CCC0DB3F76FB3D9033D6 /* SubscriptionCardView.swift in Sources */,
 				7E79252544D2552F7335E60C /* SyntaxHighlighter.swift in Sources */,
@@ -1849,6 +1852,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				20F63B2966AEF56EC965FC9D /* AccountHeadroomTests.swift in Sources */,
+				479DE2FE9457787C45E9E44D /* AccountRouterTests.swift in Sources */,
 				7467E7C0CF10006DE74138EA /* AccountSignInControllerTests.swift in Sources */,
 				91A9433AFEC39C634D53B3E8 /* AcpAttachmentsTests.swift in Sources */,
 				941E9FD174F5BD0CF47EE87E /* AcpClientTests.swift in Sources */,

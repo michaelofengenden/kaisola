@@ -1133,6 +1133,50 @@ final class UsageCenterTests: XCTestCase {
         XCTAssertEqual(Set(requests.map { "\($0.provider.rawValue):\($0.profileID)" }).count, requests.count)
     }
 
+    /// The account pointer rides the helper invocation as an explicit
+    /// argument. The environment copy alone was silently deleted by the
+    /// helper's compatibility allowlist, which is how six subscriptions
+    /// rendered as clones of the default login — the env stays as a fallback,
+    /// but the argument is what cannot be stripped.
+    func testUsageServiceArgumentsCarryTheAccountPointerExplicitly() throws {
+        let profiles = [
+            UsageAccountProfile(id: "claude-work", provider: .claude, label: "Work", directory: "/tmp/claude-work"),
+            UsageAccountProfile(id: "codex-research", provider: .codex, label: "Research", directory: "/tmp/codex-research"),
+        ]
+        let requests = UsageCenter.planUsageRequests(
+            workspace: URL(fileURLWithPath: "/tmp/project", isDirectory: true),
+            environment: ["HOME": "/tmp/home"],
+            profiles: profiles
+        )
+        let arguments = requests.map {
+            UsageCenter.usageServiceArguments(scriptPath: "/pkg/usage.cjs", request: $0)
+        }
+
+        // Active requests carry no pointer: the CLI's implicit default profile
+        // is NOT the same account as an explicit CLAUDE_CONFIG_DIR=~/.claude.
+        XCTAssertEqual(arguments[0], ["/pkg/usage.cjs", "--provider", "claude"])
+        XCTAssertEqual(arguments[1], [
+            "/pkg/usage.cjs", "--provider", "claude", "--claude-config-dir", "/tmp/claude-work",
+        ])
+        XCTAssertEqual(arguments[2], ["/pkg/usage.cjs", "--provider", "codex"])
+        XCTAssertEqual(arguments[3], [
+            "/pkg/usage.cjs", "--provider", "codex", "--codex-home", "/tmp/codex-research",
+        ])
+
+        // An app-wide pointer in the base environment reaches the active
+        // request's arguments too — it is a real account selection.
+        let scoped = UsageCenter.planUsageRequests(
+            workspace: nil,
+            environment: ["HOME": "/tmp/home", "CLAUDE_CONFIG_DIR": "/tmp/claude-else"],
+            profiles: []
+        )
+        let claudeActive = try XCTUnwrap(scoped.first { $0.provider == .claude })
+        XCTAssertEqual(
+            UsageCenter.usageServiceArguments(scriptPath: "/pkg/usage.cjs", request: claudeActive),
+            ["/pkg/usage.cjs", "--provider", "claude", "--claude-config-dir", "/tmp/claude-else"]
+        )
+    }
+
     /// A named account that aliases the active directory is the active account.
     /// Fanning out a second request for it queries one subscription twice and
     /// shows it as two limits side by side.

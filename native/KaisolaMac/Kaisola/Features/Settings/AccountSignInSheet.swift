@@ -20,8 +20,12 @@ enum AccountSignInFooterAction: Equatable {
 }
 
 enum AccountSignInFooterPolicy {
+    /// `stalled` is the sheet's judgement that a live attempt has gone quiet
+    /// for too long. It surfaces Retry without waiting for the CLI to exit,
+    /// because a login that hangs never becomes `.failed` on its own.
     static func actions(
-        for phase: AccountSignInController.Phase
+        for phase: AccountSignInController.Phase,
+        stalled: Bool = false
     ) -> [AccountSignInFooterAction] {
         switch phase {
         case .failed:
@@ -29,7 +33,7 @@ enum AccountSignInFooterPolicy {
         case .succeeded:
             [.done]
         default:
-            [.cancel]
+            stalled ? [.cancel, .retry] : [.cancel]
         }
     }
 }
@@ -48,7 +52,40 @@ struct AccountSignInSheet: View {
 
     @StateObject private var controller = AccountSignInController()
     @State private var form = AccountSignInFormState()
+    /// A live attempt has gone quiet past the phase's patience window. Judged
+    /// here rather than in the controller because it is presentation: nothing
+    /// about the subprocess changes, the sheet just stops pretending progress.
+    @State private var stalled = false
     @FocusState private var codeFocused: Bool
+
+    /// How long each phase may sit silent before the sheet says so and offers
+    /// Retry. Launching covers the 12-second shell probe plus the spawn; a
+    /// browser wait with no URL yet means the CLI has printed nothing usable;
+    /// submitting means the CLI took a code and went quiet, which is the one
+    /// hang the user cannot diagnose. The phases that are genuinely waiting
+    /// on the user — a browser wait with its link, the code prompt — never
+    /// count as stalled.
+    static func stallPatience(for phase: AccountSignInController.Phase) -> Duration? {
+        switch phase {
+        case .launching: .seconds(25)
+        case .awaitingBrowser(.none): .seconds(20)
+        case .submitting: .seconds(20)
+        default: nil
+        }
+    }
+
+    /// The identity the per-phase task keys on. The attempt number matters:
+    /// a retry from a stalled `.launching` lands back on `.launching`, which
+    /// compares equal — phase alone would keep the stale stall verdict and
+    /// never start a fresh patience window for the replacement attempt.
+    struct PhaseTaskID: Equatable {
+        let attempt: Int
+        let phase: AccountSignInController.Phase
+    }
+
+    /// How long the success beat stays on screen before the sheet closes
+    /// itself. Long enough to read "Signed in", short enough to not need Done.
+    static let successDismissDelay: Duration = .seconds(1.2)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -65,6 +102,17 @@ struct AccountSignInSheet: View {
             Divider()
 
             status
+
+            if stalled, !controller.phase.isFinished {
+                Label(
+                    "Nothing has arrived from the \(AccountSignInController.toolName(for: profile.provider)) CLI in a while. Retry, or check Details for what it said.",
+                    systemImage: "clock.badge.questionmark"
+                )
+                .font(.caption)
+                .foregroundStyle(.kaisolaSecondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .transition(.opacity)
+            }
 
             if controller.phase.acceptsCode || controller.phase == .submitting {
                 VStack(alignment: .leading, spacing: 6) {
@@ -83,6 +131,7 @@ struct AccountSignInSheet: View {
                                       || controller.phase == .submitting)
                     }
                 }
+                .transition(.opacity)
             }
 
             DisclosureGroup("Details", isExpanded: $form.showsTranscript) {
@@ -103,7 +152,7 @@ struct AccountSignInSheet: View {
                         .help(url.absoluteString)
                 }
                 Spacer()
-                switch AccountSignInFooterPolicy.actions(for: controller.phase) {
+                switch AccountSignInFooterPolicy.actions(for: controller.phase, stalled: stalled) {
                 case [.done]:
                     Button("Done") { dismiss() }
                         .buttonStyle(.borderedProminent)
@@ -132,6 +181,13 @@ struct AccountSignInSheet: View {
         }
         .padding(20)
         .frame(width: 460)
+        // One animation clock for every phase swap. The body used to rebuild
+        // per phase with no continuity at all — the code field popped in, the
+        // status swapped icon and text, the footer changed button count, and
+        // the sheet height jumped on each. Michael: "the sign-in is a little
+        // chopped."
+        .animation(.easeInOut(duration: 0.18), value: controller.phase)
+        .animation(.easeInOut(duration: 0.18), value: stalled)
         .onAppear { controller.start(profile: profile) }
         .onChange(of: controller.phase) { _, phase in
             // The code field is the only thing to do once it appears.
@@ -141,13 +197,35 @@ struct AccountSignInSheet: View {
                 codeFocused = false
             }
         }
+        // Restarts on every phase change AND every new attempt, so each phase
+        // gets a fresh patience window and success gets its exit beat.
+        // Cancellation on identity change is what clears a pending stall
+        // verdict.
+        .task(id: PhaseTaskID(attempt: controller.attemptCount, phase: controller.phase)) {
+            stalled = false
+            if controller.phase == .succeeded {
+                try? await Task.sleep(for: Self.successDismissDelay)
+                if !Task.isCancelled { dismiss() }
+                return
+            }
+            guard let patience = Self.stallPatience(for: controller.phase) else { return }
+            try? await Task.sleep(for: patience)
+            guard !Task.isCancelled else { return }
+            stalled = true
+            // The transcript is where the explanation lives; opening it for
+            // the user beats telling them it exists.
+            form.showsTranscript = true
+        }
     }
 
     @ViewBuilder
     private var status: some View {
         switch controller.phase {
         case .launching:
-            label("Starting \(profile.provider.displayName)…", symbol: "hourglass", tone: .secondary)
+            progressLabel(
+                "Starting \(profile.provider.displayName)…",
+                caption: "Locating the CLI through your login shell — a slow shell setup can take a few seconds."
+            )
         case .awaitingBrowser:
             label(
                 "Finish signing in with your browser. Kaisola is waiting.",
@@ -166,7 +244,7 @@ struct AccountSignInSheet: View {
                 tone: .secondary
             )
         case .submitting:
-            label("Checking the code…", symbol: "hourglass", tone: .secondary)
+            progressLabel("Checking the code…")
         case .succeeded:
             label(
                 "Signed in. \(profile.label) now has its own credentials, and its usage appears under Usage.",
@@ -186,6 +264,28 @@ struct AccountSignInSheet: View {
             Text(text)
                 .font(.callout)
                 .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+    }
+
+    /// A working phase shows a live spinner, not a static hourglass — the
+    /// hourglass made a 12-second shell probe indistinguishable from a hang.
+    private func progressLabel(_ text: String, caption: String? = nil) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            ProgressView()
+                .controlSize(.small)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(text)
+                    .font(.callout)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let caption {
+                    Text(caption)
+                        .font(.caption)
+                        .foregroundStyle(.kaisolaSecondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             Spacer(minLength: 0)
         }
     }

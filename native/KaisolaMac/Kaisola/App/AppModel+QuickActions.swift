@@ -24,17 +24,6 @@ extension AppModel {
         await runInFreshTerminal(command, inDirectory: directory, settleNanoseconds: 0)
     }
 
-    /// Open a fresh owned shell in the current project (or home) and run a
-    /// one-off command there — the Settings sign-in card's path. A brief settle
-    /// after the shell lands keeps a heavy rc file from eating the keystrokes.
-    func runCommandInNewTerminal(_ command: String) async {
-        let directory = currentProjectDirectory
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        await runInFreshTerminal(trimmed, inDirectory: directory, settleNanoseconds: 500_000_000)
-    }
-
     /// Shared spawn-then-type core. `createTerminal` returns the id of the shell
     /// it created, so we type into THAT terminal specifically — never the shared
     /// `selectedSessionID`, which the user could change between the spawn and the

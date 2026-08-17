@@ -909,7 +909,6 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private var agentsObserver: NSObjectProtocol?
     private var keymapObserver: NSObjectProtocol?
     private var commandPresentationObserver: NSObjectProtocol?
-    private var runInTerminalObserver: NSObjectProtocol?
     private var checkForUpdatesObserver: NSObjectProtocol?
     private var attentionJumpObserver: NSObjectProtocol?
     private var authPhaseObserver: AnyCancellable?
@@ -1280,18 +1279,6 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         ) { _ in
             Task { @MainActor in
                 AppCommandKeymapCenter.shared.reload()
-            }
-        }
-        // The Settings sign-in card asks for a terminal via notification (it
-        // has no AppModel). Handled here — not per-window — so exactly one
-        // shell window spawns the terminal.
-        runInTerminalObserver = NotificationCenter.default.addObserver(
-            forName: .kaisolaRunInTerminal, object: nil, queue: .main
-        ) { [weak self] note in
-            let command = note.userInfo?[SignInCardView.commandUserInfoKey] as? String
-            Task { @MainActor in
-                guard let command, let model = self?.keyModel() else { return }
-                await model.runCommandInNewTerminal(command)
             }
         }
         checkForUpdatesObserver = NotificationCenter.default.addObserver(
@@ -4257,13 +4244,11 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
         if let commandPresentationObserver {
             NotificationCenter.default.removeObserver(commandPresentationObserver)
         }
-        if let runInTerminalObserver { NotificationCenter.default.removeObserver(runInTerminalObserver) }
         if let checkForUpdatesObserver { NotificationCenter.default.removeObserver(checkForUpdatesObserver) }
         wakeObserver = nil
         agentsObserver = nil
         keymapObserver = nil
         commandPresentationObserver = nil
-        runInTerminalObserver = nil
         checkForUpdatesObserver = nil
         if let suite = Self.isolatedSettingsSuite {
             let defaults = UserDefaults(suiteName: suite)

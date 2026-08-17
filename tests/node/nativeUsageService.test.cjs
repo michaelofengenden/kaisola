@@ -3,6 +3,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 const {
+  accountEnvironmentOverrides,
   fixture,
   normalizeClaude,
   normalizeCodex,
@@ -121,4 +122,89 @@ test('both Codex windows keep their own names when both are reported', () => {
     now
   )
   assert.deepEqual(value.windows.map((w) => w.label), ['5 hour', 'Weekly'])
+})
+
+test('the account pointer survives as an explicit argument', () => {
+  // Six subscriptions rendered as clones of one because the per-account
+  // CLAUDE_CONFIG_DIR/CODEX_HOME was stripped by the compatibility allowlist
+  // before either provider reader saw it. Arguments cannot be stripped.
+  assert.deepEqual(
+    parseArguments(['--provider', 'claude', '--claude-config-dir', '/tmp/claude-work']),
+    { provider: 'claude', claudeConfigDir: '/tmp/claude-work' }
+  )
+  assert.deepEqual(
+    parseArguments(['--codex-home', '/tmp/codex-work', '--provider', 'codex']),
+    { provider: 'codex', codexHome: '/tmp/codex-work' }
+  )
+  assert.throws(() => parseArguments(['--claude-config-dir']), /Usage:/)
+  assert.throws(() => parseArguments(['--claude-config-dir', '--provider']), /Usage:/)
+  assert.throws(() => parseArguments(['--claude-config-dir', ' ']), /Usage:/)
+  assert.throws(() => parseArguments(['--provider', 'claude', '--provider', 'claude']), /Usage:/)
+  assert.throws(() => parseArguments(['--frobnicate', 'x']), /Usage:/)
+})
+
+test('explicit account arguments outrank the spawn environment, which outranks nothing', () => {
+  assert.deepEqual(
+    accountEnvironmentOverrides(
+      { claudeConfigDir: '/arg/claude', codexHome: '/arg/codex' },
+      { CLAUDE_CONFIG_DIR: '/env/claude', CODEX_HOME: '/env/codex' }
+    ),
+    { CLAUDE_CONFIG_DIR: '/arg/claude', CODEX_HOME: '/arg/codex' }
+  )
+  assert.deepEqual(
+    accountEnvironmentOverrides({}, { CLAUDE_CONFIG_DIR: '/env/claude' }),
+    { CLAUDE_CONFIG_DIR: '/env/claude' }
+  )
+  assert.deepEqual(accountEnvironmentOverrides({}, {}), {})
+  assert.deepEqual(
+    accountEnvironmentOverrides({ claudeConfigDir: '  ' }, { CLAUDE_CONFIG_DIR: '  ' }),
+    {}
+  )
+})
+
+test('agentEnv keeps an account pointer that arrives through extra', () => {
+  // The allowlist rebuild is the exact mechanism that deleted the pointer;
+  // the extra argument is its documented carrier. Pin that it works, so a
+  // future allowlist edit cannot silently orphan per-account probes again.
+  const { agentEnv } = require('../../runtime/node-broker/ipc/shellEnv.cjs')
+  const env = agentEnv(
+    { CLAUDE_CONFIG_DIR: '/tmp/claude-a', CODEX_HOME: '/tmp/codex-b' },
+    { environment: { HOME: '/Users/someone', CLAUDE_CONFIG_DIR: '/inherited/ignored' }, loginShellPath: null }
+  )
+  assert.equal(env.CLAUDE_CONFIG_DIR, '/tmp/claude-a')
+  assert.equal(env.CODEX_HOME, '/tmp/codex-b')
+  const bare = agentEnv(undefined, {
+    environment: { HOME: '/Users/someone', CLAUDE_CONFIG_DIR: '/inherited/ignored' },
+    loginShellPath: null,
+  })
+  assert.equal(bare.CLAUDE_CONFIG_DIR, undefined, 'ambient pointers stay filtered without extra')
+})
+
+test('codexUsage merges the explicit home over a caller-supplied environment', async () => {
+  // `options.env || agentEnv(extraEnv)` chose one or the other, so the only
+  // carrier of CODEX_HOME was discarded whenever a caller (the native usage
+  // service, always) supplied its own environment.
+  const { codexUsage } = require('../../runtime/node-broker/ipc/usageHandler.cjs')
+  const { EventEmitter } = require('node:events')
+  const { PassThrough } = require('node:stream')
+  let captured
+  const spawnImpl = (command, args, options) => {
+    captured = options.env
+    const proc = new EventEmitter()
+    proc.stdin = new PassThrough()
+    proc.stdout = new PassThrough()
+    proc.stderr = new PassThrough()
+    proc.kill = () => proc.emit('exit', 0)
+    // The capture happens at spawn; ending the probe immediately through the
+    // error path keeps the test synchronous-fast without faking JSON-RPC.
+    setImmediate(() => proc.emit('error', new Error('fake app-server stops here')))
+    return proc
+  }
+  await codexUsage('/tmp/codex-account-b', {
+    env: { PATH: '/usr/bin', HOME: '/Users/someone' },
+    spawnImpl,
+    timeoutMs: 10,
+  })
+  assert.equal(captured.CODEX_HOME, '/tmp/codex-account-b')
+  assert.equal(captured.HOME, '/Users/someone', 'the caller environment is kept, not replaced')
 })

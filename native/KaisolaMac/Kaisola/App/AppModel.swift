@@ -4502,6 +4502,15 @@ final class AppModel: ObservableObject {
     /// Profile used by the recovery card's direct Sign In sheet. If the user
     /// had removed the registry entry, this explicit action re-registers the
     /// exact immutable id/path before authentication begins.
+    ///
+    /// The recovery window is armed twice, deliberately. Here, at sheet-open,
+    /// with the long sign-in window: any reconcile the notification below (or
+    /// the controller's own success post) triggers must see a fresh deadline —
+    /// against the stale one from restore time, the watchdog fired within one
+    /// run-loop turn and re-invalidated the resume identity before the user
+    /// had even seen the sheet. And again at sheet-close, in
+    /// `completeChatAccountSignIn`, so the probe that actually decides the
+    /// outcome gets its own full window however long the browser took.
     func accountSignInProfile(for chatID: String) -> UsageAccountProfile? {
         guard let chat = chats.first(where: { $0.id == chatID }),
               let binding = chat.accountBinding,
@@ -4512,18 +4521,36 @@ final class AppModel: ObservableObject {
             label: binding.label,
             directory: binding.configDirectory
         )
-        let profile = usageAccountStore.profiles().first(where: {
+        let existing = usageAccountStore.profiles().first(where: {
             guard $0.id == accountID, $0.provider == binding.provider else { return false }
             return SessionAccountBinding.resolve(
                 provider: $0.provider,
                 profile: $0,
                 fallbackEnvironment: [:]
             )?.continuationKey == binding.continuationKey
-        }) ?? usageAccountStore.restore(requested)
-        guard let profile else { return nil }
-        chat.accountAccess.beginRecovery()
-        NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+        })
+        guard let profile = existing ?? usageAccountStore.restore(requested) else { return nil }
+        chat.accountAccess.beginRecovery(window: ChatAccountAccess.signInVerificationWindow)
+        if existing == nil {
+            // A profile was actually re-registered; the account lists need to
+            // hear about it. A pre-sign-in probe fan-out for the unchanged
+            // case would only confirm the signed-out state the card already
+            // shows.
+            NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
+        }
         return profile
+    }
+
+    /// The sign-in sheet for a blocked chat closed — signed in, cancelled, or
+    /// failed. Re-arm the bounded verification, sized for a real probe rather
+    /// than a cache hit, and make sure a probe decides it: a successful
+    /// sign-in already forced one via the controller's notification, so a
+    /// second post here would only cancel and restart that probe mid-read.
+    func completeChatAccountSignIn(_ chatID: String) {
+        guard let chat = chats.first(where: { $0.id == chatID }) else { return }
+        chat.accountAccess.beginRecovery(window: ChatAccountAccess.signInVerificationWindow)
+        guard !usageCenter.isRefreshingPlanUsage else { return }
+        NotificationCenter.default.post(name: .kaisolaUsageAccountsChanged, object: nil)
     }
 
     /// Explicitly confirms the non-destructive path advertised by the blocked

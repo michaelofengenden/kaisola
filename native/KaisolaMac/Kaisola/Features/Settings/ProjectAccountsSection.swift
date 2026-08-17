@@ -337,6 +337,7 @@ struct ProjectAccountsSection: View {
     @State private var signingIn: UsageAccountProfile?
     @ObservedObject private var recoveryCenter: ProjectAccountRecoveryCenter
     @ObservedObject private var usage: UsageCenter
+    @ObservedObject private var routingSettings = NativePreviewSettings.shared
     private let usageAccountStore = UsageAccountStore()
 
     init(
@@ -382,7 +383,12 @@ struct ProjectAccountsSection: View {
             AccountSignInSheet(profile: profile) {
                 signingIn = nil
                 loadUsageProfiles()
-                refreshAuthentication(force: true)
+                // A successful sign-in already forced a probe through the
+                // controller's notification; forcing again mid-read would
+                // cancel and restart it for nothing.
+                if !usage.isRefreshingPlanUsage {
+                    refreshAuthentication(force: true)
+                }
             }
         }
         .confirmationDialog(
@@ -546,7 +552,36 @@ struct ProjectAccountsSection: View {
             }
             SettingsDivider()
             addAccountRow
+            SettingsDivider()
+            routingRow
         }
+    }
+
+    /// How new sessions pick among these accounts. The policy lives on the
+    /// same card as the accounts it routes, in the same vocabulary — not in a
+    /// separate Settings corner the user would have to connect themselves.
+    private var routingRow: some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text("New sessions")
+                    .font(.callout.weight(.medium))
+                Text(routingSettings.accountRoutingPolicy.caption)
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 12)
+            Picker("", selection: $routingSettings.accountRoutingPolicy) {
+                ForEach(AccountRoutingPolicy.allCases) { policy in
+                    Text(policy.displayName).tag(policy)
+                }
+            }
+            .labelsHidden()
+            .fixedSize()
+            .accessibilityLabel("Subscription routing policy")
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
     }
 
     /// One named account: what it is, where its credentials live, and the two

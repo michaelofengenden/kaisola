@@ -2225,24 +2225,24 @@ struct RootShellView: View {
         sheet.styleMask = [.titled, .fullSizeContentView]
         sheet.titleVisibility = .hidden
         sheet.titlebarAppearsTransparent = true
+        sheet.isReleasedWhenClosed = false
         sheet.setContentSize(hosting.view.fittingSize)
 
+        // Clearing the handler box on completion breaks the cycle
+        // sheet → hosting → view → box → handler → sheet, so a dismissed
+        // picker's window is actually released.
         if let window = NSApp.keyWindow
             ?? NSApp.mainWindow
             ?? NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) }) {
-            var finished = false
             complete = { outcome in
-                guard !finished else { return }
-                finished = true
+                complete = { _ in }
                 window.endSheet(sheet)
                 finish(outcome)
             }
             window.beginSheet(sheet)
         } else {
-            var finished = false
             complete = { outcome in
-                guard !finished else { return }
-                finished = true
+                complete = { _ in }
                 NSApp.stopModal()
                 sheet.orderOut(nil)
                 finish(outcome)

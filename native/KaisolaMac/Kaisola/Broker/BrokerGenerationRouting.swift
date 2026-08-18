@@ -225,9 +225,26 @@ actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
                 await client.setDisconnectHandler { [weak self] error in
                     Task { await self?.childDisconnected(error, generationID: generationID) }
                 }
-                let hello = try await client.connect(to: generation.info)
-                clients[generationID] = client
-                if generationID == requestedTopology.current.id { currentHello = hello }
+                do {
+                    let hello = try await client.connect(to: generation.info)
+                    clients[generationID] = client
+                    if generationID == requestedTopology.current.id { currentHello = hello }
+                } catch {
+                    // A drain can die between the registry locate and this
+                    // dial, and a dead broker's socket vnode outlives it —
+                    // connect() then answers ECONNREFUSED. Failing the WHOLE
+                    // topology for that corpse took down the healthy current
+                    // broker and every live drain with it, and the reaping
+                    // sweep runs behind a successful connect, so the app
+                    // could never bury the record it kept tripping over.
+                    // Only a provably dead drain is skipped: a live drain
+                    // refusing its dial is an anomaly worth the loud failure,
+                    // and the current generation always is.
+                    guard generation.role == .draining,
+                          generation.info.isProcessProvablyDead else { throw error }
+                    await client.disconnect()
+                    detachedGenerationIDs.insert(generationID)
+                }
             }
             guard let currentHello else { throw BrokerClientError.identityChanged }
             return currentHello

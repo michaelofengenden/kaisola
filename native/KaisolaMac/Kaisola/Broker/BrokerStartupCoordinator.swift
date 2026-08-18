@@ -440,6 +440,16 @@ actor BrokerStartupCoordinator:
     }
 
     private func prepare(package: BrokerHelperManifest) async throws -> BrokerInfo {
+        // Bury provably dead drains BEFORE any topology is handed to connect.
+        // The heartbeat sweep does the same reaping — but the heartbeat only
+        // ticks while connected, and a dead drain's stale socket vnode fails
+        // the whole topology dial with ECONNREFUSED first. The app then can
+        // never connect, so it can never reap the very record that keeps it
+        // from connecting; four such corpses (v0.1.105–0.1.112) held one
+        // machine in that loop across three releases. Prepare already holds
+        // the handoff claim, so this is the sweep's single-writer discipline
+        // at the one moment it can actually break the cycle.
+        reapProvablyDeadDrainingGenerationsBeforeConnect()
         do {
             let topology = try locator.locateTopology()
             let info = topology.current.info
@@ -877,6 +887,25 @@ actor BrokerStartupCoordinator:
             // into a misleading quarantine/retry of the removed generation.
             try? garbageCollectRetiredMetadata(draining, store: store)
             return
+        }
+    }
+
+    /// Registry-only reaping of every provably dead drain, for callers that
+    /// already hold the handoff claim (`prepare`). Mirrors the sweep's loop;
+    /// re-locates per iteration so each reap works against the registry it
+    /// just produced, and stops the moment a reap changes nothing rather
+    /// than spinning on a record it cannot remove.
+    private func reapProvablyDeadDrainingGenerationsBeforeConnect() {
+        let store = BrokerGenerationRegistryStore(profileRoot: locator.preferredUserDataRoot)
+        var reaped = 0
+        var lastDeadID: String?
+        while reaped < BrokerGenerationRegistry.maximumGenerationCount {
+            guard let topology = try? locator.locateTopology(validateSockets: false),
+                  let dead = topology.draining.first(where: { $0.info.isProcessProvablyDead }),
+                  dead.id != lastDeadID else { return }
+            lastDeadID = dead.id
+            reapDeadDrainingGeneration(dead, topology: topology, store: store)
+            reaped += 1
         }
     }
 

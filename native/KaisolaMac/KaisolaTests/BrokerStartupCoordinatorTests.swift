@@ -483,6 +483,96 @@ final class BrokerStartupCoordinatorTests: XCTestCase {
         await launcher.close()
     }
 
+    /// The dead-drain wedge: connect dials every registered generation, a
+    /// dead drain's stale socket vnode answers ECONNREFUSED, and the reaping
+    /// sweep that removes dead records only ran behind a successful connect —
+    /// so the app could never bury the record that kept it from connecting.
+    /// Four such corpses (v0.1.105–0.1.112) held one machine in that loop
+    /// across three releases. prepare() now reaps provably dead drains before
+    /// any topology is handed out, under the handoff claim it already holds.
+    func testPrepareReapsProvablyDeadDrainsBeforeAnyTopologyIsHandedOut() async throws {
+        let home = try privateTemporaryDirectory()
+        let currentDigest = String(repeating: "d", count: 64)
+        let live = try makeRegisteredLiveBroker(home: home, contentDigest: currentDigest)
+        defer { Darwin.close(live.descriptor) }
+
+        // A drain whose broker is long gone: registry record, published
+        // metadata, and a stale socket vnode with no process behind it.
+        // Epoch-1 startedAt is pre-boot on any real machine, so the record
+        // is provably dead however its recycled pid answers kill(0).
+        let deadDigest = String(repeating: "b", count: 64)
+        let store = BrokerGenerationRegistryStore(profileRoot: live.profile)
+        let broker = live.profile.appendingPathComponent("session-broker", isDirectory: true)
+        let deadSocket = broker.appendingPathComponent(
+            BrokerLaunchConfiguration.generationSocketLeaf(
+                userData: live.profile,
+                contentDigest: deadDigest
+            )
+        )
+        let staleDescriptor = try bindUnixSocket(at: deadSocket)
+        Darwin.close(staleDescriptor)
+        let deadInfo = BrokerInfo(
+            protocolVersion: 2,
+            securityEpoch: 1,
+            implementationVersion: 2,
+            packageSchema: 1,
+            packageVersion: "old-package",
+            contentDigest: deadDigest,
+            pid: Int32.max,
+            socketPath: deadSocket.path,
+            token: String(repeating: "c", count: 64),
+            startedAt: 1,
+            version: "dead-native"
+        )
+        let deadRecord = BrokerGenerationRecord(
+            id: deadDigest,
+            role: .draining,
+            info: deadInfo,
+            packageRoot: live.profile
+                .appendingPathComponent("broker-generations", isDirectory: true)
+                .appendingPathComponent(deadDigest, isDirectory: true)
+                .path,
+            registeredAt: 1
+        )
+        let deadMetadataURL = store.metadataURL(for: deadRecord)
+        try JSONEncoder().encode(deadInfo).write(to: deadMetadataURL)
+        _ = chmod(deadMetadataURL.path, 0o600)
+        let seeded = try store.load()
+        _ = try store.save(
+            currentGenerationID: currentDigest,
+            generations: seeded.generations + [deadRecord],
+            expectedRevision: seeded.revision,
+            now: 2
+        )
+
+        let launcher = FakeBrokerHelperLauncher(
+            implementationVersion: 2,
+            contentDigest: currentDigest
+        )
+        let coordinator = BrokerStartupCoordinator(
+            locator: BrokerInfoLocator(userDataCandidates: [live.profile]),
+            launcher: launcher,
+            homeDirectory: home,
+            appVersion: "native-test"
+        )
+
+        let prepared = try await coordinator.prepare()
+        let registry = try store.load()
+
+        XCTAssertEqual(prepared.contentDigest, currentDigest)
+        XCTAssertEqual(
+            registry.generations.map(\.id),
+            [currentDigest],
+            "the dead drain must be gone before any topology reaches connect"
+        )
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: deadSocket.path),
+            "the corpse's socket vnode is what answered ECONNREFUSED; it goes with the record"
+        )
+        XCTAssertFalse(FileManager.default.fileExists(atPath: deadMetadataURL.path))
+        await launcher.close()
+    }
+
     /// A recorded current whose process still answers is refused even with its
     /// rendezvous missing: unreachable, but evicting it would orphan whatever
     /// terminals it owns with no record they existed.

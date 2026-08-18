@@ -531,6 +531,80 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         XCTAssertFalse(staleDetail.contains("Retirement skipped"))
     }
 
+    /// A dead broker's socket vnode outlives it and answers ECONNREFUSED.
+    /// One such corpse in the topology used to fail the WHOLE connect —
+    /// taking the healthy current broker down with it — while the reaping
+    /// that removes dead records ran behind the connect that could never
+    /// succeed. A provably dead drain that refuses its dial is now skipped
+    /// as detached; its terminals are gone with its process.
+    func testAProvablyDeadDrainThatRefusesItsDialIsSkippedNotFatal() async throws {
+        let topology = makeTopology()
+        let currentObserver = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("current-terminal")])
+        )
+        let observerQueue = ObserverClientQueue([currentObserver, RefusingObserverClient()])
+        let routes = BrokerGenerationRouteTable()
+        let observer = BrokerGenerationObserverRouter(
+            routes: routes,
+            factory: { observerQueue.next() }
+        )
+
+        _ = try await observer.connect(to: topology)
+        let status = try await observer.inventory()
+
+        XCTAssertEqual(status.terminals.map(\.id), ["current-terminal"])
+        XCTAssertEqual(status.terminals[0].brokerGenerationID, topology.current.id)
+    }
+
+    /// A LIVE drain refusing its dial is an anomaly, not a corpse: its
+    /// terminals exist and skipping it would silently drop them from the
+    /// inventory. That failure stays loud.
+    func testALiveDrainThatRefusesItsDialStillFailsTheConnect() async {
+        let liveStartedAt = Int64(Date().timeIntervalSince1970 * 1_000)
+        let topology = BrokerGenerationTopology(
+            current: generation(String(repeating: "a", count: 64), role: .current, startedAt: 2),
+            draining: [
+                generation(String(repeating: "b", count: 64), role: .draining, startedAt: liveStartedAt),
+            ],
+            registryTopologyVersion: 1
+        )
+        let currentObserver = RoutingObserverClient(status: BrokerStatus(terminals: []))
+        let observerQueue = ObserverClientQueue([currentObserver, RefusingObserverClient()])
+        let observer = BrokerGenerationObserverRouter(
+            routes: BrokerGenerationRouteTable(),
+            factory: { observerQueue.next() }
+        )
+
+        do {
+            _ = try await observer.connect(to: topology)
+            XCTFail("a live drain's dial failure must fail the connect")
+        } catch let error as BrokerClientError {
+            XCTAssertEqual(error, .socketFailure(61))
+        } catch {
+            XCTFail("unexpected error type: \(error)")
+        }
+    }
+
+    /// The current generation is never skippable, whatever its record's age
+    /// claims — there is no session service without it.
+    func testTheCurrentGenerationsDialFailureIsAlwaysFatal() async {
+        let topology = makeTopology()
+        let observerQueue = ObserverClientQueue([RefusingObserverClient()])
+        let observer = BrokerGenerationObserverRouter(
+            routes: BrokerGenerationRouteTable(),
+            factory: { observerQueue.next() }
+        )
+
+        do {
+            _ = try await observer.connect(to: topology)
+            XCTFail("the current generation's dial failure must fail the connect")
+        } catch let error as BrokerClientError {
+            XCTAssertEqual(error, .socketFailure(61))
+        } catch {
+            XCTFail("unexpected error type: \(error)")
+        }
+    }
+
     private func makeTopology(registryTopologyVersion: Int64 = 1) -> BrokerGenerationTopology {
         let currentDigest = String(repeating: "a", count: 64)
         let drainingDigest = String(repeating: "b", count: 64)
@@ -577,6 +651,30 @@ final class BrokerGenerationRoutingTests: XCTestCase {
             endOffset: 0
         )
     }
+}
+
+/// Stands in for a generation whose socket answers ECONNREFUSED — the exact
+/// behavior of a socket vnode whose broker is gone.
+private actor RefusingObserverClient: ObserveOnlyBrokerServing {
+    func setEventHandler(_ handler: (@Sendable (BrokerEvent) -> Void)?) async {}
+    func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {}
+    func connect(to info: BrokerInfo) async throws -> BrokerHello {
+        throw BrokerClientError.socketFailure(61)
+    }
+    func inventory() async throws -> BrokerStatus {
+        throw BrokerClientError.notConnected
+    }
+    func subscribe(
+        to terminal: BrokerTerminalRecord,
+        ownerID: String,
+        cursor: TerminalCursor?
+    ) async throws -> TerminalSubscriptionResult {
+        throw BrokerClientError.notConnected
+    }
+    func unsubscribe(from terminal: BrokerTerminalRecord, ownerID: String) async throws {
+        throw BrokerClientError.notConnected
+    }
+    func disconnect() async {}
 }
 
 private final class ObserverClientQueue: @unchecked Sendable {

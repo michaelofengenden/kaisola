@@ -158,10 +158,35 @@ actor BrokerGenerationRouteTable {
     }
 }
 
+/// Whether a failed generation dial may be skipped instead of failing the
+/// whole topology connect. Three conditions, all required: only a DRAINING
+/// generation (there is no session service without the current one), only
+/// when its recorded process is provably dead (a live drain's terminals are
+/// real, and silently dropping them is worse than failing loud), and only
+/// for unreachable-endpoint failures — an authentication or protocol
+/// rejection means something ANSWERED, and whatever answered is never a
+/// corpse, whatever the record's age claims.
+enum BrokerGenerationDialPolicy {
+    static func tolerates(
+        _ error: any Error,
+        from generation: BrokerGenerationRecord
+    ) -> Bool {
+        guard generation.role == .draining,
+              generation.info.isProcessProvablyDead else { return false }
+        switch error as? BrokerClientError {
+        case .socketFailure, .connectionTimedOut, .connectionClosed:
+            return true
+        default:
+            return false
+        }
+    }
+}
+
 /// One read-only socket per registered generation. Inventories are merged only
 /// after every generation independently proves its sealed identity; duplicate
-/// terminal IDs fail closed instead of making routing order-dependent. The one
-/// exception: a drain this router already detached from as provably empty is
+/// terminal IDs fail closed instead of making routing order-dependent. The
+/// exceptions: a drain this router already detached from as provably empty,
+/// and a drain whose process was provably dead when its dial failed, are
 /// skipped, not re-proven, until a reconnect rebuilds every lane (see
 /// `detachedGenerationIDs`).
 actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
@@ -225,9 +250,24 @@ actor BrokerGenerationObserverRouter: ObserveOnlyBrokerServing {
                 await client.setDisconnectHandler { [weak self] error in
                     Task { await self?.childDisconnected(error, generationID: generationID) }
                 }
-                let hello = try await client.connect(to: generation.info)
-                clients[generationID] = client
-                if generationID == requestedTopology.current.id { currentHello = hello }
+                do {
+                    let hello = try await client.connect(to: generation.info)
+                    clients[generationID] = client
+                    if generationID == requestedTopology.current.id { currentHello = hello }
+                } catch {
+                    // A drain can die between the registry locate and this
+                    // dial, and a dead broker's socket vnode outlives it —
+                    // connect() then answers ECONNREFUSED. Failing the WHOLE
+                    // topology for that corpse took down the healthy current
+                    // broker and every live drain with it, and the reaping
+                    // sweep runs behind a successful connect, so the app
+                    // could never bury the record it kept tripping over.
+                    guard BrokerGenerationDialPolicy.tolerates(error, from: generation) else {
+                        throw error
+                    }
+                    await client.disconnect()
+                    detachedGenerationIDs.insert(generationID)
+                }
             }
             guard let currentHello else { throw BrokerClientError.identityChanged }
             return currentHello
@@ -465,8 +505,21 @@ actor BrokerGenerationControlRouter: BrokerControlServing {
                 await client.setDisconnectHandler { [weak self] error in
                     Task { await self?.childDisconnected(error, generationID: generationID) }
                 }
-                try await client.connect(to: generation.info, ownerID: ownerID)
-                clients[generationID] = client
+                do {
+                    try await client.connect(to: generation.info, ownerID: ownerID)
+                    clients[generationID] = client
+                } catch {
+                    // Same tolerance as the observer lane, for the same
+                    // corpse. The lanes dial seconds apart — inventory,
+                    // upgrade state, and rollback probes sit between them —
+                    // and a drain that died in that window used to fail the
+                    // whole control connect: the app kept observing but
+                    // silently lost writes until the next reconnect.
+                    guard BrokerGenerationDialPolicy.tolerates(error, from: generation) else {
+                        throw error
+                    }
+                    await client.disconnect()
+                }
             }
         } catch {
             await disconnect()

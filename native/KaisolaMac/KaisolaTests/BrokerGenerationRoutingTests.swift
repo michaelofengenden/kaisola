@@ -531,6 +531,164 @@ final class BrokerGenerationRoutingTests: XCTestCase {
         XCTAssertFalse(staleDetail.contains("Retirement skipped"))
     }
 
+    /// A dead broker's socket vnode outlives it and answers ECONNREFUSED.
+    /// One such corpse in the topology used to fail the WHOLE connect —
+    /// taking the healthy current broker down with it — while the reaping
+    /// that removes dead records ran behind the connect that could never
+    /// succeed. A provably dead drain that refuses its dial is now skipped
+    /// as detached; its terminals are gone with its process.
+    func testAProvablyDeadDrainThatRefusesItsDialIsSkippedNotFatal() async throws {
+        let topology = makeTopology()
+        let currentObserver = RoutingObserverClient(
+            status: BrokerStatus(terminals: [terminal("current-terminal")])
+        )
+        let observerQueue = ObserverClientQueue([currentObserver, RefusingObserverClient()])
+        let routes = BrokerGenerationRouteTable()
+        let observer = BrokerGenerationObserverRouter(
+            routes: routes,
+            factory: { observerQueue.next() }
+        )
+
+        _ = try await observer.connect(to: topology)
+        let status = try await observer.inventory()
+
+        XCTAssertEqual(status.terminals.map(\.id), ["current-terminal"])
+        XCTAssertEqual(status.terminals[0].brokerGenerationID, topology.current.id)
+    }
+
+    /// A LIVE drain refusing its dial is an anomaly, not a corpse: its
+    /// terminals exist and skipping it would silently drop them from the
+    /// inventory. That failure stays loud.
+    func testALiveDrainThatRefusesItsDialStillFailsTheConnect() async {
+        let liveStartedAt = Int64(Date().timeIntervalSince1970 * 1_000)
+        let topology = BrokerGenerationTopology(
+            current: generation(String(repeating: "a", count: 64), role: .current, startedAt: 2),
+            draining: [
+                generation(String(repeating: "b", count: 64), role: .draining, startedAt: liveStartedAt),
+            ],
+            registryTopologyVersion: 1
+        )
+        let currentObserver = RoutingObserverClient(status: BrokerStatus(terminals: []))
+        let observerQueue = ObserverClientQueue([currentObserver, RefusingObserverClient()])
+        let observer = BrokerGenerationObserverRouter(
+            routes: BrokerGenerationRouteTable(),
+            factory: { observerQueue.next() }
+        )
+
+        do {
+            _ = try await observer.connect(to: topology)
+            XCTFail("a live drain's dial failure must fail the connect")
+        } catch let error as BrokerClientError {
+            XCTAssertEqual(error, .socketFailure(61))
+        } catch {
+            XCTFail("unexpected error type: \(error)")
+        }
+    }
+
+    /// The write lane dials seconds after the observer lane — inventory and
+    /// upgrade probes sit between them — so a drain can die in the gap. The
+    /// control connect must skip the corpse exactly as the observer does;
+    /// failing it silently cost every terminal its writes until the next
+    /// reconnect.
+    func testTheControlLaneAlsoSkipsAProvablyDeadDrainThatRefusesItsDial() async throws {
+        let topology = makeTopology()
+        let connectionID = "33333333-3333-4333-8333-333333333333"
+        let current = RoutingControlClient(connectionInstanceID: connectionID)
+        let refusing = RoutingControlClient(
+            connectionInstanceID: connectionID,
+            connectError: .socketFailure(61)
+        )
+        let queue = ControlClientQueue([current, refusing])
+        let routes = BrokerGenerationRouteTable()
+        let control = BrokerGenerationControlRouter(
+            routes: routes,
+            connectionInstanceID: connectionID,
+            factory: { _ in queue.next() }
+        )
+
+        try await control.connect(to: topology, ownerID: "owner")
+        _ = try await control.createTerminal(
+            projectID: "project",
+            terminalID: "new-terminal",
+            command: "/bin/sh",
+            arguments: [],
+            cwd: "/tmp",
+            columns: 80,
+            rows: 24
+        )
+
+        let currentCalls = await current.calls()
+        XCTAssertEqual(currentCalls, ["create:new-terminal"])
+    }
+
+    /// The tolerance is three-conditional on purpose: draining role, provably
+    /// dead process, and an unreachable-endpoint failure. An authentication
+    /// or protocol rejection means something ANSWERED — whatever answered is
+    /// not a corpse, whatever the record's age claims.
+    func testDialPolicyToleratesOnlyUnreachableCorpses() {
+        let dead = generation(String(repeating: "b", count: 64), role: .draining, startedAt: 1)
+        let liveDrain = generation(
+            String(repeating: "a", count: 64),
+            role: .draining,
+            startedAt: Int64(Date().timeIntervalSince1970 * 1_000)
+        )
+        let deadShapedCurrent = generation(String(repeating: "d", count: 64), role: .current, startedAt: 1)
+
+        XCTAssertTrue(BrokerGenerationDialPolicy.tolerates(BrokerClientError.socketFailure(61), from: dead))
+        XCTAssertTrue(BrokerGenerationDialPolicy.tolerates(BrokerClientError.socketFailure(2), from: dead))
+        XCTAssertTrue(BrokerGenerationDialPolicy.tolerates(BrokerClientError.connectionTimedOut, from: dead))
+        XCTAssertFalse(BrokerGenerationDialPolicy.tolerates(BrokerClientError.authenticationRejected, from: dead))
+        XCTAssertFalse(BrokerGenerationDialPolicy.tolerates(BrokerClientError.protocolMismatch, from: dead))
+        XCTAssertFalse(BrokerGenerationDialPolicy.tolerates(BrokerClientError.socketFailure(61), from: liveDrain))
+        XCTAssertFalse(
+            BrokerGenerationDialPolicy.tolerates(BrokerClientError.socketFailure(61), from: deadShapedCurrent)
+        )
+    }
+
+    /// The pre-boot dead rule corroborates against the kernel's own start
+    /// time for the pid holder — kernel starts never move, unlike boottime,
+    /// which steps with wall-clock corrections. What a real process can
+    /// prove here: the kernel reports a usable start for a live pid, a
+    /// record whose startedAt matches its live holder is not dead, an
+    /// ancient startedAt on a live pid IS provably dead exactly because the
+    /// kernel start disagrees, and an invalid pid yields no start at all.
+    func testALiveProcessWhoseStartMatchesItsRecordIsNeverProvablyDead() throws {
+        let processStart = try XCTUnwrap(
+            BrokerInfo.processStartTimeMilliseconds(pid: getpid())
+        )
+        let matching = generation(
+            String(repeating: "a", count: 64),
+            role: .draining,
+            startedAt: processStart
+        )
+        XCTAssertFalse(matching.info.isProcessProvablyDead)
+
+        let ancient = generation(String(repeating: "b", count: 64), role: .draining, startedAt: 1)
+        XCTAssertTrue(ancient.info.isProcessProvablyDead)
+
+        XCTAssertNil(BrokerInfo.processStartTimeMilliseconds(pid: -1))
+    }
+
+    /// The current generation is never skippable, whatever its record's age
+    /// claims — there is no session service without it.
+    func testTheCurrentGenerationsDialFailureIsAlwaysFatal() async {
+        let topology = makeTopology()
+        let observerQueue = ObserverClientQueue([RefusingObserverClient()])
+        let observer = BrokerGenerationObserverRouter(
+            routes: BrokerGenerationRouteTable(),
+            factory: { observerQueue.next() }
+        )
+
+        do {
+            _ = try await observer.connect(to: topology)
+            XCTFail("the current generation's dial failure must fail the connect")
+        } catch let error as BrokerClientError {
+            XCTAssertEqual(error, .socketFailure(61))
+        } catch {
+            XCTFail("unexpected error type: \(error)")
+        }
+    }
+
     private func makeTopology(registryTopologyVersion: Int64 = 1) -> BrokerGenerationTopology {
         let currentDigest = String(repeating: "a", count: 64)
         let drainingDigest = String(repeating: "b", count: 64)
@@ -577,6 +735,30 @@ final class BrokerGenerationRoutingTests: XCTestCase {
             endOffset: 0
         )
     }
+}
+
+/// Stands in for a generation whose socket answers ECONNREFUSED — the exact
+/// behavior of a socket vnode whose broker is gone.
+private actor RefusingObserverClient: ObserveOnlyBrokerServing {
+    func setEventHandler(_ handler: (@Sendable (BrokerEvent) -> Void)?) async {}
+    func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {}
+    func connect(to info: BrokerInfo) async throws -> BrokerHello {
+        throw BrokerClientError.socketFailure(61)
+    }
+    func inventory() async throws -> BrokerStatus {
+        throw BrokerClientError.notConnected
+    }
+    func subscribe(
+        to terminal: BrokerTerminalRecord,
+        ownerID: String,
+        cursor: TerminalCursor?
+    ) async throws -> TerminalSubscriptionResult {
+        throw BrokerClientError.notConnected
+    }
+    func unsubscribe(from terminal: BrokerTerminalRecord, ownerID: String) async throws {
+        throw BrokerClientError.notConnected
+    }
+    func disconnect() async {}
 }
 
 private final class ObserverClientQueue: @unchecked Sendable {
@@ -765,13 +947,15 @@ private actor RoutingInventoryPause {
 
 private actor RoutingControlClient: BrokerControlServing {
     nonisolated let connectionInstanceID: String
+    private let connectError: BrokerClientError?
     private var recordedCalls: [String] = []
     private var recordedDisconnectCount = 0
     private var recordedConnectCount = 0
     private var disconnectHandler: (@Sendable (any Error) -> Void)?
 
-    init(connectionInstanceID: String) {
+    init(connectionInstanceID: String, connectError: BrokerClientError? = nil) {
         self.connectionInstanceID = connectionInstanceID
+        self.connectError = connectError
     }
 
     func setDisconnectHandler(_ handler: (@Sendable (any Error) -> Void)?) async {
@@ -780,6 +964,7 @@ private actor RoutingControlClient: BrokerControlServing {
 
     func connect(to info: BrokerInfo, ownerID: String) async throws {
         recordedConnectCount += 1
+        if let connectError { throw connectError }
     }
 
     func createTerminal(

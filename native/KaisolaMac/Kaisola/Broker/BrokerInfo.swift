@@ -121,11 +121,23 @@ struct BrokerInfo: Codable, Equatable, Sendable {
     /// it forever, and every connect raced the sweeps working around it.
     /// The minute of slack errs toward "started after boot" (not provably
     /// dead), which fails closed.
+    ///
+    /// The pre-boot rule carries one corroboration: `kern.boottime` is
+    /// stepped when the wall clock is corrected, so a large enough step can
+    /// shove a live same-session broker's `startedAt` behind "boot". The
+    /// kernel's own start time for whoever holds the pid settles it — a
+    /// start near the record's `startedAt` means the pid holder IS the
+    /// recorded broker. Both stamps were taken at nearly the same wall-clock
+    /// moment, so their comparison is immune to any later step.
     var isProcessProvablyDead: Bool {
         if !isProcessAlive { return true }
         if startedAt > 0,
            let boot = Self.bootTimeMilliseconds,
            startedAt < boot - 60_000 {
+            if let processStart = Self.processStartTimeMilliseconds(pid: pid),
+               abs(processStart - startedAt) <= 120_000 {
+                return false
+            }
             return true
         }
         return false
@@ -139,6 +151,22 @@ struct BrokerInfo: Codable, Equatable, Sendable {
             return nil
         }
         return Int64(value.tv_sec) * 1_000 + Int64(value.tv_usec) / 1_000
+    }
+
+    /// Wall-clock start of the process currently holding `pid`, or nil when
+    /// no such process exists or the kernel won't say. Recorded by the kernel
+    /// at spawn, so unlike `kern.boottime` it never moves afterward.
+    static func processStartTimeMilliseconds(pid: Int32) -> Int64? {
+        guard pid > 0 else { return nil }
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.size
+        var name: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        guard sysctl(&name, 4, &info, &size, nil, 0) == 0,
+              size > 0,
+              info.kp_proc.p_pid == pid else { return nil }
+        let started = info.kp_proc.p_starttime
+        guard started.tv_sec > 0 else { return nil }
+        return Int64(started.tv_sec) * 1_000 + Int64(started.tv_usec) / 1_000
     }
 }
 

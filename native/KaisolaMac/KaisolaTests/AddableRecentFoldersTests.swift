@@ -197,7 +197,7 @@ final class AddableRecentFoldersTests: XCTestCase {
     }
 
     @MainActor
-    func testRunOnPickerMakesLocationSubscriptionAndRunProfileReadableAtAGlance() throws {
+    func testRunOnPickerMakesLocationAndSubscriptionReadableAtAGlance() throws {
         let target = RunOnTarget(
             name: "Kaisola",
             path: "/Users/example/Developer/Kaisola",
@@ -206,8 +206,8 @@ final class AddableRecentFoldersTests: XCTestCase {
             scope: .local,
             isRecent: false
         )
-        let controller = RunOnPickerController(
-            model: RunOnPickerModel(targets: [target], selectedScope: .local),
+        let viewModel = RunOnPickerViewModel(
+            picker: RunOnPickerModel(targets: [target], selectedScope: .local),
             profiles: [
                 UsageAccountProfile(
                     id: "research",
@@ -217,60 +217,35 @@ final class AddableRecentFoldersTests: XCTestCase {
                 ),
             ],
             provider: .codex,
-            runProfiles: AcpRunProfile.builtIns,
-            selectedRunProfileID: AcpRunProfile.write.id,
             preferNamedAccount: true,
+            usageCaptions: ["research": "12% used · Weekly limit"],
             removeRecent: { _ in }
         )
 
-        controller.refresh()
-        controller.accessoryView.layoutSubtreeIfNeeded()
-
-        XCTAssertEqual(controller.scopeControl.segmentCount, RunOnScope.allCases.count)
-        XCTAssertEqual(controller.scopeControl.selectedSegment, 0)
-        XCTAssertTrue(controller.scopeControl.isHidden, "one available location is not a choice")
-        XCTAssertTrue(controller.searchField.isHidden, "two targets do not need a search box")
-        XCTAssertGreaterThanOrEqual(controller.targetPopup.frame.width, 480)
-        XCTAssertEqual(controller.accountPopup.accessibilityLabel(), "Subscription")
-        XCTAssertGreaterThanOrEqual(controller.accountPopup.frame.width, 220)
-        XCTAssertEqual(controller.runProfilePopup.accessibilityLabel(), "Run profile")
-        XCTAssertEqual(controller.selectedRunProfile?.id, AcpRunProfile.write.id)
-        XCTAssertTrue(controller.confirmationLabel.stringValue.contains("Kaisola"))
-        XCTAssertTrue(controller.confirmationLabel.stringValue.contains("Research"))
-        XCTAssertTrue(controller.confirmationLabel.stringValue.contains("Write"))
-        XCTAssertTrue(controller.removeRecentButton.isHidden)
-        XCTAssertEqual(controller.chooseFolderButton.title, "Choose another folder…")
-        var choseAnotherFolder = false
-        controller.chooseFolder = { choseAnotherFolder = true }
-        controller.chooseFolderButton.performClick(nil)
-        XCTAssertTrue(choseAnotherFolder, "the inline location action is visually present but inert")
-    }
-
-    func testRunProfileLaunchSummaryNamesModelAndHostAccess() {
-        XCTAssertEqual(
-            RunOnPickerPresentation.runProfileSummary(.write),
-            "Provider default model · Read, write, terminal · All MCP servers"
-        )
-        XCTAssertEqual(
-            RunOnPickerPresentation.runProfileSummary(.minimal),
-            "Provider default model · No host tools · No MCP servers"
-        )
+        XCTAssertFalse(viewModel.showsScopePicker, "one available location is not a choice")
+        XCTAssertFalse(viewModel.showsSearch, "one target does not need a search box")
+        let options = viewModel.accountOptions
+        XCTAssertEqual(options.first?.title, "Project default · Codex")
+        XCTAssertEqual(options.map(\.profileID), [nil, "research"])
+        XCTAssertEqual(options.last?.caption, "12% used · Weekly limit")
+        XCTAssertEqual(viewModel.selectedProfile?.id, "research")
+        XCTAssertTrue(viewModel.confirmation.contains("Kaisola"))
+        XCTAssertTrue(viewModel.confirmation.contains("Research"))
+        XCTAssertTrue(viewModel.canStart)
+        XCTAssertFalse(viewModel.selectedTargetIsRecent)
     }
 
     @MainActor
-    func testRunOnPickerRestoresSubscriptionAndRunProfileWhileChangingLocation() {
+    func testRunOnPickerRestoresSubscriptionWhileChangingLocation() {
         let profile = UsageAccountProfile(
             id: "research",
             provider: .codex,
             label: "Research",
             directory: "/Users/example/.codex-research"
         )
-        let selection = RunOnPickerSelection(
-            accountProfileID: profile.id,
-            runProfileID: AcpRunProfile.minimal.id
-        )
-        let controller = RunOnPickerController(
-            model: RunOnPickerModel(targets: [
+        let selection = RunOnPickerSelection(accountProfileID: profile.id)
+        let viewModel = RunOnPickerViewModel(
+            picker: RunOnPickerModel(targets: [
                 RunOnTarget(
                     name: "Kaisola",
                     path: "/tmp/kaisola",
@@ -282,15 +257,64 @@ final class AddableRecentFoldersTests: XCTestCase {
             ]),
             profiles: [profile],
             provider: .codex,
-            runProfiles: AcpRunProfile.builtIns,
-            selectedRunProfileID: AcpRunProfile.write.id,
             restoredSelection: selection,
-            preferNamedAccount: false,
+            // A restored explicit choice outranks the router's suggestion.
+            routedVerdict: AccountRouter.Verdict(
+                profileID: profile.id,
+                reason: "You used Research with this agent last time."
+            ),
             removeRecent: { _ in }
         )
 
-        XCTAssertEqual(controller.selectedProfile?.id, profile.id)
-        XCTAssertEqual(controller.selectedRunProfile?.id, AcpRunProfile.minimal.id)
-        XCTAssertEqual(controller.selection, selection)
+        XCTAssertEqual(viewModel.selectedProfile?.id, profile.id)
+        XCTAssertEqual(viewModel.selection, selection)
+        XCTAssertFalse(
+            viewModel.showsRoutingReason,
+            "a restored explicit choice needs no routing justification"
+        )
+    }
+
+    @MainActor
+    func testRoutedVerdictPreselectsWithItsReasonUntilTheUserChooses() {
+        let work = UsageAccountProfile(
+            id: "work",
+            provider: .claude,
+            label: "Work",
+            directory: "/Users/example/.claude-work"
+        )
+        let viewModel = RunOnPickerViewModel(
+            picker: RunOnPickerModel(targets: [
+                RunOnTarget(
+                    name: "Kaisola",
+                    path: "/tmp/kaisola",
+                    branch: "main",
+                    host: "This Mac",
+                    scope: .local,
+                    isRecent: false
+                ),
+            ]),
+            profiles: [work],
+            provider: .claude,
+            routedVerdict: AccountRouter.Verdict(
+                profileID: work.id,
+                reason: "Work has the most room: 12% used on its Weekly limit."
+            ),
+            removeRecent: { _ in }
+        )
+
+        XCTAssertEqual(viewModel.selectedProfileID, work.id)
+        XCTAssertTrue(viewModel.showsRoutingReason)
+        XCTAssertEqual(
+            viewModel.routingReason,
+            "Work has the most room: 12% used on its Weekly limit."
+        )
+
+        viewModel.selectProfile(nil)
+
+        XCTAssertNil(viewModel.selectedProfileID)
+        XCTAssertFalse(
+            viewModel.showsRoutingReason,
+            "a suggestion the user overrode has been heard"
+        )
     }
 }

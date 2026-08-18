@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.129 — 2026-08-17
+
+- "Session Connection Unavailable" is dead, this time at the root. Three releases of broker fixes each cleared a real blockage, and the message kept coming back, because the last cause was a deadlock rather than a stale record: connecting dials every broker generation the registry remembers, a dead one's leftover socket answers "connection refused", and one corpse failed the whole connection — healthy brokers included. Meanwhile the cleanup that removes dead records only ran after a successful connection, so the app could never bury the very record that kept it from connecting. One machine carried four such corpses, back to v0.1.105, in exactly this loop. Startup now buries provably dead records before anything dials; if one dies in the moment between that check and the dial, both the reading and the writing connection skip the corpse instead of dying on it; and a living broker that refuses its dial still fails loudly, because skipping it would silently drop real terminals. The "provably dead" judgment also grew a second witness — the kernel's own record of when the process started — so a clock correction can never get a living broker's records reaped.
+
 ## 0.1.128 — 2026-08-16
 
 - Six subscriptions no longer read as one. Every account card in Usage was showing the default login's numbers with a different name on top, because the helper that reads each account rebuilt its environment from a compatibility allowlist that silently deleted the very variable naming which account to read — and the Codex reader dropped it a second time on its own. The account pointer now rides the helper invocation as an explicit argument, which no environment filter can strip, so each card shows the account it names: its own plan, its own percentages, its own reset times, and its own signed-in state.

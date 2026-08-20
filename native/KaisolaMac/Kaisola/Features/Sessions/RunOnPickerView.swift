@@ -306,6 +306,9 @@ struct RunOnPickerView: View {
                 Text(option.title)
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
+                    // The account's name wins the line; a crowded row drops
+                    // caption characters, never identity characters.
+                    .layoutPriority(1)
                 Spacer(minLength: 8)
                 if let caption = option.caption {
                     Text(caption)

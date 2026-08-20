@@ -189,8 +189,11 @@ struct NewSessionChooserView: View {
         // grid instead of letting it reflow.
         .frame(maxWidth: 500)
         .background {
+            // Opaque on purpose: the translucent card read as grey over the
+            // workspace glass. Solid controlBackgroundColor is white in light
+            // appearance and the matching dark surface in dark.
             RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
-                .fill(Color(nsColor: .controlBackgroundColor).opacity(0.76))
+                .fill(Color(nsColor: .controlBackgroundColor))
                 .overlay {
                     RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
                         .stroke(Color.primary.opacity(0.11), lineWidth: KaisolaVisualSystem.hairline)

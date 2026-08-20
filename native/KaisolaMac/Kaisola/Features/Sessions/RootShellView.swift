@@ -1924,7 +1924,7 @@ struct RootShellView: View {
             model: model,
             additionalDirectory: preferredDirectory,
             cancelled: cancelled
-        ) { directory, profile, _ in
+        ) { directory, profile in
             Task { @MainActor in
                 let terminalID = await model.createAgentSession(
                     agent,
@@ -1972,8 +1972,10 @@ struct RootShellView: View {
     }
 
     /// New-chat setup is reversible. The temporary New Session tab remains the
-    /// visible owner while location, subscription, and run policy are chosen,
-    /// and is consumed only after AppModel confirms a real chat was appended.
+    /// visible owner while location and subscription are chosen, and is
+    /// consumed only after AppModel confirms a real chat was appended. The
+    /// chat starts on the default run profile; policies are edited in
+    /// Settings, not re-decided at every launch.
     @MainActor
     private static func promptForNewChat(
         _ agent: AgentProfile,
@@ -1990,22 +1992,20 @@ struct RootShellView: View {
             agent,
             model: model,
             additionalDirectory: preferredDirectory,
-            includesRunProfile: true,
+            isChat: true,
             cancelled: cancelled
-        ) { directory, profile, runProfile in
+        ) { directory, profile in
             completed(model.openChat(
                 agent,
                 inDirectory: directory,
-                accountProfile: profile,
-                runProfile: runProfile
+                accountProfile: profile
             ))
         }
     }
 
     private typealias RunOnLaunch = @MainActor (
         URL,
-        UsageAccountProfile?,
-        AcpRunProfile?
+        UsageAccountProfile?
     ) -> Void
 
     @MainActor
@@ -2013,7 +2013,7 @@ struct RootShellView: View {
         _ agent: AgentProfile,
         model: AppModel,
         additionalDirectory: URL? = nil,
-        includesRunProfile: Bool = false,
+        isChat: Bool = false,
         restoredSelection: RunOnPickerSelection? = nil,
         cancelled: @escaping @MainActor () -> Void = {},
         then launch: @escaping RunOnLaunch
@@ -2083,7 +2083,7 @@ struct RootShellView: View {
                 model: model,
                 targets: targets,
                 preferredPath: preferredPath,
-                includesRunProfile: includesRunProfile,
+                isChat: isChat,
                 restoredSelection: restoredSelection,
                 cancelled: cancelled,
                 launch: launch
@@ -2097,7 +2097,7 @@ struct RootShellView: View {
         model: AppModel,
         targets: [RunOnTarget],
         preferredPath: String?,
-        includesRunProfile: Bool,
+        isChat: Bool,
         restoredSelection: RunOnPickerSelection?,
         cancelled: @escaping @MainActor () -> Void,
         launch: @escaping RunOnLaunch
@@ -2142,46 +2142,35 @@ struct RootShellView: View {
             )
         }
 
-        let controller = RunOnPickerController(
-            model: RunOnPickerModel(
+        // Fixtures show a deterministic design surface: invented captions
+        // instead of routing over invented accounts.
+        let usageCaptions: [String: String] = visualFixture
+            ? [
+                "visual-work": "38% used · 5-hour limit",
+                "visual-research": "12% used · Weekly limit",
+            ]
+            : RunOnPickerViewModel.usageCaptions(
+                profiles: profiles,
+                readings: UsageCenter.shared.planUsage
+            )
+        let viewModel = RunOnPickerViewModel(
+            picker: RunOnPickerModel(
                 targets: targets,
                 selectedScope: selectedTarget?.scope,
                 selectedTargetID: selectedTarget?.id
             ),
             profiles: profiles,
             provider: provider,
-            runProfiles: includesRunProfile ? AcpRunProfileStore().all() : [],
-            selectedRunProfileID: includesRunProfile
-                ? AcpRunProfileStore().defaultProfileID
-                : nil,
             restoredSelection: restoredSelection,
             preferNamedAccount: visualFixture,
             routedVerdict: routedVerdict,
+            usageCaptions: usageCaptions,
             removeRecent: { path in model.removeRecentFolder(path) }
         )
-        let alert = NSAlert()
-        alert.messageText = includesRunProfile
-            ? "Chat with \(agent.name)"
-            : "Start \(agent.name)"
-        alert.informativeText = includesRunProfile
-            ? "Choose the subscription and launch policy, then confirm where this chat will run."
-            : "Choose where this agent runs and which provider account it uses."
-        alert.alertStyle = .informational
-        alert.accessoryView = controller.accessoryView
-        alert.addButton(withTitle: includesRunProfile ? "Start Chat" : "Start")
-        alert.addButton(withTitle: "Cancel")
-        controller.startButton = alert.buttons.first
-        controller.chooseFolder = {
-            if let parent = alert.window.sheetParent {
-                parent.endSheet(alert.window, returnCode: .alertThirdButtonReturn)
-            } else {
-                NSApp.stopModal(withCode: .alertThirdButtonReturn)
-            }
-        }
-        controller.refresh()
 
-        let finish: @MainActor (NSApplication.ModalResponse) -> Void = { response in
-            if response == .alertThirdButtonReturn {
+        let finish: @MainActor (RunOnPickerOutcome) -> Void = { outcome in
+            switch outcome {
+            case .chooseFolder:
                 chooseDirectory(
                     prompt: "Run \(agent.name) Here",
                     cancelled: cancelled
@@ -2190,42 +2179,76 @@ struct RootShellView: View {
                         agent,
                         model: model,
                         additionalDirectory: directory,
-                        includesRunProfile: includesRunProfile,
-                        restoredSelection: controller.selection,
+                        isChat: isChat,
+                        restoredSelection: viewModel.selection,
                         cancelled: cancelled,
                         then: launch
                     )
                 }
-                return
-            }
-            guard response == .alertFirstButtonReturn,
-                  let target = controller.selectedTarget,
-                  target.canStart else {
+            case .cancel:
                 cancelled()
-                return
-            }
-            // What actually launched is what sticky remembers — including an
-            // explicit Project default, which is a choice, not an absence.
-            if provider != nil, !visualFixture {
-                routingSettings.rememberAccountSelection(
-                    agentID: agent.id,
-                    profileID: controller.selectedProfile?.id
+            case .start:
+                guard let target = viewModel.selectedTarget, target.canStart else {
+                    cancelled()
+                    return
+                }
+                // What actually launched is what sticky remembers — including
+                // an explicit Project default, which is a choice, not an
+                // absence.
+                if provider != nil, !visualFixture {
+                    routingSettings.rememberAccountSelection(
+                        agentID: agent.id,
+                        profileID: viewModel.selectedProfile?.id
+                    )
+                }
+                launch(
+                    URL(fileURLWithPath: target.path, isDirectory: true),
+                    viewModel.selectedProfile
                 )
             }
-            launch(
-                URL(fileURLWithPath: target.path, isDirectory: true),
-                controller.selectedProfile,
-                controller.selectedRunProfile
-            )
         }
+
+        // A plain hosted sheet instead of NSAlert: the picker owns its whole
+        // hierarchy, so it can speak the Start a Session chooser's design
+        // language instead of an alert accessory's.
+        var complete: (@MainActor (RunOnPickerOutcome) -> Void) = { _ in }
+        let hosting = NSHostingController(rootView: RunOnPickerView(
+            title: isChat ? "Chat with \(agent.name)" : "Start \(agent.name)",
+            subtitle: provider == nil
+                ? "Choose where this \(isChat ? "chat" : "agent") runs."
+                : "Pick the subscription and choose where this \(isChat ? "chat" : "agent") runs.",
+            startTitle: isChat ? "Start Chat" : "Start",
+            viewModel: viewModel,
+            complete: { outcome in complete(outcome) }
+        ))
+        let sheet = NSWindow(contentViewController: hosting)
+        sheet.styleMask = [.titled, .fullSizeContentView]
+        sheet.titleVisibility = .hidden
+        sheet.titlebarAppearsTransparent = true
+        sheet.isReleasedWhenClosed = false
+        sheet.setContentSize(hosting.view.fittingSize)
+
+        // Clearing the handler box on completion breaks the cycle
+        // sheet → hosting → view → box → handler → sheet, so a dismissed
+        // picker's window is actually released.
         if let window = NSApp.keyWindow
             ?? NSApp.mainWindow
             ?? NSApp.windows.first(where: { $0.isVisible && !($0 is NSPanel) }) {
-            alert.beginSheetModal(for: window) { response in
-                Task { @MainActor in finish(response) }
+            complete = { outcome in
+                complete = { _ in }
+                window.endSheet(sheet)
+                finish(outcome)
             }
+            window.beginSheet(sheet)
         } else {
-            finish(alert.runModal())
+            complete = { outcome in
+                complete = { _ in }
+                NSApp.stopModal()
+                sheet.orderOut(nil)
+                finish(outcome)
+            }
+            sheet.center()
+            NSApp.runModal(for: sheet)
         }
     }
 
@@ -5856,41 +5879,9 @@ enum RunOnTargetBuilder {
     }
 }
 
-/// Human-readable launch policy for the Chat setup sheet. AppKit owns the
-/// controls, while these summaries stay value-based so the same hierarchy can
-/// be verified without driving a modal window.
+/// Human-readable launch summaries for the Run On sheet, value-based so the
+/// same contract can be verified without driving a modal window.
 enum RunOnPickerPresentation {
-    static func runProfileSummary(_ profile: AcpRunProfile) -> String {
-        let model = profile.modelID ?? "Provider default model"
-        let enabled = Set(profile.enabledClientToolIDs)
-        let allTools = Set(AcpRunProfile.ClientTool.allCases.map(\.rawValue))
-        let tools: String
-        if enabled.isEmpty {
-            tools = "No host tools"
-        } else if enabled == allTools {
-            tools = "Read, write, terminal"
-        } else {
-            tools = AcpRunProfile.ClientTool.allCases.compactMap { tool in
-                guard enabled.contains(tool.rawValue) else { return nil }
-                switch tool {
-                case .readTextFile: return "Read"
-                case .writeTextFile: return "Write"
-                case .terminal: return "Terminal"
-                }
-            }.joined(separator: ", ")
-        }
-        let mcp: String
-        if profile.enabledMCPServerNames.contains(AcpRunProfile.allMCPServersID) {
-            mcp = "All MCP servers"
-        } else if profile.enabledMCPServerNames.isEmpty {
-            mcp = "No MCP servers"
-        } else {
-            mcp = "\(profile.enabledMCPServerNames.count) MCP server"
-                + (profile.enabledMCPServerNames.count == 1 ? "" : "s")
-        }
-        return "\(model) · \(tools) · \(mcp)"
-    }
-
     static func accountTitle(
         _ profile: UsageAccountProfile,
         among profiles: [UsageAccountProfile]
@@ -5905,384 +5896,23 @@ enum RunOnPickerPresentation {
 
     static func confirmation(
         target: RunOnTarget?,
-        accountName: String,
-        runProfile: AcpRunProfile?
+        accountName: String
     ) -> String {
         guard let target else {
             return "No project or worktree in this location matches the search."
         }
         let branch = target.branch ?? "Not a Git repository"
-        var policy = "Subscription: \(accountName)"
-        if let runProfile {
-            policy += "   ·   Run profile: \(runProfile.name)"
-        }
-        return "\(target.name) · \(branch) · \(target.host)\n\(target.path)\n\(policy)"
+        return "\(target.name) · \(branch) · \(target.host)\n\(target.path)\nSubscription: \(accountName)"
     }
 }
 
-/// The launch choices that remain authoritative while only the execution
+/// The launch choice that remains authoritative while only the execution
 /// folder is being changed. The optional outer value means "use defaults";
 /// a present value with a nil account explicitly means Project default.
 struct RunOnPickerSelection: Equatable, Sendable {
     let accountProfileID: String?
-    let runProfileID: String?
 }
 
-/// AppKit coordinator for the launch sheet. Subscription and Run Profile are
-/// the first launch choices; location remains explicit below them without the
-/// old form-like wall of four equally weighted labels.
-@MainActor
-final class RunOnPickerController: NSObject {
-    private var model: RunOnPickerModel
-    private let profiles: [UsageAccountProfile]
-    private let runProfiles: [AcpRunProfile]
-    private let removeRecent: (String) -> Void
-
-    let accessoryView = NSView(frame: NSRect(x: 0, y: 0, width: 560, height: 278))
-    let scopeControl = NSSegmentedControl(frame: .zero)
-    let searchField = NSSearchField(frame: .zero)
-    let targetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    let accountPopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    let runProfilePopup = NSPopUpButton(frame: .zero, pullsDown: false)
-    let removeRecentButton = NSButton(title: "Remove from Recents", target: nil, action: nil)
-    let chooseFolderButton = NSButton(title: "Choose another folder…", target: nil, action: nil)
-    let confirmationLabel = NSTextField(wrappingLabelWithString: "")
-    /// Why the router preselected an account. Hidden the moment the user
-    /// touches the popup — a suggestion the user overrode has been heard.
-    let routingReasonLabel = NSTextField(wrappingLabelWithString: "")
-    weak var startButton: NSButton?
-    var chooseFolder: (() -> Void)?
-
-    init(
-        model: RunOnPickerModel,
-        profiles: [UsageAccountProfile],
-        provider: UsageAccountProfile.Provider?,
-        runProfiles: [AcpRunProfile] = [],
-        selectedRunProfileID: String? = nil,
-        restoredSelection: RunOnPickerSelection? = nil,
-        preferNamedAccount: Bool,
-        routedVerdict: AccountRouter.Verdict? = nil,
-        removeRecent: @escaping (String) -> Void
-    ) {
-        self.model = model
-        self.profiles = profiles
-        self.runProfiles = runProfiles
-        self.removeRecent = removeRecent
-        super.init()
-
-        scopeControl.segmentCount = RunOnScope.allCases.count
-        scopeControl.trackingMode = .selectOne
-        scopeControl.segmentStyle = .rounded
-        scopeControl.setAccessibilityLabel("Execution location")
-        scopeControl.target = self
-        scopeControl.action = #selector(scopeChanged)
-        for (index, scope) in RunOnScope.allCases.enumerated() {
-            let count = model.targets.filter { $0.scope == scope }.count
-            scopeControl.setLabel("\(scope.sectionTitle) · \(count)", forSegment: index)
-            scopeControl.setImage(
-                NSImage(
-                    systemSymbolName: scope.systemImage,
-                    accessibilityDescription: scope.sectionTitle
-                ),
-                forSegment: index
-            )
-        }
-
-        searchField.placeholderString = "Search this location"
-        searchField.setAccessibilityLabel("Search selected execution location")
-        searchField.sendsSearchStringImmediately = true
-        searchField.target = self
-        searchField.action = #selector(searchChanged)
-
-        targetPopup.setAccessibilityLabel("Project, root, or branch")
-        targetPopup.target = self
-        targetPopup.action = #selector(targetChanged)
-
-        accountPopup.setAccessibilityLabel("Subscription")
-        accountPopup.addItem(withTitle: provider.map {
-            "Project default · \($0.displayName)"
-        } ?? "Project default")
-        accountPopup.item(at: 0)?.toolTip = provider.map {
-            "Use this project's effective \($0.environmentKey)"
-        } ?? "Use the project's default environment"
-        for profile in profiles {
-            accountPopup.addItem(withTitle: RunOnPickerPresentation.accountTitle(
-                profile,
-                among: profiles
-            ))
-            accountPopup.lastItem?.toolTip = "\(profile.provider.displayName) · \(profile.expandedDirectory)"
-        }
-        var showsRoutingReason = false
-        if let restoredSelection {
-            if let profileID = restoredSelection.accountProfileID,
-               let index = profiles.firstIndex(where: { $0.id == profileID }) {
-                accountPopup.selectItem(at: index + 1)
-            } else {
-                accountPopup.selectItem(at: 0)
-            }
-        } else if let routedVerdict,
-                  let index = profiles.firstIndex(where: { $0.id == routedVerdict.profileID }) {
-            // The router's suggestion, preselected with its reason on show.
-            // Never applied over a restored selection: an explicit choice the
-            // user already made outranks any policy.
-            accountPopup.selectItem(at: index + 1)
-            routingReasonLabel.stringValue = routedVerdict.reason
-            showsRoutingReason = true
-        } else if preferNamedAccount, !profiles.isEmpty {
-            accountPopup.selectItem(at: 1)
-        }
-        accountPopup.target = self
-        accountPopup.action = #selector(accountChanged)
-
-        routingReasonLabel.font = .systemFont(ofSize: 11)
-        routingReasonLabel.textColor = .secondaryLabelColor
-        routingReasonLabel.maximumNumberOfLines = 2
-        routingReasonLabel.isHidden = !showsRoutingReason
-        routingReasonLabel.setAccessibilityLabel("Why this subscription is suggested")
-
-        runProfilePopup.setAccessibilityLabel("Run profile")
-        for profile in runProfiles {
-            runProfilePopup.addItem(withTitle: profile.name)
-            runProfilePopup.lastItem?.representedObject = profile.id
-            runProfilePopup.lastItem?.toolTip = RunOnPickerPresentation.runProfileSummary(profile)
-        }
-        let desiredRunProfileID = restoredSelection?.runProfileID ?? selectedRunProfileID
-        if let desiredRunProfileID,
-           let item = runProfilePopup.itemArray.first(where: {
-               ($0.representedObject as? String) == desiredRunProfileID
-           }) {
-            runProfilePopup.select(item)
-        }
-        runProfilePopup.target = self
-        runProfilePopup.action = #selector(runProfileChanged)
-
-        removeRecentButton.setAccessibilityLabel("Remove selected target from recents")
-        removeRecentButton.bezelStyle = .inline
-        removeRecentButton.controlSize = .small
-        removeRecentButton.target = self
-        removeRecentButton.action = #selector(removeSelectedRecent)
-
-        chooseFolderButton.setAccessibilityLabel("Choose another folder")
-        chooseFolderButton.bezelStyle = .inline
-        chooseFolderButton.controlSize = .small
-        chooseFolderButton.target = self
-        chooseFolderButton.action = #selector(chooseFolderClicked)
-
-        confirmationLabel.maximumNumberOfLines = 3
-        confirmationLabel.lineBreakMode = .byTruncatingMiddle
-        confirmationLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
-        confirmationLabel.textColor = .secondaryLabelColor
-        confirmationLabel.setAccessibilityLabel("Execution confirmation")
-
-        func sectionLabel(_ title: String) -> NSTextField {
-            let label = NSTextField(labelWithString: title)
-            label.font = .systemFont(ofSize: 11, weight: .semibold)
-            label.textColor = .secondaryLabelColor
-            return label
-        }
-
-        func choiceColumn(title: String, control: NSView) -> NSStackView {
-            let column = NSStackView(views: [sectionLabel(title), control])
-            column.orientation = .vertical
-            column.alignment = .leading
-            column.spacing = 5
-            control.widthAnchor.constraint(equalTo: column.widthAnchor).isActive = true
-            return column
-        }
-
-        let accountColumn = choiceColumn(title: "Subscription", control: accountPopup)
-        accountColumn.addArrangedSubview(routingReasonLabel)
-        routingReasonLabel.widthAnchor.constraint(
-            equalTo: accountColumn.widthAnchor
-        ).isActive = true
-        var choiceViews: [NSView] = [accountColumn]
-        if !runProfiles.isEmpty {
-            choiceViews.append(choiceColumn(title: "Run profile", control: runProfilePopup))
-        }
-        let choices = NSStackView(views: choiceViews)
-        choices.orientation = .horizontal
-        choices.alignment = .top
-        choices.spacing = 12
-        choices.distribution = .fillEqually
-
-        let locationSpacer = NSView()
-        locationSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        let locationHeader = NSStackView(views: [
-            sectionLabel("Run in"),
-            locationSpacer,
-            removeRecentButton,
-            chooseFolderButton,
-        ])
-        locationHeader.orientation = .horizontal
-        locationHeader.alignment = .centerY
-
-        let divider = NSBox()
-        divider.boxType = .separator
-
-        let summary = NSView()
-        summary.wantsLayer = true
-        summary.layer?.cornerRadius = 10
-        summary.layer?.backgroundColor = NSColor.controlBackgroundColor
-            .withAlphaComponent(0.55).cgColor
-        summary.layer?.borderColor = NSColor.separatorColor
-            .withAlphaComponent(0.35).cgColor
-        summary.layer?.borderWidth = 0.5
-        confirmationLabel.translatesAutoresizingMaskIntoConstraints = false
-        summary.addSubview(confirmationLabel)
-        NSLayoutConstraint.activate([
-            confirmationLabel.leadingAnchor.constraint(equalTo: summary.leadingAnchor, constant: 10),
-            confirmationLabel.trailingAnchor.constraint(equalTo: summary.trailingAnchor, constant: -10),
-            confirmationLabel.topAnchor.constraint(equalTo: summary.topAnchor, constant: 8),
-            confirmationLabel.bottomAnchor.constraint(equalTo: summary.bottomAnchor, constant: -8),
-            summary.heightAnchor.constraint(greaterThanOrEqualToConstant: 58),
-        ])
-
-        let stack = NSStackView(views: [
-            choices,
-            divider,
-            locationHeader,
-            scopeControl,
-            searchField,
-            targetPopup,
-            summary,
-        ])
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        accessoryView.addSubview(stack)
-        NSLayoutConstraint.activate([
-            stack.leadingAnchor.constraint(equalTo: accessoryView.leadingAnchor, constant: 16),
-            stack.trailingAnchor.constraint(equalTo: accessoryView.trailingAnchor, constant: -16),
-            stack.topAnchor.constraint(equalTo: accessoryView.topAnchor, constant: 4),
-            stack.bottomAnchor.constraint(lessThanOrEqualTo: accessoryView.bottomAnchor, constant: -4),
-            choices.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            divider.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            locationHeader.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            scopeControl.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            searchField.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            targetPopup.widthAnchor.constraint(equalTo: stack.widthAnchor),
-            summary.widthAnchor.constraint(equalTo: stack.widthAnchor),
-        ])
-    }
-
-    var selectedTarget: RunOnTarget? { model.selectedTarget }
-
-    var selectedProfile: UsageAccountProfile? {
-        let index = accountPopup.indexOfSelectedItem
-        guard index > 0, profiles.indices.contains(index - 1) else { return nil }
-        return profiles[index - 1]
-    }
-
-    var selectedRunProfile: AcpRunProfile? {
-        guard let id = runProfilePopup.selectedItem?.representedObject as? String else {
-            return nil
-        }
-        return runProfiles.first { $0.id == id }
-    }
-
-    var selection: RunOnPickerSelection {
-        RunOnPickerSelection(
-            accountProfileID: selectedProfile?.id,
-            runProfileID: selectedRunProfile?.id
-        )
-    }
-
-    func refresh() {
-        for (index, scope) in RunOnScope.allCases.enumerated() {
-            let count = model.targets.filter { $0.scope == scope }.count
-            scopeControl.setLabel("\(scope.sectionTitle) · \(count)", forSegment: index)
-            scopeControl.setEnabled(count > 0, forSegment: index)
-        }
-        if let index = RunOnScope.allCases.firstIndex(of: model.selectedScope) {
-            scopeControl.selectedSegment = index
-        }
-        let selectedID = model.selectedTarget?.id
-        targetPopup.removeAllItems()
-        for target in model.filteredTargets {
-            targetPopup.addItem(withTitle: target.name)
-            guard let item = targetPopup.lastItem else { continue }
-            item.image = NSImage(
-                systemSymbolName: target.scope.systemImage,
-                accessibilityDescription: target.scope.sectionTitle
-            )
-            item.representedObject = target.id
-            item.toolTip = [target.path, target.branch].compactMap { $0 }.joined(separator: " — ")
-        }
-        if targetPopup.numberOfItems == 0 {
-            targetPopup.addItem(withTitle: "No matching targets")
-            targetPopup.lastItem?.isEnabled = false
-        } else if let selectedID,
-                  let item = targetPopup.itemArray.first(where: {
-                      ($0.representedObject as? String) == selectedID
-                  }) {
-            targetPopup.select(item)
-        }
-        let populatedScopes = RunOnScope.allCases.filter { scope in
-            model.targets.contains { $0.scope == scope }
-        }.count
-        scopeControl.isHidden = populatedScopes <= 1
-        let hasQuery = !model.query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        searchField.isHidden = model.filteredTargets.count <= 6 && !hasQuery
-        let hiddenRows = (scopeControl.isHidden ? 36 : 0)
-            + (searchField.isHidden ? 36 : 0)
-        accessoryView.setFrameSize(NSSize(width: 560, height: 278 - hiddenRows))
-        refreshConfirmation()
-    }
-
-    @objc private func scopeChanged() {
-        guard RunOnScope.allCases.indices.contains(scopeControl.selectedSegment) else { return }
-        let scope = RunOnScope.allCases[scopeControl.selectedSegment]
-        model.selectScope(scope)
-        searchField.stringValue = ""
-        refresh()
-    }
-
-    @objc private func searchChanged() {
-        model.updateQuery(searchField.stringValue)
-        refresh()
-    }
-
-    @objc private func targetChanged() {
-        model.selectTarget(targetPopup.selectedItem?.representedObject as? String)
-        refreshConfirmation()
-    }
-
-    @objc private func accountChanged() {
-        routingReasonLabel.isHidden = true
-        refreshConfirmation()
-    }
-
-    @objc private func runProfileChanged() {
-        refreshConfirmation()
-    }
-
-    @objc private func removeSelectedRecent() {
-        guard let target = model.selectedTarget,
-              let path = model.removeRecent(targetID: target.id) else { return }
-        removeRecent(path)
-        refresh()
-    }
-
-    @objc private func chooseFolderClicked() {
-        chooseFolder?()
-    }
-
-    private func refreshConfirmation() {
-        let target = model.selectedTarget
-        removeRecentButton.isHidden = target?.isRecent != true
-        startButton?.isEnabled = target?.canStart == true
-        confirmationLabel.stringValue = RunOnPickerPresentation.confirmation(
-            target: target,
-            accountName: accountName,
-            runProfile: selectedRunProfile
-        )
-    }
-
-    private var accountName: String {
-        selectedProfile?.label ?? "Project default"
-    }
-}
 
 private struct ConnectionFooter: View {
     @EnvironmentObject private var auth: AuthModel

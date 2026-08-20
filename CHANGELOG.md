@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.130 — 2026-08-17
+
+- The launch sheet grew up. Starting a chat or an agent used to open a system alert stuffed with four popups; it now opens a sheet in the same design language as the Start a Session chooser: pick a subscription, pick where it runs, go. Each subscription row carries its own headroom — "38% used · 5-hour limit" — right where the choice is made, the router's suggestion arrives preselected with its reason written underneath, and locations are real rows showing their branch and path instead of entries buried in a popup. The Run Profile popup left the launch flow entirely: new chats start on the default profile, and policies are edited in Settings, not re-decided at every launch.
+
 ## 0.1.129 — 2026-08-17
 
 - "Session Connection Unavailable" is dead, this time at the root. Three releases of broker fixes each cleared a real blockage, and the message kept coming back, because the last cause was a deadlock rather than a stale record: connecting dials every broker generation the registry remembers, a dead one's leftover socket answers "connection refused", and one corpse failed the whole connection — healthy brokers included. Meanwhile the cleanup that removes dead records only ran after a successful connection, so the app could never bury the very record that kept it from connecting. One machine carried four such corpses, back to v0.1.105, in exactly this loop. Startup now buries provably dead records before anything dials; if one dies in the moment between that check and the dial, both the reading and the writing connection skip the corpse instead of dying on it; and a living broker that refuses its dial still fails loudly, because skipping it would silently drop real terminals. The "provably dead" judgment also grew a second witness — the kernel's own record of when the process started — so a clock correction can never get a living broker's records reaped.

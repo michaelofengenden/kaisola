@@ -594,28 +594,31 @@ enum TintFlowComposition {
         desktop: DesktopTintComponents,
         coverageScale: Double
     ) -> [TintFlowStop] {
-        let scale = min(1, max(0, coverageScale))
+        // The scale may exceed 1 (a rail share times a Vivid/Bold intensity);
+        // saturation is guarded per stop instead, so no stop can ever paint
+        // past full coverage.
+        let scale = max(0, coverageScale)
         let stops = palette.light(desktop: desktop)
         return [
             TintFlowStop(
                 red: stops.cool.red,
                 green: stops.cool.green,
                 blue: stops.cool.blue,
-                opacity: stops.coolCoverage * scale,
+                opacity: min(1, stops.coolCoverage * scale),
                 location: 0
             ),
             TintFlowStop(
                 red: stops.neutral.red,
                 green: stops.neutral.green,
                 blue: stops.neutral.blue,
-                opacity: stops.neutralCoverage * scale,
+                opacity: min(1, stops.neutralCoverage * scale),
                 location: stops.neutralLocation
             ),
             TintFlowStop(
                 red: stops.pearl.red,
                 green: stops.pearl.green,
                 blue: stops.pearl.blue,
-                opacity: stops.pearlCoverage * scale,
+                opacity: min(1, stops.pearlCoverage * scale),
                 location: 1
             ),
         ]
@@ -631,7 +634,7 @@ enum TintFlowComposition {
         tint: DesktopTintComponents,
         coverageScale: Double
     ) -> [TintFlowStop] {
-        let scale = min(1, max(0, coverageScale))
+        let scale = max(0, coverageScale)
         let coverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
         let anchor: TintRGB
         let companion: TintRGB
@@ -656,14 +659,14 @@ enum TintFlowComposition {
                 red: anchor.red,
                 green: anchor.green,
                 blue: anchor.blue,
-                opacity: coverage.top * scale,
+                opacity: min(1, coverage.top * scale),
                 location: 0
             ),
             TintFlowStop(
                 red: companion.red,
                 green: companion.green,
                 blue: companion.blue,
-                opacity: coverage.bottom * scale,
+                opacity: min(1, coverage.bottom * scale),
                 location: 1
             ),
         ]
@@ -682,6 +685,7 @@ struct FlowingTintGradientView: NSViewRepresentable {
     let endPoint: CGPoint
     let animated: Bool
     var breathing: Bool = false
+    var breathDepth: Double = 1
 
     func makeNSView(context: Context) -> FlowingTintGradientHostView {
         let view = FlowingTintGradientHostView()
@@ -690,7 +694,8 @@ struct FlowingTintGradientView: NSViewRepresentable {
             startPoint: startPoint,
             endPoint: endPoint,
             animated: animated,
-            breathing: breathing
+            breathing: breathing,
+            breathDepth: breathDepth
         )
         return view
     }
@@ -701,7 +706,8 @@ struct FlowingTintGradientView: NSViewRepresentable {
             startPoint: startPoint,
             endPoint: endPoint,
             animated: animated,
-            breathing: breathing
+            breathing: breathing,
+            breathDepth: breathDepth
         )
     }
 }
@@ -713,6 +719,7 @@ final class FlowingTintGradientHostView: NSView {
     private var appliedEnd: CGPoint = .zero
     private var appliedAnimated: Bool?
     private var appliedBreathing: Bool?
+    private var appliedBreathDepth: Double?
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -759,14 +766,17 @@ final class FlowingTintGradientHostView: NSView {
         }
         guard window != nil, appliedAnimated == true || appliedBreathing == true else { return }
         let restoreBreathing = appliedBreathing == true
+        let restoreBreathDepth = appliedBreathDepth ?? 1
         appliedAnimated = nil
         appliedBreathing = nil
+        appliedBreathDepth = nil
         apply(
             stops: appliedStops,
             startPoint: appliedStart,
             endPoint: appliedEnd,
             animated: true,
-            breathing: restoreBreathing
+            breathing: restoreBreathing,
+            breathDepth: restoreBreathDepth
         )
     }
 
@@ -775,18 +785,21 @@ final class FlowingTintGradientHostView: NSView {
         startPoint: CGPoint,
         endPoint: CGPoint,
         animated: Bool,
-        breathing: Bool = false
+        breathing: Bool = false,
+        breathDepth: Double = 1
     ) {
         let colorsChanged = stops != appliedStops
         let geometryChanged = startPoint != appliedStart || endPoint != appliedEnd
         let motionChanged = animated != appliedAnimated
         let breathingChanged = breathing != appliedBreathing
+            || breathDepth != appliedBreathDepth
         guard colorsChanged || geometryChanged || motionChanged || breathingChanged else { return }
         appliedStops = stops
         appliedStart = startPoint
         appliedEnd = endPoint
         appliedAnimated = animated
         appliedBreathing = breathing
+        appliedBreathDepth = breathDepth
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
@@ -829,8 +842,8 @@ final class FlowingTintGradientHostView: NSView {
             forKey: Self.endAnimationKey
         )
         guard breathing else { return }
-        gradient.add(Self.breath(), forKey: Self.breathAnimationKey)
-        gradient.add(Self.swell(), forKey: Self.swellAnimationKey)
+        gradient.add(Self.breath(depth: breathDepth), forKey: Self.breathAnimationKey)
+        gradient.add(Self.swell(depth: breathDepth), forKey: Self.swellAnimationKey)
     }
 
     @objc private func windowOcclusionStateDidChange(_ notification: Notification) {
@@ -868,10 +881,12 @@ final class FlowingTintGradientHostView: NSView {
 
     /// The opt-in breath: whole-layer opacity easing between the floor and 1.
     /// Same render-server ownership, frame-rate cap, occlusion freeze
-    /// (`gradient.speed`), and wall-clock phase lock as the drift.
-    private static func breath() -> CABasicAnimation {
+    /// (`gradient.speed`), and wall-clock phase lock as the drift. `depth`
+    /// deepens the swing for the Vivid/Bold intensities; the floor can never
+    /// drop below half opacity whatever the multiplier.
+    private static func breath(depth: Double = 1) -> CABasicAnimation {
         let animation = CABasicAnimation(keyPath: "opacity")
-        animation.fromValue = TintFlowMotion.breathFloorOpacity
+        animation.fromValue = max(0.5, 1 - TintFlowMotion.breathAmplitude * max(0, depth))
         animation.toValue = 1
         animation.duration = TintFlowMotion.breathPeriod
         animation.autoreverses = true
@@ -893,10 +908,10 @@ final class FlowingTintGradientHostView: NSView {
     /// the layer only ever over-covers its bounds — clipping crops overflow
     /// rather than exposing a gap. Same discipline as the breath in every
     /// other respect.
-    private static func swell() -> CABasicAnimation {
+    private static func swell(depth: Double = 1) -> CABasicAnimation {
         let animation = CABasicAnimation(keyPath: "transform.scale")
         animation.fromValue = 1.0
-        animation.toValue = 1.0 + TintFlowMotion.breathScaleAmplitude
+        animation.toValue = 1.0 + TintFlowMotion.breathScaleAmplitude * max(0, depth)
         animation.duration = TintFlowMotion.breathScalePeriod
         animation.autoreverses = true
         animation.repeatCount = .infinity
@@ -1182,6 +1197,10 @@ struct FlowingTintedBackdrop: View {
     var body: some View {
         let isDark = colorScheme == .dark
         let palette = settings.tintPalette
+        // Intensity multiplies at composition time, the same seam the rail
+        // share already uses, so the palette definitions stay untouched.
+        let intensity = settings.tintIntensity
+        let scale = coverageScale * intensity.coverageMultiplier
         // A screenshot must never catch a mid-drift frame: fixture processes
         // pin the endpoints outright, which parks the layer at its given
         // start/end deterministically. Reduce Motion pins the same way.
@@ -1191,17 +1210,18 @@ struct FlowingTintedBackdrop: View {
                 ? TintFlowComposition.dark(
                     palette: palette,
                     tint: desktop.painting.tint,
-                    coverageScale: coverageScale
+                    coverageScale: scale
                 )
                 : TintFlowComposition.light(
                     palette: palette,
                     desktop: desktop.painting.tint,
-                    coverageScale: coverageScale
+                    coverageScale: scale
                 ),
             startPoint: TintFlowMotion.layerPoint(startPoint),
             endPoint: TintFlowMotion.layerPoint(endPoint),
             animated: !reduceMotion && !pinned,
-            breathing: settings.tintedBreathing && !reduceMotion && !pinned
+            breathing: settings.tintedBreathing && !reduceMotion && !pinned,
+            breathDepth: intensity.breathDepthMultiplier
         )
         .allowsHitTesting(false)
         .onAppear { refreshIfNeeded() }

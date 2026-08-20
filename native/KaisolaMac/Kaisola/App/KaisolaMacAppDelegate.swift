@@ -1206,9 +1206,24 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             // pick up a stray palette default. `.desktop` must never be the
             // fixture value: it samples the machine's wallpaper and is
             // therefore not deterministic.
-            settings.tintPalette = ProcessInfo.processInfo
+            //
+            // Pinned on BOTH settings objects: the delegate's instance feeds
+            // the injected environment, but `FlowingTintedBackdrop` reads
+            // `NativePreviewSettings.shared` directly (the same trap the
+            // mixed-density pin below already sidesteps). Pinning only the
+            // local instance left the palette env override silently inert.
+            let fixtureTintPalette = ProcessInfo.processInfo
                 .environment["KAISOLA_NATIVE_VISUAL_TINT_PALETTE"]
                 .flatMap(TintPalette.init) ?? .meadow
+            settings.tintPalette = fixtureTintPalette
+            NativePreviewSettings.shared.tintPalette = fixtureTintPalette
+            // Same discipline for intensity: Standard is every baseline's
+            // value, and captures of the louder rungs opt in by env.
+            let fixtureTintIntensity = ProcessInfo.processInfo
+                .environment["KAISOLA_NATIVE_VISUAL_TINT_INTENSITY"]
+                .flatMap(TintIntensity.init) ?? .standard
+            settings.tintIntensity = fixtureTintIntensity
+            NativePreviewSettings.shared.tintIntensity = fixtureTintIntensity
             // `empty-workspace` is the *idle* canvas — nothing mounted is its
             // whole definition, and a visible Files rail is a mounted surface.
             settings.workspaceRailVisible = visualSurface != "topbar" && visualSurface != "terminal-solo"

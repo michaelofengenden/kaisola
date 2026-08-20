@@ -742,6 +742,20 @@ struct SettingsView: View {
                                 .toggleStyle(.switch)
                                 .accessibilityLabel("Living tint")
                         }
+                        SettingsDivider()
+                        SettingsRow(
+                            title: "Tint intensity",
+                            detail: settings.tintIntensity.detail,
+                            symbol: "dial.medium"
+                        ) {
+                            Menu {
+                                ForEach(TintIntensity.allCases) { intensity in
+                                    Button(intensity.title) { settings.tintIntensity = intensity }
+                                }
+                            } label: { SettingsChoiceLabel(settings.tintIntensity.title) }
+                            .menuIndicator(.hidden)
+                            .accessibilityLabel("Tint intensity")
+                        }
                     }
                     SettingsDivider()
                     SettingsRow(
@@ -1533,7 +1547,7 @@ enum SettingsSection: String, CaseIterable, Identifiable {
     var searchTerms: [String] {
         switch self {
         case .general:
-            ["Default Project Directory", "On Launch", "External Editor", "Appearance", "sidebar transparency", "Tinted", "Living tint", "breathing"]
+            ["Default Project Directory", "On Launch", "External Editor", "Appearance", "sidebar transparency", "Tinted", "Living tint", "breathing", "Tint intensity", "Vivid", "Bold"]
         case .terminal:
             ["Font", "Font Size", "Theme", "Palette", "Copy on Select", "Option as Meta", "Scrollback", "Shell"]
         case .companion:

@@ -469,6 +469,58 @@ extension TintPalette {
     }
 }
 
+/// How loudly the Tinted theme speaks.
+///
+/// A runtime multiplier at composition time, applied where `railTintShare`
+/// already multiplies — the palette *definitions* stay inside the pastel box
+/// the visibility tests pin, and intensity is the user turning that
+/// composition up. Standard is the shipped voice, so an existing install sees
+/// no change until it chooses.
+enum TintIntensity: String, CaseIterable, Identifiable, Sendable {
+    case standard, vivid, bold
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .standard: "Standard"
+        case .vivid: "Vivid"
+        case .bold: "Bold"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .standard: "The composition as designed"
+        case .vivid: "The same palette, half again as present"
+        case .bold: "The gradient at full voice"
+        }
+    }
+
+    /// Multiplier on every stop's coverage. Bounded well under saturation:
+    /// the heaviest shipped stop is 0.30, so even Bold's product (0.57)
+    /// stays a translucent tint over the material ground, never a plate.
+    var coverageMultiplier: Double {
+        switch self {
+        case .standard: 1.0
+        case .vivid: 1.45
+        case .bold: 1.9
+        }
+    }
+
+    /// Multiplier on the living tint's breath — the opacity swing and the
+    /// swell together, so the two halves stay one gesture. Bold's effective
+    /// amplitude is 0.24: a breath one can find without hunting, still
+    /// nowhere near a pulse.
+    var breathDepthMultiplier: Double {
+        switch self {
+        case .standard: 1.0
+        case .vivid: 1.25
+        case .bold: 1.5
+        }
+    }
+}
+
 /// The Meadow palette's original name.
 ///
 /// The stops tripled in 2026-08-14's pass. At eleven percent the whole

@@ -534,6 +534,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.toolCallDensity, .balanced)
         XCTAssertFalse(settings.tintedBreathing)
         XCTAssertEqual(settings.tintPalette, .meadow)
+        XCTAssertEqual(settings.tintIntensity, .standard)
         XCTAssertEqual(settings.projectRailWidth, NativePreviewSettings.projectRailWidthUnset)
 
         settings.navigationLayout = .topBar
@@ -542,6 +543,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         settings.workspaceBackdrop = .tinted
         settings.tintedBreathing = true
         settings.tintPalette = .harbor
+        settings.tintIntensity = .vivid
         settings.terminalThemeID = "kaisola"
         settings.restoreCLIDrafts = false
         settings.semanticShellIntegration = true
@@ -567,6 +569,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.toolCallDensity, .detailed)
         XCTAssertTrue(reloaded.tintedBreathing)
         XCTAssertEqual(reloaded.tintPalette, .harbor)
+        XCTAssertEqual(reloaded.tintIntensity, .vivid)
         XCTAssertEqual(reloaded.projectRailWidth, 290.5)
     }
 
@@ -1319,6 +1322,64 @@ final class NativePreviewSettingsTests: XCTestCase {
         let meadow = TintFlowComposition.light(palette: .meadow, desktop: desktop, coverageScale: 1)
         let dusk = TintFlowComposition.light(palette: .dusk, desktop: desktop, coverageScale: 1)
         XCTAssertNotEqual(meadow, dusk, "choosing a palette changed nothing on the surface")
+    }
+
+    /// Intensity is a user choice layered at composition time, never a
+    /// different palette: the definitions stay inside the pastel box the
+    /// tests above pin, and every rung is a real, bounded step up from the
+    /// shipped voice.
+    func testTintIntensityLaddersUpFromTheShippedVoice() {
+        XCTAssertEqual(TintIntensity.standard.coverageMultiplier, 1)
+        XCTAssertEqual(TintIntensity.standard.breathDepthMultiplier, 1)
+        let coverages = TintIntensity.allCases.map(\.coverageMultiplier)
+        XCTAssertEqual(coverages, coverages.sorted())
+        XCTAssertEqual(Set(coverages).count, coverages.count, "a rung that changes nothing is not a rung")
+        let depths = TintIntensity.allCases.map(\.breathDepthMultiplier)
+        XCTAssertEqual(depths, depths.sorted())
+        XCTAssertEqual(Set(depths).count, depths.count)
+        let heaviestStop = TintPalette.allCases
+            .compactMap(\.fixedLight)
+            .map { max($0.coolCoverage, max($0.neutralCoverage, $0.pearlCoverage)) }
+            .max() ?? 0
+        for intensity in TintIntensity.allCases {
+            XCTAssertLessThanOrEqual(
+                heaviestStop * intensity.coverageMultiplier, 0.6,
+                "even Bold stays a translucent tint over the material ground, never a plate"
+            )
+            XCTAssertLessThanOrEqual(
+                TintFlowMotion.breathAmplitude * intensity.breathDepthMultiplier, 0.25,
+                "the deepest breath is still a breath, not a pulse"
+            )
+        }
+    }
+
+    /// The composition multiplies intensity linearly and saturates per stop:
+    /// no scale, however absurd, can ask a gradient stop to paint past full
+    /// coverage.
+    func testCompositionsScaleWithIntensityAndSaturatePerStop() {
+        let desktop = DesktopTintSampler.fallback
+        let base = TintFlowComposition.light(palette: .meadow, desktop: desktop, coverageScale: 1)
+        let vivid = TintFlowComposition.light(
+            palette: .meadow,
+            desktop: desktop,
+            coverageScale: TintIntensity.vivid.coverageMultiplier
+        )
+        for (baseStop, vividStop) in zip(base, vivid) {
+            XCTAssertEqual(
+                vividStop.opacity,
+                baseStop.opacity * TintIntensity.vivid.coverageMultiplier,
+                accuracy: 0.0001
+            )
+            XCTAssertEqual(vividStop.location, baseStop.location)
+        }
+        let saturatedLight = TintFlowComposition.light(palette: .meadow, desktop: desktop, coverageScale: 50)
+        for stop in saturatedLight {
+            XCTAssertEqual(stop.opacity, 1)
+        }
+        let saturatedDark = TintFlowComposition.dark(palette: .meadow, tint: desktop, coverageScale: 50)
+        for stop in saturatedDark {
+            XCTAssertEqual(stop.opacity, 1)
+        }
     }
 
     /// The Tinted drift is glacial, bounded, and purely geometric — and the

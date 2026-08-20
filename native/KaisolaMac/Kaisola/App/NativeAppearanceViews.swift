@@ -629,13 +629,24 @@ enum TintFlowComposition {
     /// monotonic so the sweep still reads as light from above rather than as
     /// a washed band in the middle. `.desktop` keeps the sampled path; every
     /// named palette carries its own light hues to the dark canvas peak.
+    /// Dark's ceiling on any single stop. Dark's baseline coverage (0.55) is
+    /// nearly double light's heaviest stop, so an intensity multiplier that is
+    /// harmless in light would take the dark canvas's anchor fully opaque —
+    /// the plate this theme explicitly disclaims. Ninety percent keeps a
+    /// tenth of transmission at the deepest chosen intensity.
+    static let maximumDarkStopCoverage: Double = 0.90
+
     static func dark(
         palette: TintPalette,
         tint: DesktopTintComponents,
         coverageScale: Double
     ) -> [TintFlowStop] {
-        let scale = max(0, coverageScale)
         let coverage = DesktopTintSampler.canvasTintCoverage(isDark: true)
+        let heaviest = max(coverage.top, coverage.bottom)
+        let scale = min(
+            max(0, coverageScale),
+            heaviest > 0 ? maximumDarkStopCoverage / heaviest : 0
+        )
         let anchor: TintRGB
         let companion: TintRGB
         if let ends = palette.darkEnds() {
@@ -791,8 +802,12 @@ final class FlowingTintGradientHostView: NSView {
         let colorsChanged = stops != appliedStops
         let geometryChanged = startPoint != appliedStart || endPoint != appliedEnd
         let motionChanged = animated != appliedAnimated
+        // Depth only matters while the breath is actually running: an
+        // intensity change with the living tint off is a colour-only change,
+        // and treating it as a breathing change would restart the drift and
+        // visibly snap its phase — exactly what the fast path below protects.
         let breathingChanged = breathing != appliedBreathing
-            || breathDepth != appliedBreathDepth
+            || (breathing && breathDepth != appliedBreathDepth)
         guard colorsChanged || geometryChanged || motionChanged || breathingChanged else { return }
         appliedStops = stops
         appliedStart = startPoint

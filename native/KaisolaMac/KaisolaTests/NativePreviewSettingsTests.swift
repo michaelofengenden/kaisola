@@ -1347,8 +1347,13 @@ final class NativePreviewSettingsTests: XCTestCase {
                 "even Bold stays a translucent tint over the material ground, never a plate"
             )
             XCTAssertLessThanOrEqual(
-                TintFlowMotion.breathAmplitude * intensity.breathDepthMultiplier, 0.25,
-                "the deepest breath is still a breath, not a pulse"
+                TintFlowMotion.breathAmplitude * intensity.breathDepthMultiplier, 0.24,
+                """
+                the deepest chosen breath tops out at 0.24 — past the Standard \
+                voice's 0.20 resting line by deliberate user choice (see \
+                testTintBreathIsSlowShallowAndNotAHarmonicOfTheDrift), still \
+                nowhere near a strobe
+                """
             )
         }
     }
@@ -1376,10 +1381,28 @@ final class NativePreviewSettingsTests: XCTestCase {
         for stop in saturatedLight {
             XCTAssertEqual(stop.opacity, 1)
         }
+        // Dark refuses the plate outright: its baseline coverage is nearly
+        // double light's, so the composition caps the scale where the
+        // heaviest stop would stop transmitting, whatever the multiplier.
+        let boldDark = TintFlowComposition.dark(
+            palette: .meadow,
+            tint: desktop,
+            coverageScale: TintIntensity.bold.coverageMultiplier
+        )
         let saturatedDark = TintFlowComposition.dark(palette: .meadow, tint: desktop, coverageScale: 50)
-        for stop in saturatedDark {
-            XCTAssertEqual(stop.opacity, 1)
+        for stops in [boldDark, saturatedDark] {
+            let heaviest = stops.map(\.opacity).max() ?? 0
+            XCTAssertLessThanOrEqual(heaviest, TintFlowComposition.maximumDarkStopCoverage + 0.0001)
+            XCTAssertGreaterThan(
+                stops[0].opacity, stops[1].opacity,
+                "the capped sweep still reads as light from above, not a washed band"
+            )
         }
+        XCTAssertEqual(
+            saturatedDark.map(\.opacity),
+            boldDark.map(\.opacity),
+            "past the cap, more scale changes nothing — the ceiling is the ceiling"
+        )
     }
 
     /// The Tinted drift is glacial, bounded, and purely geometric — and the
@@ -1395,7 +1418,12 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
         XCTAssertLessThanOrEqual(
             TintFlowMotion.breathAmplitude, 0.20,
-            "over a fifth the breath is a pulse, not a breath"
+            """
+            over a fifth the breath is a pulse, not a breath — this bounds \
+            the resting Standard voice; a chosen TintIntensity may deepen the \
+            effective swing to 0.24, and that ceiling lives in \
+            testTintIntensityLaddersUpFromTheShippedVoice
+            """
         )
         XCTAssertEqual(
             TintFlowMotion.breathFloorOpacity,

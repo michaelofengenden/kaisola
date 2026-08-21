@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.132 — 2026-08-20
+
+- One border per pane. Every terminal and chat card in the workspace was drawing its edge as two concentric rings — the border straddled the card's clipped boundary, splitting one line into a pair at every corner. It is one crisp line now: accent when the pane holds focus, hairline otherwise.
+- The Glass side panels are white now, not gray. Third report, root fix: the light rails' frost was a thin veil over a deliberately dim underlay, so they always sat a step gray of the canvas. The underlay brightened and the rail veil thickened to where the rails read white-led the way Safari's sidebar does, while the desktop still keeps the majority share of the composite — and the faint lavender edge cast that did much of the "gray" is halved.
+- The Files panel always shows its minus. The hide control existed but only appeared when the rail was wider than its own default width, so in practice it lived buried in the "…" menu. It now sits beside the search field at every width, in the same grammar as every pane header's minus.
+
 ## 0.1.131 — 2026-08-19
 
 - The living tint has a volume knob. Tinted's flowing gradient ships deliberately pastel; a new Tint intensity control in Settings — Standard, Vivid, Bold — turns that same composition up without changing its colours. Vivid is half again as present; Bold is the gradient at full voice, and when the living tint is breathing, the deeper rungs breathe deeper too. Standard is exactly what shipped, so nothing changes until you choose. Along the way this fixed a quiet screenshot-harness bug where the tint palette override never actually reached the surface being photographed.

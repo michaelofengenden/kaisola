@@ -161,7 +161,14 @@ enum SurfaceTabChrome {
 /// add their own named, tightly bounded cool-to-pearl edge tint.
 enum LightGlassFrost {
     /// Neutral luminance of a painted wallpaper before the white veil.
-    static let backdropLuminance: Double = 0.80
+    ///
+    /// Went 0.72 → 0.80 when the shipped surface was reported grey, and
+    /// 0.80 → 0.85 in the third round of the same report: raising the
+    /// normalized underlay whitens every light-glass surface without
+    /// spending a point of wallpaper transmission. The ceiling is ~0.87 —
+    /// past it the dark warmth overlay (which divides by this value) falls
+    /// through its measured floor.
+    static let backdropLuminance: Double = 0.85
 
     /// The workspace is a white-led plane the desktop still shines through.
     ///
@@ -269,9 +276,12 @@ enum SidebarRailPlacement: Equatable, Sendable {
 enum LightRailTint {
     static let cool = (red: 90.0 / 255, green: 169.0 / 255, blue: 1.0)
     static let pearl = (red: 1.0, green: 201.0 / 255, blue: 133.0 / 255)
-    static let coolCoverage = 0.035
+    /// Halved with the white-rail pass: over the brighter ground the old
+    /// 0.035 cool edge read as a lavender-grey cast, which was most of what
+    /// "gray" meant in practice.
+    static let coolCoverage = 0.018
     static let midpointCoverage = 0.008
-    static let pearlCoverage = 0.010
+    static let pearlCoverage = 0.008
     static let midpointLocation = 0.62
     /// Was 0.12, which snuffed the rail's only warmth the moment focus left
     /// and stacked on top of the material's own inactive collapse. The rails
@@ -1137,15 +1147,15 @@ struct GlassBackdropWash: Equatable, Sendable {
     }
 
     private static func sidebarBase(isDark: Bool) -> GlassBackdropWash {
-        // Light rails carried a twelve-percent veil through v0.1.124 and read
-        // gray against the 0.93-luminance canvas — the white glass ask keeps
-        // coming back as "the rails look gray". Thirty percent lifts modeled
-        // rail luminance from 0.824 to 0.86 while transmission (0.70) stays
-        // well inside the light desktopTransmissionBand, so the desktop still
-        // reads through the glass.
+        // Third round of "the rails look gray", answered for real this time:
+        // 0.30 lifted the rail to 0.86 modeled luminance and it still read
+        // grey beside the 0.93 canvas. Forty-six percent (with the underlay
+        // at 0.85) lands the rail at ≈0.92 — white-led like Safari's sidebar
+        // — while transmission (0.54) stays above the hard 0.50 floor the
+        // structure tests hold, so the desktop still moves through the glass.
         isDark
             ? dark(top: 0.27, base: 0.34, bottom: 0.43)
-            : light(top: 0.34, base: 0.30, bottom: 0.26)
+            : light(top: 0.50, base: 0.46, bottom: 0.42)
     }
 
     /// How much of the composited backdrop is still the desktop's own colour

@@ -22,6 +22,25 @@ struct WorkspaceRailHeaderLayout: Equatable, Sendable {
 
     static let regularMinimumWidth: CGFloat = 236
 
+    /// The compact header's width budget, named so it is a testable contract
+    /// rather than a pile of literals: the responsive shell may compress the
+    /// rail to 150pt, and the row must still fit its four fixed pieces plus
+    /// the search field's floor. The mutation spinner borrows the magnifier's
+    /// slot instead of adding a fifth piece, which is what used to blow the
+    /// budget mid-operation.
+    static let itemSpacing: CGFloat = 5
+    static let glyphWidth: CGFloat = 16
+    static let controlWidth: CGFloat = 20
+    static let searchMinimumWidth: CGFloat = 46
+    static let capsulePadding: CGFloat = 6
+    static let outerPadding: CGFloat = 6
+
+    static var minimumCompactHeaderWidth: CGFloat {
+        outerPadding * 2 + capsulePadding * 2
+            + glyphWidth + searchMinimumWidth + controlWidth * 2
+            + itemSpacing * 3
+    }
+
     let mode: Mode
     let searchPlaceholder: String
     let overflowActions: [WorkspaceRailHeaderAction]
@@ -396,21 +415,27 @@ struct WorkspaceRailView: View {
     private var workspaceHeader: some View {
         GeometryReader { geometry in
             let layout = WorkspaceRailHeaderLayout.resolve(availableWidth: geometry.size.width)
-            HStack(spacing: 6) {
-                Image(systemName: "magnifyingglass")
-                    .font(.caption)
-                    .foregroundStyle(.kaisolaSecondary)
-                TextField(layout.searchPlaceholder, text: $searchText)
-                    .textFieldStyle(.plain)
-                    .lineLimit(1)
-                    .frame(minWidth: 52)
-                    .layoutPriority(1)
-                    .accessibilityLabel("Search files")
+            HStack(spacing: WorkspaceRailHeaderLayout.itemSpacing) {
+                // A running mutation replaces the magnifier in its own slot;
+                // an extra sibling used to push the row past the compressed
+                // rail's width the moment anything was mutating.
                 if isMutating {
                     ProgressView()
                         .controlSize(.mini)
+                        .frame(width: WorkspaceRailHeaderLayout.glyphWidth)
                         .accessibilityLabel("Updating project files")
+                } else {
+                    Image(systemName: "magnifyingglass")
+                        .font(.caption)
+                        .foregroundStyle(.kaisolaSecondary)
+                        .frame(width: WorkspaceRailHeaderLayout.glyphWidth)
                 }
+                TextField(layout.searchPlaceholder, text: $searchText)
+                    .textFieldStyle(.plain)
+                    .lineLimit(1)
+                    .frame(minWidth: WorkspaceRailHeaderLayout.searchMinimumWidth)
+                    .layoutPriority(1)
+                    .accessibilityLabel("Search files")
                 if layout.mode == .compact {
                     compactHeaderMenu
                 } else {
@@ -418,13 +443,13 @@ struct WorkspaceRailView: View {
                 }
                 hideRailButton
             }
-            .padding(.horizontal, 8)
+            .padding(.horizontal, WorkspaceRailHeaderLayout.capsulePadding)
             .frame(height: 30)
             .background(
                 .quaternary.opacity(0.38),
                 in: RoundedRectangle(cornerRadius: 10, style: .continuous)
             )
-            .padding(.horizontal, 6)
+            .padding(.horizontal, WorkspaceRailHeaderLayout.outerPadding)
             .padding(.vertical, 6)
         }
         .frame(height: 42)
@@ -445,7 +470,7 @@ struct WorkspaceRailView: View {
         } label: {
             Image(systemName: "ellipsis")
                 .font(.caption.weight(.semibold))
-                .frame(width: 20, height: 20)
+                .frame(width: WorkspaceRailHeaderLayout.controlWidth, height: 20)
         }
         .menuStyle(.borderlessButton)
         .fixedSize()
@@ -501,7 +526,7 @@ struct WorkspaceRailView: View {
             Image(systemName: "minus")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(.kaisolaSecondary)
-                .frame(width: 20, height: 20)
+                .frame(width: WorkspaceRailHeaderLayout.controlWidth, height: 20)
         }
         .buttonStyle(.borderless)
         .help("Hide \(root.lastPathComponent) files (Command-B)")

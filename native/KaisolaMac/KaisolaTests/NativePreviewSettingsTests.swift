@@ -5146,11 +5146,19 @@ final class NativePreviewSettingsTests: XCTestCase {
         // Floor 0.005 -> 0.004 when the dark target went 0.16 -> 0.12 for
         // "darker by default". This number is *derived* from that target, by
         // design — the amber has to stay the same proportion of the surface's
-        // colour or it reintroduces the purple cast the derivation removed — so a
-        // darker surface necessarily gets a smaller amber (measured 0.00483
-        // here). The floor exists to catch a layer scaled to nothing, not to pin
-        // the target; it moves with the target and stays far above zero.
+        // colour or it reintroduces the purple cast the derivation removed — so
+        // a darker surface necessarily gets a smaller amber. The divisor is
+        // LightGlassFrost.backdropLuminance, so every white-glass round eats
+        // this margin: 0.00483 at 0.72, 0.00435 at 0.80, 0.00409 at 0.85. The
+        // floor exists to catch a layer scaled to nothing, not to pin the
+        // target — but the underlay's ~0.87 ceiling is where the two collide,
+        // so that ceiling is asserted here, next to the floor it protects.
         XCTAssertGreaterThan(GlassWarmth.opacity(isDark: true), 0.004)
+        XCTAssertLessThanOrEqual(
+            LightGlassFrost.backdropLuminance,
+            0.87,
+            "past 0.87 the dark amber (0.029 × 0.12 / backdropLuminance) falls through its 0.004 floor — whiten the rails another way"
+        )
         XCTAssertLessThan(GlassWarmth.opacity(isDark: true), GlassWarmth.opacity)
     }
 

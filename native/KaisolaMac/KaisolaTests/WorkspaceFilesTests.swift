@@ -24,6 +24,19 @@ final class WorkspaceFilesTests: XCTestCase {
         XCTAssertTrue(regular.overflowActions.isEmpty)
     }
 
+    /// The responsive shell may compress the rail to 150pt; the compact header
+    /// — glyph slot, search at its floor, the "…" menu, and the always-there
+    /// hide minus — must fit inside it with the search field intact. The
+    /// mutation spinner shares the glyph slot, so a running operation adds
+    /// nothing to this budget.
+    func testCompactFilesHeaderFitsTheResponsiveFloorWidth() {
+        XCTAssertLessThanOrEqual(
+            WorkspaceRailHeaderLayout.minimumCompactHeaderWidth,
+            150,
+            "the compact Files header no longer fits the compressed rail"
+        )
+    }
+
     func testAllDocumentsPresentationKeepsEveryTabReachableInSourceOrder() {
         let project = URL(fileURLWithPath: "/tmp/Overflow project", isDirectory: true)
         let first = AppModel.FileWorkbenchTab(

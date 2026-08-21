@@ -10,7 +10,7 @@ on:
       #
       # The release-candidate pipeline builds, preflights, and probes the real
       # Developer ID bytes in its own job, so its call skips this workflow's
-      # duplicate macOS release compile. Standalone push/PR runs keep it.
+      # duplicate macOS release compile. Standalone push runs keep it.
       skip-macos-release-build:
         type: boolean
         default: false
@@ -49,22 +49,13 @@ on:
       - 'scripts/release-fast.cjs'
       - 'package.json'
       - 'package-lock.json'
-  pull_request:
-    paths:
-      - '.github/workflows/release-candidate.yml'
-      - '.github/workflows/release.yml'
-      - '.github/workflows/swift-contracts.yml'
-      - 'native/**'
-      - 'mobile/KaisolaCompanion/**'
-      - 'protocol/broker/**'
-      - 'runtime/**'
-      - 'tests/**'
-      - 'scripts/companion-*.cjs'
-      - 'scripts/download-native-node-runtime.cjs'
-      - 'scripts/native-*.cjs'
-      - 'scripts/release-fast.cjs'
-      - 'package.json'
-      - 'package-lock.json'
+  # No pull_request trigger, on purpose (2026-08-20, "we need to iterate and
+  # publish changes quickly"): with the up-to-date merge requirement off and
+  # `landing` the only merge gate, the PR-side copy of this ~45-minute suite
+  # re-tested nothing the push-to-main run doesn't — the release still refuses
+  # to tag until this suite is green on the main commit, which is where the
+  # notarized artifact is built anyway. PRs keep landing plus the fast
+  # fish/mesh contract checks.
 
 concurrency:
   group: >-

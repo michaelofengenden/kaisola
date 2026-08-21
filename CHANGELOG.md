@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.131 — 2026-08-19
+
+- The living tint has a volume knob. Tinted's flowing gradient ships deliberately pastel; a new Tint intensity control in Settings — Standard, Vivid, Bold — turns that same composition up without changing its colours. Vivid is half again as present; Bold is the gradient at full voice, and when the living tint is breathing, the deeper rungs breathe deeper too. Standard is exactly what shipped, so nothing changes until you choose. Along the way this fixed a quiet screenshot-harness bug where the tint palette override never actually reached the surface being photographed.
+
 ## 0.1.130 — 2026-08-17
 
 - The launch sheet grew up. Starting a chat or an agent used to open a system alert stuffed with four popups; it now opens a sheet in the same design language as the Start a Session chooser: pick a subscription, pick where it runs, go. Each subscription row carries its own headroom — "38% used · 5-hour limit" — right where the choice is made, the router's suggestion arrives preselected with its reason written underneath, and locations are real rows showing their branch and path instead of entries buried in a popup. The Run Profile popup left the launch flow entirely: new chats start on the default profile, and policies are edited in Settings, not re-decided at every launch.

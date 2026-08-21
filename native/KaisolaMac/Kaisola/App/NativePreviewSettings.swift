@@ -799,6 +799,12 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(tintPalette.rawValue, forKey: Keys.tintPalette) }
     }
 
+    /// How loud the Tinted composition is — a coverage and breath-depth
+    /// multiplier, never a different palette. Standard is the shipped voice.
+    @Published var tintIntensity: TintIntensity {
+        didSet { persist(tintIntensity.rawValue, forKey: Keys.tintIntensity) }
+    }
+
     /// The single theme control Settings vends, over the two properties above.
     ///
     /// Reads as Glass only when *both* surfaces are glass, so a workspace left on
@@ -1239,6 +1245,7 @@ final class NativePreviewSettings: ObservableObject {
         static let workspaceBackdrop = "workspaceBackdrop"
         static let tintedBreathing = "tintedBreathing"
         static let tintPalette = "tintPalette"
+        static let tintIntensity = "tintIntensity"
         static let toolCallDensity = "toolCallDensity"
         static let glassBackdropSource = "glassBackdropSource"
         static let glassTexture = "glassTexture"
@@ -1282,6 +1289,8 @@ final class NativePreviewSettings: ObservableObject {
         workspaceBackdrop = defaults.string(forKey: Keys.workspaceBackdrop).flatMap(WorkspaceBackdropMode.init) ?? .glass
         tintedBreathing = defaults.object(forKey: Keys.tintedBreathing) as? Bool ?? false
         tintPalette = defaults.string(forKey: Keys.tintPalette).flatMap(TintPalette.init) ?? .meadow
+        tintIntensity = defaults.string(forKey: Keys.tintIntensity)
+            .flatMap(TintIntensity.init) ?? .standard
         toolCallDensity = defaults.string(forKey: Keys.toolCallDensity)
             .flatMap(ToolCallDensity.init) ?? .balanced
         // The four glass knobs are a preset now, not preferences, so they are

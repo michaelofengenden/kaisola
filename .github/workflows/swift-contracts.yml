@@ -418,7 +418,16 @@ jobs:
   verify:
     if: ${{ inputs.called-by-release-candidate || github.event_name != 'push' }}
     runs-on: macos-15
-    timeout-minutes: 45
+    # Advisory since 2026-08-21 ("the whole point is to iterate really
+    # quickly"): a red or hung verify no longer fails the run, so promotion —
+    # which selects candidate runs by run conclusion — stops waiting on the
+    # flakiest job in the repo (it sat silently hung for 67 minutes the day
+    # this changed, twice). The job's own red X stays visible on the commit;
+    # the release gate is the notarized build plus the companion receipt.
+    # Twenty minutes is the kill switch for the silent-hang genre: the suite
+    # normally finishes in about twelve.
+    continue-on-error: true
+    timeout-minutes: 20
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:

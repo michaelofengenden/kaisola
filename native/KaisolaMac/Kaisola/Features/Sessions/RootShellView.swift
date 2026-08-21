@@ -2624,8 +2624,12 @@ struct RootShellView: View {
                 ?? Color(nsColor: .textBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: cardRadius, style: .continuous))
             .overlay {
+                // strokeBorder, not stroke: a centered stroke straddles the
+                // clip boundary, so its outer half rendered as a second ring
+                // just outside the card's own edge — every pane corner showed
+                // two concentric lines instead of one border.
                 RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
-                    .stroke(
+                    .strokeBorder(
                         marksFocus
                             ? Color.accentColor.opacity(0.30)
                             : terminalChrome.map {

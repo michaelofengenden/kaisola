@@ -13,7 +13,7 @@ final class WorkspaceFilesTests: XCTestCase {
         for width: CGFloat in [150, 164, 196] {
             let layout = WorkspaceRailHeaderLayout.resolve(availableWidth: width)
 
-            XCTAssertEqual(layout.mode, .compact, "\(width)pt must not scrunch five controls")
+            XCTAssertEqual(layout.mode, .compact, "\(width)pt must not scrunch four controls")
             XCTAssertEqual(layout.searchPlaceholder, "Search")
             XCTAssertEqual(Set(layout.overflowActions), Set(WorkspaceRailHeaderAction.allCases))
         }

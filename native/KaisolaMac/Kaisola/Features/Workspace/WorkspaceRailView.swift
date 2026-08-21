@@ -2,12 +2,16 @@ import AppKit
 import Darwin
 import SwiftUI
 
+/// Header actions that may collapse into the "…" menu at narrow widths.
+/// Hiding the panel is deliberately not among them: every hideable surface
+/// answers from its own visible minus (the pane-header grammar), and at the
+/// default rail width the hide control used to vanish into the overflow menu
+/// and read as missing.
 enum WorkspaceRailHeaderAction: String, CaseIterable, Hashable, Sendable {
     case newFile
     case newFolder
     case followAgentFiles
     case refresh
-    case hide
 }
 
 struct WorkspaceRailHeaderLayout: Equatable, Sendable {
@@ -412,6 +416,7 @@ struct WorkspaceRailView: View {
                 } else {
                     regularHeaderActions
                 }
+                hideRailButton
             }
             .padding(.horizontal, 8)
             .frame(height: 30)
@@ -437,9 +442,6 @@ struct WorkspaceRailView: View {
             }
             .disabled(!canFollowAgentFiles)
             Button("Refresh Files") { refresh() }
-            Divider()
-            Button("Hide Files") { close() }
-                .accessibilityIdentifier("files.hide")
         } label: {
             Image(systemName: "ellipsis")
                 .font(.caption.weight(.semibold))
@@ -488,18 +490,23 @@ struct WorkspaceRailView: View {
             }
             .buttonStyle(.borderless)
             .help("Refresh files")
-            Button(action: close) {
-                Image(systemName: "minus")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.kaisolaSecondary)
-                    .frame(width: 20, height: 20)
-            }
-            .buttonStyle(.borderless)
-            .help("Hide \(root.lastPathComponent) files (Command-B)")
-            .accessibilityLabel("Hide Files")
-            .accessibilityIdentifier("files.hide")
         }
         .fixedSize(horizontal: true, vertical: false)
+    }
+
+    /// Always visible, whatever the rail width: the panel's own minus, in the
+    /// same grammar as every session pane header.
+    private var hideRailButton: some View {
+        Button(action: close) {
+            Image(systemName: "minus")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.kaisolaSecondary)
+                .frame(width: 20, height: 20)
+        }
+        .buttonStyle(.borderless)
+        .help("Hide \(root.lastPathComponent) files (Command-B)")
+        .accessibilityLabel("Hide Files")
+        .accessibilityIdentifier("files.hide")
     }
 
     /// The index is deliberately bounded; when one of those bounds wins, do

@@ -114,7 +114,10 @@ test('the explicit inventory covers every release workflow and release script', 
   assert.deepEqual([...releaseScriptFiles].sort(), referencedReleaseScripts())
 })
 
-for (const event of ['push', 'pull_request']) {
+// push only, on purpose (2026-08-20): the PR-side copy of the heavy suite was
+// removed — `landing` gates merges and this suite gates the release on the
+// main commit, so push is the one event whose path filters must stay complete.
+for (const event of ['push']) {
   test(`${event} validates every release-critical workflow and script`, () => {
     const filters = pathsForEvent(workflow, event)
     const uncovered = releaseCriticalFiles.filter((file) => (

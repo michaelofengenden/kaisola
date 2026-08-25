@@ -2675,7 +2675,25 @@ struct RootShellView: View {
                         .font(.system(size: 12, weight: .semibold))
                         .lineLimit(1)
                     if surfaceWorking(id) {
-                        if reduceMotion {
+                        if let chat = model.chats.first(where: { $0.id == id }),
+                           let status = chat.conversation.liveThinkingStatus {
+                            HStack(spacing: 4) {
+                                if reduceMotion {
+                                    Image(systemName: "hourglass")
+                                        .font(.system(size: 8, weight: .bold))
+                                } else {
+                                    ProgressView()
+                                        .controlSize(.mini)
+                                        .scaleEffect(0.5)
+                                }
+                                Text(status.word)
+                                    .font(.caption2.weight(.medium))
+                                    .lineLimit(1)
+                            }
+                            .foregroundStyle(KaisolaStatusTone.working.foregroundColor)
+                            .accessibilityElement(children: .combine)
+                            .accessibilityLabel(status.spoken)
+                        } else if reduceMotion {
                             Image(systemName: "hourglass")
                                 .font(.system(size: 8, weight: .bold))
                                 .foregroundStyle(KaisolaStatusTone.working.foregroundColor)
@@ -5233,13 +5251,21 @@ private struct SessionStrip: View {
                 ForEach(chats) { chat in
                     Button {
                         selectRealSurface()
-                        model.selectChat(chat.id)
+                        model.selectChatPreservingConcurrentOutput(chat.id)
                     } label: {
                         HStack(spacing: 6) {
                             Image(systemName: "bubble.left.and.text.bubble.right")
                             Text(chat.conversation.title).lineLimit(1)
-                            if chat.conversation.isRunning {
-                                ProgressView().controlSize(.mini).scaleEffect(0.55)
+                            if let status = chat.conversation.liveThinkingStatus {
+                                HStack(spacing: 4) {
+                                    ProgressView().controlSize(.mini).scaleEffect(0.5)
+                                    Text(status.word)
+                                        .font(.caption2.weight(.medium))
+                                        .lineLimit(1)
+                                }
+                                .foregroundStyle(KaisolaStatusTone.working.foregroundColor)
+                                .accessibilityElement(children: .combine)
+                                .accessibilityLabel(status.spoken)
                             }
                             if let usage = chat.conversation.usage,
                                let amount = usage.costAmount,

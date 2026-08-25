@@ -79,4 +79,20 @@ final class AcpThinkingStatusTests: XCTestCase {
     func testABlankToolTitleFallsBackToWorking() {
         XCTAssertEqual(derive(lastRow: tool("   ", status: .inProgress))?.word, "Working")
     }
+
+    func testTranscriptSectionsKeepWorkDistinctFromTheResponse() {
+        XCTAssertEqual(
+            AcpTranscriptRow.user(id: "u", text: "go", failed: false).transcriptSection,
+            .user
+        )
+        XCTAssertEqual(
+            AcpTranscriptRow.thought(id: "t", text: "considering").transcriptSection,
+            .work
+        )
+        XCTAssertEqual(tool("Build", status: .inProgress).transcriptSection, .work)
+        XCTAssertEqual(
+            AcpTranscriptRow.message(id: "m", text: "done").transcriptSection,
+            .response
+        )
+    }
 }

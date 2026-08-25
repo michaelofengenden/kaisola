@@ -41,6 +41,36 @@ enum ToolCallDensity: String, CaseIterable, Identifiable, Sendable {
     }
 }
 
+/// Semantic chat zoom. Using Dynamic Type rather than scaling the finished
+/// view keeps wrapping, selection, disclosure controls, and scroll geometry
+/// native at every level.
+enum AgentChatTextSize: String, CaseIterable, Identifiable, Sendable {
+    case compact
+    case standard
+    case large
+    case extraLarge
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .compact: "85%"
+        case .standard: "100%"
+        case .large: "115%"
+        case .extraLarge: "130%"
+        }
+    }
+
+    var dynamicTypeSize: DynamicTypeSize {
+        switch self {
+        case .compact: .small
+        case .standard: .medium
+        case .large: .large
+        case .extraLarge: .xLarge
+        }
+    }
+}
+
 /// Appearance mode. Follows the system by default; shell chrome and the chosen
 /// terminal palette both resolve against it.
 enum AppearanceMode: String, CaseIterable, Identifiable, Sendable {
@@ -827,6 +857,10 @@ final class NativePreviewSettings: ObservableObject {
         didSet { persist(toolCallDensity.rawValue, forKey: Keys.toolCallDensity) }
     }
 
+    @Published var agentChatTextSize: AgentChatTextSize {
+        didSet { persist(agentChatTextSize.rawValue, forKey: Keys.agentChatTextSize) }
+    }
+
     @Published var glassTexture: GlassTexture {
         didSet { persist(glassTexture.rawValue, forKey: Keys.glassTexture) }
     }
@@ -1247,6 +1281,7 @@ final class NativePreviewSettings: ObservableObject {
         static let tintPalette = "tintPalette"
         static let tintIntensity = "tintIntensity"
         static let toolCallDensity = "toolCallDensity"
+        static let agentChatTextSize = "agentChatTextSize"
         static let glassBackdropSource = "glassBackdropSource"
         static let glassTexture = "glassTexture"
         static let glassColour = "glassColour"
@@ -1293,6 +1328,8 @@ final class NativePreviewSettings: ObservableObject {
             .flatMap(TintIntensity.init) ?? .standard
         toolCallDensity = defaults.string(forKey: Keys.toolCallDensity)
             .flatMap(ToolCallDensity.init) ?? .balanced
+        agentChatTextSize = defaults.string(forKey: Keys.agentChatTextSize)
+            .flatMap(AgentChatTextSize.init) ?? .standard
         // The four glass knobs are a preset now, not preferences, so they are
         // NOT read back from defaults: a value stored by a build that still
         // offered the pickers would otherwise outlive the pickers themselves and

@@ -346,6 +346,28 @@ struct AcpChatView: View {
     /// next turn.
     @ViewBuilder
     private var sessionControls: some View {
+        Menu {
+            ForEach(AgentChatTextSize.allCases) { size in
+                Button {
+                    previewSettings.agentChatTextSize = size
+                } label: {
+                    if previewSettings.agentChatTextSize == size {
+                        Label(size.title, systemImage: "checkmark")
+                    } else {
+                        Text(size.title)
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "textformat.size")
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Chat zoom: \(previewSettings.agentChatTextSize.title)")
+        .accessibilityLabel("Chat zoom")
+        .accessibilityValue(previewSettings.agentChatTextSize.title)
+
         if !conversation.checkpoints.isEmpty {
             Menu {
                 Text("Restore the working tree to before a turn:")
@@ -507,12 +529,21 @@ struct AcpChatView: View {
                         }
                         let visibleRows = conversation.visibleRows
                         ForEach(Array(visibleRows.enumerated()), id: \.element.id) { index, row in
-                            TranscriptRowView(
-                                row: row,
-                                workspaceURL: conversation.workspaceURL,
-                                retry: { conversation.retryFailed($0) },
-                                terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) }
-                            )
+                            VStack(alignment: .leading, spacing: 7) {
+                                if row.transcriptSection != visibleRows[safe: index - 1]?.transcriptSection {
+                                    if row.transcriptSection == .work {
+                                        AcpTranscriptSectionLabel(kind: .work)
+                                    } else if row.transcriptSection == .response {
+                                        AcpTranscriptSectionLabel(kind: .response)
+                                    }
+                                }
+                                TranscriptRowView(
+                                    row: row,
+                                    workspaceURL: conversation.workspaceURL,
+                                    retry: { conversation.retryFailed($0) },
+                                    terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) }
+                                )
+                            }
                             .id(row.id)
                             .background {
                                 AcpTranscriptViewportMarker(
@@ -536,12 +567,7 @@ struct AcpChatView: View {
                                 after: row.rhythmKind
                             ))
                         }
-                        if let status = AcpThinkingStatus.derive(
-                            isRunning: conversation.isRunning,
-                            isConnected: conversation.isConnected,
-                            hasPendingPermission: conversation.pendingPermissionReview != nil,
-                            lastRow: visibleRows.last
-                        ) {
+                        if let status = conversation.liveThinkingStatus {
                             AcpThinkingStatusRow(status: status)
                                 .id("acp-thinking-status")
                                 .padding(.top, AcpTranscriptMetrics.spacing(
@@ -629,6 +655,7 @@ struct AcpChatView: View {
             }
         }
         .id(ObjectIdentifier(conversation))
+        .dynamicTypeSize(previewSettings.agentChatTextSize.dynamicTypeSize)
     }
 
     @State private var transcriptSearch = AcpTranscriptSearchState()
@@ -977,7 +1004,7 @@ struct AcpChatView: View {
             if !conversation.pendingAttachments.isEmpty {
                 attachmentStrip
             }
-            AcpComposerCard(
+        AcpComposerCard(
                 conversation: conversation,
                 draft: $draft,
                 focused: $composerFocused,
@@ -988,6 +1015,7 @@ struct AcpChatView: View {
                 onKeyboardFocus: onKeyboardFocus
             )
         }
+        .dynamicTypeSize(previewSettings.agentChatTextSize.dynamicTypeSize)
         // The card carries its own border and shadow, so the composer region
         // is a gutter rather than a bar: no divider, no material, nothing that
         // would draw a second edge a few points from the card's own.
@@ -1501,11 +1529,31 @@ struct TranscriptRowView: View {
 }
 
 extension AcpTranscriptRow {
+    enum TranscriptSection: Equatable {
+        case user
+        case work
+        case response
+    }
+
+    var transcriptSection: TranscriptSection {
+        switch self {
+        case .user: .user
+        case .message: .response
+        case .runProfileAudit, .thought, .tool, .plan, .permissionDecision: .work
+        }
+    }
+
     /// Which side of the conversation the row sits on, for the transcript's
     /// vertical rhythm.
     var rhythmKind: AcpTranscriptMetrics.RowKind {
         if case .user = self { return .user }
         return .assistant
+    }
+}
+
+private extension Collection {
+    subscript(safe index: Index) -> Element? {
+        indices.contains(index) ? self[index] : nil
     }
 }
 

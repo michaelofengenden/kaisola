@@ -4786,6 +4786,26 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Chat tabs are also a lightweight monitor for parallel agents. When a
+    /// visible chat is still producing output, opening another chat tab keeps
+    /// that live transcript mounted and reveals the requested chat beside it.
+    /// Ordinary navigation retains the existing replace-primary behaviour.
+    func selectChatPreservingConcurrentOutput(_ chatID: String) {
+        guard let chat = chats.first(where: { $0.id == chatID }) else { return }
+        let layout = paneLayout(for: chat.projectID)
+        let hasVisibleRunningPeer = chats.contains { candidate in
+            candidate.id != chatID
+                && candidate.projectID == chat.projectID
+                && candidate.conversation.isRunning
+                && layout.contains(candidate.id)
+        }
+        if !layout.contains(chatID), hasVisibleRunningPeer {
+            revealSurfaceBeside(chatID)
+        } else {
+            selectChat(chatID)
+        }
+    }
+
     // MARK: - Kaisola Mesh
 
     enum MeshDeleteResult: Equatable {

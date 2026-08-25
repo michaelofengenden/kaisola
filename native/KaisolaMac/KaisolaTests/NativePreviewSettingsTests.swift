@@ -532,6 +532,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(settings.workspaceRailWidth, NativePreviewSettings.workspaceRailWidthDefault)
         XCTAssertEqual(settings.filePreviewWidth, NativePreviewSettings.filePreviewWidthDefault)
         XCTAssertEqual(settings.toolCallDensity, .balanced)
+        XCTAssertEqual(settings.agentChatTextSize, .standard)
         XCTAssertFalse(settings.tintedBreathing)
         XCTAssertEqual(settings.tintPalette, .meadow)
         XCTAssertEqual(settings.tintIntensity, .standard)
@@ -552,6 +553,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         settings.workspaceRailWidth = 300
         settings.filePreviewWidth = 640
         settings.toolCallDensity = .detailed
+        settings.agentChatTextSize = .extraLarge
         settings.projectRailWidth = 290.5
 
         let reloaded = NativePreviewSettings(defaults: defaults)
@@ -567,6 +569,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(reloaded.workspaceRailWidth, 300)
         XCTAssertEqual(reloaded.filePreviewWidth, 640)
         XCTAssertEqual(reloaded.toolCallDensity, .detailed)
+        XCTAssertEqual(reloaded.agentChatTextSize, .extraLarge)
         XCTAssertTrue(reloaded.tintedBreathing)
         XCTAssertEqual(reloaded.tintPalette, .harbor)
         XCTAssertEqual(reloaded.tintIntensity, .vivid)
@@ -594,6 +597,14 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(ToolCallDensity.allCases.map(\.title), [
             "Compact", "Balanced", "Detailed",
         ])
+    }
+
+    func testAgentChatTextSizeRejectsUnknownPersistedValues() {
+        let defaults = makeDefaults()
+        defaults.set("enormous", forKey: "agentChatTextSize")
+
+        XCTAssertEqual(NativePreviewSettings(defaults: defaults).agentChatTextSize, .standard)
+        XCTAssertEqual(AgentChatTextSize.allCases.map(\.title), ["85%", "100%", "115%", "130%"])
     }
 
     func testProviderRoutingPersistsWithoutTouchingProviderDefaults() {

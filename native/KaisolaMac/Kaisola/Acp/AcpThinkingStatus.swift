@@ -49,6 +49,46 @@ struct AcpThinkingStatus: Equatable, Sendable {
     }
 }
 
+/// A compact, shared description of a live agent turn. Keeping this beside the
+/// transcript status means the pane header and every chat tab say the same
+/// thing as the bottom of the conversation instead of falling back to an
+/// anonymous spinner.
+extension AcpConversation {
+    var liveThinkingStatus: AcpThinkingStatus? {
+        AcpThinkingStatus.derive(
+            isRunning: isRunning,
+            isConnected: isConnected,
+            hasPendingPermission: pendingPermissionReview != nil,
+            lastRow: visibleRows.last
+        )
+    }
+}
+
+/// Separates the agent's process from the answer without putting either in a
+/// chat bubble. Labels appear only at a boundary, so a run of tool calls reads
+/// as one work section and streamed answer chunks still read as one response.
+struct AcpTranscriptSectionLabel: View {
+    enum Kind {
+        case work
+        case response
+
+        var title: String { self == .work ? "Agent work" : "Response" }
+        var symbol: String { self == .work ? "gearshape.2" : "sparkles" }
+    }
+
+    let kind: Kind
+
+    var body: some View {
+        Label(kind.title, systemImage: kind.symbol)
+            .font(.caption2.weight(.semibold))
+            .foregroundStyle(kind == .work ? Color.kaisolaSecondary : Color.accentColor)
+            .textCase(.uppercase)
+            .tracking(0.55)
+            .accessibilityAddTraits(.isHeader)
+            .accessibilityIdentifier("acp.section.\(kind == .work ? "work" : "response")")
+    }
+}
+
 /// The mounted status line. It sits inside the transcript stack, between the
 /// last row and the bottom sentinel, so the existing follow-stream scrolling
 /// keeps it in view without new machinery.

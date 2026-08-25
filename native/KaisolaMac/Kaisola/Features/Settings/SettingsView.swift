@@ -771,6 +771,20 @@ struct SettingsView: View {
                         .menuIndicator(.hidden)
                         .accessibilityLabel("Tool-call detail")
                     }
+                    SettingsDivider()
+                    SettingsRow(
+                        title: "Agent chat zoom",
+                        detail: "Changes transcript and composer text in every agent chat",
+                        symbol: "textformat.size"
+                    ) {
+                        Menu {
+                            ForEach(AgentChatTextSize.allCases) { size in
+                                Button(size.title) { settings.agentChatTextSize = size }
+                            }
+                        } label: { SettingsChoiceLabel(settings.agentChatTextSize.title) }
+                        .menuIndicator(.hidden)
+                        .accessibilityLabel("Agent chat zoom")
+                    }
                 }
 
                 SettingsCard(title: "System", symbol: "macwindow") {

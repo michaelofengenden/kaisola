@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.133 — 2026-08-25
+
+- Parallel agent chats now read like parallel work, not a stack of anonymous chat boxes. Thinking, tool activity, and plans are grouped under an explicit Agent Work boundary; the answer begins under Response, so process is never mistaken for the delivered result. Live tabs and pane headers name what each agent is doing — Thinking, Working, or the current tool — and opening another chat while a visible agent is still running keeps both transcripts on screen side by side. Ordinary idle tab navigation stays compact and continues to reuse the primary pane. A new chat zoom control in every chat header and Settings scales transcript and composer type from 85% to 130%, persists across launches, and reflows text natively instead of magnifying a blurry finished surface.
+
 ## 0.1.132 — 2026-08-20
 
 - One border per pane. Every terminal and chat card in the workspace was drawing its edge as two concentric rings — the border straddled the card's clipped boundary, splitting one line into a pair at every corner. It is one crisp line now: accent when the pane holds focus, hairline otherwise.

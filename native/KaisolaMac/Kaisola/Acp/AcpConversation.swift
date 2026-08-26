@@ -287,6 +287,10 @@ final class AcpConversation: ObservableObject {
     /// bypassing after the user restrained the session. Restored at `start`
     /// only when the adapter still declares the remembered mode.
     private var rememberedModeID: String?
+    /// Armed at the end of each connect's mode handshake. Adapter-side mode
+    /// announcements update the memory only while armed: connect-time
+    /// announcements (load replay, boot defaults) are history, not decisions.
+    private var remembersAdapterModeSwitches = false
     /// The one adapter-owned setting currently awaiting confirmation. Keeping
     /// the prior value visible until this clears prevents a rejected effort
     /// level from masquerading as the value the next prompt will use.
@@ -647,6 +651,7 @@ final class AcpConversation: ObservableObject {
         hasStarted = true
         providerStartupFailure = nil
         pendingModelFallback = nil
+        remembersAdapterModeSwitches = false
         invalidateConfigOptionRequest()
         // One ordered pipe from the client's (off-main) event handler to the
         // MainActor consumer: yields preserve order, and a single draining task
@@ -711,12 +716,23 @@ final class AcpConversation: ObservableObject {
             if let remembered = rememberedModeID,
                remembered != info.currentModeID,
                info.modes.contains(where: { $0.id == remembered }) {
-                if await client.setMode(remembered) {
+                switch await client.setMode(remembered) {
+                case .accepted:
                     currentModeID = remembered
-                } else if let confirmed = info.currentModeID {
-                    rememberMode(confirmed)
+                case .refused:
+                    if let confirmed = info.currentModeID {
+                        rememberMode(confirmed)
+                    }
+                case .noSession:
+                    break
                 }
             }
+            // Only from here on are adapter-side mode announcements decisions
+            // worth remembering. Anything earlier — `session/load` replaying a
+            // historical announcement before its response, an adapter naming
+            // its boot default — is history, and letting it write the memory
+            // wiped the remembered mode on every relaunch.
+            remembersAdapterModeSwitches = true
             var confirmedOptions = info.configOptions
             var restorationFailure: String?
             for (id, desiredValue) in confirmedBooleanConfigValues.sorted(by: { $0.key < $1.key }) {
@@ -1146,14 +1162,17 @@ final class AcpConversation: ObservableObject {
         let confirmed = currentModeID
         currentModeID = id
         Task {
-            // Remember only what the adapter accepted: a refused switch rolls
-            // the chip back to the confirmed mode instead of persisting a mode
-            // the session is not actually in. The `currentModeID == id` guards
-            // keep a slow reply from clobbering a newer selection.
-            if await client.setMode(id) {
+            // Remember what the adapter accepted, or what there was no adapter
+            // yet to refuse: a choice made while the session is still spawning
+            // (the seconds after a relaunch) is kept and applied by the connect
+            // handshake. Only an actual refusal rolls the chip back. The
+            // `currentModeID == id` guards keep a slow reply from clobbering a
+            // newer selection.
+            switch await client.setMode(id) {
+            case .accepted, .noSession:
                 if currentModeID == id { rememberMode(id) }
-            } else if currentModeID == id {
-                currentModeID = confirmed
+            case .refused:
+                if currentModeID == id { currentModeID = confirmed }
             }
         }
     }
@@ -2133,8 +2152,9 @@ final class AcpConversation: ObservableObject {
             currentModeID = id
             // Adapter-side switches (plan-mode exits, in-band slash commands)
             // are as much the chat's mode as a chip click, so they update the
-            // remembered mode too.
-            rememberMode(id)
+            // remembered mode too — but only once the connect handshake has
+            // finished, so replayed or boot-time announcements cannot wipe it.
+            if remembersAdapterModeSwitches { rememberMode(id) }
         case let .commands(list):
             commands = list
         case let .configOptions(options):

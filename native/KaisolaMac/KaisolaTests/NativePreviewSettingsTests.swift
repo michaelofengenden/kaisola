@@ -6796,9 +6796,9 @@ final class NativePreviewSettingsTests: XCTestCase {
             fontResetAction: #selector(NSResponder.doCommand(by:))
         )
         let viewMenu = try XCTUnwrap(menu.item(withTitle: "View")?.submenu)
-        XCTAssertNotNil(viewMenu.items.first { $0.title == "Bigger" && $0.keyEquivalent == "+" })
-        XCTAssertNotNil(viewMenu.items.first { $0.title == "Smaller" && $0.keyEquivalent == "-" })
-        XCTAssertNotNil(viewMenu.items.first { $0.title == "Reset Size" && $0.keyEquivalent == "0" })
+        XCTAssertNotNil(viewMenu.items.first { $0.title == "Zoom In" && $0.keyEquivalent == "+" })
+        XCTAssertNotNil(viewMenu.items.first { $0.title == "Zoom Out" && $0.keyEquivalent == "-" })
+        XCTAssertNotNil(viewMenu.items.first { $0.title == "Actual Size" && $0.keyEquivalent == "0" })
     }
 
     func testViewMenuCarriesDiscoverableFileTabNavigation() throws {

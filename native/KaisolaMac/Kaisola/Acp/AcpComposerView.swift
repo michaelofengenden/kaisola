@@ -126,7 +126,9 @@ struct AcpComposerCard: View {
                         : KaisolaVisualSystem.hairline
                 )
         }
-        .shadow(color: .black.opacity(colorScheme == .dark ? 0.34 : 0.07), radius: 6, y: 2)
+        // 0.34 → 0.18 dark (2026-08-26): the composer sits INSIDE the chrome
+        // card, and its shadow must not out-weigh the card's own 0.18 float.
+        .shadow(color: .black.opacity(colorScheme == .dark ? 0.18 : 0.07), radius: 6, y: 2)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("acp.composer")
         .task(id: agentName) {
@@ -302,7 +304,7 @@ struct AcpComposerCard: View {
                     Image(systemName: "plus").font(.system(size: 12, weight: .medium))
                 }
             }
-            .frame(width: 22, height: 22)
+            .frame(width: 24, height: 24)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -699,7 +701,7 @@ struct AcpComposerChipLabel<Leading: View>: View {
         }
         .foregroundStyle(tint ?? .primary)
         .padding(.horizontal, 7)
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
         .contentShape(RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius))
     }
 }

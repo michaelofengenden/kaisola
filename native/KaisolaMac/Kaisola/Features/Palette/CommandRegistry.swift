@@ -358,9 +358,12 @@ enum AppCommandRegistry {
             definition(.openExternalEditor, "Open in External Editor", .file, "arrow.up.forward.app", "command+shift+o"),
             definition(.previousFileTab, "Previous File Tab", .file, "arrow.left", "command+option+left"),
             definition(.nextFileTab, "Next File Tab", .file, "arrow.right", "command+option+right"),
-            definition(.increaseTerminalFont, "Bigger", .terminal, "plus.magnifyingglass", "command+plus"),
-            definition(.decreaseTerminalFont, "Smaller", .terminal, "minus.magnifyingglass", "command+minus"),
-            definition(.resetTerminalFont, "Reset Size", .terminal, "textformat.size", "command+0"),
+            // Apple's own zoom vocabulary: these route contextually (chat
+            // zoom when a chat pane is focused, terminal font otherwise), so
+            // "Terminal Font › Bigger" lied to anyone with a chat in front.
+            definition(.increaseTerminalFont, "Zoom In", .terminal, "plus.magnifyingglass", "command+plus"),
+            definition(.decreaseTerminalFont, "Zoom Out", .terminal, "minus.magnifyingglass", "command+minus"),
+            definition(.resetTerminalFont, "Actual Size", .terminal, "textformat.size", "command+0"),
             definition(.clearTerminal, "Clear Terminal", .terminal, "eraser", "command+option+k"),
             definition(.scrollTerminalToLatest, "Scroll to Latest Output", .terminal, "arrow.down.to.line", "command+option+down"),
             definition(.focusPreviousPane, "Focus Previous Pane", .view, "arrow.left.to.line", "command+control+left"),

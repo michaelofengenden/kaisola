@@ -71,7 +71,12 @@ enum ChromeCardElevation {
     static let shadowRadius: CGFloat = 12
     static let shadowOffsetY: CGFloat = 3
 
-    static func shadowOpacity(isDark: Bool) -> Double { isDark ? 0.30 : 0.10 }
+    /// 0.30/0.10 → 0.18/0.06 on 2026-08-26: the mask fix made the spill
+    /// actually render for the first time, and constants tuned while the
+    /// shadow was invisible landed at popover weight. macOS 26 keeps
+    /// in-window inset panels nearly shadowless; this is the float, softened
+    /// to what the gutter neighbourhood can carry.
+    static func shadowOpacity(isDark: Bool) -> Double { isDark ? 0.18 : 0.06 }
 
     /// The containment hairline drawn *under* `panelEdge`'s top-light
     /// gradient. The gradient lights the top; nothing was closing the bottom
@@ -1363,22 +1368,44 @@ struct GlassBackdropWash: Equatable, Sendable {
     }
 }
 
-/// See `kaisolaBarSurface()`. The white coverages: 0.55 in light keeps the
-/// bar unmistakably white-led over the glass canvas while the desktop still
-/// moves through it; 0.055 in dark is a lift toward white — "clear" with just
-/// enough definition to separate the band from the content below it.
+/// See `kaisolaBarSurface()`. On macOS 26 a bar is regular Liquid Glass —
+/// the same material Finder's and Mail's bands ride, which already resolves
+/// white-led in Aqua. Below 26 (and under Reduce Transparency) the bar is a
+/// white plate: 0.55 in light keeps it unmistakably white-led over the glass
+/// canvas while the desktop still moves through it; 0.055 in dark is a lift
+/// toward white — "clear" with just enough definition to separate the band
+/// from the content below it.
 private struct KaisolaBarSurfaceModifier: ViewModifier {
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorScheme) private var colorScheme
 
+    @Environment(\.colorSchemeContrast) private var accessibilityContrast
+
+    @ViewBuilder
     func body(content: Content) -> some View {
-        content.background {
-            if reduceTransparency {
-                Color(nsColor: .controlBackgroundColor)
+        if reduceTransparency {
+            content.background(Color(nsColor: .controlBackgroundColor))
+        } else {
+            #if compiler(>=6.2)
+            if #available(macOS 26.0, *) {
+                content.glassEffect(.regular, in: Rectangle())
             } else {
-                Color.white.opacity(colorScheme == .dark ? 0.055 : 0.55)
+                content.background(whitePlate)
             }
+            #else
+            content.background(whitePlate)
+            #endif
         }
+    }
+
+    /// Increased Contrast thickens the plate the way the rails and control
+    /// surfaces already answer it — a preference typed into System Settings
+    /// outranks the translucency preference typed into ours.
+    private var whitePlate: Color {
+        if accessibilityContrast == .increased {
+            return Color.white.opacity(colorScheme == .dark ? 0.14 : 0.78)
+        }
+        return Color.white.opacity(colorScheme == .dark ? 0.055 : 0.55)
     }
 }
 

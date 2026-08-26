@@ -282,11 +282,11 @@ struct AcpChatView: View {
         )
         return HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "archivebox")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityHidden(true)
             Text("Earlier saved history was truncated at this chat's disk quota (\(status.truncatedRowCount.formatted()) rows, \(bytes)). User prompts, tool evidence, and the newest transcript were kept first.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
@@ -319,7 +319,7 @@ struct AcpChatView: View {
                 .accessibilityHidden(true)
             Text(detail)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
             if canRetry {
@@ -703,7 +703,7 @@ struct AcpChatView: View {
     private var transcriptSearchBar: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityHidden(true)
             TextField(
                 "Find in conversation",
@@ -1118,10 +1118,10 @@ struct AcpChatView: View {
                         .font(.caption.weight(.semibold))
                     Text("\(account.provider) · \(account.account)")
                         .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     Text(account.detail)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
@@ -1484,7 +1484,7 @@ struct HarnessNoticeRow: View {
                 .textSelection(.enabled)
         }
         .font(.caption)
-        .foregroundStyle(.secondary)
+        .foregroundStyle(.kaisolaSecondary)
         .help(fullText)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Background task notification: \(summary)")
@@ -1519,7 +1519,7 @@ struct TranscriptRowView: View {
                 if let model = profile.modelID { Text("· \(model)") }
             }
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Run profile audit: \(profile.name)")
         case let .user(_, text, failed):
@@ -1566,11 +1566,14 @@ struct TranscriptRowView: View {
                 // The turn's final answer announces itself. Interim narration
                 // flows as plain prose; the one message that closes the
                 // exchange carries the title, so "where is the actual answer"
-                // has a visible landmark again (2026-08-26 feedback).
+                // has a visible landmark again (2026-08-26 feedback). Callout
+                // semibold in primary ink: the landmark must outrank the
+                // work-run marker's callout line by weight and ink, not lose
+                // to it at caption size.
                 if showsResponseChrome {
                     Text("Response")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.kaisolaPrimary)
                         .accessibilityHidden(true)
                 }
                 AssistantMarkdownText(
@@ -1636,7 +1639,7 @@ struct TranscriptRowView: View {
             Label {
                 Text(text)
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .textSelection(.enabled)
             } icon: {
                 Image(systemName: "shield.slash")

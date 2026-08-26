@@ -929,10 +929,16 @@ struct RootShellView: View {
     /// The Show Document door reuses the toggle path, so with nothing to
     /// restore it opens Files instead of doing nothing — same fallback the
     /// footer's menu item has always had.
-    /// The two "show" doors as bare header controls: same 24×22 slot, same
+    /// The two panel toggles as bare header controls: same 24×22 slot, same
     /// inherited glyph size, same secondary ink as the pane controls beside
     /// them. The grey `.regularMaterial` capsule that used to wrap them — and
     /// the overlay that floated it over the header's own buttons — is gone.
+    ///
+    /// Both toggles render whenever they can act; only the words flip between
+    /// Show and Hide. A door that existed only while its panel was hidden
+    /// deleted itself on click and slid the neighbouring control into the
+    /// pixel under the cursor — the toolbar-toggle permanence Apple's own
+    /// sidebar buttons have is what keeps the slot geometry stable.
     @ViewBuilder
     private var detailShowDoorButtons: some View {
         let doors = DetailShowDoors.resolve(
@@ -940,19 +946,17 @@ struct RootShellView: View {
             previewVisible: detailPreviewPanelVisible,
             hasProjectDirectory: model.currentProjectDirectory != nil
         )
-        if doors.showDocument {
-            showDoor(
-                symbol: "doc.text",
-                label: "Show Document",
-                shortcut: keymap.shortcut(for: .toggleDocumentPreview)?.display,
-                identifier: "detail.toggle-document",
-                action: { runCommand(.toggleDocumentPreview) }
-            )
-        }
-        if doors.showFiles {
+        showDoor(
+            symbol: "doc.text",
+            label: doors.showDocument ? "Show Document" : "Hide Document",
+            shortcut: keymap.shortcut(for: .toggleDocumentPreview)?.display,
+            identifier: "detail.toggle-document",
+            action: { runCommand(.toggleDocumentPreview) }
+        )
+        if model.currentProjectDirectory != nil {
             showDoor(
                 symbol: "sidebar.trailing",
-                label: "Show Files",
+                label: doors.showFiles ? "Show Files" : "Hide Files",
                 shortcut: keymap.shortcut(for: .toggleFiles)?.display,
                 identifier: "detail.toggle-files",
                 action: { runCommand(.toggleFiles) }
@@ -984,7 +988,7 @@ struct RootShellView: View {
                 .frame(width: 24, height: 22)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.accessoryBar)
         .help(shortcut.map { "\(label) (\($0))" } ?? label)
         .accessibilityLabel(label)
         .accessibilityIdentifier(identifier)
@@ -2778,17 +2782,21 @@ struct RootShellView: View {
             // accounting, export — as one overflow in the pane's only bar.
             // The chat surface itself draws no header strip anymore.
             if let chat = model.chats.first(where: { $0.id == id }) {
+                // The 24×22 slot lives on the menu's own label now; an outer
+                // frame around its `.fixedSize()` was dead weight.
                 AcpChatOverflowMenu(conversation: chat.conversation)
-                    .frame(width: 24, height: 22)
                     .foregroundStyle(.kaisolaSecondary)
             }
+            // accessoryBar, not plain: plain paints nothing on hover, so this
+            // row split into controls that light up (the two menus) and
+            // controls that play dead. One native hover answer for all of it.
             Button { model.toggleMaximizeSurface(id) } label: {
                 Image(systemName: model.maximizedPaneID == id
                     ? "arrow.down.right.and.arrow.up.left"
                     : "arrow.up.left.and.arrow.down.right")
                     .frame(width: 24, height: 22)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.accessoryBar)
             .foregroundStyle(.kaisolaSecondary)
             .help(model.maximizedPaneID == id ? "Restore pane" : "Maximize pane")
             if model.sessions.contains(where: { $0.id == id }) {
@@ -2798,7 +2806,7 @@ struct RootShellView: View {
                     Image(systemName: "doc.text.magnifyingglass")
                         .frame(width: 24, height: 22)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(.accessoryBar)
                 .foregroundStyle(.kaisolaSecondary)
                 .disabled(model.terminalTranscriptContext(for: id) == nil)
                 .help("Open the full retained terminal transcript")
@@ -2808,7 +2816,7 @@ struct RootShellView: View {
                 Image(systemName: "minus.circle")
                     .frame(width: 24, height: 22)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.accessoryBar)
             .foregroundStyle(.kaisolaSecondary)
             .help("Hide this session; keep it running")
             // The show-doors used to float as a capsule overlay four view
@@ -3093,7 +3101,7 @@ struct RootShellView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
         .background(.regularMaterial, in: Capsule())
-        .overlay(Capsule().stroke(Color.primary.opacity(0.1), lineWidth: 0.8))
+        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.1), lineWidth: KaisolaVisualSystem.hairline))
         .padding(.top, 10)
         .help("This terminal was running \(agent?.name ?? agentID) before the restart. Run resumes the conversation; dismiss keeps the plain shell.")
     }
@@ -3199,7 +3207,7 @@ struct RootShellView: View {
                 .padding(.vertical, 6)
                 .background(.regularMaterial, in: Capsule())
                 .overlay {
-                    Capsule().stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+                    Capsule().strokeBorder(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: KaisolaVisualSystem.hairline)
                 }
                 .padding(10)
                 .accessibilityElement(children: .contain)
@@ -3221,7 +3229,7 @@ struct RootShellView: View {
                 .padding(.vertical, 6)
                 .background(.regularMaterial, in: Capsule())
                 .overlay {
-                    Capsule().stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+                    Capsule().strokeBorder(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: KaisolaVisualSystem.hairline)
                 }
                 .padding(10)
                 .accessibilityElement(children: .contain)
@@ -3245,7 +3253,7 @@ struct RootShellView: View {
                 .padding(.vertical, 6)
                 .background(.regularMaterial, in: Capsule())
                 .overlay {
-                    Capsule().stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+                    Capsule().strokeBorder(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: KaisolaVisualSystem.hairline)
                 }
                 .padding(10)
                 .accessibilityElement(children: .contain)
@@ -3260,7 +3268,7 @@ struct RootShellView: View {
                     .padding(.vertical, 6)
                     .background(.regularMaterial, in: Capsule())
                     .overlay {
-                        Capsule().stroke(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: 0.5)
+                        Capsule().strokeBorder(Color(nsColor: .separatorColor).opacity(0.7), lineWidth: KaisolaVisualSystem.hairline)
                     }
                     .padding(10)
                     .accessibilityLabel("Reconnecting to \(surfaceTitle(id))")
@@ -3374,10 +3382,10 @@ struct RootShellView: View {
             KaisolaMacAppDelegate.popOut(sessionID: id)
         } label: {
             Image(systemName: "macwindow.badge.plus")
-                .frame(width: 22, height: 20)
+                .frame(width: 24, height: 22)
                 .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(.accessoryBar)
         .foregroundStyle(.kaisolaSecondary)
         .help("Open this session in a new window")
     }

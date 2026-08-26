@@ -121,9 +121,9 @@ struct WorkspaceRestorationNoticeView: View {
             Spacer(minLength: 8)
         }
         .padding(12)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius)
+            RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
                 .strokeBorder(Color.red.opacity(0.45), lineWidth: KaisolaVisualSystem.focusStroke)
         )
         .shadow(color: .black.opacity(0.18), radius: 14, y: 5)
@@ -184,9 +184,9 @@ struct WorkspaceRestorationNoticeView: View {
             .accessibilityLabel("Collapse Window Layout Notice")
         }
         .padding(12)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius)
+            RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius, style: .continuous)
                 .strokeBorder(Color.orange.opacity(0.45), lineWidth: KaisolaVisualSystem.focusStroke)
         )
         .shadow(color: .black.opacity(0.18), radius: 14, y: 5)

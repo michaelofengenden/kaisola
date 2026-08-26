@@ -853,6 +853,11 @@ struct AssistantMarkdownText: View {
                                 .equatable()
                         }
                     }
+                    // One leading for the whole answer: set per-paragraph, the
+                    // ~25% looser prose leading vanished at every list, quote,
+                    // and heading, and a mixed reply read loose/tight/loose.
+                    // Code blocks keep their own tighter metric.
+                    .lineSpacing(4)
                 }
             }
             .textSelection(.enabled)
@@ -921,9 +926,10 @@ private struct AcpTranscriptBlockView: View, Equatable {
         case let .paragraph(text, _):
             // Stated, not inherited: a chat is a reading surface and its
             // paragraphs are body text whatever the enclosing chrome sets.
+            // Leading comes from the message container, so lists and quotes
+            // breathe at the same rhythm as the prose around them.
             Text(AcpTranscriptInlineRendering.attributed(text, workspaceURL: workspaceURL))
                 .font(.body)
-                .lineSpacing(4)
                 .frame(maxWidth: .infinity, alignment: .leading)
         case let .image(source, alt, _, _, _):
             Label(alt ?? source, systemImage: "photo")

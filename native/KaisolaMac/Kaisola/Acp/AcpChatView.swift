@@ -639,6 +639,8 @@ struct AcpChatView: View {
                         }
                     }
                 )
+            case let .harnessNotice(_, summary, text):
+                HarnessNoticeRow(summary: summary, fullText: text)
             }
         }
         .id(item.id)
@@ -1443,6 +1445,29 @@ struct ToolCallDensityPresentation: Equatable, Sendable {
     }
 }
 
+/// One quiet line for a harness-injected background-task notification. The
+/// full XML stays reachable (selection and the export path keep the raw
+/// text); the stream shows only the line a reader might care about.
+struct HarnessNoticeRow: View {
+    let summary: String
+    let fullText: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "clock.badge.checkmark")
+                .accessibilityHidden(true)
+            Text(summary)
+                .lineLimit(2)
+                .textSelection(.enabled)
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+        .help(fullText)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Background task notification: \(summary)")
+    }
+}
+
 struct TranscriptRowView: View {
     let row: AcpTranscriptRow
     var workspaceURL: URL?
@@ -1514,13 +1539,25 @@ struct TranscriptRowView: View {
             .accessibilityIdentifier("acp.transcript.\(row.id)")
             .accessibilityLabel("You said: \(text)")
         case let .message(_, text):
-            AssistantMarkdownText(
-                text: text,
-                workspaceURL: workspaceURL,
-                showsCopyButton: showsResponseChrome
-            )
-            // The section captions are gone; the turn's final answer is the
-            // heading landmark VoiceOver's rotor steps between.
+            VStack(alignment: .leading, spacing: 6) {
+                // The turn's final answer announces itself. Interim narration
+                // flows as plain prose; the one message that closes the
+                // exchange carries the title, so "where is the actual answer"
+                // has a visible landmark again (2026-08-26 feedback).
+                if showsResponseChrome {
+                    Text("Response")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .accessibilityHidden(true)
+                }
+                AssistantMarkdownText(
+                    text: text,
+                    workspaceURL: workspaceURL,
+                    showsCopyButton: showsResponseChrome
+                )
+            }
+            // The turn's final answer is the heading landmark VoiceOver's
+            // rotor steps between.
             .accessibilityAddTraits(showsResponseChrome ? .isHeader : [])
         case let .thought(_, text):
             // The quote block's left rule, in tertiary ink: an expanded

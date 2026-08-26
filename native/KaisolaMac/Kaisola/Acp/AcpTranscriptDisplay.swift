@@ -19,18 +19,24 @@ enum AcpTranscriptDisplayItem: Equatable, Identifiable {
     /// call's id, which is stable while the run grows at its tail — so an
     /// expansion the user opened stays open as the turn streams.
     case workRun(id: String, calls: [AcpToolCall])
+    /// A harness-injected background-task notification. It arrives as a user
+    /// turn on the wire, but it is protocol plumbing, not something the user
+    /// typed: the stream shows one quiet line with the extracted summary
+    /// instead of a full-width bubble of XML.
+    case harnessNotice(id: String, summary: String, text: String)
 
     var id: String {
         switch self {
         case let .row(row): row.id
         case let .workRun(id, _): "workrun-\(id)"
+        case let .harnessNotice(id, _, _): id
         }
     }
 
     var rhythmKind: AcpTranscriptMetrics.RowKind {
         switch self {
         case let .row(row): row.rhythmKind
-        case .workRun: .work
+        case .workRun, .harnessNotice: .work
         }
     }
 }
@@ -61,6 +67,10 @@ enum AcpTranscriptDisplay {
         for row in rows {
             if isCollapsible(row), case let .tool(call) = row {
                 run.append(call)
+            } else if case let .user(_, text, failed) = row, !failed,
+                      let summary = harnessNoticeSummary(text) {
+                flushRun()
+                items.append(.harnessNotice(id: row.id, summary: summary, text: text))
             } else {
                 flushRun()
                 items.append(.row(row))
@@ -97,9 +107,11 @@ enum AcpTranscriptDisplay {
     }
 
     /// Which message rows are a turn's final answer. Response chrome (the
-    /// Copy response affordance) belongs only to the message after which the
-    /// agent stopped talking — the next conversational row is the user's, or
-    /// the transcript ends. Interim narration flows as plain prose.
+    /// Copy response affordance and title) belongs only to the message after
+    /// which the agent stopped talking — the next conversational row is the
+    /// user's, or the transcript ends. Interim narration flows as plain
+    /// prose, and a harness notification is not the user talking: one human
+    /// exchange has one final answer, not one per background-task event.
     static func finalResponseMessageIDs(rows: [AcpTranscriptRow]) -> Set<String> {
         var ids: Set<String> = []
         var pendingMessageID: String?
@@ -107,7 +119,8 @@ enum AcpTranscriptDisplay {
             switch row {
             case let .message(id, _):
                 pendingMessageID = id
-            case .user:
+            case let .user(_, text, _):
+                guard harnessNoticeSummary(text) == nil else { break }
                 if let id = pendingMessageID { ids.insert(id) }
                 pendingMessageID = nil
             default:
@@ -116,6 +129,24 @@ enum AcpTranscriptDisplay {
         }
         if let id = pendingMessageID { ids.insert(id) }
         return ids
+    }
+
+    /// Detect a harness-injected background-task notification and pull out
+    /// its one human-relevant line. Only a message that IS the notification
+    /// counts — the preamble or the tag must open the text; quoting the tag
+    /// mid-sentence never folds a real prompt away.
+    static func harnessNoticeSummary(_ text: String) -> String? {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("[SYSTEM NOTIFICATION - NOT USER INPUT]")
+            || trimmed.hasPrefix("<task-notification>") else { return nil }
+        if let start = trimmed.range(of: "<summary>"),
+           let end = trimmed.range(of: "</summary>"),
+           start.upperBound <= end.lowerBound {
+            let summary = trimmed[start.upperBound..<end.lowerBound]
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !summary.isEmpty { return summary }
+        }
+        return "Background task update"
     }
 }
 

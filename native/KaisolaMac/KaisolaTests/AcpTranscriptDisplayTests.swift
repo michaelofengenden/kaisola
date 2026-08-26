@@ -78,6 +78,89 @@ final class AcpTranscriptDisplayTests: XCTestCase {
         XCTAssertEqual(finals, ["m2", "m3"], "interim narration is prose; the last word of each turn is the response")
     }
 
+    /// A harness-injected background-task notification is protocol plumbing,
+    /// not something the user typed: it folds into one quiet notice line
+    /// carrying the extracted summary, never a full-width user bubble of XML.
+    func testHarnessTaskNotificationsFoldIntoAQuietNoticeLine() {
+        let notification = """
+        [SYSTEM NOTIFICATION - NOT USER INPUT]
+        This is an automated background-task event, NOT a message from the user.
+        <task-notification>
+        <task-id>abc123</task-id>
+        <status>completed</status>
+        <summary>Background command "Build and test" completed (exit code 0)</summary>
+        </task-notification>
+        """
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "u1", text: "real prompt", failed: false),
+            .message(id: "m1", text: "answer"),
+            .user(id: "n1", text: notification, failed: false),
+            .message(id: "m2", text: "follow-up"),
+        ]
+        let items = AcpTranscriptDisplay.items(rows: rows, isRunning: false)
+        XCTAssertTrue(items.contains {
+            if case let .harnessNotice(id, summary, _) = $0 {
+                return id == "user-n1"
+                    && summary == "Background command \"Build and test\" completed (exit code 0)"
+            }
+            return false
+        }, "the notification becomes a quiet notice with its own summary")
+        XCTAssertFalse(items.contains {
+            if case let .row(.user(id, _, _)) = $0 { return id == "n1" }
+            return false
+        }, "the raw XML user bubble is gone")
+        XCTAssertTrue(items.contains {
+            if case let .row(.user(id, _, _)) = $0 { return id == "u1" }
+            return false
+        }, "real prompts keep their bubble")
+    }
+
+    /// A bare <task-notification> block (no preamble) and one without a
+    /// summary still fold; the label falls back to a generic line.
+    func testNoticeDetectionHandlesBareAndSummarylessNotifications() {
+        let bare = "<task-notification><task-id>x</task-id></task-notification>"
+        let items = AcpTranscriptDisplay.items(
+            rows: [.user(id: "n2", text: bare, failed: false)],
+            isRunning: false
+        )
+        XCTAssertTrue(items.contains {
+            if case let .harnessNotice(_, summary, _) = $0 {
+                return summary == "Background task update"
+            }
+            return false
+        })
+        XCTAssertNil(
+            AcpTranscriptDisplay.harnessNoticeSummary("just a normal message"),
+            "ordinary text is never mistaken for plumbing"
+        )
+        XCTAssertNil(
+            AcpTranscriptDisplay.harnessNoticeSummary(
+                "I pasted <task-notification> into the middle of a question"
+            ),
+            "mentioning the tag mid-message is not a notification"
+        )
+    }
+
+    /// A harness notification does not close a turn: the final answer is the
+    /// message before the next REAL user prompt (or the transcript's end), so
+    /// one human exchange has exactly one response, not one per notification.
+    func testHarnessNotificationsDoNotSplitTheFinalResponse() {
+        let notification = """
+        [SYSTEM NOTIFICATION - NOT USER INPUT]
+        <task-notification><summary>done</summary></task-notification>
+        """
+        let rows: [AcpTranscriptRow] = [
+            .user(id: "u1", text: "prompt", failed: false),
+            .message(id: "m1", text: "interim word"),
+            .user(id: "n1", text: notification, failed: false),
+            .message(id: "m2", text: "the actual answer"),
+            .user(id: "u2", text: "next prompt", failed: false),
+            .message(id: "m3", text: "second answer"),
+        ]
+        let finals = AcpTranscriptDisplay.finalResponseMessageIDs(rows: rows)
+        XCTAssertEqual(finals, ["m2", "m3"], "notification boundaries are not turn boundaries")
+    }
+
     /// The collapsed line stays quiet about failures on purpose (2026-08-26):
     /// non-zero exits are routine agent probing, and the red suffix made every
     /// one an alarm. The per-call log behind the click still marks them.

@@ -291,6 +291,15 @@ final class AcpConversation: ObservableObject {
     /// announcements update the memory only while armed: connect-time
     /// announcements (load replay, boot defaults) are history, not decisions.
     private var remembersAdapterModeSwitches = false
+    /// The newest mode the user picked during the CURRENT connect epoch.
+    /// The connect restore defers to it: a selection made while the restore's
+    /// own set_mode is still in flight must not have its display clobbered by
+    /// the restore's later continuation — and the accept-time guards check
+    /// this field, not the mutable display state, so a clobber could not
+    /// discard the accepted choice either. Reset at each start(): a choice
+    /// made before the connect lives in `rememberedModeID`, and the restore
+    /// handshake is what applies it.
+    private var pendingUserModeSelection: String?
     /// The one adapter-owned setting currently awaiting confirmation. Keeping
     /// the prior value visible until this clears prevents a rejected effort
     /// level from masquerading as the value the next prompt will use.
@@ -652,6 +661,7 @@ final class AcpConversation: ObservableObject {
         providerStartupFailure = nil
         pendingModelFallback = nil
         remembersAdapterModeSwitches = false
+        pendingUserModeSelection = nil
         invalidateConfigOptionRequest()
         // One ordered pipe from the client's (off-main) event handler to the
         // MainActor consumer: yields preserve order, and a single draining task
@@ -718,9 +728,15 @@ final class AcpConversation: ObservableObject {
                info.modes.contains(where: { $0.id == remembered }) {
                 switch await client.setMode(remembered) {
                 case .accepted:
-                    currentModeID = remembered
+                    // A user selection that raced in while this request was
+                    // in flight outranks the restore: the adapter processed
+                    // the newer request last, and the newer choice owns the
+                    // display and the memory.
+                    if pendingUserModeSelection == nil {
+                        currentModeID = remembered
+                    }
                 case .refused:
-                    if let confirmed = info.currentModeID {
+                    if pendingUserModeSelection == nil, let confirmed = info.currentModeID {
                         rememberMode(confirmed)
                     }
                 case .noSession:
@@ -1161,18 +1177,25 @@ final class AcpConversation: ObservableObject {
     func selectMode(_ id: String) {
         let confirmed = currentModeID
         currentModeID = id
+        pendingUserModeSelection = id
         Task {
             // Remember what the adapter accepted, or what there was no adapter
             // yet to refuse: a choice made while the session is still spawning
             // (the seconds after a relaunch) is kept and applied by the connect
             // handshake. Only an actual refusal rolls the chip back. The
-            // `currentModeID == id` guards keep a slow reply from clobbering a
-            // newer selection.
+            // guards check `pendingUserModeSelection` — the newest selection —
+            // not the display state, which a concurrent connect restore may
+            // have rewritten mid-flight; acceptance re-asserts the display for
+            // the same reason.
             switch await client.setMode(id) {
             case .accepted, .noSession:
-                if currentModeID == id { rememberMode(id) }
+                guard pendingUserModeSelection == id else { break }
+                currentModeID = id
+                rememberMode(id)
             case .refused:
-                if currentModeID == id { currentModeID = confirmed }
+                guard pendingUserModeSelection == id else { break }
+                pendingUserModeSelection = nil
+                currentModeID = confirmed
             }
         }
     }

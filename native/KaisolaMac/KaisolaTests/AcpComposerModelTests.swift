@@ -1267,6 +1267,61 @@ extension AcpComposerModelTests {
         XCTAssertEqual(requests, ["bypassPermissions"])
     }
 
+    /// A mode picked while the connect restore is still in flight must win
+    /// over it: the restore's late continuation used to overwrite the display
+    /// with the older mode, and the equality guard then discarded the
+    /// accepted user choice — adapter on the new mode, UI and memory on the
+    /// old one.
+    @MainActor
+    func testUserSelectionDuringConnectRestoreOutranksTheRestore() async throws {
+        let draftKey = "permission-mode-race-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(
+                for: draftKey,
+                currentDefaults: .standard,
+                migratedDefaults: nil
+            )
+        }
+        UserDefaults.standard.set(
+            "bypassPermissions",
+            forKey: AcpConversation.persistedModeDefaultsKeys(for: draftKey).first!
+        )
+        let transport = PermissionModeConversationTransport(holdFirstSetModeUntilSecond: true)
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport),
+            draftKey: draftKey
+        )
+
+        let startTask = Task { await conversation.start() }
+        // Wait for the restore's set_mode to be parked at the transport, so
+        // the user selection genuinely races the in-flight handshake.
+        let raceDeadline = ContinuousClock.now + .seconds(2)
+        while await transport.modeRequests().count < 1, ContinuousClock.now < raceDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        conversation.selectMode("acceptEdits")
+        await startTask.value
+
+        let deadline = ContinuousClock.now + .seconds(2)
+        while (conversation.currentModeID != "acceptEdits"
+            || AcpConversation.loadPersistedModeID(for: draftKey) != "acceptEdits"),
+            ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(
+            conversation.currentModeID,
+            "acceptEdits",
+            "the user's mid-handshake choice stays on screen"
+        )
+        XCTAssertEqual(
+            AcpConversation.loadPersistedModeID(for: draftKey),
+            "acceptEdits",
+            "the accepted choice is remembered even though the restore resolved after it"
+        )
+    }
+
     /// After the handshake, adapter-side switches (plan-mode exits, in-band
     /// slash commands) are the chat's mode and keep updating the memory.
     @MainActor
@@ -1642,15 +1697,19 @@ private actor PermissionModeConversationTransport: AcpByteTransport {
     private let rejectedModeIDs: Set<String>
     private let advertiseLoadSession: Bool
     private let announceModeOnLoad: String?
+    private let holdFirstSetModeUntilSecond: Bool
+    private var heldSetModeReplyID: JSONValue?
 
     init(
         rejectedModeIDs: Set<String> = [],
         advertiseLoadSession: Bool = false,
-        announceModeOnLoad: String? = nil
+        announceModeOnLoad: String? = nil,
+        holdFirstSetModeUntilSecond: Bool = false
     ) {
         self.rejectedModeIDs = rejectedModeIDs
         self.advertiseLoadSession = advertiseLoadSession
         self.announceModeOnLoad = announceModeOnLoad
+        self.holdFirstSetModeUntilSecond = holdFirstSetModeUntilSecond
     }
 
     func start(
@@ -1689,8 +1748,16 @@ private actor PermissionModeConversationTransport: AcpByteTransport {
             if let modeID { requestedModeIDs.append(modeID) }
             if let modeID, rejectedModeIDs.contains(modeID) {
                 replyError(id: id, message: "mode unavailable for this account")
+            } else if holdFirstSetModeUntilSecond, heldSetModeReplyID == nil, requestedModeIDs.count == 1 {
+                // Park the FIRST set_mode (the connect restore) so a user
+                // selection can race past it — the interleave the fix is for.
+                heldSetModeReplyID = id
             } else {
                 reply(id: id, result: .null)
+                if let held = heldSetModeReplyID {
+                    heldSetModeReplyID = nil
+                    reply(id: held, result: .null)
+                }
             }
         default:
             if let id { reply(id: id, result: .null) }

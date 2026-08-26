@@ -1009,6 +1009,167 @@ extension AcpComposerModelTests {
         )
     }
 
+    /// A restart must not quietly demote "Full access" back to asking: the
+    /// selected permission mode is a per-chat decision, persisted under the
+    /// chat's draft key and re-applied to the fresh adapter session.
+    @MainActor
+    func testSelectedPermissionModeRestoresAcrossConversationLifetimes() async throws {
+        let draftKey = "permission-mode-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(
+                for: draftKey,
+                currentDefaults: .standard,
+                migratedDefaults: nil
+            )
+        }
+        let firstConversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: PermissionModeConversationTransport()),
+            draftKey: draftKey
+        )
+        await firstConversation.start()
+        XCTAssertEqual(firstConversation.currentModeID, "default")
+
+        firstConversation.selectMode("bypassPermissions")
+        let persistDeadline = ContinuousClock.now + .seconds(2)
+        while AcpConversation.loadPersistedModeID(for: draftKey) == nil,
+              ContinuousClock.now < persistDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(AcpConversation.loadPersistedModeID(for: draftKey), "bypassPermissions")
+        _ = await firstConversation.stop()
+
+        let restoredTransport = PermissionModeConversationTransport()
+        let restoredConversation = AcpConversation(
+            title: "Restored", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: restoredTransport),
+            draftKey: draftKey
+        )
+        await restoredConversation.start()
+
+        XCTAssertEqual(restoredConversation.currentModeID, "bypassPermissions")
+        let restoredRequests = await restoredTransport.modeRequests()
+        XCTAssertEqual(restoredRequests, ["bypassPermissions"])
+
+        AcpConversation.removePersistedDraft(
+            for: draftKey,
+            currentDefaults: .standard,
+            migratedDefaults: nil
+        )
+        XCTAssertNil(AcpConversation.loadPersistedModeID(for: draftKey))
+    }
+
+    /// A remembered mode the adapter no longer declares is never sent: the
+    /// adapter's own current mode stands rather than a guessed restoration.
+    @MainActor
+    func testRememberedModeAbsentFromAdapterKeepsAdapterCurrentMode() async throws {
+        let draftKey = "permission-mode-gone-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(
+                for: draftKey,
+                currentDefaults: .standard,
+                migratedDefaults: nil
+            )
+        }
+        UserDefaults.standard.set(
+            "vanished-mode",
+            forKey: AcpConversation.persistedModeDefaultsKeys(for: draftKey).first!
+        )
+        let transport = PermissionModeConversationTransport()
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport),
+            draftKey: draftKey
+        )
+        await conversation.start()
+
+        XCTAssertEqual(conversation.currentModeID, "default")
+        let requests = await transport.modeRequests()
+        XCTAssertTrue(requests.isEmpty)
+    }
+
+    /// A switch the adapter refuses must not stick: the chip rolls back to the
+    /// confirmed mode and nothing is persisted, so the chip never claims "Ask"
+    /// while the adapter quietly stays on full access (or the reverse).
+    @MainActor
+    func testRejectedModeChangeRollsBackTheChipAndPersistsNothing() async throws {
+        let draftKey = "permission-mode-rejected-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(
+                for: draftKey,
+                currentDefaults: .standard,
+                migratedDefaults: nil
+            )
+        }
+        let transport = PermissionModeConversationTransport(
+            rejectedModeIDs: ["bypassPermissions"]
+        )
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport),
+            draftKey: draftKey
+        )
+        await conversation.start()
+        XCTAssertEqual(conversation.currentModeID, "default")
+
+        conversation.selectMode("bypassPermissions")
+
+        let deadline = ContinuousClock.now + .seconds(2)
+        while conversation.currentModeID != "default", ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(
+            conversation.currentModeID,
+            "default",
+            "a refused switch must roll the chip back to the adapter-confirmed mode"
+        )
+        XCTAssertNil(
+            AcpConversation.loadPersistedModeID(for: draftKey),
+            "a refused mode must never be remembered"
+        )
+    }
+
+    /// A remembered mode the adapter still declares but refuses to enter is
+    /// not replayed on every launch: the adapter's current mode stands and the
+    /// memory realigns to it.
+    @MainActor
+    func testRememberedModeTheAdapterRefusesFallsBackAndRealignsMemory() async throws {
+        let draftKey = "permission-mode-refused-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(
+                for: draftKey,
+                currentDefaults: .standard,
+                migratedDefaults: nil
+            )
+        }
+        UserDefaults.standard.set(
+            "bypassPermissions",
+            forKey: AcpConversation.persistedModeDefaultsKeys(for: draftKey).first!
+        )
+        let transport = PermissionModeConversationTransport(
+            rejectedModeIDs: ["bypassPermissions"]
+        )
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport),
+            draftKey: draftKey
+        )
+        await conversation.start()
+
+        XCTAssertEqual(
+            conversation.currentModeID,
+            "default",
+            "a refused restoration must keep the adapter's own current mode on screen"
+        )
+        let requests = await transport.modeRequests()
+        XCTAssertEqual(requests, ["bypassPermissions"], "the restoration is attempted exactly once")
+        XCTAssertEqual(
+            AcpConversation.loadPersistedModeID(for: draftKey),
+            "default",
+            "memory realigns to the adapter's mode so the refusal is not retried every launch"
+        )
+    }
+
     @MainActor
     func testRejectedEffortChangeKeepsTheAdapterConfirmedValueAndDraft() async throws {
         let transport = ReasoningEffortAcpTransport(rejectedValues: ["high"])
@@ -1325,6 +1486,105 @@ private actor BooleanConfigConversationTransport: AcpByteTransport {
 
     private func enqueue(_ value: JSONValue) {
         guard var data = try? JSONEncoder().encode(value) else { return }
+        data.append(0x0A)
+        if let waiter {
+            self.waiter = nil
+            waiter.resume(returning: data)
+        } else {
+            outbound.append(data)
+        }
+    }
+
+    private func trimmed(_ data: Data) -> Data {
+        data.last == 0x0A ? data.dropLast() : data
+    }
+}
+
+/// Declares two permission modes and records `session/set_mode` requests so
+/// per-chat mode persistence is proven across two conversation lifetimes.
+private actor PermissionModeConversationTransport: AcpByteTransport {
+    private var outbound: [Data] = []
+    private var waiter: CheckedContinuation<Data?, Never>?
+    private var requestedModeIDs: [String] = []
+    private let rejectedModeIDs: Set<String>
+
+    init(rejectedModeIDs: Set<String> = []) {
+        self.rejectedModeIDs = rejectedModeIDs
+    }
+
+    func start(
+        command: String,
+        arguments: [String],
+        environment: [String: String],
+        cwd: String
+    ) async throws {}
+
+    func send(_ data: Data) async throws {
+        guard let object = try? JSONDecoder().decode(JSONValue.self, from: trimmed(data)).objectValue else {
+            return
+        }
+        let id = object["id"]
+        switch object["method"]?.stringValue {
+        case "initialize":
+            reply(id: id, result: .object([
+                "protocolVersion": .integer(1),
+                "agentCapabilities": .object([:]),
+            ]))
+        case "session/new":
+            reply(id: id, result: .object([
+                "sessionId": .string("mode-session"),
+                "modes": .object([
+                    "availableModes": .array([
+                        .object(["id": .string("default"), "name": .string("Ask")]),
+                        .object(["id": .string("bypassPermissions"), "name": .string("Bypass Permissions")]),
+                    ]),
+                    "currentModeId": .string("default"),
+                ]),
+            ]))
+        case "session/set_mode":
+            let modeID = object["params"]?.objectValue?["modeId"]?.stringValue
+            if let modeID { requestedModeIDs.append(modeID) }
+            if let modeID, rejectedModeIDs.contains(modeID) {
+                replyError(id: id, message: "mode unavailable for this account")
+            } else {
+                reply(id: id, result: .null)
+            }
+        default:
+            if let id { reply(id: id, result: .null) }
+        }
+    }
+
+    func modeRequests() -> [String] { requestedModeIDs }
+
+    func receive(maximumBytes: Int) async throws -> Data? {
+        if !outbound.isEmpty { return outbound.removeFirst() }
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func terminate() async {
+        waiter?.resume(returning: nil)
+        waiter = nil
+    }
+
+    func exitCode() async -> Int32? { 0 }
+
+    private func reply(id: JSONValue?, result: JSONValue) {
+        guard let id else { return }
+        deliver(JSONValue.object([
+            "jsonrpc": .string("2.0"), "id": id, "result": result,
+        ]))
+    }
+
+    private func replyError(id: JSONValue?, message: String) {
+        guard let id else { return }
+        deliver(JSONValue.object([
+            "jsonrpc": .string("2.0"), "id": id,
+            "error": .object(["code": .integer(-32000), "message": .string(message)]),
+        ]))
+    }
+
+    private func deliver(_ payload: JSONValue) {
+        guard var data = try? JSONEncoder().encode(payload) else { return }
         data.append(0x0A)
         if let waiter {
             self.waiter = nil

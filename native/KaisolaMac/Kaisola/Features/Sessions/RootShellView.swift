@@ -2757,6 +2757,14 @@ struct RootShellView: View {
                SessionAccountBinding.declaredProvider(forAgentID: chat.agentID) != nil {
                 chatAccountMenu(chat)
             }
+            // The chat's whole session-control set — zoom, checkpoints,
+            // accounting, export — as one overflow in the pane's only bar.
+            // The chat surface itself draws no header strip anymore.
+            if let chat = model.chats.first(where: { $0.id == id }) {
+                AcpChatOverflowMenu(conversation: chat.conversation)
+                    .frame(width: 24, height: 22)
+                    .foregroundStyle(.kaisolaSecondary)
+            }
             Button { model.toggleMaximizeSurface(id) } label: {
                 Image(systemName: model.maximizedPaneID == id
                     ? "arrow.down.right.and.arrow.up.left"

@@ -67,7 +67,6 @@ struct AcpChatView: View {
         case embedded
     }
 
-    @State private var restoreTarget: AcpConversation.TurnCheckpoint?
     @ObservedObject var conversation: AcpConversation
     @ObservedObject private var accountAccess: ChatAccountAccess
     private let presentation: Presentation
@@ -138,7 +137,10 @@ struct AcpChatView: View {
         currentTurnToolIDs = spawns
     }
     @State private var transcriptConversationID: ObjectIdentifier?
-    @State private var isExportingTranscript = false
+    /// The one subagent being watched as a floating card, or nil. Watching a
+    /// second replaces the first: two live feeds racing each other over the
+    /// same corner answer no question a reader is actually asking.
+    @State private var subagentWatchTarget: AcpSubagentWatchTarget?
     @StateObject private var transcriptViewportAnchor = AcpTranscriptViewportAnchor()
     @ObservedObject private var previewSettings = NativePreviewSettings.shared
     @State private var densityAnchorGeneration: UInt64 = 0
@@ -189,12 +191,15 @@ struct AcpChatView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // Embedded chats draw no header of their own (2026-08-26): the
+            // containing pane's 32pt header is the one bar, and the session
+            // controls live in its overflow menu. The second strip this used
+            // to draw — zoom, checkpoints, usage fraction, export — was chrome
+            // over chrome.
             if presentation == .standard {
                 standardHeader
-            } else {
-                embeddedControls
+                Divider()
             }
-            Divider()
             if conversation.transcriptRetentionStatus.isTruncated {
                 transcriptRetentionNotice
                 Divider()
@@ -381,167 +386,10 @@ struct AcpChatView: View {
             // is the running-turn signal, and a second indicator in the
             // header would say the same fact twice.
             Spacer()
-            sessionControls
+            AcpChatOverflowMenu(conversation: conversation)
         }
         .padding(.horizontal, 16)
         .frame(height: 46)
-    }
-
-    /// The containing session card supplies title, connection, and activity.
-    /// Keeping this row a fixed, quiet height prevents asynchronously-arriving
-    /// model/config metadata from pushing the transcript during startup.
-    private var embeddedControls: some View {
-        HStack(spacing: 8) {
-            Spacer(minLength: 0)
-            sessionControls
-        }
-        .padding(.horizontal, 12)
-        .frame(height: 34)
-    }
-
-    /// What stays in the header now that the composer owns the agent controls.
-    ///
-    /// Model, permission mode, and adapter options moved onto the composer's
-    /// chip rail, where the reference apps put them and where they sit next to
-    /// the message they will govern. Duplicating them up here would have left
-    /// two controls for one setting; what remains is session *history* and
-    /// *accounting*, which belong to the whole conversation rather than the
-    /// next turn.
-    @ViewBuilder
-    private var sessionControls: some View {
-        Menu {
-            ForEach(AgentChatTextSize.allCases) { size in
-                Button {
-                    previewSettings.agentChatTextSize = size
-                } label: {
-                    if previewSettings.agentChatTextSize == size {
-                        Label(size.title, systemImage: "checkmark")
-                    } else {
-                        Text(size.title)
-                    }
-                }
-            }
-        } label: {
-            Image(systemName: "textformat.size")
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("Chat zoom: \(previewSettings.agentChatTextSize.title)")
-        .accessibilityLabel("Chat zoom")
-        .accessibilityValue(previewSettings.agentChatTextSize.title)
-
-        if !conversation.checkpoints.isEmpty {
-            Menu {
-                Text("Restore the working tree to before a turn:")
-                ForEach(conversation.checkpoints.reversed()) { checkpoint in
-                    let time = checkpoint.at.formatted(date: .omitted, time: .shortened)
-                    Button("Turn \(checkpoint.turn) — \(time)") {
-                        restoreTarget = checkpoint
-                    }
-                    .accessibilityLabel(CheckpointMenuAccessibility.choiceLabel(
-                        turn: checkpoint.turn,
-                        time: time
-                    ))
-                    .accessibilityHint(CheckpointMenuAccessibility.choiceHint)
-                }
-            } label: {
-                Image(systemName: "clock.arrow.circlepath")
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-            .accessibilityLabel(CheckpointMenuAccessibility.label)
-            .accessibilityValue(CheckpointMenuAccessibility.value(
-                checkpointCount: conversation.checkpoints.count
-            ))
-            .accessibilityHint(CheckpointMenuAccessibility.hint)
-            .accessibilityIdentifier(CheckpointMenuAccessibility.identifier)
-            .help("Pre-turn checkpoints (git snapshots)")
-            .confirmationDialog(
-                "Restore checkpoint?",
-                isPresented: Binding(get: { restoreTarget != nil }, set: { if !$0 { restoreTarget = nil } })
-            ) {
-                Button("Restore Files", role: .destructive) {
-                    if let restoreTarget { conversation.restoreCheckpoint(restoreTarget) }
-                    restoreTarget = nil
-                }
-                Button("Cancel", role: .cancel) { restoreTarget = nil }
-            } message: {
-                Text("Applies the snapshot taken before turn \(restoreTarget?.turn ?? 0) over the current working tree. Conflicts surface as git conflict markers.")
-            }
-        }
-        if let usage = conversation.usage {
-            Text("\(usage.used / 1000)k / \(usage.max / 1000)k")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.kaisolaSecondary)
-            if let amount = usage.costAmount,
-               let cost = UsageCenter.costLabel(amount: amount, currency: usage.costCurrency) {
-                Text(cost)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.kaisolaSecondary)
-                    .help("Cumulative cost reported by this agent session")
-                    .accessibilityLabel("Session cost \(cost)")
-            }
-        }
-        Menu {
-            Button("Copy Last Response") { copyLastResponse() }
-                .disabled(conversation.lastAssistantResponse == nil)
-            Button("Export/Open as Markdown…") { exportAndOpenMarkdown() }
-                .disabled(
-                    isExportingTranscript
-                        || (conversation.rows.isEmpty && conversation.hiddenEarlierCount == 0)
-                )
-        } label: {
-            if isExportingTranscript {
-                ProgressView().controlSize(.mini)
-            } else {
-                Image(systemName: "square.and.arrow.up")
-            }
-        }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .help("Copy or export this conversation")
-        .accessibilityLabel("Conversation export actions")
-        .accessibilityIdentifier("acp.transcriptExportMenu")
-    }
-
-    @MainActor
-    private func copyLastResponse() {
-        guard let response = conversation.lastAssistantResponse else { return }
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        guard pasteboard.setString(response, forType: .string) else {
-            ToastCenter.shared.show("Could not copy the last response.", style: .error)
-            return
-        }
-        ToastCenter.shared.show("Last response copied.", style: .success)
-    }
-
-    @MainActor
-    private func exportAndOpenMarkdown() {
-        let panel = NSSavePanel()
-        panel.title = "Export and Open Chat as Markdown"
-        panel.prompt = "Export & Open"
-        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
-        panel.nameFieldStringValue = AcpTranscriptMarkdownExport.suggestedFileName(
-            for: conversation.title
-        )
-        guard panel.runModal() == .OK, let destination = panel.url else { return }
-        isExportingTranscript = true
-        Task { @MainActor in
-            defer { isExportingTranscript = false }
-            do {
-                _ = try await conversation.exportTranscriptMarkdown(to: destination)
-                guard NSWorkspace.shared.open(destination) else {
-                    throw CocoaError(.fileNoSuchFile)
-                }
-            } catch {
-                ToastCenter.shared.show(
-                    "Could not export the chat as Markdown: \(error.localizedDescription)",
-                    style: .error
-                )
-            }
-        }
     }
 
     private var transcript: some View {
@@ -595,57 +443,7 @@ struct AcpChatView: View {
                         // the Codex app logs work, and only prose, thoughts,
                         // chips, and the live tail keep their own line.
                         ForEach(Array(displayItems.enumerated()), id: \.element.id) { index, item in
-                            Group {
-                                switch item {
-                                case let .row(row):
-                                    TranscriptRowView(
-                                        row: row,
-                                        workspaceURL: conversation.workspaceURL,
-                                        retry: { conversation.retryFailed($0) },
-                                        terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) },
-                                        showsResponseChrome: rowShowsResponseChrome(row),
-                                        conversationIsRunning: conversation.isRunning
-                                            && { if case let .tool(call) = row { return currentTurnToolIDs.contains(call.id) }; return true }()
-                                    )
-                                case let .workRun(_, calls):
-                                    WorkRunMarkerRow(
-                                        calls: calls,
-                                        expanded: expandedRunIDs.contains(item.id),
-                                        workspaceURL: conversation.workspaceURL,
-                                        terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) },
-                                        toggle: {
-                                            if expandedRunIDs.contains(item.id) {
-                                                expandedRunIDs.remove(item.id)
-                                            } else {
-                                                expandedRunIDs.insert(item.id)
-                                            }
-                                        }
-                                    )
-                                }
-                            }
-                            .id(item.id)
-                            .background {
-                                AcpTranscriptViewportMarker(
-                                    rowID: item.id,
-                                    anchor: transcriptViewportAnchor
-                                )
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            }
-                            .background {
-                                if let highlighted = highlightedDisplayItemID,
-                                   highlighted == item.id {
-                                    RoundedRectangle(cornerRadius: 8)
-                                        .fill(Color.accentColor.opacity(0.12))
-                                        .accessibilityHidden(true)
-                                }
-                            }
-                            // After the backgrounds, so the viewport marker
-                            // and search highlight hug the row rather than
-                            // annexing the turn gap above it.
-                            .padding(.top, AcpTranscriptMetrics.spacing(
-                                before: index == 0 ? nil : displayItems[index - 1].rhythmKind,
-                                after: item.rhythmKind
-                            ))
+                            transcriptDisplayItem(item, index: index)
                         }
                         if let status = conversation.liveThinkingStatus {
                             AcpThinkingStatusRow(
@@ -694,12 +492,25 @@ struct AcpChatView: View {
                 // anchor also governs size changes, which would drag a
                 // deliberately scrolled-up reader back to the tail and glue a
                 // short transcript to the composer.
-                .modifier(TranscriptBottomAnchorModifier())
+                .modifier(TranscriptBottomAnchorModifier(followsTail: transcriptFollowsTail))
+                .modifier(TranscriptTopEdgeModifier())
 
                 // Keyed to intent, not visibility: while follow is engaged the
                 // sentinel can flicker offscreen between pins during a fast
                 // stream, and a pill that blinks through every burst reads as
                 // "following is broken" — which it was.
+                // The watched subagent's floating card, pinned to the
+                // workspace's top-trailing corner over the stream it watches.
+                if let watchTarget = subagentWatchTarget {
+                    SubagentWatchCard(target: watchTarget) {
+                        withAnimation(.spring(duration: 0.25)) { subagentWatchTarget = nil }
+                    }
+                    .padding(.top, 10)
+                    .padding(.trailing, 14)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
+                }
+
                 if transcriptIsReady, !transcriptFollowsTail, !conversation.rows.isEmpty {
                     Button {
                         hasUnseenTranscriptUpdates = false
@@ -728,6 +539,7 @@ struct AcpChatView: View {
                 // expanded, so a remount never mounts thousands of rows.
                 conversation.collapseToTail()
                 expandedRunIDs.removeAll()
+                subagentWatchTarget = nil
                 transcriptSearch.refresh(rows: conversation.visibleRows)
                 transcriptIsReady = false
                 transcriptIsAtBottom = true
@@ -792,6 +604,73 @@ struct AcpChatView: View {
         }
         .id(ObjectIdentifier(conversation))
         .dynamicTypeSize(previewSettings.agentChatTextSize.dynamicTypeSize)
+    }
+
+    /// One display item of the stream, with its viewport marker, search
+    /// highlight, and rhythm spacing. Extracted from the transcript `ForEach`
+    /// body: the inline version pushed that expression past the
+    /// type-checker's budget.
+    @ViewBuilder
+    private func transcriptDisplayItem(_ item: AcpTranscriptDisplayItem, index: Int) -> some View {
+        Group {
+            switch item {
+            case let .row(row):
+                TranscriptRowView(
+                    row: row,
+                    workspaceURL: conversation.workspaceURL,
+                    retry: { conversation.retryFailed($0) },
+                    terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) },
+                    showsResponseChrome: rowShowsResponseChrome(row),
+                    onWatchSubagent: toggleSubagentWatch,
+                    conversationIsRunning: conversation.isRunning
+                        && { if case let .tool(call) = row { return currentTurnToolIDs.contains(call.id) }; return true }()
+                )
+            case let .workRun(_, calls):
+                WorkRunMarkerRow(
+                    calls: calls,
+                    expanded: expandedRunIDs.contains(item.id),
+                    workspaceURL: conversation.workspaceURL,
+                    terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) },
+                    toggle: {
+                        if expandedRunIDs.contains(item.id) {
+                            expandedRunIDs.remove(item.id)
+                        } else {
+                            expandedRunIDs.insert(item.id)
+                        }
+                    }
+                )
+            }
+        }
+        .id(item.id)
+        .background {
+            AcpTranscriptViewportMarker(
+                rowID: item.id,
+                anchor: transcriptViewportAnchor
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background {
+            if let highlighted = highlightedDisplayItemID,
+               highlighted == item.id {
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(Color.accentColor.opacity(0.12))
+                    .accessibilityHidden(true)
+            }
+        }
+        // After the backgrounds, so the viewport marker and search highlight
+        // hug the row rather than annexing the turn gap above it.
+        .padding(.top, AcpTranscriptMetrics.spacing(
+            before: index == 0 ? nil : displayItems[index - 1].rhythmKind,
+            after: item.rhythmKind
+        ))
+    }
+
+    /// Watch toggles: the same chip closes its own card, a different chip
+    /// replaces it.
+    private func toggleSubagentWatch(_ target: AcpSubagentWatchTarget) {
+        withAnimation(.spring(duration: 0.3)) {
+            subagentWatchTarget = subagentWatchTarget?.id == target.id ? nil : target
+        }
     }
 
     /// At most one pending pin at a time, fired a beat later, so a burst of
@@ -1573,6 +1452,10 @@ struct TranscriptRowView: View {
     /// plain prose; only the turn's final answer carries the response
     /// affordances (Copy response).
     var showsResponseChrome = true
+    /// Present in chat panes, where a watched subagent floats as a card over
+    /// the workspace; absent elsewhere (Mesh), where the chip keeps its
+    /// anchored popover.
+    var onWatchSubagent: ((AcpSubagentWatchTarget) -> Void)?
     /// Whether the conversation is still running. A backgrounded subagent's
     /// chip may only claim live work while the turn that spawned it is alive;
     /// after that the honest word is past tense.
@@ -1675,7 +1558,8 @@ struct TranscriptRowView: View {
                     call: call,
                     phase: phase,
                     workspaceURL: workspaceURL,
-                    turnIsLive: conversationIsRunning
+                    turnIsLive: conversationIsRunning,
+                    onWatch: onWatchSubagent
                 )
             case .compaction:
                 CompactionRow(status: call.status)
@@ -1780,12 +1664,41 @@ struct ToolCallAccessibility: Equatable {
 /// scoped form; the unscoped anchor below macOS 15 also re-anchors on size
 /// changes, which is tolerable there and correct nowhere else.
 private struct TranscriptBottomAnchorModifier: ViewModifier {
+    /// While the reader's intent is "follow the stream", the scroll view keeps
+    /// the tail pinned through every content-size change natively, instead of
+    /// chasing it with discrete `scrollTo` hops. The hops fired ~80ms apart,
+    /// and every frame between two of them could show the tail mid-flight —
+    /// rows sliced at the viewport edge, then yanked. The coalesced pin stays
+    /// as a correction pass; the anchor does the per-frame work. A reader who
+    /// scrolls up drops the size-change anchor entirely, so history holds
+    /// still while the stream grows below.
+    var followsTail: Bool
+
     func body(content: Content) -> some View {
         if #available(macOS 15.0, *) {
-            content.defaultScrollAnchor(.bottom, for: .initialOffset)
+            content
+                .defaultScrollAnchor(.bottom, for: .initialOffset)
+                .defaultScrollAnchor(followsTail ? .bottom : nil, for: .sizeChanges)
         } else {
             content.defaultScrollAnchor(.bottom)
         }
+    }
+}
+
+/// The transcript's top edge, under the pane header: on macOS 26 the system's
+/// soft scroll-edge treatment eases rows out instead of guillotining them at
+/// the clip line; earlier systems keep the plain edge.
+private struct TranscriptTopEdgeModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        #if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            content.scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            content
+        }
+        #else
+        content
+        #endif
     }
 }
 
@@ -1810,23 +1723,21 @@ struct WorkRunMarkerRow: View {
                         .foregroundStyle(.kaisolaTertiary)
                         .frame(width: 13)
                         .accessibilityHidden(true)
+                    // No failure suffix on the collapsed line (2026-08-26):
+                    // a red "2 failed" turned every benign non-zero exit — a
+                    // grep with no matches, a probe that said no — into an
+                    // alarm on the quiet summary. The call-by-call log behind
+                    // the click still marks each failed call in red.
                     Text(summary.label)
                         .font(.callout)
                         .foregroundStyle(.kaisolaSecondary)
-                    if let failure = summary.failureLabel {
-                        Text("· " + failure)
-                            .font(.callout)
-                            .foregroundStyle(.red)
-                    }
                     Spacer(minLength: 0)
                 }
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
             .accessibilityElement(children: .ignore)
-            .accessibilityLabel(
-                summary.failureLabel.map { "\(summary.label), \($0)" } ?? summary.label
-            )
+            .accessibilityLabel(summary.label)
             .accessibilityValue(expanded ? "expanded" : "collapsed")
             .accessibilityHint("Shows the call-by-call log")
             .accessibilityIdentifier("acp.workrun.\(calls.first?.id ?? "empty")")
@@ -1868,6 +1779,9 @@ struct SubagentChipRow: View {
     /// the stream never says whether it completed, and the chip must not
     /// pretend to know.
     var turnIsLive = true
+    /// When set, watching opens the floating workspace card; when nil the
+    /// chip falls back to its anchored popover.
+    var onWatch: ((AcpSubagentWatchTarget) -> Void)?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var expanded = false
     @State private var showsActivity = false
@@ -1893,8 +1807,12 @@ struct SubagentChipRow: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                if activityFileURL != nil, hasReport == false || phase == .backgrounded {
-                    showsActivity.toggle()
+                if let url = activityFileURL, hasReport == false || phase == .backgrounded {
+                    if let onWatch {
+                        onWatch(AcpSubagentWatchTarget(id: call.id, title: call.title, fileURL: url))
+                    } else {
+                        showsActivity.toggle()
+                    }
                 } else if hasReport {
                     expanded.toggle()
                 }
@@ -1987,8 +1905,18 @@ struct SubagentChipRow: View {
 /// The live window onto a detached subagent: the tail of its harness
 /// transcript, refreshed every two seconds while open, with a freshness line
 /// so "is it working" has an answer at a glance.
-private struct SubagentActivityView: View {
+/// One watched subagent: identity so a second watch replaces the first, the
+/// title for the card header, and the transcript file the feed tails.
+struct AcpSubagentWatchTarget: Equatable, Identifiable, Sendable {
+    let id: String
     let title: String
+    let fileURL: URL
+}
+
+/// The live tail of a subagent's transcript — freshness dot, recent actions,
+/// reveal-in-Finder — shared by the floating watch card and the popover
+/// fallback. Polls the file every two seconds while mounted.
+private struct SubagentActivityFeed: View {
     let fileURL: URL
     @State private var actions: [String] = []
     @State private var lastModified: Date?
@@ -1996,14 +1924,6 @@ private struct SubagentActivityView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 7) {
-                Image(systemName: "arrow.triangle.branch")
-                    .foregroundStyle(Color.accentColor)
-                Text(title)
-                    .font(.headline)
-                    .lineLimit(2)
-                Spacer(minLength: 0)
-            }
             freshnessLine
             Divider()
             if actions.isEmpty {
@@ -2033,16 +1953,12 @@ private struct SubagentActivityView: View {
             .buttonStyle(.borderless)
             .font(.caption)
         }
-        .padding(14)
-        .frame(width: 400, alignment: .leading)
-        .task {
+        .task(id: fileURL) {
             while !Task.isCancelled {
                 await refresh()
                 try? await Task.sleep(for: .seconds(2))
             }
         }
-        .accessibilityElement(children: .contain)
-        .accessibilityIdentifier("acp.subagent.activity")
     }
 
     @ViewBuilder
@@ -2087,6 +2003,123 @@ private struct SubagentActivityView: View {
         actions = result.0
         lastModified = result.1
         fileMissing = result.2
+    }
+}
+
+/// The anchored-popover presentation of a subagent's activity, kept for
+/// embedders without a workspace to float a card over (Mesh columns).
+private struct SubagentActivityView: View {
+    let title: String
+    let fileURL: URL
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "arrow.triangle.branch")
+                    .foregroundStyle(Color.accentColor)
+                Text(title)
+                    .font(.headline)
+                    .lineLimit(2)
+                Spacer(minLength: 0)
+            }
+            SubagentActivityFeed(fileURL: fileURL)
+        }
+        .padding(14)
+        .frame(width: 400, alignment: .leading)
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("acp.subagent.activity")
+    }
+}
+
+/// A watched subagent as a real surface: a floating glass card popped over
+/// the chat workspace, in the grammar Landmarks uses for its floating badge
+/// stack — a card over content, opened and dismissed in place. It replaces
+/// the anchored popover for chats, which vanished on any outside click and
+/// could never be *kept* open beside the stream it was watching.
+private struct SubagentWatchCard: View {
+    let target: AcpSubagentWatchTarget
+    let close: () -> Void
+
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: KaisolaVisualSystem.insetRadius, style: .continuous)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 7) {
+                Image(systemName: "arrow.triangle.branch")
+                    .foregroundStyle(Color.accentColor)
+                    .accessibilityHidden(true)
+                Text(target.title)
+                    .font(.headline)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 8)
+                Button(action: close) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 15))
+                        .foregroundStyle(.kaisolaTertiary)
+                }
+                .buttonStyle(.plain)
+                .help("Close the watch card")
+                .accessibilityLabel("Close subagent watch")
+            }
+            .padding(.horizontal, 14)
+            .padding(.top, 12)
+            .padding(.bottom, 9)
+            Divider()
+            // The feed scrolls inside the card, so a chatty subagent grows a
+            // scrollbar rather than a tower.
+            ScrollView {
+                SubagentActivityFeed(fileURL: target.fileURL)
+                    .padding(14)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 280)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(width: 420)
+        .modifier(SubagentWatchCardChrome(shape: shape, reduceTransparency: reduceTransparency))
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("acp.subagent.watchCard")
+    }
+}
+
+/// Liquid Glass on macOS 26, a material below, a clean solid under Reduce
+/// Transparency — the control-surface ladder at card size, with the floating
+/// card's own shadow.
+private struct SubagentWatchCardChrome: ViewModifier {
+    let shape: RoundedRectangle
+    let reduceTransparency: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        surfaced(content)
+            .overlay(shape.strokeBorder(Color.primary.opacity(0.10), lineWidth: KaisolaVisualSystem.hairline))
+            .shadow(
+                color: .black.opacity(0.18),
+                radius: ChromeCardElevation.shadowRadius,
+                y: ChromeCardElevation.shadowOffsetY
+            )
+    }
+
+    @ViewBuilder
+    private func surfaced(_ content: Content) -> some View {
+        if reduceTransparency {
+            content.background(Color(nsColor: .controlBackgroundColor), in: shape)
+        } else {
+            #if compiler(>=6.2)
+            if #available(macOS 26.0, *) {
+                content.glassEffect(.regular, in: shape)
+            } else {
+                content.background(.regularMaterial, in: shape)
+            }
+            #else
+            content.background(.regularMaterial, in: shape)
+            #endif
+        }
     }
 }
 
@@ -3111,5 +3144,139 @@ private extension NSImage {
     func pngRepresentation() -> Data? {
         guard let tiff = tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return nil }
         return rep.representation(using: .png, properties: [:])
+    }
+}
+
+/// The conversation's one overflow: zoom, checkpoints, accounting, export —
+/// everything the retired second header strip used to spread across four
+/// controls, behind a single quiet ellipsis (2026-08-26 minimalist pass).
+///
+/// Embedded chats render this inside the containing pane's 32pt header, so a
+/// chat surface has exactly one bar; the standalone presentation keeps it at
+/// the trailing end of its own single header. Context is reported as tokens
+/// used, deliberately without the "/ 1,000k" denominator: the limit read as a
+/// wall you were about to hit, and the number that matters is what the session
+/// has actually spent.
+struct AcpChatOverflowMenu: View {
+    @ObservedObject var conversation: AcpConversation
+    @ObservedObject private var previewSettings = NativePreviewSettings.shared
+
+    @State private var restoreTarget: AcpConversation.TurnCheckpoint?
+    @State private var isExportingTranscript = false
+
+    var body: some View {
+        Menu {
+            Menu("Chat Zoom") {
+                ForEach(AgentChatTextSize.allCases) { size in
+                    Button {
+                        previewSettings.agentChatTextSize = size
+                    } label: {
+                        if previewSettings.agentChatTextSize == size {
+                            Label(size.title, systemImage: "checkmark")
+                        } else {
+                            Text(size.title)
+                        }
+                    }
+                }
+            }
+            if !conversation.checkpoints.isEmpty {
+                Menu("Restore Checkpoint") {
+                    Text("Restore the working tree to before a turn:")
+                    ForEach(conversation.checkpoints.reversed()) { checkpoint in
+                        let time = checkpoint.at.formatted(date: .omitted, time: .shortened)
+                        Button("Turn \(checkpoint.turn) — \(time)") {
+                            restoreTarget = checkpoint
+                        }
+                        .accessibilityLabel(CheckpointMenuAccessibility.choiceLabel(
+                            turn: checkpoint.turn,
+                            time: time
+                        ))
+                        .accessibilityHint(CheckpointMenuAccessibility.choiceHint)
+                    }
+                }
+                .accessibilityIdentifier(CheckpointMenuAccessibility.identifier)
+            }
+            Divider()
+            Button("Copy Last Response") { copyLastResponse() }
+                .disabled(conversation.lastAssistantResponse == nil)
+            Button("Export/Open as Markdown…") { exportAndOpenMarkdown() }
+                .disabled(
+                    isExportingTranscript
+                        || (conversation.rows.isEmpty && conversation.hiddenEarlierCount == 0)
+                )
+            if let usage = conversation.usage {
+                Divider()
+                // Non-interactive accounting rows: what the session has spent,
+                // available on demand instead of ambient in a bar.
+                Text("Context used: \(usage.used / 1000)k")
+                if let amount = usage.costAmount,
+                   let cost = UsageCenter.costLabel(amount: amount, currency: usage.costCurrency) {
+                    Text("Session cost: \(cost)")
+                }
+            }
+        } label: {
+            if isExportingTranscript {
+                ProgressView().controlSize(.mini)
+            } else {
+                Image(systemName: "ellipsis.circle")
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Chat options")
+        .accessibilityLabel("Chat options")
+        .accessibilityIdentifier("acp.chatOverflowMenu")
+        .confirmationDialog(
+            "Restore checkpoint?",
+            isPresented: Binding(get: { restoreTarget != nil }, set: { if !$0 { restoreTarget = nil } })
+        ) {
+            Button("Restore Files", role: .destructive) {
+                if let restoreTarget { conversation.restoreCheckpoint(restoreTarget) }
+                restoreTarget = nil
+            }
+            Button("Cancel", role: .cancel) { restoreTarget = nil }
+        } message: {
+            Text("Applies the snapshot taken before turn \(restoreTarget?.turn ?? 0) over the current working tree. Conflicts surface as git conflict markers.")
+        }
+    }
+
+    @MainActor
+    private func copyLastResponse() {
+        guard let response = conversation.lastAssistantResponse else { return }
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        guard pasteboard.setString(response, forType: .string) else {
+            ToastCenter.shared.show("Could not copy the last response.", style: .error)
+            return
+        }
+        ToastCenter.shared.show("Last response copied.", style: .success)
+    }
+
+    @MainActor
+    private func exportAndOpenMarkdown() {
+        let panel = NSSavePanel()
+        panel.title = "Export and Open Chat as Markdown"
+        panel.prompt = "Export & Open"
+        panel.allowedContentTypes = [UTType(filenameExtension: "md") ?? .plainText]
+        panel.nameFieldStringValue = AcpTranscriptMarkdownExport.suggestedFileName(
+            for: conversation.title
+        )
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        isExportingTranscript = true
+        Task { @MainActor in
+            defer { isExportingTranscript = false }
+            do {
+                _ = try await conversation.exportTranscriptMarkdown(to: destination)
+                guard NSWorkspace.shared.open(destination) else {
+                    throw CocoaError(.fileNoSuchFile)
+                }
+            } catch {
+                ToastCenter.shared.show(
+                    "Could not export the chat as Markdown: \(error.localizedDescription)",
+                    style: .error
+                )
+            }
+        }
     }
 }

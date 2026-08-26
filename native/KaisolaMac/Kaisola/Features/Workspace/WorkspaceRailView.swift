@@ -141,6 +141,28 @@ private struct WorkspaceFileTreeAccessibilityModifier: ViewModifier {
 
 /// The workspace rail: a lazy file tree for the active project (⌘B). Clicking a
 /// file opens it in the preview pane.
+/// The Files rail's row grammar, shared with the sidebar it faces.
+///
+/// The two rails frame the workspace as one pane of glass each, but their rows
+/// used to select in two dialects — the sidebar's designed accent pill against
+/// an ad-hoc flat wash here: two corner radii, and one appearance-blind opacity
+/// that all but vanished on the dark rail. The 2026-08-26 panel review against
+/// the Safari sidebar and Apple's Landmarks sample made it one grammar: the
+/// rail borrows the sidebar's own pill constants, so a selected file and a
+/// selected chat are the same statement on opposite edges of the window.
+enum WorkspaceRailRowGrammar {
+    /// The sidebar's pill radius, verbatim.
+    static var selectionCornerRadius: CGFloat { QuietSelectionPill.cornerRadius }
+    /// The sidebar's appearance-aware selection coverage, verbatim.
+    static func selectionFillOpacity(dark: Bool) -> Double {
+        QuietSelectionPill.fillOpacity(dark: dark)
+    }
+    /// Safari-spaced rows: 4.5pt of air packs a tree row to ≈25pt, between the
+    /// sidebar's 26pt session rows and the old 21pt cram — and keeps the shared
+    /// pill radius under the documented lozenge ratio on the rail's own rows.
+    static let rowVerticalPadding: CGFloat = 4.5
+}
+
 struct WorkspaceRailView: View {
     private enum CreationKind: String, Sendable {
         case file = "File"
@@ -154,6 +176,7 @@ struct WorkspaceRailView: View {
     }
 
     @EnvironmentObject private var settings: NativePreviewSettings
+    @Environment(\.colorScheme) private var colorScheme
     let root: URL
     let selectedFile: URL?
     let openFile: (URL, Bool) -> Void
@@ -259,18 +282,25 @@ struct WorkspaceRailView: View {
                                 HStack(spacing: 7) {
                                     Image(systemName: "doc.text")
                                         .font(.caption)
-                                        .foregroundStyle(.kaisolaSecondary)
-                                    FadingFileName(text: path)
+                                        .foregroundStyle(
+                                            isSelected(node) ? QuietSelectionPill.ink : Color.kaisolaSecondary
+                                        )
+                                    fileName(path, selected: isSelected(node))
                                     Spacer(minLength: 0)
                                 }
                                 .padding(.horizontal, 10)
-                                .padding(.vertical, 4)
+                                .padding(.vertical, WorkspaceRailRowGrammar.rowVerticalPadding)
                                 .padding(.trailing, Self.optionsClearance - 10)
                                 .background(
                                     isSelected(node)
-                                        ? Color.accentColor.opacity(0.15)
+                                        ? Color.accentColor.opacity(
+                                            WorkspaceRailRowGrammar.selectionFillOpacity(dark: colorScheme == .dark)
+                                        )
                                         : .clear,
-                                    in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                    in: RoundedRectangle(
+                                        cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius,
+                                        style: .continuous
+                                    )
                                 )
                                 .contentShape(Rectangle())
                             }
@@ -968,11 +998,15 @@ struct WorkspaceRailView: View {
                 }
                 Image(systemName: node.isDirectory ? "folder" : "doc.text")
                     .font(.caption)
-                    .foregroundStyle(node.isDirectory ? Color.accentColor : .kaisolaSecondary)
-                fileName(node.name)
+                    .foregroundStyle(
+                        rowIsHighlighted(node)
+                            ? QuietSelectionPill.ink
+                            : (node.isDirectory ? Color.accentColor : .kaisolaSecondary)
+                    )
+                fileName(node.name, selected: rowIsHighlighted(node))
                 Spacer(minLength: 0)
             }
-            .padding(.vertical, 2.5)
+            .padding(.vertical, WorkspaceRailRowGrammar.rowVerticalPadding)
             .padding(.leading, CGFloat(depth) * 14 + 10)
             // The options button is a trailing *overlay*, so it floats over
             // whatever the row draws. Without this the name ran under it and
@@ -982,9 +1016,14 @@ struct WorkspaceRailView: View {
             .padding(.trailing, Self.optionsClearance)
             .background(
                 rowIsHighlighted(node)
-                    ? Color.accentColor.opacity(0.15)
+                    ? Color.accentColor.opacity(
+                        WorkspaceRailRowGrammar.selectionFillOpacity(dark: colorScheme == .dark)
+                    )
                     : .clear,
-                in: RoundedRectangle(cornerRadius: 6, style: .continuous)
+                in: RoundedRectangle(
+                    cornerRadius: WorkspaceRailRowGrammar.selectionCornerRadius,
+                    style: .continuous
+                )
             )
             .contentShape(Rectangle())
         }
@@ -1064,8 +1103,12 @@ struct WorkspaceRailView: View {
         return selectedFile?.standardizedFileURL.path == node.url.standardizedFileURL.path
     }
 
-    private func fileName(_ name: String) -> some View {
-        FadingFileName(text: name)
+    /// A selected name speaks in the sidebar's voice: the accent-derived pill
+    /// ink at semibold, exactly what a selected chat's title does across the
+    /// window. Resting rows keep plain primary.
+    private func fileName(_ name: String, selected: Bool = false) -> some View {
+        FadingFileName(text: name, font: selected ? .callout.weight(.semibold) : .callout)
+            .foregroundStyle(selected ? QuietSelectionPill.ink : Color.primary)
     }
 
     /// `revealed` drives opacity only. Dropping the menu from the hierarchy
@@ -1648,6 +1691,8 @@ private struct WorkspaceMoveSheet: View {
 /// whose tail happens to sit near the edge is not dimmed for no reason.
 struct FadingFileName: View {
     let text: String
+    /// The row's voice; the selected row hands in a heavier one.
+    var font: Font = .callout
     /// How far the name's last characters take to fade out.
     var fadeWidth: CGFloat = 18
 
@@ -1658,13 +1703,13 @@ struct FadingFileName: View {
 
     var body: some View {
         Text(text)
-            .font(.callout)
+            .font(font)
             .lineLimit(1)
             .hidden()
             .frame(maxWidth: .infinity, alignment: .leading)
             .overlay(alignment: .leading) {
                 Text(text)
-                    .font(.callout)
+                    .font(font)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
                     .onGeometryChange(for: CGFloat.self) { proxy in

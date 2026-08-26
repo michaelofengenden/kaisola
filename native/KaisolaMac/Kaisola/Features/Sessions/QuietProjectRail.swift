@@ -1571,7 +1571,14 @@ enum QuietSelectionPill {
     /// One step tighter than the app's inset radius: the pill is nested inside
     /// the sidebar's own chrome corner, so it sits one rung down the ladder, and
     /// a 12pt radius on a 32pt row reads as a lozenge rather than a row.
-    static var cornerRadius: CGFloat { KaisolaVisualSystem.controlRadius }
+    ///
+    /// A literal, deliberately no longer `KaisolaVisualSystem.controlRadius`:
+    /// the 0.1.134 "rounder at every edge" pass stepped the ladder up
+    /// (controls 9 → 10) while the session lane kept its 26pt height, and a
+    /// pill that follows the chrome ladder crossed the documented 0.375
+    /// lozenge ratio on the very row it marks. The ladder governs nested
+    /// chrome; a row pill's radius answers to its own row height.
+    static let cornerRadius: CGFloat = 9
     /// Inset from the row's own edges, so the pill floats inside the column
     /// rather than reaching the sidebar's border.
     static let horizontalInset: CGFloat = 6

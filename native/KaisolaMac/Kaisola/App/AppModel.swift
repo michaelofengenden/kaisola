@@ -2863,6 +2863,7 @@ final class AppModel: ObservableObject {
         )
         let defaultsKeys = AcpConversation.persistedDraftDefaultsKeys(for: chatID)
             + AcpConversation.persistedBooleanConfigDefaultsKeys(for: chatID)
+            + AcpConversation.persistedModeDefaultsKeys(for: chatID)
         return await transcriptStore.completeExternalCleanup(
             tombstone,
             performExternalCleanup: {

@@ -1053,12 +1053,13 @@ final class QuietIdentityMarkTests: XCTestCase {
             "the narrower rail handed the title back to the indent"
         )
 
-        // …and the resting width sits at v0.1.125's 290, by request — the
-        // width Michael pins the Files rail to. The density era's "under
-        // every width since v1.1.5" pin is retired with the density default
-        // itself; what this release still owes is that the wide rail stays
-        // inside its own bounds and the title lane it buys is real.
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 290)
+        // …and the resting width sits at 245 as of 2026-08-26, by request —
+        // the double-click reset lands "1-2cm less wide" than v0.1.125's
+        // 290. The density era's "under every width since v1.1.5" pin is
+        // retired with the density default itself; what this release still
+        // owes is that the rail stays inside its own bounds and the title
+        // lane it buys is real.
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 245)
     }
 
     // MARK: - Header "+" containment

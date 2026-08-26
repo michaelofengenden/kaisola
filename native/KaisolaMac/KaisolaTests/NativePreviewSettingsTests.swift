@@ -70,6 +70,39 @@ final class NativePreviewSettingsTests: XCTestCase {
         )
     }
 
+    /// Cmd+Plus / Cmd+Minus walk the chat zoom ladder one rung at a time and
+    /// stop at the ends; Cmd+0 returns to standard. The rungs must be far
+    /// enough apart on macOS to be visible — `.large` is the system default,
+    /// so a ladder clustered around it is a zoom control that does nothing.
+    func testAgentChatZoomStepsClampAndReset() {
+        let defaults = makeDefaults()
+        let settings = NativePreviewSettings(defaults: defaults)
+        XCTAssertEqual(settings.agentChatTextSize, .standard)
+        XCTAssertEqual(AgentChatTextSize.standard.dynamicTypeSize, .large)
+
+        settings.stepAgentChatTextSize(by: 1)
+        XCTAssertEqual(settings.agentChatTextSize, .large)
+        settings.stepAgentChatTextSize(by: 1)
+        XCTAssertEqual(settings.agentChatTextSize, .extraLarge)
+        settings.stepAgentChatTextSize(by: 1)
+        XCTAssertEqual(settings.agentChatTextSize, .extraLarge, "the top rung clamps")
+
+        settings.resetAgentChatTextSize()
+        XCTAssertEqual(settings.agentChatTextSize, .standard)
+
+        settings.stepAgentChatTextSize(by: -1)
+        XCTAssertEqual(settings.agentChatTextSize, .compact)
+        settings.stepAgentChatTextSize(by: -1)
+        XCTAssertEqual(settings.agentChatTextSize, .compact, "the bottom rung clamps")
+
+        let rungs = AgentChatTextSize.allCases.map(\.dynamicTypeSize)
+        XCTAssertEqual(rungs, rungs.sorted(), "the ladder ascends")
+        XCTAssertTrue(
+            AgentChatTextSize.extraLarge.dynamicTypeSize.isAccessibilitySize,
+            "the top rung is a real magnification, not a point of body text"
+        )
+    }
+
     func testExternalEditorSelectionRejectsNonApplicationsWithoutChangingTheDraft() throws {
         let defaults = makeDefaults()
         let settings = NativePreviewSettings(defaults: defaults)
@@ -604,7 +637,7 @@ final class NativePreviewSettingsTests: XCTestCase {
         defaults.set("enormous", forKey: "agentChatTextSize")
 
         XCTAssertEqual(NativePreviewSettings(defaults: defaults).agentChatTextSize, .standard)
-        XCTAssertEqual(AgentChatTextSize.allCases.map(\.title), ["85%", "100%", "115%", "130%"])
+        XCTAssertEqual(AgentChatTextSize.allCases.map(\.title), ["85%", "100%", "130%", "170%"])
     }
 
     func testProviderRoutingPersistsWithoutTouchingProviderDefaults() {
@@ -4288,18 +4321,17 @@ final class NativePreviewSettingsTests: XCTestCase {
         defer { defaults.removePersistentDomain(forName: suite) }
 
         let fresh = NativePreviewSettings(defaults: defaults)
-        // The shipped recipe is soft / muted / balanced, and it is a PRESET
+        // The shipped recipe is soft / muted / clear, and it is a PRESET
         // rather than three preferences: Settings offers Glass or Solid and
         // nothing else, so there is no picker left for these to disagree with.
         //
-        // Clarity is `balanced`, NOT the `frosted` that was asked for, and that
-        // is deliberate. Frosted multiplies every veil coverage by 1.16, which
-        // makes the surface *less* see-through — it shipped once and came straight
-        // back as "glass mode is not really glassy at all". Darkness is bought
-        // from the luminance target instead, where it costs no transmission.
+        // Clarity went balanced → clear on 2026-08-26, the third round of
+        // "extremely more translucent": Clear is the tier built for exactly
+        // that request, and `resolved(for:)` still hands anyone with Increase
+        // Contrast or Reduce Transparency the Balanced floors.
         XCTAssertEqual(fresh.glassTexture, .soft)
         XCTAssertEqual(fresh.glassColour, .muted)
-        XCTAssertEqual(fresh.glassClarity, .balanced)
+        XCTAssertEqual(fresh.glassClarity, .clear)
         XCTAssertEqual(fresh.glassTexture, GlassPreset.texture)
         XCTAssertEqual(fresh.glassColour, GlassPreset.colour)
         XCTAssertEqual(fresh.glassClarity, GlassPreset.clarity)
@@ -4319,11 +4351,11 @@ final class NativePreviewSettingsTests: XCTestCase {
         // resurrect a recipe the user can no longer see or change.
         defaults.set(GlassTexture.crisp.rawValue, forKey: "glassTexture")
         defaults.set(GlassColour.vivid.rawValue, forKey: "glassColour")
-        defaults.set(GlassClarity.clear.rawValue, forKey: "glassClarity")
+        defaults.set(GlassClarity.balanced.rawValue, forKey: "glassClarity")
         let reopened = NativePreviewSettings(defaults: defaults)
         XCTAssertEqual(reopened.glassTexture, .soft)
         XCTAssertEqual(reopened.glassColour, .muted)
-        XCTAssertEqual(reopened.glassClarity, .balanced)
+        XCTAssertEqual(reopened.glassClarity, .clear)
 
         // They remain settable in-process, which is what the sweep tests need.
         fresh.glassTexture = .crisp
@@ -5885,24 +5917,31 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertFalse(
             InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 214, didForce: false)
         )
-        // 248 is a previously-forced ideal now too (the v0.1.124 resting
-        // width), so v2-forced windows move once to the v0.1.125 width.
+        // 248 and 290 are previously-forced ideals now (the v0.1.124 and
+        // v0.1.125 resting widths), so windows the app parked there move once
+        // to the current 245.
         XCTAssertTrue(
             InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 248, didForce: false)
         )
         XCTAssertFalse(
             InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 248, didForce: true)
         )
+        XCTAssertTrue(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 290, didForce: false)
+        )
+        XCTAssertFalse(
+            InitialSidebarWidth.shouldForceInitialWidth(currentWidth: 290, didForce: true)
+        )
 
         // The new key generation is what re-arms previously-forced windows;
         // it must actually be new.
         XCTAssertTrue(
-            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v3.")
+            InitialSidebarWidth.defaultsKey(restorationID: "main").contains(".v4.")
         )
 
         // Never against a restored or user-chosen width — including the ideal
         // itself, so a second window does not re-run the override.
-        for width in [168.0, 240.0, 290.0, 300.0, 340.0] {
+        for width in [168.0, 240.0, 245.0, 300.0, 340.0] {
             XCTAssertFalse(
                 InitialSidebarWidth.shouldForceInitialWidth(
                     currentWidth: width,
@@ -5960,7 +5999,7 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// The width the override applies is the one the rest of the chrome is
     /// designed around, not a second literal that can drift away from it.
     func testSidebarOverrideTargetsTheIdealWidthTheChromeIsSizedFor() {
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 290)
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 245)
         XCTAssertGreaterThan(
             NativeWorkspaceChrome.projectSidebarIdealWidth,
             InitialSidebarWidth.systemDefault + InitialSidebarWidth.tolerance,
@@ -6476,9 +6515,10 @@ final class NativePreviewSettingsTests: XCTestCase {
     /// `QuietIdentityMarkTests` rather than left as comments here.
     func testProjectSidebarHasComfortableResizableWidth() {
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMinimumWidth, 168)
-        // 210 → 248 in v0.1.124, 248 → 290 in v0.1.125: the resting rail
-        // matches the width Michael pins the Files rail to, by request.
-        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 290)
+        // 210 → 248 in v0.1.124, 248 → 290 in v0.1.125, 290 → 245 on
+        // 2026-08-26: the double-click reset should land "1-2cm less wide",
+        // by request.
+        XCTAssertEqual(NativeWorkspaceChrome.projectSidebarIdealWidth, 245)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarMaximumWidth, 340)
         XCTAssertEqual(NativeWorkspaceChrome.projectSidebarDividerWidth, 1)
         // Still comfortably inside its own bounds after two narrowings.

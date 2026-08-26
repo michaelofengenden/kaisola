@@ -27,9 +27,13 @@ enum KaisolaVisualSystem {
     static let controlRadius: CGFloat = 10
     /// A session pane card, which sits *inside* the detail chrome panel. Was a
     /// bare `8` written inline in `RootShellView.unifiedSessionCard`; naming it
-    /// is what puts it on the ladder at all.
-    static let paneRadius: CGFloat = 12
-    static let insetRadius: CGFloat = 14
+    /// is what puts it on the ladder at all. 12 → 14 on 2026-08-26 ("the edges
+    /// of kaisola need to be more rounded to reflect apple-style apps") — the
+    /// grid panes and the composer are the surfaces in view all day, so the
+    /// one rounding move of that pass lands here; `insetRadius` steps to 15 to
+    /// keep the ladder strict.
+    static let paneRadius: CGFloat = 14
+    static let insetRadius: CGFloat = 15
     static let cardRadius: CGFloat = 18
     /// The document-preview and Files panels, which are nested one level inside
     /// the detail chrome panel and so stay a step under `chromeRadius`.
@@ -1359,6 +1363,25 @@ struct GlassBackdropWash: Equatable, Sendable {
     }
 }
 
+/// See `kaisolaBarSurface()`. The white coverages: 0.55 in light keeps the
+/// bar unmistakably white-led over the glass canvas while the desktop still
+/// moves through it; 0.055 in dark is a lift toward white — "clear" with just
+/// enough definition to separate the band from the content below it.
+private struct KaisolaBarSurfaceModifier: ViewModifier {
+    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
+    @Environment(\.colorScheme) private var colorScheme
+
+    func body(content: Content) -> some View {
+        content.background {
+            if reduceTransparency {
+                Color(nsColor: .controlBackgroundColor)
+            } else {
+                Color.white.opacity(colorScheme == .dark ? 0.055 : 0.55)
+            }
+        }
+    }
+}
+
 private struct KaisolaControlSurfaceModifier: ViewModifier {
     let active: Bool
     let tint: Color?
@@ -1422,6 +1445,18 @@ extension View {
         modifier(KaisolaControlSurfaceModifier(active: active, tint: tint, interactive: interactive))
     }
 
+    /// The one voice for horizontal bars — pane headers, find bars, panel
+    /// strips. White-led in light, a faint white lift in dark, solid under
+    /// Reduce Transparency. Before this token the bars spoke five dialects
+    /// (`controlBackgroundColor` at two opacities, three different materials),
+    /// and every material one read as the grey wash Michael keeps flagging:
+    /// "the color of the translucent bars needs to be white or clear"
+    /// (2026-08-26). A bar is a region, not a control, so unlike
+    /// `kaisolaControlSurface` it takes no shape, no stroke, and no glass.
+    func kaisolaBarSurface() -> some View {
+        modifier(KaisolaBarSurfaceModifier())
+    }
+
     /// Safari's inset floating-card chrome. The window backdrop stays visible
     /// in a gutter around the panel; the content rides a rounded material with
     /// a hairline top-light edge. Reduce Transparency yields a clean solid.
@@ -1475,9 +1510,16 @@ private struct KaisolaChromePanelModifier: ViewModifier {
     /// then masked out of its own interior. It composites once and the render
     /// server caches it — no per-frame work and no offscreen pass over the
     /// live material the `.glass` fill sits on. The spill into the 6pt gutter
-    /// is the depth cue, not a bug; it must never be clipped away, never
-    /// animated, and never allowed to eat clicks aimed at the divider
-    /// corridors that share that gutter.
+    /// is the depth cue; it must never be animated, and never allowed to eat
+    /// clicks aimed at the divider corridors that share that gutter.
+    ///
+    /// The mask's rectangle is padded OUT past the card's own frame by the
+    /// shadow's full reach. A frame-bound `Rectangle()` here erased the
+    /// outward spill entirely and kept only the bounding-box corner notches —
+    /// four blurred wedges ending at hard 90° edges, which read as small grey
+    /// squares tucked behind every rounded corner (Michael's 2026-08-26
+    /// screenshot). The negative padding is what lets the shadow fade
+    /// continuously into the gutter the way the doc always claimed it did.
     @ViewBuilder
     private func cardShadow(_ shape: RoundedRectangle) -> some View {
         if ChromeCardElevation.engages(
@@ -1497,6 +1539,10 @@ private struct KaisolaChromePanelModifier: ViewModifier {
                 .compositingGroup()
                 .mask {
                     Rectangle()
+                        .padding(-(
+                            ChromeCardElevation.shadowRadius * 2
+                                + ChromeCardElevation.shadowOffsetY
+                        ))
                         .overlay { shape.fill(Color.black).blendMode(.destinationOut) }
                         .compositingGroup()
                 }

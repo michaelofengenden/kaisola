@@ -56,17 +56,20 @@ enum AgentChatTextSize: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .compact: "85%"
         case .standard: "100%"
-        case .large: "115%"
-        case .extraLarge: "130%"
+        case .large: "130%"
+        case .extraLarge: "170%"
         }
     }
 
+    /// `.large` IS the macOS default; the old ladder (.small … .xLarge) spanned
+    /// roughly ±1pt around body text and read as "zoom doesn't work". The
+    /// rungs now sit far enough apart to be worth a keyboard shortcut.
     var dynamicTypeSize: DynamicTypeSize {
         switch self {
         case .compact: .small
-        case .standard: .medium
-        case .large: .large
-        case .extraLarge: .xLarge
+        case .standard: .large
+        case .large: .xxxLarge
+        case .extraLarge: .accessibility2
         }
     }
 }
@@ -235,7 +238,12 @@ enum GlassPreset {
     static let source: GlassBackdropSource = .behindWindow
     static let texture: GlassTexture = .soft
     static let colour: GlassColour = .muted
-    static let clarity: GlassClarity = .balanced
+    /// Balanced → clear (2026-08-26): the third round of "the glass needs to
+    /// be much more translucent, extremely more". Clear is the tier built for
+    /// exactly that request — transmission 0.92 — and `resolved(for:)` still
+    /// returns Balanced for anyone whose system settings ask for contrast or
+    /// reduced transparency.
+    static let clarity: GlassClarity = .clear
 }
 
 /// How far past legibility the wallpaper under the glass is blurred, as the
@@ -1438,6 +1446,19 @@ final class NativePreviewSettings: ObservableObject {
 
     func resetTerminalFont() {
         terminalFontSize = Self.terminalFontDefault
+    }
+
+    /// Step the agent-chat zoom one rung along its ladder, clamped at the
+    /// ends. Cmd+Plus / Cmd+Minus land here when the focused pane is a chat.
+    func stepAgentChatTextSize(by delta: Int) {
+        let ladder = AgentChatTextSize.allCases
+        guard let index = ladder.firstIndex(of: agentChatTextSize) else { return }
+        let next = min(max(index + delta, 0), ladder.count - 1)
+        agentChatTextSize = ladder[next]
+    }
+
+    func resetAgentChatTextSize() {
+        agentChatTextSize = .standard
     }
 
     /// Restore the stable, public-facing aspects of Terminal.app's Basic

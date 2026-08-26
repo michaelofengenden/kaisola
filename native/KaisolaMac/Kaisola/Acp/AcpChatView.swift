@@ -234,7 +234,7 @@ struct AcpChatView: View {
         // asking the user to find the one strip that accepts it is precision a
         // drag should never demand. `handleDrop` is unchanged, so
         // `AcpAttachmentClassifier` still decides what is attachable.
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted, perform: handleDrop)
+        .onDrop(of: [.fileURL, .image], isTargeted: $isDropTargeted, perform: handleDrop)
         .overlay {
             if isDropTargeted {
                 // `paneRadius`, not `panelRadius`: the ring sits just inside
@@ -390,6 +390,10 @@ struct AcpChatView: View {
         }
         .padding(.horizontal, 16)
         .frame(height: 46)
+        // Parity with the embedded pane header: the standalone window's one
+        // bar speaks the same white-led surface instead of inheriting
+        // whatever sits behind it.
+        .kaisolaBarSurface()
     }
 
     private var transcript: some View {
@@ -761,7 +765,7 @@ struct AcpChatView: View {
         .controlSize(.small)
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+        .kaisolaBarSurface()
         .onExitCommand { dismissTranscriptSearch() }
         .onChange(of: transcriptSearchFocused) { _, isFocused in
             if isFocused { onKeyboardFocus?() }
@@ -1247,11 +1251,30 @@ struct AcpChatView: View {
     /// Stage files dropped onto the composer.
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         var handled = false
-        for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-            handled = true
-            _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { [conversation] data, _ in
-                guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                Task { @MainActor in conversation.prepareAttachment(fileURL: url) }
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                handled = true
+                _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { [conversation] data, _ in
+                    guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                    Task { @MainActor in conversation.prepareAttachment(fileURL: url) }
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                // The macOS screenshot thumbnail — the drag most worth
+                // catching — offers image data behind a file promise, never a
+                // plain file URL, so the fileURL-only net dropped exactly the
+                // drag people make right after taking a screenshot.
+                handled = true
+                let typeID = provider.registeredTypeIdentifiers.first {
+                    UTType($0)?.conforms(to: .image) == true
+                } ?? UTType.png.identifier
+                let suggested = provider.suggestedName
+                _ = provider.loadDataRepresentation(forTypeIdentifier: typeID) { [conversation] data, _ in
+                    guard let data, let image = NSImage(data: data),
+                          let png = image.pngRepresentation() else { return }
+                    let base = (suggested as NSString?)?.deletingPathExtension
+                    let name = (base?.isEmpty == false ? base! : "Dropped image") + ".png"
+                    Task { @MainActor in conversation.addImageData(png, name: name) }
+                }
             }
         }
         return handled
@@ -3175,9 +3198,10 @@ private extension View {
     }
 }
 
-private extension NSImage {
-    /// PNG-encode this image, used to normalize a pasteboard image before it
-    /// rides as an ACP image block.
+extension NSImage {
+    /// PNG-encode this image, used to normalize a pasteboard or dropped image
+    /// before it rides as an ACP image block. Shared with the composer's
+    /// Cmd+V interceptor.
     func pngRepresentation() -> Data? {
         guard let tiff = tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return nil }
         return rep.representation(using: .png, properties: [:])
@@ -3252,11 +3276,20 @@ struct AcpChatOverflowMenu: View {
                 }
             }
         } label: {
-            if isExportingTranscript {
-                ProgressView().controlSize(.mini)
-            } else {
-                Image(systemName: "ellipsis.circle")
+            // The 24×22 slot lives on the LABEL, inside the menu's own
+            // `.fixedSize()`: on the outside it only centered an
+            // intrinsically-sized glyph, so this control's real click target
+            // was the bare 16pt symbol while every sibling in the header
+            // answered across its whole slot.
+            Group {
+                if isExportingTranscript {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: "ellipsis.circle")
+                }
             }
+            .frame(width: 24, height: 22)
+            .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)

@@ -929,39 +929,46 @@ struct RootShellView: View {
     /// The Show Document door reuses the toggle path, so with nothing to
     /// restore it opens Files instead of doing nothing — same fallback the
     /// footer's menu item has always had.
+    /// The two "show" doors as bare header controls: same 24×22 slot, same
+    /// inherited glyph size, same secondary ink as the pane controls beside
+    /// them. The grey `.regularMaterial` capsule that used to wrap them — and
+    /// the overlay that floated it over the header's own buttons — is gone.
     @ViewBuilder
-    private var detailShowDoors: some View {
+    private var detailShowDoorButtons: some View {
         let doors = DetailShowDoors.resolve(
             railVisible: detailRailPanelVisible,
             previewVisible: detailPreviewPanelVisible,
             hasProjectDirectory: model.currentProjectDirectory != nil
         )
-        if !doors.isEmpty {
-            HStack(spacing: NativeWorkspaceChrome.detailChromeControlGap) {
-                if doors.showDocument {
-                    showDoor(
-                        symbol: "doc.text",
-                        label: "Show Document",
-                        shortcut: keymap.shortcut(for: .toggleDocumentPreview)?.display,
-                        identifier: "detail.toggle-document",
-                        action: { runCommand(.toggleDocumentPreview) }
-                    )
-                }
-                if doors.showFiles {
-                    showDoor(
-                        symbol: "sidebar.trailing",
-                        label: "Show Files",
-                        shortcut: keymap.shortcut(for: .toggleFiles)?.display,
-                        identifier: "detail.toggle-files",
-                        action: { runCommand(.toggleFiles) }
-                    )
-                }
-            }
-            .padding(4)
-            .background(.regularMaterial, in: Capsule())
-            .padding(.top, 8)
-            .padding(.trailing, 10)
+        if doors.showDocument {
+            showDoor(
+                symbol: "doc.text",
+                label: "Show Document",
+                shortcut: keymap.shortcut(for: .toggleDocumentPreview)?.display,
+                identifier: "detail.toggle-document",
+                action: { runCommand(.toggleDocumentPreview) }
+            )
         }
+        if doors.showFiles {
+            showDoor(
+                symbol: "sidebar.trailing",
+                label: "Show Files",
+                shortcut: keymap.shortcut(for: .toggleFiles)?.display,
+                identifier: "detail.toggle-files",
+                action: { runCommand(.toggleFiles) }
+            )
+        }
+    }
+
+    /// With no pane open there is no header to host the doors, so the empty
+    /// workspace carries them itself, at the same trailing metrics a header
+    /// would give them.
+    private var emptyWorkspaceDoors: some View {
+        HStack(spacing: 7) {
+            detailShowDoorButtons
+        }
+        .padding(.top, 5)
+        .padding(.trailing, 9)
     }
 
     private func showDoor(
@@ -973,9 +980,8 @@ struct RootShellView: View {
     ) -> some View {
         Button(action: action) {
             Image(systemName: symbol)
-                .font(.system(size: NativeWorkspaceChrome.detailChromeGlyphSize, weight: .regular))
                 .foregroundStyle(.kaisolaSecondary)
-                .frame(width: 24, height: 20)
+                .frame(width: 24, height: 22)
                 .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -1658,7 +1664,6 @@ struct RootShellView: View {
                 .frame(minWidth: NativeDetailPaneSizing.minimumContentWidth,
                        maxWidth: .infinity, maxHeight: .infinity)
                 .layoutPriority(1)
-                .overlay(alignment: .topTrailing) { detailShowDoors }
             if let browserURL = model.browserCardURL {
                 filePreviewDivider
                 BrowserCardView(url: browserURL) { model.browserCardURL = nil }
@@ -2470,7 +2475,12 @@ struct RootShellView: View {
             if let recovery = model.missingSessionRecovery {
                 missingSessionRecoveryState(recovery)
             } else if let maximized = model.maximizedPaneID, layout.contains(maximized) {
-                unifiedSessionCard(maximized, clearsWindowControls: true, isSolo: true)
+                unifiedSessionCard(
+                    maximized,
+                    clearsWindowControls: true,
+                    isSolo: true,
+                    hostsDetailDoors: true
+                )
             } else if layout.isEmpty {
                 // The draft overlay paints its own chooser over this grid;
                 // mounting the empty state's chooser underneath it doubled
@@ -2478,6 +2488,7 @@ struct RootShellView: View {
                 // over "Start a session".
                 if selectedNewSessionDraft == nil {
                     emptyWorkspaceState
+                        .overlay(alignment: .topTrailing) { emptyWorkspaceDoors }
                 }
             } else {
                 GeometryReader { geometry in
@@ -2491,7 +2502,8 @@ struct RootShellView: View {
                                 column,
                                 projectID: activeProjectID,
                                 clearsWindowControls: index == 0,
-                                isSolo: isSolo
+                                isSolo: isSolo,
+                                hostsDetailDoors: index == layout.columns.count - 1
                             )
                                 .frame(width: available * CGFloat(column.weight / totalWeight))
                             if index < layout.columns.count - 1, let projectID = activeProjectID {
@@ -2513,7 +2525,8 @@ struct RootShellView: View {
         _ column: SessionPaneLayout.Column,
         projectID: String?,
         clearsWindowControls: Bool,
-        isSolo: Bool = false
+        isSolo: Bool = false,
+        hostsDetailDoors: Bool = false
     ) -> some View {
         GeometryReader { geometry in
             let dividerSpace = CGFloat(max(0, column.sessionIDs.count - 1)) * SessionPaneDividerSizing.layoutExtent
@@ -2524,7 +2537,8 @@ struct RootShellView: View {
                     unifiedSessionCard(
                         id,
                         clearsWindowControls: clearsWindowControls && index == 0,
-                        isSolo: isSolo
+                        isSolo: isSolo,
+                        hostsDetailDoors: hostsDetailDoors && index == 0
                     )
                         .frame(height: available * CGFloat(column.rowWeights[index] / totalWeight))
                     if index < column.sessionIDs.count - 1, let projectID {
@@ -2606,7 +2620,8 @@ struct RootShellView: View {
     private func unifiedSessionCard(
         _ id: String,
         clearsWindowControls: Bool = false,
-        isSolo: Bool = false
+        isSolo: Bool = false,
+        hostsDetailDoors: Bool = false
     ) -> some View {
         GeometryReader { geometry in
             // On the shared corner ladder since v1.1.8; it was a bare literal 8
@@ -2623,7 +2638,8 @@ struct RootShellView: View {
                 unifiedSessionHeader(
                     id,
                     paneWidth: geometry.size.width,
-                    clearsWindowControls: clearsWindowControls
+                    clearsWindowControls: clearsWindowControls,
+                    hostsDetailDoors: hostsDetailDoors
                 )
                 unifiedSessionContent(id)
             }
@@ -2679,7 +2695,8 @@ struct RootShellView: View {
     private func unifiedSessionHeader(
         _ id: String,
         paneWidth: CGFloat,
-        clearsWindowControls: Bool
+        clearsWindowControls: Bool,
+        hostsDetailDoors: Bool = false
     ) -> some View {
         let terminalChrome = terminalPaneChrome(for: id)
         return HStack(spacing: 7) {
@@ -2794,6 +2811,15 @@ struct RootShellView: View {
             .buttonStyle(.plain)
             .foregroundStyle(.kaisolaSecondary)
             .help("Hide this session; keep it running")
+            // The show-doors used to float as a capsule overlay four view
+            // levels up, in a different coordinate space — 6pt off the header
+            // controls' baseline, and sitting directly ON TOP of this pane's
+            // minimize and maximize buttons whenever a panel was hidden. They
+            // are header controls now, in the header, of the pane that owns
+            // the workspace's top-trailing corner.
+            if hostsDetailDoors {
+                detailShowDoorButtons
+            }
         }
         .padding(
             .leading,
@@ -2813,7 +2839,10 @@ struct RootShellView: View {
                         .opacity(terminalChrome.headerTintOpacity)
                 }
             } else {
-                Color(nsColor: .controlBackgroundColor).opacity(0.62)
+                // The one bar voice — white-led, not the 62% control-color
+                // wash that read as grey. Terminals keep their theme-derived
+                // chrome (pinned by its own contrast test).
+                Color.clear.kaisolaBarSurface()
             }
         }
         .overlay(alignment: .bottom) {
@@ -3571,9 +3600,10 @@ enum InitialSidebarWidth {
     /// windows the request was about. Widths the *app* placed are the app's to
     /// move again — matched exactly (±2 for the restoration round-trip), so a
     /// width the user dragged anywhere else stays exactly as found. 248
-    /// joined the list with the v0.1.125 move to 290, and dragged widths now
-    /// persist, so a user choice can never sit in this band by accident.
-    static let previouslyForcedIdeals: [CGFloat] = [210, 248]
+    /// joined the list with the v0.1.125 move to 290; 290 joined with the
+    /// 2026-08-26 move to 245. Dragged widths persist, so a user choice can
+    /// never sit in this band by accident.
+    static let previouslyForcedIdeals: [CGFloat] = [210, 248, 290]
     static let previouslyForcedTolerance: CGFloat = 2
 
     /// True only for a column still sitting at AppKit's untouched default.
@@ -3601,11 +3631,11 @@ enum InitialSidebarWidth {
     }
 
     /// The key generation moves whenever the flag's meaning changes: v2
-    /// recorded "this window was widened to 248", and windows carrying it
-    /// must be revisited exactly once to move to 290 (or to the user's own
-    /// persisted width, which wins outright).
+    /// recorded "this window was widened to 248", v3 "moved to 290", and each
+    /// bump revisits flagged windows exactly once to move them to the current
+    /// ideal (or to the user's own persisted width, which wins outright).
     static func defaultsKey(restorationID: String) -> String {
-        "kaisola.sidebar.openedAtIdealWidth.v3.\(restorationID)"
+        "kaisola.sidebar.openedAtIdealWidth.v4.\(restorationID)"
     }
 
     static func hasApplied(restorationID: String, defaults: UserDefaults) -> Bool {
@@ -4761,10 +4791,12 @@ enum NativeWorkspaceChrome {
     /// request — long project and session titles were the point of the wide
     /// rail, and the density passes had walked the default back below legible;
     /// 248 → 290 in v0.1.125, again by request, matching the width Michael
-    /// pins the Files rail to. Users who dragged their rail keep their width —
-    /// and as of v0.1.125 a drag persists (`NativePreviewSettings
-    /// .projectRailWidth`), so this constant only sizes truly fresh windows.
-    static let projectSidebarIdealWidth: CGFloat = 290
+    /// pins the Files rail to; 290 → 245 on 2026-08-26, again by request —
+    /// the double-click reset should land "1-2cm less wide" than it did.
+    /// Users who dragged their rail keep their width — a drag persists
+    /// (`NativePreviewSettings.projectRailWidth`), so this constant sizes
+    /// fresh windows and the divider's double-click reset.
+    static let projectSidebarIdealWidth: CGFloat = 245
     /// Raised alongside the ideal so a user who wants long titles can have
     /// them; the minimum is unchanged, so nothing about the narrow rail moves.
     static let projectSidebarMaximumWidth: CGFloat = 340

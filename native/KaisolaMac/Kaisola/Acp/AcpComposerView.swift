@@ -327,6 +327,9 @@ struct AcpComposerCard: View {
                 panelPresenter: {
                     attachmentMenuPresented = false
                     openAttachmentPanel()
+                },
+                imagePaster: { [conversation] png in
+                    conversation.addImageData(png, name: "Pasted image.png")
                 }
             )
             .frame(width: 1, height: 1)
@@ -617,6 +620,7 @@ struct AcpComposerCard: View {
 struct AcpAttachmentCommandKeyEquivalent: NSViewRepresentable {
     let isEnabled: Bool
     let panelPresenter: @MainActor () -> Void
+    var imagePaster: (@MainActor (Data) -> Void)?
 
     func makeNSView(context: Context) -> CommandView {
         let view = CommandView()
@@ -627,12 +631,14 @@ struct AcpAttachmentCommandKeyEquivalent: NSViewRepresentable {
     func updateNSView(_ nsView: CommandView, context: Context) {
         nsView.isShortcutEnabled = isEnabled
         nsView.panelPresenter = panelPresenter
+        nsView.imagePaster = imagePaster
     }
 
     @MainActor
     final class CommandView: NSView {
         var isShortcutEnabled = false
         var panelPresenter: (@MainActor () -> Void)?
+        var imagePaster: (@MainActor (Data) -> Void)?
 
         override func performKeyEquivalent(with event: NSEvent) -> Bool {
             let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -640,13 +646,29 @@ struct AcpAttachmentCommandKeyEquivalent: NSViewRepresentable {
                   window?.isKeyWindow == true,
                   event.type == .keyDown,
                   !event.isARepeat,
-                  modifiers == [.command],
-                  event.charactersIgnoringModifiers?.lowercased() == "u",
-                  let panelPresenter else {
+                  modifiers == [.command] else {
                 return super.performKeyEquivalent(with: event)
             }
-            panelPresenter()
-            return true
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "u":
+                guard let panelPresenter else { break }
+                panelPresenter()
+                return true
+            case "v":
+                // The field editor owns Cmd+V while the composer has focus, so
+                // an image on the pasteboard pasted into nothing. Intercept
+                // only when there is an image and no plain text to insert —
+                // ordinary text pastes stay the text system's business.
+                guard let imagePaster,
+                      NSPasteboard.general.string(forType: .string) == nil,
+                      let image = NSImage(pasteboard: .general),
+                      let png = image.pngRepresentation() else { break }
+                imagePaster(png)
+                return true
+            default:
+                break
+            }
+            return super.performKeyEquivalent(with: event)
         }
     }
 }

@@ -1170,6 +1170,194 @@ extension AcpComposerModelTests {
         )
     }
 
+    /// The seconds right after a relaunch are exactly when someone re-opens a
+    /// chat and flips its permission: the adapter is still spawning, there is
+    /// no session to ask yet, and the choice must be kept — displayed,
+    /// remembered, and applied by the connect handshake — not silently
+    /// snapped back.
+    @MainActor
+    func testModeChosenWhileConnectingIsKeptAndAppliedOnConnect() async throws {
+        let draftKey = "permission-mode-preconnect-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(
+                for: draftKey,
+                currentDefaults: .standard,
+                migratedDefaults: nil
+            )
+        }
+        let transport = PermissionModeConversationTransport()
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport),
+            draftKey: draftKey
+        )
+
+        conversation.selectMode("bypassPermissions")
+
+        let persistDeadline = ContinuousClock.now + .seconds(2)
+        while AcpConversation.loadPersistedModeID(for: draftKey) == nil,
+              ContinuousClock.now < persistDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(
+            AcpConversation.loadPersistedModeID(for: draftKey),
+            "bypassPermissions",
+            "a choice made before the session exists is still a choice"
+        )
+        XCTAssertEqual(conversation.currentModeID, "bypassPermissions")
+
+        await conversation.start()
+
+        XCTAssertEqual(
+            conversation.currentModeID,
+            "bypassPermissions",
+            "the connect handshake applies the kept choice"
+        )
+        let requests = await transport.modeRequests()
+        XCTAssertEqual(requests, ["bypassPermissions"])
+    }
+
+    /// `session/load` replays historical notifications before its response. A
+    /// replayed mode announcement is history, not a decision: it must not
+    /// overwrite the remembered per-chat mode before the restore handshake
+    /// has run, or the memory wipes itself on every relaunch.
+    @MainActor
+    func testConnectTimeModeAnnouncementDoesNotWipeTheMemory() async throws {
+        let draftKey = "permission-mode-replay-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(
+                for: draftKey,
+                currentDefaults: .standard,
+                migratedDefaults: nil
+            )
+        }
+        UserDefaults.standard.set(
+            "bypassPermissions",
+            forKey: AcpConversation.persistedModeDefaultsKeys(for: draftKey).first!
+        )
+        let transport = PermissionModeConversationTransport(
+            advertiseLoadSession: true,
+            announceModeOnLoad: "default"
+        )
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport),
+            draftKey: draftKey,
+            resumeSessionID: "mode-session"
+        )
+        await conversation.start()
+
+        let deadline = ContinuousClock.now + .seconds(2)
+        while (conversation.currentModeID != "bypassPermissions"
+            || AcpConversation.loadPersistedModeID(for: draftKey) != "bypassPermissions"),
+            ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(
+            AcpConversation.loadPersistedModeID(for: draftKey),
+            "bypassPermissions",
+            "a replayed announcement must not rewrite the remembered mode"
+        )
+        XCTAssertEqual(
+            conversation.currentModeID,
+            "bypassPermissions",
+            "the restore handshake wins over replayed history"
+        )
+        let requests = await transport.modeRequests()
+        XCTAssertEqual(requests, ["bypassPermissions"])
+    }
+
+    /// A mode picked while the connect restore is still in flight must win
+    /// over it: the restore's late continuation used to overwrite the display
+    /// with the older mode, and the equality guard then discarded the
+    /// accepted user choice — adapter on the new mode, UI and memory on the
+    /// old one.
+    @MainActor
+    func testUserSelectionDuringConnectRestoreOutranksTheRestore() async throws {
+        let draftKey = "permission-mode-race-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(
+                for: draftKey,
+                currentDefaults: .standard,
+                migratedDefaults: nil
+            )
+        }
+        UserDefaults.standard.set(
+            "bypassPermissions",
+            forKey: AcpConversation.persistedModeDefaultsKeys(for: draftKey).first!
+        )
+        let transport = PermissionModeConversationTransport(holdFirstSetModeUntilSecond: true)
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport),
+            draftKey: draftKey
+        )
+
+        let startTask = Task { await conversation.start() }
+        // Wait for the restore's set_mode to be parked at the transport, so
+        // the user selection genuinely races the in-flight handshake.
+        let raceDeadline = ContinuousClock.now + .seconds(2)
+        while await transport.modeRequests().count < 1, ContinuousClock.now < raceDeadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+
+        conversation.selectMode("acceptEdits")
+        await startTask.value
+
+        let deadline = ContinuousClock.now + .seconds(2)
+        while (conversation.currentModeID != "acceptEdits"
+            || AcpConversation.loadPersistedModeID(for: draftKey) != "acceptEdits"),
+            ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(
+            conversation.currentModeID,
+            "acceptEdits",
+            "the user's mid-handshake choice stays on screen"
+        )
+        XCTAssertEqual(
+            AcpConversation.loadPersistedModeID(for: draftKey),
+            "acceptEdits",
+            "the accepted choice is remembered even though the restore resolved after it"
+        )
+    }
+
+    /// After the handshake, adapter-side switches (plan-mode exits, in-band
+    /// slash commands) are the chat's mode and keep updating the memory.
+    @MainActor
+    func testAdapterModeSwitchAfterConnectIsStillRemembered() async throws {
+        let draftKey = "permission-mode-adapter-switch-\(UUID().uuidString)"
+        defer {
+            AcpConversation.removePersistedDraft(
+                for: draftKey,
+                currentDefaults: .standard,
+                migratedDefaults: nil
+            )
+        }
+        let transport = PermissionModeConversationTransport()
+        let conversation = AcpConversation(
+            title: "Test", command: "mock", arguments: [], environment: [:],
+            cwd: "/tmp", client: AcpClient(transport: transport),
+            draftKey: draftKey
+        )
+        await conversation.start()
+        XCTAssertEqual(conversation.currentModeID, "default")
+
+        await transport.announceMode("acceptEdits")
+
+        let deadline = ContinuousClock.now + .seconds(2)
+        while AcpConversation.loadPersistedModeID(for: draftKey) != "acceptEdits",
+              ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertEqual(conversation.currentModeID, "acceptEdits")
+        XCTAssertEqual(
+            AcpConversation.loadPersistedModeID(for: draftKey),
+            "acceptEdits",
+            "post-handshake adapter switches still update the memory"
+        )
+    }
+
     @MainActor
     func testRejectedEffortChangeKeepsTheAdapterConfirmedValueAndDraft() async throws {
         let transport = ReasoningEffortAcpTransport(rejectedValues: ["high"])
@@ -1507,9 +1695,21 @@ private actor PermissionModeConversationTransport: AcpByteTransport {
     private var waiter: CheckedContinuation<Data?, Never>?
     private var requestedModeIDs: [String] = []
     private let rejectedModeIDs: Set<String>
+    private let advertiseLoadSession: Bool
+    private let announceModeOnLoad: String?
+    private let holdFirstSetModeUntilSecond: Bool
+    private var heldSetModeReplyID: JSONValue?
 
-    init(rejectedModeIDs: Set<String> = []) {
+    init(
+        rejectedModeIDs: Set<String> = [],
+        advertiseLoadSession: Bool = false,
+        announceModeOnLoad: String? = nil,
+        holdFirstSetModeUntilSecond: Bool = false
+    ) {
         self.rejectedModeIDs = rejectedModeIDs
+        self.advertiseLoadSession = advertiseLoadSession
+        self.announceModeOnLoad = announceModeOnLoad
+        self.holdFirstSetModeUntilSecond = holdFirstSetModeUntilSecond
     }
 
     func start(
@@ -1528,30 +1728,68 @@ private actor PermissionModeConversationTransport: AcpByteTransport {
         case "initialize":
             reply(id: id, result: .object([
                 "protocolVersion": .integer(1),
-                "agentCapabilities": .object([:]),
-            ]))
-        case "session/new":
-            reply(id: id, result: .object([
-                "sessionId": .string("mode-session"),
-                "modes": .object([
-                    "availableModes": .array([
-                        .object(["id": .string("default"), "name": .string("Ask")]),
-                        .object(["id": .string("bypassPermissions"), "name": .string("Bypass Permissions")]),
-                    ]),
-                    "currentModeId": .string("default"),
+                "agentCapabilities": .object([
+                    "loadSession": .bool(advertiseLoadSession),
                 ]),
             ]))
+        case "session/new":
+            reply(id: id, result: sessionPayload(sessionID: "mode-session"))
+        case "session/load":
+            let sessionID = object["params"]?.objectValue?["sessionId"]?.stringValue ?? "mode-session"
+            // The real adapter replays session notifications BEFORE the load
+            // response; a historical mode announcement arriving first is the
+            // exact hazard the memory arming exists for.
+            if let announceModeOnLoad {
+                announceMode(announceModeOnLoad, sessionID: sessionID)
+            }
+            reply(id: id, result: sessionPayload(sessionID: sessionID))
         case "session/set_mode":
             let modeID = object["params"]?.objectValue?["modeId"]?.stringValue
             if let modeID { requestedModeIDs.append(modeID) }
             if let modeID, rejectedModeIDs.contains(modeID) {
                 replyError(id: id, message: "mode unavailable for this account")
+            } else if holdFirstSetModeUntilSecond, heldSetModeReplyID == nil, requestedModeIDs.count == 1 {
+                // Park the FIRST set_mode (the connect restore) so a user
+                // selection can race past it — the interleave the fix is for.
+                heldSetModeReplyID = id
             } else {
                 reply(id: id, result: .null)
+                if let held = heldSetModeReplyID {
+                    heldSetModeReplyID = nil
+                    reply(id: held, result: .null)
+                }
             }
         default:
             if let id { reply(id: id, result: .null) }
         }
+    }
+
+    func announceMode(_ modeID: String, sessionID: String = "mode-session") {
+        deliver(JSONValue.object([
+            "jsonrpc": .string("2.0"),
+            "method": .string("session/update"),
+            "params": .object([
+                "sessionId": .string(sessionID),
+                "update": .object([
+                    "sessionUpdate": .string("current_mode_update"),
+                    "currentModeId": .string(modeID),
+                ]),
+            ]),
+        ]))
+    }
+
+    private func sessionPayload(sessionID: String) -> JSONValue {
+        .object([
+            "sessionId": .string(sessionID),
+            "modes": .object([
+                "availableModes": .array([
+                    .object(["id": .string("default"), "name": .string("Ask")]),
+                    .object(["id": .string("acceptEdits"), "name": .string("Accept Edits")]),
+                    .object(["id": .string("bypassPermissions"), "name": .string("Bypass Permissions")]),
+                ]),
+                "currentModeId": .string("default"),
+            ]),
+        ])
     }
 
     func modeRequests() -> [String] { requestedModeIDs }

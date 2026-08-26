@@ -234,7 +234,7 @@ struct AcpChatView: View {
         // asking the user to find the one strip that accepts it is precision a
         // drag should never demand. `handleDrop` is unchanged, so
         // `AcpAttachmentClassifier` still decides what is attachable.
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted, perform: handleDrop)
+        .onDrop(of: [.fileURL, .image], isTargeted: $isDropTargeted, perform: handleDrop)
         .overlay {
             if isDropTargeted {
                 // `paneRadius`, not `panelRadius`: the ring sits just inside
@@ -282,11 +282,11 @@ struct AcpChatView: View {
         )
         return HStack(alignment: .firstTextBaseline, spacing: 8) {
             Image(systemName: "archivebox")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityHidden(true)
             Text("Earlier saved history was truncated at this chat's disk quota (\(status.truncatedRowCount.formatted()) rows, \(bytes)). User prompts, tool evidence, and the newest transcript were kept first.")
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
         }
@@ -319,7 +319,7 @@ struct AcpChatView: View {
                 .accessibilityHidden(true)
             Text(detail)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
             if canRetry {
@@ -390,6 +390,10 @@ struct AcpChatView: View {
         }
         .padding(.horizontal, 16)
         .frame(height: 46)
+        // Parity with the embedded pane header: the standalone window's one
+        // bar speaks the same white-led surface instead of inheriting
+        // whatever sits behind it.
+        .kaisolaBarSurface()
     }
 
     private var transcript: some View {
@@ -639,6 +643,8 @@ struct AcpChatView: View {
                         }
                     }
                 )
+            case let .harnessNotice(_, summary, text):
+                HarnessNoticeRow(summary: summary, fullText: text)
             }
         }
         .id(item.id)
@@ -697,7 +703,7 @@ struct AcpChatView: View {
     private var transcriptSearchBar: some View {
         HStack(spacing: 8) {
             Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
+                .foregroundStyle(.kaisolaSecondary)
                 .accessibilityHidden(true)
             TextField(
                 "Find in conversation",
@@ -759,7 +765,7 @@ struct AcpChatView: View {
         .controlSize(.small)
         .padding(.horizontal, 12)
         .padding(.vertical, 7)
-        .background(Color(nsColor: .controlBackgroundColor).opacity(0.55))
+        .kaisolaBarSurface()
         .onExitCommand { dismissTranscriptSearch() }
         .onChange(of: transcriptSearchFocused) { _, isFocused in
             if isFocused { onKeyboardFocus?() }
@@ -1112,10 +1118,10 @@ struct AcpChatView: View {
                         .font(.caption.weight(.semibold))
                     Text("\(account.provider) · \(account.account)")
                         .font(.caption2.monospaced())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                     Text(account.detail)
                         .font(.caption)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.kaisolaSecondary)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
@@ -1245,11 +1251,30 @@ struct AcpChatView: View {
     /// Stage files dropped onto the composer.
     private func handleDrop(_ providers: [NSItemProvider]) -> Bool {
         var handled = false
-        for provider in providers where provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
-            handled = true
-            _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { [conversation] data, _ in
-                guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                Task { @MainActor in conversation.prepareAttachment(fileURL: url) }
+        for provider in providers {
+            if provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) {
+                handled = true
+                _ = provider.loadDataRepresentation(forTypeIdentifier: UTType.fileURL.identifier) { [conversation] data, _ in
+                    guard let data, let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                    Task { @MainActor in conversation.prepareAttachment(fileURL: url) }
+                }
+            } else if provider.hasItemConformingToTypeIdentifier(UTType.image.identifier) {
+                // The macOS screenshot thumbnail — the drag most worth
+                // catching — offers image data behind a file promise, never a
+                // plain file URL, so the fileURL-only net dropped exactly the
+                // drag people make right after taking a screenshot.
+                handled = true
+                let typeID = provider.registeredTypeIdentifiers.first {
+                    UTType($0)?.conforms(to: .image) == true
+                } ?? UTType.png.identifier
+                let suggested = provider.suggestedName
+                _ = provider.loadDataRepresentation(forTypeIdentifier: typeID) { [conversation] data, _ in
+                    guard let data, let image = NSImage(data: data),
+                          let png = image.pngRepresentation() else { return }
+                    let base = (suggested as NSString?)?.deletingPathExtension
+                    let name = (base?.isEmpty == false ? base! : "Dropped image") + ".png"
+                    Task { @MainActor in conversation.addImageData(png, name: name) }
+                }
             }
         }
         return handled
@@ -1443,6 +1468,29 @@ struct ToolCallDensityPresentation: Equatable, Sendable {
     }
 }
 
+/// One quiet line for a harness-injected background-task notification. The
+/// full XML stays reachable (selection and the export path keep the raw
+/// text); the stream shows only the line a reader might care about.
+struct HarnessNoticeRow: View {
+    let summary: String
+    let fullText: String
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "clock.badge.checkmark")
+                .accessibilityHidden(true)
+            Text(summary)
+                .lineLimit(2)
+                .textSelection(.enabled)
+        }
+        .font(.caption)
+        .foregroundStyle(.kaisolaSecondary)
+        .help(fullText)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Background task notification: \(summary)")
+    }
+}
+
 struct TranscriptRowView: View {
     let row: AcpTranscriptRow
     var workspaceURL: URL?
@@ -1471,7 +1519,7 @@ struct TranscriptRowView: View {
                 if let model = profile.modelID { Text("· \(model)") }
             }
             .font(.caption)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(.kaisolaSecondary)
             .accessibilityElement(children: .combine)
             .accessibilityLabel("Run profile audit: \(profile.name)")
         case let .user(_, text, failed):
@@ -1514,13 +1562,28 @@ struct TranscriptRowView: View {
             .accessibilityIdentifier("acp.transcript.\(row.id)")
             .accessibilityLabel("You said: \(text)")
         case let .message(_, text):
-            AssistantMarkdownText(
-                text: text,
-                workspaceURL: workspaceURL,
-                showsCopyButton: showsResponseChrome
-            )
-            // The section captions are gone; the turn's final answer is the
-            // heading landmark VoiceOver's rotor steps between.
+            VStack(alignment: .leading, spacing: 6) {
+                // The turn's final answer announces itself. Interim narration
+                // flows as plain prose; the one message that closes the
+                // exchange carries the title, so "where is the actual answer"
+                // has a visible landmark again (2026-08-26 feedback). Callout
+                // semibold in primary ink: the landmark must outrank the
+                // work-run marker's callout line by weight and ink, not lose
+                // to it at caption size.
+                if showsResponseChrome {
+                    Text("Response")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.kaisolaPrimary)
+                        .accessibilityHidden(true)
+                }
+                AssistantMarkdownText(
+                    text: text,
+                    workspaceURL: workspaceURL,
+                    showsCopyButton: showsResponseChrome
+                )
+            }
+            // The turn's final answer is the heading landmark VoiceOver's
+            // rotor steps between.
             .accessibilityAddTraits(showsResponseChrome ? .isHeader : [])
         case let .thought(_, text):
             // The quote block's left rule, in tertiary ink: an expanded
@@ -1576,7 +1639,7 @@ struct TranscriptRowView: View {
             Label {
                 Text(text)
                     .font(.callout)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.kaisolaSecondary)
                     .textSelection(.enabled)
             } icon: {
                 Image(systemName: "shield.slash")
@@ -3138,9 +3201,10 @@ private extension View {
     }
 }
 
-private extension NSImage {
-    /// PNG-encode this image, used to normalize a pasteboard image before it
-    /// rides as an ACP image block.
+extension NSImage {
+    /// PNG-encode this image, used to normalize a pasteboard or dropped image
+    /// before it rides as an ACP image block. Shared with the composer's
+    /// Cmd+V interceptor.
     func pngRepresentation() -> Data? {
         guard let tiff = tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return nil }
         return rep.representation(using: .png, properties: [:])
@@ -3215,11 +3279,20 @@ struct AcpChatOverflowMenu: View {
                 }
             }
         } label: {
-            if isExportingTranscript {
-                ProgressView().controlSize(.mini)
-            } else {
-                Image(systemName: "ellipsis.circle")
+            // The 24×22 slot lives on the LABEL, inside the menu's own
+            // `.fixedSize()`: on the outside it only centered an
+            // intrinsically-sized glyph, so this control's real click target
+            // was the bare 16pt symbol while every sibling in the header
+            // answered across its whole slot.
+            Group {
+                if isExportingTranscript {
+                    ProgressView().controlSize(.mini)
+                } else {
+                    Image(systemName: "ellipsis.circle")
+                }
             }
+            .frame(width: 24, height: 22)
+            .contentShape(Rectangle())
         }
         .menuStyle(.borderlessButton)
         .menuIndicator(.hidden)

@@ -45,6 +45,15 @@ struct AcpPlanPayloadLimits: Equatable, Sendable {
     }
 }
 
+/// How a `session/set_mode` request resolved. Three-valued because "there is
+/// no session yet" is not a refusal: the chosen mode is kept for the connect
+/// handshake to apply, whereas a refusal must roll back.
+enum AcpSetModeOutcome: Equatable, Sendable {
+    case accepted
+    case refused
+    case noSession
+}
+
 enum AcpPlanParser {
     private static let contentTruncationSuffix = "\n[truncated]"
     private static let entriesTruncationNotice = "Plan entries truncated."
@@ -1500,23 +1509,23 @@ actor AcpClient {
         }
     }
 
-    /// Request a permission-mode switch and report whether the adapter
-    /// accepted it. Callers must not persist or keep displaying the requested
-    /// mode on `false`: an adapter can refuse a mode it declares (an account
-    /// gate, a mid-session lockout), and a refusal has to roll back rather
-    /// than stick.
+    /// Request a permission-mode switch. `.accepted` is the only confirmation;
+    /// `.refused` means the adapter rejected a mode it declares (an account
+    /// gate, a mid-session lockout) and the caller must roll back rather than
+    /// persist; `.noSession` means there was nothing to ask yet — the caller
+    /// may keep the choice and let the connect handshake apply it.
     @discardableResult
-    func setMode(_ modeID: String) async -> Bool {
-        guard let sessionID else { return false }
+    func setMode(_ modeID: String) async -> AcpSetModeOutcome {
+        guard let sessionID else { return .noSession }
         do {
             _ = try await request("session/set_mode", params: .object([
                 "sessionId": .string(sessionID),
                 "modeId": .string(modeID),
             ]))
-            return true
+            return .accepted
         } catch {
             eventHandler?(.error(errorText(error)))
-            return false
+            return .refused
         }
     }
 

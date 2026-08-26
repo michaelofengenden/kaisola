@@ -552,7 +552,7 @@ struct MeshView: View {
         }
         .padding(.horizontal, 12)
         .frame(height: 42)
-        .background(.ultraThinMaterial)
+        .kaisolaBarSurface()
     }
 
     private var configurationMenu: some View {
@@ -586,7 +586,7 @@ struct MeshView: View {
             .help("Fan this prompt out to every column")
         }
         .padding(10)
-        .background(.ultraThinMaterial)
+        .kaisolaBarSurface()
     }
 
     private func applyFocusRequest(_ generation: UInt64?) {
@@ -916,7 +916,7 @@ struct MeshColumnOverviewStrip: View {
             .padding(.vertical, 6)
         }
         .scrollIndicators(.hidden)
-        .background(.thinMaterial)
+        .kaisolaBarSurface()
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Mesh agents")
     }
@@ -1043,7 +1043,7 @@ private struct MeshColumnView: View {
             }
             .padding(.horizontal, 10)
             .frame(height: 34)
-            .background(.thinMaterial)
+            .kaisolaBarSurface()
             Divider()
             ScrollViewReader { proxy in
                 ZStack(alignment: .bottomTrailing) {

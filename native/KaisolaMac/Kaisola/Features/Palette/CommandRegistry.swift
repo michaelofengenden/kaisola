@@ -358,9 +358,12 @@ enum AppCommandRegistry {
             definition(.openExternalEditor, "Open in External Editor", .file, "arrow.up.forward.app", "command+shift+o"),
             definition(.previousFileTab, "Previous File Tab", .file, "arrow.left", "command+option+left"),
             definition(.nextFileTab, "Next File Tab", .file, "arrow.right", "command+option+right"),
-            definition(.increaseTerminalFont, "Bigger", .terminal, "plus.magnifyingglass", "command+plus"),
-            definition(.decreaseTerminalFont, "Smaller", .terminal, "minus.magnifyingglass", "command+minus"),
-            definition(.resetTerminalFont, "Reset Size", .terminal, "textformat.size", "command+0"),
+            // Apple's own zoom vocabulary: these route contextually (chat
+            // zoom when a chat pane is focused, terminal font otherwise), so
+            // "Terminal Font › Bigger" lied to anyone with a chat in front.
+            definition(.increaseTerminalFont, "Zoom In", .terminal, "plus.magnifyingglass", "command+plus"),
+            definition(.decreaseTerminalFont, "Zoom Out", .terminal, "minus.magnifyingglass", "command+minus"),
+            definition(.resetTerminalFont, "Actual Size", .terminal, "textformat.size", "command+0"),
             definition(.clearTerminal, "Clear Terminal", .terminal, "eraser", "command+option+k"),
             definition(.scrollTerminalToLatest, "Scroll to Latest Output", .terminal, "arrow.down.to.line", "command+option+down"),
             definition(.focusPreviousPane, "Focus Previous Pane", .view, "arrow.left.to.line", "command+control+left"),
@@ -526,6 +529,15 @@ enum AppCommandRegistry {
         return .available
     }
 
+    /// Whether the zoom shortcuts should speak to the focused agent chat
+    /// rather than the terminal font: one Cmd+Plus, routed by what the user
+    /// is looking at, the way Apple's own apps overload zoom.
+    @MainActor
+    private static func focusedPaneIsAgentChat(_ model: AppModel?) -> Bool {
+        guard let model, let focused = model.focusedPaneID else { return false }
+        return model.chats.contains { $0.id == focused }
+    }
+
     /// The only semantic execution switch for registered commands. Menus,
     /// palette rows, hidden SwiftUI shortcuts, and feature buttons all call
     /// this same function; presentation-only commands are routed to the exact
@@ -589,11 +601,23 @@ enum AppCommandRegistry {
         case .nextFileTab:
             model?.selectAdjacentFileTab(direction: 1)
         case .increaseTerminalFont:
-            settings.adjustTerminalFont(by: 1)
+            if focusedPaneIsAgentChat(model) {
+                settings.stepAgentChatTextSize(by: 1)
+            } else {
+                settings.adjustTerminalFont(by: 1)
+            }
         case .decreaseTerminalFont:
-            settings.adjustTerminalFont(by: -1)
+            if focusedPaneIsAgentChat(model) {
+                settings.stepAgentChatTextSize(by: -1)
+            } else {
+                settings.adjustTerminalFont(by: -1)
+            }
         case .resetTerminalFont:
-            settings.resetTerminalFont()
+            if focusedPaneIsAgentChat(model) {
+                settings.resetAgentChatTextSize()
+            } else {
+                settings.resetTerminalFont()
+            }
         case .clearTerminal:
             delegate?.commandFocusedTerminal(for: model)?.clearLiveScrollback()
         case .scrollTerminalToLatest:

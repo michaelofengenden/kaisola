@@ -116,8 +116,8 @@ struct CommandPaletteView: View {
             }
         }
         .frame(width: 560)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.quaternary))
         .shadow(radius: 24, y: 8)
         .onAppear { searchFocused = true }
         .task(id: model.currentProjectDirectory?.standardizedFileURL.path) {

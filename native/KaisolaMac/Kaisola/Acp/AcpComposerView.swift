@@ -126,7 +126,9 @@ struct AcpComposerCard: View {
                         : KaisolaVisualSystem.hairline
                 )
         }
-        .shadow(color: .black.opacity(colorScheme == .dark ? 0.34 : 0.07), radius: 6, y: 2)
+        // 0.34 → 0.18 dark (2026-08-26): the composer sits INSIDE the chrome
+        // card, and its shadow must not out-weigh the card's own 0.18 float.
+        .shadow(color: .black.opacity(colorScheme == .dark ? 0.18 : 0.07), radius: 6, y: 2)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("acp.composer")
         .task(id: agentName) {
@@ -302,7 +304,7 @@ struct AcpComposerCard: View {
                     Image(systemName: "plus").font(.system(size: 12, weight: .medium))
                 }
             }
-            .frame(width: 22, height: 22)
+            .frame(width: 24, height: 24)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -327,6 +329,9 @@ struct AcpComposerCard: View {
                 panelPresenter: {
                     attachmentMenuPresented = false
                     openAttachmentPanel()
+                },
+                imagePaster: { [conversation] png in
+                    conversation.addImageData(png, name: "Pasted image.png")
                 }
             )
             .frame(width: 1, height: 1)
@@ -617,6 +622,7 @@ struct AcpComposerCard: View {
 struct AcpAttachmentCommandKeyEquivalent: NSViewRepresentable {
     let isEnabled: Bool
     let panelPresenter: @MainActor () -> Void
+    var imagePaster: (@MainActor (Data) -> Void)?
 
     func makeNSView(context: Context) -> CommandView {
         let view = CommandView()
@@ -627,12 +633,14 @@ struct AcpAttachmentCommandKeyEquivalent: NSViewRepresentable {
     func updateNSView(_ nsView: CommandView, context: Context) {
         nsView.isShortcutEnabled = isEnabled
         nsView.panelPresenter = panelPresenter
+        nsView.imagePaster = imagePaster
     }
 
     @MainActor
     final class CommandView: NSView {
         var isShortcutEnabled = false
         var panelPresenter: (@MainActor () -> Void)?
+        var imagePaster: (@MainActor (Data) -> Void)?
 
         override func performKeyEquivalent(with event: NSEvent) -> Bool {
             let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
@@ -640,13 +648,29 @@ struct AcpAttachmentCommandKeyEquivalent: NSViewRepresentable {
                   window?.isKeyWindow == true,
                   event.type == .keyDown,
                   !event.isARepeat,
-                  modifiers == [.command],
-                  event.charactersIgnoringModifiers?.lowercased() == "u",
-                  let panelPresenter else {
+                  modifiers == [.command] else {
                 return super.performKeyEquivalent(with: event)
             }
-            panelPresenter()
-            return true
+            switch event.charactersIgnoringModifiers?.lowercased() {
+            case "u":
+                guard let panelPresenter else { break }
+                panelPresenter()
+                return true
+            case "v":
+                // The field editor owns Cmd+V while the composer has focus, so
+                // an image on the pasteboard pasted into nothing. Intercept
+                // only when there is an image and no plain text to insert —
+                // ordinary text pastes stay the text system's business.
+                guard let imagePaster,
+                      NSPasteboard.general.string(forType: .string) == nil,
+                      let image = NSImage(pasteboard: .general),
+                      let png = image.pngRepresentation() else { break }
+                imagePaster(png)
+                return true
+            default:
+                break
+            }
+            return super.performKeyEquivalent(with: event)
         }
     }
 }
@@ -677,7 +701,7 @@ struct AcpComposerChipLabel<Leading: View>: View {
         }
         .foregroundStyle(tint ?? .primary)
         .padding(.horizontal, 7)
-        .padding(.vertical, 4)
+        .padding(.vertical, 6)
         .contentShape(RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius))
     }
 }

@@ -5208,7 +5208,7 @@ final class KaisolaMacAppDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             if commandAction != nil
                 || (fontIncreaseAction != nil && fontDecreaseAction != nil && fontResetAction != nil) {
                 viewMenu.addItem(.separator())
-                viewMenu.addItem(sectionHeader("Terminal Font"))
+                viewMenu.addItem(sectionHeader("Zoom"))
                 addRegisteredItem(
                     to: viewMenu,
                     id: .increaseTerminalFont,

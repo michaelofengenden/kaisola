@@ -968,7 +968,7 @@ struct FilePreviewView: View {
         }
         .padding(.horizontal, 11)
         .frame(height: 38)
-        .background(.thinMaterial)
+        .kaisolaBarSurface()
     }
 
     @ViewBuilder

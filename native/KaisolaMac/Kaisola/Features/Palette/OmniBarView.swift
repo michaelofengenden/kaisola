@@ -38,8 +38,8 @@ struct OmniBarView: View {
         .padding(.horizontal, 16)
         .padding(.vertical, 12)
         .frame(width: 560)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.quaternary))
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous).strokeBorder(.quaternary))
         .shadow(radius: 24, y: 8)
         .onAppear { fieldFocused = true }
         .onKeyPress(.escape) { isPresented = false; return .handled }

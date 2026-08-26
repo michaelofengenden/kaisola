@@ -78,7 +78,10 @@ final class AcpTranscriptDisplayTests: XCTestCase {
         XCTAssertEqual(finals, ["m2", "m3"], "interim narration is prose; the last word of each turn is the response")
     }
 
-    func testWorkRunSummarySpeaksCountsAndAlwaysSaysFailures() {
+    /// The collapsed line stays quiet about failures on purpose (2026-08-26):
+    /// non-zero exits are routine agent probing, and the red suffix made every
+    /// one an alarm. The per-call log behind the click still marks them.
+    func testWorkRunSummarySpeaksCountsWithoutAFailureSuffix() {
         let calls = [
             AcpToolCall(id: "1", title: "b", kind: "execute", status: .completed),
             AcpToolCall(id: "2", title: "r", kind: "read", status: .completed),
@@ -87,8 +90,6 @@ final class AcpTranscriptDisplayTests: XCTestCase {
         ]
         let summary = AcpWorkRunSummary(calls: calls)
         XCTAssertEqual(summary.label, "Ran a command, read 2 files, edited a file")
-        XCTAssertEqual(summary.failureLabel, "1 failed")
-        XCTAssertNil(AcpWorkRunSummary(calls: Array(calls.prefix(2))).failureLabel)
         XCTAssertEqual(
             AcpWorkRunSummary(calls: [
                 AcpToolCall(id: "5", title: "t", kind: "other", status: .completed),

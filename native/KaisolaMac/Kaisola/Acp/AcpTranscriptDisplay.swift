@@ -164,8 +164,4 @@ struct AcpWorkRunSummary: Equatable {
         return text
     }
 
-    /// The red suffix, kept separate so the view can tint it.
-    var failureLabel: String? {
-        failed == 0 ? nil : (failed == 1 ? "1 failed" : "\(failed) failed")
-    }
 }

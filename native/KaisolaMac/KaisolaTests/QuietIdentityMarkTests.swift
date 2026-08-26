@@ -1430,10 +1430,12 @@ final class QuietIdentityMarkTests: XCTestCase {
         )
         XCTAssertLessThan(QuietSelectionPill.fillOpacity(dark: true), 0.35)
 
-        // One rung tighter than the app's inset radius: the pill is nested inside
-        // the sidebar's own chrome corner, so the ladder stays strictly
-        // increasing outward.
-        XCTAssertEqual(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.controlRadius)
+        // At most the control rung, and strictly inside the inset radius: the
+        // pill sits at the bottom of the ladder but no longer *tracks* it —
+        // the 0.1.134 rounder pass moved controls 9 → 10 while session rows
+        // stayed 26pt, and a tracking pill silently crossed the lozenge bound
+        // below. The pill answers to its row height first, the ladder second.
+        XCTAssertLessThanOrEqual(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.controlRadius)
         XCTAssertLessThan(QuietSelectionPill.cornerRadius, KaisolaVisualSystem.insetRadius)
         // "A 12pt radius on a 32pt row reads as a lozenge rather than a row"
         // — that 0.375 ratio is the documented failure, and the session lane
@@ -1456,6 +1458,38 @@ final class QuietIdentityMarkTests: XCTestCase {
         // the column edge, so it cannot paint colour under nothing.
         XCTAssertGreaterThan(QuietRailMetrics.pillMarkLead, 0)
         XCTAssertLessThan(QuietRailMetrics.pillMarkLead, QuietRailMetrics.sessionIndent)
+    }
+
+    /// The Files rail selects with the sidebar's own pill — one grammar on
+    /// both edges of the window (2026-08-26 panel review against Safari and
+    /// the Landmarks Liquid Glass sample). This pins the borrowing itself:
+    /// the rail may never redeclare its own radius or coverage, only forward
+    /// the sidebar's, so the two rails cannot drift apart again.
+    func testTheFilesRailSelectsWithTheSidebarsOwnPill() {
+        XCTAssertEqual(
+            WorkspaceRailRowGrammar.selectionCornerRadius,
+            QuietSelectionPill.cornerRadius,
+            "the rails select in two dialects again"
+        )
+        XCTAssertEqual(
+            WorkspaceRailRowGrammar.selectionFillOpacity(dark: false),
+            QuietSelectionPill.fillOpacity(dark: false)
+        )
+        XCTAssertEqual(
+            WorkspaceRailRowGrammar.selectionFillOpacity(dark: true),
+            QuietSelectionPill.fillOpacity(dark: true)
+        )
+        // Roomier than the old 2.5pt cram, but the rail's rows stay a step
+        // tighter than the sidebar's 26pt session lane.
+        XCTAssertGreaterThan(WorkspaceRailRowGrammar.rowVerticalPadding, 3)
+        let approximateRowHeight = WorkspaceRailRowGrammar.rowVerticalPadding * 2 + 16
+        XCTAssertLessThan(approximateRowHeight, QuietRailMetrics.sessionRowHeight + 0.5)
+        // The documented lozenge bound holds on the rail's own rows too.
+        XCTAssertLessThan(
+            WorkspaceRailRowGrammar.selectionCornerRadius / approximateRowHeight,
+            0.375,
+            "the selected file's pill turned into a lozenge"
+        )
     }
 
     // MARK: - Project drag mapping

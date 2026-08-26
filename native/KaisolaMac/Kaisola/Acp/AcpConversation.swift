@@ -282,6 +282,11 @@ final class AcpConversation: ObservableObject {
     /// adapter-session state; these values are explicitly persisted because an
     /// ACP boolean has no safe string fallback when a session must be recreated.
     @Published private(set) var confirmedBooleanConfigValues: [String: Bool]
+    /// The permission mode this chat last ran under, persisted per chat so a
+    /// relaunch cannot quietly demote "Full access" back to asking — or keep
+    /// bypassing after the user restrained the session. Restored at `start`
+    /// only when the adapter still declares the remembered mode.
+    private var rememberedModeID: String?
     /// The one adapter-owned setting currently awaiting confirmation. Keeping
     /// the prior value visible until this clears prevents a rejected effort
     /// level from masquerading as the value the next prompt will use.
@@ -617,6 +622,7 @@ final class AcpConversation: ObservableObject {
         self.confirmedBooleanConfigValues = draftKey.map {
             Self.loadPersistedBooleanConfigValues(for: $0)
         } ?? [:]
+        self.rememberedModeID = draftKey.flatMap { Self.loadPersistedModeID(for: $0) }
         self.pendingAttachments = Self.restoredPendingAttachments(initialAttachments)
         self.attachmentCounter = self.pendingAttachments.count
         self.usage = initialUsage
@@ -696,6 +702,16 @@ final class AcpConversation: ObservableObject {
             }
             modes = info.modes
             currentModeID = info.currentModeID
+            // The permission mode is a per-chat decision, not per-process
+            // state: restarting the app (or the adapter) must not reset it.
+            // Restore only a mode the adapter still declares; a vanished mode
+            // keeps the adapter's own current one rather than guessing.
+            if let remembered = rememberedModeID,
+               remembered != info.currentModeID,
+               info.modes.contains(where: { $0.id == remembered }) {
+                currentModeID = remembered
+                await client.setMode(remembered)
+            }
             var confirmedOptions = info.configOptions
             var restorationFailure: String?
             for (id, desiredValue) in confirmedBooleanConfigValues.sorted(by: { $0.key < $1.key }) {
@@ -1123,6 +1139,7 @@ final class AcpConversation: ObservableObject {
 
     func selectMode(_ id: String) {
         currentModeID = id
+        rememberMode(id)
         Task { await client.setMode(id) }
     }
 
@@ -1755,6 +1772,32 @@ final class AcpConversation: ObservableObject {
         ["chatBooleanConfig.\(draftStorageKey)"]
     }
 
+    static func persistedModeDefaultsKeys(for draftStorageKey: String) -> [String] {
+        ["chatPermissionMode.\(draftStorageKey)"]
+    }
+
+    static func loadPersistedModeID(
+        for draftStorageKey: String,
+        defaults: UserDefaults = .standard
+    ) -> String? {
+        guard let key = persistedModeDefaultsKeys(for: draftStorageKey).first,
+              let id = defaults.string(forKey: key),
+              !id.isEmpty, id.utf8.count <= 256 else { return nil }
+        return id
+    }
+
+    /// Remember (or forget, for an unkeyed chat) the mode this chat runs under.
+    private func rememberMode(_ id: String) {
+        rememberedModeID = id
+        guard let draftStorageKey,
+              let key = Self.persistedModeDefaultsKeys(for: draftStorageKey).first else { return }
+        guard !id.isEmpty, id.utf8.count <= 256 else {
+            UserDefaults.standard.removeObject(forKey: key)
+            return
+        }
+        UserDefaults.standard.set(id, forKey: key)
+    }
+
     static func loadPersistedBooleanConfigValues(
         for draftStorageKey: String,
         defaults: UserDefaults = .standard
@@ -1800,6 +1843,7 @@ final class AcpConversation: ObservableObject {
     ) {
         let keys = persistedDraftDefaultsKeys(for: draftStorageKey)
             + persistedBooleanConfigDefaultsKeys(for: draftStorageKey)
+            + persistedModeDefaultsKeys(for: draftStorageKey)
         for key in keys {
             currentDefaults.removeObject(forKey: key)
             migratedDefaults?.removeObject(forKey: key)
@@ -2072,6 +2116,10 @@ final class AcpConversation: ObservableObject {
             currentModelID = id
         case let .modeChanged(id):
             currentModeID = id
+            // Adapter-side switches (plan-mode exits, in-band slash commands)
+            // are as much the chat's mode as a chip click, so they update the
+            // remembered mode too.
+            rememberMode(id)
         case let .commands(list):
             commands = list
         case let .configOptions(options):

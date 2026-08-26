@@ -1282,7 +1282,6 @@ struct SidebarBackdropView: View {
     static let liveTint = (dark: 0.15, light: 0.0)
 
     @Environment(\.colorScheme) private var colorScheme
-    @Environment(\.controlActiveState) private var controlActiveState
     @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
     @Environment(\.colorSchemeContrast) private var accessibilityContrast
     @ObservedObject private var settings = NativePreviewSettings.shared
@@ -1308,36 +1307,10 @@ struct SidebarBackdropView: View {
                             reduceTransparency: reduceTransparency
                         ))
                         .veil
-                    if colorScheme == .light {
-                        let visibility = controlActiveState == .key
-                            ? 1.0
-                            : LightRailTint.inactiveMultiplier
-                        LinearGradient(
-                            gradient: Gradient(stops: [
-                                .init(
-                                    color: LightRailTint.coolColor.opacity(
-                                        LightRailTint.coolCoverage * visibility
-                                    ),
-                                    location: 0
-                                ),
-                                .init(
-                                    color: Color.white.opacity(
-                                        LightRailTint.midpointCoverage * visibility
-                                    ),
-                                    location: LightRailTint.midpointLocation
-                                ),
-                                .init(
-                                    color: LightRailTint.pearlColor.opacity(
-                                        LightRailTint.pearlCoverage * visibility
-                                    ),
-                                    location: 1
-                                ),
-                            ]),
-                            startPoint: placement.tintStartPoint,
-                            endPoint: placement.tintEndPoint
-                        )
-                        .allowsHitTesting(false)
-                    }
+                    // No edge cast. The light rails used to carry a
+                    // cool-to-pearl gradient here; the white/black pass
+                    // removed it so a glass rail is white frost, black frost,
+                    // and the desktop's own colour — nothing the app adds.
                     if accessibilityContrast == .increased {
                         Color(nsColor: .controlBackgroundColor)
                             .opacity(GlassBackdropWash.sidebarIncreasedContrastOverlay(isDark: colorScheme == .dark))
@@ -1348,10 +1321,8 @@ struct SidebarBackdropView: View {
             // The rails are ground, and the ground is material in every theme
             // now: the same coverage as the Solid canvas, because the rails
             // and the canvas are one surface in the opaque themes and a
-            // separation step here would draw a seam at the divider. No
-            // `LightRailTint` edge cast — that cast is solved against the
-            // glass rail's composite, and it would give Solid a colour it
-            // never had.
+            // separation step here would draw a seam at the divider. No edge
+            // cast, same as glass: colour on a rail belongs to Tinted alone.
             if reduceTransparency {
                 Color(nsColor: .controlBackgroundColor)
             } else {

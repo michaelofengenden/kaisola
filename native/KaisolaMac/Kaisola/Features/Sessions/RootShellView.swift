@@ -2397,7 +2397,10 @@ struct RootShellView: View {
                 .padding(.vertical, 8)
                 .background(
                     .regularMaterial,
-                    in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    in: RoundedRectangle(
+                        cornerRadius: KaisolaVisualSystem.chromeRadius,
+                        style: .continuous
+                    )
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
@@ -2467,7 +2470,7 @@ struct RootShellView: View {
             if let recovery = model.missingSessionRecovery {
                 missingSessionRecoveryState(recovery)
             } else if let maximized = model.maximizedPaneID, layout.contains(maximized) {
-                unifiedSessionCard(maximized, clearsWindowControls: true)
+                unifiedSessionCard(maximized, clearsWindowControls: true, isSolo: true)
             } else if layout.isEmpty {
                 // The draft overlay paints its own chooser over this grid;
                 // mounting the empty state's chooser underneath it doubled
@@ -2481,12 +2484,14 @@ struct RootShellView: View {
                     let dividerSpace = CGFloat(max(0, layout.columns.count - 1)) * SessionPaneDividerSizing.layoutExtent
                     let available = max(1, geometry.size.width - dividerSpace)
                     let totalWeight = max(0.01, layout.columns.reduce(0) { $0 + $1.weight })
+                    let isSolo = layout.sessionIDs.count == 1
                     HStack(spacing: 0) {
                         ForEach(Array(layout.columns.enumerated()), id: \.element.id) { index, column in
                             unifiedSessionColumn(
                                 column,
                                 projectID: activeProjectID,
-                                clearsWindowControls: index == 0
+                                clearsWindowControls: index == 0,
+                                isSolo: isSolo
                             )
                                 .frame(width: available * CGFloat(column.weight / totalWeight))
                             if index < layout.columns.count - 1, let projectID = activeProjectID {
@@ -2507,7 +2512,8 @@ struct RootShellView: View {
     private func unifiedSessionColumn(
         _ column: SessionPaneLayout.Column,
         projectID: String?,
-        clearsWindowControls: Bool
+        clearsWindowControls: Bool,
+        isSolo: Bool = false
     ) -> some View {
         GeometryReader { geometry in
             let dividerSpace = CGFloat(max(0, column.sessionIDs.count - 1)) * SessionPaneDividerSizing.layoutExtent
@@ -2517,7 +2523,8 @@ struct RootShellView: View {
                 ForEach(Array(column.sessionIDs.enumerated()), id: \.element) { index, id in
                     unifiedSessionCard(
                         id,
-                        clearsWindowControls: clearsWindowControls && index == 0
+                        clearsWindowControls: clearsWindowControls && index == 0,
+                        isSolo: isSolo
                     )
                         .frame(height: available * CGFloat(column.rowWeights[index] / totalWeight))
                     if index < column.sessionIDs.count - 1, let projectID {
@@ -2598,7 +2605,8 @@ struct RootShellView: View {
 
     private func unifiedSessionCard(
         _ id: String,
-        clearsWindowControls: Bool = false
+        clearsWindowControls: Bool = false,
+        isSolo: Bool = false
     ) -> some View {
         GeometryReader { geometry in
             // On the shared corner ladder since v1.1.8; it was a bare literal 8
@@ -2622,26 +2630,38 @@ struct RootShellView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(terminalChrome.map { Color(nsColor: $0.background) }
                 ?? Color(nsColor: .textBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: cardRadius, style: .continuous))
+            // A lone pane is the chrome card's whole content, so it takes the
+            // card's own corners instead of floating as a second card: the
+            // old 6pt gutter put an 11pt-radius hairline ring inside the
+            // 22pt-radius chrome edge, and the two unrelated arcs a few
+            // points apart were exactly the "weird corner borders" around a
+            // solo chat. Grids keep the gutter, the tighter clip, and the
+            // border — there the ring separates siblings, which is a job.
+            .clipShape(RoundedRectangle(
+                cornerRadius: isSolo ? KaisolaVisualSystem.chromeRadius : cardRadius,
+                style: .continuous
+            ))
             .overlay {
                 // strokeBorder, not stroke: a centered stroke straddles the
                 // clip boundary, so its outer half rendered as a second ring
                 // just outside the card's own edge — every pane corner showed
                 // two concentric lines instead of one border.
-                RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
-                    .strokeBorder(
-                        marksFocus
-                            ? Color.accentColor.opacity(0.30)
-                            : terminalChrome.map {
-                                Color(nsColor: $0.foreground).opacity($0.ruleOpacity)
-                            } ?? Color(nsColor: .separatorColor).opacity(0.55),
-                        lineWidth: marksFocus
-                            ? KaisolaVisualSystem.focusStroke
-                            : KaisolaVisualSystem.hairline
-                    )
+                if !isSolo {
+                    RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
+                        .strokeBorder(
+                            marksFocus
+                                ? Color.accentColor.opacity(0.30)
+                                : terminalChrome.map {
+                                    Color(nsColor: $0.foreground).opacity($0.ruleOpacity)
+                                } ?? Color(nsColor: .separatorColor).opacity(0.55),
+                            lineWidth: marksFocus
+                                ? KaisolaVisualSystem.focusStroke
+                                : KaisolaVisualSystem.hairline
+                        )
+                }
             }
-            .padding(.horizontal, 6)
-            .padding(.vertical, 4)
+            .padding(.horizontal, isSolo ? 0 : 6)
+            .padding(.vertical, isSolo ? 0 : 4)
             .onDrop(
                 of: [UTType.utf8PlainText],
                 delegate: SessionPaneDropDelegate(

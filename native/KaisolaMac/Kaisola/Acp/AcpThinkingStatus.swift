@@ -94,6 +94,10 @@ struct AcpTranscriptSectionLabel: View {
 /// keeps it in view without new machinery.
 struct AcpThinkingStatusRow: View {
     let status: AcpThinkingStatus
+    /// The current turn's subagent headcount ("2 subagents, 1 working"),
+    /// spoken beside the status word so checking on delegated work never
+    /// requires scrolling back to find the chips. Nil when the turn has none.
+    var subagentDetail: String?
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// The CI capture must never photograph a mid-sweep frame. Structural,
@@ -128,10 +132,18 @@ struct AcpThinkingStatusRow: View {
                 ShimmerTextView(text: status.word + "…", font: Self.font, animated: true)
                     .fixedSize()
             }
+            if let subagentDetail {
+                Text("· " + subagentDetail)
+                    .font(.callout)
+                    .foregroundStyle(.kaisolaSecondary)
+                    .lineLimit(1)
+            }
         }
         .padding(.vertical, 2)
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel(status.spoken)
+        .accessibilityLabel(
+            subagentDetail.map { "\(status.spoken), \($0)" } ?? status.spoken
+        )
         .accessibilityAddTraits(.updatesFrequently)
         .accessibilityIdentifier("acp.thinkingStatus")
     }

@@ -96,6 +96,47 @@ struct AcpChatView: View {
     /// survives the whole turn, so on a large transcript an every-chunk pin
     /// became a layout storm that pegged a core and starved painting.
     @State private var transcriptTailPinScheduled = false
+    /// The folded transcript (markers instead of tool-call runs), recomputed
+    /// once per content version alongside the other derived state — never in
+    /// the body.
+    @State private var displayItems: [AcpTranscriptDisplayItem] = []
+    /// Message rows that are a turn's final answer and so carry the response
+    /// chrome; interim narration renders as plain prose.
+    @State private var finalResponseIDs: Set<String> = []
+    /// Work markers the user has opened. Keyed by the run's stable id, so an
+    /// open run stays open while the turn streams; reset by remount, so a
+    /// revisited chat starts quiet again.
+    @State private var expandedRunIDs: Set<String> = []
+    /// Tool-call ids of the turn in flight, so a chip's "in background" claim
+    /// dies with its own turn instead of resurrecting on any later one.
+    @State private var currentTurnToolIDs: Set<String> = []
+
+    /// One scan per body pass: which mounted item carries the search match.
+    private var highlightedDisplayItemID: String? {
+        guard let current = transcriptSearch.currentRowID else { return nil }
+        if displayItems.contains(where: { $0.id == current }) { return current }
+        return AcpTranscriptDisplay.runID(containing: current, in: displayItems)
+    }
+
+    private func rowShowsResponseChrome(_ row: AcpTranscriptRow) -> Bool {
+        if case let .message(id, _) = row {
+            return finalResponseIDs.contains(id)
+        }
+        return true
+    }
+
+    private func refreshDisplayState() {
+        let rows = conversation.visibleRows
+        displayItems = AcpTranscriptDisplay.items(rows: rows, isRunning: conversation.isRunning)
+        finalResponseIDs = AcpTranscriptDisplay.finalResponseMessageIDs(rows: rows)
+        subagentStatusDetail = AcpSubagentSummary.derive(rows: rows)?.label
+        var spawns: Set<String> = []
+        for row in rows.reversed() {
+            if case .user = row { break }
+            if case let .tool(call) = row { spawns.insert(call.id) }
+        }
+        currentTurnToolIDs = spawns
+    }
     @State private var transcriptConversationID: ObjectIdentifier?
     @State private var isExportingTranscript = false
     @StateObject private var transcriptViewportAnchor = AcpTranscriptViewportAnchor()
@@ -549,33 +590,50 @@ struct AcpChatView: View {
                                 .foregroundStyle(.kaisolaSecondary)
                                 .padding(.bottom, AcpTranscriptMetrics.intraTurnSpacing)
                         }
-                        let visibleRows = conversation.visibleRows
-                        ForEach(Array(visibleRows.enumerated()), id: \.element.id) { index, row in
-                            VStack(alignment: .leading, spacing: 7) {
-                                if row.transcriptSection != visibleRows[safe: index - 1]?.transcriptSection {
-                                    if row.transcriptSection == .work {
-                                        AcpTranscriptSectionLabel(kind: .work)
-                                    } else if row.transcriptSection == .response {
-                                        AcpTranscriptSectionLabel(kind: .response)
-                                    }
+                        // Display items, not raw rows: bursts of plain tool
+                        // calls fold into one expandable marker line, the way
+                        // the Codex app logs work, and only prose, thoughts,
+                        // chips, and the live tail keep their own line.
+                        ForEach(Array(displayItems.enumerated()), id: \.element.id) { index, item in
+                            Group {
+                                switch item {
+                                case let .row(row):
+                                    TranscriptRowView(
+                                        row: row,
+                                        workspaceURL: conversation.workspaceURL,
+                                        retry: { conversation.retryFailed($0) },
+                                        terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) },
+                                        showsResponseChrome: rowShowsResponseChrome(row),
+                                        conversationIsRunning: conversation.isRunning
+                                            && { if case let .tool(call) = row { return currentTurnToolIDs.contains(call.id) }; return true }()
+                                    )
+                                case let .workRun(_, calls):
+                                    WorkRunMarkerRow(
+                                        calls: calls,
+                                        expanded: expandedRunIDs.contains(item.id),
+                                        workspaceURL: conversation.workspaceURL,
+                                        terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) },
+                                        toggle: {
+                                            if expandedRunIDs.contains(item.id) {
+                                                expandedRunIDs.remove(item.id)
+                                            } else {
+                                                expandedRunIDs.insert(item.id)
+                                            }
+                                        }
+                                    )
                                 }
-                                TranscriptRowView(
-                                    row: row,
-                                    workspaceURL: conversation.workspaceURL,
-                                    retry: { conversation.retryFailed($0) },
-                                    terminalSnapshot: { [weak conversation] id in await conversation?.terminalSnapshot(id) }
-                                )
                             }
-                            .id(row.id)
+                            .id(item.id)
                             .background {
                                 AcpTranscriptViewportMarker(
-                                    rowID: row.id,
+                                    rowID: item.id,
                                     anchor: transcriptViewportAnchor
                                 )
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                             }
                             .background {
-                                if transcriptSearch.currentRowID == row.id {
+                                if let highlighted = highlightedDisplayItemID,
+                                   highlighted == item.id {
                                     RoundedRectangle(cornerRadius: 8)
                                         .fill(Color.accentColor.opacity(0.12))
                                         .accessibilityHidden(true)
@@ -585,18 +643,19 @@ struct AcpChatView: View {
                             // and search highlight hug the row rather than
                             // annexing the turn gap above it.
                             .padding(.top, AcpTranscriptMetrics.spacing(
-                                before: index == 0 ? nil : visibleRows[index - 1].rhythmKind,
-                                after: row.rhythmKind
+                                before: index == 0 ? nil : displayItems[index - 1].rhythmKind,
+                                after: item.rhythmKind
                             ))
                         }
                         if let status = conversation.liveThinkingStatus {
                             AcpThinkingStatusRow(
                                 status: status,
-                                subagentDetail: subagentStatusDetail
+                                subagentDetail: subagentStatusDetail,
+                                startedAt: conversation.turnStartedAt
                             )
                                 .id("acp-thinking-status")
                                 .padding(.top, AcpTranscriptMetrics.spacing(
-                                    before: visibleRows.last?.rhythmKind,
+                                    before: displayItems.last?.rhythmKind,
                                     after: .assistant
                                 ))
                         }
@@ -627,6 +686,15 @@ struct AcpChatView: View {
                         }
                     }
                 }
+                // Content mounts already sitting at its end. Without an
+                // anchor, SwiftUI laid the transcript out at offset zero and
+                // the mount then chased the bottom across frames — which read
+                // as the whole history scrolling past on every open. Scoped
+                // to the initial offset where the OS allows: unscoped, the
+                // anchor also governs size changes, which would drag a
+                // deliberately scrolled-up reader back to the tail and glue a
+                // short transcript to the composer.
+                .modifier(TranscriptBottomAnchorModifier())
 
                 // Keyed to intent, not visibility: while follow is engaged the
                 // sentinel can flicker offscreen between pins during a fast
@@ -655,24 +723,25 @@ struct AcpChatView: View {
             }
             .onAppear {
                 transcriptConversationID = ObjectIdentifier(conversation)
+                // A chat you return to opens at its end, exactly like one you
+                // just restored: collapse the render window a reader may have
+                // expanded, so a remount never mounts thousands of rows.
+                conversation.collapseToTail()
+                expandedRunIDs.removeAll()
                 transcriptSearch.refresh(rows: conversation.visibleRows)
                 transcriptIsReady = false
                 transcriptIsAtBottom = true
                 transcriptFollowsTail = true
                 hasUnseenTranscriptUpdates = false
-                subagentStatusDetail = AcpSubagentSummary.derive(
-                    rows: conversation.visibleRows
-                )?.label
+                refreshDisplayState()
                 DispatchQueue.main.async {
                     proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
                     transcriptIsReady = true
                 }
             }
-            .onChange(of: conversation.contentVersion) { _, newVersion in
+            .onChange(of: conversation.contentVersion, initial: true) { _, newVersion in
                 transcriptSearch.refresh(rows: conversation.visibleRows)
-                subagentStatusDetail = AcpSubagentSummary.derive(
-                    rows: conversation.visibleRows
-                )?.label
+                refreshDisplayState()
                 guard transcriptIsReady,
                       conversation.lastHistoryInsertionContentVersion != newVersion else { return }
                 if transcriptFollowsTail {
@@ -690,11 +759,28 @@ struct AcpChatView: View {
                     proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
                 }
             }
+            .onChange(of: conversation.isRunning) { _, _ in
+                // The turn's end folds the live tail rows back into their
+                // marker; the start splits them out.
+                refreshDisplayState()
+            }
             .onChange(of: searchNavigationRequest) { _, request in
                 guard let request,
                       let rowID = transcriptSearch.move(request.direction) else { return }
-                TerminalTranscriptScrollPolicy.preserveUserVelocity {
-                    proxy.scrollTo(rowID, anchor: .center)
+                // A match hidden inside a collapsed work marker opens it
+                // first, or the scroll would target an id that isn't mounted.
+                if let runID = AcpTranscriptDisplay.runID(containing: rowID, in: displayItems) {
+                    expandedRunIDs.insert(runID)
+                    // The card mounts on the state change; scroll after it.
+                    DispatchQueue.main.async {
+                        TerminalTranscriptScrollPolicy.preserveUserVelocity {
+                            proxy.scrollTo(rowID, anchor: .center)
+                        }
+                    }
+                } else {
+                    TerminalTranscriptScrollPolicy.preserveUserVelocity {
+                        proxy.scrollTo(rowID, anchor: .center)
+                    }
                 }
             }
             .onChange(of: searchPageRequestGeneration) { _, _ in
@@ -859,7 +945,7 @@ struct AcpChatView: View {
                 await nextTranscriptLayoutPass()
                 mountedAnchor = transcriptViewportAnchor.capture()
             }
-            let fallbackAnchor = conversation.visibleRows.first?.id
+            let fallbackAnchor = displayItems.first?.id
             guard mountedAnchor != nil || fallbackAnchor != nil else {
                 loadingEarlierRows = false
                 return
@@ -1483,6 +1569,14 @@ struct TranscriptRowView: View {
     var workspaceURL: URL?
     var retry: ((String) -> Void)?
     var terminalSnapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
+    /// True for the message that closes a turn. Interim narration renders as
+    /// plain prose; only the turn's final answer carries the response
+    /// affordances (Copy response).
+    var showsResponseChrome = true
+    /// Whether the conversation is still running. A backgrounded subagent's
+    /// chip may only claim live work while the turn that spawned it is alive;
+    /// after that the honest word is past tense.
+    var conversationIsRunning = true
 
     var body: some View {
         switch row {
@@ -1537,7 +1631,14 @@ struct TranscriptRowView: View {
             .accessibilityIdentifier("acp.transcript.\(row.id)")
             .accessibilityLabel("You said: \(text)")
         case let .message(_, text):
-            AssistantMarkdownText(text: text, workspaceURL: workspaceURL)
+            AssistantMarkdownText(
+                text: text,
+                workspaceURL: workspaceURL,
+                showsCopyButton: showsResponseChrome
+            )
+            // The section captions are gone; the turn's final answer is the
+            // heading landmark VoiceOver's rotor steps between.
+            .accessibilityAddTraits(showsResponseChrome ? .isHeader : [])
         case let .thought(_, text):
             // The quote block's left rule, in tertiary ink: an expanded
             // thought must stay separable from the answer around it.
@@ -1570,7 +1671,12 @@ struct TranscriptRowView: View {
         case let .tool(call):
             switch AcpDelegatedWork.classify(call) {
             case let .subagent(phase):
-                SubagentChipRow(call: call, phase: phase, workspaceURL: workspaceURL)
+                SubagentChipRow(
+                    call: call,
+                    phase: phase,
+                    workspaceURL: workspaceURL,
+                    turnIsLive: conversationIsRunning
+                )
             case .compaction:
                 CompactionRow(status: call.status)
             case nil:
@@ -1670,6 +1776,82 @@ struct ToolCallAccessibility: Equatable {
     }
 }
 
+/// `.defaultScrollAnchor(.bottom, for: .initialOffset)` where the OS has the
+/// scoped form; the unscoped anchor below macOS 15 also re-anchors on size
+/// changes, which is tolerable there and correct nowhere else.
+private struct TranscriptBottomAnchorModifier: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 15.0, *) {
+            content.defaultScrollAnchor(.bottom, for: .initialOffset)
+        } else {
+            content.defaultScrollAnchor(.bottom)
+        }
+    }
+}
+
+/// One quiet line per burst of tool work — "Ran 4 commands, read 2 files" —
+/// with the call-by-call log behind a click, the way the Codex app writes a
+/// turn. The marker is the collapsed state and the default: the stream shows
+/// the occasional prose and thoughts, not the machinery.
+struct WorkRunMarkerRow: View {
+    let calls: [AcpToolCall]
+    let expanded: Bool
+    var workspaceURL: URL?
+    var terminalSnapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
+    let toggle: () -> Void
+
+    var body: some View {
+        let summary = AcpWorkRunSummary(calls: calls)
+        return VStack(alignment: .leading, spacing: 4) {
+            Button(action: toggle) {
+                HStack(spacing: 7) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.kaisolaTertiary)
+                        .frame(width: 13)
+                        .accessibilityHidden(true)
+                    Text(summary.label)
+                        .font(.callout)
+                        .foregroundStyle(.kaisolaSecondary)
+                    if let failure = summary.failureLabel {
+                        Text("· " + failure)
+                            .font(.callout)
+                            .foregroundStyle(.red)
+                    }
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(
+                summary.failureLabel.map { "\(summary.label), \($0)" } ?? summary.label
+            )
+            .accessibilityValue(expanded ? "expanded" : "collapsed")
+            .accessibilityHint("Shows the call-by-call log")
+            .accessibilityIdentifier("acp.workrun.\(calls.first?.id ?? "empty")")
+            .accessibilityAddTraits(.isButton)
+
+            if expanded {
+                VStack(alignment: .leading, spacing: AcpTranscriptMetrics.workRunSpacing) {
+                    ForEach(calls) { call in
+                        ToolCallCard(
+                            call: call,
+                            workspaceURL: workspaceURL,
+                            terminalSnapshot: terminalSnapshot
+                        )
+                        // Keep the row-prefixed id addressable so search
+                        // navigation can land on a call inside an opened run.
+                        .id(AcpTranscriptRow.tool(call).id)
+                    }
+                }
+                .padding(.leading, 20)
+            }
+        }
+        .padding(.vertical, 1)
+    }
+}
+
 /// A spawned subagent, as the Codex app draws one: a small pill with the
 /// job's name and its state, visually distinct from the flat run of tool log
 /// lines around it — one row of the transcript is a whole other agent, and it
@@ -1681,8 +1863,18 @@ struct SubagentChipRow: View {
     let call: AcpToolCall
     let phase: AcpSubagentPhase
     var workspaceURL: URL?
+    /// False once the turn that spawned this agent has ended. "in background"
+    /// is a live claim; a finished turn's detached spawn reads "delegated" —
+    /// the stream never says whether it completed, and the chip must not
+    /// pretend to know.
+    var turnIsLive = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var expanded = false
+    @State private var showsActivity = false
+
+    private var statusText: String {
+        phase == .backgrounded && !turnIsLive ? "delegated" : phase.statusWord
+    }
 
     /// The launch acknowledgement on a backgrounded spawn is adapter
     /// plumbing, not a report; there is nothing worth disclosing.
@@ -1691,20 +1883,35 @@ struct SubagentChipRow: View {
         return call.content.contains { if case .text = $0 { return true } else { return false } }
     }
 
+    /// The detached agent's own transcript, when the launch acknowledgement
+    /// named one. This is what makes the chip a window, not a label: click it
+    /// and watch what the subagent is doing.
+    private var activityFileURL: URL? {
+        AcpSubagentActivity.outputFileURL(from: call)
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             Button {
-                guard hasReport else { return }
-                expanded.toggle()
+                if activityFileURL != nil, hasReport == false || phase == .backgrounded {
+                    showsActivity.toggle()
+                } else if hasReport {
+                    expanded.toggle()
+                }
             } label: {
                 chip
             }
             .buttonStyle(.plain)
+            .popover(isPresented: $showsActivity, arrowEdge: .bottom) {
+                if let url = activityFileURL {
+                    SubagentActivityView(title: call.title, fileURL: url)
+                }
+            }
             .accessibilityElement(children: .ignore)
             .accessibilityLabel("Subagent: \(call.title)")
-            .accessibilityValue(phase.statusWord + (hasReport ? (expanded ? ", expanded" : ", report available") : ""))
+            .accessibilityValue(statusText + (hasReport ? (expanded ? ", expanded" : ", report available") : (activityFileURL != nil ? ", activity available" : "")))
             .accessibilityIdentifier("acp.subagent.\(call.id)")
-            .accessibilityAddTraits(hasReport ? [.isButton, .updatesFrequently] : [.updatesFrequently])
+            .accessibilityAddTraits((hasReport || activityFileURL != nil) ? [.isButton, .updatesFrequently] : [.updatesFrequently])
 
             if expanded {
                 ForEach(call.content) { artifact in
@@ -1735,10 +1942,17 @@ struct SubagentChipRow: View {
                 .font(.callout.weight(.medium))
                 .lineLimit(1)
                 .truncationMode(.middle)
-            Text(phase.statusWord)
+            Text(statusText)
                 .font(.caption)
                 .foregroundStyle(phase == .failed ? AnyShapeStyle(.red) : AnyShapeStyle(.kaisolaSecondary))
-            if hasReport {
+            if activityFileURL != nil, phase == .backgrounded || phase == .working {
+                // The spoken invitation, not a mystery glyph: a detached
+                // agent's chip says it can be watched.
+                Label("watch", systemImage: "waveform")
+                    .font(.caption)
+                    .foregroundStyle(Color.accentColor)
+                    .labelStyle(.titleAndIcon)
+            } else if hasReport {
                 Image(systemName: expanded ? "chevron.down" : "chevron.right")
                     .font(.caption2)
                     .foregroundStyle(.kaisolaSecondary)
@@ -1746,11 +1960,19 @@ struct SubagentChipRow: View {
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 5)
-        .background(
-            phase == .failed ? AnyShapeStyle(.red.opacity(0.08)) : AnyShapeStyle(.quaternary.opacity(0.4)),
-            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
-        )
-        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        // A pill of Liquid Glass (material below macOS 26), not a grey wash —
+        // the Codex reference chips are white-led. The failed wash is an
+        // explicit layer because the control surface's tint channel only
+        // exists on the macOS 26 branch, and a failed chip must differ on
+        // every OS and under Reduce Transparency.
+        .background {
+            if phase == .failed {
+                RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous)
+                    .fill(.red.opacity(0.08))
+            }
+        }
+        .kaisolaControlSurface(active: phase == .working)
+        .contentShape(RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius, style: .continuous))
     }
 
     private var iconColor: Color {
@@ -1759,6 +1981,112 @@ struct SubagentChipRow: View {
         case .backgrounded, .finished: .kaisolaSecondary
         case .failed: .red
         }
+    }
+}
+
+/// The live window onto a detached subagent: the tail of its harness
+/// transcript, refreshed every two seconds while open, with a freshness line
+/// so "is it working" has an answer at a glance.
+private struct SubagentActivityView: View {
+    let title: String
+    let fileURL: URL
+    @State private var actions: [String] = []
+    @State private var lastModified: Date?
+    @State private var fileMissing = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 7) {
+                Image(systemName: "arrow.triangle.branch")
+                    .foregroundStyle(Color.accentColor)
+                Text(title)
+                    .font(.headline)
+                    .lineLimit(2)
+                Spacer(minLength: 0)
+            }
+            freshnessLine
+            Divider()
+            if actions.isEmpty {
+                Text(fileMissing
+                    ? "No transcript yet — the agent may still be starting."
+                    : "Nothing readable in the transcript yet.")
+                    .font(.callout)
+                    .foregroundStyle(.kaisolaSecondary)
+            } else {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(Array(actions.enumerated()), id: \.offset) { index, action in
+                        Text(action)
+                            .font(.callout)
+                            .foregroundStyle(index == actions.count - 1
+                                ? AnyShapeStyle(.primary)
+                                : AnyShapeStyle(.kaisolaSecondary))
+                            .lineLimit(2)
+                    }
+                }
+            }
+            Divider()
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+            } label: {
+                Label("Reveal transcript in Finder", systemImage: "folder")
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+        }
+        .padding(14)
+        .frame(width: 400, alignment: .leading)
+        .task {
+            while !Task.isCancelled {
+                await refresh()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("acp.subagent.activity")
+    }
+
+    @ViewBuilder
+    private var freshnessLine: some View {
+        if let lastModified {
+            let age = Date().timeIntervalSince(lastModified)
+            HStack(spacing: 5) {
+                Circle()
+                    .fill(age < 10 ? Color.green : Color.kaisolaTertiary)
+                    .frame(width: 7, height: 7)
+                Text(age < 10
+                    ? "Writing right now"
+                    : "Last wrote \(Self.ago(age)) ago")
+                    .font(.caption)
+                    .foregroundStyle(.kaisolaSecondary)
+            }
+        }
+    }
+
+    private static func ago(_ seconds: TimeInterval) -> String {
+        let s = Int(seconds)
+        if s < 60 { return "\(s)s" }
+        if s < 3600 { return "\(s / 60)m" }
+        return "\(s / 3600)h \(s % 3600 / 60)m"
+    }
+
+    private func refresh() async {
+        let url = fileURL
+        let result: ([String], Date?, Bool) = await Task.detached(priority: .utility) {
+            guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+                  let handle = try? FileHandle(forReadingFrom: url) else {
+                return ([], nil, true)
+            }
+            defer { try? handle.close() }
+            let size = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+            let modified = attributes[.modificationDate] as? Date
+            let tailLength: Int64 = 65_536
+            if size > tailLength { try? handle.seek(toOffset: UInt64(size - tailLength)) }
+            let data = (try? handle.readToEnd()) ?? Data()
+            return (AcpSubagentActivity.recentActions(fromTail: data), modified, false)
+        }.value
+        actions = result.0
+        lastModified = result.1
+        fileMissing = result.2
     }
 }
 

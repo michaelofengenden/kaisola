@@ -259,7 +259,17 @@ final class AcpConversation: ObservableObject {
     /// The transcript re-engages tail-follow on it: sending is asking to see
     /// the reply, wherever the user had scrolled to.
     @Published private(set) var localSendVersion: UInt64 = 0
-    @Published private(set) var isRunning = false
+    @Published private(set) var isRunning = false {
+        didSet {
+            guard isRunning != oldValue else { return }
+            // One owner for the turn clock, so no `isRunning = false` site —
+            // stop, turn end, error, exit — can forget to stop it.
+            turnStartedAt = isRunning ? Date() : nil
+        }
+    }
+    /// When the running turn began, for the status row's "Working for 33s".
+    /// Nil whenever no turn is running.
+    @Published private(set) var turnStartedAt: Date?
     @Published private(set) var isConnected = false
     @Published private(set) var isReconnecting = false
     @Published private(set) var usage: AcpUsage?
@@ -1693,6 +1703,16 @@ final class AcpConversation: ObservableObject {
     /// before it. Page insertion deliberately suppresses the persistence hook:
     /// those rows already came from the durable store and only the UI window
     /// changed. `contentVersion` still advances so the view restores its anchor.
+    /// Snaps the render window back to the tail. A chat you return to opens
+    /// at its end, exactly like a chat you just restored: `visibleLimit` only
+    /// ever grows while reading history, and remounting a view over a
+    /// thousands-of-rows window is what made a pane switch replay the whole
+    /// scroll. The loaded rows stay in memory; paging back re-expands the
+    /// window without touching disk.
+    func collapseToTail() {
+        visibleLimit = Self.defaultVisibleLimit
+    }
+
     func expandEarlier() async {
         if rows.count > visibleLimit {
             visibleLimit = min(rows.count, visibleLimit + Self.expandStep)

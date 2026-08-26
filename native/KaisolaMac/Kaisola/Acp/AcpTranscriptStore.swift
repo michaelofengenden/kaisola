@@ -228,15 +228,20 @@ actor AcpTranscriptStore {
             self.recentRowCount = max(0, min(recentRowCount, self.maximumRowCount))
         }
 
-        /// One pathological chat may spend at most 32 MiB and 10,000 rows.
-        /// The newest 2,000 rows are the first retention priority; older user
-        /// prompts and tool cards are pinned evidence and outrank narration,
-        /// thoughts, and superseded plans when the quota is tight.
+        /// Disk is deliberately cheap to spend (Michael, 2026-08-26: "it's
+        /// totally okay for Kaisola to take up as much disk space as
+        /// needed"). The old 32 MiB / 10,000-row cap was sized like a cache
+        /// and truncated real working history; the quota is now a
+        /// pathological-runaway bound only — 2 GiB and a million rows per
+        /// chat, roughly two orders of magnitude past the largest transcript
+        /// observed in practice. The eviction machinery and its
+        /// evidence-first ordering stay, because a bound you never hit still
+        /// needs to behave when something absurd hits it.
         static var production: RetentionPolicy {
             RetentionPolicy(
-                maximumRowCount: 10_000,
-                maximumBytes: 32 * 1_048_576,
-                recentRowCount: 2_000
+                maximumRowCount: 1_000_000,
+                maximumBytes: 2_048 * 1_048_576,
+                recentRowCount: 50_000
             )
         }
     }

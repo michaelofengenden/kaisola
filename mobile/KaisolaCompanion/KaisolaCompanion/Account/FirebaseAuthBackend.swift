@@ -279,6 +279,14 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
     /// legacy item may prompt ONE last time; the copy then lives in the
     /// data-protection keychain, where access is granted by the app's signed
     /// identity and never prompts again.
+    ///
+    /// The legacy original is deleted ONLY when the rewrite provably landed
+    /// in the data-protection keychain. `write` can fall back to the legacy
+    /// keychain mid-call (an unentitled build's normal path), and the old
+    /// unconditional delete then removed the very item the write had just
+    /// refreshed — the user granted the prompt, was signed in for one
+    /// session, and woke up signed out. That was the recurring
+    /// sign-out-after-update.
     private func migrateLegacyItemIfPresent(for key: String) throws -> Data? {
         var legacy = legacyQuery(for: key)
         legacy[kSecReturnData as String] = true
@@ -286,12 +294,21 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
         var result: CFTypeRef?
         let status = securityOperations.copyMatching(legacy as CFDictionary, &result)
         guard status == errSecSuccess, let data = result as? Data else { return nil }
-        try set(data, for: key)
-        _ = securityOperations.delete(legacyQuery(for: key) as CFDictionary)
+        let landedIn = try write(data, for: key)
+        if landedIn == .dataProtection {
+            _ = securityOperations.delete(legacyQuery(for: key) as CFDictionary)
+        }
         return data
     }
 
     func set(_ data: Data, for key: String) throws {
+        _ = try write(data, for: key)
+    }
+
+    /// The write, reporting which keychain actually took it — the migration
+    /// path's delete decision depends on that answer.
+    @discardableResult
+    private func write(_ data: Data, for key: String) throws -> KeychainAuthQueryMode {
         let attributes: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
@@ -303,7 +320,7 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
                 query as CFDictionary,
                 attributes as CFDictionary
             )
-            if updateStatus == errSecSuccess { return }
+            if updateStatus == errSecSuccess { return mode }
             if updateStatus == errSecMissingEntitlement {
                 guard let retryMode = fallbackState.retryMode(
                     afterMissingEntitlementIn: mode
@@ -332,7 +349,7 @@ final class KeychainAuthSecureStore: AuthSecureStoring, @unchecked Sendable {
             guard addStatus == errSecSuccess else {
                 throw KeychainStoreError(status: addStatus)
             }
-            return
+            return mode
         }
     }
 
@@ -535,7 +552,29 @@ final class FirebaseAuthBackend: AuthBackend {
         }
 
         try await vault.updateRefreshToken(refreshed.refreshToken ?? refreshToken)
-        guard let cachedAccount else {
+        let claims = Self.decodeClaims(from: refreshed.idToken)
+
+        // The token and the profile blob are two keychain items with
+        // independent fates. A refresh token that just proved itself must
+        // never be destroyed because the *profile cache* is unreadable — the
+        // fresh ID token names the account, so rebuild the profile from its
+        // claims and carry on. Only a token that cannot say who it is gives
+        // the session up.
+        let knownAccount: AuthAccount
+        if let cachedAccount {
+            knownAccount = cachedAccount
+        } else if let uid = claims?.userID, let derived = try? Self.makeAccount(
+            uid: uid,
+            email: claims?.email,
+            displayName: claims?.name,
+            photoURL: claims?.picture.flatMap(Self.safeAvatarURL)
+        ) {
+            try await vault.save(
+                refreshToken: refreshed.refreshToken ?? refreshToken,
+                account: derived
+            )
+            knownAccount = derived
+        } else {
             try await vault.clear()
             return nil
         }
@@ -548,12 +587,11 @@ final class FirebaseAuthBackend: AuthBackend {
                 idToken: refreshed.idToken,
                 configuration: configuration
             )
-            let claims = Self.decodeClaims(from: refreshed.idToken)
             let verifiedAccount = try Self.makeAccount(
                 uid: verifiedUser.uid,
-                email: verifiedUser.email ?? claims?.email ?? cachedAccount.email,
-                displayName: verifiedUser.name ?? claims?.name ?? cachedAccount.displayName,
-                photoURL: claims?.picture.flatMap(Self.safeAvatarURL) ?? cachedAccount.avatarURL
+                email: verifiedUser.email ?? claims?.email ?? knownAccount.email,
+                displayName: verifiedUser.name ?? claims?.name ?? knownAccount.displayName,
+                photoURL: claims?.picture.flatMap(Self.safeAvatarURL) ?? knownAccount.avatarURL
             )
             try await vault.save(
                 refreshToken: refreshed.refreshToken ?? refreshToken,
@@ -562,7 +600,7 @@ final class FirebaseAuthBackend: AuthBackend {
             return verifiedAccount
         } catch {
             if Task.isCancelled { throw CancellationError() }
-            return cachedAccount
+            return knownAccount
         }
     }
 
@@ -985,6 +1023,16 @@ private struct FirebaseIDTokenClaims: Decodable {
     let email: String?
     let name: String?
     let picture: String?
+    /// Firebase's stable uid claim, so a session can be restored even when
+    /// the cached profile blob is gone: the token itself says who it is.
+    let userID: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case email
+        case name
+        case picture
+        case userID = "user_id"
+    }
 }
 
 private struct FirebaseErrorEnvelope: Decodable {

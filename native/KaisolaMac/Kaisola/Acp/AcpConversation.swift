@@ -255,6 +255,10 @@ final class AcpConversation: ObservableObject {
     /// output. Page insertion has its own explicit anchor restoration and must
     /// never trigger the bottom-follow or "New output" path.
     private(set) var lastHistoryInsertionContentVersion: UInt64?
+    /// Advances when the user sends (or queues) a message from this machine.
+    /// The transcript re-engages tail-follow on it: sending is asking to see
+    /// the reply, wherever the user had scrolled to.
+    @Published private(set) var localSendVersion: UInt64 = 0
     @Published private(set) var isRunning = false
     @Published private(set) var isConnected = false
     @Published private(set) var isReconnecting = false
@@ -788,10 +792,12 @@ final class AcpConversation: ObservableObject {
             guard !trimmed.isEmpty else { return false }
             queueCounter += 1
             queued.append(QueuedMessage(id: "q\(queueCounter)", text: trimmed))
+            localSendVersion &+= 1
             return true
         }
         pendingAttachments.removeAll()
         dispatch(trimmed, attachments: attachments)
+        localSendVersion &+= 1
         return true
     }
 

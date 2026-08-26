@@ -19,22 +19,27 @@ enum KaisolaVisualSystem {
     /// < 26, and the perceived roundness lives in `chromeRadius` — the corner
     /// that sits mid-screen for the whole session, where the window's own
     /// 10pt system corner is only glanced at.
-    static let controlRadius: CGFloat = 9
+    /// v0.1.133 climbs once more ("make the kaisola app edges more round"),
+    /// and this time the chrome takes the biggest step: 10 < 12 < 14 < 18 <
+    /// 20 < 26 < 30. Twenty-six is the macOS 26 window-corner neighbourhood,
+    /// so the floating detail card now curves like the windows around it
+    /// rather than a step tighter.
+    static let controlRadius: CGFloat = 10
     /// A session pane card, which sits *inside* the detail chrome panel. Was a
     /// bare `8` written inline in `RootShellView.unifiedSessionCard`; naming it
     /// is what puts it on the ladder at all.
-    static let paneRadius: CGFloat = 11
-    static let insetRadius: CGFloat = 13
-    static let cardRadius: CGFloat = 16
+    static let paneRadius: CGFloat = 12
+    static let insetRadius: CGFloat = 14
+    static let cardRadius: CGFloat = 18
     /// The document-preview and Files panels, which are nested one level inside
     /// the detail chrome panel and so stay a step under `chromeRadius`.
-    static let panelRadius: CGFloat = 18
-    static let shellRadius: CGFloat = 26
+    static let panelRadius: CGFloat = 20
+    static let shellRadius: CGFloat = 30
     /// Safari's inset floating-card chrome: the radius of the sidebar and
     /// detail panels that float over the window backdrop. Larger than
     /// `cardRadius` (which belongs to session cards *inside* a panel) and
     /// smaller than `shellRadius` (the window itself).
-    static let chromeRadius: CGFloat = 22
+    static let chromeRadius: CGFloat = 26
     /// The gutter of window backdrop left visible around each chrome panel.
     static let chromeInset: CGFloat = 6
     static let hairline: CGFloat = 0.5
@@ -89,17 +94,25 @@ enum AcpTranscriptMetrics {
     static let turnSpacing: CGFloat = 20
     /// Between consecutive assistant artifacts: message, tool call, plan.
     static let intraTurnSpacing: CGFloat = 8
+    /// Between consecutive work rows. A burst of tool calls is one activity,
+    /// the way Claude Code and the Codex app log it: a tight run of quiet
+    /// lines, not a stack of separated cards. Prose keeps `intraTurnSpacing`
+    /// on both sides of the run, so the log reads as one block between
+    /// paragraphs.
+    static let workRunSpacing: CGFloat = 3
     static let pagePadding: CGFloat = 20
     static let horizontalPadding: CGFloat = 22
     /// Between blocks inside one rendered assistant message.
     static let messageBlockSpacing: CGFloat = 12
 
-    /// The only distinction the rhythm draws. Everything that is not the
-    /// user's own message — audits and permission decisions included — sits
-    /// on the assistant's side of the conversation.
+    /// The rhythm's three voices. Everything that is not the user's own
+    /// message sits on the assistant's side of the conversation; within that
+    /// side, `work` rows (tool calls, thoughts, plans, audits, permission
+    /// decisions) run tighter than the prose they surround.
     enum RowKind: Equatable, Sendable {
         case user
         case assistant
+        case work
     }
 
     /// Top spacing for the row after the pair's boundary. Pure, so the pair
@@ -108,6 +121,7 @@ enum AcpTranscriptMetrics {
     static func spacing(before previous: RowKind?, after current: RowKind) -> CGFloat {
         guard let previous else { return 0 }
         if current == .user || previous == .user { return turnSpacing }
+        if current == .work, previous == .work { return workRunSpacing }
         return intraTurnSpacing
     }
 }
@@ -123,6 +137,14 @@ enum AcpBubble {
     /// A bubble is wider than it is tall.
     static let horizontalPadding: CGFloat = 13
     static let verticalPadding: CGFloat = 9
+    /// The bubble used `cardRadius`, which outranks the pane that clips the
+    /// whole chat — an inversion of the corner ladder — and on a one-line
+    /// prompt (~35pt tall) a 16pt arc consumed nearly the full height, so the
+    /// corners read as blown-out lobes and a failed bubble's red border was
+    /// four red arcs. Ten points stays under `paneRadius`, and under half the
+    /// one-line height, so the shape reads as a rounded rectangle at every
+    /// length.
+    static let cornerRadius: CGFloat = 10
 
     /// Light: a quiet ink wash, quaternary-weight. Dark: a near-black lift
     /// above the pane — opaque, like the composer card, so a pasted block
@@ -272,33 +294,12 @@ enum SidebarRailPlacement: Equatable, Sendable {
     }
 }
 
-/// A restrained cool-to-pearl cast at the two outside window edges.
-enum LightRailTint {
-    static let cool = (red: 90.0 / 255, green: 169.0 / 255, blue: 1.0)
-    static let pearl = (red: 1.0, green: 201.0 / 255, blue: 133.0 / 255)
-    /// Halved with the white-rail pass: over the brighter ground the old
-    /// 0.035 cool edge read as a lavender-grey cast, which was most of what
-    /// "gray" meant in practice.
-    static let coolCoverage = 0.018
-    static let midpointCoverage = 0.008
-    static let pearlCoverage = 0.008
-    static let midpointLocation = 0.62
-    /// Was 0.12, which snuffed the rail's only warmth the moment focus left
-    /// and stacked on top of the material's own inactive collapse. The rails
-    /// are not a focus indicator; the traffic lights and the toolbar already
-    /// are, so an unfocused window keeps nearly all of its edge cast.
-    static let inactiveMultiplier = 0.85
-    static let maximumCoverage = max(coolCoverage, midpointCoverage, pearlCoverage)
-    static let minimumTransmission = 1 - maximumCoverage
-
-    static var coolColor: Color {
-        Color(red: cool.red, green: cool.green, blue: cool.blue)
-    }
-
-    static var pearlColor: Color {
-        Color(red: pearl.red, green: pearl.green, blue: pearl.blue)
-    }
-}
+// `LightRailTint` — the cool-to-pearl cast at the light rails' outside edges
+// — is gone. It had already been halved once for reading as a lavender-grey
+// haze; the white/black pass removed it outright, because the glass rails'
+// contract is now strict neutrality: the only chroma on a rail is whatever
+// the desktop itself contributes through the material. The Tinted theme is
+// where colour on a rail lives.
 
 /// One tint source colour. A struct rather than a `(red:green:blue:)` tuple
 /// so palettes can be compared, iterated, and held in a table.

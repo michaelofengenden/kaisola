@@ -77,7 +77,25 @@ struct AcpChatView: View {
     @State private var transcriptIsReady = false
     @State private var loadingEarlierRows = false
     @State private var transcriptIsAtBottom = true
+    /// Whether streaming output keeps the transcript pinned to its tail.
+    /// This is the user's *intent*, set only by their own scrolling (or the
+    /// jump pill, or sending a message) — never by what streaming pushed
+    /// offscreen. `transcriptIsAtBottom` remains the sentinel's report of
+    /// what is visible; conflating the two was why follow silently died the
+    /// moment output outran the scroll pin.
+    @State private var transcriptFollowsTail = true
     @State private var hasUnseenTranscriptUpdates = false
+    /// The status row's subagent clause, recomputed once per content version
+    /// in `onChange` rather than in the body: a streaming turn re-evaluates
+    /// the transcript body far more often than its content actually changes,
+    /// and the derivation walks rows.
+    @State private var subagentStatusDetail: String?
+    /// Coalesces tail pins. One scroll-to-bottom per streamed chunk was the
+    /// old at-bottom behavior too, but the sentinel bug used to kill follow
+    /// within moments — accidental overload protection. Intent-based follow
+    /// survives the whole turn, so on a large transcript an every-chunk pin
+    /// became a layout storm that pegged a core and starved painting.
+    @State private var transcriptTailPinScheduled = false
     @State private var transcriptConversationID: ObjectIdentifier?
     @State private var isExportingTranscript = false
     @StateObject private var transcriptViewportAnchor = AcpTranscriptViewportAnchor()
@@ -173,7 +191,11 @@ struct AcpChatView: View {
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted, perform: handleDrop)
         .overlay {
             if isDropTargeted {
-                RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius)
+                // `paneRadius`, not `panelRadius`: the ring sits just inside
+                // the pane's own clip, and an 18pt arc inset 6pt inside an
+                // 11pt clip lost its corners to the clip — four different
+                // dash fragments where the corners should be.
+                RoundedRectangle(cornerRadius: KaisolaVisualSystem.paneRadius, style: .continuous)
                     .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6]))
                     .padding(6)
                     .allowsHitTesting(false)
@@ -568,7 +590,10 @@ struct AcpChatView: View {
                             ))
                         }
                         if let status = conversation.liveThinkingStatus {
-                            AcpThinkingStatusRow(status: status)
+                            AcpThinkingStatusRow(
+                                status: status,
+                                subagentDetail: subagentStatusDetail
+                            )
                                 .id("acp-thinking-status")
                                 .padding(.top, AcpTranscriptMetrics.spacing(
                                     before: visibleRows.last?.rhythmKind,
@@ -581,17 +606,36 @@ struct AcpChatView: View {
                             .onAppear {
                                 transcriptIsAtBottom = true
                                 hasUnseenTranscriptUpdates = false
+                                // Reaching the bottom by any means — keyboard,
+                                // scrollbar, momentum — re-engages follow.
+                                transcriptFollowsTail = true
                             }
                             .onDisappear { transcriptIsAtBottom = false }
                     }
                     .padding(.horizontal, AcpTranscriptMetrics.horizontalPadding)
                     .padding(.vertical, AcpTranscriptMetrics.pagePadding)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .background {
+                        AcpTranscriptScrollIntentSensor { distance in
+                            let follows = AcpTranscriptFollowPolicy.follows(
+                                afterUserScrollDistance: distance
+                            )
+                            if follows != transcriptFollowsTail {
+                                transcriptFollowsTail = follows
+                            }
+                            if follows { hasUnseenTranscriptUpdates = false }
+                        }
+                    }
                 }
 
-                if transcriptIsReady, !transcriptIsAtBottom, !conversation.rows.isEmpty {
+                // Keyed to intent, not visibility: while follow is engaged the
+                // sentinel can flicker offscreen between pins during a fast
+                // stream, and a pill that blinks through every burst reads as
+                // "following is broken" — which it was.
+                if transcriptIsReady, !transcriptFollowsTail, !conversation.rows.isEmpty {
                     Button {
                         hasUnseenTranscriptUpdates = false
+                        transcriptFollowsTail = true
                         withAnimation(.easeOut(duration: 0.15)) {
                             proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
                         }
@@ -614,7 +658,11 @@ struct AcpChatView: View {
                 transcriptSearch.refresh(rows: conversation.visibleRows)
                 transcriptIsReady = false
                 transcriptIsAtBottom = true
+                transcriptFollowsTail = true
                 hasUnseenTranscriptUpdates = false
+                subagentStatusDetail = AcpSubagentSummary.derive(
+                    rows: conversation.visibleRows
+                )?.label
                 DispatchQueue.main.async {
                     proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
                     transcriptIsReady = true
@@ -622,22 +670,24 @@ struct AcpChatView: View {
             }
             .onChange(of: conversation.contentVersion) { _, newVersion in
                 transcriptSearch.refresh(rows: conversation.visibleRows)
+                subagentStatusDetail = AcpSubagentSummary.derive(
+                    rows: conversation.visibleRows
+                )?.label
                 guard transcriptIsReady,
                       conversation.lastHistoryInsertionContentVersion != newVersion else { return }
-                if transcriptIsAtBottom {
-                    DispatchQueue.main.async {
-                        if presentation == .standard {
-                            withAnimation(.easeOut(duration: 0.15)) {
-                                proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
-                            }
-                        } else {
-                            // A unified card can swap sessions in place. Do not
-                            // animate from the preceding session's scroll offset.
-                            proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
-                        }
-                    }
+                if transcriptFollowsTail {
+                    scheduleTailPin(using: proxy)
                 } else {
                     hasUnseenTranscriptUpdates = true
+                }
+            }
+            .onChange(of: conversation.localSendVersion) { _, _ in
+                // Sending a message is asking to see the reply: it re-engages
+                // follow even from deep in history.
+                transcriptFollowsTail = true
+                hasUnseenTranscriptUpdates = false
+                DispatchQueue.main.async {
+                    proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
                 }
             }
             .onChange(of: searchNavigationRequest) { _, request in
@@ -656,6 +706,21 @@ struct AcpChatView: View {
         }
         .id(ObjectIdentifier(conversation))
         .dynamicTypeSize(previewSettings.agentChatTextSize.dynamicTypeSize)
+    }
+
+    /// At most one pending pin at a time, fired a beat later, so a burst of
+    /// streamed chunks collapses into a single scroll-and-layout pass. Intent
+    /// is re-checked at fire time: a user scroll during the wait wins. No
+    /// animation — an ease re-targeted at every burst lags the tail it is
+    /// chasing, and the content's own growth already reads as motion.
+    private func scheduleTailPin(using proxy: ScrollViewProxy) {
+        guard !transcriptTailPinScheduled else { return }
+        transcriptTailPinScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(80)) {
+            transcriptTailPinScheduled = false
+            guard transcriptFollowsTail else { return }
+            proxy.scrollTo("acp-transcript-bottom", anchor: .bottom)
+        }
     }
 
     @State private var transcriptSearch = AcpTranscriptSearchState()
@@ -1379,7 +1444,11 @@ struct ToolCallDensityPresentation: Equatable, Sendable {
         }
     }
 
-    var showsArtifactSummary: Bool { density != .compact }
+    /// Only the Detailed density annotates collapsed rows. Compact and
+    /// Balanced keep a collapsed call to its single line — the log-line
+    /// contract — and reveal counts and paths behind the disclosure.
+    var showsArtifactSummary: Bool { density == .detailed }
+    var showsAffectedFilesWhenCollapsed: Bool { density == .detailed }
     var wrapsAffectedFiles: Bool { density == .detailed }
     var expandsArtifactsByDefault: Bool { false }
 
@@ -1397,19 +1466,14 @@ struct ToolCallDensityPresentation: Equatable, Sendable {
         ]
     }
 
+    /// Spacing between a row's header and whatever detail it shows — the
+    /// files line, the artifact count, or the expanded artifacts. The old
+    /// `cardPadding` died with the card itself.
     var cardSpacing: CGFloat {
         switch density {
         case .compact: 4
-        case .balanced: 8
-        case .detailed: 10
-        }
-    }
-
-    var cardPadding: CGFloat {
-        switch density {
-        case .compact: 6
-        case .balanced: 9
-        case .detailed: 12
+        case .balanced: 6
+        case .detailed: 8
         }
     }
 }
@@ -1455,11 +1519,11 @@ struct TranscriptRowView: View {
                     .padding(.vertical, AcpBubble.verticalPadding)
                     .background(
                         failed ? Color.red.opacity(0.12) : AcpBubble.userFill,
-                        in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius)
+                        in: RoundedRectangle(cornerRadius: AcpBubble.cornerRadius, style: .continuous)
                     )
                     .overlay {
                         if failed {
-                            RoundedRectangle(cornerRadius: KaisolaVisualSystem.cardRadius)
+                            RoundedRectangle(cornerRadius: AcpBubble.cornerRadius, style: .continuous)
                                 .strokeBorder(.red.opacity(0.5))
                         }
                     }
@@ -1504,11 +1568,18 @@ struct TranscriptRowView: View {
                 }
             }
         case let .tool(call):
-            ToolCallCard(
-                call: call,
-                workspaceURL: workspaceURL,
-                terminalSnapshot: terminalSnapshot
-            )
+            switch AcpDelegatedWork.classify(call) {
+            case let .subagent(phase):
+                SubagentChipRow(call: call, phase: phase, workspaceURL: workspaceURL)
+            case .compaction:
+                CompactionRow(status: call.status)
+            case nil:
+                ToolCallCard(
+                    call: call,
+                    workspaceURL: workspaceURL,
+                    terminalSnapshot: terminalSnapshot
+                )
+            }
         case let .plan(_, entries):
             PlanCard(entries: entries)
         case let .permissionDecision(_, text):
@@ -1543,11 +1614,16 @@ extension AcpTranscriptRow {
         }
     }
 
-    /// Which side of the conversation the row sits on, for the transcript's
-    /// vertical rhythm.
+    /// Which voice of the transcript's vertical rhythm the row speaks in.
+    /// Work rows share `transcriptSection == .work` exactly, so the tight
+    /// work-run spacing and the "Agent work" label always describe the same
+    /// set of rows.
     var rhythmKind: AcpTranscriptMetrics.RowKind {
-        if case .user = self { return .user }
-        return .assistant
+        switch transcriptSection {
+        case .user: .user
+        case .response: .assistant
+        case .work: .work
+        }
     }
 }
 
@@ -1594,12 +1670,147 @@ struct ToolCallAccessibility: Equatable {
     }
 }
 
+/// A spawned subagent, as the Codex app draws one: a small pill with the
+/// job's name and its state, visually distinct from the flat run of tool log
+/// lines around it — one row of the transcript is a whole other agent, and it
+/// should not dress like a shell command. A foreground spawn's chip carries
+/// "working…" while its tool call is open and discloses the returned report
+/// when it lands; a background spawn honestly says "in background", because
+/// the stream never reports a detached agent's completion.
+struct SubagentChipRow: View {
+    let call: AcpToolCall
+    let phase: AcpSubagentPhase
+    var workspaceURL: URL?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var expanded = false
+
+    /// The launch acknowledgement on a backgrounded spawn is adapter
+    /// plumbing, not a report; there is nothing worth disclosing.
+    private var hasReport: Bool {
+        guard phase == .finished || phase == .failed else { return false }
+        return call.content.contains { if case .text = $0 { return true } else { return false } }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Button {
+                guard hasReport else { return }
+                expanded.toggle()
+            } label: {
+                chip
+            }
+            .buttonStyle(.plain)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Subagent: \(call.title)")
+            .accessibilityValue(phase.statusWord + (hasReport ? (expanded ? ", expanded" : ", report available") : ""))
+            .accessibilityIdentifier("acp.subagent.\(call.id)")
+            .accessibilityAddTraits(hasReport ? [.isButton, .updatesFrequently] : [.updatesFrequently])
+
+            if expanded {
+                ForEach(call.content) { artifact in
+                    if case let .text(text) = artifact {
+                        ToolTextArtifact(text: text)
+                    }
+                }
+                .padding(.leading, 20)
+            }
+        }
+        .environment(\.openURL, OpenURLAction { link in
+            AcpTranscriptLinkRouting.open(link, workspaceURL: workspaceURL)
+        })
+    }
+
+    private var chip: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "arrow.triangle.branch")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(iconColor)
+                .symbolEffect(
+                    .pulse,
+                    options: .repeating,
+                    isActive: !reduceMotion && phase == .working
+                )
+                .accessibilityHidden(true)
+            Text(call.title)
+                .font(.callout.weight(.medium))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Text(phase.statusWord)
+                .font(.caption)
+                .foregroundStyle(phase == .failed ? AnyShapeStyle(.red) : AnyShapeStyle(.kaisolaSecondary))
+            if hasReport {
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2)
+                    .foregroundStyle(.kaisolaSecondary)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(
+            phase == .failed ? AnyShapeStyle(.red.opacity(0.08)) : AnyShapeStyle(.quaternary.opacity(0.4)),
+            in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private var iconColor: Color {
+        switch phase {
+        case .working: .accentColor
+        case .backgrounded, .finished: .kaisolaSecondary
+        case .failed: .red
+        }
+    }
+}
+
+/// Context compaction is housekeeping, not work: one tertiary line, the way
+/// the Codex app writes "Context automatically compacting".
+struct CompactionRow: View {
+    let status: AcpToolCall.Status
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var text: String {
+        status == .completed ? "Context compacted" : "Compacting context…"
+    }
+
+    var body: some View {
+        HStack(spacing: 7) {
+            Image(systemName: "rectangle.compress.vertical")
+                .font(.system(size: 11))
+                .symbolEffect(
+                    .pulse,
+                    options: .repeating,
+                    isActive: !reduceMotion && status != .completed
+                )
+                .accessibilityHidden(true)
+            Text(text)
+                .font(.caption)
+        }
+        .foregroundStyle(.kaisolaTertiary)
+        .padding(.vertical, 1)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(text)
+    }
+}
+
+/// A tool call is a log line, not a card. The reference surfaces — Claude
+/// Code, the Codex app — write agent work as a run of quiet one-line entries
+/// between paragraphs of prose; the old full-width filled box per call turned
+/// every turn into a wall of grey rectangles, with the artifact paths spelled
+/// out under each one. The box, its padding, and the always-on affected-files
+/// line are gone: a collapsed call is one slim row, and everything heavier
+/// waits behind the disclosure.
 struct ToolCallCard: View {
     let call: AcpToolCall
     var workspaceURL: URL?
     var terminalSnapshot: (@Sendable (String) async -> AcpTerminalHost.Snapshot?)?
     @ObservedObject private var settings = NativePreviewSettings.shared
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var expanded = false
+    @State private var hovered = false
+
+    /// Aligns expanded detail under the title, past the status glyph and kind
+    /// tag, the way Claude Code indents a call's result under its bullet.
+    private static let detailIndent: CGFloat = 20
 
     private var density: ToolCallDensity { settings.toolCallDensity }
     private var presentation: ToolCallDensityPresentation {
@@ -1633,7 +1844,12 @@ struct ToolCallCard: View {
                     .accessibilityAddTraits(.updatesFrequently)
             }
 
-            if !presentation.affectedFiles.isEmpty {
+            // The paths live behind the disclosure now (or in the Detailed
+            // density, which asks for them): the title already names what the
+            // call touched, and a second line of raw links under every row was
+            // most of what made the transcript read as machinery.
+            if !presentation.affectedFiles.isEmpty,
+               expanded || presentation.showsAffectedFilesWhenCollapsed {
                 Text(AcpTranscriptInlineRendering.attributed(
                     presentation.affectedFiles.joined(separator: ", "),
                     workspaceURL: workspaceURL
@@ -1641,10 +1857,12 @@ struct ToolCallCard: View {
                     .font(.caption)
                     .foregroundStyle(.kaisolaSecondary)
                     .lineLimit(presentation.wrapsAffectedFiles ? nil : 1)
+                    .truncationMode(.middle)
+                    .padding(.leading, Self.detailIndent)
                     .accessibilityLabel(presentation.accessibilityOrder[3])
             }
 
-            if presentation.showsArtifactSummary, presentation.hasExpandableContent {
+            if presentation.showsArtifactSummary, hasArtifacts, !expanded {
                 Text(
                     presentation.artifactCount == 1
                         ? "1 artifact"
@@ -1652,6 +1870,7 @@ struct ToolCallCard: View {
                 )
                 .font(.caption2)
                 .foregroundStyle(.kaisolaSecondary)
+                .padding(.leading, Self.detailIndent)
                 .accessibilityLabel(presentation.accessibilityOrder[4])
             }
 
@@ -1666,33 +1885,45 @@ struct ToolCallCard: View {
                         TerminalContentView(terminalID: id, snapshot: terminalSnapshot)
                     }
                 }
+                .padding(.leading, Self.detailIndent)
             }
         }
-        .padding(presentation.cardPadding)
-        .background(
-            .quaternary.opacity(0.5),
-            in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius)
-        )
-        .overlay {
-            // A failed call must differ from a completed one by more than one
-            // red glyph.
-            if call.status == .failed {
-                RoundedRectangle(cornerRadius: KaisolaVisualSystem.controlRadius)
-                    .strokeBorder(
-                        Color.red.opacity(0.35),
-                        lineWidth: KaisolaVisualSystem.focusStroke
-                    )
-            }
-        }
+        .padding(.vertical, 1)
+        .background { rowWash }
+        .onHover { hovered = $0 }
         .environment(\.openURL, OpenURLAction { link in
             AcpTranscriptLinkRouting.open(link, workspaceURL: workspaceURL)
         })
     }
 
+    /// The only fills a row carries, bled a few points into the page margin so
+    /// the row's text stays on the prose's left edge. Failure keeps a standing
+    /// wash — a failed call must differ from a completed one by more than one
+    /// red glyph — and hover earns a whisper of surface on expandable rows.
+    @ViewBuilder
+    private var rowWash: some View {
+        if call.status == .failed {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(.red.opacity(0.07))
+                .padding(.horizontal, -7)
+        } else if hovered, hasArtifacts {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(.quaternary.opacity(0.35))
+                .padding(.horizontal, -7)
+        }
+    }
+
     private var header: some View {
         HStack(spacing: density == .compact ? 6 : 9) {
             Image(systemName: statusSymbol)
+                .font(.system(size: 11, weight: .medium))
                 .foregroundStyle(statusColor)
+                .frame(width: 13)
+                .symbolEffect(
+                    .pulse,
+                    options: .repeating,
+                    isActive: !reduceMotion && call.status == .inProgress
+                )
                 .accessibilityHidden(true)
             // The symbol already carries the status, so no status word: the
             // kind leads instead, and a column of chips scans as a left-aligned
@@ -1702,11 +1933,19 @@ struct ToolCallCard: View {
                 .font(.caption.monospaced())
                 .foregroundStyle(.kaisolaSecondary)
             Text(call.title)
+                .font(.callout)
+                .foregroundStyle(call.status == .failed ? AnyShapeStyle(.primary) : AnyShapeStyle(.kaisolaSecondary))
                 .lineLimit(density == .detailed ? 2 : 1)
+                .truncationMode(.middle)
             Spacer()
             if hasArtifacts {
+                // Present only while the pointer is near or the row is open:
+                // a chevron on every line of a forty-call run is forty
+                // chevrons. The hover wash and the AX value carry the
+                // affordance the rest of the time.
                 Image(systemName: expanded ? "chevron.down" : "chevron.right")
                     .font(.caption2).foregroundStyle(.kaisolaSecondary)
+                    .opacity(hovered || expanded ? 1 : 0)
             }
         }
         .contentShape(Rectangle())
@@ -1929,8 +2168,9 @@ struct TerminalContentView: View {
                     .padding(.vertical, 4)
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .strokeBorder(.quaternary, lineWidth: KaisolaVisualSystem.hairline))
         .task(id: PollIdentity(terminalID: terminalID, retryGeneration: retryGeneration)) {
             await model.poll(terminalID: terminalID, snapshot: snapshot)
         }
@@ -2040,8 +2280,9 @@ struct DiffView: View {
                 .padding(6)
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 6))
-        .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(.quaternary))
+        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 6, style: .continuous)
+            .strokeBorder(.quaternary, lineWidth: KaisolaVisualSystem.hairline))
     }
 
     private var unifiedBody: some View {

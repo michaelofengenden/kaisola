@@ -500,8 +500,14 @@ struct FilePreviewView: View {
         .background(Color(nsColor: .textBackgroundColor))
         .clipShape(RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius, style: .continuous))
         .overlay {
+            // strokeBorder at the shared hairline, like the session panes: a
+            // centered 0.8pt stroke straddled the clip edge and doubled the
+            // panel's corner arcs.
             RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius, style: .continuous)
-                .stroke(Color.primary.opacity(0.10), lineWidth: 0.8)
+                .strokeBorder(
+                    Color(nsColor: .separatorColor).opacity(0.55),
+                    lineWidth: KaisolaVisualSystem.hairline
+                )
         }
         .onAppear {
             FilePreviewRecoveryOwnerRegistry.shared.register(recoveryOwnerID)

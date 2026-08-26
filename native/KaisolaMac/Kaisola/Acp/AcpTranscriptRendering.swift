@@ -455,6 +455,103 @@ struct AcpTranscriptViewportMarker: NSViewRepresentable {
     }
 }
 
+/// Reports user-initiated scrolls of the transcript's enclosing scroll view.
+///
+/// The tail-follow decision must come from the user's hand, not from what
+/// happens to be on screen: the old signal was the bottom sentinel's
+/// `onDisappear`, and a fast-streaming turn pushes the sentinel offscreen
+/// between two pins, silently ending follow while the user never moved. AppKit
+/// separates the two cases for us — live-scroll notifications fire only for
+/// user gestures (trackpad, wheel, scroller drag), never for programmatic
+/// `scrollTo` — so this view forwards exactly that signal, with the distance
+/// from the bottom the gesture ended at.
+struct AcpTranscriptScrollIntentSensor: NSViewRepresentable {
+    var onUserScroll: (_ distanceFromBottom: CGFloat) -> Void
+
+    func makeNSView(context: Context) -> SensorView {
+        let view = SensorView()
+        view.setAccessibilityElement(false)
+        view.onUserScroll = onUserScroll
+        return view
+    }
+
+    func updateNSView(_ nsView: SensorView, context: Context) {
+        nsView.onUserScroll = onUserScroll
+    }
+
+    final class SensorView: NSView {
+        var onUserScroll: ((CGFloat) -> Void)?
+        private var observers: [NSObjectProtocol] = []
+        private weak var observedScrollView: NSScrollView?
+
+        override var isFlipped: Bool { true }
+
+        /// Detaches when leaving the window rather than in deinit: Swift 6
+        /// forbids touching the non-Sendable observer tokens from a
+        /// nonisolated deinit, and SwiftUI always unmounts through window
+        /// removal anyway.
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if window == nil {
+                detach()
+            } else {
+                attachIfNeeded()
+            }
+        }
+
+        override func layout() {
+            super.layout()
+            attachIfNeeded()
+        }
+
+        /// The enclosing scroll view exists only after SwiftUI mounts the
+        /// hierarchy, so attachment is retried from layout until it lands.
+        private func attachIfNeeded() {
+            guard let scrollView = enclosingScrollView,
+                  scrollView !== observedScrollView else { return }
+            detach()
+            observedScrollView = scrollView
+            let center = NotificationCenter.default
+            for name in [
+                NSScrollView.didLiveScrollNotification,
+                NSScrollView.didEndLiveScrollNotification,
+            ] {
+                observers.append(center.addObserver(
+                    forName: name,
+                    object: scrollView,
+                    queue: .main
+                ) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.reportDistance() }
+                })
+            }
+        }
+
+        private func detach() {
+            observers.forEach(NotificationCenter.default.removeObserver)
+            observers.removeAll()
+            observedScrollView = nil
+        }
+
+        /// Live-scroll notifications can also arrive for scroller adjustments
+        /// AppKit makes on its own (overlay scrollers appearing as streamed
+        /// content grows, for one). Requiring a scroll-shaped input event in
+        /// flight keeps the signal what it claims to be: the user's hand.
+        private static let userScrollEventTypes: Set<NSEvent.EventType> = [
+            .scrollWheel, .leftMouseDragged, .leftMouseDown, .leftMouseUp,
+        ]
+
+        private func reportDistance() {
+            guard let event = NSApp.currentEvent,
+                  Self.userScrollEventTypes.contains(event.type) else { return }
+            guard let scrollView = observedScrollView,
+                  let document = scrollView.documentView else { return }
+            let visibleBottom = scrollView.contentView.bounds.maxY
+            let distance = max(0, document.frame.height - visibleBottom)
+            onUserScroll?(distance)
+        }
+    }
+}
+
 /// Incremental structural cache for one assistant row. ACP message chunks are
 /// append-only, so an update reparses the final (potentially still-open) block
 /// rather than every stable block above it. Two short sentinels validate that
@@ -919,9 +1016,10 @@ private struct AcpTranscriptCodeBlock: View {
             }
             .frame(maxHeight: 420)
         }
-        .background(.black.opacity(0.10), in: RoundedRectangle(cornerRadius: 8))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .overlay(RoundedRectangle(cornerRadius: 8).strokeBorder(.quaternary))
+        .background(.black.opacity(0.10), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+            .strokeBorder(.quaternary, lineWidth: KaisolaVisualSystem.hairline))
         .accessibilityElement(children: .contain)
     }
 }
@@ -942,8 +1040,14 @@ private struct AcpTranscriptTable: View {
                             .background(index.isMultiple(of: 2) ? Color.primary.opacity(0.025) : .clear)
                     }
                 }
-                .overlay(RoundedRectangle(cornerRadius: 7).strokeBorder(.quaternary))
-                .clipShape(RoundedRectangle(cornerRadius: 7))
+                // Clip first, then stroke, like every sibling artifact. The
+                // reversed order drew the border and then clipped it with an
+                // identical shape, and the coincident antialiasing ate the
+                // stroke along the four corner arcs — a border that read as
+                // broken exactly at the corners.
+                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(.quaternary, lineWidth: KaisolaVisualSystem.hairline))
             }
             if omittedRows > 0 {
                 Label(MarkdownTableTruncation.message(omittedRows: omittedRows), systemImage: "ellipsis.rectangle")
@@ -967,7 +1071,7 @@ private struct AcpTranscriptTable: View {
                 .overlay(alignment: .trailing) {
                     Rectangle()
                         .fill(Color(nsColor: .separatorColor).opacity(0.55))
-                        .frame(width: 1)
+                        .frame(width: KaisolaVisualSystem.hairline)
                 }
         }
     }

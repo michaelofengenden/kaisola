@@ -106,13 +106,17 @@ struct AcpComposerCard: View {
                 .padding(.horizontal, 7)
                 .padding(.bottom, 7)
         }
-        .background(cardFill, in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius))
+        // `paneRadius`, one rung under the pane that clips the chat:
+        // `panelRadius` made the composer the roundest shape in the pane —
+        // rounder than its own container, an inversion of the corner ladder
+        // that read as a bulbous pill against the pane's tighter corners.
+        .background(cardFill, in: RoundedRectangle(cornerRadius: KaisolaVisualSystem.paneRadius, style: .continuous))
         .overlay {
             // The focused/unfocused split the pane focus ring already uses:
             // an accent stroke while the field holds focus, a hairline
             // separator otherwise. A flat full-weight border under Glass read
             // as a floating grey box.
-            RoundedRectangle(cornerRadius: KaisolaVisualSystem.panelRadius)
+            RoundedRectangle(cornerRadius: KaisolaVisualSystem.paneRadius, style: .continuous)
                 .strokeBorder(
                     focused
                         ? Color.accentColor.opacity(0.30)

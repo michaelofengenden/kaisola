@@ -991,22 +991,15 @@ final class NativePreviewSettingsTests: XCTestCase {
         XCTAssertEqual(KaisolaTheme.glass.workspaceBackdrop, .glass)
     }
 
-    func testLightRailTintIsDelicateAndMirroredAtWindowEdges() {
+    /// The placement points survive the `LightRailTint` removal because the
+    /// Tinted theme still mirrors its sweep per rail; the glass rails
+    /// themselves now carry no app-added chroma at all — white frost, black
+    /// frost, and whatever the desktop contributes through the material.
+    func testRailPlacementMirrorsTintSweepAtWindowEdges() {
         XCTAssertEqual(SidebarRailPlacement.leading.tintStartPoint, .topLeading)
         XCTAssertEqual(SidebarRailPlacement.leading.tintEndPoint, .bottomTrailing)
         XCTAssertEqual(SidebarRailPlacement.trailing.tintStartPoint, .topTrailing)
         XCTAssertEqual(SidebarRailPlacement.trailing.tintEndPoint, .bottomLeading)
-
-        XCTAssertLessThanOrEqual(LightRailTint.maximumCoverage, 0.04)
-        XCTAssertGreaterThanOrEqual(LightRailTint.minimumTransmission, 0.96)
-        // An unfocused window keeps nearly all of its edge cast: the rails are
-        // not a focus indicator, and 0.12 stacked on the material's own
-        // inactive collapse was half of the "gray when unfocused" bug.
-        XCTAssertEqual(LightRailTint.inactiveMultiplier, 0.85, accuracy: 0.0001)
-        XCTAssertGreaterThan(LightRailTint.cool.blue, LightRailTint.cool.green)
-        XCTAssertGreaterThan(LightRailTint.cool.green, LightRailTint.cool.red)
-        XCTAssertGreaterThan(LightRailTint.pearl.red, LightRailTint.pearl.green)
-        XCTAssertGreaterThan(LightRailTint.pearl.green, LightRailTint.pearl.blue)
     }
 
     func testGlassRailsDeclareNearlyHalfWhiteAndStillExposeTheDesktop() {
@@ -1574,21 +1567,35 @@ final class NativePreviewSettingsTests: XCTestCase {
     }
 
     /// The transcript's rhythm pair table: a turn boundary is a larger event
-    /// than the next artifact inside the same reply, and the opening row
-    /// leaves the top edge to the page padding.
+    /// than the next artifact inside the same reply, a run of work rows is a
+    /// tighter event than either, and the opening row leaves the top edge to
+    /// the page padding.
     func testTranscriptRhythmSeparatesTurnsMoreThanArtifacts() {
         XCTAssertGreaterThan(
             AcpTranscriptMetrics.turnSpacing,
             AcpTranscriptMetrics.intraTurnSpacing
         )
+        XCTAssertGreaterThan(
+            AcpTranscriptMetrics.intraTurnSpacing,
+            AcpTranscriptMetrics.workRunSpacing
+        )
         XCTAssertEqual(AcpTranscriptMetrics.spacing(before: nil, after: .user), 0)
         XCTAssertEqual(AcpTranscriptMetrics.spacing(before: nil, after: .assistant), 0)
+        XCTAssertEqual(AcpTranscriptMetrics.spacing(before: nil, after: .work), 0)
         XCTAssertEqual(
             AcpTranscriptMetrics.spacing(before: .user, after: .assistant),
             AcpTranscriptMetrics.turnSpacing
         )
         XCTAssertEqual(
             AcpTranscriptMetrics.spacing(before: .assistant, after: .user),
+            AcpTranscriptMetrics.turnSpacing
+        )
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .work, after: .user),
+            AcpTranscriptMetrics.turnSpacing
+        )
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .user, after: .work),
             AcpTranscriptMetrics.turnSpacing
         )
         XCTAssertEqual(
@@ -1599,15 +1606,31 @@ final class NativePreviewSettingsTests: XCTestCase {
             AcpTranscriptMetrics.spacing(before: .assistant, after: .assistant),
             AcpTranscriptMetrics.intraTurnSpacing
         )
-        // Only the user's own rows sit on the user side of the table.
+        // Work beside prose keeps the artifact gap; only work beside work
+        // tightens into a run, so a tool log reads as one block between
+        // paragraphs rather than a stack of separated cards.
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .assistant, after: .work),
+            AcpTranscriptMetrics.intraTurnSpacing
+        )
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .work, after: .assistant),
+            AcpTranscriptMetrics.intraTurnSpacing
+        )
+        XCTAssertEqual(
+            AcpTranscriptMetrics.spacing(before: .work, after: .work),
+            AcpTranscriptMetrics.workRunSpacing
+        )
+        // Only the user's own rows sit on the user side of the table, and the
+        // rhythm's work voice matches the "Agent work" section exactly.
         XCTAssertEqual(AcpTranscriptRow.user(id: "1", text: "go", failed: false).rhythmKind, .user)
         XCTAssertEqual(AcpTranscriptRow.message(id: "1", text: "on it").rhythmKind, .assistant)
-        XCTAssertEqual(AcpTranscriptRow.thought(id: "1", text: "…").rhythmKind, .assistant)
+        XCTAssertEqual(AcpTranscriptRow.thought(id: "1", text: "…").rhythmKind, .work)
         XCTAssertEqual(
             AcpTranscriptRow.tool(AcpToolCall(
                 id: "t", title: "Build", kind: "execute", status: .completed
             )).rhythmKind,
-            .assistant
+            .work
         )
     }
 
@@ -6289,8 +6312,8 @@ final class NativePreviewSettingsTests: XCTestCase {
                 "\(inner.0)Radius must stay tighter than \(outer.0)Radius"
             )
         }
-        XCTAssertEqual(KaisolaVisualSystem.shellRadius, 26)
-        XCTAssertEqual(KaisolaVisualSystem.chromeRadius, 22)
+        XCTAssertEqual(KaisolaVisualSystem.shellRadius, 30)
+        XCTAssertEqual(KaisolaVisualSystem.chromeRadius, 26)
 
         // The rail's active-project capsule uses `insetRadius` inside a 32pt
         // row, so it has to stay under half the row height or the capsule turns

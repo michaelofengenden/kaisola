@@ -136,7 +136,10 @@ final class AcpToolArtifactsTests: XCTestCase {
         }
 
         XCTAssertEqual(presentations.map(\.visibleDetailLevel), [1, 2, 3])
-        XCTAssertEqual(presentations.map(\.showsArtifactSummary), [false, true, true])
+        // Collapsed rows are log lines in Compact and Balanced: only Detailed
+        // annotates them with the artifact count and affected-file paths.
+        XCTAssertEqual(presentations.map(\.showsArtifactSummary), [false, false, true])
+        XCTAssertEqual(presentations.map(\.showsAffectedFilesWhenCollapsed), [false, false, true])
         XCTAssertEqual(presentations.map(\.wrapsAffectedFiles), [false, false, true])
         XCTAssertTrue(presentations.allSatisfy { !$0.expandsArtifactsByDefault })
     }

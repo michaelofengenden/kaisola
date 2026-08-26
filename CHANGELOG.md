@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.135 — 2026-08-26
+## 0.1.136 — 2026-08-26
 
 - A chat opens at its end, instantly. The transcript used to mount at the top and then chase the bottom — which read as the whole history scrolling past on every restart, update, and pane switch — and a chat you had paged back through replayed its entire expanded window on return. Content now mounts already sitting at the tail (the same anchor the iPhone companion has always used), and returning to a chat collapses the render window back to the end, so every open looks the same: the conversation, ready, at its latest word.
 - The stream shows the work the way the Codex app does. A burst of tool calls is one quiet line — "Ran 4 commands, read 2 files" — with the call-by-call log behind a click, closed by default; prose, thoughts, subagent chips, and the live tail keep their own lines, and the last still-running calls stay visible so the current action never hides. While a turn runs the status line carries a clock ("Working… · 33s"), and the Copy-response affordance now belongs only to the message that actually ends the turn — interim narration flows as plain prose. The Agent Work / Response captions retired; the shape of the stream says it now.

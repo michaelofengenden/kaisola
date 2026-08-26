@@ -1500,15 +1500,23 @@ actor AcpClient {
         }
     }
 
-    func setMode(_ modeID: String) async {
-        guard let sessionID else { return }
+    /// Request a permission-mode switch and report whether the adapter
+    /// accepted it. Callers must not persist or keep displaying the requested
+    /// mode on `false`: an adapter can refuse a mode it declares (an account
+    /// gate, a mid-session lockout), and a refusal has to roll back rather
+    /// than stick.
+    @discardableResult
+    func setMode(_ modeID: String) async -> Bool {
+        guard let sessionID else { return false }
         do {
             _ = try await request("session/set_mode", params: .object([
                 "sessionId": .string(sessionID),
                 "modeId": .string(modeID),
             ]))
+            return true
         } catch {
             eventHandler?(.error(errorText(error)))
+            return false
         }
     }
 

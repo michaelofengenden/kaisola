@@ -704,13 +704,18 @@ final class AcpConversation: ObservableObject {
             currentModeID = info.currentModeID
             // The permission mode is a per-chat decision, not per-process
             // state: restarting the app (or the adapter) must not reset it.
-            // Restore only a mode the adapter still declares; a vanished mode
-            // keeps the adapter's own current one rather than guessing.
+            // Restore only a mode the adapter still declares, and show it only
+            // once the adapter confirms the switch; a vanished or refused mode
+            // keeps the adapter's own current one, and a refusal realigns the
+            // memory so it is not replayed on every launch.
             if let remembered = rememberedModeID,
                remembered != info.currentModeID,
                info.modes.contains(where: { $0.id == remembered }) {
-                currentModeID = remembered
-                await client.setMode(remembered)
+                if await client.setMode(remembered) {
+                    currentModeID = remembered
+                } else if let confirmed = info.currentModeID {
+                    rememberMode(confirmed)
+                }
             }
             var confirmedOptions = info.configOptions
             var restorationFailure: String?
@@ -1138,9 +1143,19 @@ final class AcpConversation: ObservableObject {
     }
 
     func selectMode(_ id: String) {
+        let confirmed = currentModeID
         currentModeID = id
-        rememberMode(id)
-        Task { await client.setMode(id) }
+        Task {
+            // Remember only what the adapter accepted: a refused switch rolls
+            // the chip back to the confirmed mode instead of persisting a mode
+            // the session is not actually in. The `currentModeID == id` guards
+            // keep a slow reply from clobbering a newer selection.
+            if await client.setMode(id) {
+                if currentModeID == id { rememberMode(id) }
+            } else if currentModeID == id {
+                currentModeID = confirmed
+            }
+        }
     }
 
     /// Set an adapter config option (effort level etc.) transactionally.

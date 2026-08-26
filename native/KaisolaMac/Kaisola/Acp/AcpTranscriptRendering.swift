@@ -820,6 +820,9 @@ enum AcpTranscriptCodeLanguage {
 struct AssistantMarkdownText: View {
     let text: String
     let workspaceURL: URL?
+    /// False for interim narration inside a turn: the prose flows without a
+    /// Copy affordance, and only the turn's final answer carries one.
+    var showsCopyButton = true
     @StateObject private var renderer = AcpTranscriptRenderModel()
     @State private var characterLimit = AcpChatRendering.assistantCharacterLimit
     @State private var lineLimit = AcpChatRendering.assistantLineLimit
@@ -862,6 +865,8 @@ struct AssistantMarkdownText: View {
                 .font(.caption2)
                 .foregroundStyle(.kaisolaSecondary)
             }
+            if showsCopyButton || rendered.isTruncated
+                || characterLimit > AcpChatRendering.assistantCharacterLimit {
             HStack(spacing: 10) {
                 if rendered.isTruncated {
                     Button("Show more") {
@@ -880,14 +885,17 @@ struct AssistantMarkdownText: View {
                     .buttonStyle(.borderless)
                     .font(.caption)
                 }
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(text, forType: .string)
-                } label: {
-                    Label("Copy response", systemImage: "doc.on.doc")
+                if showsCopyButton {
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(text, forType: .string)
+                    } label: {
+                        Label("Copy response", systemImage: "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .font(.caption)
                 }
-                .buttonStyle(.borderless)
-                .font(.caption)
+            }
             }
         }
         .environment(\.openURL, OpenURLAction { link in

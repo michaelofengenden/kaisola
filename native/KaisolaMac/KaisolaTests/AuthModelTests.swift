@@ -152,3 +152,71 @@ private final class NoticeAuthBackend: AuthBackend {
     func freshIDToken() async throws -> String { "fresh-token" }
     func signOut() async {}
 }
+
+/// The legacy-keychain migration must never destroy the only surviving copy
+/// of a credential. On an unentitled build the data-protection write is
+/// refused and the rewrite silently lands back in the legacy keychain — the
+/// exact environment every shipping build runs in — and the old code then
+/// deleted the legacy item it had just refreshed: signed in for one session,
+/// signed out on the next launch, forever.
+final class KeychainAuthMigrationTests: XCTestCase {
+    /// Data-protection world empty and unwritable (entitlement refused on
+    /// add); legacy world holds the token. The migration read must return the
+    /// token AND leave the legacy item standing, because the rewrite landed
+    /// legacy.
+    func testUnentitledMigrationKeepsTheLegacyItemItRewrote() throws {
+        final class World: @unchecked Sendable {
+            var legacy: [String: Data] = ["firebase-refresh-token": Data("token".utf8)]
+            var deletedLegacy = 0
+        }
+        let world = World()
+        func isDataProtection(_ query: CFDictionary) -> Bool {
+            (query as NSDictionary)[kSecUseDataProtectionKeychain as String] as? Bool == true
+        }
+        func account(_ query: CFDictionary) -> String {
+            (query as NSDictionary)[kSecAttrAccount as String] as? String ?? ""
+        }
+        let operations = KeychainAuthSecurityOperations(
+            copyMatching: { query, result in
+                if isDataProtection(query) { return errSecItemNotFound }
+                guard let data = world.legacy[account(query)] else { return errSecItemNotFound }
+                result?.pointee = data as CFTypeRef
+                return errSecSuccess
+            },
+            update: { query, attributes in
+                if isDataProtection(query) { return errSecItemNotFound }
+                guard world.legacy[account(query)] != nil else { return errSecItemNotFound }
+                world.legacy[account(query)] =
+                    (attributes as NSDictionary)[kSecValueData as String] as? Data
+                return errSecSuccess
+            },
+            add: { query, _ in
+                if isDataProtection(query) { return errSecMissingEntitlement }
+                world.legacy[account(query)] =
+                    (query as NSDictionary)[kSecValueData as String] as? Data
+                return errSecSuccess
+            },
+            delete: { query in
+                if isDataProtection(query) { return errSecItemNotFound }
+                world.deletedLegacy += 1
+                world.legacy[account(query)] = nil
+                return errSecSuccess
+            }
+        )
+        let store = KeychainAuthSecureStore(
+            service: "test.firebase-auth",
+            securityOperations: operations
+        )
+
+        let data = try store.data(for: "firebase-refresh-token")
+        XCTAssertEqual(data, Data("token".utf8))
+        XCTAssertEqual(
+            world.legacy["firebase-refresh-token"], Data("token".utf8),
+            "the rewrite landed in the legacy keychain, so the legacy item is the only copy and must survive"
+        )
+        XCTAssertEqual(world.deletedLegacy, 0, "nothing may delete the surviving copy")
+
+        // And the next launch still finds it.
+        XCTAssertEqual(try store.data(for: "firebase-refresh-token"), Data("token".utf8))
+    }
+}

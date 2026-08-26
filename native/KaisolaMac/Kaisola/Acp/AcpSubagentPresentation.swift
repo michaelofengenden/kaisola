@@ -146,3 +146,88 @@ enum AcpTranscriptFollowPolicy {
         distance <= reengageDistance
     }
 }
+
+/// Reading a detached subagent over the harness's shoulder.
+///
+/// The stream never reports a backgrounded agent again, but the Claude
+/// harness's launch acknowledgement names the transcript file the agent
+/// writes as it works ("output_file: …tasks/<id>.output", JSONL). Tailing
+/// that file is the one honest window into "is it actually doing something"
+/// — so the chip can open a live activity view instead of shrugging.
+/// Parsing is pure over bytes and deliberately forgiving: an unrecognised
+/// line contributes nothing rather than failing the view.
+enum AcpSubagentActivity {
+    /// The transcript path named in the spawn's launch acknowledgement.
+    static func outputFileURL(from call: AcpToolCall) -> URL? {
+        for artifact in call.content {
+            guard case let .text(text) = artifact else { continue }
+            for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard trimmed.hasPrefix("output_file:") else { continue }
+                let path = trimmed.dropFirst("output_file:".count)
+                    .trimmingCharacters(in: .whitespaces)
+                guard path.hasPrefix("/") else { continue }
+                return URL(fileURLWithPath: path)
+            }
+        }
+        return nil
+    }
+
+    /// Recent actions from the tail of a harness JSONL transcript, newest
+    /// last. Each assistant `tool_use` becomes "Name — hint" (description
+    /// over command over path over prompt); each assistant text chunk becomes
+    /// its first line; a `result` line closes the story.
+    static func recentActions(fromTail data: Data, limit: Int = 8) -> [String] {
+        guard let text = String(data: data, encoding: .utf8) else { return [] }
+        var lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        // The tail read may start mid-line; drop the first fragment.
+        if lines.count > 1 { lines.removeFirst() }
+        var actions: [String] = []
+        for line in lines {
+            guard let object = try? JSONSerialization.jsonObject(
+                with: Data(line.utf8)
+            ) as? [String: Any] else { continue }
+            actions.append(contentsOf: describe(object))
+        }
+        return actions.suffix(limit)
+    }
+
+    private static func describe(_ object: [String: Any]) -> [String] {
+        switch object["type"] as? String {
+        case "assistant":
+            guard let message = object["message"] as? [String: Any],
+                  let content = message["content"] as? [[String: Any]] else { return [] }
+            return content.compactMap { item in
+                switch item["type"] as? String {
+                case "tool_use":
+                    let name = item["name"] as? String ?? "Tool"
+                    let input = item["input"] as? [String: Any] ?? [:]
+                    let hint = (input["description"] as? String)
+                        ?? (input["command"] as? String)
+                        ?? (input["file_path"] as? String)
+                        ?? (input["prompt"] as? String)
+                        ?? (input["query"] as? String)
+                    return hint.map { "\(name) — \(snippet($0))" } ?? name
+                case "text":
+                    return (item["text"] as? String).flatMap { text in
+                        let line = snippet(text)
+                        return line.isEmpty ? nil : "“\(line)”"
+                    }
+                default:
+                    return nil
+                }
+            }
+        case "result":
+            return ["Finished"]
+        default:
+            return []
+        }
+    }
+
+    private static func snippet(_ text: String, limit: Int = 90) -> String {
+        let firstLine = text.split(separator: "\n", omittingEmptySubsequences: true)
+            .first.map(String.init) ?? ""
+        let trimmed = firstLine.trimmingCharacters(in: .whitespaces)
+        return trimmed.count > limit ? String(trimmed.prefix(limit)) + "…" : trimmed
+    }
+}

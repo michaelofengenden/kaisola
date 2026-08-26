@@ -445,10 +445,10 @@ struct WorkspaceRailView: View {
             }
             .padding(.horizontal, WorkspaceRailHeaderLayout.capsulePadding)
             .frame(height: 30)
-            .background(
-                .quaternary.opacity(0.38),
-                in: RoundedRectangle(cornerRadius: 10, style: .continuous)
-            )
+            // A control surface, not a grey wash: Liquid Glass on macOS 26,
+            // a light material below — either way the capsule reads white
+            // over the rail's frost instead of a quaternary grey.
+            .kaisolaControlSurface(interactive: false)
             .padding(.horizontal, WorkspaceRailHeaderLayout.outerPadding)
             .padding(.vertical, 6)
         }
